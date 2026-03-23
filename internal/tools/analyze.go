@@ -4,17 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/danweinerdev/code-graph-mcp/internal/graph"
 	"github.com/danweinerdev/code-graph-mcp/internal/parser"
 )
+
+// sendProgress sends a progress notification to the MCP client if a server
+// is available in the context. Failures are silently ignored.
+func sendProgress(ctx context.Context, progress, total int, message string) {
+	srv := server.ServerFromContext(ctx)
+	if srv == nil {
+		return
+	}
+	err := srv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+		"progress": progress,
+		"total":    total,
+		"message":  message,
+	})
+	if err != nil {
+		log.Printf("progress notification failed: %v", err)
+	}
+}
 
 type analyzeResult struct {
 	Files    int      `json:"files"`
@@ -73,6 +93,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Collect files to parse.
+	sendProgress(ctx, 0, 0, "Discovering source files...")
 	var filePaths []string
 	var warnings []string
 	err = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
@@ -97,6 +118,9 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(fmt.Sprintf("no supported source files found in %s", absPath)), nil
 	}
 
+	totalFiles := len(filePaths)
+	sendProgress(ctx, 0, totalFiles, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
+
 	// Phase 1: Parse files concurrently.
 	numWorkers := runtime.NumCPU()
 	if numWorkers > len(filePaths) {
@@ -106,6 +130,8 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	jobs := make(chan string, len(filePaths))
 	results := make(chan *parser.FileGraph, len(filePaths))
 	errs := make(chan string, len(filePaths))
+
+	var parsed atomic.Int32
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -120,14 +146,20 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 				content, err := os.ReadFile(path)
 				if err != nil {
 					errs <- fmt.Sprintf("%s: read error: %v", path, err)
+					parsed.Add(1)
 					continue
 				}
 				fg, err := p.ParseFile(path, content)
 				if err != nil {
 					errs <- fmt.Sprintf("%s: parse error: %v", path, err)
+					parsed.Add(1)
 					continue
 				}
 				results <- fg
+				n := int(parsed.Add(1))
+				if n%10 == 0 || n == totalFiles {
+					sendProgress(ctx, n, totalFiles, fmt.Sprintf("Parsed %d/%d files", n, totalFiles))
+				}
 			}
 		}()
 	}
@@ -154,6 +186,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Build indices for resolution.
+	sendProgress(ctx, totalFiles, totalFiles, "Resolving symbol references...")
 	fileIndex := buildFileIndex(filePaths)
 	symbolIndex := buildSymbolIndex(fileGraphs)
 
@@ -163,6 +196,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Phase 2: Merge into graph sequentially.
+	sendProgress(ctx, totalFiles, totalFiles, "Building graph...")
 	t.graph.Clear()
 	for _, fg := range fileGraphs {
 		t.graph.MergeFileGraph(fg)
@@ -172,6 +206,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	t.indexed.Store(true)
 
 	// Save cache for next time.
+	sendProgress(ctx, totalFiles, totalFiles, "Saving cache...")
 	if err := t.graph.Save(absPath); err != nil {
 		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
 	}
