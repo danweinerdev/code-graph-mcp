@@ -205,6 +205,30 @@ void f() { make<int>(); }
 	}
 }
 
+func TestCppCastsFiltered(t *testing.T) {
+	fg := parse(t, `
+void f() {
+    int x = static_cast<int>(3.14);
+    auto p = reinterpret_cast<char*>(0);
+    const int& r = const_cast<int&>(x);
+    auto d = dynamic_cast<int*>(nullptr);
+    realFunction();
+}
+`)
+	// Casts should NOT produce call edges.
+	for _, cast := range []string{"static_cast", "reinterpret_cast", "const_cast", "dynamic_cast"} {
+		e := findEdge(fg, parser.EdgeCalls, cast)
+		if e != nil {
+			t.Errorf("C++ cast %q should not produce a call edge", cast)
+		}
+	}
+	// Real function should still be captured.
+	e := findEdge(fg, parser.EdgeCalls, "realFunction")
+	if e == nil {
+		t.Fatal("expected call edge to 'realFunction'")
+	}
+}
+
 // --- Include Tests ---
 
 func TestQuotedInclude(t *testing.T) {

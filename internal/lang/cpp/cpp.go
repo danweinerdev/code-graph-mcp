@@ -252,6 +252,11 @@ func (p *CppParser) extractCalls(root *tree_sitter.Node, content []byte, path st
 				continue
 			}
 
+			// Filter out C++ cast expressions that tree-sitter parses as call_expression.
+			if isCppCast(calleeName) {
+				continue
+			}
+
 			// Find the enclosing call_expression for line info.
 			nodePtr := &capture.Node
 			callNode := findEnclosingKind(nodePtr, "call_expression")
@@ -419,6 +424,16 @@ func enclosingFunctionID(node *tree_sitter.Node, content []byte, path string) st
 	}
 
 	return path
+}
+
+// isCppCast returns true if the name is a C++ cast keyword that tree-sitter
+// parses as a call_expression.
+func isCppCast(name string) bool {
+	switch name {
+	case "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast":
+		return true
+	}
+	return false
 }
 
 // splitQualified splits "Scope::Name" into (scope, name). If there is no "::",
