@@ -46,6 +46,14 @@ AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
               [go-tree-sitter + tree-sitter-cpp]
 ```
 
+## MCP Tools (11 total)
+
+**Indexing:** `analyze_codebase`
+**Symbol queries:** `get_file_symbols`, `search_symbols`, `get_symbol_detail`
+**Call graph:** `get_callers`, `get_callees`
+**Dependencies:** `get_dependencies`
+**Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling`
+
 ## Code Conventions
 
 - All tool handlers return `(*mcp.CallToolResult, error)` — use `mcp.NewToolResultError()` for user errors, never return non-nil Go error
@@ -68,7 +76,7 @@ Validated against tree-sitter-cpp v0.23.4.
 
 3. **Complex template metaprogramming** — Deeply nested template specializations may produce incomplete or error-containing AST nodes. The parser skips error nodes gracefully.
 
-4. **Call resolution is syntactic** — Call edges are based on name matching, not semantic resolution. `foo()` inside a class method and `foo()` as a free function both produce a call edge to `foo`. Scope-aware matching is deferred to the graph engine.
+4. **Call resolution is heuristic** — Call edges are resolved via scope-aware heuristic matching (same file > same class > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
 
 5. **C++ cast expressions** — `static_cast`, `dynamic_cast`, `const_cast`, `reinterpret_cast` are filtered out (tree-sitter parses them as call expressions).
 

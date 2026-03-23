@@ -1,7 +1,7 @@
 ---
 title: "Code Graph MCP Server"
 type: plan
-status: active
+status: complete
 created: 2026-03-22
 updated: 2026-03-22
 tags: [mcp, code-graph, tree-sitter, golang, cpp]
@@ -33,7 +33,7 @@ phases:
     depends_on: [3, 4]
   - id: 6
     title: "P1 Tools & Polish"
-    status: planned
+    status: complete
     doc: "06-P1-Tools-And-Polish.md"
     depends_on: [5]
 ---
