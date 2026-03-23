@@ -119,15 +119,21 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					continue
 				}
 				ns := resolveNamespace(nodePtr, content)
+				parentClass := resolveParentClass(nodePtr, content)
+				kind := parser.KindFunction
+				if parentClass != "" {
+					kind = parser.KindMethod
+				}
 				fg.Symbols = append(fg.Symbols, parser.Symbol{
 					Name:      text,
-					Kind:      parser.KindFunction,
+					Kind:      kind,
 					File:      path,
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
 					Signature: truncate(defNode.Utf8Text(content), 200),
 					Namespace: ns,
+					Parent:    parentClass,
 				})
 
 			case "method.qname":
