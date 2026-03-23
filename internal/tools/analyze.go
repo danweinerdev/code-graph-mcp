@@ -45,6 +45,33 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(fmt.Sprintf("directory does not exist: %s", absPath)), nil
 	}
 
+	// Check for force flag.
+	force, _ := req.GetArguments()["force"].(bool)
+
+	// Try loading from cache if not forced.
+	if !force {
+		loaded, err := t.graph.Load(absPath)
+		if err == nil && loaded {
+			// Check for stale files.
+			stale, _ := graph.StalePaths(absPath)
+			if len(stale) == 0 {
+				t.rootPath = absPath
+				t.indexed.Store(true)
+				nodes, edges, files := t.graph.Stats()
+				result := analyzeResult{
+					Files:    files,
+					Symbols:  nodes,
+					Edges:    edges,
+					RootPath: absPath,
+					Warnings: []string{"loaded from cache"},
+				}
+				jsonBytes, _ := json.Marshal(result)
+				return mcp.NewToolResultText(string(jsonBytes)), nil
+			}
+			// Stale files found — fall through to re-index.
+		}
+	}
+
 	// Collect files to parse.
 	var filePaths []string
 	var warnings []string
@@ -143,6 +170,11 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 
 	t.rootPath = absPath
 	t.indexed.Store(true)
+
+	// Save cache for next time.
+	if err := t.graph.Save(absPath); err != nil {
+		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
+	}
 
 	nodes, edges, files := t.graph.Stats()
 	result := analyzeResult{

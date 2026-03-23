@@ -19,6 +19,7 @@ type Tools struct {
 	indexed  atomic.Bool
 	indexMu  sync.Mutex
 	rootPath string
+	watch    watchState
 }
 
 // New creates a new Tools instance.
@@ -96,16 +97,27 @@ func (t *Tools) Register(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("get_coupling",
 		mcp.WithDescription("Get cross-file dependency counts for a file"),
 		mcp.WithString("file", mcp.Required(), mcp.Description("Absolute path to the source file")),
+		mcp.WithString("direction", mcp.Description("'outgoing' (default), 'incoming', or 'both'")),
 	), t.handleGetCoupling)
 
 	// Visualization
 	s.AddTool(mcp.NewTool("generate_mermaid",
-		mcp.WithDescription("Generate a Mermaid flowchart diagram centered on a symbol (call graph) or file (dependency graph)"),
+		mcp.WithDescription("Generate a Mermaid diagram: call graph (symbol), file dependencies (file), or inheritance tree (class)"),
 		mcp.WithString("symbol", mcp.Description("Symbol ID to center the call graph on (format: file:name)")),
 		mcp.WithString("file", mcp.Description("File path to center the dependency graph on")),
+		mcp.WithString("class", mcp.Description("Class name to center the inheritance diagram on")),
 		mcp.WithNumber("depth", mcp.Description("BFS traversal depth (default 1)")),
 		mcp.WithNumber("max_nodes", mcp.Description("Maximum nodes in diagram (default 30)")),
 	), t.handleGenerateMermaid)
+
+	// Watch mode
+	s.AddTool(mcp.NewTool("watch_start",
+		mcp.WithDescription("Start watching the indexed directory for file changes and auto-reindex modified files"),
+	), t.handleWatchStart)
+
+	s.AddTool(mcp.NewTool("watch_stop",
+		mcp.WithDescription("Stop watching for file changes"),
+	), t.handleWatchStop)
 }
 
 // suggestSymbols returns up to limit symbol name suggestions for did-you-mean errors.

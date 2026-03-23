@@ -424,6 +424,43 @@ func (g *Graph) Coupling(path string) map[string]int {
 	return counts
 }
 
+// IncomingCoupling returns a map of other file paths to the number of
+// cross-file edges (calls + includes) pointing INTO the given file.
+func (g *Graph) IncomingCoupling(path string) map[string]int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	counts := make(map[string]int)
+
+	// Count incoming call edges to symbols in this file.
+	for _, id := range g.files[path] {
+		for _, entry := range g.radj[id] {
+			if entry.Kind == parser.EdgeCalls {
+				// entry.Target is the caller's ID — find its file.
+				if callerNode, ok := g.nodes[entry.Target]; ok {
+					if callerNode.Symbol.File != path {
+						counts[callerNode.Symbol.File]++
+					}
+				}
+			}
+		}
+	}
+
+	// Count files that include this file.
+	for from, incs := range g.includes {
+		if from == path {
+			continue
+		}
+		for _, inc := range incs {
+			if inc == path {
+				counts[from]++
+			}
+		}
+	}
+
+	return counts
+}
+
 // MermaidGraph generates a Mermaid flowchart centered on a symbol or file.
 // It performs a BFS to collect connected nodes up to the given depth, bounded
 // by maxNodes to keep diagrams readable.
@@ -452,6 +489,115 @@ func (g *Graph) MermaidGraph(startID string, depth, maxNodes int) string {
 		return g.mermaidFileGraph(startID, depth, maxNodes)
 	}
 	return ""
+}
+
+// MermaidInheritance generates a Mermaid class diagram showing inheritance
+// relationships centered on the given class name.
+func (g *Graph) MermaidInheritance(className string, depth, maxNodes int) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if depth <= 0 {
+		depth = 2
+	}
+	if maxNodes <= 0 {
+		maxNodes = 30
+	}
+
+	// Verify the class exists.
+	found := false
+	for _, n := range g.nodes {
+		if n.Symbol.Name == className &&
+			(n.Symbol.Kind == parser.KindClass || n.Symbol.Kind == parser.KindStruct) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ""
+	}
+
+	type item struct {
+		name  string
+		depth int
+	}
+
+	visited := map[string]bool{className: true}
+	queue := []item{{className, 0}}
+	var edges [][2]string // [derived, base]
+
+	for len(queue) > 0 && len(visited) < maxNodes {
+		curr := queue[0]
+		queue = queue[1:]
+
+		if curr.depth >= depth {
+			continue
+		}
+
+		// Base classes (upward via adj — inheritance edges: From=derived, To=base).
+		for _, entry := range g.adj[curr.name] {
+			if entry.Kind != parser.EdgeInherits {
+				continue
+			}
+			edges = append(edges, [2]string{curr.name, entry.Target})
+			if !visited[entry.Target] && len(visited) < maxNodes {
+				visited[entry.Target] = true
+				queue = append(queue, item{entry.Target, curr.depth + 1})
+			}
+		}
+
+		// Derived classes (downward via radj).
+		for _, entry := range g.radj[curr.name] {
+			if entry.Kind != parser.EdgeInherits {
+				continue
+			}
+			edges = append(edges, [2]string{entry.Target, curr.name})
+			if !visited[entry.Target] && len(visited) < maxNodes {
+				visited[entry.Target] = true
+				queue = append(queue, item{entry.Target, curr.depth + 1})
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("graph BT\n")
+
+	shortIDs := make(map[string]string)
+	idx := 0
+	shortID := func(name string) string {
+		if s, ok := shortIDs[name]; ok {
+			return s
+		}
+		s := fmt.Sprintf("c%d", idx)
+		idx++
+		shortIDs[name] = s
+		return s
+	}
+
+	for name := range visited {
+		sid := shortID(name)
+		if name == className {
+			b.WriteString(fmt.Sprintf("    %s[\"%s\"]:::%s\n", sid, name, "center"))
+		} else {
+			b.WriteString(fmt.Sprintf("    %s[\"%s\"]\n", sid, name))
+		}
+	}
+
+	seen := make(map[[2]string]bool)
+	for _, e := range edges {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		if !visited[e[0]] || !visited[e[1]] {
+			continue
+		}
+		// derived -->|inherits| base (BT direction: derived at bottom, base at top)
+		b.WriteString(fmt.Sprintf("    %s -->|inherits| %s\n", shortID(e[0]), shortID(e[1])))
+	}
+
+	b.WriteString("    classDef center fill:#f96,stroke:#333\n")
+	return b.String()
 }
 
 func (g *Graph) mermaidCallGraph(startID string, depth, maxNodes int) string {
@@ -643,6 +789,30 @@ func mermaidLabel(id string, nodes map[string]*Node) string {
 		return filepath.Base(id)
 	}
 	return id
+}
+
+// AllFilePaths returns all indexed file paths.
+func (g *Graph) AllFilePaths() []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	paths := make([]string, 0, len(g.files))
+	for path := range g.files {
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// AllSymbols returns all symbols in the graph.
+func (g *Graph) AllSymbols() []parser.Symbol {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	symbols := make([]parser.Symbol, 0, len(g.nodes))
+	for _, n := range g.nodes {
+		symbols = append(symbols, n.Symbol)
+	}
+	return symbols
 }
 
 // Stats returns summary statistics about the graph.

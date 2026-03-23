@@ -80,21 +80,37 @@ Add to your project's `.claude/settings.json`:
 | `detect_cycles` | Find circular include dependencies | (none) |
 | `get_orphans` | Find uncalled functions/methods | `kind` (optional): filter |
 | `get_class_hierarchy` | Get inheritance tree | `class`: class name |
-| `get_coupling` | Cross-file dependency counts | `file`: absolute file path |
+| `get_coupling` | Cross-file dependency counts | `file`: absolute file path; `direction` (optional): outgoing/incoming/both |
 
 ### Visualization
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `generate_mermaid` | Generate a Mermaid flowchart | `symbol` or `file`: center node; `depth` (optional); `max_nodes` (optional, default 30) |
+| `generate_mermaid` | Generate a Mermaid diagram | `symbol`, `file`, or `class`: center node; `depth` (optional); `max_nodes` (optional, default 30) |
+
+### Watch Mode
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `watch_start` | Auto-reindex on file changes | (none — uses indexed root) |
+| `watch_stop` | Stop watching for changes | (none) |
+
+## Features
+
+- **Graph persistence:** Index is cached to `.code-graph-cache.json` and reloaded on next `analyze_codebase` if files haven't changed. Use `force=true` to bypass.
+- **Watch mode:** Call `watch_start` after indexing to auto-reindex files as they change. Call `watch_stop` to disable.
+- **Three Mermaid diagram types:** call graph (symbol), file dependencies (file), inheritance tree (class)
+- **Bidirectional coupling:** `get_coupling` supports outgoing, incoming, or both directions
 
 ## Workflow
 
 1. Call `analyze_codebase` with the project root to index the codebase
-2. Use `search_symbols` or `get_file_symbols` to find symbols of interest
-3. Use `get_callers`/`get_callees` to navigate the call graph
-4. Use `get_dependencies` and `detect_cycles` to understand file structure
-5. Use `get_class_hierarchy` to explore inheritance
+2. Optionally call `watch_start` to keep the index fresh as files change
+3. Use `search_symbols` or `get_file_symbols` to find symbols of interest
+4. Use `get_callers`/`get_callees` to navigate the call graph
+5. Use `get_dependencies` and `detect_cycles` to understand file structure
+6. Use `get_class_hierarchy` or `generate_mermaid` with `class` to explore inheritance
+7. Use `generate_mermaid` with `symbol` or `file` for visual diagrams
 
 Symbol IDs are in the format `file:name` (e.g., `/path/engine.cpp:Engine::update`) and are returned by symbol query tools for use in call graph queries.
 
