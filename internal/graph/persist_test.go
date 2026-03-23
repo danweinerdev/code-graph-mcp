@@ -101,7 +101,7 @@ func TestIncomingCoupling(t *testing.T) {
 	}
 }
 
-func TestMermaidInheritance(t *testing.T) {
+func TestDiagramInheritance(t *testing.T) {
 	g := New()
 	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
 		sym("Base", parser.KindClass, "/a.cpp"),
@@ -112,31 +112,44 @@ func TestMermaidInheritance(t *testing.T) {
 		inheritEdge("Derived", "Middle", "/a.cpp"),
 	}))
 
-	diagram := g.MermaidInheritance("Middle", 2, 30)
-	if diagram == "" {
-		t.Fatal("expected non-empty inheritance diagram")
+	dr := g.DiagramInheritance("Middle", 2, 30)
+	if dr == nil {
+		t.Fatal("expected non-nil result")
 	}
-	t.Log(diagram)
+	if len(dr.Edges) != 2 {
+		t.Errorf("expected 2 edges, got %d", len(dr.Edges))
+	}
 
-	if !strings.Contains(diagram, "graph BT") {
-		t.Error("expected bottom-top graph")
+	// Check edges format.
+	found := map[string]bool{}
+	for _, e := range dr.Edges {
+		found[e.From+"->"+e.To] = true
+		if e.Label != "inherits" {
+			t.Errorf("expected label 'inherits', got %q", e.Label)
+		}
 	}
-	if !strings.Contains(diagram, "inherits") {
-		t.Error("expected 'inherits' edge labels")
+	if !found["Middle->Base"] {
+		t.Error("expected Middle->Base edge")
 	}
-	if !strings.Contains(diagram, "Base") {
-		t.Error("expected Base in diagram")
+	if !found["Derived->Middle"] {
+		t.Error("expected Derived->Middle edge")
 	}
-	if !strings.Contains(diagram, "Derived") {
-		t.Error("expected Derived in diagram")
+
+	// Mermaid unstyled.
+	mermaid := dr.RenderMermaid("BT", false)
+	if !strings.Contains(mermaid, "graph BT") {
+		t.Error("expected BT direction")
+	}
+	if strings.Contains(mermaid, "classDef") {
+		t.Error("unstyled should not have classDef")
 	}
 }
 
-func TestMermaidInheritanceUnknown(t *testing.T) {
+func TestDiagramInheritanceUnknown(t *testing.T) {
 	g := New()
-	diagram := g.MermaidInheritance("Unknown", 1, 30)
-	if diagram != "" {
-		t.Error("expected empty diagram for unknown class")
+	dr := g.DiagramInheritance("Unknown", 1, 30)
+	if dr != nil {
+		t.Error("expected nil for unknown class")
 	}
 }
 

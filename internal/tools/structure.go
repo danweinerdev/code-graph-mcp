@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/danweinerdev/code-graph-mcp/internal/graph"
 	"github.com/danweinerdev/code-graph-mcp/internal/parser"
 )
 
@@ -126,32 +127,62 @@ func (t *Tools) handleGenerateMermaid(ctx context.Context, req mcp.CallToolReque
 		maxNodes = int(m)
 	}
 
-	var diagram string
+	format, _ := req.GetArguments()["format"].(string)
+	if format == "" {
+		format = "edges"
+	}
+	styled, _ := req.GetArguments()["styled"].(bool)
+
+	// Get the diagram data.
+	var dr *graph.DiagramResult
+	var direction string
+
 	if class != "" {
-		diagram = t.graph.MermaidInheritance(class, depth, maxNodes)
-		if diagram == "" {
+		dr = t.graph.DiagramInheritance(class, depth, maxNodes)
+		direction = "BT"
+		if dr == nil {
 			msg := fmt.Sprintf("class not found: %q", class)
 			if suggestions := t.suggestSymbols(class, 5); suggestions != "" {
 				msg += fmt.Sprintf(". Did you mean: %s?", suggestions)
 			}
 			return mcp.NewToolResultError(msg), nil
 		}
-	} else {
-		startID := symbolID
-		if startID == "" {
-			startID = file
-		}
-		diagram = t.graph.MermaidGraph(startID, depth, maxNodes)
-		if diagram == "" {
-			msg := fmt.Sprintf("no graph found for %q", startID)
-			if symbolID != "" {
-				if suggestions := t.suggestSymbols(symbolID, 5); suggestions != "" {
-					msg += fmt.Sprintf(". Did you mean: %s?", suggestions)
-				}
+	} else if symbolID != "" {
+		dr = t.graph.DiagramCallGraph(symbolID, depth, maxNodes)
+		direction = "TD"
+		if dr == nil {
+			msg := fmt.Sprintf("symbol not found: %q", symbolID)
+			if suggestions := t.suggestSymbols(symbolID, 5); suggestions != "" {
+				msg += fmt.Sprintf(". Did you mean: %s?", suggestions)
 			}
 			return mcp.NewToolResultError(msg), nil
 		}
+	} else {
+		dr = t.graph.DiagramFileGraph(file, depth, maxNodes)
+		direction = "TD"
+		if dr == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("file not found: %q", file)), nil
+		}
 	}
 
-	return mcp.NewToolResultText(diagram), nil
+	// Format the output.
+	switch format {
+	case "edges":
+		edges := dr.Edges
+		if edges == nil {
+			edges = []graph.DiagramEdge{}
+		}
+		jsonBytes, _ := json.Marshal(edges)
+		return mcp.NewToolResultText(string(jsonBytes)), nil
+
+	case "mermaid":
+		diagram := dr.RenderMermaid(direction, styled)
+		if diagram == "" {
+			return mcp.NewToolResultText(""), nil
+		}
+		return mcp.NewToolResultText(diagram), nil
+
+	default:
+		return mcp.NewToolResultError("'format' must be 'edges' or 'mermaid'"), nil
+	}
 }

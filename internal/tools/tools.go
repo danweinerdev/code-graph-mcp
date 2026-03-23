@@ -101,13 +101,15 @@ func (t *Tools) Register(s *server.MCPServer) {
 	), t.handleGetCoupling)
 
 	// Visualization
-	s.AddTool(mcp.NewTool("generate_mermaid",
-		mcp.WithDescription("Generate a Mermaid diagram: call graph (symbol), file dependencies (file), or inheritance tree (class)"),
+	s.AddTool(mcp.NewTool("generate_diagram",
+		mcp.WithDescription("Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid."),
 		mcp.WithString("symbol", mcp.Description("Symbol ID to center the call graph on (format: file:name)")),
 		mcp.WithString("file", mcp.Description("File path to center the dependency graph on")),
 		mcp.WithString("class", mcp.Description("Class name to center the inheritance diagram on")),
 		mcp.WithNumber("depth", mcp.Description("BFS traversal depth (default 1)")),
 		mcp.WithNumber("max_nodes", mcp.Description("Maximum nodes in diagram (default 30)")),
+		mcp.WithString("format", mcp.Description("Output format: 'edges' (default, minimal JSON) or 'mermaid' (Mermaid flowchart syntax)")),
+		mcp.WithBoolean("styled", mcp.Description("When format=mermaid, add CSS styling and center node highlighting (default false)")),
 	), t.handleGenerateMermaid)
 
 	// Watch mode

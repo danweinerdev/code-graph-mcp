@@ -568,11 +568,10 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// --- Mermaid ---
+// --- Diagram ---
 
-func TestMermaidCallGraph(t *testing.T) {
+func TestDiagramCallGraph(t *testing.T) {
 	g := New()
-	// A calls B, B calls C
 	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
 		sym("A", parser.KindFunction, "/a.cpp"),
 		sym("B", parser.KindFunction, "/a.cpp"),
@@ -582,49 +581,65 @@ func TestMermaidCallGraph(t *testing.T) {
 		callEdge("/a.cpp:B", "/a.cpp:C", "/a.cpp"),
 	}))
 
-	diagram := g.MermaidGraph("/a.cpp:B", 1, 30)
-	if diagram == "" {
-		t.Fatal("expected non-empty diagram")
+	dr := g.DiagramCallGraph("/a.cpp:B", 1, 30)
+	if dr == nil {
+		t.Fatal("expected non-nil result")
 	}
-	t.Log(diagram)
+	if len(dr.Edges) != 2 {
+		t.Errorf("expected 2 edges (A->B, B->C), got %d", len(dr.Edges))
+	}
 
-	if !strings.Contains(diagram, "graph TD") {
-		t.Error("expected 'graph TD' header")
+	// Test edges format (JSON).
+	for _, e := range dr.Edges {
+		if e.Label != "calls" {
+			t.Errorf("expected label 'calls', got %q", e.Label)
+		}
 	}
-	if !strings.Contains(diagram, "-->") {
-		t.Error("expected edges in diagram")
+
+	// Test mermaid rendering (unstyled).
+	mermaid := dr.RenderMermaid("TD", false)
+	if !strings.Contains(mermaid, "graph TD") {
+		t.Error("expected 'graph TD'")
 	}
-	// Should contain all 3 nodes since B is connected to both A and C at depth 1.
-	if !strings.Contains(diagram, "\"B\"") {
-		t.Error("expected center node B in diagram")
+	if strings.Contains(mermaid, "classDef") {
+		t.Error("unstyled should not have classDef")
+	}
+
+	// Test mermaid rendering (styled).
+	styled := dr.RenderMermaid("TD", true)
+	if !strings.Contains(styled, "classDef center") {
+		t.Error("styled should have classDef")
+	}
+	if !strings.Contains(styled, ":::center") {
+		t.Error("styled should have :::center annotation")
 	}
 }
 
-func TestMermaidFileGraph(t *testing.T) {
+func TestDiagramFileGraph(t *testing.T) {
 	g := New()
 	g.MergeFileGraph(makeFileGraph("/a.cpp", nil, []parser.Edge{
 		includeEdge("/a.cpp", "/b.h", "/a.cpp"),
 		includeEdge("/a.cpp", "/c.h", "/a.cpp"),
 	}))
-
-	// Need /b.h and /c.h in the files map for them to be recognized.
 	g.MergeFileGraph(makeFileGraph("/b.h", nil, nil))
 	g.MergeFileGraph(makeFileGraph("/c.h", nil, nil))
 
-	diagram := g.MermaidGraph("/a.cpp", 1, 30)
-	if diagram == "" {
-		t.Fatal("expected non-empty diagram")
+	dr := g.DiagramFileGraph("/a.cpp", 1, 30)
+	if dr == nil {
+		t.Fatal("expected non-nil result")
 	}
-	t.Log(diagram)
-
-	if !strings.Contains(diagram, "includes") {
-		t.Error("expected 'includes' edge labels in file diagram")
+	if len(dr.Edges) != 2 {
+		t.Errorf("expected 2 edges, got %d", len(dr.Edges))
+	}
+	for _, e := range dr.Edges {
+		if e.Label != "includes" {
+			t.Errorf("expected label 'includes', got %q", e.Label)
+		}
 	}
 }
 
-func TestMermaidMaxNodes(t *testing.T) {
+func TestDiagramMaxNodes(t *testing.T) {
 	g := New()
-	// Create a chain of 10 functions.
 	var syms []parser.Symbol
 	var edges []parser.Edge
 	for i := 0; i < 10; i++ {
@@ -637,23 +652,41 @@ func TestMermaidMaxNodes(t *testing.T) {
 	}
 	g.MergeFileGraph(makeFileGraph("/a.cpp", syms, edges))
 
-	diagram := g.MermaidGraph("/a.cpp:A", 10, 5)
-	if diagram == "" {
-		t.Fatal("expected diagram")
+	dr := g.DiagramCallGraph("/a.cpp:A", 10, 5)
+	if dr == nil {
+		t.Fatal("expected result")
 	}
-
-	// Count nodes — should be capped at ~5.
-	nodeCount := strings.Count(diagram, "[\"")
-	if nodeCount > 6 { // allow slight overshoot due to BFS batch
-		t.Errorf("expected ~5 nodes max, got %d", nodeCount)
+	// Edges should be bounded by max nodes.
+	if len(dr.Edges) > 5 {
+		t.Errorf("expected at most 5 edges with maxNodes=5, got %d", len(dr.Edges))
 	}
 }
 
-func TestMermaidUnknown(t *testing.T) {
+func TestDiagramUnknownSymbol(t *testing.T) {
 	g := New()
-	diagram := g.MermaidGraph("/unknown:func", 1, 30)
-	if diagram != "" {
-		t.Error("expected empty diagram for unknown ID")
+	dr := g.DiagramCallGraph("/unknown:func", 1, 30)
+	if dr != nil {
+		t.Error("expected nil for unknown symbol")
+	}
+}
+
+func TestDiagramEmptyEdges(t *testing.T) {
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		sym("lonely", parser.KindFunction, "/a.cpp"),
+	}, nil))
+
+	dr := g.DiagramCallGraph("/a.cpp:lonely", 1, 30)
+	if dr == nil {
+		t.Fatal("expected non-nil result for existing symbol")
+	}
+	if len(dr.Edges) != 0 {
+		t.Errorf("expected 0 edges for isolated node, got %d", len(dr.Edges))
+	}
+	// Mermaid render should be empty for no edges.
+	mermaid := dr.RenderMermaid("TD", false)
+	if mermaid != "" {
+		t.Errorf("expected empty mermaid for no edges, got %q", mermaid)
 	}
 }
 

@@ -348,7 +348,7 @@ func TestGetCoupling(t *testing.T) {
 	}
 }
 
-func TestGenerateMermaidSymbol(t *testing.T) {
+func TestDiagramEdgesFormat(t *testing.T) {
 	tools := setupTools(t)
 	dir := testdataDir(t)
 	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
@@ -356,22 +356,77 @@ func TestGenerateMermaidSymbol(t *testing.T) {
 	mainCpp := filepath.Join(dir, "main.cpp")
 	symbolID := mainCpp + ":main"
 
+	// Default format=edges: returns JSON array.
 	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": symbolID, "depth": 1.0})
 	if result.IsError {
-		t.Fatalf("generate_mermaid failed: %s", textContent(result))
+		t.Fatalf("diagram failed: %s", textContent(result))
 	}
 
-	diagram := textContent(result)
-	t.Log(diagram)
-	if !strings.Contains(diagram, "graph TD") {
-		t.Error("expected Mermaid graph header")
+	var edges []graph.DiagramEdge
+	if err := json.Unmarshal([]byte(textContent(result)), &edges); err != nil {
+		t.Fatalf("expected JSON edges array, got: %s", textContent(result))
 	}
-	if !strings.Contains(diagram, "main") {
-		t.Error("expected main in diagram")
+	t.Logf("edges format: %d edges", len(edges))
+	if len(edges) < 3 {
+		t.Errorf("expected at least 3 edges from main, got %d", len(edges))
+	}
+	for _, e := range edges {
+		if e.Label != "calls" {
+			t.Errorf("expected label 'calls', got %q", e.Label)
+		}
 	}
 }
 
-func TestGenerateMermaidFile(t *testing.T) {
+func TestDiagramMermaidUnstyled(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	mainCpp := filepath.Join(dir, "main.cpp")
+	symbolID := mainCpp + ":main"
+
+	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{
+		"symbol": symbolID, "depth": 1.0, "format": "mermaid",
+	})
+	if result.IsError {
+		t.Fatalf("diagram failed: %s", textContent(result))
+	}
+
+	mermaid := textContent(result)
+	t.Log(mermaid)
+	if !strings.Contains(mermaid, "graph TD") {
+		t.Error("expected 'graph TD'")
+	}
+	if strings.Contains(mermaid, "classDef") {
+		t.Error("unstyled should not contain classDef")
+	}
+	if strings.Contains(mermaid, ":::") {
+		t.Error("unstyled should not contain ::: annotations")
+	}
+}
+
+func TestDiagramMermaidStyled(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	mainCpp := filepath.Join(dir, "main.cpp")
+	symbolID := mainCpp + ":main"
+
+	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{
+		"symbol": symbolID, "depth": 1.0, "format": "mermaid", "styled": true,
+	})
+	if result.IsError {
+		t.Fatalf("diagram failed: %s", textContent(result))
+	}
+
+	mermaid := textContent(result)
+	if !strings.Contains(mermaid, "classDef center") {
+		t.Error("styled should contain classDef")
+	}
+}
+
+func TestDiagramFileEdges(t *testing.T) {
 	tools := setupTools(t)
 	dir := testdataDir(t)
 	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
@@ -379,17 +434,20 @@ func TestGenerateMermaidFile(t *testing.T) {
 	engineCpp := filepath.Join(dir, "engine.cpp")
 	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"file": engineCpp, "depth": 1.0})
 	if result.IsError {
-		t.Fatalf("generate_mermaid file failed: %s", textContent(result))
+		t.Fatalf("diagram failed: %s", textContent(result))
 	}
 
-	diagram := textContent(result)
-	t.Log(diagram)
-	if !strings.Contains(diagram, "includes") {
-		t.Error("expected 'includes' edge labels in file diagram")
+	var edges []graph.DiagramEdge
+	json.Unmarshal([]byte(textContent(result)), &edges)
+	t.Logf("file edges: %d", len(edges))
+	for _, e := range edges {
+		if e.Label != "includes" {
+			t.Errorf("expected label 'includes', got %q", e.Label)
+		}
 	}
 }
 
-func TestGenerateMermaidUnknown(t *testing.T) {
+func TestDiagramUnknown(t *testing.T) {
 	tools := setupTools(t)
 	dir := testdataDir(t)
 	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
@@ -397,6 +455,30 @@ func TestGenerateMermaidUnknown(t *testing.T) {
 	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": "/fake:unknown"})
 	if !result.IsError {
 		t.Fatal("expected error for unknown symbol")
+	}
+}
+
+func TestDiagramEmptyResult(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	// Search for a function with no call edges.
+	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "neverCalled"})
+	var symbols []symbolResult
+	json.Unmarshal([]byte(textContent(result)), &symbols)
+	if len(symbols) == 0 {
+		t.Skip("neverCalled not found")
+	}
+
+	// edges format: should return empty array, not null.
+	result = callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": symbols[0].ID})
+	if result.IsError {
+		t.Fatalf("diagram failed: %s", textContent(result))
+	}
+	text := textContent(result)
+	if text != "[]" {
+		t.Errorf("expected '[]' for isolated node, got %q", text)
 	}
 }
 

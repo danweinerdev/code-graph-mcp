@@ -149,16 +149,18 @@ func TestGameMermaid(t *testing.T) {
 		t.Fatal("could not find any update method")
 	}
 
+	// Default edges format.
 	result = callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": playerUpdateID, "depth": 2.0})
 	if result.IsError {
-		t.Fatalf("mermaid failed: %s", textContent(result))
+		t.Fatalf("diagram failed: %s", textContent(result))
 	}
 
-	diagram := textContent(result)
-	if !strings.Contains(diagram, "graph TD") {
-		t.Error("expected Mermaid graph")
+	var edges []graph.DiagramEdge
+	json.Unmarshal([]byte(textContent(result)), &edges)
+	t.Logf("Player::update edges: %d", len(edges))
+	if len(edges) == 0 {
+		t.Error("expected edges for Player::update")
 	}
-	t.Logf("Mermaid diagram:\n%s", diagram)
 }
 
 // --- Data Structures Project Tests ---
