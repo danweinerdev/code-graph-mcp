@@ -142,7 +142,12 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	totalFiles := len(filePaths)
-	progress.send(0, totalFiles, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
+	// Single monotonic progress counter across all phases.
+	// Total steps: parse(N) + resolve(N) + merge(N) + save(1) = 3N+1
+	totalSteps := totalFiles*3 + 1
+	step := 0
+
+	progress.send(step, totalSteps, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
 
 	// Phase 1: Parse files concurrently.
 	numWorkers := runtime.NumCPU()
@@ -181,7 +186,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 				results <- fg
 				n := int(parsed.Add(1))
 				if n%10 == 0 || n == totalFiles {
-					progress.send(n, totalFiles, fmt.Sprintf("Parsed %d/%d files", n, totalFiles))
+					progress.send(n, totalSteps, fmt.Sprintf("Parsing: %d/%d files", n, totalFiles))
 				}
 			}
 		}()
@@ -207,8 +212,9 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	for w := range errs {
 		warnings = append(warnings, w)
 	}
+	step = totalFiles
 
-	// Count total symbols and edges for progress reporting.
+	// Count totals for progress messages.
 	totalSymbols := 0
 	totalEdges := 0
 	for _, fg := range fileGraphs {
@@ -216,35 +222,35 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 		totalEdges += len(fg.Edges)
 	}
 
-	// Build indices for resolution.
-	progress.send(totalFiles, totalFiles, fmt.Sprintf("Building symbol index (%d symbols)...", totalSymbols))
+	// Phase 2: Build indices and resolve edges.
+	progress.send(step, totalSteps, fmt.Sprintf("Building symbol index (%d symbols, %d edges)...", totalSymbols, totalEdges))
 	fileIndex := buildFileIndex(filePaths)
 	symbolIndex := buildSymbolIndex(fileGraphs)
 
-	// Resolve edges in each FileGraph.
-	progress.send(totalFiles, totalFiles, fmt.Sprintf("Resolving %d edges...", totalEdges))
 	for i, fg := range fileGraphs {
 		resolveEdges(fg, fileIndex, symbolIndex)
+		step = totalFiles + i + 1
 		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
-			progress.send(i+1, len(fileGraphs), fmt.Sprintf("Resolved edges in %d/%d files", i+1, len(fileGraphs)))
+			progress.send(step, totalSteps, fmt.Sprintf("Resolving: %d/%d files", i+1, len(fileGraphs)))
 		}
 	}
 
-	// Phase 2: Merge into graph sequentially.
-	progress.send(0, len(fileGraphs), "Merging into graph...")
+	// Phase 3: Merge into graph sequentially.
 	t.graph.Clear()
 	for i, fg := range fileGraphs {
 		t.graph.MergeFileGraph(fg)
+		step = totalFiles*2 + i + 1
 		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
-			progress.send(i+1, len(fileGraphs), fmt.Sprintf("Merged %d/%d files into graph", i+1, len(fileGraphs)))
+			progress.send(step, totalSteps, fmt.Sprintf("Merging: %d/%d files", i+1, len(fileGraphs)))
 		}
 	}
 
 	t.rootPath = absPath
 	t.indexed.Store(true)
 
-	// Save cache for next time.
-	progress.send(len(fileGraphs), len(fileGraphs), fmt.Sprintf("Saving cache (%d symbols, %d edges)...", totalSymbols, totalEdges))
+	// Phase 4: Save cache.
+	step = totalFiles*3
+	progress.send(step, totalSteps, fmt.Sprintf("Saving cache (%d symbols, %d edges)...", totalSymbols, totalEdges))
 	if err := t.graph.Save(absPath); err != nil {
 		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
 	}
