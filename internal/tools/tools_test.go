@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -344,6 +345,58 @@ func TestGetCoupling(t *testing.T) {
 	t.Logf("engine.cpp coupling: %v", coupling)
 	if len(coupling) == 0 {
 		t.Error("expected non-empty coupling for engine.cpp")
+	}
+}
+
+func TestGenerateMermaidSymbol(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	mainCpp := filepath.Join(dir, "main.cpp")
+	symbolID := mainCpp + ":main"
+
+	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": symbolID, "depth": 1.0})
+	if result.IsError {
+		t.Fatalf("generate_mermaid failed: %s", textContent(result))
+	}
+
+	diagram := textContent(result)
+	t.Log(diagram)
+	if !strings.Contains(diagram, "graph TD") {
+		t.Error("expected Mermaid graph header")
+	}
+	if !strings.Contains(diagram, "main") {
+		t.Error("expected main in diagram")
+	}
+}
+
+func TestGenerateMermaidFile(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	engineCpp := filepath.Join(dir, "engine.cpp")
+	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"file": engineCpp, "depth": 1.0})
+	if result.IsError {
+		t.Fatalf("generate_mermaid file failed: %s", textContent(result))
+	}
+
+	diagram := textContent(result)
+	t.Log(diagram)
+	if !strings.Contains(diagram, "includes") {
+		t.Error("expected 'includes' edge labels in file diagram")
+	}
+}
+
+func TestGenerateMermaidUnknown(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	result := callTool(t, tools, tools.handleGenerateMermaid, map[string]any{"symbol": "/fake:unknown"})
+	if !result.IsError {
+		t.Fatal("expected error for unknown symbol")
 	}
 }
 

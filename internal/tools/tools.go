@@ -97,6 +97,15 @@ func (t *Tools) Register(s *server.MCPServer) {
 		mcp.WithDescription("Get cross-file dependency counts for a file"),
 		mcp.WithString("file", mcp.Required(), mcp.Description("Absolute path to the source file")),
 	), t.handleGetCoupling)
+
+	// Visualization
+	s.AddTool(mcp.NewTool("generate_mermaid",
+		mcp.WithDescription("Generate a Mermaid flowchart diagram centered on a symbol (call graph) or file (dependency graph)"),
+		mcp.WithString("symbol", mcp.Description("Symbol ID to center the call graph on (format: file:name)")),
+		mcp.WithString("file", mcp.Description("File path to center the dependency graph on")),
+		mcp.WithNumber("depth", mcp.Description("BFS traversal depth (default 1)")),
+		mcp.WithNumber("max_nodes", mcp.Description("Maximum nodes in diagram (default 30)")),
+	), t.handleGenerateMermaid)
 }
 
 // suggestSymbols returns up to limit symbol name suggestions for did-you-mean errors.

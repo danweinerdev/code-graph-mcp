@@ -2,6 +2,7 @@ package graph
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -565,6 +566,95 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// --- Mermaid ---
+
+func TestMermaidCallGraph(t *testing.T) {
+	g := New()
+	// A calls B, B calls C
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		sym("A", parser.KindFunction, "/a.cpp"),
+		sym("B", parser.KindFunction, "/a.cpp"),
+		sym("C", parser.KindFunction, "/a.cpp"),
+	}, []parser.Edge{
+		callEdge("/a.cpp:A", "/a.cpp:B", "/a.cpp"),
+		callEdge("/a.cpp:B", "/a.cpp:C", "/a.cpp"),
+	}))
+
+	diagram := g.MermaidGraph("/a.cpp:B", 1, 30)
+	if diagram == "" {
+		t.Fatal("expected non-empty diagram")
+	}
+	t.Log(diagram)
+
+	if !strings.Contains(diagram, "graph TD") {
+		t.Error("expected 'graph TD' header")
+	}
+	if !strings.Contains(diagram, "-->") {
+		t.Error("expected edges in diagram")
+	}
+	// Should contain all 3 nodes since B is connected to both A and C at depth 1.
+	if !strings.Contains(diagram, "\"B\"") {
+		t.Error("expected center node B in diagram")
+	}
+}
+
+func TestMermaidFileGraph(t *testing.T) {
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/a.cpp", nil, []parser.Edge{
+		includeEdge("/a.cpp", "/b.h", "/a.cpp"),
+		includeEdge("/a.cpp", "/c.h", "/a.cpp"),
+	}))
+
+	// Need /b.h and /c.h in the files map for them to be recognized.
+	g.MergeFileGraph(makeFileGraph("/b.h", nil, nil))
+	g.MergeFileGraph(makeFileGraph("/c.h", nil, nil))
+
+	diagram := g.MermaidGraph("/a.cpp", 1, 30)
+	if diagram == "" {
+		t.Fatal("expected non-empty diagram")
+	}
+	t.Log(diagram)
+
+	if !strings.Contains(diagram, "includes") {
+		t.Error("expected 'includes' edge labels in file diagram")
+	}
+}
+
+func TestMermaidMaxNodes(t *testing.T) {
+	g := New()
+	// Create a chain of 10 functions.
+	var syms []parser.Symbol
+	var edges []parser.Edge
+	for i := 0; i < 10; i++ {
+		name := string(rune('A' + i))
+		syms = append(syms, sym(name, parser.KindFunction, "/a.cpp"))
+		if i > 0 {
+			prev := string(rune('A' + i - 1))
+			edges = append(edges, callEdge("/a.cpp:"+prev, "/a.cpp:"+name, "/a.cpp"))
+		}
+	}
+	g.MergeFileGraph(makeFileGraph("/a.cpp", syms, edges))
+
+	diagram := g.MermaidGraph("/a.cpp:A", 10, 5)
+	if diagram == "" {
+		t.Fatal("expected diagram")
+	}
+
+	// Count nodes — should be capped at ~5.
+	nodeCount := strings.Count(diagram, "[\"")
+	if nodeCount > 6 { // allow slight overshoot due to BFS batch
+		t.Errorf("expected ~5 nodes max, got %d", nodeCount)
+	}
+}
+
+func TestMermaidUnknown(t *testing.T) {
+	g := New()
+	diagram := g.MermaidGraph("/unknown:func", 1, 30)
+	if diagram != "" {
+		t.Error("expected empty diagram for unknown ID")
+	}
 }
 
 // --- Stats ---

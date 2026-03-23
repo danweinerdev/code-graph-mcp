@@ -81,3 +81,44 @@ func (t *Tools) handleGetCoupling(ctx context.Context, req mcp.CallToolRequest) 
 	jsonBytes, _ := json.Marshal(coupling)
 	return mcp.NewToolResultText(string(jsonBytes)), nil
 }
+
+func (t *Tools) handleGenerateMermaid(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if err := t.requireIndexed(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	symbolID, _ := req.GetArguments()["symbol"].(string)
+	file, _ := req.GetArguments()["file"].(string)
+
+	if symbolID == "" && file == "" {
+		return mcp.NewToolResultError("either 'symbol' or 'file' is required"), nil
+	}
+
+	startID := symbolID
+	if startID == "" {
+		startID = file
+	}
+
+	depth := 1
+	if d, ok := req.GetArguments()["depth"].(float64); ok && d > 0 {
+		depth = int(d)
+	}
+
+	maxNodes := 30
+	if m, ok := req.GetArguments()["max_nodes"].(float64); ok && m > 0 {
+		maxNodes = int(m)
+	}
+
+	diagram := t.graph.MermaidGraph(startID, depth, maxNodes)
+	if diagram == "" {
+		msg := fmt.Sprintf("no graph found for %q", startID)
+		if symbolID != "" {
+			if suggestions := t.suggestSymbols(symbolID, 5); suggestions != "" {
+				msg += fmt.Sprintf(". Did you mean: %s?", suggestions)
+			}
+		}
+		return mcp.NewToolResultError(msg), nil
+	}
+
+	return mcp.NewToolResultText(diagram), nil
+}
