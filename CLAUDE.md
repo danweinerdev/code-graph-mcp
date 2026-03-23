@@ -53,6 +53,7 @@ AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
 **Call graph:** `get_callers`, `get_callees`
 **Dependencies:** `get_dependencies`
 **Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling`
+**Visualization:** `generate_mermaid`
 
 ## Code Conventions
 

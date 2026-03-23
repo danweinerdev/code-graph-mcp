@@ -82,6 +82,12 @@ Add to your project's `.claude/settings.json`:
 | `get_class_hierarchy` | Get inheritance tree | `class`: class name |
 | `get_coupling` | Cross-file dependency counts | `file`: absolute file path |
 
+### Visualization
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `generate_mermaid` | Generate a Mermaid flowchart | `symbol` or `file`: center node; `depth` (optional); `max_nodes` (optional, default 30) |
+
 ## Workflow
 
 1. Call `analyze_codebase` with the project root to index the codebase
