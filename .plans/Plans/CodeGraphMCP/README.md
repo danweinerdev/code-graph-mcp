@@ -13,7 +13,7 @@ phases:
     doc: "01-Scaffold-And-Core-Types.md"
   - id: 2
     title: "C++ Parser"
-    status: planned
+    status: complete
     doc: "02-Cpp-Parser.md"
     depends_on: [1]
   - id: 3
