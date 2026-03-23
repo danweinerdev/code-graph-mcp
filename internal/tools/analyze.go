@@ -19,19 +19,40 @@ import (
 	"github.com/danweinerdev/code-graph-mcp/internal/parser"
 )
 
-// sendProgress sends a progress notification to the MCP client if a server
-// is available in the context. Failures are silently ignored.
-func sendProgress(ctx context.Context, progress, total int, message string) {
+// progressReporter sends MCP progress notifications tied to a progressToken.
+type progressReporter struct {
+	srv   *server.MCPServer
+	ctx   context.Context
+	token any
+}
+
+// newProgressReporter creates a reporter from the request's _meta.progressToken.
+// Returns nil if no token was provided or no server is available.
+func newProgressReporter(ctx context.Context, req mcp.CallToolRequest) *progressReporter {
+	var token any
+	if req.Params.Meta != nil {
+		token = req.Params.Meta.ProgressToken
+	}
+	if token == nil {
+		return nil
+	}
 	srv := server.ServerFromContext(ctx)
 	if srv == nil {
+		return nil
+	}
+	return &progressReporter{srv: srv, ctx: ctx, token: token}
+}
+
+func (p *progressReporter) send(progress, total int, message string) {
+	if p == nil {
 		return
 	}
-	err := srv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
-		"progress": progress,
-		"total":    total,
-		"message":  message,
-	})
-	if err != nil {
+	if err := p.srv.SendNotificationToClient(p.ctx, "notifications/progress", map[string]any{
+		"progressToken": p.token,
+		"progress":      float64(progress),
+		"total":         float64(total),
+		"message":       message,
+	}); err != nil {
 		log.Printf("progress notification failed: %v", err)
 	}
 }
@@ -92,8 +113,10 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 		}
 	}
 
+	progress := newProgressReporter(ctx, req)
+
 	// Collect files to parse.
-	sendProgress(ctx, 0, 0, "Discovering source files...")
+	progress.send(0, 0, "Discovering source files...")
 	var filePaths []string
 	var warnings []string
 	err = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
@@ -119,7 +142,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	totalFiles := len(filePaths)
-	sendProgress(ctx, 0, totalFiles, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
+	progress.send(0, totalFiles, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
 
 	// Phase 1: Parse files concurrently.
 	numWorkers := runtime.NumCPU()
@@ -158,7 +181,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 				results <- fg
 				n := int(parsed.Add(1))
 				if n%10 == 0 || n == totalFiles {
-					sendProgress(ctx, n, totalFiles, fmt.Sprintf("Parsed %d/%d files", n, totalFiles))
+					progress.send(n, totalFiles, fmt.Sprintf("Parsed %d/%d files", n, totalFiles))
 				}
 			}
 		}()
@@ -186,7 +209,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Build indices for resolution.
-	sendProgress(ctx, totalFiles, totalFiles, "Resolving symbol references...")
+	progress.send(totalFiles, totalFiles, "Resolving symbol references...")
 	fileIndex := buildFileIndex(filePaths)
 	symbolIndex := buildSymbolIndex(fileGraphs)
 
@@ -196,7 +219,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Phase 2: Merge into graph sequentially.
-	sendProgress(ctx, totalFiles, totalFiles, "Building graph...")
+	progress.send(totalFiles, totalFiles, "Building graph...")
 	t.graph.Clear()
 	for _, fg := range fileGraphs {
 		t.graph.MergeFileGraph(fg)
@@ -206,7 +229,7 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	t.indexed.Store(true)
 
 	// Save cache for next time.
-	sendProgress(ctx, totalFiles, totalFiles, "Saving cache...")
+	progress.send(totalFiles, totalFiles, "Saving cache...")
 	if err := t.graph.Save(absPath); err != nil {
 		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
 	}
