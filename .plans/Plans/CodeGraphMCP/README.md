@@ -23,7 +23,7 @@ phases:
     depends_on: [2]
   - id: 4
     title: "Graph Engine"
-    status: planned
+    status: complete
     doc: "04-Graph-Engine.md"
     depends_on: [1]
   - id: 5
