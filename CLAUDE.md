@@ -69,18 +69,27 @@ AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
 
 Validated against tree-sitter-cpp v0.23.4.
 
+### Supported C++ Patterns
+
+- Free functions, qualified methods (`Class::method`), inline methods in class bodies
+- Classes, structs, enums (including `enum class`), typedefs, `using` aliases
+- Function pointer typedefs (`typedef void (*Callback)(int)`)
+- Operator overloads (`operator+`, `operator==`, etc.) — both in-class and free
+- Auto return types (trailing `-> T` and deduced)
+- Nested classes/structs (Parent field set correctly)
+- Lambda call edges (calls inside and to lambdas)
+- All call patterns: free, method, arrow, qualified, template
+
 ### Known Limitations
 
-1. **Function pointer typedefs** — `typedef void (*Callback)()` uses a `pointer_declarator` which is not matched by the typedef query pattern. Only simple `type_identifier` typedefs are extracted.
+1. **Macro-generated definitions** — Macros like `DEFINE_HANDLER(name)` that expand to function definitions are not visible to tree-sitter (it sees the macro call, not the expansion). Macro invocations that look like function calls ARE captured as call edges.
 
-2. **Macro-generated definitions** — Macros like `DEFINE_HANDLER(name)` that expand to function definitions are not visible to tree-sitter (it sees the macro call, not the expansion). Macro invocations that look like function calls ARE captured as call edges.
+2. **Complex template metaprogramming** — Deeply nested template specializations may produce incomplete or error-containing AST nodes. The parser skips error nodes gracefully.
 
-3. **Complex template metaprogramming** — Deeply nested template specializations may produce incomplete or error-containing AST nodes. The parser skips error nodes gracefully.
+3. **Call resolution is heuristic** — Call edges are resolved via scope-aware heuristic matching (same file > same class > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
 
-4. **Call resolution is heuristic** — Call edges are resolved via scope-aware heuristic matching (same file > same class > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
+4. **C++ cast expressions** — `static_cast`, `dynamic_cast`, `const_cast`, `reinterpret_cast` are filtered out (tree-sitter parses them as call expressions).
 
-5. **C++ cast expressions** — `static_cast`, `dynamic_cast`, `const_cast`, `reinterpret_cast` are filtered out (tree-sitter parses them as call expressions).
+5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
 
-6. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
-
-7. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
+6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.

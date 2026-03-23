@@ -4,18 +4,28 @@ package cpp
 // Validated against tree-sitter-cpp v0.23.4.
 
 // definitionQueries extracts symbol definitions: functions, methods, classes,
-// structs, enums, typedefs, and namespace definitions.
+// structs, enums, typedefs, operator overloads, and inline methods.
 const definitionQueries = `
 ; Free functions — function_declarator holds the name
 (function_definition
   declarator: (function_declarator
     declarator: (identifier) @func.name)) @func.def
 
+; Inline methods inside class body — use field_identifier
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @inline.name)) @inline.def
+
 ; Methods (qualified: Class::method or ns::func)
 ; Capture full qualified_identifier text; split scope::name in Go.
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier) @method.qname)) @method.def
+
+; Operator overloads — operator+ etc.
+(function_definition
+  declarator: (function_declarator
+    declarator: (operator_name) @operator.name)) @operator.def
 
 ; Classes with body
 (class_specifier
@@ -27,13 +37,25 @@ const definitionQueries = `
   name: (type_identifier) @struct.name
   body: (_)) @struct.def
 
-; Enums
+; Enums (covers both plain enum and enum class)
 (enum_specifier
   name: (type_identifier) @enum.name) @enum.def
 
-; Typedefs
+; Simple typedefs: typedef int MyInt;
 (type_definition
   declarator: (type_identifier) @typedef.name) @typedef.def
+
+; Function pointer typedefs: typedef void (*Callback)(int);
+; The type_identifier is nested inside pointer_declarator > parenthesized_declarator
+(type_definition
+  declarator: (function_declarator
+    declarator: (parenthesized_declarator
+      (pointer_declarator
+        declarator: (type_identifier) @typedef.name)))) @typedef.def
+
+; Type alias: using Callback = void(*)(int);
+(alias_declaration
+  name: (type_identifier) @typedef.name) @typedef.def
 `
 
 // callQueries extracts function and method call sites.

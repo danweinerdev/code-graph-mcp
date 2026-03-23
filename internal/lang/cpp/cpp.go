@@ -155,6 +155,8 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					continue
 				}
 				ns := resolveNamespace(nodePtr, content)
+				// For nested classes, find the outer class.
+				parentClass := resolveParentClass(defNode, content)
 				fg.Symbols = append(fg.Symbols, parser.Symbol{
 					Name:      text,
 					Kind:      parser.KindClass,
@@ -164,6 +166,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					EndLine:   int(defNode.EndPosition().Row) + 1,
 					Signature: truncate(defNode.Utf8Text(content), 200),
 					Namespace: ns,
+					Parent:    parentClass,
 				})
 
 			case "struct.name":
@@ -172,6 +175,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					continue
 				}
 				ns := resolveNamespace(nodePtr, content)
+				parentClass := resolveParentClass(defNode, content)
 				fg.Symbols = append(fg.Symbols, parser.Symbol{
 					Name:      text,
 					Kind:      parser.KindStruct,
@@ -181,6 +185,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					EndLine:   int(defNode.EndPosition().Row) + 1,
 					Signature: truncate(defNode.Utf8Text(content), 200),
 					Namespace: ns,
+					Parent:    parentClass,
 				})
 
 			case "enum.name":
@@ -200,8 +205,52 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Namespace: ns,
 				})
 
+			case "inline.name":
+				// Inline method defined inside a class body (uses field_identifier).
+				defNode := findEnclosingKind(nodePtr, "function_definition")
+				if defNode == nil {
+					continue
+				}
+				ns := resolveNamespace(nodePtr, content)
+				parentClass := resolveParentClass(nodePtr, content)
+				fg.Symbols = append(fg.Symbols, parser.Symbol{
+					Name:      text,
+					Kind:      parser.KindMethod,
+					File:      path,
+					Line:      int(defNode.StartPosition().Row) + 1,
+					Column:    int(defNode.StartPosition().Column),
+					EndLine:   int(defNode.EndPosition().Row) + 1,
+					Signature: truncate(defNode.Utf8Text(content), 200),
+					Namespace: ns,
+					Parent:    parentClass,
+				})
+
+			case "operator.name":
+				defNode := findEnclosingKind(nodePtr, "function_definition")
+				if defNode == nil {
+					continue
+				}
+				ns := resolveNamespace(nodePtr, content)
+				parentClass := resolveParentClass(nodePtr, content)
+				fg.Symbols = append(fg.Symbols, parser.Symbol{
+					Name:      text,
+					Kind:      parser.KindFunction,
+					File:      path,
+					Line:      int(defNode.StartPosition().Row) + 1,
+					Column:    int(defNode.StartPosition().Column),
+					EndLine:   int(defNode.EndPosition().Row) + 1,
+					Signature: truncate(defNode.Utf8Text(content), 200),
+					Namespace: ns,
+					Parent:    parentClass,
+				})
+
 			case "typedef.name":
+				// Handles simple typedefs, function pointer typedefs, and using aliases.
 				defNode := findEnclosingKind(nodePtr, "type_definition")
+				if defNode == nil {
+					// Try alias_declaration for `using X = ...`
+					defNode = findEnclosingKind(nodePtr, "alias_declaration")
+				}
 				if defNode == nil {
 					continue
 				}
@@ -398,6 +447,21 @@ func resolveNamespace(node *tree_sitter.Node, content []byte) string {
 		parts[i], parts[j] = parts[j], parts[i]
 	}
 	return strings.Join(parts, "::")
+}
+
+// resolveParentClass walks up the AST to find an enclosing class_specifier or
+// struct_specifier and returns its name. Used for inline methods and operators
+// defined inside class bodies.
+func resolveParentClass(node *tree_sitter.Node, content []byte) string {
+	for n := node.Parent(); n != nil; n = n.Parent() {
+		if n.Kind() == "class_specifier" || n.Kind() == "struct_specifier" {
+			nameNode := n.ChildByFieldName("name")
+			if nameNode != nil {
+				return nameNode.Utf8Text(content)
+			}
+		}
+	}
+	return ""
 }
 
 // enclosingFunctionID finds the enclosing function_definition and returns a

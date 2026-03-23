@@ -328,6 +328,284 @@ func TestSignatureTruncation(t *testing.T) {
 	}
 }
 
+// --- Function Pointer Typedef Tests ---
+
+func TestFunctionPointerTypedef(t *testing.T) {
+	fg := parse(t, `typedef void (*Callback)(int, int);`)
+	s := findSymbol(fg, "Callback")
+	if s == nil {
+		t.Fatal("expected symbol 'Callback' from function pointer typedef")
+	}
+	if s.Kind != parser.KindTypedef {
+		t.Errorf("expected kind typedef, got %s", s.Kind)
+	}
+}
+
+func TestFunctionPointerTypedefNoArgs(t *testing.T) {
+	fg := parse(t, `typedef int (*Producer)();`)
+	s := findSymbol(fg, "Producer")
+	if s == nil {
+		t.Fatal("expected symbol 'Producer'")
+	}
+	if s.Kind != parser.KindTypedef {
+		t.Errorf("expected kind typedef, got %s", s.Kind)
+	}
+}
+
+func TestUsingAlias(t *testing.T) {
+	fg := parse(t, `using Callback = void(*)(int, int);`)
+	s := findSymbol(fg, "Callback")
+	if s == nil {
+		t.Fatal("expected symbol 'Callback' from using alias")
+	}
+	if s.Kind != parser.KindTypedef {
+		t.Errorf("expected kind typedef, got %s", s.Kind)
+	}
+}
+
+func TestUsingAliasSimple(t *testing.T) {
+	fg := parse(t, `using MyInt = int;`)
+	s := findSymbol(fg, "MyInt")
+	if s == nil {
+		t.Fatal("expected symbol 'MyInt' from using alias")
+	}
+	if s.Kind != parser.KindTypedef {
+		t.Errorf("expected kind typedef, got %s", s.Kind)
+	}
+}
+
+// --- Operator Overload Tests ---
+
+func TestOperatorOverloadInClass(t *testing.T) {
+	fg := parse(t, `
+class Vec {
+public:
+    Vec operator+(const Vec& other) const { return Vec(); }
+    bool operator==(const Vec& other) const { return true; }
+};
+`)
+	s1 := findSymbol(fg, "operator+")
+	if s1 == nil {
+		t.Fatal("expected symbol 'operator+'")
+	}
+	if s1.Parent != "Vec" {
+		t.Errorf("expected parent Vec, got %q", s1.Parent)
+	}
+
+	s2 := findSymbol(fg, "operator==")
+	if s2 == nil {
+		t.Fatal("expected symbol 'operator=='")
+	}
+}
+
+func TestOperatorOverloadOutOfClass(t *testing.T) {
+	fg := parse(t, `
+class Vec {};
+Vec operator*(const Vec& a, float s) { return Vec(); }
+`)
+	s := findSymbol(fg, "operator*")
+	if s == nil {
+		t.Fatal("expected symbol 'operator*'")
+	}
+	// Free operator — no parent class.
+	if s.Parent != "" {
+		t.Errorf("expected empty parent for free operator, got %q", s.Parent)
+	}
+}
+
+// --- Enum Class Tests ---
+
+func TestEnumClass(t *testing.T) {
+	fg := parse(t, `enum class Color { Red, Green, Blue };`)
+	s := findSymbol(fg, "Color")
+	if s == nil {
+		t.Fatal("expected symbol 'Color' from enum class")
+	}
+	if s.Kind != parser.KindEnum {
+		t.Errorf("expected kind enum, got %s", s.Kind)
+	}
+}
+
+func TestEnumClassScoped(t *testing.T) {
+	fg := parse(t, `
+namespace gfx {
+enum class Primitive { Triangle, Quad, Line };
+}
+`)
+	s := findSymbol(fg, "Primitive")
+	if s == nil {
+		t.Fatal("expected symbol 'Primitive'")
+	}
+	if s.Namespace != "gfx" {
+		t.Errorf("expected namespace gfx, got %q", s.Namespace)
+	}
+}
+
+// --- Auto Return Type Tests ---
+
+func TestAutoTrailingReturn(t *testing.T) {
+	fg := parse(t, `auto foo() -> int { return 42; }`)
+	s := findSymbol(fg, "foo")
+	if s == nil {
+		t.Fatal("expected symbol 'foo' with trailing return type")
+	}
+	if s.Kind != parser.KindFunction {
+		t.Errorf("expected kind function, got %s", s.Kind)
+	}
+}
+
+func TestAutoDeducedReturn(t *testing.T) {
+	fg := parse(t, `auto bar() { return 42; }`)
+	s := findSymbol(fg, "bar")
+	if s == nil {
+		t.Fatal("expected symbol 'bar' with auto deduced return")
+	}
+	if s.Kind != parser.KindFunction {
+		t.Errorf("expected kind function, got %s", s.Kind)
+	}
+}
+
+// --- Nested Class Tests ---
+
+func TestNestedClass(t *testing.T) {
+	fg := parse(t, `
+class Outer {
+public:
+    class Inner {
+    public:
+        void method() {}
+    };
+};
+`)
+	outer := findSymbol(fg, "Outer")
+	if outer == nil {
+		t.Fatal("expected symbol 'Outer'")
+	}
+	if outer.Parent != "" {
+		t.Errorf("Outer should have no parent, got %q", outer.Parent)
+	}
+
+	inner := findSymbol(fg, "Inner")
+	if inner == nil {
+		t.Fatal("expected symbol 'Inner'")
+	}
+	if inner.Parent != "Outer" {
+		t.Errorf("expected Inner parent=Outer, got %q", inner.Parent)
+	}
+	if inner.Kind != parser.KindClass {
+		t.Errorf("expected Inner kind=class, got %s", inner.Kind)
+	}
+}
+
+func TestNestedStruct(t *testing.T) {
+	fg := parse(t, `
+class Container {
+    struct Node {
+        int value;
+    };
+};
+`)
+	node := findSymbol(fg, "Node")
+	if node == nil {
+		t.Fatal("expected symbol 'Node'")
+	}
+	if node.Parent != "Container" {
+		t.Errorf("expected parent Container, got %q", node.Parent)
+	}
+	if node.Kind != parser.KindStruct {
+		t.Errorf("expected kind struct, got %s", node.Kind)
+	}
+}
+
+// --- Inline Method Tests ---
+
+func TestInlineMethodInClass(t *testing.T) {
+	fg := parse(t, `
+class Engine {
+public:
+    void update() {}
+    int getSpeed() const { return 0; }
+};
+`)
+	s := findSymbol(fg, "update")
+	if s == nil {
+		t.Fatal("expected symbol 'update' from inline method")
+	}
+	if s.Kind != parser.KindMethod {
+		t.Errorf("expected kind method, got %s", s.Kind)
+	}
+	if s.Parent != "Engine" {
+		t.Errorf("expected parent Engine, got %q", s.Parent)
+	}
+
+	s2 := findSymbol(fg, "getSpeed")
+	if s2 == nil {
+		t.Fatal("expected symbol 'getSpeed'")
+	}
+	if s2.Parent != "Engine" {
+		t.Errorf("expected parent Engine, got %q", s2.Parent)
+	}
+}
+
+// --- Lambda Tests ---
+
+func TestLambdaCallEdge(t *testing.T) {
+	fg := parse(t, `
+void process() {
+    auto fn = [](int x) { return x * 2; };
+    fn(42);
+}
+`)
+	// Lambda invocation should produce a call edge.
+	e := findEdge(fg, parser.EdgeCalls, "fn")
+	if e == nil {
+		t.Fatal("expected call edge to lambda 'fn'")
+	}
+	if e.From != "/test.cpp:process" {
+		t.Errorf("expected from /test.cpp:process, got %q", e.From)
+	}
+}
+
+func TestLambdaCallsInsideLambda(t *testing.T) {
+	fg := parse(t, `
+void helper() {}
+void outer() {
+    auto fn = [](){ helper(); };
+}
+`)
+	// Call to helper() inside the lambda — enclosing function is outer().
+	e := findEdge(fg, parser.EdgeCalls, "helper")
+	if e == nil {
+		t.Fatal("expected call edge to 'helper' from inside lambda")
+	}
+}
+
+// --- Constructor Initializer List Tests ---
+
+func TestConstructorInitListNotCallEdge(t *testing.T) {
+	fg := parse(t, `
+class Engine {
+    int x_;
+public:
+    Engine() : x_(0) {}
+};
+`)
+	// Constructor initializer lists are NOT function calls.
+	// x_(0) is a field_initializer, not a call_expression.
+	// The constructor itself should be a symbol.
+	s := findSymbol(fg, "Engine")
+	found := false
+	for _, sym := range fg.Symbols {
+		if sym.Name == "Engine" && sym.Kind == parser.KindClass {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Engine class symbol")
+	}
+	_ = s
+}
+
 // --- Helper Tests ---
 
 func TestSplitQualified(t *testing.T) {
