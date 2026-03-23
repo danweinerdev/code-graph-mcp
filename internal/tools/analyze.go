@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -21,9 +22,12 @@ import (
 
 // progressReporter sends MCP progress notifications tied to a progressToken.
 type progressReporter struct {
-	srv   *server.MCPServer
-	ctx   context.Context
-	token any
+	srv       *server.MCPServer
+	ctx       context.Context
+	token     any
+	sendCount int
+	errCount  int
+	lastErr   error
 }
 
 // newProgressReporter creates a reporter from the request's _meta.progressToken.
@@ -53,8 +57,22 @@ func (p *progressReporter) send(progress, total int, message string) {
 		"total":         float64(total),
 		"message":       message,
 	}); err != nil {
-		log.Printf("progress notification failed: %v", err)
+		log.Printf("progress notification failed: progress=%d total=%d msg=%q err=%v", progress, total, message, err)
+		p.lastErr = err
+		p.errCount++
 	}
+	p.sendCount++
+}
+
+// diagnostics returns a summary of send attempts for debugging.
+func (p *progressReporter) diagnostics() string {
+	if p == nil {
+		return "no progressToken provided"
+	}
+	if p.errCount > 0 {
+		return fmt.Sprintf("progress: %d sent, %d failed, last error: %v", p.sendCount, p.errCount, p.lastErr)
+	}
+	return fmt.Sprintf("progress: %d sent, 0 failed", p.sendCount)
 }
 
 type analyzeResult struct {
@@ -142,12 +160,10 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	}
 
 	totalFiles := len(filePaths)
-	// Single monotonic progress counter across all phases.
-	// Total steps: parse(N) + resolve(N) + merge(N) + save(1) = 3N+1
-	totalSteps := totalFiles*3 + 1
-	step := 0
+	// Parse is ~95% of wall time — it IS the progress bar.
+	totalSteps := totalFiles
 
-	progress.send(step, totalSteps, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
+	progress.send(0, totalSteps, fmt.Sprintf("Found %d source files, parsing...", totalFiles))
 
 	// Phase 1: Parse files concurrently.
 	numWorkers := runtime.NumCPU()
@@ -174,20 +190,20 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 				content, err := os.ReadFile(path)
 				if err != nil {
 					errs <- fmt.Sprintf("%s: read error: %v", path, err)
-					parsed.Add(1)
+					n := int(parsed.Add(1))
+					progress.send(n, totalSteps, fmt.Sprintf("Parsing: %d/%d files", n, totalFiles))
 					continue
 				}
 				fg, err := p.ParseFile(path, content)
 				if err != nil {
 					errs <- fmt.Sprintf("%s: parse error: %v", path, err)
-					parsed.Add(1)
+					n := int(parsed.Add(1))
+					progress.send(n, totalSteps, fmt.Sprintf("Parsing: %d/%d files", n, totalFiles))
 					continue
 				}
 				results <- fg
 				n := int(parsed.Add(1))
-				if n%10 == 0 || n == totalFiles {
-					progress.send(n, totalSteps, fmt.Sprintf("Parsing: %d/%d files", n, totalFiles))
-				}
+				progress.send(n, totalSteps, fmt.Sprintf("Parsing: %d/%d — %s", n, totalFiles, filepath.Base(path)))
 			}
 		}()
 	}
@@ -212,48 +228,66 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 	for w := range errs {
 		warnings = append(warnings, w)
 	}
-	step = totalFiles
 
-	// Count totals for progress messages.
-	totalSymbols := 0
-	totalEdges := 0
-	for _, fg := range fileGraphs {
-		totalSymbols += len(fg.Symbols)
-		totalEdges += len(fg.Edges)
+	// Run post-parse phases in a goroutine so progress notifications
+	// are sent from a non-handler goroutine. mcp-go's stdio transport
+	// may not flush notifications sent from the handler goroutine itself.
+	type postParseResult struct {
+		warnings []string
+		err      error
 	}
 
-	// Phase 2: Build indices and resolve edges.
-	progress.send(step, totalSteps, fmt.Sprintf("Building symbol index (%d symbols, %d edges)...", totalSymbols, totalEdges))
-	fileIndex := buildFileIndex(filePaths)
-	symbolIndex := buildSymbolIndex(fileGraphs)
+	done := make(chan postParseResult, 1)
+	go func() {
+		var postWarnings []string
+		phaseStart := time.Now()
 
-	for i, fg := range fileGraphs {
-		resolveEdges(fg, fileIndex, symbolIndex)
-		step = totalFiles + i + 1
-		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
-			progress.send(step, totalSteps, fmt.Sprintf("Resolving: %d/%d files", i+1, len(fileGraphs)))
+		// Count totals for progress messages.
+		totalSymbols := 0
+		totalEdges := 0
+		for _, fg := range fileGraphs {
+			totalSymbols += len(fg.Symbols)
+			totalEdges += len(fg.Edges)
 		}
-	}
 
-	// Phase 3: Merge into graph sequentially.
-	t.graph.Clear()
-	for i, fg := range fileGraphs {
-		t.graph.MergeFileGraph(fg)
-		step = totalFiles*2 + i + 1
-		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
-			progress.send(step, totalSteps, fmt.Sprintf("Merging: %d/%d files", i+1, len(fileGraphs)))
+		// Post-parse phases are fast (~4s for 100K symbols, vs minutes for parsing).
+		// No progress notifications — the bar completes at 100% after parsing,
+		// and the response arrives a few seconds later.
+		fileIndex := buildFileIndex(filePaths)
+		symbolIndex := buildSymbolIndex(fileGraphs)
+		postWarnings = append(postWarnings, fmt.Sprintf("index built in %s", time.Since(phaseStart).Round(time.Millisecond)))
+
+		resolveStart := time.Now()
+		for _, fg := range fileGraphs {
+			resolveEdges(fg, fileIndex, symbolIndex)
 		}
-	}
+		postWarnings = append(postWarnings, fmt.Sprintf("edges resolved in %s", time.Since(resolveStart).Round(time.Millisecond)))
 
-	t.rootPath = absPath
-	t.indexed.Store(true)
+		mergeStart := time.Now()
+		t.graph.Clear()
+		for _, fg := range fileGraphs {
+			t.graph.MergeFileGraph(fg)
+		}
+		postWarnings = append(postWarnings, fmt.Sprintf("graph merged in %s", time.Since(mergeStart).Round(time.Millisecond)))
 
-	// Phase 4: Save cache.
-	step = totalFiles*3
-	progress.send(step, totalSteps, fmt.Sprintf("Saving cache (%d symbols, %d edges)...", totalSymbols, totalEdges))
-	if err := t.graph.Save(absPath); err != nil {
-		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
-	}
+		t.rootPath = absPath
+		t.indexed.Store(true)
+
+		cacheStart := time.Now()
+		if err := t.graph.Save(absPath); err != nil {
+			postWarnings = append(postWarnings, fmt.Sprintf("cache save failed: %v", err))
+		} else {
+			postWarnings = append(postWarnings, fmt.Sprintf("cache saved in %s", time.Since(cacheStart).Round(time.Millisecond)))
+		}
+
+		postWarnings = append(postWarnings, fmt.Sprintf("total post-parse: %s", time.Since(phaseStart).Round(time.Millisecond)))
+
+		done <- postParseResult{warnings: postWarnings}
+	}()
+
+	pr := <-done
+	warnings = append(warnings, pr.warnings...)
+	warnings = append(warnings, progress.diagnostics())
 
 	nodes, edges, files := t.graph.Stats()
 	result := analyzeResult{
