@@ -18,7 +18,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Real-World Validation"
-    status: planned
+    status: complete
     doc: "03-Real-World-Validation.md"
     depends_on: [2]
   - id: 4
