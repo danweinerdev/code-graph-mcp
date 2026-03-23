@@ -208,28 +208,43 @@ func (t *Tools) handleAnalyzeCodebase(ctx context.Context, req mcp.CallToolReque
 		warnings = append(warnings, w)
 	}
 
+	// Count total symbols and edges for progress reporting.
+	totalSymbols := 0
+	totalEdges := 0
+	for _, fg := range fileGraphs {
+		totalSymbols += len(fg.Symbols)
+		totalEdges += len(fg.Edges)
+	}
+
 	// Build indices for resolution.
-	progress.send(totalFiles, totalFiles, "Resolving symbol references...")
+	progress.send(totalFiles, totalFiles, fmt.Sprintf("Building symbol index (%d symbols)...", totalSymbols))
 	fileIndex := buildFileIndex(filePaths)
 	symbolIndex := buildSymbolIndex(fileGraphs)
 
 	// Resolve edges in each FileGraph.
-	for _, fg := range fileGraphs {
+	progress.send(totalFiles, totalFiles, fmt.Sprintf("Resolving %d edges...", totalEdges))
+	for i, fg := range fileGraphs {
 		resolveEdges(fg, fileIndex, symbolIndex)
+		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
+			progress.send(i+1, len(fileGraphs), fmt.Sprintf("Resolved edges in %d/%d files", i+1, len(fileGraphs)))
+		}
 	}
 
 	// Phase 2: Merge into graph sequentially.
-	progress.send(totalFiles, totalFiles, "Building graph...")
+	progress.send(0, len(fileGraphs), "Merging into graph...")
 	t.graph.Clear()
-	for _, fg := range fileGraphs {
+	for i, fg := range fileGraphs {
 		t.graph.MergeFileGraph(fg)
+		if (i+1)%100 == 0 || i+1 == len(fileGraphs) {
+			progress.send(i+1, len(fileGraphs), fmt.Sprintf("Merged %d/%d files into graph", i+1, len(fileGraphs)))
+		}
 	}
 
 	t.rootPath = absPath
 	t.indexed.Store(true)
 
 	// Save cache for next time.
-	progress.send(totalFiles, totalFiles, "Saving cache...")
+	progress.send(len(fileGraphs), len(fileGraphs), fmt.Sprintf("Saving cache (%d symbols, %d edges)...", totalSymbols, totalEdges))
 	if err := t.graph.Save(absPath); err != nil {
 		warnings = append(warnings, fmt.Sprintf("cache save failed: %v", err))
 	}
