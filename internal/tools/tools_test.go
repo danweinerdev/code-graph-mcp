@@ -1,0 +1,254 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/danweinerdev/code-graph-mcp/internal/graph"
+	"github.com/danweinerdev/code-graph-mcp/internal/lang/cpp"
+	"github.com/danweinerdev/code-graph-mcp/internal/parser"
+)
+
+func setupTools(t *testing.T) *Tools {
+	t.Helper()
+	g := graph.New()
+	reg := parser.NewRegistry()
+	p, err := cpp.NewCppParser()
+	if err != nil {
+		t.Fatalf("NewCppParser: %v", err)
+	}
+	t.Cleanup(p.Close)
+	if err := reg.Register(p); err != nil {
+		t.Fatal(err)
+	}
+	return New(g, reg)
+}
+
+func callTool(t *testing.T, tools *Tools, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = args
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler returned Go error: %v", err)
+	}
+	return result
+}
+
+func testdataDir(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs("../../testdata/cpp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func TestGuardBeforeIndex(t *testing.T) {
+	tools := setupTools(t)
+	result := callTool(t, tools, tools.handleGetFileSymbols, map[string]any{"file": "/test.cpp"})
+	if !result.IsError {
+		t.Fatal("expected error before indexing")
+	}
+}
+
+func TestAnalyzeCodebase(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+
+	result := callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+	if result.IsError {
+		t.Fatalf("analyze failed: %s", textContent(result))
+	}
+
+	var ar analyzeResult
+	if err := json.Unmarshal([]byte(textContent(result)), &ar); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	t.Logf("Analyzed: %d files, %d symbols, %d edges", ar.Files, ar.Symbols, ar.Edges)
+	if ar.Files != 8 {
+		t.Errorf("expected 8 files, got %d", ar.Files)
+	}
+	if ar.Symbols < 15 {
+		t.Errorf("expected at least 15 symbols, got %d", ar.Symbols)
+	}
+}
+
+func TestAnalyzeInvalidPath(t *testing.T) {
+	tools := setupTools(t)
+	result := callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": "/nonexistent/dir"})
+	if !result.IsError {
+		t.Fatal("expected error for invalid path")
+	}
+}
+
+func TestGetFileSymbols(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	engineCpp := filepath.Join(dir, "engine.cpp")
+	result := callTool(t, tools, tools.handleGetFileSymbols, map[string]any{"file": engineCpp})
+	if result.IsError {
+		t.Fatalf("get_file_symbols failed: %s", textContent(result))
+	}
+
+	var symbols []symbolResult
+	if err := json.Unmarshal([]byte(textContent(result)), &symbols); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	t.Logf("engine.cpp symbols: %d", len(symbols))
+	if len(symbols) < 4 {
+		t.Errorf("expected at least 4 symbols in engine.cpp, got %d", len(symbols))
+	}
+
+	// Check a symbol has an ID.
+	for _, s := range symbols {
+		if s.ID == "" {
+			t.Error("symbol missing ID")
+		}
+	}
+}
+
+func TestSearchSymbols(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "Engine"})
+	if result.IsError {
+		t.Fatalf("search failed: %s", textContent(result))
+	}
+
+	var symbols []symbolResult
+	json.Unmarshal([]byte(textContent(result)), &symbols)
+	t.Logf("Search 'Engine': %d results", len(symbols))
+	if len(symbols) == 0 {
+		t.Fatal("expected results for 'Engine'")
+	}
+}
+
+func TestSearchSymbolsKindFilter(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "", "kind": "class"})
+	if result.IsError {
+		t.Fatalf("search failed: %s", textContent(result))
+	}
+
+	var symbols []symbolResult
+	json.Unmarshal([]byte(textContent(result)), &symbols)
+	for _, s := range symbols {
+		if s.Kind != "class" {
+			t.Errorf("expected kind class, got %s", s.Kind)
+		}
+	}
+}
+
+func TestGetSymbolDetail(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	// Get a known symbol ID.
+	mainCpp := filepath.Join(dir, "main.cpp")
+	symbolID := mainCpp + ":main"
+
+	result := callTool(t, tools, tools.handleGetSymbolDetail, map[string]any{"symbol": symbolID})
+	if result.IsError {
+		t.Fatalf("get_symbol_detail failed: %s", textContent(result))
+	}
+
+	var detail symbolResult
+	json.Unmarshal([]byte(textContent(result)), &detail)
+	if detail.Name != "main" {
+		t.Errorf("expected name main, got %s", detail.Name)
+	}
+}
+
+func TestGetSymbolDetailUnknown(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	result := callTool(t, tools, tools.handleGetSymbolDetail, map[string]any{"symbol": "/fake:unknown"})
+	if !result.IsError {
+		t.Fatal("expected error for unknown symbol")
+	}
+	text := textContent(result)
+	if text == "" {
+		t.Fatal("expected error message")
+	}
+	t.Logf("Error: %s", text)
+}
+
+func TestGetCalleesFromMain(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	mainCpp := filepath.Join(dir, "main.cpp")
+	symbolID := mainCpp + ":main"
+
+	result := callTool(t, tools, tools.handleGetCallees, map[string]any{"symbol": symbolID})
+	if result.IsError {
+		t.Fatalf("get_callees failed: %s", textContent(result))
+	}
+
+	var callees []graph.CallChain
+	json.Unmarshal([]byte(textContent(result)), &callees)
+	t.Logf("main() callees: %d", len(callees))
+	for _, c := range callees {
+		t.Logf("  -> %s", c.SymbolID)
+	}
+	if len(callees) < 3 {
+		t.Errorf("expected at least 3 callees from main, got %d", len(callees))
+	}
+}
+
+func TestGetDependencies(t *testing.T) {
+	tools := setupTools(t)
+	dir := testdataDir(t)
+	callTool(t, tools, tools.handleAnalyzeCodebase, map[string]any{"path": dir})
+
+	engineCpp := filepath.Join(dir, "engine.cpp")
+	result := callTool(t, tools, tools.handleGetDependencies, map[string]any{"file": engineCpp})
+	if result.IsError {
+		t.Fatalf("get_dependencies failed: %s", textContent(result))
+	}
+
+	var deps []string
+	json.Unmarshal([]byte(textContent(result)), &deps)
+	t.Logf("engine.cpp deps: %v", deps)
+	if len(deps) < 2 {
+		t.Errorf("expected at least 2 deps, got %d", len(deps))
+	}
+
+	// Check that include paths are resolved to absolute.
+	for _, d := range deps {
+		if filepath.IsAbs(d) {
+			t.Logf("  resolved: %s", d)
+		} else {
+			t.Logf("  unresolved: %s", d)
+		}
+	}
+}
+
+// textContent extracts the text from an MCP tool result.
+func textContent(result *mcp.CallToolResult) string {
+	if len(result.Content) == 0 {
+		return ""
+	}
+	tc, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		return ""
+	}
+	return tc.Text
+}

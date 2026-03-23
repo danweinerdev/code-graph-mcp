@@ -28,7 +28,7 @@ phases:
     depends_on: [1]
   - id: 5
     title: "MCP Server & P0 Tools"
-    status: planned
+    status: complete
     doc: "05-MCP-Server-And-P0-Tools.md"
     depends_on: [3, 4]
   - id: 6
