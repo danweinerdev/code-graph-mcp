@@ -14,7 +14,7 @@ tasks:
     verification: "`cargo build --workspace` succeeds with empty crate skeletons; rust-toolchain.toml pins a specific stable channel; .gitignore covers target/ and bin/; `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` both pass clean on the empty workspace"
   - id: "1.2"
     title: "codegraph-core: shared types"
-    status: planned
+    status: complete
     depends_on: ["1.1"]
     verification: "Language enum (Cpp/Rust/Go/Python) serializes to lowercase strings; SymbolKind covers Function/Method/Class/Struct/Enum/Typedef/Interface/Trait — Interface and Trait added now (not deferred); EdgeKind covers Calls/Includes/Inherits; Symbol carries `language` field plus all Go fields with `#[serde(skip_serializing_if = \"String::is_empty\")]` on namespace and parent so empty fields omit cleanly; SymbolId helper produces `path:Name` for free symbols and `path:Parent::Name` for methods identical to Go; round-trip JSON tests cover every kind"
   - id: "1.3"
@@ -55,7 +55,7 @@ The phase deliberately bundles foundation and C++ work because the foundation is
 ## 1.1: Cargo workspace scaffold and toolchain pin
 
 ### Subtasks
-- [x] Create top-level `Cargo.toml` workspace manifest listing all 8 crates as members
+- [x] Create top-level `Cargo.toml` workspace manifest listing all 10 crates as members
 - [x] Create `rust-toolchain.toml` pinning to stable (e.g., `channel = "1.84"`)
 - [x] Create skeleton crates: `crates/code-graph-mcp` (bin), `crates/codegraph-core` (lib), `crates/codegraph-lang` (lib), `crates/codegraph-graph` (lib), `crates/codegraph-tools` (lib), `crates/codegraph-lang-cpp` (lib), `crates/codegraph-parse-test` (bin), plus placeholders for `codegraph-lang-{rust,go,python}` (lib) for later phases
 - [x] Top-level `.gitignore` covers `target/`, `bin/`, `.code-graph-cache.json`, `.code-graph.toml` (the latter only at indexed-project root, not workspace root, but ignore-by-default is safer)
@@ -65,15 +65,15 @@ The phase deliberately bundles foundation and C++ work because the foundation is
 ## 1.2: codegraph-core: shared types
 
 ### Subtasks
-- [ ] `Language` enum derives `Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize` with `#[serde(rename_all = "lowercase")]`
-- [ ] `SymbolKind` enum with all 8 variants (Function, Method, Class, Struct, Enum, Typedef, Interface, Trait); same derives; `#[serde(rename_all = "lowercase")]`
-- [ ] `EdgeKind` enum (Calls, Includes, Inherits) with same derives
-- [ ] `Symbol` struct with `language` field added; namespace and parent use `#[serde(skip_serializing_if = "String::is_empty", default)]`; line/column/end_line are `u32`
-- [ ] `Edge` struct with `from`, `to`, `kind`, `file`, `line`
-- [ ] `FileGraph` struct with `path`, `language`, `symbols`, `edges`
-- [ ] `SymbolId` type alias for `String`; `symbol_id(&Symbol) -> SymbolId` helper that matches Go's `SymbolID` exactly
-- [ ] Round-trip JSON serialization tests for every kind, edge variant, and FileGraph
-- [ ] Wire-format invariant: collections-returning fields (Vec) never serialize as null — verified by tests with empty inputs
+- [x] `Language` enum derives `Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize` with `#[serde(rename_all = "lowercase")]`
+- [x] `SymbolKind` enum with all 8 variants (Function, Method, Class, Struct, Enum, Typedef, Interface, Trait); same derives; `#[serde(rename_all = "lowercase")]`
+- [x] `EdgeKind` enum (Calls, Includes, Inherits) with same derives
+- [x] `Symbol` struct with `language` field added; namespace and parent use `#[serde(skip_serializing_if = "String::is_empty", default)]`; line/column/end_line are `u32`
+- [x] `Edge` struct with `from`, `to`, `kind`, `file`, `line`
+- [x] `FileGraph` struct with `path`, `language`, `symbols`, `edges`
+- [x] `SymbolId` type alias for `String`; `symbol_id(&Symbol) -> SymbolId` helper that matches Go's `SymbolID` exactly
+- [x] Round-trip JSON serialization tests for every kind, edge variant, and FileGraph
+- [x] Wire-format invariant: collections-returning fields (Vec) never serialize as null — verified by tests with empty inputs
 
 ## 1.3: LanguagePlugin trait, LanguageRegistry, RootConfig
 

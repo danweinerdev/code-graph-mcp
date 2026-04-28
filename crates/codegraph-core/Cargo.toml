@@ -11,3 +11,5 @@ description = "Shared types for the code-graph-mcp workspace (Symbol, Edge, File
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
