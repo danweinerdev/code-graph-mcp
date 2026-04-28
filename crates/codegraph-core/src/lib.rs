@@ -12,7 +12,7 @@
 //! v2; older Go-written caches are detected by the version tag and trigger
 //! a silent re-index rather than being parsed.
 
-pub mod config;
+mod config;
 
 pub use config::{ConfigError, DiscoveryConfig, ParsingConfig, RootConfig};
 

@@ -38,11 +38,26 @@ pub enum ParseError {
 
 /// Errors returned by [`LanguageRegistry::register`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RegistryError {
     /// Two plugins claimed the same extension. The string is the lowercased
     /// extension that collided (e.g. `".cpp"`).
     #[error("extension {0:?} is already registered")]
     DuplicateExtension(String),
+    /// A plugin was registered for a [`Language`] that already has a plugin.
+    /// The first plugin's extensions would otherwise resolve to a different
+    /// (replacement) plugin — see the validation pass in
+    /// [`LanguageRegistry::register`].
+    #[error("language {0:?} is already registered")]
+    DuplicateLanguage(Language),
+    /// A plugin returned an extension that did not start with `.`. The trait
+    /// contract requires the leading dot — without it, `language_for_path`
+    /// would never match the file because lookup uses `format!(".{ext}")`.
+    #[error("invalid extension {extension:?}: {reason}")]
+    InvalidExtension {
+        extension: String,
+        reason: &'static str,
+    },
 }
 
 // Phase-2 placeholder types -----------------------------------------------
@@ -122,7 +137,7 @@ impl FileIndex {
 // TODO(phase-2): implement the same-file > same-parent > same-namespace >
 // global heuristic from internal/graph/resolver.go once SymbolIndex carries
 // real data.
-pub fn default_scope_aware_resolve(
+pub(crate) fn default_scope_aware_resolve(
     _callee: &str,
     _ctx: &CallContext,
     _index: &SymbolIndex,
@@ -135,7 +150,7 @@ pub fn default_scope_aware_resolve(
 // TODO(phase-2): implement basename matching against FileIndex once Phase 2
 // ships the path index. Languages like Go and Python override this entirely;
 // C++ relies on the basename heuristic.
-pub fn default_basename_resolve(_raw: &str, _file_index: &FileIndex) -> Option<PathBuf> {
+pub(crate) fn default_basename_resolve(_raw: &str, _file_index: &FileIndex) -> Option<PathBuf> {
     None
 }
 
@@ -216,7 +231,13 @@ impl LanguageRegistry {
     /// lowercased before insertion. Returns
     /// [`RegistryError::DuplicateExtension`] if any extension is already
     /// claimed (by this plugin or a previously-registered one) — matching
-    /// the Go `Register` behavior.
+    /// the Go `Register` behavior. Returns
+    /// [`RegistryError::DuplicateLanguage`] if a plugin for the same
+    /// [`Language`] is already registered (without this guard, a second
+    /// plugin would silently replace the first while the first plugin's
+    /// extensions stayed mapped). Returns [`RegistryError::InvalidExtension`]
+    /// if any extension does not start with `.` — the lookup path uses
+    /// `format!(".{ext}")` and a dotless extension would never match.
     ///
     /// On error the registry is unchanged: the plugin is dropped and no
     /// extensions are registered. (Implementation note: we validate every
@@ -229,11 +250,18 @@ impl LanguageRegistry {
             .map(|e| e.to_ascii_lowercase())
             .collect();
 
-        // First pass: detect duplicates (against existing entries AND within
-        // the plugin's own list — `[".cpp", ".CPP"]` would dedupe on insert
-        // and silently drop one, which is worse than an explicit error).
+        // First pass: validate before mutating anything.
+        if self.plugins.contains_key(&lang) {
+            return Err(RegistryError::DuplicateLanguage(lang));
+        }
         let mut seen = std::collections::HashSet::with_capacity(exts.len());
         for ext in &exts {
+            if !ext.starts_with('.') {
+                return Err(RegistryError::InvalidExtension {
+                    extension: ext.clone(),
+                    reason: "extension must start with '.'",
+                });
+            }
             if self.by_ext.contains_key(ext) || !seen.insert(ext.clone()) {
                 return Err(RegistryError::DuplicateExtension(ext.clone()));
             }
@@ -367,7 +395,59 @@ mod tests {
             .expect_err("duplicate extension must error");
         match err {
             RegistryError::DuplicateExtension(ext) => assert_eq!(ext, ".fake"),
+            other => panic!("expected DuplicateExtension, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_language_errors_and_leaves_registry_unchanged() {
+        // Two different plugins for the same Language must not silently
+        // replace each other. The first plugin's extensions stay mapped to
+        // it; the second registration must fail.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".one", ".two"]))
+            .unwrap();
+
+        let err = reg
+            .register(fake(Language::Cpp, &[".alpha", ".beta"]))
+            .expect_err("duplicate Language must error");
+        match err {
+            RegistryError::DuplicateLanguage(lang) => assert_eq!(lang, Language::Cpp),
+            other => panic!("expected DuplicateLanguage, got {other:?}"),
+        }
+
+        // Registry unchanged: first plugin's extensions still resolve.
+        assert_eq!(
+            reg.for_path(Path::new("/tmp/x.one")).map(|p| p.id()),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            reg.for_path(Path::new("/tmp/x.two")).map(|p| p.id()),
+            Some(Language::Cpp)
+        );
+        // Second plugin's would-be extensions never registered.
+        assert!(reg.for_path(Path::new("/tmp/x.alpha")).is_none());
+        assert!(reg.for_path(Path::new("/tmp/x.beta")).is_none());
+    }
+
+    #[test]
+    fn missing_leading_dot_extension_errors() {
+        // The trait contract says extensions MUST start with '.'. A plugin
+        // returning `["cpp"]` (no dot) must be rejected at register-time
+        // rather than silently registered and never matching anything.
+        let mut reg = LanguageRegistry::new();
+        let err = reg
+            .register(fake(Language::Cpp, &["cpp"]))
+            .expect_err("dotless extension must error");
+        match err {
+            RegistryError::InvalidExtension { extension, .. } => {
+                assert_eq!(extension, "cpp");
+            }
+            other => panic!("expected InvalidExtension, got {other:?}"),
+        }
+        // Failed registration must leave the registry empty.
+        assert!(reg.for_path(Path::new("/tmp/foo.cpp")).is_none());
+        assert!(reg.plugin_for(Language::Cpp).is_none());
     }
 
     #[test]
@@ -380,6 +460,7 @@ mod tests {
             .expect_err("intra-plugin duplicate must error");
         match err {
             RegistryError::DuplicateExtension(ext) => assert_eq!(ext, ".foo"),
+            other => panic!("expected DuplicateExtension, got {other:?}"),
         }
         // Failed registration must leave the registry empty.
         assert!(reg.for_path(Path::new("/tmp/x.foo")).is_none());
