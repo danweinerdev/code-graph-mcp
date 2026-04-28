@@ -1,2 +1,6 @@
 bin/
 .code-graph-cache.json
+
+# Rust workspace
+target/
+.code-graph.toml

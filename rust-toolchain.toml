@@ -1,0 +1,9 @@
+# Rationale: pin to "stable" rather than "1.84" to avoid forcing a rustup
+# install on hosts that already ship a recent system Rust (e.g., the Fedora
+# packaged toolchain). The 1.84 floor is enforced by `rust-version` in the
+# workspace Cargo.toml — Cargo will error if a contributor builds on
+# anything older. Bumping to a specific channel is a one-line change here
+# if/when we need a feature only available in a newer stable.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
