@@ -47,18 +47,29 @@ func (t *Tools) Register(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("get_file_symbols",
 		mcp.WithDescription("List all symbols (functions, classes, etc.) defined in a file"),
 		mcp.WithString("file", mcp.Required(), mcp.Description("Absolute path to the source file")),
+		mcp.WithBoolean("top_level_only", mcp.Description("Only return top-level symbols (no nested methods/types) (default false)")),
+		mcp.WithBoolean("brief", mcp.Description("Omit signature, column, end_line for compact output (default true)")),
 	), t.handleGetFileSymbols)
 
 	s.AddTool(mcp.NewTool("search_symbols",
-		mcp.WithDescription("Search for symbols by name pattern across the indexed codebase"),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Substring or regex pattern to match symbol names")),
+		mcp.WithDescription("Search for symbols by name pattern across the indexed codebase. Returns paginated results. Default brief mode omits signatures for token efficiency."),
+		mcp.WithString("query", mcp.Description("Substring or regex pattern to match symbol names")),
 		mcp.WithString("kind", mcp.Description("Filter by symbol kind: function, method, class, struct, enum, typedef")),
+		mcp.WithString("namespace", mcp.Description("Filter by namespace (substring match, e.g., 'Nfs' matches 'Ark::Nfs::V4')")),
+		mcp.WithNumber("limit", mcp.Description("Maximum results to return (default 20)")),
+		mcp.WithNumber("offset", mcp.Description("Skip first N matches for pagination (default 0)")),
+		mcp.WithBoolean("brief", mcp.Description("Omit signature, column, end_line (default true)")),
 	), t.handleSearchSymbols)
 
 	s.AddTool(mcp.NewTool("get_symbol_detail",
 		mcp.WithDescription("Get full details for a symbol by its ID"),
 		mcp.WithString("symbol", mcp.Required(), mcp.Description("Symbol ID in format file:name as returned by get_file_symbols or search_symbols")),
 	), t.handleGetSymbolDetail)
+
+	s.AddTool(mcp.NewTool("get_symbol_summary",
+		mcp.WithDescription("Get symbol counts grouped by namespace and kind — useful for codebase orientation"),
+		mcp.WithString("file", mcp.Description("Optional absolute path: scope counts to a single file")),
+	), t.handleGetSymbolSummary)
 
 	// Call graph queries
 	s.AddTool(mcp.NewTool("get_callers",
@@ -92,6 +103,7 @@ func (t *Tools) Register(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("get_class_hierarchy",
 		mcp.WithDescription("Get the inheritance tree for a class (base classes and derived classes)"),
 		mcp.WithString("class", mcp.Required(), mcp.Description("Class name to look up")),
+		mcp.WithNumber("depth", mcp.Description("Traversal depth for transitive inheritance (default 1 = direct only)")),
 	), t.handleGetClassHierarchy)
 
 	s.AddTool(mcp.NewTool("get_coupling",
@@ -123,11 +135,14 @@ func (t *Tools) Register(s *server.MCPServer) {
 }
 
 // suggestSymbols returns up to limit symbol name suggestions for did-you-mean errors.
+// Pulls a wider candidate pool (Limit: 100) than search_symbols' default of 20
+// so the top suggestions aren't dropped before truncation.
 func (t *Tools) suggestSymbols(name string, limit int) string {
-	results := t.graph.SearchSymbols(name, "")
-	if len(results) == 0 {
+	sr := t.graph.Search(graph.SearchParams{Pattern: name, Limit: 100})
+	if len(sr.Symbols) == 0 {
 		return ""
 	}
+	results := sr.Symbols
 	if len(results) > limit {
 		results = results[:limit]
 	}

@@ -46,13 +46,13 @@ AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
               [go-tree-sitter + tree-sitter-cpp]
 ```
 
-## MCP Tools (14 total)
+## MCP Tools (15 total)
 
 **Indexing:** `analyze_codebase` (with JSON cache + mtime-based incremental re-index)
-**Symbol queries:** `get_file_symbols`, `search_symbols`, `get_symbol_detail`
+**Symbol queries:** `get_file_symbols` (with `top_level_only`/`brief`), `search_symbols` (with `namespace`, `limit`/`offset`, `brief` default true), `get_symbol_detail`, `get_symbol_summary` (counts by namespace/kind)
 **Call graph:** `get_callers`, `get_callees`
 **Dependencies:** `get_dependencies`
-**Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling` (outgoing/incoming/both)
+**Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy` (with `depth` for transitive walk), `get_coupling` (outgoing/incoming/both)
 **Visualization:** `generate_mermaid` (call graph, file deps, or inheritance tree)
 **Watch mode:** `watch_start`, `watch_stop` (auto-reindex on file changes via fsnotify)
 

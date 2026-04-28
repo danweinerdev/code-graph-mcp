@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/danweinerdev/code-graph-mcp/internal/parser"
 )
@@ -440,7 +441,7 @@ func TestClassHierarchySingle(t *testing.T) {
 		inheritEdge("Derived", "Base", "/a.cpp"),
 	}))
 
-	h := g.ClassHierarchy("Derived")
+	h := g.ClassHierarchy("Derived", 1)
 	if h == nil {
 		t.Fatal("expected hierarchy")
 	}
@@ -448,7 +449,7 @@ func TestClassHierarchySingle(t *testing.T) {
 		t.Errorf("expected base Base, got %v", h.Bases)
 	}
 
-	h = g.ClassHierarchy("Base")
+	h = g.ClassHierarchy("Base", 1)
 	if h == nil {
 		t.Fatal("expected hierarchy for Base")
 	}
@@ -468,7 +469,7 @@ func TestClassHierarchyMultiple(t *testing.T) {
 		inheritEdge("D", "B", "/a.cpp"),
 	}))
 
-	h := g.ClassHierarchy("D")
+	h := g.ClassHierarchy("D", 1)
 	if h == nil {
 		t.Fatal("expected hierarchy")
 	}
@@ -479,9 +480,246 @@ func TestClassHierarchyMultiple(t *testing.T) {
 
 func TestClassHierarchyUnknown(t *testing.T) {
 	g := New()
-	h := g.ClassHierarchy("Unknown")
+	h := g.ClassHierarchy("Unknown", 1)
 	if h != nil {
 		t.Fatal("expected nil for unknown class")
+	}
+}
+
+// --- Search pagination, namespace filter, summary ---
+
+func TestSearchPagination(t *testing.T) {
+	g := New()
+	syms := make([]parser.Symbol, 25)
+	for i := range syms {
+		syms[i] = sym("fn"+string(rune('a'+i%26))+string(rune('a'+i/26)), parser.KindFunction, "/a.cpp")
+	}
+	g.MergeFileGraph(makeFileGraph("/a.cpp", syms, nil))
+
+	r := g.Search(SearchParams{Pattern: "fn", Limit: 10})
+	if len(r.Symbols) != 10 {
+		t.Errorf("expected 10 results, got %d", len(r.Symbols))
+	}
+	if r.Total != 25 {
+		t.Errorf("expected total 25, got %d", r.Total)
+	}
+
+	// Offset skips.
+	r2 := g.Search(SearchParams{Pattern: "fn", Limit: 10, Offset: 20})
+	if len(r2.Symbols) != 5 {
+		t.Errorf("expected 5 results after offset 20, got %d", len(r2.Symbols))
+	}
+	if r2.Total != 25 {
+		t.Errorf("expected total 25, got %d", r2.Total)
+	}
+
+	// Default limit (Limit=0) becomes 20.
+	r3 := g.Search(SearchParams{Pattern: "fn"})
+	if len(r3.Symbols) != 20 {
+		t.Errorf("expected default limit 20, got %d", len(r3.Symbols))
+	}
+}
+
+func TestSearchNamespaceFilter(t *testing.T) {
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/nfs.cpp", []parser.Symbol{
+		{Name: "foo", Kind: parser.KindFunction, File: "/nfs.cpp", Line: 1, Namespace: "Ark::Nfs::V4"},
+		{Name: "bar", Kind: parser.KindFunction, File: "/nfs.cpp", Line: 2, Namespace: "Ark::Nfs::V4"},
+	}, nil))
+	g.MergeFileGraph(makeFileGraph("/http.cpp", []parser.Symbol{
+		{Name: "foo", Kind: parser.KindFunction, File: "/http.cpp", Line: 1, Namespace: "Http"},
+	}, nil))
+
+	r := g.Search(SearchParams{Namespace: "Nfs"})
+	if r.Total != 2 {
+		t.Errorf("expected 2 matches in Nfs namespace, got %d", r.Total)
+	}
+	for _, s := range r.Symbols {
+		if !strings.Contains(s.Namespace, "Nfs") {
+			t.Errorf("got symbol outside namespace filter: %q", s.Namespace)
+		}
+	}
+
+	// Case-insensitive.
+	r2 := g.Search(SearchParams{Namespace: "nfs"})
+	if r2.Total != 2 {
+		t.Errorf("expected case-insensitive match, got %d", r2.Total)
+	}
+
+	// Combined with pattern.
+	r3 := g.Search(SearchParams{Pattern: "foo", Namespace: "Nfs"})
+	if r3.Total != 1 || r3.Symbols[0].Name != "foo" {
+		t.Errorf("expected foo in Nfs only, got %v", r3.Symbols)
+	}
+
+	// Empty namespace = no filter: all symbols across namespaces returned.
+	r4 := g.Search(SearchParams{Namespace: ""})
+	if r4.Total != 3 {
+		t.Errorf("expected all 3 symbols when namespace is empty, got %d", r4.Total)
+	}
+}
+
+func TestSymbolSummary(t *testing.T) {
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		{Name: "Engine", Kind: parser.KindClass, File: "/a.cpp", Line: 1, Namespace: "ns1"},
+		{Name: "update", Kind: parser.KindFunction, File: "/a.cpp", Line: 2, Namespace: "ns1"},
+		{Name: "render", Kind: parser.KindFunction, File: "/a.cpp", Line: 3, Namespace: "ns1"},
+		{Name: "free", Kind: parser.KindFunction, File: "/a.cpp", Line: 4},
+	}, nil))
+	g.MergeFileGraph(makeFileGraph("/b.cpp", []parser.Symbol{
+		{Name: "Other", Kind: parser.KindClass, File: "/b.cpp", Line: 1, Namespace: "ns2"},
+	}, nil))
+
+	s := g.SymbolSummary("")
+	if s["ns1"][parser.KindClass] != 1 {
+		t.Errorf("expected 1 class in ns1, got %d", s["ns1"][parser.KindClass])
+	}
+	if s["ns1"][parser.KindFunction] != 2 {
+		t.Errorf("expected 2 functions in ns1, got %d", s["ns1"][parser.KindFunction])
+	}
+	if s[""][parser.KindFunction] != 1 {
+		t.Errorf("expected 1 free function, got %d", s[""][parser.KindFunction])
+	}
+	if s["ns2"][parser.KindClass] != 1 {
+		t.Errorf("expected 1 class in ns2, got %d", s["ns2"][parser.KindClass])
+	}
+
+	// Scoped to /a.cpp: ns2 must not appear.
+	scoped := g.SymbolSummary("/a.cpp")
+	if _, ok := scoped["ns2"]; ok {
+		t.Error("expected ns2 absent when scoped to /a.cpp")
+	}
+	if scoped["ns1"][parser.KindFunction] != 2 {
+		t.Errorf("expected 2 functions in ns1 (scoped), got %d", scoped["ns1"][parser.KindFunction])
+	}
+}
+
+func TestSymbolSummaryEmpty(t *testing.T) {
+	g := New()
+	if len(g.SymbolSummary("")) != 0 {
+		t.Error("expected empty summary for empty graph")
+	}
+}
+
+func TestClassHierarchyDepth(t *testing.T) {
+	g := New()
+	// A <- B <- C (C derives from B, B derives from A)
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		sym("A", parser.KindClass, "/a.cpp"),
+		sym("B", parser.KindClass, "/a.cpp"),
+		sym("C", parser.KindClass, "/a.cpp"),
+	}, []parser.Edge{
+		inheritEdge("B", "A", "/a.cpp"),
+		inheritEdge("C", "B", "/a.cpp"),
+	}))
+
+	// depth=1: only direct parent.
+	h1 := g.ClassHierarchy("C", 1)
+	if len(h1.Bases) != 1 || h1.Bases[0].Name != "B" {
+		t.Fatalf("depth=1: expected direct parent B, got %v", h1.Bases)
+	}
+	if len(h1.Bases[0].Bases) != 0 {
+		t.Errorf("depth=1: should not include grandparent")
+	}
+
+	// depth=2: parent and grandparent.
+	h2 := g.ClassHierarchy("C", 2)
+	if len(h2.Bases) != 1 || len(h2.Bases[0].Bases) != 1 || h2.Bases[0].Bases[0].Name != "A" {
+		t.Errorf("depth=2: expected grandparent A, got %v", h2.Bases)
+	}
+
+	// Walking down from A should reach C at depth=2.
+	hd := g.ClassHierarchy("A", 2)
+	if len(hd.Derived) != 1 || len(hd.Derived[0].Derived) != 1 || hd.Derived[0].Derived[0].Name != "C" {
+		t.Errorf("depth=2 derived: expected A → B → C, got %v", hd.Derived)
+	}
+}
+
+// TestClassHierarchyDiamond verifies that a class shared between two branches
+// (diamond inheritance) is fully expanded on both branches, not stubbed on the
+// second one. Cycle protection must be per-DFS-path, not global-visited.
+//
+// The hierarchy is intentionally deeper than 2 levels so the shared node has
+// its own children to expand — at shallow depth the shared node would be a
+// leaf either way, masking the bug:
+//
+//	Root <- Base <- MixinA, MixinB
+//	             <- (Derived inherits both MixinA and MixinB)
+//	Leaf >- Derived (Leaf derives Derived, mirror direction)
+func TestClassHierarchyDiamond(t *testing.T) {
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		sym("Root", parser.KindClass, "/a.cpp"),
+		sym("Base", parser.KindClass, "/a.cpp"),
+		sym("MixinA", parser.KindClass, "/a.cpp"),
+		sym("MixinB", parser.KindClass, "/a.cpp"),
+		sym("Derived", parser.KindClass, "/a.cpp"),
+		sym("Leaf", parser.KindClass, "/a.cpp"),
+	}, []parser.Edge{
+		inheritEdge("Base", "Root", "/a.cpp"),
+		inheritEdge("MixinA", "Base", "/a.cpp"),
+		inheritEdge("MixinB", "Base", "/a.cpp"),
+		inheritEdge("Derived", "MixinA", "/a.cpp"),
+		inheritEdge("Derived", "MixinB", "/a.cpp"),
+		inheritEdge("Leaf", "Derived", "/a.cpp"),
+	}))
+
+	// Walking up from Derived at depth 3: the shared ancestor `Base` is
+	// reached via both MixinA and MixinB. Both arms must expand Base's own
+	// base (`Root`), not return a stub on the second arm.
+	h := g.ClassHierarchy("Derived", 3)
+	if len(h.Bases) != 2 {
+		t.Fatalf("expected 2 direct bases of Derived, got %d", len(h.Bases))
+	}
+	for _, mixin := range h.Bases {
+		if len(mixin.Bases) != 1 || mixin.Bases[0].Name != "Base" {
+			t.Fatalf("branch %q should expand Base, got %v", mixin.Name, mixin.Bases)
+		}
+		base := mixin.Bases[0]
+		if len(base.Bases) != 1 || base.Bases[0].Name != "Root" {
+			t.Errorf("Base under %q should expand to Root, got %v (diamond truncation)", mixin.Name, base.Bases)
+		}
+	}
+
+	// Walking down from Base at depth 3: both MixinA and MixinB reach
+	// `Derived`, and `Derived` must expand to `Leaf` on both arms.
+	hd := g.ClassHierarchy("Base", 3)
+	if len(hd.Derived) != 2 {
+		t.Fatalf("expected 2 direct deriveds of Base, got %d", len(hd.Derived))
+	}
+	for _, mixin := range hd.Derived {
+		if len(mixin.Derived) != 1 || mixin.Derived[0].Name != "Derived" {
+			t.Fatalf("branch %q should reach Derived, got %v", mixin.Name, mixin.Derived)
+		}
+		derived := mixin.Derived[0]
+		if len(derived.Derived) != 1 || derived.Derived[0].Name != "Leaf" {
+			t.Errorf("Derived under %q should expand to Leaf, got %v (diamond truncation)", mixin.Name, derived.Derived)
+		}
+	}
+}
+
+func TestClassHierarchyCycleSafe(t *testing.T) {
+	// Pathological inheritance cycle should not infinite-loop.
+	g := New()
+	g.MergeFileGraph(makeFileGraph("/a.cpp", []parser.Symbol{
+		sym("A", parser.KindClass, "/a.cpp"),
+		sym("B", parser.KindClass, "/a.cpp"),
+	}, []parser.Edge{
+		inheritEdge("A", "B", "/a.cpp"),
+		inheritEdge("B", "A", "/a.cpp"),
+	}))
+
+	// Should return without hanging, regardless of resulting tree shape.
+	done := make(chan struct{})
+	go func() {
+		_ = g.ClassHierarchy("A", 5)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ClassHierarchy did not terminate on a cycle")
 	}
 }
 

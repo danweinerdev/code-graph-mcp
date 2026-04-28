@@ -131,7 +131,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parentClass,
 				})
@@ -150,7 +150,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parent,
 				})
@@ -170,7 +170,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parentClass,
 				})
@@ -189,7 +189,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parentClass,
 				})
@@ -207,7 +207,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 				})
 
@@ -226,7 +226,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parentClass,
 				})
@@ -245,7 +245,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 					Parent:    parentClass,
 				})
@@ -268,7 +268,7 @@ func (p *CppParser) extractDefinitions(root *tree_sitter.Node, content []byte, p
 					Line:      int(defNode.StartPosition().Row) + 1,
 					Column:    int(defNode.StartPosition().Column),
 					EndLine:   int(defNode.EndPosition().Row) + 1,
-					Signature: truncate(defNode.Utf8Text(content), 200),
+					Signature: truncateSignature(defNode.Utf8Text(content)),
 					Namespace: ns,
 				})
 			}
@@ -527,10 +527,16 @@ func stripIncludePath(raw string) string {
 	return raw
 }
 
-// truncate returns the first n bytes of s, or all of s if shorter.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+// truncateSignature truncates a signature at the first `{` or `;`, keeping
+// only the declaration line. Falls back to a byte limit if neither is found.
+func truncateSignature(s string) string {
+	for i, c := range s {
+		if c == '{' || c == ';' {
+			return strings.TrimRight(s[:i], " \t\n\r")
+		}
+		if i >= 200 {
+			return s[:i] + "..."
+		}
 	}
-	return s[:n] + "..."
+	return s
 }

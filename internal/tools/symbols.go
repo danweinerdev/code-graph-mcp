@@ -17,26 +17,29 @@ type symbolResult struct {
 	Kind      string `json:"kind"`
 	File      string `json:"file"`
 	Line      int    `json:"line"`
-	Column    int    `json:"column"`
-	EndLine   int    `json:"end_line"`
-	Signature string `json:"signature"`
+	Column    int    `json:"column,omitempty"`
+	EndLine   int    `json:"end_line,omitempty"`
+	Signature string `json:"signature,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Parent    string `json:"parent,omitempty"`
 }
 
-func symbolToResult(s parser.Symbol) symbolResult {
-	return symbolResult{
+func symbolToResult(s parser.Symbol, brief bool) symbolResult {
+	r := symbolResult{
 		ID:        graph.SymbolID(s),
 		Name:      s.Name,
 		Kind:      string(s.Kind),
 		File:      s.File,
 		Line:      s.Line,
-		Column:    s.Column,
-		EndLine:   s.EndLine,
-		Signature: s.Signature,
 		Namespace: s.Namespace,
 		Parent:    s.Parent,
 	}
+	if !brief {
+		r.Column = s.Column
+		r.EndLine = s.EndLine
+		r.Signature = s.Signature
+	}
+	return r
 }
 
 func (t *Tools) handleGetFileSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -49,14 +52,25 @@ func (t *Tools) handleGetFileSymbols(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("'file' is required"), nil
 	}
 
+	topLevelOnly, _ := req.GetArguments()["top_level_only"].(bool)
+
+	// Default brief=true for LLM-optimized output.
+	brief := true
+	if b, ok := req.GetArguments()["brief"].(bool); ok {
+		brief = b
+	}
+
 	symbols := t.graph.FileSymbols(file)
 	if len(symbols) == 0 {
 		return mcp.NewToolResultError(fmt.Sprintf("no symbols found in file: %s", file)), nil
 	}
 
-	results := make([]symbolResult, len(symbols))
-	for i, s := range symbols {
-		results[i] = symbolToResult(s)
+	results := make([]symbolResult, 0, len(symbols))
+	for _, s := range symbols {
+		if topLevelOnly && s.Parent != "" {
+			continue
+		}
+		results = append(results, symbolToResult(s, brief))
 	}
 
 	jsonBytes, _ := json.Marshal(results)
@@ -75,18 +89,54 @@ func (t *Tools) handleSearchSymbols(ctx context.Context, req mcp.CallToolRequest
 		kind = parser.SymbolKind(k)
 	}
 
-	if query == "" && kind == "" {
-		return mcp.NewToolResultError("'query' is required (or provide 'kind' to list all of a type)"), nil
+	namespace, _ := req.GetArguments()["namespace"].(string)
+
+	if query == "" && kind == "" && namespace == "" {
+		return mcp.NewToolResultError("'query', 'kind', or 'namespace' is required"), nil
 	}
 
-	symbols := t.graph.SearchSymbols(query, kind)
-
-	results := make([]symbolResult, len(symbols))
-	for i, s := range symbols {
-		results[i] = symbolToResult(s)
+	limit := 20
+	if l, ok := req.GetArguments()["limit"].(float64); ok && l > 0 {
+		limit = int(l)
 	}
 
-	jsonBytes, _ := json.Marshal(results)
+	offset := 0
+	if o, ok := req.GetArguments()["offset"].(float64); ok && o > 0 {
+		offset = int(o)
+	}
+
+	// Default brief=true for LLM-optimized output.
+	brief := true
+	if b, ok := req.GetArguments()["brief"].(bool); ok {
+		brief = b
+	}
+
+	sr := t.graph.Search(graph.SearchParams{
+		Pattern:   query,
+		Kind:      kind,
+		Namespace: namespace,
+		Limit:     limit,
+		Offset:    offset,
+	})
+
+	results := make([]symbolResult, len(sr.Symbols))
+	for i, s := range sr.Symbols {
+		results[i] = symbolToResult(s, brief)
+	}
+
+	response := struct {
+		Results []symbolResult `json:"results"`
+		Total   int            `json:"total"`
+		Offset  int            `json:"offset"`
+		Limit   int            `json:"limit"`
+	}{
+		Results: results,
+		Total:   sr.Total,
+		Offset:  offset,
+		Limit:   limit,
+	}
+
+	jsonBytes, _ := json.Marshal(response)
 	return mcp.NewToolResultText(string(jsonBytes)), nil
 }
 
@@ -109,7 +159,19 @@ func (t *Tools) handleGetSymbolDetail(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(msg), nil
 	}
 
-	result := symbolToResult(*s)
+	result := symbolToResult(*s, false) // always full detail
 	jsonBytes, _ := json.Marshal(result)
+	return mcp.NewToolResultText(string(jsonBytes)), nil
+}
+
+func (t *Tools) handleGetSymbolSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if err := t.requireIndexed(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	file, _ := req.GetArguments()["file"].(string)
+
+	summary := t.graph.SymbolSummary(file)
+	jsonBytes, _ := json.Marshal(summary)
 	return mcp.NewToolResultText(string(jsonBytes)), nil
 }

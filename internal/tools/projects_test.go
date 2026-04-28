@@ -82,8 +82,7 @@ func TestGameOperatorOverloads(t *testing.T) {
 		t.Fatalf("search failed: %s", textContent(result))
 	}
 
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 	t.Logf("Operators found: %d", len(symbols))
 	for _, s := range symbols {
 		t.Logf("  %s (parent=%s)", s.Name, s.Parent)
@@ -99,8 +98,7 @@ func TestGameCallGraph(t *testing.T) {
 
 	// Find main and check callees.
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "^main$", "kind": "function"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("could not find main()")
@@ -125,8 +123,7 @@ func TestGameMermaid(t *testing.T) {
 
 	// Generate call graph for Player::update.
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "Player::update", "kind": "method"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	// Find Player's update — could be in .cpp (qualified method) or .h (inline).
 	var playerUpdateID string
@@ -179,8 +176,7 @@ func TestDataStructsNestedTypes(t *testing.T) {
 		t.Fatalf("search failed: %s", textContent(result))
 	}
 
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	found := false
 	for _, s := range symbols {
@@ -198,8 +194,7 @@ func TestDataStructsIteratorClass(t *testing.T) {
 	tools := analyzeProject(t, "datastructs")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "Iterator"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	found := false
 	for _, s := range symbols {
@@ -217,8 +212,7 @@ func TestDataStructsOperators(t *testing.T) {
 	tools := analyzeProject(t, "datastructs")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "operator"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	t.Logf("Data structure operators: %d", len(symbols))
 	if len(symbols) < 5 {
@@ -238,8 +232,7 @@ func TestEventsTypedefs(t *testing.T) {
 
 	// Should find EventCallback (C-style typedef) and EventHandler (using alias).
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "Event", "kind": "typedef"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	names := make(map[string]bool)
 	for _, s := range symbols {
@@ -259,8 +252,7 @@ func TestEventsEnumClass(t *testing.T) {
 	tools := analyzeProject(t, "events")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "EventType"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("expected EventType enum class")
@@ -293,8 +285,7 @@ func TestEventsLambdaCallEdges(t *testing.T) {
 
 	// main() should have many callees including lambda invocations.
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "^main$", "kind": "function"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("could not find main()")
@@ -322,8 +313,7 @@ func TestModernAutoReturnTypes(t *testing.T) {
 
 	// makeGreeting has trailing return type.
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "makeGreeting"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("expected makeGreeting function")
@@ -334,7 +324,7 @@ func TestModernAutoReturnTypes(t *testing.T) {
 
 	// square has deduced auto return.
 	result = callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "^square$"})
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols = unmarshalSearchResults(t, result)
 	if len(symbols) == 0 {
 		t.Fatal("expected square function")
 	}
@@ -344,8 +334,7 @@ func TestModernUsingAliases(t *testing.T) {
 	tools := analyzeProject(t, "modern")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"kind": "typedef"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	names := make(map[string]bool)
 	for _, s := range symbols {
@@ -365,8 +354,7 @@ func TestModernScopedEnums(t *testing.T) {
 	tools := analyzeProject(t, "modern")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "LogLevel"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("expected LogLevel enum class")
@@ -380,8 +368,7 @@ func TestModernNestedNamespace(t *testing.T) {
 	tools := analyzeProject(t, "modern")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "Settings"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("expected Settings struct")
@@ -398,8 +385,7 @@ func TestModernConstexpr(t *testing.T) {
 	tools := analyzeProject(t, "modern")
 
 	result := callTool(t, tools, tools.handleSearchSymbols, map[string]any{"query": "factorial"})
-	var symbols []symbolResult
-	json.Unmarshal([]byte(textContent(result)), &symbols)
+	symbols := unmarshalSearchResults(t, result)
 
 	if len(symbols) == 0 {
 		t.Fatal("expected factorial constexpr function")
