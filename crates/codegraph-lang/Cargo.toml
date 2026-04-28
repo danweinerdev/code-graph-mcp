@@ -11,3 +11,5 @@ description = "LanguagePlugin trait and LanguageRegistry for dispatching parsers
 workspace = true
 
 [dependencies]
+codegraph-core = { path = "../codegraph-core" }
+thiserror = { workspace = true }

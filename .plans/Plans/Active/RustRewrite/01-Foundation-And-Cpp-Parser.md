@@ -19,7 +19,7 @@ tasks:
     verification: "Language enum (Cpp/Rust/Go/Python) serializes to lowercase strings; SymbolKind covers Function/Method/Class/Struct/Enum/Typedef/Interface/Trait — Interface and Trait added now (not deferred); EdgeKind covers Calls/Includes/Inherits; Symbol carries `language` field plus all Go fields with `#[serde(skip_serializing_if = \"String::is_empty\")]` on namespace and parent so empty fields omit cleanly; SymbolId helper produces `path:Name` for free symbols and `path:Parent::Name` for methods identical to Go; round-trip JSON tests cover every kind"
   - id: "1.3"
     title: "LanguagePlugin trait, LanguageRegistry, RootConfig"
-    status: planned
+    status: complete
     depends_on: ["1.2"]
     verification: "LanguagePlugin trait is object-safe (Box<dyn LanguagePlugin> compiles); Registry::for_path returns the right plugin for known extensions and None for unknown; duplicate-extension registration returns an error; RootConfig::load(root) returns Default for missing file, parsed value for valid TOML, ConfigError for malformed TOML (no silent fallback); resolve_concurrency() clamps `max_threads` to available_parallelism() and emits a clamp warning, treats 0 as auto, returns warnings list; tests cover missing file, valid file with auto values, valid file with over-cap values, and malformed TOML"
   - id: "1.4"
@@ -78,13 +78,13 @@ The phase deliberately bundles foundation and C++ work because the foundation is
 ## 1.3: LanguagePlugin trait, LanguageRegistry, RootConfig
 
 ### Subtasks
-- [ ] `LanguagePlugin` trait in `codegraph-lang` with `id`, `extensions`, `parse_file`, `resolve_call` (default impl), `resolve_include` (default impl), `close`
-- [ ] Trait is `Send + Sync` and object-safe (proven by `Box<dyn LanguagePlugin>` compiling)
-- [ ] `LanguageRegistry` with `register`, `for_path`, `language_for_path`, `plugin_for(Language)`; duplicate registration returns error
-- [ ] `RootConfig` (in `codegraph-core::config`) with `[discovery]` and `[parsing]` sections; both have `max_threads`, plus discovery gets `respect_gitignore`, `follow_symlinks`, `extra_ignore`
-- [ ] `RootConfig::load(root)` reads `<root>/.code-graph.toml`; returns `Ok(Default)` if missing; returns `Err(ConfigError::Toml)` on parse failure
-- [ ] `RootConfig::resolve_concurrency()` clamps `max_threads` to `std::thread::available_parallelism()`; treats 0 as auto; returns a `Vec<String>` of clamp warnings
-- [ ] Tests: missing file → default; valid auto config; valid pinned-value config; over-cap config (warning emitted, value clamped); malformed TOML (parse error returned, no fallback)
+- [x] `LanguagePlugin` trait in `codegraph-lang` with `id`, `extensions`, `parse_file`, `resolve_call` (default impl), `resolve_include` (default impl), `close`
+- [x] Trait is `Send + Sync` and object-safe (proven by `Box<dyn LanguagePlugin>` compiling)
+- [x] `LanguageRegistry` with `register`, `for_path`, `language_for_path`, `plugin_for(Language)`; duplicate registration returns error
+- [x] `RootConfig` (in `codegraph-core::config`) with `[discovery]` and `[parsing]` sections; both have `max_threads`, plus discovery gets `respect_gitignore`, `follow_symlinks`, `extra_ignore`
+- [x] `RootConfig::load(root)` reads `<root>/.code-graph.toml`; returns `Ok(Default)` if missing; returns `Err(ConfigError::Toml)` on parse failure
+- [x] `RootConfig::resolve_concurrency()` clamps `max_threads` to `std::thread::available_parallelism()`; treats 0 as auto; returns a `Vec<String>` of clamp warnings
+- [x] Tests: missing file → default; valid auto config; valid pinned-value config; over-cap config (warning emitted, value clamped); malformed TOML (parse error returned, no fallback)
 
 ### Notes
 The TOML loader fails the entire `analyze_codebase` call on parse error rather than silently falling back to defaults — this is a deliberate decision from the design (Decision 8 / Risks table). A typo in a thread-count is the kind of silent perf-degradation that wastes hours; the explicit error is worth the rare friction.
