@@ -6,7 +6,8 @@ PLATFORM := $(GOOS)-$(GOARCH)
 
 PLATFORMS := linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
 
-.PHONY: build build-all $(PLATFORMS) test test-integration vet clean
+.PHONY: build build-all $(PLATFORMS) test test-integration vet clean \
+	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 build: $(PLATFORM)
 
@@ -76,3 +77,27 @@ vet:
 
 clean:
 	rm -rf bin/
+
+# ---- Rust workspace targets (Phase 1+ rewrite) -------------------------
+# These coexist with the Go targets above. The Go tree is removed in
+# Phase 4 of the RustRewrite plan; until then both build systems live
+# side-by-side. All Rust recipes are prefixed `rust-` to avoid colliding
+# with the existing Go `build`/`test`/`vet`/`clean` targets.
+
+rust-build:
+	cargo build --workspace
+
+rust-test:
+	cargo test --workspace
+
+rust-lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+rust-fmt:
+	cargo fmt --all
+
+rust-fmt-check:
+	cargo fmt --all --check
+
+rust-clean:
+	cargo clean

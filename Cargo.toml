@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/code-graph-mcp",
+    "crates/codegraph-core",
+    "crates/codegraph-lang",
+    "crates/codegraph-graph",
+    "crates/codegraph-tools",
+    "crates/codegraph-lang-cpp",
+    "crates/codegraph-lang-rust",
+    "crates/codegraph-lang-go",
+    "crates/codegraph-lang-python",
+    "crates/codegraph-parse-test",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/danielwco/code-graph-mcp"
+rust-version = "1.84"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

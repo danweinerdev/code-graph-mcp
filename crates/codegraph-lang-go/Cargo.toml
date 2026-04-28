@@ -1,0 +1,13 @@
+[package]
+name = "codegraph-lang-go"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Go language plugin (tree-sitter-go) for code-graph-mcp (placeholder for Phase 6)"
+
+[lints]
+workspace = true
+
+[dependencies]

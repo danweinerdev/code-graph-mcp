@@ -1,0 +1,13 @@
+[package]
+name = "codegraph-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared types for the code-graph-mcp workspace (Symbol, Edge, FileGraph, Language, RootConfig)"
+
+[lints]
+workspace = true
+
+[dependencies]

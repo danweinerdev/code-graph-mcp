@@ -1,0 +1,13 @@
+[package]
+name = "codegraph-lang-python"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Python language plugin (tree-sitter-python) for code-graph-mcp (placeholder for Phase 7)"
+
+[lints]
+workspace = true
+
+[dependencies]
