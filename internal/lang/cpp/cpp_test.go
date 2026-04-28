@@ -1,7 +1,9 @@
 package cpp
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/danweinerdev/code-graph-mcp/internal/parser"
 )
@@ -325,6 +327,70 @@ func TestSignatureTruncation(t *testing.T) {
 	}
 	if len(s.Signature) > 210 {
 		t.Errorf("signature should be truncated, got length %d", len(s.Signature))
+	}
+}
+
+// TestTruncateSignatureByteFallback exercises the byte-limit path of
+// truncateSignature directly: a string with no '{' or ';' before byte 200.
+func TestTruncateSignatureByteFallback(t *testing.T) {
+	long := strings.Repeat("a", 250)
+	got := truncateSignature(long)
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("expected trailing '...', got %q", got)
+	}
+	if len(got) > 210 {
+		t.Errorf("expected length <= 210, got %d", len(got))
+	}
+}
+
+// TestTruncateSignatureUTF8Boundary verifies that the byte fallback never
+// slices through a multi-byte rune. The cut point must land on a rune boundary.
+func TestTruncateSignatureUTF8Boundary(t *testing.T) {
+	// 199 ASCII bytes, then 'é' (0xC3 0xA9) starting at byte 199. The next
+	// rune boundary after byte 200 is at byte 201; truncateSignature must
+	// cut at 201, not 200.
+	input := strings.Repeat("a", 199) + "é" + strings.Repeat("b", 100)
+	got := truncateSignature(input)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncated signature is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("expected trailing '...', got %q", got)
+	}
+}
+
+func TestSignatureTruncatedAtBrace(t *testing.T) {
+	// Body contents must not appear in the signature.
+	src := `void hello() { int x = 1; doStuff(x); return; }`
+	fg := parse(t, src)
+	s := findSymbol(fg, "hello")
+	if s == nil {
+		t.Fatal("expected symbol")
+	}
+	if strings.Contains(s.Signature, "{") {
+		t.Errorf("signature should be truncated at '{', got %q", s.Signature)
+	}
+	if strings.Contains(s.Signature, "doStuff") {
+		t.Errorf("signature should not contain body, got %q", s.Signature)
+	}
+}
+
+func TestSignatureClassBodyTruncated(t *testing.T) {
+	// Class signatures should not include the body.
+	src := `class Engine {
+public:
+    void update();
+    void render();
+private:
+    int state;
+};`
+	fg := parse(t, src)
+	s := findSymbol(fg, "Engine")
+	if s == nil {
+		t.Fatal("expected symbol Engine")
+	}
+	if strings.Contains(s.Signature, "{") {
+		t.Errorf("class signature should be truncated at '{', got %q", s.Signature)
 	}
 }
 

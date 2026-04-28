@@ -58,7 +58,7 @@ AI Agent ←─ stdio/MCP ─→ code-graph-mcp
                     ┌─────────┴─────────┐
                     │                   │
               Tool Handlers       Graph Engine
-              (14 tools)         (in-memory graph)
+              (15 tools)         (in-memory graph)
                     │                   │
               Parser Registry     Nodes + Edges
                     │             + Algorithms
@@ -70,7 +70,7 @@ AI Agent ←─ stdio/MCP ─→ code-graph-mcp
 
 1. **Index** — `analyze_codebase` walks a directory, parses source files with tree-sitter, extracts symbols (functions, classes, etc.) and relationships (calls, includes, inheritance), resolves names, and builds an in-memory directed graph.
 
-2. **Query** — 13 query/visualization tools let the agent explore the graph: find callers, trace call chains, detect cycles, find orphaned code, visualize dependencies.
+2. **Query** — 14 query/visualization tools let the agent explore the graph: find callers, trace call chains, detect cycles, find orphaned code, visualize dependencies.
 
 3. **Watch** — Optional file watcher auto-reindexes changed files in real time.
 
@@ -88,11 +88,14 @@ The index is cached to `.code-graph-cache.json` in the indexed directory. On sub
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `get_file_symbols` | List all symbols defined in a file | `file`: absolute file path |
-| `search_symbols` | Search symbols by name pattern | `query`: substring or regex; `kind` (optional): function, method, class, struct, enum, typedef |
+| `get_file_symbols` | List all symbols defined in a file | `file`: absolute file path; `top_level_only` (optional): exclude nested methods/types; `brief` (optional): omit signature/column/end_line |
+| `search_symbols` | Search symbols by name pattern (paginated, brief by default) | `query` / `kind` / `namespace` (at least one required); `limit` (default 20); `offset` (default 0); `brief` (default true) |
 | `get_symbol_detail` | Get full details for a symbol | `symbol`: symbol ID (`file:name`) |
+| `get_symbol_summary` | Count symbols grouped by namespace and kind | (none) |
 
 Symbol IDs are in the format `file:name` for free functions or `file:Parent::name` for methods (e.g., `/path/engine.cpp:Engine::update`). They are returned by `get_file_symbols` and `search_symbols` for use in other queries.
+
+`search_symbols` returns a paginated envelope: `{"results": [...], "total": N, "offset": X, "limit": Y}`. In `brief` mode (default), each result contains `id`, `name`, `kind`, `file`, `line`, `namespace`, `parent` — call `get_symbol_detail` for the full signature and source span.
 
 ### Call Graph
 
@@ -115,7 +118,7 @@ Depth > 1 traces transitive callers/callees via BFS. Cycles are handled safely.
 |------|-------------|------------|
 | `detect_cycles` | Find circular include/import dependencies | (none) |
 | `get_orphans` | Find symbols with no callers | `kind` (optional): filter by symbol kind |
-| `get_class_hierarchy` | Get inheritance tree (bases + derived) | `class`: class name |
+| `get_class_hierarchy` | Get inheritance tree (bases + derived) | `class`: class name; `depth` (optional, default 1) |
 | `get_coupling` | Count cross-file dependencies | `file`: absolute file path; `direction` (optional): `outgoing`, `incoming`, or `both` |
 
 ### Visualization

@@ -38,7 +38,7 @@ func (t *Tools) handleGetOrphans(ctx context.Context, req mcp.CallToolRequest) (
 	orphans := t.graph.Orphans(kind)
 	results := make([]symbolResult, len(orphans))
 	for i, s := range orphans {
-		results[i] = symbolToResult(s)
+		results[i] = symbolToResult(s, true)
 	}
 
 	jsonBytes, _ := json.Marshal(results)
@@ -55,7 +55,12 @@ func (t *Tools) handleGetClassHierarchy(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("'class' is required"), nil
 	}
 
-	h := t.graph.ClassHierarchy(class)
+	depth := 1
+	if d, ok := req.GetArguments()["depth"].(float64); ok && d > 0 {
+		depth = int(d)
+	}
+
+	h := t.graph.ClassHierarchy(class, depth)
 	if h == nil {
 		msg := fmt.Sprintf("class not found: %q", class)
 		if suggestions := t.suggestSymbols(class, 5); suggestions != "" {

@@ -1,9 +1,9 @@
 ---
 title: "LLM-Optimized Query Output"
 type: design
-status: draft
+status: implemented
 created: 2026-03-23
-updated: 2026-03-23
+updated: 2026-04-28
 tags: [optimization, llm, token-efficiency, usability]
 related: [Designs/CodeGraphMCP]
 ---
@@ -130,11 +130,11 @@ type symbolResult struct {
 
 **Problem:** Returns all symbols including nested structs, methods, typedefs. Noisy when you want the class-level overview.
 
-**Change:** Add `top_level_only` boolean parameter (default `false`). When true, filter to symbols where `Parent == ""`.
+**Change:** Add `top_level_only` boolean parameter (default `false`). When true, filter to symbols where `Parent == ""`. Also adds `brief` parameter (default `true`) consistent with Decision 1 — `get_file_symbols` is LLM-facing too.
 
 **Implementation:**
-- Add param to tool registration
-- In `handleGetFileSymbols`, filter results where `Parent == ""`
+- Add `top_level_only` and `brief` params to tool registration
+- In `handleGetFileSymbols`, filter results where `Parent == ""`; pass `brief` through to `symbolToResult`
 - This is a handler-level filter — no graph engine change needed
 
 **Affected files:** `internal/tools/symbols.go`, `internal/tools/tools.go`
@@ -164,7 +164,8 @@ type symbolResult struct {
 
 **Graph method:**
 ```go
-func (g *Graph) SymbolSummary() map[string]map[SymbolKind]int
+// file is optional; pass "" for whole-graph summary.
+func (g *Graph) SymbolSummary(file string) map[string]map[SymbolKind]int
 ```
 
 **Affected files:** `internal/graph/graph.go`, `internal/tools/symbols.go`, `internal/tools/tools.go`
@@ -254,3 +255,14 @@ All changes are backward-compatible additions (new parameters with defaults that
 5. Top-level filter — handler change
 6. Symbol summary — new tool
 7. Hierarchy depth — graph + handler change
+
+---
+
+## Post-implementation fixes
+
+Issues caught in code review and fixed in the same diff:
+
+- **`truncateSignature` UTF-8 boundary** — fallback used `s[:200]`, which sliced through multi-byte runes. Fixed to `s[:i] + "..."` (`i` is always a rune boundary).
+- **`buildHierarchy` diamond inheritance** — a global `visited` map caused shared ancestors to be stubbed on the second branch. Replaced with per-DFS-path tracking so siblings each fully expand a shared ancestor; true cycles are still broken.
+- **`handleGetFileSymbols` `null` vs `[]`** — uninitialized slice serialized as `null` when filtered to empty. Now uses `make([]symbolResult, 0, len(symbols))`.
+- **`suggestSymbols` candidate cap** — `Search` defaults `Limit` to 20, which silently shrank the pre-existing 100-candidate pool used by did-you-mean. Now passes `Limit: 100` explicitly.

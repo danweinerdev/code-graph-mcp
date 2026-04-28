@@ -3,6 +3,7 @@ package graph
 import (
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -205,46 +206,117 @@ func (g *Graph) SymbolDetail(symbolID string) *parser.Symbol {
 	return nil
 }
 
-// SearchSymbols finds symbols matching a pattern, optionally filtered by kind.
+// SearchParams holds parameters for SearchSymbols.
+type SearchParams struct {
+	Pattern   string
+	Kind      parser.SymbolKind
+	Namespace string // substring filter on Symbol.Namespace
+	Limit     int    // max results (default 20)
+	Offset    int    // skip first N matches
+}
+
+// SearchResult holds paginated search results.
+type SearchResult struct {
+	Symbols []parser.Symbol
+	Total   int // total matches before limit/offset
+}
+
+// SearchSymbols finds symbols matching a pattern with optional filters.
 // The pattern is tried as a regex first; if it fails to compile, it's used as
-// a case-insensitive substring match. Results are capped at 100.
+// a case-insensitive substring match.
 func (g *Graph) SearchSymbols(pattern string, kind parser.SymbolKind) []parser.Symbol {
+	r := g.Search(SearchParams{Pattern: pattern, Kind: kind})
+	return r.Symbols
+}
+
+// Search performs a filtered, paginated symbol search.
+func (g *Graph) Search(params SearchParams) SearchResult {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	re, err := regexp.Compile("(?i)" + pattern)
-	if err != nil {
-		re = nil
+	if params.Limit <= 0 {
+		params.Limit = 20
 	}
 
-	lowerPattern := strings.ToLower(pattern)
-	var result []parser.Symbol
+	var re *regexp.Regexp
+	var lowerPattern string
+	if params.Pattern != "" {
+		var err error
+		re, err = regexp.Compile("(?i)" + params.Pattern)
+		if err != nil {
+			re = nil
+		}
+		lowerPattern = strings.ToLower(params.Pattern)
+	}
 
+	lowerNS := strings.ToLower(params.Namespace)
+
+	// Collect all matches first so pagination order is stable.
+	var matches []parser.Symbol
 	for _, n := range g.nodes {
-		if kind != "" && n.Symbol.Kind != kind {
+		if params.Kind != "" && n.Symbol.Kind != params.Kind {
 			continue
 		}
 
-		fullName := n.Symbol.Name
-		if n.Symbol.Parent != "" {
-			fullName = n.Symbol.Parent + "::" + n.Symbol.Name
+		if lowerNS != "" && !strings.Contains(strings.ToLower(n.Symbol.Namespace), lowerNS) {
+			continue
 		}
 
-		matched := false
-		if re != nil {
-			matched = re.MatchString(fullName)
-		} else {
-			matched = strings.Contains(strings.ToLower(fullName), lowerPattern)
-		}
+		if params.Pattern != "" {
+			fullName := n.Symbol.Name
+			if n.Symbol.Parent != "" {
+				fullName = n.Symbol.Parent + "::" + n.Symbol.Name
+			}
 
-		if matched {
-			result = append(result, n.Symbol)
-			if len(result) >= 100 {
-				break
+			matched := false
+			if re != nil {
+				matched = re.MatchString(fullName)
+			} else {
+				matched = strings.Contains(strings.ToLower(fullName), lowerPattern)
+			}
+			if !matched {
+				continue
 			}
 		}
+
+		matches = append(matches, n.Symbol)
 	}
-	return result
+
+	sort.Slice(matches, func(i, j int) bool {
+		return SymbolID(matches[i]) < SymbolID(matches[j])
+	})
+
+	total := len(matches)
+	start := params.Offset
+	if start > total {
+		start = total
+	}
+	end := start + params.Limit
+	if end > total {
+		end = total
+	}
+
+	return SearchResult{Symbols: matches[start:end], Total: total}
+}
+
+// SymbolSummary returns symbol counts grouped by namespace and kind.
+// If file is non-empty, only symbols from that file are counted.
+func (g *Graph) SymbolSummary(file string) map[string]map[parser.SymbolKind]int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	summary := make(map[string]map[parser.SymbolKind]int)
+	for _, n := range g.nodes {
+		if file != "" && n.Symbol.File != file {
+			continue
+		}
+		ns := n.Symbol.Namespace
+		if summary[ns] == nil {
+			summary[ns] = make(map[parser.SymbolKind]int)
+		}
+		summary[ns][n.Symbol.Kind]++
+	}
+	return summary
 }
 
 // Callers returns symbols that call the given symbol, up to the given depth.
@@ -355,42 +427,62 @@ func (g *Graph) Orphans(kind parser.SymbolKind) []parser.Symbol {
 }
 
 // ClassHierarchy returns an inheritance tree for the given class name.
+// depth controls how many levels to traverse (default 1 = direct only).
 // Returns nil if the class is not found.
-func (g *Graph) ClassHierarchy(className string) *HierarchyNode {
+func (g *Graph) ClassHierarchy(className string, depth int) *HierarchyNode {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	// Find the class node by name (search all nodes).
-	var classID string
-	for id, n := range g.nodes {
+	// Verify the class exists.
+	found := false
+	for _, n := range g.nodes {
 		if n.Symbol.Name == className &&
 			(n.Symbol.Kind == parser.KindClass || n.Symbol.Kind == parser.KindStruct) {
-			classID = id
+			found = true
 			break
 		}
 	}
-	if classID == "" {
+	if !found {
 		return nil
 	}
 
-	root := &HierarchyNode{Name: className}
+	if depth <= 0 {
+		depth = 1
+	}
 
-	// Inheritance edges are keyed by class name (not symbol ID) in adj/radj.
-	// Walk upward for base classes.
-	for _, entry := range g.adj[className] {
+	return g.buildHierarchy(className, depth, make(map[string]bool))
+}
+
+// buildHierarchy walks inheritance edges in both directions up to depth levels.
+// onPath tracks the current DFS stack to break true cycles; siblings (e.g.,
+// diamond inheritance) can each fully expand a shared ancestor.
+func (g *Graph) buildHierarchy(name string, depth int, onPath map[string]bool) *HierarchyNode {
+	if onPath[name] {
+		return &HierarchyNode{Name: name}
+	}
+
+	node := &HierarchyNode{Name: name}
+
+	if depth <= 0 {
+		return node
+	}
+
+	onPath[name] = true
+	defer delete(onPath, name)
+
+	for _, entry := range g.adj[name] {
 		if entry.Kind == parser.EdgeInherits {
-			root.Bases = append(root.Bases, &HierarchyNode{Name: entry.Target})
+			node.Bases = append(node.Bases, g.buildHierarchy(entry.Target, depth-1, onPath))
 		}
 	}
 
-	// Walk downward for derived classes.
-	for _, entry := range g.radj[className] {
+	for _, entry := range g.radj[name] {
 		if entry.Kind == parser.EdgeInherits {
-			root.Derived = append(root.Derived, &HierarchyNode{Name: entry.Target})
+			node.Derived = append(node.Derived, g.buildHierarchy(entry.Target, depth-1, onPath))
 		}
 	}
 
-	return root
+	return node
 }
 
 // Coupling returns a map of other file paths to the number of cross-file
