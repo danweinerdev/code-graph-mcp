@@ -1,11 +1,16 @@
 //! Shared types for the code-graph-mcp workspace.
 //!
 //! These mirror the canonical Go types in `internal/parser/types.go` and
-//! `internal/graph/graph.go` so the JSON wire format stays identical and
-//! existing agent prompts continue to work unchanged. The one intentional
-//! addition here is the [`Language`] field on [`Symbol`] (and [`FileGraph`]),
-//! which the multi-language Rust rewrite needs for cheap full-graph queries
-//! and language-scoped resolution.
+//! `internal/graph/graph.go`. The JSON wire format **adds** a `language`
+//! field to [`Symbol`] and [`FileGraph`] versus the Go binary's shape; all
+//! other fields and JSON tags match Go exactly so MCP tool responses stay
+//! backward-compatible for agents that only read the existing fields.
+//!
+//! These types are **not** designed to deserialize Go-produced cache files.
+//! `Symbol` and `FileGraph` require `language`, which Go output does not
+//! produce. Phase 4 of the Rust rewrite bumps the on-disk cache format to
+//! v2; older Go-written caches are detected by the version tag and trigger
+//! a silent re-index rather than being parsed.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// so cross-language queries can filter by language without parsing paths.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Language {
     Cpp,
     Rust,
@@ -25,6 +31,7 @@ pub enum Language {
 /// require a JSON-format bump.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SymbolKind {
     Function,
     Method,
@@ -39,6 +46,7 @@ pub enum SymbolKind {
 /// Kind of edge in the code graph.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum EdgeKind {
     Calls,
     Includes,
@@ -358,5 +366,24 @@ mod tests {
             language: Language::Cpp,
         };
         assert_eq!(symbol_id(&s), "src/widget.cpp:Widget::do_it");
+    }
+
+    #[test]
+    fn symbol_id_ignores_namespace_when_parent_empty() {
+        // Go's graph.SymbolID only branches on Parent — a populated namespace
+        // with empty parent must still produce "file:Name", not "file:ns::Name".
+        let s = Symbol {
+            name: "free_in_ns".to_string(),
+            kind: SymbolKind::Function,
+            file: "src/util.cpp".to_string(),
+            line: 5,
+            column: 0,
+            end_line: 7,
+            signature: "void acme::free_in_ns()".to_string(),
+            namespace: "acme".to_string(),
+            parent: String::new(),
+            language: Language::Cpp,
+        };
+        assert_eq!(symbol_id(&s), "src/util.cpp:free_in_ns");
     }
 }
