@@ -30,11 +30,11 @@ use codegraph_core::{symbol_id, EdgeKind, FileGraph, Language, Symbol, SymbolId}
 ///   `adj`/`radj` because include edges are file-to-file, not symbol-to-symbol)
 #[derive(Debug, Default)]
 pub struct Graph {
-    nodes: HashMap<SymbolId, Node>,
-    adj: HashMap<SymbolId, Vec<EdgeEntry>>,
-    radj: HashMap<SymbolId, Vec<EdgeEntry>>,
-    files: HashMap<PathBuf, FileEntry>,
-    includes: HashMap<PathBuf, Vec<PathBuf>>,
+    pub(crate) nodes: HashMap<SymbolId, Node>,
+    pub(crate) adj: HashMap<SymbolId, Vec<EdgeEntry>>,
+    pub(crate) radj: HashMap<SymbolId, Vec<EdgeEntry>>,
+    pub(crate) files: HashMap<PathBuf, FileEntry>,
+    pub(crate) includes: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 /// Wrapper around a [`Symbol`] stored in the graph. Mirrors Go's `Node`.

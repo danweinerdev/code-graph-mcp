@@ -10,5 +10,7 @@
 //! diamond-safe class hierarchy, coupling, and the Mermaid renderer.
 
 pub mod graph;
+mod queries;
 
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
+pub use queries::{SearchParams, SearchResult};
