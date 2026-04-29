@@ -140,8 +140,12 @@ dependencies = [
  "codegraph-core",
  "indexmap",
  "parking_lot",
+ "pretty_assertions",
  "regex",
  "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

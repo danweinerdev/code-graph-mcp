@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use codegraph_core::{symbol_id, EdgeKind, FileGraph, Language, Symbol, SymbolId};
+use serde::{Deserialize, Serialize};
 
 /// In-memory directed graph of code symbols.
 ///
@@ -38,7 +39,12 @@ pub struct Graph {
 }
 
 /// Wrapper around a [`Symbol`] stored in the graph. Mirrors Go's `Node`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are derived so callers can round-trip a `Node`
+/// directly when convenient. Cache v2 (`persist.rs`) does not use them — it
+/// flattens to `HashMap<SymbolId, Symbol>` to match the Go cache shape — but
+/// other persistence layers may.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub symbol: Symbol,
 }
@@ -47,7 +53,10 @@ pub struct Node {
 /// adjacency list. Mirrors Go's `EdgeEntry`. The `target` is the *other end*
 /// of the edge from the map key's perspective: in `adj[from]` it is the
 /// destination; in `radj[to]` it is the origin.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PathBuf`'s default serde impl serializes as a string on Unix (and a
+/// best-effort string on Windows), which is what cache v2 expects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EdgeEntry {
     pub target: SymbolId,
     pub kind: EdgeKind,
@@ -59,7 +68,7 @@ pub struct EdgeEntry {
 /// `map[string][]string` (path → symbol IDs); the Rust port also captures
 /// the source [`Language`] so cache v2 (Phase 3) can persist it without
 /// re-deriving from the path extension.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub language: Language,
     pub symbol_ids: Vec<SymbolId>,

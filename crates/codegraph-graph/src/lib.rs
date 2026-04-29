@@ -13,6 +13,7 @@ mod algorithms;
 mod callgraph;
 mod diagrams;
 pub mod graph;
+pub mod persist;
 mod queries;
 
 #[cfg(test)]
@@ -22,6 +23,7 @@ pub use algorithms::HierarchyNode;
 pub use callgraph::CallChain;
 pub use diagrams::{DiagramEdge, DiagramResult};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
+pub use persist::{cache_path, stale_paths, PersistError};
 pub use queries::{SearchParams, SearchResult};
 
 /// Re-export of [`parking_lot::RwLock`] so downstream callers (e.g. the
