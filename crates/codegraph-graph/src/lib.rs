@@ -14,6 +14,9 @@ mod callgraph;
 pub mod graph;
 mod queries;
 
+#[cfg(test)]
+mod test_fixtures;
+
 pub use algorithms::HierarchyNode;
 pub use callgraph::CallChain;
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};

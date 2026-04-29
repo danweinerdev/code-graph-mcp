@@ -248,66 +248,8 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codegraph_core::{Edge, SymbolKind};
-
-    fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind,
-            file: file.to_string(),
-            line: 1,
-            column: 0,
-            end_line: 1,
-            signature: String::new(),
-            namespace: String::new(),
-            parent: String::new(),
-            language: Language::Cpp,
-        }
-    }
-
-    fn call_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Calls,
-            file: file.to_string(),
-            line: 1,
-        }
-    }
-
-    fn include_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Includes,
-            file: file.to_string(),
-            line: 1,
-        }
-    }
-
-    fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Inherits,
-            file: file.to_string(),
-            line: 0,
-        }
-    }
-
-    fn make_fg(
-        path: &str,
-        language: Language,
-        symbols: Vec<Symbol>,
-        edges: Vec<Edge>,
-    ) -> FileGraph {
-        FileGraph {
-            path: path.to_string(),
-            language,
-            symbols,
-            edges,
-        }
-    }
+    use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
+    use codegraph_core::SymbolKind;
 
     #[test]
     fn merge_one_file_adds_nodes_and_edges() {
@@ -320,7 +262,7 @@ mod tests {
                 sym("bar", SymbolKind::Function, "/a.cpp"),
             ],
             vec![
-                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp"),
+                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1),
                 include_edge("/a.cpp", "/utils.h", "/a.cpp"),
             ],
         );
@@ -433,7 +375,7 @@ mod tests {
                 sym("b", SymbolKind::Function, "/a.cpp"),
                 sym("c", SymbolKind::Function, "/a.cpp"),
             ],
-            vec![call_edge("/a.cpp:a", "/a.cpp:b", "/a.cpp")],
+            vec![call_edge("/a.cpp:a", "/a.cpp:b", "/a.cpp", 1)],
         ));
         assert_eq!(g.adj()["/a.cpp:a"][0].target, "/a.cpp:b");
         assert!(g.radj().contains_key("/a.cpp:b"));
@@ -447,7 +389,7 @@ mod tests {
                 sym("b", SymbolKind::Function, "/a.cpp"),
                 sym("c", SymbolKind::Function, "/a.cpp"),
             ],
-            vec![call_edge("/a.cpp:a", "/a.cpp:c", "/a.cpp")],
+            vec![call_edge("/a.cpp:a", "/a.cpp:c", "/a.cpp", 1)],
         ));
 
         // Stale edge gone, new edge present, no doubling.
@@ -471,7 +413,7 @@ mod tests {
             Language::Cpp,
             vec![sym("foo", SymbolKind::Function, "/a.cpp")],
             vec![
-                call_edge("/a.cpp:foo", "/b.cpp:bar", "/a.cpp"),
+                call_edge("/a.cpp:foo", "/b.cpp:bar", "/a.cpp", 1),
                 include_edge("/a.cpp", "/utils.h", "/a.cpp"),
             ],
         ));
@@ -479,7 +421,7 @@ mod tests {
             "/b.cpp",
             Language::Cpp,
             vec![sym("bar", SymbolKind::Function, "/b.cpp")],
-            vec![call_edge("/b.cpp:bar", "/b.cpp:helper", "/b.cpp")],
+            vec![call_edge("/b.cpp:bar", "/b.cpp:helper", "/b.cpp", 1)],
         ));
 
         let path_a = PathBuf::from("/a.cpp");
@@ -616,7 +558,7 @@ mod tests {
                 sym("baz", SymbolKind::Function, "/a.cpp"),
             ],
             vec![
-                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp"),
+                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1),
                 include_edge("/a.cpp", "/utils.h", "/a.cpp"),
             ],
         );

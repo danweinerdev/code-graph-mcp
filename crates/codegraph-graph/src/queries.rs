@@ -217,48 +217,8 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codegraph_core::{Edge, FileGraph};
+    use crate::test_fixtures::{make_fg, sym, sym_full};
     use std::path::PathBuf;
-
-    fn sym_full(
-        name: &str,
-        kind: SymbolKind,
-        file: &str,
-        namespace: &str,
-        parent: &str,
-        language: Language,
-    ) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind,
-            file: file.to_string(),
-            line: 1,
-            column: 0,
-            end_line: 1,
-            signature: String::new(),
-            namespace: namespace.to_string(),
-            parent: parent.to_string(),
-            language,
-        }
-    }
-
-    fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
-        sym_full(name, kind, file, "", "", Language::Cpp)
-    }
-
-    fn make_fg(
-        path: &str,
-        language: Language,
-        symbols: Vec<Symbol>,
-        edges: Vec<Edge>,
-    ) -> FileGraph {
-        FileGraph {
-            path: path.to_string(),
-            language,
-            symbols,
-            edges,
-        }
-    }
 
     // --- file_symbols ---
 
