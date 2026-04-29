@@ -172,26 +172,60 @@ impl Graph {
 
         on_path.insert(name.to_string());
 
+        // Panic-safe `on_path` cleanup: matches the Go reference's
+        // `defer delete(onPath, name)` semantic. If either recursive
+        // loop below panics, `PopGuard::drop` still runs and removes
+        // `name`, so a sibling DFS path on the unwound stack doesn't
+        // see a stale entry. The workspace uses `panic = unwind`
+        // (default), so this RAII guard is the way to guarantee
+        // unconditional cleanup without `unsafe`.
+        struct PopGuard<'a> {
+            set: &'a mut HashSet<String>,
+            name: String,
+        }
+        impl Drop for PopGuard<'_> {
+            fn drop(&mut self) {
+                self.set.remove(&self.name);
+            }
+        }
+        let guard = PopGuard {
+            set: on_path,
+            name: name.to_string(),
+        };
+
+        // Targets are collected up front so the immutable borrow on
+        // `self.adj` / `self.radj` ends before each recursive call; the
+        // recursion only needs `&self`, but cloning the names releases
+        // the slice borrow and lets the loop pass `guard.set` (auto-
+        // reborrowed as `&mut HashSet<String>`) through the call.
         if let Some(entries) = self.adj.get(name) {
-            for entry in entries {
-                if entry.kind == EdgeKind::Inherits {
-                    node.bases
-                        .push(self.build_hierarchy(&entry.target, depth - 1, on_path));
-                }
+            let bases: Vec<String> = entries
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Inherits)
+                .map(|e| e.target.clone())
+                .collect();
+            for target in bases {
+                node.bases
+                    .push(self.build_hierarchy(&target, depth - 1, guard.set));
             }
         }
 
         if let Some(entries) = self.radj.get(name) {
-            for entry in entries {
-                if entry.kind == EdgeKind::Inherits {
-                    node.derived
-                        .push(self.build_hierarchy(&entry.target, depth - 1, on_path));
-                }
+            let derived: Vec<String> = entries
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Inherits)
+                .map(|e| e.target.clone())
+                .collect();
+            for target in derived {
+                node.derived
+                    .push(self.build_hierarchy(&target, depth - 1, guard.set));
             }
         }
 
-        on_path.remove(name);
-
+        // `guard` drops here, removing `name` from `on_path`. Drop also
+        // runs along the panic unwind path if either recursion above
+        // panicked, which is the whole point of the guard struct.
+        drop(guard);
         node
     }
 }
@@ -343,51 +377,8 @@ fn tarjan_scc(nodes: &HashSet<PathBuf>, adj: &HashMap<PathBuf, Vec<PathBuf>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codegraph_core::{Edge, FileGraph, Language, Symbol};
-
-    fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind,
-            file: file.to_string(),
-            line: 1,
-            column: 0,
-            end_line: 1,
-            signature: String::new(),
-            namespace: String::new(),
-            parent: String::new(),
-            language: Language::Cpp,
-        }
-    }
-
-    fn include_edge(from: &str, to: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Includes,
-            file: from.to_string(),
-            line: 0,
-        }
-    }
-
-    fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Inherits,
-            file: file.to_string(),
-            line: 0,
-        }
-    }
-
-    fn make_fg(path: &str, symbols: Vec<Symbol>, edges: Vec<Edge>) -> FileGraph {
-        FileGraph {
-            path: path.to_string(),
-            language: Language::Cpp,
-            symbols,
-            edges,
-        }
-    }
+    use crate::test_fixtures::{include_edge, inherit_edge, make_fg, sym};
+    use codegraph_core::{Edge, Language};
 
     /// Build a graph whose include map exactly mirrors `edges`. Each
     /// edge must be `(from_file, to_file)`. We synthesize one FileGraph
@@ -405,11 +396,14 @@ mod tests {
                 .push(((*from).to_string(), (*to).to_string()));
         }
         for (from, edges_for_from) in by_source {
+            // Pass `from` as the file argument to match the existing
+            // `algorithms.rs` semantic where each include edge is
+            // attributed to its source file.
             let edge_objs: Vec<Edge> = edges_for_from
                 .iter()
-                .map(|(f, t)| include_edge(f, t))
+                .map(|(f, t)| include_edge(f, t, f))
                 .collect();
-            g.merge_file_graph(make_fg(&from, vec![], edge_objs));
+            g.merge_file_graph(make_fg(&from, Language::Cpp, vec![], edge_objs));
         }
         g
     }
@@ -507,6 +501,40 @@ mod tests {
         );
     }
 
+    /// Exercises the iterative Tarjan branch where a neighbor `w` is
+    /// already visited but **not** on the SCC stack — i.e. it belongs
+    /// to a different, already-emitted SCC. The recursive textbook form
+    /// would update `lowlinks[v] = min(lowlinks[v], indices[w])` only
+    /// when `w` is on the stack; the iterative port at lines 296–298
+    /// of this file relies on the same predicate to avoid corrupting a
+    /// finalized SCC. Without this test, the cross-SCC branch is dark
+    /// code — flipping the `on_stack.contains` check would still pass
+    /// every other Tarjan test in this module.
+    ///
+    /// Fixture:
+    /// ```text
+    ///   /a <-> /b   (cycle)
+    ///   /c  ->  /a  (cross-SCC edge into the cycle)
+    /// ```
+    /// Expected: exactly one SCC of size 2 containing `{/a, /b}`. `/c`
+    /// is acyclic — its size-1 SCC is filtered out by the `len > 1`
+    /// guard.
+    #[test]
+    fn tarjan_cross_scc_edge_not_doubled() {
+        let g = graph_from_includes(&[("/a", "/b"), ("/b", "/a"), ("/c", "/a")]);
+        let cycles = g.detect_cycles();
+        assert_eq!(
+            cycles.len(),
+            1,
+            "cross-SCC edge from /c must not create a second cycle: {cycles:?}",
+        );
+        assert_eq!(cycles[0].len(), 2);
+        assert_eq!(
+            scc_contents(&cycles[0]),
+            vec!["/a".to_string(), "/b".to_string()],
+        );
+    }
+
     // --- class_hierarchy: lookup and kind filter ---
 
     #[test]
@@ -520,6 +548,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![sym("MyStruct", SymbolKind::Struct, "/a.cpp")],
             vec![],
         ));
@@ -535,6 +564,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.rs",
+            Language::Rust,
             vec![sym("MyTrait", SymbolKind::Trait, "/a.rs")],
             vec![],
         ));
@@ -550,6 +580,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.go",
+            Language::Go,
             vec![sym("MyInterface", SymbolKind::Interface, "/a.go")],
             vec![],
         ));
@@ -567,6 +598,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![sym("foo", SymbolKind::Function, "/a.cpp")],
             vec![],
         ));
@@ -584,6 +616,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![
                 sym("Base", SymbolKind::Class, "/a.cpp"),
                 sym("Mid", SymbolKind::Class, "/a.cpp"),
@@ -618,6 +651,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![
                 sym("Base", SymbolKind::Class, "/a.cpp"),
                 sym("Derived", SymbolKind::Class, "/a.cpp"),
@@ -669,6 +703,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![
                 sym("Root", SymbolKind::Class, "/a.cpp"),
                 sym("Base", SymbolKind::Class, "/a.cpp"),

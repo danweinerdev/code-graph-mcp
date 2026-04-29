@@ -159,67 +159,15 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codegraph_core::{Edge, FileGraph, Language};
-
-    fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind,
-            file: file.to_string(),
-            line: 1,
-            column: 0,
-            end_line: 1,
-            signature: String::new(),
-            namespace: String::new(),
-            parent: String::new(),
-            language: Language::Cpp,
-        }
-    }
-
-    fn call_edge(from: &str, to: &str, file: &str, line: u32) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Calls,
-            file: file.to_string(),
-            line,
-        }
-    }
-
-    fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Inherits,
-            file: file.to_string(),
-            line: 0,
-        }
-    }
-
-    fn include_edge(from: &str, to: &str, file: &str) -> Edge {
-        Edge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind: EdgeKind::Includes,
-            file: file.to_string(),
-            line: 0,
-        }
-    }
-
-    fn make_fg(path: &str, symbols: Vec<Symbol>, edges: Vec<Edge>) -> FileGraph {
-        FileGraph {
-            path: path.to_string(),
-            language: Language::Cpp,
-            symbols,
-            edges,
-        }
-    }
+    use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
+    use codegraph_core::Language;
 
     /// Linear chain `a -> b -> c -> d` all in `/x.cpp`.
     fn linear_chain() -> Graph {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("a", SymbolKind::Function, "/x.cpp"),
                 sym("b", SymbolKind::Function, "/x.cpp"),
@@ -293,6 +241,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("a", SymbolKind::Function, "/x.cpp"),
                 sym("b", SymbolKind::Function, "/x.cpp"),
@@ -327,6 +276,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("a", SymbolKind::Function, "/x.cpp"),
                 sym("b", SymbolKind::Function, "/x.cpp"),
@@ -377,6 +327,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("a", SymbolKind::Function, "/x.cpp"),
                 sym("b", SymbolKind::Function, "/x.cpp"),
@@ -403,6 +354,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("a", SymbolKind::Function, "/x.cpp"),
                 sym("b", SymbolKind::Function, "/x.cpp"),
@@ -436,6 +388,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("unused", SymbolKind::Function, "/x.cpp"),
                 sym("MyClass", SymbolKind::Class, "/x.cpp"),
@@ -457,6 +410,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("unused", SymbolKind::Function, "/x.cpp"),
                 sym("MyClass", SymbolKind::Class, "/x.cpp"),
@@ -480,6 +434,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
+            Language::Cpp,
             vec![
                 sym("caller", SymbolKind::Function, "/x.cpp"),
                 sym("used", SymbolKind::Function, "/x.cpp"),
@@ -503,6 +458,7 @@ mod tests {
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/a.cpp",
+            Language::Cpp,
             vec![],
             vec![
                 include_edge("/a.cpp", "/utils.h", "/a.cpp"),
