@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 codegraph-core = { path = "../codegraph-core" }
+regex = { workspace = true }

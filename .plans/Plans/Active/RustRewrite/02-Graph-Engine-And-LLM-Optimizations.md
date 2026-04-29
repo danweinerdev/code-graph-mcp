@@ -14,7 +14,7 @@ tasks:
     verification: "Graph::new() initializes all maps non-null; FileEntry carries both `language` and `symbol_ids`; merge_file_graph adds nodes and edges, replaces stale data on re-merge from the same path, splits Calls/Inherits into adj+radj and Includes into the includes map; remove_file deletes nodes, adj entries originating from path, radj entries originating from path, includes for path, and the files entry; clear() resets to empty; tests cover merge-one-file, merge-two-files, re-merge-same-file (idempotent), remove-file, clear, and stats reporting consistent counts"
   - id: "2.2"
     title: "Symbol queries: file_symbols, symbol_detail, search with pagination, symbol_summary"
-    status: planned
+    status: complete
     depends_on: ["2.1"]
     verification: "file_symbols returns Vec (never Option) for known and unknown paths — empty for unknown so JSON serializes as []; symbol_detail returns Some for known IDs and None for unknown; SearchParams supports pattern (regex with case-insensitive substring fallback), kind, namespace (substring), language (NEW — exact match, optional), limit (default 20), offset (default 0); SearchResult has `symbols` and `total`; results sorted by SymbolID for stable pagination; tests cover regex match, substring fallback when regex invalid, kind filter, namespace filter, language filter, all-filters-combined, empty pattern, offset beyond total returns empty with correct total; symbol_summary groups by namespace and kind, handles file=None (whole graph) and file=Some(path) (scoped); empty graph returns empty map (not null)"
   - id: "2.3"
@@ -67,17 +67,17 @@ This phase has zero MCP dependency — `codegraph-graph` is unit-testable with n
 ## 2.2: Symbol queries: file_symbols, symbol_detail, search, symbol_summary
 
 ### Subtasks
-- [ ] `file_symbols(&self, path: &Path) -> Vec<Symbol>` (cloned Vec, never Option, never null in JSON)
-- [ ] `symbol_detail(&self, id: &SymbolId) -> Option<Symbol>` (None is fine — handler converts to McpError with did-you-mean)
-- [ ] `SearchParams { pattern, kind: Option<SymbolKind>, namespace, language: Option<Language>, limit, offset }`
-- [ ] `SearchResult { symbols: Vec<Symbol>, total: u32 }` — symbols always Vec; total always present
-- [ ] `Search` collects matches → sorts by SymbolID → applies offset/limit; returns total before slicing for pagination correctness
-- [ ] Regex match: `Regex::new("(?i)" + pattern)` first; on compile error fall back to case-insensitive substring contains
-- [ ] Namespace filter: case-insensitive substring (matches Go); empty namespace = no filter
-- [ ] **Language filter (NEW):** exact-match `Option<Language>`; None = no filter
-- [ ] `SearchSymbols` legacy wrapper for `suggestSymbols` did-you-mean — passes `Limit: 100` explicitly so the candidate pool isn't capped at 20 (LLMOptimization debrief carry-forward)
-- [ ] `symbol_summary(&self, file: Option<&Path>) -> HashMap<String, HashMap<SymbolKind, u32>>` — empty graph returns empty map, file=Some scopes to that file
-- [ ] Tests: regex hit; substring fallback when regex compile fails; kind filter; namespace filter (substring, case-insensitive); language filter — Rust-only matches don't return Cpp results; pagination boundaries (offset=total, offset>total, limit=0 treated as default 20); summary empty-graph; summary file-scope
+- [x] `file_symbols(&self, path: &Path) -> Vec<Symbol>` (cloned Vec, never Option, never null in JSON)
+- [x] `symbol_detail(&self, id: &SymbolId) -> Option<Symbol>` (None is fine — handler converts to McpError with did-you-mean)
+- [x] `SearchParams { pattern, kind: Option<SymbolKind>, namespace, language: Option<Language>, limit, offset }`
+- [x] `SearchResult { symbols: Vec<Symbol>, total: u32 }` — symbols always Vec; total always present
+- [x] `Search` collects matches → sorts by SymbolID → applies offset/limit; returns total before slicing for pagination correctness
+- [x] Regex match: `Regex::new("(?i)" + pattern)` first; on compile error fall back to case-insensitive substring contains
+- [x] Namespace filter: case-insensitive substring (matches Go); empty namespace = no filter
+- [x] **Language filter (NEW):** exact-match `Option<Language>`; None = no filter
+- [x] `SearchSymbols` legacy wrapper for `suggestSymbols` did-you-mean — passes `Limit: 100` explicitly so the candidate pool isn't capped at 20 (LLMOptimization debrief carry-forward)
+- [x] `symbol_summary(&self, file: Option<&Path>) -> HashMap<String, HashMap<SymbolKind, u32>>` — empty graph returns empty map, file=Some scopes to that file
+- [x] Tests: regex hit; substring fallback when regex compile fails; kind filter; namespace filter (substring, case-insensitive); language filter — Rust-only matches don't return Cpp results; pagination boundaries (offset=total, offset>total, limit=0 treated as default 20); summary empty-graph; summary file-scope
 
 ## 2.3: Call graph: callers, callees BFS; orphans; file_dependencies
 
