@@ -11,6 +11,7 @@
 
 mod algorithms;
 mod callgraph;
+mod diagrams;
 pub mod graph;
 mod queries;
 
@@ -19,5 +20,6 @@ mod test_fixtures;
 
 pub use algorithms::HierarchyNode;
 pub use callgraph::CallChain;
+pub use diagrams::{DiagramEdge, DiagramResult};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
 pub use queries::{SearchParams, SearchResult};

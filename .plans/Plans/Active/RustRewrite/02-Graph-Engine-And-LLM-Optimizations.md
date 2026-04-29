@@ -29,7 +29,7 @@ tasks:
     verification: "detect_cycles uses an iterative Tarjan implementation (no recursion — explicit Vec stack so deep include graphs don't overflow); reports only SCCs of size > 1; tested on acyclic, 2-node cycle, 3-node cycle, mixed cyclic-and-acyclic graphs; class_hierarchy accepts root symbols whose kind is in {Class, Struct, Interface, Trait} (the widened filter from the design — without this, Rust traits and Go interfaces hierarchy lookups return None); diamond inheritance fixture (4-level chain Root←Base←{MixinA, MixinB}←Derived←Leaf, depth=3) fully expands the shared ancestor under both arms — verified by reverting the per-DFS-path tracking and watching the test fail (matches the Go regression-test discipline)"
   - id: "2.5"
     title: "Coupling and Diagrams (call/file/inheritance) with RenderMermaid"
-    status: planned
+    status: complete
     depends_on: ["2.3", "2.4"]
     verification: "coupling returns outgoing cross-file edge counts (calls + includes), incoming_coupling returns reverse direction; both return HashMap<PathBuf, u32> never Option; DiagramCallGraph performs BFS bounded by depth and max_nodes, includes both forward and reverse edges, deduplicates; DiagramFileGraph BFS over includes; DiagramInheritance BFS over Inherits edges starting from the widened kind filter; RenderMermaid produces valid Mermaid graph syntax with shortened node IDs (n0, n1...), preserves edge labels (calls/includes/inherits), supports `styled` flag adding center-node CSS class; empty diagrams render as empty string (or empty edges array — same wire-format invariant)"
   - id: "2.6"
@@ -108,15 +108,15 @@ The 4-level diamond fixture is the same one used in the Go regression test (`Tes
 ## 2.5: Coupling and Diagrams with RenderMermaid
 
 ### Subtasks
-- [ ] `coupling(&self, path: &Path) -> HashMap<PathBuf, u32>` — outgoing: cross-file calls + includes; never Option
-- [ ] `incoming_coupling(&self, path: &Path) -> HashMap<PathBuf, u32>` — reverse direction
-- [ ] `DiagramResult { center: String, edges: Vec<DiagramEdge> }`; `DiagramEdge { from, to, label }`
-- [ ] `diagram_call_graph(&self, id: &SymbolId, depth, max_nodes) -> Option<DiagramResult>` — BFS over both adj and radj filtering by Calls; deduplicates edges; bounded by max_nodes
-- [ ] `diagram_file_graph(&self, file: &Path, depth, max_nodes) -> Option<DiagramResult>` — BFS over includes
-- [ ] `diagram_inheritance(&self, name: &str, depth, max_nodes) -> Option<DiagramResult>` — uses the widened {Class, Struct, Interface, Trait} root filter
-- [ ] `DiagramResult::render_mermaid(&self, direction: &str, styled: bool) -> String` — emits valid Mermaid `graph DIR` syntax; node IDs shortened to `n0`, `n1`, ...; preserves edge labels; styled mode adds `classDef center fill:#f96,stroke:#333` and tags the center node
-- [ ] Empty `DiagramResult::edges` renders as empty string (matches Go); empty edges JSON serializes as `[]` (LLMOptimization invariant)
-- [ ] Tests: each of the three diagrams against a known fixture; empty case; max_nodes truncation; styled vs unstyled; direction TD vs BT for inheritance
+- [x] `coupling(&self, path: &Path) -> HashMap<PathBuf, u32>` — outgoing: cross-file calls + includes; never Option
+- [x] `incoming_coupling(&self, path: &Path) -> HashMap<PathBuf, u32>` — reverse direction
+- [x] `DiagramResult { center: String, edges: Vec<DiagramEdge> }`; `DiagramEdge { from, to, label }`
+- [x] `diagram_call_graph(&self, id: &SymbolId, depth, max_nodes) -> Option<DiagramResult>` — BFS over both adj and radj filtering by Calls; deduplicates edges; bounded by max_nodes
+- [x] `diagram_file_graph(&self, file: &Path, depth, max_nodes) -> Option<DiagramResult>` — BFS over includes
+- [x] `diagram_inheritance(&self, name: &str, depth, max_nodes) -> Option<DiagramResult>` — uses the widened {Class, Struct, Interface, Trait} root filter
+- [x] `DiagramResult::render_mermaid(&self, direction: &str, styled: bool) -> String` — emits valid Mermaid `graph DIR` syntax; node IDs shortened to `n0`, `n1`, ...; preserves edge labels; styled mode adds `classDef center fill:#f96,stroke:#333` and tags the center node
+- [x] Empty `DiagramResult::edges` renders as empty string (matches Go); empty edges JSON serializes as `[]` (LLMOptimization invariant)
+- [x] Tests: each of the three diagrams against a known fixture; empty case; max_nodes truncation; styled vs unstyled; direction TD vs BT for inheritance
 
 ## 2.6: Concurrency safety with parking_lot::RwLock
 

@@ -12,5 +12,6 @@ workspace = true
 
 [dependencies]
 codegraph-core = { path = "../codegraph-core" }
+indexmap = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

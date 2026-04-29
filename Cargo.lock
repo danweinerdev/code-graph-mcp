@@ -53,6 +53,7 @@ name = "codegraph-graph"
 version = "0.1.0"
 dependencies = [
  "codegraph-core",
+ "indexmap",
  "regex",
  "serde",
 ]
