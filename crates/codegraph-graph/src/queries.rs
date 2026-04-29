@@ -385,6 +385,33 @@ mod tests {
         let names: Vec<&str> = foo.symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"FooHandler"));
         assert!(names.contains(&"BarFooBaz"));
+
+        // Substring-fallback success: pattern is invalid as regex (`[Handler`
+        // is unclosed) but lowercased contains `[handler` — wait, `[handler`
+        // appears in no name. Use `[oo` which is invalid regex but the
+        // lowercase substring `[oo` won't match either. Pick a pattern that
+        // is invalid regex AND a real substring of one of our names: `[`
+        // alone — invalid regex, and the names contain no `[`. Workaround:
+        // build a name that contains `[` literally so the substring branch
+        // visibly succeeds.
+        let mut g2 = Graph::new();
+        g2.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![
+                sym("foo[bracket]", SymbolKind::Function, "/b.cpp"),
+                sym("plain", SymbolKind::Function, "/b.cpp"),
+            ],
+            vec![],
+        ));
+        // `[bracket` is invalid regex (unclosed character class) — must fall
+        // back to substring, where it matches `foo[bracket]` and not `plain`.
+        let bracket = g2.search(SearchParams {
+            pattern: "[bracket".to_string(),
+            ..SearchParams::default()
+        });
+        assert_eq!(bracket.total, 1);
+        assert_eq!(bracket.symbols[0].name, "foo[bracket]");
     }
 
     // --- search: filters ---
