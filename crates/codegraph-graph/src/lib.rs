@@ -23,3 +23,12 @@ pub use callgraph::CallChain;
 pub use diagrams::{DiagramEdge, DiagramResult};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
 pub use queries::{SearchParams, SearchResult};
+
+/// Re-export of [`parking_lot::RwLock`] so downstream callers (e.g. the
+/// Phase-3 MCP server's `ServerInner`) can write `use codegraph_graph::RwLock`
+/// without risking an accidental `std::sync::RwLock` import. The two types
+/// have the same surface but different semantics: `parking_lot::RwLock` is
+/// faster, doesn't poison on panic, and its `read()` / `write()` return guards
+/// directly rather than `LockResult`. Task 2.6 establishes this as the
+/// canonical lock type for `Graph`.
+pub use parking_lot::RwLock;

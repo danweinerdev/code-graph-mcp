@@ -13,5 +13,6 @@ workspace = true
 [dependencies]
 codegraph-core = { path = "../codegraph-core" }
 indexmap = { workspace = true }
+parking_lot = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
