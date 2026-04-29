@@ -1,0 +1,57 @@
+//! Shared helpers for `codegraph-tools` integration and snapshot tests.
+//!
+//! Cargo treats each `tests/*.rs` file as an independent crate, so a shared
+//! module needs the special-cased `tests/common/mod.rs` path. Test files
+//! pull these in with `mod common;`.
+
+use std::path::{Path, PathBuf};
+
+use rmcp::model::CallToolResult;
+
+/// Resolve the source `testdata/cpp` directory used to seed each
+/// per-test TempDir copy. Canonicalizes to defeat symlink-based path
+/// surprises in CI environments.
+pub fn testdata_cpp_path() -> PathBuf {
+    let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("testdata")
+        .join("cpp");
+    std::fs::canonicalize(&raw)
+        .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; testdata must exist"))
+}
+
+/// Recursively copy every file in `testdata_cpp_path()` into `dest`. Each
+/// test using this gets its own TempDir so concurrent `analyze_codebase`
+/// calls don't race on the shared `.code-graph-cache.json` write.
+pub fn copy_testdata(dest: &Path) {
+    let src = testdata_cpp_path();
+    for entry in walkdir::WalkDir::new(&src) {
+        let entry = entry.expect("walk testdata");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&src)
+            .expect("path within testdata");
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(entry.path(), &target).unwrap_or_else(|e| {
+            panic!("copy {:?} → {:?}: {e}", entry.path(), target);
+        });
+    }
+}
+
+/// Pull the first text block out of a `CallToolResult`. All callers route
+/// through here so a future change to rmcp's `Content` shape surfaces in
+/// one place rather than across every test.
+pub fn first_text(r: &CallToolResult) -> String {
+    r.content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.to_string())
+        .unwrap_or_default()
+}

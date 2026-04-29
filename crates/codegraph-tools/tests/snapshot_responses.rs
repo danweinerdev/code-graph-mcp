@@ -28,6 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod common;
+use common::{copy_testdata, first_text};
+
 use codegraph_core::Language;
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
@@ -45,41 +48,7 @@ use codegraph_tools::CodeGraphServer;
 use rmcp::model::CallToolResult;
 use tempfile::TempDir;
 
-/// Resolve the source `testdata/cpp` directory used to seed each
-/// per-test TempDir copy.
-fn source_testdata_cpp_path() -> PathBuf {
-    let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("testdata")
-        .join("cpp");
-    std::fs::canonicalize(&raw)
-        .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; testdata must exist"))
-}
-
-/// Recursively copy every file in `source_testdata_cpp_path()` into
-/// `dest`. Used to seed each per-test TempDir so concurrent analyze
-/// calls don't race on the shared `.code-graph-cache.json`.
-fn copy_testdata(dest: &Path) {
-    let src = source_testdata_cpp_path();
-    for entry in walkdir::WalkDir::new(&src) {
-        let entry = entry.expect("walk testdata");
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(&src)
-            .expect("path within testdata");
-        let target = dest.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::copy(entry.path(), &target).unwrap_or_else(|e| {
-            panic!("copy {:?} → {:?}: {e}", entry.path(), target);
-        });
-    }
-}
+// Shared `testdata_cpp_path` and `copy_testdata` live in `tests/common/mod.rs`.
 
 /// Per-test fixture: a TempDir holding a fresh copy of testdata, plus
 /// a server with the indexed graph. Hold the TempDir for the test's
@@ -126,16 +95,7 @@ async fn build_indexed_fixture() -> IndexedFixture {
     }
 }
 
-/// Extract the first text block of a `CallToolResult`. All snapshot tests
-/// use this single helper so a future change to the rmcp content shape
-/// surfaces here, not in 20 different call sites.
-fn first_text(r: &CallToolResult) -> String {
-    r.content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.to_string())
-        .unwrap_or_default()
-}
+// `first_text` lives in `tests/common/mod.rs`.
 
 /// Recursively sort every `Object` in a `serde_json::Value` by key. This
 /// is the determinism shim documented at the module level: handler
@@ -289,7 +249,7 @@ async fn response_get_callers_engine_update() {
         fx.indexed_root.join("engine.cpp").display()
     );
     let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callers);
-    let parsed = parsed_sorted(&r);
+    let parsed = sort_chains_by_symbol_id(parsed_sorted(&r));
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
     });
@@ -303,10 +263,30 @@ async fn response_get_callees_engine_update() {
         fx.indexed_root.join("engine.cpp").display()
     );
     let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callees);
-    let parsed = parsed_sorted(&r);
+    let parsed = sort_chains_by_symbol_id(parsed_sorted(&r));
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
     });
+}
+
+/// Sort a JSON array of `CallChain` objects by their `symbol_id` field.
+/// Defends against future changes to BFS emission order (which depends on
+/// HashMap iteration order in the graph engine). Today the order is stable
+/// because both edges originate from a single-file single-parse merge, but
+/// adding a second file that interleaves edges into the same adjacency
+/// entry would surface non-determinism here.
+fn sort_chains_by_symbol_id(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(mut arr) => {
+            arr.sort_by(|a, b| {
+                let ka = a["symbol_id"].as_str().unwrap_or("");
+                let kb = b["symbol_id"].as_str().unwrap_or("");
+                ka.cmp(kb)
+            });
+            serde_json::Value::Array(arr)
+        }
+        other => other,
+    }
 }
 
 // --- get_dependencies ----------------------------------------------------

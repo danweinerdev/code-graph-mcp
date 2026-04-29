@@ -12,7 +12,6 @@
 //! suite. Direct invocation lets the tests assert against the
 //! `CallToolResult` body without juggling stdio/JSON-RPC plumbing.
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -25,18 +24,10 @@ use codegraph_tools::handlers::structure::detect_cycles;
 use codegraph_tools::handlers::symbols::{get_file_symbols, get_symbol_summary};
 use codegraph_tools::server::ServerInner;
 use codegraph_tools::CodeGraphServer;
-use rmcp::model::CallToolResult;
 use tempfile::TempDir;
 
-/// Resolve `testdata/cpp` from the manifest dir.
-fn testdata_cpp_path() -> PathBuf {
-    let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("testdata")
-        .join("cpp");
-    std::fs::canonicalize(&raw).unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}"))
-}
+mod common;
+use common::{copy_testdata, first_text};
 
 /// Fresh server with the C++ parser plugin registered.
 fn fresh_server() -> CodeGraphServer {
@@ -47,38 +38,6 @@ fn fresh_server() -> CodeGraphServer {
     CodeGraphServer::new(registry)
 }
 
-/// Convenience: pull the first text block out of a tool result.
-fn first_text(r: &CallToolResult) -> String {
-    r.content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.to_string())
-        .unwrap_or_default()
-}
-
-/// Make a copy of the testdata fixture inside `dest` so tests that mutate
-/// timestamps / files don't poison the shared `testdata/` tree.
-fn copy_testdata_to(dest: &Path) {
-    let src = testdata_cpp_path();
-    for entry in walkdir::WalkDir::new(&src) {
-        let entry = entry.expect("walk testdata");
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(&src)
-            .expect("path within testdata");
-        let target = dest.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::copy(entry.path(), &target).unwrap_or_else(|e| {
-            panic!("copy {:?} → {:?}: {e}", entry.path(), target);
-        });
-    }
-}
-
 // -------- end-to-end pipeline -------------------------------------------
 
 #[tokio::test]
@@ -86,7 +45,7 @@ async fn analyze_then_query_pipeline() {
     // Use a per-test TempDir copy so the cache write doesn't race the
     // other tests in this file (they all hit `analyze_codebase`).
     let dir = TempDir::new().unwrap();
-    copy_testdata_to(dir.path());
+    copy_testdata(dir.path());
     let path = std::fs::canonicalize(dir.path()).unwrap();
 
     let server = fresh_server();
@@ -148,7 +107,7 @@ async fn concurrent_analyze_returns_indexing_in_progress() {
     // servers would each hold their own lock and the test would race
     // its way to a passing pair of Ok results.)
     let dir = TempDir::new().unwrap();
-    copy_testdata_to(dir.path());
+    copy_testdata(dir.path());
     let server = fresh_server();
     let inner: Arc<ServerInner> = server.inner.clone();
     let path = std::fs::canonicalize(dir.path())
@@ -219,7 +178,7 @@ async fn analyze_path_is_file_returns_not_a_directory() {
     // canonicalize already distinguishes "missing" from "file" so we
     // surface the richer wording. This test locks the wording in.
     let server = fresh_server();
-    let file = testdata_cpp_path().join("engine.cpp");
+    let file = common::testdata_cpp_path().join("engine.cpp");
     let r = analyze_codebase(
         server.inner.clone(),
         file.to_string_lossy().into_owned(),
@@ -250,7 +209,7 @@ async fn analyze_empty_path_returns_path_required() {
 async fn cache_hit_on_second_analyze_no_force() {
     // Use a temp copy so we don't pollute the shared testdata cache.
     let dir = TempDir::new().unwrap();
-    copy_testdata_to(dir.path());
+    copy_testdata(dir.path());
 
     let server = fresh_server();
     let path = dir.path().to_string_lossy().into_owned();
@@ -286,7 +245,7 @@ async fn cache_hit_on_second_analyze_no_force() {
 #[tokio::test]
 async fn force_skips_cache_load() {
     let dir = TempDir::new().unwrap();
-    copy_testdata_to(dir.path());
+    copy_testdata(dir.path());
 
     let server = fresh_server();
     let path = dir.path().to_string_lossy().into_owned();
@@ -310,7 +269,7 @@ async fn stale_mtime_invalidates_cached_file() {
     // file's mtime. The next analyze (no force) must take the
     // stale-paths branch and re-index without erroring.
     let dir = TempDir::new().unwrap();
-    copy_testdata_to(dir.path());
+    copy_testdata(dir.path());
 
     let server = fresh_server();
     let path = dir.path().to_string_lossy().into_owned();
