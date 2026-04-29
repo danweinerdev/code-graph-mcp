@@ -163,6 +163,8 @@ impl Graph {
         self.remove_file_unsafe(path);
     }
 
+    // "unsafe" here means "caller must hold the write lock once Task 2.6 wraps
+    // Graph in parking_lot::RwLock". No Rust `unsafe` code is involved.
     fn remove_file_unsafe(&mut self, path: &Path) {
         // Remove nodes for this file's symbols.
         if let Some(entry) = self.files.get(path) {
@@ -414,6 +416,49 @@ mod tests {
         let stats2 = g.stats();
         assert_eq!(stats, stats2);
         assert_eq!(stats2.nodes, 1);
+    }
+
+    #[test]
+    fn re_merge_replaces_edges_not_just_nodes() {
+        // The realistic incremental-index scenario: a file is edited so its
+        // call targets change. Re-merging must drop stale edges, not just
+        // stale nodes.
+        let mut g = Graph::new();
+
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/a.cpp"),
+                sym("b", SymbolKind::Function, "/a.cpp"),
+                sym("c", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![call_edge("/a.cpp:a", "/a.cpp:b", "/a.cpp")],
+        ));
+        assert_eq!(g.adj()["/a.cpp:a"][0].target, "/a.cpp:b");
+        assert!(g.radj().contains_key("/a.cpp:b"));
+
+        // Re-merge: same nodes but `a` now calls `c` instead of `b`.
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/a.cpp"),
+                sym("b", SymbolKind::Function, "/a.cpp"),
+                sym("c", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![call_edge("/a.cpp:a", "/a.cpp:c", "/a.cpp")],
+        ));
+
+        // Stale edge gone, new edge present, no doubling.
+        assert_eq!(g.adj()["/a.cpp:a"].len(), 1);
+        assert_eq!(g.adj()["/a.cpp:a"][0].target, "/a.cpp:c");
+        assert!(
+            !g.radj().contains_key("/a.cpp:b"),
+            "stale reverse-edge key for old target must be dropped"
+        );
+        assert!(g.radj().contains_key("/a.cpp:c"));
+        assert_eq!(g.stats().edges, 1);
     }
 
     #[test]
