@@ -1,0 +1,22 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_symbol_detail\")"
+---
+{
+  "name": "get_symbol_detail",
+  "description": "Get full details for a symbol by its ID",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "symbol": {
+        "description": "Symbol ID in format file:name as returned by get_file_symbols or search_symbols",
+        "type": "string"
+      }
+    },
+    "required": [
+      "symbol"
+    ],
+    "title": "GetSymbolDetailArgs",
+    "type": "object"
+  }
+}

@@ -1,0 +1,22 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_dependencies\")"
+---
+{
+  "name": "get_dependencies",
+  "description": "List files included/imported by the given file",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "file": {
+        "description": "Absolute path to the source file",
+        "type": "string"
+      }
+    },
+    "required": [
+      "file"
+    ],
+    "title": "GetDependenciesArgs",
+    "type": "object"
+  }
+}

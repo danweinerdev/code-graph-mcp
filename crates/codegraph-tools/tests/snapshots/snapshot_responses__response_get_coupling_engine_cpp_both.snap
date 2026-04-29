@@ -1,0 +1,10 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "[testdata]/engine.h": 1,
+  "[testdata]/main.cpp": 3,
+  "[testdata]/utils.cpp": 3,
+  "[testdata]/utils.h": 1
+}

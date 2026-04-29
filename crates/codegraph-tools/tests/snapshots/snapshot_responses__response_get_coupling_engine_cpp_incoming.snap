@@ -1,0 +1,7 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "[testdata]/main.cpp": 3
+}

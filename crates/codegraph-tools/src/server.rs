@@ -124,6 +124,14 @@ impl CodeGraphServer {
         self.tool_router.list_all().len()
     }
 
+    /// Snapshot of every registered tool descriptor (`name`, `description`,
+    /// `inputSchema`, …). Used by the Phase 3.7 wire-format snapshot suite
+    /// — the macro-generated `Self::tool_router()` factory is private, so
+    /// tests reach for this helper instead.
+    pub fn tool_descriptors(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all()
+    }
+
     /// Returns `Ok(())` if a codebase has been indexed; otherwise returns
     /// `Err(CallToolResult)` carrying the tool-level error envelope so the
     /// caller can hand it straight back to the MCP runtime.

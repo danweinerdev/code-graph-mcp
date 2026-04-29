@@ -1,0 +1,32 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_class_hierarchy\")"
+---
+{
+  "name": "get_class_hierarchy",
+  "description": "Get the inheritance tree for a class (base classes and derived classes)",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "class": {
+        "description": "Class name to look up",
+        "type": "string"
+      },
+      "depth": {
+        "default": null,
+        "description": "Traversal depth for transitive inheritance (default 1 = direct only)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "class"
+    ],
+    "title": "GetClassHierarchyArgs",
+    "type": "object"
+  }
+}

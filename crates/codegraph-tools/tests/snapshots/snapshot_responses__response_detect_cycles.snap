@@ -1,0 +1,10 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+[
+  [
+    "[testdata]/circular_a.h",
+    "[testdata]/circular_b.h"
+  ]
+]

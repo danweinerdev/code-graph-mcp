@@ -1,0 +1,14 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"watch_start\")"
+---
+{
+  "name": "watch_start",
+  "description": "Start watching the indexed directory for file changes and auto-reindex modified files",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Empty parameter struct for tools that take no arguments\n(`detect_cycles`, `watch_start`, `watch_stop`). The empty `{}` JSON\nobject deserializes into this without error.",
+    "title": "EmptyParams",
+    "type": "object"
+  }
+}

@@ -47,3 +47,4 @@ rmcp = { version = "=1.5.0", features = ["server", "macros", "transport-io", "sc
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 schemars = "1"
+insta = { version = "1", features = ["json", "redactions", "filters"] }

@@ -1,0 +1,673 @@
+//! Wire-format snapshots of representative response bodies for every tool.
+//!
+//! Each test copies `testdata/cpp/` into a fresh `TempDir`, runs
+//! `analyze_codebase` against that copy, then invokes the target tool
+//! and snapshots the parsed JSON body. Using a per-test directory
+//! avoids races on the shared cache file (`.code-graph-cache.json`)
+//! when tokio runs tests in parallel — without this isolation, two
+//! concurrent saves can clobber each other and surface a `cache save
+//! failed` warning that shows up in only some snapshot runs.
+//!
+//! The TempDir path is environment-dependent (`/tmp/.tmpXXXXXX/...`).
+//! `insta::Settings::add_filter` redacts it to `[testdata]` so the
+//! snapshot stays portable across machines.
+//!
+//! ## Determinism
+//!
+//! `serde_json::to_string(&HashMap<...>)` iterates the map in HashMap
+//! order (non-deterministic). The snapshots normalize via [`sort_json`]
+//! before assertion, which recursively sorts every `Object` key — same
+//! shape, stable byte order. Sorting at the test boundary (rather than
+//! in the handler) keeps the JSON wire format unchanged for clients that
+//! don't depend on key order while letting the snapshots stay stable.
+//!
+//! Vec-of-Symbol responses are sorted by the graph layer; Vec-of-orphans
+//! and BFS edge collections are not, so they are sorted in the test via
+//! [`sort_array_by_id`] / [`sort_diagram_edges`] / [`sort_mermaid_lines`].
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use codegraph_core::Language;
+use codegraph_lang::LanguageRegistry;
+use codegraph_lang_cpp::CppParser;
+use codegraph_tools::handlers::analyze::analyze_codebase;
+use codegraph_tools::handlers::query::{callers_or_callees, get_dependencies, Direction};
+use codegraph_tools::handlers::structure::{
+    detect_cycles, generate_diagram, get_class_hierarchy, get_coupling, get_orphans,
+    GenerateDiagramInput,
+};
+use codegraph_tools::handlers::symbols::{
+    get_file_symbols, get_symbol_detail, get_symbol_summary, search_symbols, SearchSymbolsInput,
+};
+use codegraph_tools::server::ServerInner;
+use codegraph_tools::CodeGraphServer;
+use rmcp::model::CallToolResult;
+use tempfile::TempDir;
+
+/// Resolve the source `testdata/cpp` directory used to seed each
+/// per-test TempDir copy.
+fn source_testdata_cpp_path() -> PathBuf {
+    let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("testdata")
+        .join("cpp");
+    std::fs::canonicalize(&raw)
+        .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; testdata must exist"))
+}
+
+/// Recursively copy every file in `source_testdata_cpp_path()` into
+/// `dest`. Used to seed each per-test TempDir so concurrent analyze
+/// calls don't race on the shared `.code-graph-cache.json`.
+fn copy_testdata(dest: &Path) {
+    let src = source_testdata_cpp_path();
+    for entry in walkdir::WalkDir::new(&src) {
+        let entry = entry.expect("walk testdata");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&src)
+            .expect("path within testdata");
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(entry.path(), &target).unwrap_or_else(|e| {
+            panic!("copy {:?} → {:?}: {e}", entry.path(), target);
+        });
+    }
+}
+
+/// Per-test fixture: a TempDir holding a fresh copy of testdata, plus
+/// a server with the indexed graph. Hold the TempDir for the test's
+/// lifetime so the OS doesn't reclaim it while we read symbols out.
+struct IndexedFixture {
+    _dir: TempDir,
+    /// Canonical absolute path of the indexed root (TempDir + cpp/...).
+    indexed_root: PathBuf,
+    inner: Arc<ServerInner>,
+}
+
+/// Build the per-test fixture: copy testdata into a fresh TempDir,
+/// register the C++ parser, run `analyze_codebase`, return the indexed
+/// `ServerInner`. Each test gets its own TempDir so the cache write in
+/// the analyze handler can't race against another test's write.
+async fn build_indexed_fixture() -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for testdata copy");
+    copy_testdata(dir.path());
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+/// Extract the first text block of a `CallToolResult`. All snapshot tests
+/// use this single helper so a future change to the rmcp content shape
+/// surfaces here, not in 20 different call sites.
+fn first_text(r: &CallToolResult) -> String {
+    r.content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.to_string())
+        .unwrap_or_default()
+}
+
+/// Recursively sort every `Object` in a `serde_json::Value` by key. This
+/// is the determinism shim documented at the module level: handler
+/// responses that include `HashMap<...>` serialize in HashMap order, but
+/// snapshot stability requires byte-identical output across runs.
+///
+/// `Vec<...>` ordering is preserved as-is (the graph layer already sorts
+/// where it matters; a sort here would break tests that assert on order).
+fn sort_json(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k, sort_json(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_json).collect()),
+        other => other,
+    }
+}
+
+/// Build the insta `Settings` that redact the per-test TempDir path
+/// (the indexed root) to `[testdata]`. Each test calls this with its
+/// own `indexed_root` from the fixture; the redaction makes snapshots
+/// portable across machines and across runs (TempDir paths vary).
+fn settings_with_path_redaction(indexed_root: &Path) -> insta::Settings {
+    let mut settings = insta::Settings::clone_current();
+    let testdata_str = indexed_root.to_string_lossy().into_owned();
+    // Add a trailing slash so `[testdata]/foo` is the result, not
+    // `[testdata]foo`. Both forms (with and without trailing /) are
+    // listed separately so symbol IDs (`<dir>/foo.cpp:Bar`) and the
+    // `root_path` field (`<dir>` exactly) both redact cleanly.
+    settings.add_filter(&regex::escape(&format!("{testdata_str}/")), "[testdata]/");
+    settings.add_filter(&regex::escape(&testdata_str), "[testdata]");
+    settings
+}
+
+/// Parse a tool response's first text block as JSON, then `sort_json`
+/// for deterministic key ordering.
+fn parsed_sorted(r: &CallToolResult) -> serde_json::Value {
+    let body = first_text(r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("response body must be valid JSON");
+    sort_json(parsed)
+}
+
+// --- analyze_codebase ----------------------------------------------------
+
+#[tokio::test]
+async fn response_analyze_codebase_testdata_cpp() {
+    // Build the fixture by hand here so we can capture the analyze
+    // response itself rather than discarding it inside `build_indexed_fixture`.
+    let dir = TempDir::new().unwrap();
+    copy_testdata(dir.path());
+    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    let server = CodeGraphServer::new(registry);
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_file_symbols ----------------------------------------------------
+
+#[tokio::test]
+async fn response_get_file_symbols_engine_cpp() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- search_symbols ------------------------------------------------------
+
+#[tokio::test]
+async fn response_search_symbols_query_engine() {
+    let fx = build_indexed_fixture().await;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("Engine"),
+            brief: true,
+            ..Default::default()
+        },
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_symbol_detail ---------------------------------------------------
+
+#[tokio::test]
+async fn response_get_symbol_detail_engine_update() {
+    let fx = build_indexed_fixture().await;
+    let id = format!(
+        "{}:Engine::update",
+        fx.indexed_root.join("engine.cpp").display()
+    );
+    let r = get_symbol_detail(&fx.inner.graph, &id);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_symbol_summary --------------------------------------------------
+
+#[tokio::test]
+async fn response_get_symbol_summary_whole_graph() {
+    let fx = build_indexed_fixture().await;
+    let r = get_symbol_summary(&fx.inner.graph, None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_callers / get_callees -------------------------------------------
+
+#[tokio::test]
+async fn response_get_callers_engine_update() {
+    let fx = build_indexed_fixture().await;
+    let id = format!(
+        "{}:Engine::update",
+        fx.indexed_root.join("engine.cpp").display()
+    );
+    let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callers);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_callees_engine_update() {
+    let fx = build_indexed_fixture().await;
+    let id = format!(
+        "{}:Engine::update",
+        fx.indexed_root.join("engine.cpp").display()
+    );
+    let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callees);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_dependencies ----------------------------------------------------
+
+#[tokio::test]
+async fn response_get_dependencies_engine_cpp() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_dependencies(&fx.inner.graph, &file);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- detect_cycles -------------------------------------------------------
+
+#[tokio::test]
+async fn response_detect_cycles() {
+    let fx = build_indexed_fixture().await;
+    let r = detect_cycles(&fx.inner.graph);
+    // `detect_cycles` returns a Vec<Vec<String>>; sort the inner cycles for
+    // determinism (DFS visit order can flip pair direction across runs).
+    let body = first_text(&r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("detect_cycles response is JSON");
+    let normalized = match parsed {
+        serde_json::Value::Array(outer) => {
+            let mut cycles: Vec<serde_json::Value> = outer
+                .into_iter()
+                .map(|cycle| {
+                    if let serde_json::Value::Array(mut inner) = cycle {
+                        inner
+                            .sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
+                        serde_json::Value::Array(inner)
+                    } else {
+                        cycle
+                    }
+                })
+                .collect();
+            cycles.sort_by(|a, b| {
+                let ka = a
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default();
+                let kb = b
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default();
+                ka.as_str().unwrap_or("").cmp(kb.as_str().unwrap_or(""))
+            });
+            serde_json::Value::Array(cycles)
+        }
+        other => other,
+    };
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
+}
+
+// --- get_orphans ---------------------------------------------------------
+
+#[tokio::test]
+async fn response_get_orphans_default_callables() {
+    let fx = build_indexed_fixture().await;
+    let r = get_orphans(&fx.inner.graph, None);
+    // `Graph::orphans` walks the symbol map (HashMap) in iteration order,
+    // so the resulting Vec ordering varies across runs. Sort by `id` for
+    // stable snapshot output. (Within-array ordering is not part of the
+    // wire contract — clients are expected to sort or hash to compare.)
+    let body = first_text(&r);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("orphans response is JSON");
+    let normalized = sort_array_by_id(parsed);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
+}
+
+/// Sort a JSON array of objects by their `id` field (string compare).
+/// Used to stabilize orphans / search-results output where the underlying
+/// graph traversal walks a HashMap.
+fn sort_array_by_id(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(mut arr) => {
+            arr.sort_by(|a, b| {
+                let ka = a["id"].as_str().unwrap_or("");
+                let kb = b["id"].as_str().unwrap_or("");
+                ka.cmp(kb)
+            });
+            serde_json::Value::Array(arr.into_iter().map(sort_json).collect())
+        }
+        other => sort_json(other),
+    }
+}
+
+// --- get_class_hierarchy -------------------------------------------------
+
+#[tokio::test]
+async fn response_get_class_hierarchy_engine() {
+    let fx = build_indexed_fixture().await;
+    let r = get_class_hierarchy(&fx.inner.graph, "Engine", Some(1));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- get_coupling --------------------------------------------------------
+
+#[tokio::test]
+async fn response_get_coupling_engine_cpp_outgoing() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_coupling(&fx.inner.graph, &file, Some("outgoing"));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_coupling_engine_cpp_incoming() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_coupling(&fx.inner.graph, &file, Some("incoming"));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_coupling_engine_cpp_both() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_coupling(&fx.inner.graph, &file, Some("both"));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- generate_diagram ----------------------------------------------------
+//
+// One snapshot per (dispatch type × output format). With three dispatch
+// types (symbol/file/class) and two output formats (edges/mermaid), we
+// get six snapshots — covering every supported combination.
+
+#[tokio::test]
+async fn response_generate_diagram_symbol_edges() {
+    let fx = build_indexed_fixture().await;
+    let id = format!(
+        "{}:Engine::update",
+        fx.indexed_root.join("engine.cpp").display()
+    );
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            symbol: Some(&id),
+            format: Some("edges"),
+            ..Default::default()
+        },
+    );
+    // Edges format → JSON array of {from, to, label}. Sort entries for
+    // determinism (BFS visit order is randomized per the diagram module
+    // doc comment).
+    let body = first_text(&r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("symbol-edges response is JSON");
+    let normalized = sort_diagram_edges(parsed);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_symbol_mermaid() {
+    let fx = build_indexed_fixture().await;
+    let id = format!(
+        "{}:Engine::update",
+        fx.indexed_root.join("engine.cpp").display()
+    );
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            symbol: Some(&id),
+            format: Some("mermaid"),
+            ..Default::default()
+        },
+    );
+    // Mermaid output is plain text, not JSON. Sort the body lines (after
+    // the `graph TD` header) so BFS-driven ordering doesn't churn the
+    // snapshot.
+    let text = first_text(&r);
+    let normalized = sort_mermaid_lines(&text);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_snapshot!(normalized);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_file_edges() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            file: Some(&file),
+            format: Some("edges"),
+            ..Default::default()
+        },
+    );
+    let body = first_text(&r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("file-edges response is JSON");
+    let normalized = sort_diagram_edges(parsed);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_file_mermaid() {
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            file: Some(&file),
+            format: Some("mermaid"),
+            ..Default::default()
+        },
+    );
+    let text = first_text(&r);
+    let normalized = sort_mermaid_lines(&text);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_snapshot!(normalized);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_class_edges() {
+    let fx = build_indexed_fixture().await;
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            class: Some("Engine"),
+            format: Some("edges"),
+            ..Default::default()
+        },
+    );
+    let body = first_text(&r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("class-edges response is JSON");
+    let normalized = sort_diagram_edges(parsed);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_class_mermaid() {
+    let fx = build_indexed_fixture().await;
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            class: Some("Engine"),
+            format: Some("mermaid"),
+            ..Default::default()
+        },
+    );
+    let text = first_text(&r);
+    let normalized = sort_mermaid_lines(&text);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_snapshot!(normalized);
+    });
+}
+
+// --- helpers for diagram normalization -----------------------------------
+
+/// Sort the `from-to` edges in a diagram-edges response by `(from, to)`.
+fn sort_diagram_edges(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(mut arr) => {
+            arr.sort_by(|a, b| {
+                let ka = format!(
+                    "{}-{}",
+                    a["from"].as_str().unwrap_or(""),
+                    a["to"].as_str().unwrap_or("")
+                );
+                let kb = format!(
+                    "{}-{}",
+                    b["from"].as_str().unwrap_or(""),
+                    b["to"].as_str().unwrap_or("")
+                );
+                ka.cmp(&kb)
+            });
+            serde_json::Value::Array(arr.into_iter().map(sort_json).collect())
+        }
+        other => sort_json(other),
+    }
+}
+
+/// Sort lines of a Mermaid diagram preserving the `graph TD` header.
+/// BFS-driven ordering of edges in the rendered output is non-deterministic
+/// (per `diagrams.rs` module doc) but the set-of-edges is stable. Sorting
+/// lines collapses ordering to a stable form for snapshotting.
+fn sort_mermaid_lines(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if let Some(first) = lines.first() {
+        if first.starts_with("graph ") {
+            let header = lines.remove(0);
+            lines.sort();
+            std::iter::once(header)
+                .chain(lines)
+                .collect::<Vec<&str>>()
+                .join("\n")
+        } else {
+            lines.sort();
+            lines.join("\n")
+        }
+    } else {
+        String::new()
+    }
+}
+
+// --- guard: confirm Cpp registered language is present in the binary ----
+
+/// Sanity check that doesn't exercise a snapshot — keeps the pipeline
+/// honest if someone removes the C++ parser registration.
+#[test]
+fn cpp_parser_registers_for_cpp_language() {
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    assert!(registry.plugin_for(Language::Cpp).is_some());
+}

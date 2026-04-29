@@ -1,0 +1,12 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+[
+  {
+    "depth": 1,
+    "file": "[testdata]/main.cpp",
+    "line": 11,
+    "symbol_id": "[testdata]/main.cpp:main"
+  }
+]

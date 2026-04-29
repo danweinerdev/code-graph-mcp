@@ -30,3 +30,5 @@ rayon = { workspace = true }
 codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
+insta = { workspace = true }
+regex = { workspace = true }

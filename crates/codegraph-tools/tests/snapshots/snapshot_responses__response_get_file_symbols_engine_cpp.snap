@@ -1,0 +1,46 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+[
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:Engine::Engine",
+    "kind": "method",
+    "line": 4,
+    "name": "Engine",
+    "parent": "Engine"
+  },
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:Engine::update",
+    "kind": "method",
+    "line": 6,
+    "name": "update",
+    "parent": "Engine"
+  },
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:Engine::render",
+    "kind": "method",
+    "line": 12,
+    "name": "render",
+    "parent": "Engine"
+  },
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:Engine::status",
+    "kind": "method",
+    "line": 16,
+    "name": "status",
+    "parent": "Engine"
+  },
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:DebugEngine::dumpState",
+    "kind": "method",
+    "line": 20,
+    "name": "dumpState",
+    "parent": "DebugEngine"
+  }
+]

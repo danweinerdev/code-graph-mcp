@@ -1,0 +1,14 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"detect_cycles\")"
+---
+{
+  "name": "detect_cycles",
+  "description": "Detect circular include dependencies in the indexed codebase",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Empty parameter struct for tools that take no arguments\n(`detect_cycles`, `watch_start`, `watch_stop`). The empty `{}` JSON\nobject deserializes into this without error.",
+    "title": "EmptyParams",
+    "type": "object"
+  }
+}

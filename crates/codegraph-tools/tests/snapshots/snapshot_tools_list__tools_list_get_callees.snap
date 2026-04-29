@@ -1,0 +1,32 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_callees\")"
+---
+{
+  "name": "get_callees",
+  "description": "Find functions called by the given symbol (downstream call chain)",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "depth": {
+        "default": null,
+        "description": "Maximum traversal depth (default 1)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "symbol": {
+        "description": "Symbol ID in format file:name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "symbol"
+    ],
+    "title": "GetCalleesArgs",
+    "type": "object"
+  }
+}

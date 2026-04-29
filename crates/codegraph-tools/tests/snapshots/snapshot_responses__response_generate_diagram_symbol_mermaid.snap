@@ -1,0 +1,12 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+graph TD
+    n0 -->|calls| n1
+    n0 -->|calls| n2
+    n0["Engine::update"]
+    n1["lerp"]
+    n2["clamp"]
+    n3 -->|calls| n0
+    n3["main"]

@@ -1,0 +1,43 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+[
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:DebugEngine::dumpState",
+    "kind": "method",
+    "line": 20,
+    "name": "dumpState",
+    "parent": "DebugEngine"
+  },
+  {
+    "file": "[testdata]/engine.cpp",
+    "id": "[testdata]/engine.cpp:Engine::Engine",
+    "kind": "method",
+    "line": 4,
+    "name": "Engine",
+    "parent": "Engine"
+  },
+  {
+    "file": "[testdata]/main.cpp",
+    "id": "[testdata]/main.cpp:main",
+    "kind": "function",
+    "line": 9,
+    "name": "main"
+  },
+  {
+    "file": "[testdata]/orphan.cpp",
+    "id": "[testdata]/orphan.cpp:alsoOrphaned",
+    "kind": "function",
+    "line": 7,
+    "name": "alsoOrphaned"
+  },
+  {
+    "file": "[testdata]/orphan.cpp",
+    "id": "[testdata]/orphan.cpp:neverCalled",
+    "kind": "function",
+    "line": 3,
+    "name": "neverCalled"
+  }
+]

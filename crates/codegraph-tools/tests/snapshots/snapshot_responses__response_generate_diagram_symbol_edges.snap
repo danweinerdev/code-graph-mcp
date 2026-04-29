@@ -1,0 +1,21 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+[
+  {
+    "from": "Engine::update",
+    "label": "calls",
+    "to": "clamp"
+  },
+  {
+    "from": "Engine::update",
+    "label": "calls",
+    "to": "lerp"
+  },
+  {
+    "from": "main",
+    "label": "calls",
+    "to": "Engine::update"
+  }
+]

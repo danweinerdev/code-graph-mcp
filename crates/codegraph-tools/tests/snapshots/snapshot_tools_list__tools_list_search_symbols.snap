@@ -1,0 +1,75 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"search_symbols\")"
+---
+{
+  "name": "search_symbols",
+  "description": "Search for symbols by name pattern across the indexed codebase. Returns paginated results. Default brief mode omits signatures for token efficiency.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "brief": {
+        "default": null,
+        "description": "Omit signature, column, end_line (default true)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "kind": {
+        "default": null,
+        "description": "Filter by symbol kind: function, method, class, struct, enum, typedef",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "language": {
+        "default": null,
+        "description": "Filter by source language: cpp, rust, go, or python",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum results to return (default 20)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "namespace": {
+        "default": null,
+        "description": "Filter by namespace (substring match, e.g., 'Nfs' matches 'Ark::Nfs::V4')",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N matches for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "default": null,
+        "description": "Substring or regex pattern to match symbol names",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "SearchSymbolsArgs",
+    "type": "object"
+  }
+}

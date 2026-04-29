@@ -1,0 +1,23 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_orphans\")"
+---
+{
+  "name": "get_orphans",
+  "description": "Find symbols with no incoming call edges (uncalled functions/methods)",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "kind": {
+        "default": null,
+        "description": "Filter by symbol kind: function, method (default: all callables)",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "GetOrphansArgs",
+    "type": "object"
+  }
+}

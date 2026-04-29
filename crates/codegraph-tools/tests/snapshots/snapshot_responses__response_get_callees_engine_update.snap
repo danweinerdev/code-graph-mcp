@@ -1,0 +1,18 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+[
+  {
+    "depth": 1,
+    "file": "[testdata]/engine.cpp",
+    "line": 7,
+    "symbol_id": "[testdata]/utils.cpp:lerp"
+  },
+  {
+    "depth": 1,
+    "file": "[testdata]/engine.cpp",
+    "line": 9,
+    "symbol_id": "[testdata]/utils.cpp:clamp"
+  }
+]

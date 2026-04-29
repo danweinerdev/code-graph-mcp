@@ -1,0 +1,11 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+[
+  {
+    "from": "DebugEngine",
+    "label": "inherits",
+    "to": "Engine"
+  }
+]

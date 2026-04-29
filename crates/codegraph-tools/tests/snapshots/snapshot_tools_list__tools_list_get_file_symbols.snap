@@ -1,0 +1,38 @@
+---
+source: crates/codegraph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_file_symbols\")"
+---
+{
+  "name": "get_file_symbols",
+  "description": "List all symbols (functions, classes, etc.) defined in a file",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "brief": {
+        "default": null,
+        "description": "Omit signature, column, end_line for compact output (default true)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "file": {
+        "description": "Absolute path to the source file",
+        "type": "string"
+      },
+      "top_level_only": {
+        "default": null,
+        "description": "Only return top-level symbols (no nested methods/types) (default false)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "file"
+    ],
+    "title": "GetFileSymbolsArgs",
+    "type": "object"
+  }
+}
