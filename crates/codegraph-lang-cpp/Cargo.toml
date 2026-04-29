@@ -15,3 +15,4 @@ codegraph-core = { path = "../codegraph-core" }
 codegraph-lang = { path = "../codegraph-lang" }
 tree-sitter = { workspace = true }
 tree-sitter-cpp = { workspace = true }
+streaming-iterator = { workspace = true }

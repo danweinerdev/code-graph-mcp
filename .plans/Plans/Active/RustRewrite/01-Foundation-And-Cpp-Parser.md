@@ -29,7 +29,7 @@ tasks:
     verification: "CppParser::new() compiles all 4 query strings (definitions, calls, includes, inheritance) against tree-sitter-cpp 0.23.4 without error; Extensions() returns [.cpp .cc .cxx .c .h .hpp .hxx]; helpers split_qualified, strip_include_path, is_cpp_cast, find_enclosing_kind, resolve_namespace, resolve_parent_class, enclosing_function_id are unit-tested with the same fixtures as the Go test corpus; truncate_signature uses char_indices so UTF-8 boundary slicing is impossible by construction (test with multi-byte content past 200 bytes confirming no panic and a valid UTF-8 result)"
   - id: "1.5"
     title: "codegraph-lang-cpp: definition, call, include, inheritance extraction"
-    status: planned
+    status: complete
     depends_on: ["1.4"]
     verification: "Extracts free functions, qualified methods (Class::method, ns::func), inline methods (field_identifier path), classes/structs/enums (incl. enum class), simple typedefs, function-pointer typedefs, type-alias `using` declarations, operator overloads (free and in-class); each symbol has correct Name, Kind, File, Line, Column, EndLine, Signature, Namespace, Parent — Namespace populated from enclosing namespace_definition, joined `a::b` for nesting, empty for anonymous namespaces; call edges produced for all 4 patterns (free, method, qualified, template free) with correct From (enclosing function symbol ID) and To (callee text); cast expressions (static_cast/dynamic_cast/const_cast/reinterpret_cast) filtered; include edges produced for both quoted and system forms with brackets/quotes stripped; inheritance edges produced for class_specifier and struct_specifier with simple and qualified bases, multiple bases produce multiple edges; tree-sitter error nodes skipped via has_error()"
   - id: "1.6"
@@ -105,15 +105,15 @@ The TOML loader fails the entire `analyze_codebase` call on parse error rather t
 ## 1.5: codegraph-lang-cpp: definition, call, include, inheritance extraction
 
 ### Subtasks
-- [ ] `extract_definitions` iterates `def_query` matches; handles capture names: `func.name`, `inline.name`, `method.qname`, `operator.name`, `class.name`, `struct.name`, `enum.name`, `typedef.name`
-- [ ] Each symbol populated with Name, Kind, File, Line (1-based), Column (0-based), EndLine, Signature (truncated), Namespace (joined `a::b`), Parent (from class_specifier or struct_specifier or qualified split)
-- [ ] Method-vs-function distinction: `func.name` becomes Method when enclosed in a class/struct; `method.qname` always Method with parent split from `Scope::Name`
-- [ ] `extract_calls` iterates `call_query` matches; capture names `call.name` and `call.qname`
-- [ ] Cast filter: `is_cpp_cast(callee_name)` skips `static_cast`/`dynamic_cast`/`const_cast`/`reinterpret_cast`
-- [ ] `From` field set via `enclosing_function_id` (returns `path:funcName` or just `path` for top-level calls)
-- [ ] `extract_includes` iterates `incl_query` matches; quotes/angle brackets stripped
-- [ ] `extract_inheritance` iterates `inh_query` matches; emits one Edge per (derived, base) pair; both `type_identifier` and `qualified_identifier` base node forms handled
-- [ ] Error nodes: every extraction loop checks `node.has_error()` and skips gracefully (matches Go behavior, prevents crashes on macro-heavy or template-metaprogramming-heavy code)
+- [x] `extract_definitions` iterates `def_query` matches; handles capture names: `func.name`, `inline.name`, `method.qname`, `operator.name`, `class.name`, `struct.name`, `enum.name`, `typedef.name`
+- [x] Each symbol populated with Name, Kind, File, Line (1-based), Column (0-based), EndLine, Signature (truncated), Namespace (joined `a::b`), Parent (from class_specifier or struct_specifier or qualified split)
+- [x] Method-vs-function distinction: `func.name` becomes Method when enclosed in a class/struct; `method.qname` always Method with parent split from `Scope::Name`
+- [x] `extract_calls` iterates `call_query` matches; capture names `call.name` and `call.qname`
+- [x] Cast filter: `is_cpp_cast(callee_name)` skips `static_cast`/`dynamic_cast`/`const_cast`/`reinterpret_cast`
+- [x] `From` field set via `enclosing_function_id` (returns `path:funcName` or just `path` for top-level calls)
+- [x] `extract_includes` iterates `incl_query` matches; quotes/angle brackets stripped
+- [x] `extract_inheritance` iterates `inh_query` matches; emits one Edge per (derived, base) pair; both `type_identifier` and `qualified_identifier` base node forms handled
+- [x] Error nodes: every extraction loop checks `node.has_error()` and skips gracefully (matches Go behavior, prevents crashes on macro-heavy or template-metaprogramming-heavy code)
 
 ### Notes
 The 7 documented C++ limitations from `CLAUDE.md` are preserved verbatim — they are intentional, not bugs:
