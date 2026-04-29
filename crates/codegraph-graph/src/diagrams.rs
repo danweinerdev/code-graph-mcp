@@ -10,11 +10,23 @@
 //! the Go reference (`!visited[from] || !visited[to]`) is preserved so
 //! a max-nodes cutoff doesn't leave dangling endpoints in the output.
 //!
-//! Determinism: the [`DiagramResult::render_mermaid`] node-id assignment
-//! uses [`indexmap::IndexMap`] to preserve insertion order, so repeat
-//! invocations on the same `DiagramResult` produce byte-identical output.
-//! The Go reference iterates a `map[string]bool` whose order is randomized
-//! per process — that randomness is not portable to a test gate.
+//! Determinism note: [`DiagramResult::render_mermaid`] produces
+//! byte-identical output for a fixed `DiagramResult` — the
+//! [`indexmap::IndexMap`]-based node-id assignment preserves insertion
+//! order across invocations. The Go reference iterates a
+//! `map[string]bool` whose order is randomized per process; that
+//! randomness is not portable to a test gate, so the Rust port pins
+//! determinism at this layer instead.
+//!
+//! The BFS methods (`diagram_call_graph`, `diagram_file_graph`,
+//! `diagram_inheritance`), in contrast, traverse `HashMap`-backed
+//! adjacency maps (`adj` / `radj` / `includes`) whose iteration order
+//! is randomized. The resulting [`DiagramResult::edges`] ordering is
+//! **not** stable across invocations — only the *set* of emitted edges
+//! is deterministic. Tests that need byte-equality of rendered output
+//! must construct the `DiagramResult` directly rather than rely on BFS
+//! output; tests over BFS results must compare edges as a set (e.g. via
+//! `contains` checks on `(from, to)` pairs).
 //!
 //! Locking is not handled in this module. Task 2.6 wraps [`Graph`] in
 //! `parking_lot::RwLock`; until then these methods take `&self` and rely
@@ -839,6 +851,44 @@ mod tests {
     }
 
     #[test]
+    fn diagram_call_graph_depth_zero_normalized_to_one() {
+        // a -> b -> c. depth=0 must normalize to 1, surfacing only
+        // the immediate edge a -> b. depth=2 (for contrast) would
+        // include both edges. Compares zero-vs-one byte-equally and
+        // pins the edge count so a regression to "depth=0 means
+        // unbounded" or "depth=0 means 2" both fail.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("c", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp", 1),
+                call_edge("/x.cpp:b", "/x.cpp:c", "/x.cpp", 2),
+            ],
+        ));
+
+        let zero = g.diagram_call_graph("/x.cpp:a", 0, 30).expect("a is known");
+        let one = g.diagram_call_graph("/x.cpp:a", 1, 30).expect("a is known");
+        assert_eq!(
+            zero.edges, one.edges,
+            "depth=0 must produce the same edges as depth=1",
+        );
+        assert_eq!(
+            zero.edges.len(),
+            1,
+            "depth=1 must return only the direct edge a -> b: {:?}",
+            zero.edges,
+        );
+        assert_eq!(zero.edges[0].from, "a");
+        assert_eq!(zero.edges[0].to, "b");
+    }
+
+    #[test]
     fn diagram_call_graph_uses_parent_label_for_methods() {
         // A method symbol with non-empty `parent` gets a "Parent::Name"
         // display label via mermaid_label. Confirms the formatter is
@@ -946,6 +996,46 @@ mod tests {
         assert_eq!(result.edges[0].to, "B.h");
     }
 
+    #[test]
+    fn diagram_file_graph_depth_zero_normalized_to_one() {
+        // A includes B includes C. depth=0 normalizes to 1; only
+        // the immediate A -> B edge surfaces. Identical edge set
+        // to an explicit depth=1 call.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/A.cpp",
+            Language::Cpp,
+            vec![],
+            vec![include_edge("/A.cpp", "/B.cpp", "/A.cpp")],
+        ));
+        g.merge_file_graph(make_fg(
+            "/B.cpp",
+            Language::Cpp,
+            vec![],
+            vec![include_edge("/B.cpp", "/C.cpp", "/B.cpp")],
+        ));
+        g.merge_file_graph(make_fg("/C.cpp", Language::Cpp, vec![], vec![]));
+
+        let zero = g
+            .diagram_file_graph(Path::new("/A.cpp"), 0, 30)
+            .expect("A.cpp is known");
+        let one = g
+            .diagram_file_graph(Path::new("/A.cpp"), 1, 30)
+            .expect("A.cpp is known");
+        assert_eq!(
+            zero.edges, one.edges,
+            "depth=0 must produce the same edges as depth=1",
+        );
+        assert_eq!(
+            zero.edges.len(),
+            1,
+            "depth=1 must return only A -> B: {:?}",
+            zero.edges,
+        );
+        assert_eq!(zero.edges[0].from, "A.cpp");
+        assert_eq!(zero.edges[0].to, "B.cpp");
+    }
+
     // ----- diagram_inheritance -----
 
     #[test]
@@ -956,48 +1046,108 @@ mod tests {
 
     #[test]
     fn diagram_inheritance_default_depth_is_two() {
-        // 3-level chain: Base ← Mid ← Leaf. With default depth=0
-        // (normalized to 2, NOT 1), querying Mid returns both edges
-        // (Mid -> Base direct, plus Leaf -> Mid surfaced via radj).
-        // If the default were 1 we'd see only one edge from Mid.
+        // 5-level chain: GrandBase ← Base ← Mid ← Leaf ← GrandLeaf.
+        // We need a chain this long because the depth-0 BFS step
+        // already collects both forward (Mid -> Base) and reverse
+        // (Leaf -> Mid) edges incident to the seed before any
+        // depth-1 expansion runs. A 3-class chain would therefore
+        // pass identically for depth=1 and depth=2 — vacuously
+        // confirming the default. With 5 classes, depth=2 reaches
+        // the second-hop edges (Base -> GrandBase, GrandLeaf -> Leaf)
+        // that depth=1 cannot, so the test fails if anyone changes
+        // the default from 2 to 1.
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
             Language::Cpp,
             vec![
+                sym("GrandBase", SymbolKind::Class, "/x.cpp"),
                 sym("Base", SymbolKind::Class, "/x.cpp"),
                 sym("Mid", SymbolKind::Class, "/x.cpp"),
                 sym("Leaf", SymbolKind::Class, "/x.cpp"),
+                sym("GrandLeaf", SymbolKind::Class, "/x.cpp"),
             ],
             vec![
+                inherit_edge("Base", "GrandBase", "/x.cpp"),
                 inherit_edge("Mid", "Base", "/x.cpp"),
                 inherit_edge("Leaf", "Mid", "/x.cpp"),
+                inherit_edge("GrandLeaf", "Leaf", "/x.cpp"),
             ],
         ));
 
-        // depth=0 → default (2). Both bases-ward AND derived-ward
-        // edges incident to Mid must show up.
+        // depth=0 → default (2). All four edges incident to the
+        // 2-hop neighborhood of Mid must show up: the immediate
+        // pair (Mid -> Base, Leaf -> Mid) plus the second-hop pair
+        // (Base -> GrandBase forward, GrandLeaf -> Leaf reverse).
         let result = g
             .diagram_inheritance("Mid", 0, 30)
             .expect("Mid is a known class");
         assert_eq!(result.center, "Mid");
-        // Mid -> Base (forward / bases) + Leaf -> Mid (reverse / derived).
         let pairs: Vec<(String, String)> = result
             .edges
             .iter()
             .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
+        assert_eq!(
+            pairs.len(),
+            4,
+            "depth=0 (normalized to 2) must surface 4 edges: {pairs:?}",
+        );
         assert!(
             pairs.contains(&("Mid".to_string(), "Base".to_string())),
-            "Mid -> Base must be present at default depth: {pairs:?}",
+            "first-hop forward Mid -> Base missing: {pairs:?}",
         );
         assert!(
             pairs.contains(&("Leaf".to_string(), "Mid".to_string())),
-            "Leaf -> Mid (radj-walked) must be present at default depth: {pairs:?}",
+            "first-hop reverse Leaf -> Mid missing: {pairs:?}",
+        );
+        assert!(
+            pairs.contains(&("Base".to_string(), "GrandBase".to_string())),
+            "second-hop forward Base -> GrandBase missing — \
+             default depth may have regressed from 2 to 1: {pairs:?}",
+        );
+        assert!(
+            pairs.contains(&("GrandLeaf".to_string(), "Leaf".to_string())),
+            "second-hop reverse GrandLeaf -> Leaf missing — \
+             default depth may have regressed from 2 to 1: {pairs:?}",
         );
         for e in &result.edges {
             assert_eq!(e.label, "inherits");
         }
+
+        // Sanity check: depth=1 must surface ONLY the first-hop
+        // edges. If this assertion ever passes with 4 edges, the
+        // depth-clamp at the BFS head broke and the depth=0
+        // assertion above is no longer non-vacuous.
+        let shallow = g
+            .diagram_inheritance("Mid", 1, 30)
+            .expect("Mid is a known class");
+        let shallow_pairs: Vec<(String, String)> = shallow
+            .edges
+            .iter()
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+        assert_eq!(
+            shallow_pairs.len(),
+            2,
+            "depth=1 must surface ONLY first-hop edges: {shallow_pairs:?}",
+        );
+        assert!(
+            shallow_pairs.contains(&("Mid".to_string(), "Base".to_string())),
+            "depth=1 must include Mid -> Base: {shallow_pairs:?}",
+        );
+        assert!(
+            shallow_pairs.contains(&("Leaf".to_string(), "Mid".to_string())),
+            "depth=1 must include Leaf -> Mid: {shallow_pairs:?}",
+        );
+        assert!(
+            !shallow_pairs.contains(&("Base".to_string(), "GrandBase".to_string())),
+            "depth=1 must NOT include second-hop Base -> GrandBase: {shallow_pairs:?}",
+        );
+        assert!(
+            !shallow_pairs.contains(&("GrandLeaf".to_string(), "Leaf".to_string())),
+            "depth=1 must NOT include second-hop GrandLeaf -> Leaf: {shallow_pairs:?}",
+        );
     }
 
     #[test]
