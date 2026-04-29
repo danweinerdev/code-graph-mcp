@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "In-memory code graph engine, algorithms, and persistence (placeholder for Phase 2)"
+description = "In-memory code graph engine, algorithms, and persistence"
 
 [lints]
 workspace = true
 
 [dependencies]
+codegraph-core = { path = "../codegraph-core" }

@@ -3,14 +3,14 @@ title: "Graph Engine & LLM Optimizations"
 type: phase
 plan: RustRewrite
 phase: 2
-status: planned
+status: in-progress
 created: 2026-04-28
 updated: 2026-04-28
 deliverable: "codegraph-graph crate with the full query surface, all algorithms (BFS callers/callees, iterative Tarjan SCC, diamond-safe class hierarchy), LLM-optimized search (brief mode, pagination envelope, namespace filter, language filter, namespace summary), and the RenderMermaid Mermaid string generator"
 tasks:
   - id: "2.1"
     title: "Graph struct, FileEntry with Language, merge/remove/clear"
-    status: planned
+    status: complete
     verification: "Graph::new() initializes all maps non-null; FileEntry carries both `language` and `symbol_ids`; merge_file_graph adds nodes and edges, replaces stale data on re-merge from the same path, splits Calls/Inherits into adj+radj and Includes into the includes map; remove_file deletes nodes, adj entries originating from path, radj entries originating from path, includes for path, and the files entry; clear() resets to empty; tests cover merge-one-file, merge-two-files, re-merge-same-file (idempotent), remove-file, clear, and stats reporting consistent counts"
   - id: "2.2"
     title: "Symbol queries: file_symbols, symbol_detail, search with pagination, symbol_summary"
@@ -55,14 +55,14 @@ This phase has zero MCP dependency — `codegraph-graph` is unit-testable with n
 ## 2.1: Graph struct, FileEntry with Language, merge/remove/clear
 
 ### Subtasks
-- [ ] `Graph` struct in `codegraph-graph::graph` with fields: `nodes: HashMap<SymbolId, Node>`, `adj: HashMap<SymbolId, Vec<EdgeEntry>>`, `radj: HashMap<SymbolId, Vec<EdgeEntry>>`, `files: HashMap<PathBuf, FileEntry>`, `includes: HashMap<PathBuf, Vec<PathBuf>>`
-- [ ] `FileEntry { language: Language, symbol_ids: Vec<SymbolId> }` — Language is captured per-file so cache v2 can record it without extension re-derivation
-- [ ] `Node { symbol: Symbol }` plus `EdgeEntry { target: SymbolId, kind: EdgeKind, file: PathBuf, line: u32 }`
-- [ ] `Graph::new() -> Self` initializes all maps with `HashMap::new()` (never returns Option)
-- [ ] `merge_file_graph(&mut self, fg: FileGraph)` removes any pre-existing data for fg.path, then adds all symbols as nodes and routes edges into adj/radj/includes by kind
-- [ ] `remove_file(&mut self, path: &Path)` — implementation iterates adj/radj entries by source file (matches Go's `e.File != path` filter), trims empty key entries
-- [ ] `clear(&mut self)` resets all maps
-- [ ] Tests: merge-one-file produces correct node and edge counts; merge-two-files; re-merge same path is idempotent; remove-file cleans up all four storage maps; clear produces empty Stats
+- [x] `Graph` struct in `codegraph-graph::graph` with fields: `nodes: HashMap<SymbolId, Node>`, `adj: HashMap<SymbolId, Vec<EdgeEntry>>`, `radj: HashMap<SymbolId, Vec<EdgeEntry>>`, `files: HashMap<PathBuf, FileEntry>`, `includes: HashMap<PathBuf, Vec<PathBuf>>`
+- [x] `FileEntry { language: Language, symbol_ids: Vec<SymbolId> }` — Language is captured per-file so cache v2 can record it without extension re-derivation
+- [x] `Node { symbol: Symbol }` plus `EdgeEntry { target: SymbolId, kind: EdgeKind, file: PathBuf, line: u32 }`
+- [x] `Graph::new() -> Self` initializes all maps with `HashMap::new()` (never returns Option)
+- [x] `merge_file_graph(&mut self, fg: FileGraph)` removes any pre-existing data for fg.path, then adds all symbols as nodes and routes edges into adj/radj/includes by kind
+- [x] `remove_file(&mut self, path: &Path)` — implementation iterates adj/radj entries by source file (matches Go's `e.File != path` filter), trims empty key entries
+- [x] `clear(&mut self)` resets all maps
+- [x] Tests: merge-one-file produces correct node and edge counts; merge-two-files; re-merge same path is idempotent; remove-file cleans up all four storage maps; clear produces empty Stats
 
 ## 2.2: Symbol queries: file_symbols, symbol_detail, search, symbol_summary
 
