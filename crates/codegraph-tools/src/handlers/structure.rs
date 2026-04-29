@@ -92,25 +92,7 @@ pub fn get_class_hierarchy(
     if let Some(h) = g.class_hierarchy(class, depth) {
         return tool_success_json(&h);
     }
-
-    // Did-you-mean: filter the 100-candidate pool to class-like kinds
-    // before joining the top 5. This deliberately does not reuse the
-    // `suggest_symbols` helper from the symbol-detail path because that
-    // helper does not filter by kind — and a user asking for
-    // `class_hierarchy("Foo")` shouldn't get a suggestion for a Function
-    // named "FooBar".
-    let candidates = g.search_symbols(class, None);
-    let class_like: Vec<String> = candidates
-        .into_iter()
-        .filter(|s| {
-            matches!(
-                s.kind,
-                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
-            )
-        })
-        .take(5)
-        .map(|s| s.name)
-        .collect();
+    let class_like = suggest_class_symbols(&g, class, 5);
     drop(g);
 
     if class_like.is_empty() {
@@ -121,6 +103,26 @@ pub fn get_class_hierarchy(
             "class not found: {class:?}. Did you mean: {suggestions}?"
         ))
     }
+}
+
+/// Did-you-mean helper for class-like lookups. Filters the candidate pool
+/// to `{Class, Struct, Interface, Trait}` so a Function named "FooBar"
+/// never appears as a suggestion for `class_hierarchy("Foo")`. Deliberately
+/// does NOT reuse `suggest_symbols` from `mod.rs` because that helper is
+/// kind-agnostic.
+fn suggest_class_symbols(graph: &Graph, name: &str, limit: usize) -> Vec<String> {
+    graph
+        .search_symbols(name, None)
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
+            )
+        })
+        .take(limit)
+        .map(|s| s.name)
+        .collect()
 }
 
 // ----- get_coupling -----
@@ -211,6 +213,12 @@ pub struct GenerateDiagramInput<'a> {
 /// consistent regardless of which view a user requested. The snapshot
 /// suite in 3.7 will lock this in.
 ///
+/// **Exactly-one-of**: when 0 or >1 of `symbol`/`file`/`class` are set,
+/// returns an error. The Go reference accepted multiple parameters and
+/// silently picked one by precedence (class > symbol > file); the Rust
+/// port rejects ambiguous calls so silent precedence ambiguity can't
+/// produce surprising results.
+///
 /// Empty edges in `edges` format serialize as `[]` (never `null`) —
 /// `DiagramResult::edges` is a `Vec`, not `Option`, so this falls out
 /// of the type system.
@@ -271,22 +279,7 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
                 };
             }
             if let Some(name) = class {
-                // Same kind-filtered did-you-mean as `get_class_hierarchy`.
-                let candidates = g.search_symbols(name, None);
-                let class_like: Vec<String> = candidates
-                    .into_iter()
-                    .filter(|s| {
-                        matches!(
-                            s.kind,
-                            SymbolKind::Class
-                                | SymbolKind::Struct
-                                | SymbolKind::Interface
-                                | SymbolKind::Trait
-                        )
-                    })
-                    .take(5)
-                    .map(|s| s.name)
-                    .collect();
+                let class_like = suggest_class_symbols(&g, name, 5);
                 drop(g);
                 return if class_like.is_empty() {
                     tool_error(format!("class not found: {name:?}"))

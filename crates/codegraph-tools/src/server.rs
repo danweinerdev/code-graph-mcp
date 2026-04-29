@@ -561,6 +561,8 @@ impl CodeGraphServer {
         // gate is intentionally NOT applied here: the stub message is the
         // same regardless of indexed state, and adding the gate would mean
         // an indexed-then-not-implemented path masks the not-implemented one.
+        // **Phase 4 must restore the `require_indexed` gate** that the Go
+        // reference enforces before spawning the watcher.
         Ok(handlers::watch::watch_start_stub())
     }
 
