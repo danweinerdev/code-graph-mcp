@@ -34,7 +34,7 @@ tasks:
     verification: "coupling returns outgoing cross-file edge counts (calls + includes), incoming_coupling returns reverse direction; both return HashMap<PathBuf, u32> never Option; DiagramCallGraph performs BFS bounded by depth and max_nodes, includes both forward and reverse edges, deduplicates; DiagramFileGraph BFS over includes; DiagramInheritance BFS over Inherits edges starting from the widened kind filter; RenderMermaid produces valid Mermaid graph syntax with shortened node IDs (n0, n1...), preserves edge labels (calls/includes/inherits), supports `styled` flag adding center-node CSS class; empty diagrams render as empty string (or empty edges array — same wire-format invariant)"
   - id: "2.6"
     title: "Concurrency safety with parking_lot::RwLock"
-    status: planned
+    status: complete
     depends_on: ["2.2", "2.3", "2.4", "2.5"]
     verification: "Graph wrapped behind parking_lot::RwLock for production use; concurrent test spawns 10 reader threads (calling search/callers/symbol_summary in a loop) and 2 writer threads (calling merge_file_graph in a loop) for at least 1s; test passes under `cargo test` and `cargo +nightly miri test` (where applicable); no deadlocks; results from readers are never partially-merged states (every merge_file_graph is atomic from the reader's perspective via the write lock)"
   - id: "2.7"
@@ -121,9 +121,9 @@ The 4-level diamond fixture is the same one used in the Go regression test (`Tes
 ## 2.6: Concurrency safety with parking_lot::RwLock
 
 ### Subtasks
-- [ ] Re-export `parking_lot::RwLock as RwLock` in `codegraph-graph::lib` so callers don't accidentally import std's
-- [ ] Concurrent test in `tests/concurrent.rs`: spawn 10 reader threads calling `search` / `callers` / `symbol_summary` in a tight loop; spawn 2 writer threads calling `merge_file_graph` with different files in a tight loop; run for ≥ 1 second; assert no panics, no deadlocks, all readers see consistent snapshots (no half-merged state)
-- [ ] Run under `cargo test` (default) — Rust's borrow checker + parking_lot semantics catch most issues; `loom` is not introduced for this phase (overkill)
+- [x] Re-export `parking_lot::RwLock as RwLock` in `codegraph-graph::lib` so callers don't accidentally import std's
+- [x] Concurrent test in `tests/concurrent.rs`: spawn 10 reader threads calling `search` / `callers` / `symbol_summary` in a tight loop; spawn 2 writer threads calling `merge_file_graph` with different files in a tight loop; run for ≥ 1 second; assert no panics, no deadlocks, all readers see consistent snapshots (no half-merged state)
+- [x] Run under `cargo test` (default) — Rust's borrow checker + parking_lot semantics catch most issues; `loom` is not introduced for this phase (overkill)
 
 ### Notes
 Rust doesn't need a `-race` flag — data races are compile-time errors via the borrow checker. The concurrent test's purpose is to exercise the locking *correctness* (no deadlock, fair access patterns, no logical race in code that uses the lock) rather than detect raw memory races.
