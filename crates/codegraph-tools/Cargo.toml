@@ -5,9 +5,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "MCP tool handlers, discovery walker, indexer, and watcher (placeholder for Phase 3)"
+description = "MCP tool handlers, discovery walker, indexer, and watcher"
 
 [lints]
 workspace = true
 
 [dependencies]
+codegraph-core = { path = "../codegraph-core" }
+codegraph-lang = { path = "../codegraph-lang" }
+codegraph-graph = { path = "../codegraph-graph" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

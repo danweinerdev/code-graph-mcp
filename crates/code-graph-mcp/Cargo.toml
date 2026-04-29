@@ -11,3 +11,15 @@ description = "MCP server that builds an in-memory semantic code graph from sour
 workspace = true
 
 [dependencies]
+codegraph-core = { path = "../codegraph-core" }
+codegraph-lang = { path = "../codegraph-lang" }
+codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
+codegraph-graph = { path = "../codegraph-graph" }
+codegraph-tools = { path = "../codegraph-tools" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

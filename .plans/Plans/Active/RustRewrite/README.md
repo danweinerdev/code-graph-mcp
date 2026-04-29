@@ -27,7 +27,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "MCP Server, Tools, Persistence & Parallel Discovery"
-    status: planned
+    status: in-progress
     doc: "03-MCP-Server-Tools-And-Discovery.md"
     depends_on: [2]
   - id: 4

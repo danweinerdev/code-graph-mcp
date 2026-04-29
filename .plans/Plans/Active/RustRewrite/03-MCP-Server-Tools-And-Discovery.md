@@ -3,14 +3,14 @@ title: "MCP Server, Tools, Persistence & Parallel Discovery"
 type: phase
 plan: RustRewrite
 phase: 3
-status: planned
+status: in-progress
 created: 2026-04-28
 updated: 2026-04-28
 deliverable: "code-graph-mcp binary serving 15 wire-format-compatible MCP tools over stdio (rmcp) with the parallel discovery walker, the per-job rayon parsing pool, the rayon→tokio progress bridge, language-aware edge resolution, and atomic JSON cache v2 persistence"
 tasks:
   - id: "3.1"
     title: "rmcp server scaffold, ServerInner state, require_indexed guard"
-    status: planned
+    status: complete
     verification: "code-graph-mcp bin starts and serves stdio MCP via `rmcp::ServiceExt::serve(stdio()).await`; ServerInner holds graph (parking_lot::RwLock), registry, indexed AtomicBool, index_lock (tokio::sync::Mutex), root_path (RwLock<Option<PathBuf>>), watch (RwLock<Option<WatchHandle>>), config (RwLock<RootConfig>); require_indexed returns the exact Go error wording 'no codebase indexed — call analyze_codebase first'; #[tool_router] macro generates dispatch table; #[tool_handler] wires ServerHandler trait; binary built via `cargo build --release` and a smoke MCP `tools/list` call returns 15 tools; tool descriptions are copied verbatim from `internal/tools/tools.go` for 13 of the 15 tools (every error wording, did-you-mean wording, and parameter description preserved byte-for-byte) — **two tools require updates**: (a) `analyze_codebase` description widens from 'Index a C/C++ codebase…' to 'Index a codebase (C/C++, Rust, Go, Python) and build the code graph. Must be called before any query tools.'; (b) `search_symbols` adds a parameter description for the new `language` filter ('Filter by source language: cpp, rust, go, or python'); these two updated strings are captured as the snapshot baseline in task 3.7 and become the wire-format-of-record going forward; ProgressSink trait is defined in `codegraph-tools::indexer` as a stub interface here so subsequent tasks (3.2 discovery, 3.3 ChannelProgressSink) can both depend on it without circularity"
   - id: "3.2"
     title: "Parallel discovery walker with config-controlled thread pool"
@@ -58,13 +58,13 @@ The largest phase — wires the Phase 2 graph engine and the Phase 1 C++ parser 
 ## 3.1: rmcp server scaffold, ServerInner state, require_indexed guard
 
 ### Subtasks
-- [ ] `crates/code-graph-mcp/src/main.rs`: `#[tokio::main] async fn main() -> anyhow::Result<()>` builds the registry (Cpp parser only for this phase), constructs `CodeGraphServer`, calls `server.serve(stdio()).await?.waiting().await`
-- [ ] `crates/codegraph-tools/src/server.rs`: `CodeGraphServer { inner: Arc<ServerInner> }` plus `ServerInner` with all fields per Designs/RustRewrite/ State Management section
-- [ ] `require_indexed(&self) -> Result<(), McpError>` returns the exact Go error string
-- [ ] `#[tool_router] impl CodeGraphServer { ... }` declares all 15 tools (handlers can stub initially with `unimplemented!()` for sub-task tracking, then fill in across 3.4 and 3.5)
-- [ ] `#[tool_handler] impl ServerHandler for CodeGraphServer` provides the default rmcp wiring
-- [ ] Tool descriptions copied verbatim from `internal/tools/tools.go` `mcp.WithDescription(...)` strings so wire-format snapshots match byte-for-byte
-- [ ] Smoke test: `cargo run --release` then send `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` over stdio; assert 15 tools returned with matching descriptions
+- [x] `crates/code-graph-mcp/src/main.rs`: `#[tokio::main] async fn main() -> anyhow::Result<()>` builds the registry (Cpp parser only for this phase), constructs `CodeGraphServer`, calls `server.serve(stdio()).await?.waiting().await`
+- [x] `crates/codegraph-tools/src/server.rs`: `CodeGraphServer { inner: Arc<ServerInner> }` plus `ServerInner` with all fields per Designs/RustRewrite/ State Management section
+- [x] `require_indexed(&self) -> Result<(), McpError>` returns the exact Go error string
+- [x] `#[tool_router] impl CodeGraphServer { ... }` declares all 15 tools (handlers can stub initially with `unimplemented!()` for sub-task tracking, then fill in across 3.4 and 3.5)
+- [x] `#[tool_handler] impl ServerHandler for CodeGraphServer` provides the default rmcp wiring
+- [x] Tool descriptions copied verbatim from `internal/tools/tools.go` `mcp.WithDescription(...)` strings so wire-format snapshots match byte-for-byte
+- [x] Smoke test: `cargo run --release` then send `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` over stdio; assert 15 tools returned with matching descriptions
 
 ## 3.2: Parallel discovery walker with config-controlled thread pool
 
