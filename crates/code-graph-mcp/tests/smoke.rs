@@ -14,23 +14,72 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-/// Read one line from `reader`, returning an error if EOF / IO error / the
-/// stream closes before we get a newline. The rmcp stdio loop is
-/// line-delimited JSON.
-fn read_response(reader: &mut BufReader<std::process::ChildStdout>) -> std::io::Result<String> {
-    let mut buf = String::new();
-    let n = reader.read_line(&mut buf)?;
-    if n == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "child closed stdout before responding",
-        ));
+/// Per-line read budget for the smoke test. The rmcp handshake should
+/// answer within milliseconds; five seconds is comfortably above the worst
+/// observed cold-start time and well below any CI watchdog.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read responses from the child stdout in a worker thread, forwarding one
+/// line at a time over a channel. Owning the reader on a single thread
+/// keeps `BufRead` semantics intact while letting the test apply a deadline
+/// via `recv_timeout`. EOF on the child's stdout closes the channel and
+/// turns subsequent reads into [`RecvTimeoutError::Disconnected`].
+struct LineReader {
+    rx: mpsc::Receiver<std::io::Result<String>>,
+    _join: thread::JoinHandle<()>,
+}
+
+impl LineReader {
+    fn new(stdout: std::process::ChildStdout) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut buf = String::new();
+                match reader.read_line(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(buf)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+        Self { rx, _join: join }
     }
-    Ok(buf)
+
+    /// Block up to `timeout` for the next line. A timeout, EOF, or read
+    /// error all surface as `Err` so the test can fail fast instead of
+    /// hanging on a stalled binary.
+    fn read_line(&self, timeout: Duration) -> std::io::Result<String> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(e)) => Err(e),
+            Err(RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no response from code-graph-mcp within {:?} — \
+                     child likely stalled before writing",
+                    timeout
+                ),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "child closed stdout before responding",
+            )),
+        }
+    }
 }
 
 #[test]
@@ -49,7 +98,7 @@ fn binary_advertises_fifteen_tools() {
         .expect("spawn code-graph-mcp");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let stdout = LineReader::new(child.stdout.take().expect("child stdout"));
 
     // 1. initialize
     let init = json!({
@@ -63,7 +112,9 @@ fn binary_advertises_fifteen_tools() {
         }
     });
     writeln!(stdin, "{init}").expect("write initialize");
-    let _init_resp = read_response(&mut stdout).expect("read initialize response");
+    let _init_resp = stdout
+        .read_line(READ_TIMEOUT)
+        .expect("read initialize response");
 
     // The MCP spec requires a notifications/initialized after the client
     // receives the initialize response.
@@ -80,7 +131,9 @@ fn binary_advertises_fifteen_tools() {
         "method": "tools/list"
     });
     writeln!(stdin, "{list}").expect("write tools/list");
-    let list_resp_line = read_response(&mut stdout).expect("read tools/list response");
+    let list_resp_line = stdout
+        .read_line(READ_TIMEOUT)
+        .expect("read tools/list response");
     let list_resp: Value =
         serde_json::from_str(&list_resp_line).expect("tools/list response is valid JSON");
 
