@@ -5,18 +5,22 @@
 //! symbols, edges, and warnings. The output format is byte-equivalent to the
 //! Go binary's so a `diff` between them validates Rust/Go output parity.
 //!
-//! Phase 1 uses a synchronous `walkdir`-based scan; Phase 3 swaps in
-//! `codegraph-tools::discovery::discover` and re-runs validation.
+//! Phase 3.2 swaps the Phase 1.6 synchronous `walkdir` scan for
+//! [`codegraph_tools::discovery::discover`], the parallel walker. Filtering
+//! moves into the walker (`registry.language_for_path` per worker thread)
+//! and the walk's deterministic ordering is restored by sorting paths in
+//! the discovery layer before returning. Output bytes are unchanged versus
+//! the Phase 1.6 baseline.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use codegraph_core::{Edge, EdgeKind, Symbol, SymbolKind};
+use codegraph_core::{DiscoveryConfig, Edge, EdgeKind, Symbol, SymbolKind};
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
-use walkdir::WalkDir;
+use codegraph_tools::discovery::discover;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -52,41 +56,32 @@ fn main() -> ExitCode {
     let mut all_edges: Vec<Edge> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // First pass: collect (absolute_path, plugin) tuples sorted by path so
-    // symbol/edge accumulation matches the Go binary's `sort.Strings(files)`
-    // ordering.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&dir).follow_links(false).sort_by_file_name() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                let path = err
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| dir.display().to_string());
-                warnings.push(format!("{path}: {err}"));
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if registry.for_path(path).is_none() {
-            continue;
-        }
-        let abs = match fs::canonicalize(path) {
+    // Phase 3.2: parallel walker. The discovery layer applies the registry
+    // extension filter in-thread and returns a path-sorted Vec — matching
+    // the Go binary's `sort.Strings(files)` ordering so the output diff
+    // stays byte-clean.
+    let cfg = DiscoveryConfig::default();
+    let discovered = discover(&dir, &registry, &cfg);
+    warnings.extend(discovered.warnings);
+
+    // Canonicalize paths after discovery so symbol IDs and the printed file
+    // list match the Go binary, which uses `filepath.Abs`. `discover`
+    // returns paths joined onto the user-supplied `root`; if `root` was
+    // relative, the joined path is relative too.
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(discovered.files.len());
+    for df in discovered.files {
+        let abs = match fs::canonicalize(&df.path) {
             Ok(a) => a,
             // `filepath.Abs` in Go does not require the path to exist; if
             // canonicalize fails for a reason other than "not found", fall
             // back to the path as-is rather than dropping the file silently.
-            Err(_) => path.to_path_buf(),
+            Err(_) => df.path,
         };
         candidates.push(abs);
     }
-    // `sort_by_file_name` already gives a deterministic order, but it's a
-    // per-directory order, not a flat lexicographic one. Match Go's
-    // `sort.Strings(files)` by sorting the absolute-path strings globally.
+    // `discover` sorted by relative path; canonicalize may have rewritten
+    // each path to a different (absolute) form. Re-sort so the global
+    // ordering matches Go's `sort.Strings(files)`.
     candidates.sort();
 
     for abs in candidates {
