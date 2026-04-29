@@ -32,11 +32,14 @@ use codegraph_lang::LanguageRegistry;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::model::{CallToolResult, Content, Meta};
+use rmcp::service::RoleServer;
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex as TokioMutex;
+
+use crate::handlers;
 
 /// Placeholder for the active filesystem watcher's handle. Phase 4 replaces
 /// this with the real `notify-debouncer-full` handle plus the channel /
@@ -342,17 +345,35 @@ impl CodeGraphServer {
     )]
     async fn analyze_codebase(
         &self,
-        Parameters(_args): Parameters<AnalyzeCodebaseArgs>,
+        Parameters(args): Parameters<AnalyzeCodebaseArgs>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        let progress_token = meta.get_progress_token();
+        Ok(handlers::analyze::analyze_codebase(
+            self.inner.clone(),
+            args.path,
+            args.force.unwrap_or(false),
+            Some(peer),
+            progress_token,
+        )
+        .await)
     }
 
     #[tool(description = "List all symbols (functions, classes, etc.) defined in a file")]
     async fn get_file_symbols(
         &self,
-        Parameters(_args): Parameters<GetFileSymbolsArgs>,
+        Parameters(args): Parameters<GetFileSymbolsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::symbols::get_file_symbols(
+            &self.inner.graph,
+            &args.file,
+            args.top_level_only.unwrap_or(false),
+            args.brief.unwrap_or(true),
+        ))
     }
 
     #[tool(
@@ -360,17 +381,35 @@ impl CodeGraphServer {
     )]
     async fn search_symbols(
         &self,
-        Parameters(_args): Parameters<SearchSymbolsArgs>,
+        Parameters(args): Parameters<SearchSymbolsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let input = handlers::symbols::SearchSymbolsInput {
+            query: args.query.as_deref(),
+            kind: args.kind.as_deref(),
+            namespace: args.namespace.as_deref(),
+            language: args.language.as_deref(),
+            limit: args.limit,
+            offset: args.offset,
+            brief: args.brief.unwrap_or(true),
+        };
+        Ok(handlers::symbols::search_symbols(&self.inner.graph, input))
     }
 
     #[tool(description = "Get full details for a symbol by its ID")]
     async fn get_symbol_detail(
         &self,
-        Parameters(_args): Parameters<GetSymbolDetailArgs>,
+        Parameters(args): Parameters<GetSymbolDetailArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::symbols::get_symbol_detail(
+            &self.inner.graph,
+            &args.symbol,
+        ))
     }
 
     #[tool(
@@ -378,33 +417,61 @@ impl CodeGraphServer {
     )]
     async fn get_symbol_summary(
         &self,
-        Parameters(_args): Parameters<GetSymbolSummaryArgs>,
+        Parameters(args): Parameters<GetSymbolSummaryArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::symbols::get_symbol_summary(
+            &self.inner.graph,
+            args.file.as_deref(),
+        ))
     }
 
     #[tool(description = "Find functions that call the given symbol (upstream call chain)")]
     async fn get_callers(
         &self,
-        Parameters(_args): Parameters<GetCallersArgs>,
+        Parameters(args): Parameters<GetCallersArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::query::callers_or_callees(
+            &self.inner.graph,
+            &args.symbol,
+            args.depth,
+            handlers::query::Direction::Callers,
+        ))
     }
 
     #[tool(description = "Find functions called by the given symbol (downstream call chain)")]
     async fn get_callees(
         &self,
-        Parameters(_args): Parameters<GetCalleesArgs>,
+        Parameters(args): Parameters<GetCalleesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::query::callers_or_callees(
+            &self.inner.graph,
+            &args.symbol,
+            args.depth,
+            handlers::query::Direction::Callees,
+        ))
     }
 
     #[tool(description = "List files included/imported by the given file")]
     async fn get_dependencies(
         &self,
-        Parameters(_args): Parameters<GetDependenciesArgs>,
+        Parameters(args): Parameters<GetDependenciesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.4"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::query::get_dependencies(
+            &self.inner.graph,
+            &args.file,
+        ))
     }
 
     // -- P1+P2 + watch (Phase 3.5) -----------------------------------------
@@ -571,23 +638,145 @@ mod tests {
         server.require_indexed().expect("indexed flag must pass");
     }
 
-    /// Each Phase 3.1 stub must surface the correct phase tag so tool
-    /// consumers can see which task owns the missing implementation.
+    /// Phase 3.4 P0 handlers must enforce the require_indexed gate before
+    /// running. Each query handler returns the tool-level "no codebase
+    /// indexed" error when the server has not yet been indexed.
     #[tokio::test]
-    async fn p0_handler_stub_reports_phase_3_4() {
+    async fn get_file_symbols_requires_indexed_before_running() {
         let server = empty_server();
-        let err = server
-            .analyze_codebase(Parameters(AnalyzeCodebaseArgs {
-                path: "/tmp/anything".to_string(),
-                force: None,
+        let r = server
+            .get_file_symbols(Parameters(GetFileSymbolsArgs {
+                file: "/never.cpp".to_string(),
+                top_level_only: None,
+                brief: None,
             }))
             .await
-            .expect_err("Phase 3.1 must stub all P0 handlers");
-        assert!(
-            err.message.contains("Phase 3.4"),
-            "P0 stub must mention Phase 3.4, got {:?}",
-            err.message,
-        );
+            .expect("tool-level errors return Ok(CallToolResult)");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn search_symbols_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .search_symbols(Parameters(SearchSymbolsArgs {
+                query: Some("foo".to_string()),
+                kind: None,
+                namespace: None,
+                language: None,
+                limit: None,
+                offset: None,
+                brief: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn get_symbol_detail_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_symbol_detail(Parameters(GetSymbolDetailArgs {
+                symbol: "/x.cpp:foo".to_string(),
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_symbol_summary_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_symbol_summary(Parameters(GetSymbolSummaryArgs { file: None }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_callers_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_callers(Parameters(GetCallersArgs {
+                symbol: "/x.cpp:foo".to_string(),
+                depth: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_callees_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_callees(Parameters(GetCalleesArgs {
+                symbol: "/x.cpp:foo".to_string(),
+                depth: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_dependencies_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_dependencies(Parameters(GetDependenciesArgs {
+                file: "/x.cpp".to_string(),
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    /// Smoke test: with the indexed flag set, query handlers run their
+    /// happy path through the in-module handler functions instead of
+    /// short-circuiting on require_indexed. The detailed shape assertions
+    /// live in the per-handler tests in `handlers/symbols.rs` and
+    /// `handlers/query.rs`.
+    #[tokio::test]
+    async fn p0_handler_passes_require_indexed_when_flag_set() {
+        let server = empty_server();
+        server
+            .inner
+            .indexed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Empty graph + unknown file → handler-specific error wording, not
+        // require_indexed wording.
+        let r = server
+            .get_file_symbols(Parameters(GetFileSymbolsArgs {
+                file: "/never.cpp".to_string(),
+                top_level_only: None,
+                brief: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no symbols found in file: /never.cpp");
     }
 
     /// One representative description must match the Go reference

@@ -24,7 +24,7 @@ tasks:
     verification: "Indexer constructs a per-job rayon::ThreadPoolBuilder with num_threads=cfg.parsing.max_threads (clamped); pool.install runs par_iter().map(parse) so the global rayon pool isn't monopolized; ChannelProgressSink writes to a tokio::sync::mpsc::Sender from rayon worker threads via try_send; a small tokio task on the async side drains and forwards to peer.notify_progress so notifications reach the agent without requiring Peer<RoleServer>: Send into spawn_blocking; resolve_all_edges dispatches per-language: SymbolIndex keyed by (Language, name) so a Python init never collides with C++ init; LanguagePlugin::resolve_call default impl mirrors Go's same-file>same-parent>same-namespace>global heuristic; LanguagePlugin::resolve_include default does basename matching; warnings from parse failures, read failures, and concurrency clamping all flow into the analyze_codebase response warnings array"
   - id: "3.4"
     title: "P0 tool handlers (8): analyze_codebase, get_file_symbols, search_symbols, get_symbol_detail, get_symbol_summary, get_callers, get_callees, get_dependencies"
-    status: planned
+    status: complete
     depends_on: ["3.3"]
     verification: "analyze_codebase parameters are `path` (required) and `force` (optional bool); the optional `language` filter mentioned in the design's MCP Tools table is **out of scope for this rewrite** — analyze always indexes all registered languages — and is captured as Open Question 7 in the design for future work; analyze_codebase loads .code-graph.toml, runs discovery → parse → resolve → merge inside spawn_blocking, sends progress notifications, returns AnalyzeResult JSON with files/symbols/edges/root_path/warnings — surfaces concurrency-clamp warnings if config exceeded NumCPU; get_file_symbols returns Vec<symbolResult> never null even when top_level_only filters everything out (initialize as `Vec::with_capacity(...)`); brief defaults to true on both get_file_symbols and search_symbols; search_symbols requires at least one of query/kind/namespace/language — language-only search is explicitly accepted; pagination envelope `{results, total, offset, limit}`; get_symbol_detail returns full detail (brief=false semantics) and produces did-you-mean suggestions from a 100-candidate pool on not-found; get_symbol_summary handles optional file param; get_callers/get_callees use BFS depth (default 1), did-you-mean on unknown symbol; get_dependencies returns [] (never null) for unknown or include-empty files; integration tests cover happy paths + each error path with exact wording"
   - id: "3.5"
@@ -105,7 +105,7 @@ The walker is thread-safe by construction; `LanguageRegistry` is `Send + Sync` b
 - [x] `pool.install(|| files.par_iter().map(parse).collect())` keeps parsing scoped to the job pool
 - [x] `parse` closure: `registry.plugin_for(df.language)`, `std::fs::read(&df.path)`, `plugin.parse_file(&df.path, &content)`, increment counter, send progress
 - [x] `ProgressSink` trait + `ChannelProgressSink(tokio::sync::mpsc::Sender<ProgressEvent>)` implementation; `try_send` so a full channel doesn't block the rayon thread (progress is best-effort)
-- [ ] `analyze_codebase` handler spawns a forwarding tokio task before `spawn_blocking`: receiver task pulls events and calls `peer.notify_progress`; sender drops when blocking job ends, signalling task exit *(deferred to Phase 3.4 when the handler body is filled in)*
+- [x] `analyze_codebase` handler spawns a forwarding tokio task before `spawn_blocking`: receiver task pulls events and calls `peer.notify_progress`; sender drops when blocking job ends, signalling task exit *(landed in Phase 3.4 alongside the handler body)*
 - [x] `resolve_all_edges` dispatches per-`Language`: `SymbolIndex { by_name: HashMap<(Language, String), Vec<SymbolEntry>> }` so cross-language collisions are impossible
 - [x] `LanguagePlugin::resolve_call` default impl ports the Go scope-aware heuristic (same_file=4, same_parent=3, same_namespace=2)
 - [x] `LanguagePlugin::resolve_include` default impl ports basename + suffix matching
@@ -121,17 +121,27 @@ The walker is thread-safe by construction; `LanguageRegistry` is `Send + Sync` b
 ## 3.4: P0 tool handlers (8)
 
 ### Subtasks (one per tool)
-- [ ] **`analyze_codebase`** — try_lock index_mu; load RootConfig; resolve_concurrency (warnings); cache hit path (load + stale_paths check); discover; spawn_blocking(parse + resolve); merge under graph write lock; save cache; return AnalyzeResult JSON with warnings array including config clamp warnings
-- [ ] **`get_file_symbols`** — params: `file` (required), `top_level_only` (default false), `brief` (default true); `Vec::with_capacity(symbols.len())` so empty filter result serializes as `[]` not `null`
-- [ ] **`search_symbols`** — params: `query`, `kind`, `namespace`, `language`, `limit` (default 20), `offset` (default 0), `brief` (default true); validation: at least one of query/kind/namespace/language must be non-empty (else `'query', 'kind', 'namespace', or 'language' is required`); pagination envelope; brief mode omits column/end_line/signature
-- [ ] **`get_symbol_detail`** — params: `symbol`; full detail (brief=false); did-you-mean uses `suggestSymbols(name, 5)` which calls Search with `Limit: 100` so candidate pool isn't 20-capped
-- [ ] **`get_symbol_summary`** — params: `file` (optional)
-- [ ] **`get_callers`** — params: `symbol`, `depth` (default 1); did-you-mean on not-found
-- [ ] **`get_callees`** — same shape as get_callers
-- [ ] **`get_dependencies`** — params: `file`; returns `Vec<PathBuf>`, marshalled as JSON array (never null)
+- [x] **`analyze_codebase`** — try_lock index_mu; load RootConfig; resolve_concurrency (warnings); cache hit path (load + stale_paths check); discover; spawn_blocking(parse + resolve); merge under graph write lock; save cache; return AnalyzeResult JSON with warnings array including config clamp warnings
+- [x] **`get_file_symbols`** — params: `file` (required), `top_level_only` (default false), `brief` (default true); `Vec::with_capacity(symbols.len())` so empty filter result serializes as `[]` not `null`
+- [x] **`search_symbols`** — params: `query`, `kind`, `namespace`, `language`, `limit` (default 20), `offset` (default 0), `brief` (default true); validation: at least one of query/kind/namespace/language must be non-empty (else `'query', 'kind', 'namespace', or 'language' is required`); pagination envelope; brief mode omits column/end_line/signature
+- [x] **`get_symbol_detail`** — params: `symbol`; full detail (brief=false); did-you-mean uses `suggestSymbols(name, 5)` which calls Search with `Limit: 100` so candidate pool isn't 20-capped
+- [x] **`get_symbol_summary`** — params: `file` (optional)
+- [x] **`get_callers`** — params: `symbol`, `depth` (default 1); did-you-mean on not-found
+- [x] **`get_callees`** — same shape as get_callers
+- [x] **`get_dependencies`** — params: `file`; returns `Vec<PathBuf>`, marshalled as JSON array (never null)
 
 ### Notes
 Every handler returns `Ok(CallToolResult)` even for user errors — `Err(McpError)` is reserved for protocol-level failures (deserialization). Error messages match Go's wording byte-for-byte to keep snapshots stable.
+
+#### Phase 3.4 deviations from the design
+
+- **Cache hit does not append a "loaded from cache" warning.** The Go binary appends `"loaded from cache"` to the response warnings array when the cache fast-path fires. The Rust port omits this — both paths (cache hit + full re-index) return the same shape, with a `warnings` array that only contains substantive issues (concurrency clamp warnings, parse failures, cache save failures). Rationale: the cache-hit warning is operational telemetry that callers don't act on; surfacing it as a "warning" muddies the contract that warnings indicate something the caller might need to address. The empty-warnings cache hit also serializes more compactly under `serde(skip_serializing_if = "Vec::is_empty")`.
+- **`directory does not exist` covers both NotFound and canonicalize failures.** Go's behavior under `os.Stat(absPath)` returning an error or a non-directory used the same wording. The Rust port mirrors this: any `std::fs::canonicalize` failure produces `directory does not exist: <raw path>`, and a successful canonicalize that yields a non-directory produces `path is not a directory: <abs path>`. The two paths are intentionally distinguishable for callers that need to debug.
+- **No-progress-token path drains the channel locally.** When the request meta has no `progressToken`, the forwarder task still spawns but only drains incoming events (no `notify_progress` call). This keeps `try_send` calls in the rayon workers cheap (the channel has capacity), so progress callbacks never see backpressure even when the client doesn't want notifications.
+- **`SymbolKind` JSON serialization helper added.** The handlers re-key `Graph::symbol_summary`'s `HashMap<String, HashMap<SymbolKind, u32>>` into `HashMap<String, HashMap<&'static str, u32>>` via a dedicated `kind_str` helper before returning. This keeps the wire format using lowercase kind names everywhere — same as the existing `SymbolKind` Serialize impl — and avoids a serde detour through the Debug formatter.
+- **Handler bodies live in `crates/codegraph-tools/src/handlers/`.** A submodule tree (`analyze.rs`, `symbols.rs`, `query.rs`, `mod.rs`) holds the bodies; `server.rs` keeps the `#[tool]` shells short. This makes Phase 3.5 (more handlers) and Phase 3.7 (snapshot tests) easier to navigate without growing `server.rs` past ~600 lines.
+- **`SearchSymbolsInput` struct.** The `search_symbols` body has 7 inputs plus the graph; bundling them into a struct keeps the function signature under clippy's `too_many_arguments` threshold (default 7) without an `#[allow]` attribute.
+- **rmcp 1.5 peer + meta extraction.** Tool handlers extract `Peer<RoleServer>` and `Meta` directly via the `#[tool]` macro's `FromContextPart` machinery — no custom request-context plumbing needed. The `Meta::get_progress_token()` method returns the `progressToken` from `_meta` when the client supplied one.
 
 ## 3.5: P1+P2 tool handlers (4) + watch_start/watch_stop stubs
 

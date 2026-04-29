@@ -11,6 +11,7 @@
 //!   reporting trait, and the tokio bridge sink. (Phase 3.3.)
 
 pub mod discovery;
+pub mod handlers;
 pub mod indexer;
 pub mod server;
 
