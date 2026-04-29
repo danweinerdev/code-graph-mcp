@@ -87,7 +87,7 @@ pub struct CppParser {
 impl CppParser {
     /// Build a new parser, compiling all four tree-sitter queries against the
     /// pinned tree-sitter-cpp grammar. Returns
-    /// [`ParseError::Query`](ParseError::Query) carrying the query compiler's
+    /// [`ParseError::Query`] carrying the query compiler's
     /// error message if any query fails to compile (this should not happen
     /// against the grammar version we pin in `Cargo.toml`; if it does, the
     /// error tells us which query is at fault).
