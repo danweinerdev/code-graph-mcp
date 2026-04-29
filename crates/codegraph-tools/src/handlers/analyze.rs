@@ -61,13 +61,16 @@ pub async fn analyze_codebase(
     let abs_path = match std::fs::canonicalize(&path_raw) {
         Ok(p) => p,
         Err(_) => {
-            // The Go binary uses the SAME message for both
-            // missing path and "is not a directory" cases when canonicalize
-            // fails; we follow Go's wording exactly.
             return tool_error(format!("directory does not exist: {path_raw}"));
         }
     };
     if !abs_path.is_dir() {
+        // We deliberately distinguish "path doesn't resolve" from "path resolves
+        // to a file, not a directory" — the Go binary collapses both into a single
+        // "directory does not exist" message, but Rust's `std::fs::canonicalize`
+        // already gave us the richer information and discarding it just for Go
+        // byte-identity would make the error less helpful for no real benefit.
+        // Phase 3.7 snapshots will lock in the Rust-specific wording.
         return tool_error(format!("path is not a directory: {}", abs_path.display()));
     }
 
@@ -284,6 +287,9 @@ mod tests {
 
     #[tokio::test]
     async fn analyze_path_is_file_errors() {
+        // Deliberate divergence from Go's collapsed message; Rust keeps the
+        // richer distinction between "path doesn't resolve" and "path
+        // resolves to a file, not a directory".
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("a.cpp");
         fs::write(&file_path, b"void f() {}\n").unwrap();

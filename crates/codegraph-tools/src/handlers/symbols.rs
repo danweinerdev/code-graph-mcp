@@ -93,6 +93,9 @@ pub fn search_symbols(graph: &RwLock<Graph>, input: SearchSymbolsInput<'_>) -> C
         && namespace_str.is_empty()
         && language_str.is_empty()
     {
+        // Four-term message (vs. Go's three) — `language` is a Rust-only filter
+        // addition (Phase 1's Symbol::language is its first consumer). Listing
+        // it here keeps the error truthful about what satisfies the validation.
         return tool_error("'query', 'kind', 'namespace', or 'language' is required");
     }
 
@@ -315,6 +318,19 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(&g, search_input());
         assert_eq!(r.is_error, Some(true));
+        assert_eq!(
+            body_text(&r),
+            "'query', 'kind', 'namespace', or 'language' is required"
+        );
+    }
+
+    #[test]
+    fn search_symbols_validation_lists_all_four_filters() {
+        // Deliberate divergence from Go (which has three terms; Rust has the
+        // language filter too). Locked in here so future edits to the message
+        // are caught.
+        let g = locked(small_graph());
+        let r = search_symbols(&g, search_input());
         assert_eq!(
             body_text(&r),
             "'query', 'kind', 'namespace', or 'language' is required"

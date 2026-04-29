@@ -697,6 +697,13 @@ mod tests {
             .await
             .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
     #[tokio::test]
@@ -707,6 +714,13 @@ mod tests {
             .await
             .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
     #[tokio::test]
