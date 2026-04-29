@@ -11,3 +11,7 @@ description = "Developer CLI harness for testing language parsers against real c
 workspace = true
 
 [dependencies]
+codegraph-core = { path = "../codegraph-core" }
+codegraph-lang = { path = "../codegraph-lang" }
+codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
+walkdir = { workspace = true }
