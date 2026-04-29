@@ -155,11 +155,18 @@ impl Graph {
     ///
     /// Returns:
     /// - `Ok(true)` — cache loaded; graph state replaced.
-    /// - `Ok(false)` — cache absent, or version mismatch (v1 from Go, or
-    ///   any future version this build does not understand). The graph is
-    ///   unchanged; the caller should re-index.
+    /// - `Ok(false)` — cache absent, or the on-disk JSON parses cleanly but
+    ///   has a `version` field that doesn't equal [`CACHE_VERSION`]. The
+    ///   graph is unchanged; the caller should re-index.
     /// - `Err(PersistError::Io)` — read failure other than not-found.
-    /// - `Err(PersistError::Json)` — corrupt JSON.
+    /// - `Err(PersistError::Json)` — corrupt JSON, **including** any
+    ///   real-world Go-produced v1 cache. Go's `EdgeEntry` lacks JSON tags
+    ///   (so it serializes as `"Target"`/`"Kind"`/...) and Go's `Symbol`
+    ///   has no `language` field; both shape mismatches surface as
+    ///   `PersistError::Json`. The handler in `analyze_codebase` (Phase
+    ///   3.4) should treat any `Err` here the same as `Ok(false)` — drop
+    ///   the cache, re-index. The structurally-valid `version != 2` path
+    ///   exists for a future Rust→Rust schema bump.
     pub fn load(&mut self, dir: &Path) -> Result<bool, PersistError> {
         let path = cache_path(dir);
         let data = match fs::read(&path) {
@@ -196,9 +203,17 @@ impl Graph {
 /// field; other fields (nodes, edges, etc.) are still deserialized but
 /// ignored, which is acceptable for the caller's hot path because
 /// `stale_paths` runs at most once per `analyze_codebase` call.
+///
+/// **Missing cache:** returns `Ok(vec![])`. This matches `Graph::load`'s
+/// `Ok(false)` ergonomics — callers can speculatively call `stale_paths`
+/// before `load` without a special-case for first-run.
 pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
     let path = cache_path(dir);
-    let data = fs::read(&path)?;
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(PersistError::Io(e)),
+    };
     let cache: GraphCache = serde_json::from_slice(&data)?;
 
     let mut stale = Vec::new();
@@ -295,7 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn load_v1_cache_returns_false() {
+    fn load_version_mismatch_returns_false() {
+        // Tests the version-check branch only: a cache with `version: 1`
+        // but otherwise structurally-valid (lowercase keys, etc.) parses
+        // cleanly and trips the version-mismatch Ok(false) branch. Real
+        // Go-produced v1 caches fail with PersistError::Json (different
+        // schema). See load() doc-comment.
         // Hand-craft a minimal v1 (Go-shape) cache file. Only the version
         // field needs to be present and wrong; the other fields are
         // optional in serde_json's loose object parsing… except they
@@ -325,11 +345,20 @@ mod tests {
         let before_nodes = g.nodes.clone();
 
         let ok = g.load(dir.path()).unwrap();
-        assert!(!ok, "v1 cache → silent re-index (Ok(false))");
+        assert!(!ok, "version mismatch → silent re-index (Ok(false))");
         assert_eq!(
             g.nodes, before_nodes,
             "graph must be unchanged on the false path"
         );
+    }
+
+    #[test]
+    fn stale_paths_missing_cache_returns_empty_vec() {
+        // Speculative call before any cache exists must not error — matches
+        // load()'s Ok(false) ergonomics for first-run.
+        let dir = TempDir::new().unwrap();
+        let result = stale_paths(dir.path()).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
