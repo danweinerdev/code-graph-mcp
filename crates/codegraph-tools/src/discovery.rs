@@ -69,7 +69,9 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig)
         // git_global+git_exclude as a group; (false) disables them. We
         // override `hidden(false)` afterwards so dotfile directories are
         // still descended into unless gitignore says otherwise — matching
-        // the Go binary's behavior.
+        // the Go binary's behavior. (When respect_gitignore=false, the
+        // explicit hidden(false) call below is redundant but kept
+        // unconditionally for simplicity.)
         .standard_filters(cfg.respect_gitignore)
         .follow_links(cfg.follow_symlinks)
         .hidden(false)
@@ -312,6 +314,34 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.contains("build/skip.cpp")),
             "build/skip.cpp must be excluded by extra_ignore: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extra_ignore_pre_inverted_pattern_passes_through() {
+        // Users may write the `!`-prefixed form themselves. The guard at
+        // line 89 (`if pat.starts_with('!')`) avoids double-prepending,
+        // and the resulting override behaves identically to the plain form.
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("keep.cpp"));
+        touch(&dir.path().join("build/skip.cpp"));
+
+        let reg = cpp_only_registry();
+        let cfg = DiscoveryConfig {
+            extra_ignore: vec!["!build/**".to_string()],
+            ..Default::default()
+        };
+        let result = discover(dir.path(), &reg, &cfg);
+
+        let paths: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("keep.cpp")));
+        assert!(
+            !paths.iter().any(|p| p.contains("build/skip.cpp")),
+            "pre-inverted `!build/**` must still exclude build/skip.cpp: {paths:?}"
         );
     }
 
