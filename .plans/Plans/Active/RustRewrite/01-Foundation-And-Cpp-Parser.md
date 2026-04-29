@@ -24,7 +24,7 @@ tasks:
     verification: "LanguagePlugin trait is object-safe (Box<dyn LanguagePlugin> compiles); Registry::for_path returns the right plugin for known extensions and None for unknown; duplicate-extension registration returns an error; RootConfig::load(root) returns Default for missing file, parsed value for valid TOML, ConfigError for malformed TOML (no silent fallback); resolve_concurrency() clamps `max_threads` to available_parallelism() and emits a clamp warning, treats 0 as auto, returns warnings list; tests cover missing file, valid file with auto values, valid file with over-cap values, and malformed TOML"
   - id: "1.4"
     title: "codegraph-lang-cpp: parser struct, queries, helpers"
-    status: planned
+    status: complete
     depends_on: ["1.3"]
     verification: "CppParser::new() compiles all 4 query strings (definitions, calls, includes, inheritance) against tree-sitter-cpp 0.23.4 without error; Extensions() returns [.cpp .cc .cxx .c .h .hpp .hxx]; helpers split_qualified, strip_include_path, is_cpp_cast, find_enclosing_kind, resolve_namespace, resolve_parent_class, enclosing_function_id are unit-tested with the same fixtures as the Go test corpus; truncate_signature uses char_indices so UTF-8 boundary slicing is impossible by construction (test with multi-byte content past 200 bytes confirming no panic and a valid UTF-8 result)"
   - id: "1.5"
@@ -92,15 +92,15 @@ The TOML loader fails the entire `analyze_codebase` call on parse error rather t
 ## 1.4: codegraph-lang-cpp: parser struct, queries, helpers
 
 ### Subtasks
-- [ ] `CppParser` struct with `language`, `def_query`, `call_query`, `incl_query`, `inh_query` fields holding `tree_sitter::Query` objects
-- [ ] `CppParser::new() -> Result<Self, ParseError>` compiles all 4 queries; returns error if any fails
-- [ ] `Extensions()` returns the same 7 extensions as Go: `.cpp .cc .cxx .c .h .hpp .hxx`
-- [ ] `Drop` impl closes queries (tree-sitter Query already drops cleanly; verify no leaks)
-- [ ] `queries.rs` ports all 4 query strings verbatim from `internal/lang/cpp/queries.go`: `DEFINITION_QUERIES`, `CALL_QUERIES`, `INCLUDE_QUERIES`, `INHERITANCE_QUERIES`
-- [ ] Helpers in `helpers.rs`: `find_enclosing_kind(node, kind)`, `resolve_namespace(node, content)`, `resolve_parent_class(node, content)`, `enclosing_function_id(node, content, path)`, `is_cpp_cast(name)`, `split_qualified(qualified)`, `strip_include_path(raw)`, `truncate_signature(s)`
-- [ ] `truncate_signature` uses `char_indices` to track byte boundaries; the 200-byte fallback returns `&s[..i]` where `i` is guaranteed on a UTF-8 boundary by construction
-- [ ] Unit tests for each helper with fixtures matching the Go test corpus (TestSplitQualified, TestStripIncludePath, TestTruncateSignature with multi-byte content)
-- [ ] `var _: &dyn LanguagePlugin = &CppParser::new()?` (or equivalent) compile-time interface check
+- [x] `CppParser` struct with `language`, `def_query`, `call_query`, `incl_query`, `inh_query` fields holding `tree_sitter::Query` objects
+- [x] `CppParser::new() -> Result<Self, ParseError>` compiles all 4 queries; returns error if any fails
+- [x] `Extensions()` returns the same 7 extensions as Go: `.cpp .cc .cxx .c .h .hpp .hxx`
+- [x] `Drop` impl closes queries (tree-sitter Query already drops cleanly; verify no leaks) — no explicit Drop needed; `Query` already drops cleanly
+- [x] `queries.rs` ports all 4 query strings verbatim from `internal/lang/cpp/queries.go`: `DEFINITION_QUERIES`, `CALL_QUERIES`, `INCLUDE_QUERIES`, `INHERITANCE_QUERIES`
+- [x] Helpers in `helpers.rs`: `find_enclosing_kind(node, kind)`, `resolve_namespace(node, content)`, `resolve_parent_class(node, content)`, `enclosing_function_id(node, content, path)`, `is_cpp_cast(name)`, `split_qualified(qualified)`, `strip_include_path(raw)`, `truncate_signature(s)`
+- [x] `truncate_signature` uses `char_indices` to track byte boundaries; the 200-byte fallback returns `&s[..i]` where `i` is guaranteed on a UTF-8 boundary by construction
+- [x] Unit tests for each helper with fixtures matching the Go test corpus (TestSplitQualified, TestStripIncludePath, TestTruncateSignature with multi-byte content)
+- [x] `var _: &dyn LanguagePlugin = &CppParser::new()?` (or equivalent) compile-time interface check
 
 ## 1.5: codegraph-lang-cpp: definition, call, include, inheritance extraction
 
