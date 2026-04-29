@@ -24,7 +24,7 @@ tasks:
     verification: "callers and callees BFS visit each node at most once via a HashSet visited; depth=0 treated as 1 (matches Go); cycles do not infinite-loop (verified by a 3-node cycle fixture); CallChain carries SymbolID, file, line, depth; orphans returns symbols with no incoming Call edges, defaults to callables only when kind=None, accepts kind filter; file_dependencies returns Vec<PathBuf> never Option, empty Vec for unknown paths"
   - id: "2.4"
     title: "Tarjan SCC (iterative) and diamond-safe class hierarchy"
-    status: planned
+    status: complete
     depends_on: ["2.1"]
     verification: "detect_cycles uses an iterative Tarjan implementation (no recursion — explicit Vec stack so deep include graphs don't overflow); reports only SCCs of size > 1; tested on acyclic, 2-node cycle, 3-node cycle, mixed cyclic-and-acyclic graphs; class_hierarchy accepts root symbols whose kind is in {Class, Struct, Interface, Trait} (the widened filter from the design — without this, Rust traits and Go interfaces hierarchy lookups return None); diamond inheritance fixture (4-level chain Root←Base←{MixinA, MixinB}←Derived←Leaf, depth=3) fully expands the shared ancestor under both arms — verified by reverting the per-DFS-path tracking and watching the test fail (matches the Go regression-test discipline)"
   - id: "2.5"
@@ -94,13 +94,13 @@ This phase has zero MCP dependency — `codegraph-graph` is unit-testable with n
 ## 2.4: Tarjan SCC and diamond-safe class hierarchy
 
 ### Subtasks
-- [ ] `detect_cycles(&self) -> Vec<Vec<PathBuf>>` — iterative Tarjan on the file include graph; uses an explicit stack to avoid recursive call-depth overflow on large include graphs
-- [ ] Only SCCs with size > 1 are reported (single-node SCCs are not cycles)
-- [ ] `class_hierarchy(&self, name: &str, depth: u32) -> Option<HierarchyNode>` — root lookup checks `kind in {Class, Struct, Interface, Trait}`
-- [ ] HierarchyNode { name, bases: Vec<HierarchyNode>, derived: Vec<HierarchyNode> }
-- [ ] DFS uses **per-DFS-path tracking** (`HashSet<&str>` inserted on enter, removed on leave) — NOT a global visited set. Diamond inheritance must fully expand the shared ancestor under both arms.
-- [ ] depth=0 normalized to 1
-- [ ] Tests: acyclic include graph (no SCCs reported); 2-node cycle (one SCC of size 2); 3-node cycle; mixed graph; class_hierarchy with depth=1 returns direct only; class_hierarchy widened-filter test (a Rust trait root resolves correctly); **diamond regression: 4-level chain Root←Base←{MixinA, MixinB}←Derived←Leaf at depth=3** — the test must fail when the per-DFS-path logic is reverted to a global-visited implementation (verify by temporary patch revert)
+- [x] `detect_cycles(&self) -> Vec<Vec<PathBuf>>` — iterative Tarjan on the file include graph; uses an explicit stack to avoid recursive call-depth overflow on large include graphs
+- [x] Only SCCs with size > 1 are reported (single-node SCCs are not cycles)
+- [x] `class_hierarchy(&self, name: &str, depth: u32) -> Option<HierarchyNode>` — root lookup checks `kind in {Class, Struct, Interface, Trait}`
+- [x] HierarchyNode { name, bases: Vec<HierarchyNode>, derived: Vec<HierarchyNode> }
+- [x] DFS uses **per-DFS-path tracking** (`HashSet<&str>` inserted on enter, removed on leave) — NOT a global visited set. Diamond inheritance must fully expand the shared ancestor under both arms.
+- [x] depth=0 normalized to 1
+- [x] Tests: acyclic include graph (no SCCs reported); 2-node cycle (one SCC of size 2); 3-node cycle; mixed graph; class_hierarchy with depth=1 returns direct only; class_hierarchy widened-filter test (a Rust trait root resolves correctly); **diamond regression: 4-level chain Root←Base←{MixinA, MixinB}←Derived←Leaf at depth=3** — the test must fail when the per-DFS-path logic is reverted to a global-visited implementation (verify by temporary patch revert)
 
 ### Notes
 The 4-level diamond fixture is the same one used in the Go regression test (`TestClassHierarchyDiamond`). The 3-class diamond at depth=2 produces identical output under both buggy and fixed code because the shared node bottoms out as a leaf either way; the 4-level chain at depth=3 is the minimal fixture that actually exposes the bug.
