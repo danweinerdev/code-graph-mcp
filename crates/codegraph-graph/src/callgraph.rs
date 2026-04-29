@@ -429,10 +429,10 @@ mod tests {
 
     #[test]
     fn orphans_default_returns_only_callables() {
-        // unused Function (no callers), MyClass with no callers, caller
-        // Function that calls used. Default mode: only `unused` is an
-        // orphan — `caller` has no callers either, but it's still a
-        // callable; `MyClass` is filtered out by the default kind rule.
+        // Default mode returns all callables with no incoming Calls edges.
+        // Both `unused` and `caller` qualify (Functions, no callers).
+        // `used` is excluded — it has an incoming Call from `caller`.
+        // `MyClass` is excluded by the default kind filter (callables only).
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
