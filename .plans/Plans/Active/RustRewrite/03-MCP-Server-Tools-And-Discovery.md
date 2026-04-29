@@ -19,7 +19,7 @@ tasks:
     verification: "codegraph-tools::discovery::discover walks via ignore::WalkBuilder::build_parallel().threads(N) where N = cfg.discovery.max_threads (already clamped to NumCPU); files filtered in-thread by registry.language_for_path so non-source files (e.g. .png .o node_modules/*.js) never enter the result Vec; results collected via crossbeam_channel::unbounded; walk warnings (permission denied, broken symlinks) flow via a sibling channel and surface in the Discovered.warnings field; respects .gitignore by default (cfg.respect_gitignore); follow_symlinks defaults to false; extra_ignore patterns honored; integration test on a synthetic 50k-file directory tree with mixed languages, ignored dirs, and unsupported extensions produces only registered-language files in the result; benchmark vs the Phase 1 synchronous walkdir shows measurable speedup on a directory with >1000 files; **walker-migration regression gate**: after `codegraph-parse-test` is migrated to use `discovery::discover` (replacing the Phase 1.6 synchronous walkdir), re-run both Phase 1 corpus gates and confirm identical numbers — `parse-test testdata/cpp/` produces 17 symbols / 21 edges (unchanged from Phase 1.6) and `parse-test <fmtlib/fmt clone>/src/` produces 32 symbols / 244 edges with 0 crashes / 0 warnings (unchanged from Phase 1.6); any divergence indicates the parallel walker is dropping or duplicating files"
   - id: "3.3"
     title: "Indexer: per-job rayon pool + language-aware edge resolution + tokio progress bridge"
-    status: planned
+    status: complete
     depends_on: ["3.2"]
     verification: "Indexer constructs a per-job rayon::ThreadPoolBuilder with num_threads=cfg.parsing.max_threads (clamped); pool.install runs par_iter().map(parse) so the global rayon pool isn't monopolized; ChannelProgressSink writes to a tokio::sync::mpsc::Sender from rayon worker threads via try_send; a small tokio task on the async side drains and forwards to peer.notify_progress so notifications reach the agent without requiring Peer<RoleServer>: Send into spawn_blocking; resolve_all_edges dispatches per-language: SymbolIndex keyed by (Language, name) so a Python init never collides with C++ init; LanguagePlugin::resolve_call default impl mirrors Go's same-file>same-parent>same-namespace>global heuristic; LanguagePlugin::resolve_include default does basename matching; warnings from parse failures, read failures, and concurrency clamping all flow into the analyze_codebase response warnings array"
   - id: "3.4"
@@ -100,16 +100,23 @@ The walker is thread-safe by construction; `LanguageRegistry` is `Send + Sync` b
 ## 3.3: Indexer: per-job rayon pool + language-aware edge resolution + tokio progress bridge
 
 ### Subtasks
-- [ ] `codegraph-tools::indexer::index_directory(root, registry, cfg, progress)` orchestrates discover → parse → resolve
-- [ ] Construct per-job `rayon::ThreadPoolBuilder::new().num_threads(cfg.parsing.max_threads).thread_name(|i| format!("codegraph-parse-{i}")).build()?`
-- [ ] `pool.install(|| files.par_iter().map(parse).collect())` keeps parsing scoped to the job pool
-- [ ] `parse` closure: `registry.plugin_for(df.language)`, `std::fs::read(&df.path)`, `plugin.parse_file(&df.path, &content)`, increment counter, send progress
-- [ ] `ProgressSink` trait + `ChannelProgressSink(tokio::sync::mpsc::Sender<ProgressEvent>)` implementation; `try_send` so a full channel doesn't block the rayon thread (progress is best-effort)
-- [ ] `analyze_codebase` handler spawns a forwarding tokio task before `spawn_blocking`: receiver task pulls events and calls `peer.notify_progress`; sender drops when blocking job ends, signalling task exit
-- [ ] `resolve_all_edges` dispatches per-`Language`: `SymbolIndex { by_name: HashMap<(Language, String), Vec<SymbolEntry>> }` so cross-language collisions are impossible
-- [ ] `LanguagePlugin::resolve_call` default impl ports the Go scope-aware heuristic (same_file=4, same_parent=3, same_namespace=2)
-- [ ] `LanguagePlugin::resolve_include` default impl ports basename + suffix matching
-- [ ] Tests: scoped resolution (multiple candidates → highest-score wins); language isolation (Python `init` never returned for C++ resolve_call); progress events received in order
+- [x] `codegraph-tools::indexer::index_directory(root, registry, cfg, progress)` orchestrates discover → parse → resolve
+- [x] Construct per-job `rayon::ThreadPoolBuilder::new().num_threads(cfg.parsing.max_threads).thread_name(|i| format!("codegraph-parse-{i}")).build()?`
+- [x] `pool.install(|| files.par_iter().map(parse).collect())` keeps parsing scoped to the job pool
+- [x] `parse` closure: `registry.plugin_for(df.language)`, `std::fs::read(&df.path)`, `plugin.parse_file(&df.path, &content)`, increment counter, send progress
+- [x] `ProgressSink` trait + `ChannelProgressSink(tokio::sync::mpsc::Sender<ProgressEvent>)` implementation; `try_send` so a full channel doesn't block the rayon thread (progress is best-effort)
+- [ ] `analyze_codebase` handler spawns a forwarding tokio task before `spawn_blocking`: receiver task pulls events and calls `peer.notify_progress`; sender drops when blocking job ends, signalling task exit *(deferred to Phase 3.4 when the handler body is filled in)*
+- [x] `resolve_all_edges` dispatches per-`Language`: `SymbolIndex { by_name: HashMap<(Language, String), Vec<SymbolEntry>> }` so cross-language collisions are impossible
+- [x] `LanguagePlugin::resolve_call` default impl ports the Go scope-aware heuristic (same_file=4, same_parent=3, same_namespace=2)
+- [x] `LanguagePlugin::resolve_include` default impl ports basename + suffix matching
+- [x] Tests: scoped resolution (multiple candidates → highest-score wins); language isolation (Python `init` never returned for C++ resolve_call); progress events received in order
+
+### Notes (Phase 3.3 deviations)
+
+- **Same-namespace bonus replicated as dead code.** Go's `resolveCall` initializes `callerNS = ""` and never updates it, so the `score += 2` same-namespace branch is unreachable. The Rust port preserves this verbatim (with the trailing `let _ = caller_ns;` mirror) so call resolution stays byte-identical against Go-binary baselines. A doc comment on `default_scope_aware_resolve` captures the rationale.
+- **Same-parent extraction diverges from Go.** Go's helper uses `strings.LastIndex(callerID, ":")`, which on a canonical method ID `file:Foo::bar` lands on the second `:` of `::` and yields `name = "bar"` — making Go's same-parent branch effectively dead too. The Rust `caller_id_parent` instead picks the LAST *singleton* `:` (one not adjacent to another `:`), correctly identifying the path/symbol boundary on both POSIX and Windows paths. This makes the same-parent bonus actually functional in the Rust binary; the test `default_scope_aware_resolve_picks_same_parent_when_no_same_file` verifies the new behavior. Documented inline.
+- **Tokio progress-forwarder task is Phase 3.4 work.** The trait, the channel sink, and the indexer-side `try_send` plumbing all ship here; the receiver-side `peer.notify_progress` task lives inside the `analyze_codebase` handler, which is the next task's payload.
+- **`codegraph-lang-cpp` added as a `codegraph-tools` dev-dependency.** The indexer's `index_directory_processes_all_cpp_files` test exercises the real C++ parser end-to-end (5 .cpp files, real tree-sitter, no stubs).
 
 ## 3.4: P0 tool handlers (8)
 

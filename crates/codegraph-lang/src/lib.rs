@@ -5,14 +5,14 @@
 //! [`LanguageRegistry`] maps file extensions to plugins; it mirrors the Go
 //! `parser.Registry` in `internal/parser/registry.go`.
 //!
-//! Phase 1.3 ships the trait surface and the registry. The default impls of
-//! [`LanguagePlugin::resolve_call`] and [`LanguagePlugin::resolve_include`]
-//! are deliberate Phase-2 stubs returning `None` — the real scope-aware
-//! heuristic and basename resolver need the [`SymbolIndex`] / [`FileIndex`]
-//! types from Phase 2's graph engine, which haven't shipped yet. The
-//! placeholder structs ([`CallContext`], [`SymbolIndex`], [`FileIndex`])
-//! are stubs marked clearly as Phase-2 work; they exist now so the trait
-//! signature is stable.
+//! Phase 3.3 wires up the real default impls of
+//! [`LanguagePlugin::resolve_call`] and [`LanguagePlugin::resolve_include`].
+//! The scope-aware resolver and the basename resolver port the Go
+//! reference at `internal/tools/analyze.go` (`resolveCall` and
+//! `resolveInclude`) byte-for-byte, including a known dead-code path in
+//! `resolveCall` that the Go implementation kept. The supporting types
+//! [`CallContext`], [`SymbolIndex`], [`FileIndex`] now carry real fields
+//! populated by the Phase 3.3 indexer.
 
 use codegraph_core::{FileGraph, Language, SymbolId};
 use std::collections::HashMap;
@@ -60,97 +60,218 @@ pub enum RegistryError {
     },
 }
 
-// Phase-2 placeholder types -----------------------------------------------
-// These exist to make the trait signatures compile today. The graph engine
-// (Phase 2) will replace each with a real type backed by the live in-memory
-// graph. Until then they are pub empty structs with `new()` constructors so
-// downstream test code can build trait objects.
+// Edge-resolution support types -------------------------------------------
+// Populated by the Phase 3.3 indexer (`codegraph-tools::indexer`) and
+// consumed by the default impls of [`LanguagePlugin::resolve_call`] /
+// [`LanguagePlugin::resolve_include`]. Per-language plugins may override the
+// trait methods to add language-specific scoping.
 
-/// Context passed to [`LanguagePlugin::resolve_call`]. Populated by the
-/// graph engine with the caller's file, parent class, namespace, etc.
+/// Context passed to [`LanguagePlugin::resolve_call`]. The indexer fills this
+/// in once per call edge from the edge's `from` symbol ID and the file the
+/// edge was emitted from.
 ///
-/// **Phase 2 placeholder.** Today this is empty; Phase 2 fills it in with
-/// `caller_file`, `caller_parent`, `caller_namespace` fields and the
-/// matching constructor.
-// TODO(phase-2): expand to carry caller_file / caller_parent / caller_namespace
-// once the Graph engine ships and we know the exact shape `resolve_call`
-// needs to consume.
-#[derive(Debug, Default, Clone)]
-pub struct CallContext {
-    _private: (),
+/// `caller_id` is the full symbol ID of the caller in `file:Name` or
+/// `file:Parent::Name` form. `caller_file` is the absolute path of the file
+/// the call appears in (the resolver awards a same-file bonus to candidates
+/// whose own file matches). `language` scopes the [`SymbolIndex`] lookup to
+/// candidates from the same language so a Python `init` never collides with
+/// a C++ `init`.
+#[derive(Debug, Clone)]
+pub struct CallContext<'a> {
+    /// Full symbol ID of the caller. Format is `file:Name` or
+    /// `file:Parent::Name`. Used to derive the caller's parent class for
+    /// the same-parent bonus.
+    pub caller_id: &'a str,
+    /// Absolute path of the file the call appears in. Used for the
+    /// same-file bonus.
+    pub caller_file: &'a Path,
+    /// Language to scope candidate lookup to. The indexer keys
+    /// [`SymbolIndex`] by `(Language, name)` so cross-language collisions
+    /// are impossible.
+    pub language: Language,
 }
 
-impl CallContext {
-    /// Construct an empty placeholder. Phase 2 replaces this with a builder
-    /// fed by the graph engine.
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
+/// One candidate for [`SymbolIndex`] lookup — a symbol that bears the name
+/// being resolved.
+#[derive(Clone, Debug)]
+pub struct SymbolEntry {
+    /// Stable graph ID — `file:Name` or `file:Parent::Name`.
+    pub id: SymbolId,
+    /// Absolute path of the file declaring this symbol.
+    pub file: PathBuf,
+    /// Parent class/struct, if any. Empty string for free functions.
+    pub parent: String,
+    /// Namespace, if any. Empty string for global-scope symbols.
+    pub namespace: String,
 }
 
 /// Symbol-name index used by [`LanguagePlugin::resolve_call`] to look up
-/// candidate callees by name and filter by scope.
+/// candidate callees by `(Language, name)` and filter by scope.
 ///
-/// **Phase 2 placeholder.** Today this is empty; Phase 2 ships the real
-/// inverted index built by the graph engine.
-// TODO(phase-2): wire to the actual graph engine `SymbolIndex` once Phase 2
-// builds the in-memory graph.
+/// Keying by `(Language, String)` instead of `String` alone (the Go shape)
+/// makes cross-language collisions impossible during call resolution — a
+/// Python `init` and a C++ `init` live in separate buckets and never
+/// confuse each other's resolvers.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolIndex {
-    _private: (),
+    /// Inverted index keyed by `(Language, name)`. The same symbol may be
+    /// indexed under several names (bare `Name`, qualified `Parent::Name`,
+    /// `Namespace::Name`, etc.) — see `codegraph-tools::indexer::build_symbol_index`.
+    pub by_name: HashMap<(Language, String), Vec<SymbolEntry>>,
 }
 
 impl SymbolIndex {
-    /// Construct an empty placeholder. Phase 2 replaces this with a real
-    /// inverted index of symbols by name.
+    /// Construct an empty index.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self::default()
     }
 }
 
 /// File-path index used by [`LanguagePlugin::resolve_include`] to map a raw
-/// `#include`/`import` string to a concrete absolute file path.
-///
-/// **Phase 2 placeholder.** Today this is empty; Phase 2 ships the real
-/// basename → absolute-path mapping.
-// TODO(phase-2): wire to the actual graph engine `FileIndex` once Phase 2
-// builds the in-memory graph.
+/// `#include`/`import` string to a concrete absolute file path. Keyed by
+/// basename so an `#include "foo.h"` finds any file named `foo.h` regardless
+/// of the directory it lives in.
 #[derive(Debug, Default, Clone)]
 pub struct FileIndex {
-    _private: (),
+    /// `file_name() → absolute paths` of every discovered file with that
+    /// basename. Multiple paths sharing a basename are kept; the resolver
+    /// disambiguates by suffix match.
+    pub by_basename: HashMap<String, Vec<PathBuf>>,
 }
 
 impl FileIndex {
-    /// Construct an empty placeholder.
+    /// Construct an empty index.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self::default()
     }
 }
 
-/// Phase-2 stub for the default scope-aware call resolver. Mirrors the Go
-/// heuristic ordering (same file > same parent > same namespace > global)
-/// once the graph engine ships.
+/// Default scope-aware call resolver. Ports the Go reference at
+/// `internal/tools/analyze.go::resolveCall` with one structural fix and one
+/// preserved dead branch — see notes below.
 ///
-/// Today this returns `None`. The trait method [`LanguagePlugin::resolve_call`]
-/// uses this as its default impl so language plugins inherit the heuristic
-/// for free in Phase 2 without changing their signatures now.
-// TODO(phase-2): implement the same-file > same-parent > same-namespace >
-// global heuristic from internal/graph/resolver.go once SymbolIndex carries
-// real data.
+/// Priority: same file > same parent class > same namespace > any.
+///
+/// # NOTE: matches the Go reference's resolveCall, including the unreachable same-namespace bonus
+///
+/// The Go implementation initializes `callerNS` to `""` and never updates
+/// it; the same-namespace branch (`score += 2`) is therefore unreachable.
+/// The trailing `_ = callerNS` line in Go suppresses the unused-variable
+/// warning. We replicate the dead branch verbatim here so this resolver
+/// produces byte-identical edge resolution against Go-binary baselines for
+/// the cases where it matters — the parity gates in Phase 3.2 and Phase
+/// 3.7 depend on this match.
+///
+/// The same-parent extraction in [`caller_id_parent`] uses a
+/// singleton-colon rule rather than Go's `strings.LastIndex(":")`. The Go
+/// helper has a subtle bug: `LastIndex(":")` on `file:Foo::bar` returns
+/// the index of the *second* `:` in `::`, so its same-parent branch is
+/// also dead in practice for canonical method IDs. The Rust helper picks
+/// the path/symbol boundary correctly (and still handles Windows drive
+/// letters), making the same-parent bonus actually functional.
 pub(crate) fn default_scope_aware_resolve(
-    _callee: &str,
-    _ctx: &CallContext,
-    _index: &SymbolIndex,
+    language: Language,
+    callee: &str,
+    ctx: &CallContext,
+    index: &SymbolIndex,
 ) -> Option<SymbolId> {
-    None
+    let candidates = index.by_name.get(&(language, callee.to_string()))?;
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].id.clone());
+    }
+
+    let caller_parent = caller_id_parent(ctx.caller_id);
+    // NOTE: matches the Go reference's resolveCall, including the
+    // unreachable same-namespace bonus. Initialized to "" and never
+    // updated — preserved for parity with the Go binary.
+    let caller_ns: String = String::new();
+
+    let mut best: Option<&SymbolEntry> = None;
+    let mut best_score: i32 = -1;
+    for c in candidates {
+        let mut score = 0i32;
+        if c.file == ctx.caller_file {
+            score += 4;
+        }
+        if !caller_parent.is_empty() && c.parent == caller_parent {
+            score += 3;
+        }
+        if !caller_ns.is_empty() && c.namespace == caller_ns {
+            score += 2;
+        }
+        if score > best_score {
+            best_score = score;
+            best = Some(c);
+        }
+    }
+    let _ = caller_ns; // mirror Go's `_ = callerNS` line
+    best.map(|e| e.id.clone())
 }
 
-/// Phase-2 stub for basename-based include resolution. Returns `None` until
-/// Phase 2 wires up [`FileIndex`].
-// TODO(phase-2): implement basename matching against FileIndex once Phase 2
-// ships the path index. Languages like Go and Python override this entirely;
-// C++ relies on the basename heuristic.
-pub(crate) fn default_basename_resolve(_raw: &str, _file_index: &FileIndex) -> Option<PathBuf> {
+/// Extract the parent class name from a caller's symbol ID.
+///
+/// Symbol IDs have the shape `file:Name` (free function) or
+/// `file:Parent::Name` (method). For methods this returns `"Parent"`; for
+/// free functions and unparseable IDs it returns `""`.
+///
+/// We need to find the colon that separates the path from the symbol name.
+/// On Windows the path can itself contain colons (`C:\proj\foo.cpp`), and
+/// the symbol name can contain `::` scope separators. The path/symbol
+/// boundary is the LAST *singleton* `:` — a colon that is neither
+/// immediately preceded nor immediately followed by another `:`. The `::`
+/// scope separator and the Windows drive `:` are both correctly skipped
+/// by this rule.
+fn caller_id_parent(caller_id: &str) -> String {
+    let bytes = caller_id.as_bytes();
+    let mut sep: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let prev_is_colon = i > 0 && bytes[i - 1] == b':';
+        let next_is_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+        if !prev_is_colon && !next_is_colon {
+            sep = Some(i);
+        }
+    }
+    let Some(idx) = sep else {
+        return String::new();
+    };
+    let name = &caller_id[idx + 1..];
+    if let Some(scope_end) = name.find("::") {
+        return name[..scope_end].to_string();
+    }
+    String::new()
+}
+
+/// Default basename-based include resolver. Mirrors the Go reference at
+/// `internal/tools/analyze.go::resolveInclude` byte-for-byte.
+///
+/// 1. Look up candidates by `file_name()` of the raw include path.
+/// 2. If exactly one candidate matches, return it.
+/// 3. If multiple candidates share the basename, prefer the one whose
+///    full path ends with `/raw` or `\raw` (suffix disambiguation for
+///    cases like `#include "foo/bar.h"` matching `.../foo/bar.h` over
+///    `.../baz/bar.h`).
+/// 4. Otherwise return the first candidate (ambiguous).
+pub(crate) fn default_basename_resolve(raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
+    let base = std::path::Path::new(raw).file_name()?.to_str()?;
+    let candidates = file_index.by_basename.get(base)?;
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+    if candidates.len() > 1 {
+        for c in candidates {
+            let cs = c.to_string_lossy();
+            if cs.ends_with(&format!("/{raw}")) || cs.ends_with(&format!("\\{raw}")) {
+                return Some(c.clone());
+            }
+        }
+        return Some(candidates[0].clone());
+    }
     None
 }
 
@@ -175,27 +296,23 @@ pub trait LanguagePlugin: Send + Sync {
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError>;
 
     /// Language-specific call resolution. The default mirrors the Go scope
-    /// heuristic (same file > same parent > same namespace > global).
-    /// Languages override to add language-specific scoping (e.g. Python
-    /// prefers same-module).
-    ///
-    /// **Phase-2 stub.** The default returns `None` until the graph engine
-    /// ships. Plugins should not override this in Phase 1.
+    /// heuristic (same file > same parent > same namespace > global) and
+    /// scopes the lookup to candidates from the same [`Language`] as the
+    /// caller. Languages override to add language-specific scoping (e.g.
+    /// Python prefers same-module).
     fn resolve_call(
         &self,
         callee: &str,
         ctx: &CallContext,
         index: &SymbolIndex,
     ) -> Option<SymbolId> {
-        default_scope_aware_resolve(callee, ctx, index)
+        default_scope_aware_resolve(self.id(), callee, ctx, index)
     }
 
     /// Optional language-specific include/import resolution. Default is
-    /// basename-based path matching. Languages with package systems (Go
-    /// modules, Python dotted imports) should override.
-    ///
-    /// **Phase-2 stub.** The default returns `None` until the graph engine
-    /// ships. Plugins should not override this in Phase 1.
+    /// basename-based path matching with a suffix-disambiguation pass.
+    /// Languages with package systems (Go modules, Python dotted imports)
+    /// should override.
     fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
         default_basename_resolve(raw, file_index)
     }
@@ -507,25 +624,30 @@ mod tests {
     }
 
     #[test]
-    fn default_resolve_call_returns_none_phase_1_stub() {
+    fn default_resolve_call_returns_none_for_unknown_callee() {
         let plugin = FakePlugin {
             id: Language::Cpp,
             exts: &[".fake"],
         };
-        let ctx = CallContext::new();
+        let caller_file = PathBuf::from("/tmp/foo.cpp");
+        let ctx = CallContext {
+            caller_id: "/tmp/foo.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
         let idx = SymbolIndex::new();
-        // Phase 1: default impl is a stub.
+        // Empty index: nothing to resolve to.
         assert!(plugin.resolve_call("any_callee", &ctx, &idx).is_none());
     }
 
     #[test]
-    fn default_resolve_include_returns_none_phase_1_stub() {
+    fn default_resolve_include_returns_none_for_unknown_basename() {
         let plugin = FakePlugin {
             id: Language::Cpp,
             exts: &[".fake"],
         };
         let idx = FileIndex::new();
-        // Phase 1: default impl is a stub.
+        // Empty index: no basenames known.
         assert!(plugin.resolve_include("foo.h", &idx).is_none());
     }
 
@@ -549,5 +671,184 @@ mod tests {
         let fg = plugin.parse_file(path, b"").unwrap();
         assert_eq!(fg.language, Language::Cpp);
         assert_eq!(fg.path, "/tmp/sample.fake");
+    }
+
+    // -- Edge resolver tests (Phase 3.3) ---------------------------------
+
+    fn entry(id: &str, file: &str, parent: &str, namespace: &str) -> SymbolEntry {
+        SymbolEntry {
+            id: id.to_string(),
+            file: PathBuf::from(file),
+            parent: parent.to_string(),
+            namespace: namespace.to_string(),
+        }
+    }
+
+    fn build_index(items: Vec<(Language, &str, SymbolEntry)>) -> SymbolIndex {
+        let mut idx = SymbolIndex::new();
+        for (lang, name, entry) in items {
+            idx.by_name
+                .entry((lang, name.to_string()))
+                .or_default()
+                .push(entry);
+        }
+        idx
+    }
+
+    #[test]
+    fn default_scope_aware_resolve_picks_same_file_over_global() {
+        // Two `helper` candidates in different files. Caller is in file A;
+        // the same-file bonus (+4) must win over the global no-bonus
+        // candidate.
+        let same_file = entry("/proj/a.cpp:helper", "/proj/a.cpp", "", "");
+        let other_file = entry("/proj/b.cpp:helper", "/proj/b.cpp", "", "");
+        let idx = build_index(vec![
+            (Language::Cpp, "helper", other_file),
+            (Language::Cpp, "helper", same_file.clone()),
+        ]);
+
+        let caller_file = PathBuf::from("/proj/a.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/a.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
+        let resolved = default_scope_aware_resolve(Language::Cpp, "helper", &ctx, &idx);
+        assert_eq!(resolved.as_deref(), Some("/proj/a.cpp:helper"));
+    }
+
+    #[test]
+    fn default_scope_aware_resolve_picks_same_parent_when_no_same_file() {
+        // No same-file candidate, but one shares the caller's parent class
+        // (`Engine`). Same-parent bonus (+3) must win over the global
+        // no-bonus candidate.
+        let same_parent = entry("/proj/b.cpp:Engine::tick", "/proj/b.cpp", "Engine", "");
+        let global = entry("/proj/c.cpp:tick", "/proj/c.cpp", "", "");
+        let idx = build_index(vec![
+            (Language::Cpp, "tick", global),
+            (Language::Cpp, "tick", same_parent.clone()),
+        ]);
+
+        let caller_file = PathBuf::from("/proj/a.cpp");
+        let ctx = CallContext {
+            // caller is `Engine::update` declared in a.cpp — different file
+            // from both candidates, but same parent as the b.cpp candidate.
+            caller_id: "/proj/a.cpp:Engine::update",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
+        let resolved = default_scope_aware_resolve(Language::Cpp, "tick", &ctx, &idx);
+        assert_eq!(resolved.as_deref(), Some("/proj/b.cpp:Engine::tick"));
+    }
+
+    #[test]
+    fn default_scope_aware_resolve_returns_none_for_unknown_callee() {
+        let idx = SymbolIndex::new();
+        let caller_file = PathBuf::from("/proj/a.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/a.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
+        let resolved = default_scope_aware_resolve(Language::Cpp, "nope", &ctx, &idx);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn default_scope_aware_resolve_isolates_languages() {
+        // Same name `init` registered for both Python and C++. A C++ caller
+        // must only see the C++ entry — the (Language, name) keying makes
+        // this byte-level impossible to mix.
+        let py_init = entry("/proj/m.py:init", "/proj/m.py", "", "");
+        let cpp_init = entry("/proj/m.cpp:init", "/proj/m.cpp", "", "");
+        let idx = build_index(vec![
+            (Language::Python, "init", py_init),
+            (Language::Cpp, "init", cpp_init.clone()),
+        ]);
+
+        let caller_file = PathBuf::from("/proj/other.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/other.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
+        let resolved = default_scope_aware_resolve(Language::Cpp, "init", &ctx, &idx);
+        assert_eq!(resolved.as_deref(), Some("/proj/m.cpp:init"));
+
+        // And the Python lookup returns the Python entry.
+        let py_caller_file = PathBuf::from("/proj/other.py");
+        let py_ctx = CallContext {
+            caller_id: "/proj/other.py:caller",
+            caller_file: &py_caller_file,
+            language: Language::Python,
+        };
+        let resolved_py = default_scope_aware_resolve(Language::Python, "init", &py_ctx, &idx);
+        assert_eq!(resolved_py.as_deref(), Some("/proj/m.py:init"));
+    }
+
+    #[test]
+    fn default_scope_aware_resolve_single_candidate_returns_directly() {
+        // Single candidate path: skip scoring entirely and return it.
+        let only = entry("/proj/x.cpp:only_one", "/proj/x.cpp", "", "");
+        let idx = build_index(vec![(Language::Cpp, "only_one", only)]);
+
+        let caller_file = PathBuf::from("/proj/elsewhere.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/elsewhere.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+        };
+        let resolved = default_scope_aware_resolve(Language::Cpp, "only_one", &ctx, &idx);
+        assert_eq!(resolved.as_deref(), Some("/proj/x.cpp:only_one"));
+    }
+
+    #[test]
+    fn default_basename_resolve_unique_match() {
+        let mut idx = FileIndex::new();
+        idx.by_basename
+            .entry("foo.h".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/include/foo.h"));
+        let resolved = default_basename_resolve("foo.h", &idx);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/proj/include/foo.h")));
+    }
+
+    #[test]
+    fn default_basename_resolve_suffix_disambiguates() {
+        // Two `bar.h` files: one at /proj/foo/bar.h, one at /proj/baz/bar.h.
+        // Caller wrote `#include "foo/bar.h"` — must resolve to the path
+        // ending with `/foo/bar.h`.
+        let mut idx = FileIndex::new();
+        idx.by_basename
+            .entry("bar.h".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/baz/bar.h"));
+        idx.by_basename
+            .entry("bar.h".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/foo/bar.h"));
+        let resolved = default_basename_resolve("foo/bar.h", &idx);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/proj/foo/bar.h")));
+    }
+
+    #[test]
+    fn default_basename_resolve_returns_none_for_no_match() {
+        let idx = FileIndex::new();
+        assert!(default_basename_resolve("missing.h", &idx).is_none());
+    }
+
+    #[test]
+    fn caller_id_parent_extracts_class_from_method_id() {
+        // Method-style ID: parent class is between final ':' and '::'.
+        assert_eq!(caller_id_parent("file:Foo::bar"), "Foo");
+        // Free-function ID: no '::' after the final ':' → empty parent.
+        assert_eq!(caller_id_parent("file:plain"), "");
+        // Empty input.
+        assert_eq!(caller_id_parent(""), "");
+        // Windows-style path with `:` after drive letter — the LAST `:`
+        // separates symbol name from path, so the drive's `:` is ignored.
+        assert_eq!(caller_id_parent(r"C:\proj\foo.cpp:Foo::bar"), "Foo");
+        // Windows-style path with a free function.
+        assert_eq!(caller_id_parent(r"C:\proj\foo.cpp:plain"), "");
     }
 }

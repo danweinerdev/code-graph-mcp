@@ -24,7 +24,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 ignore = { workspace = true }
 crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
+codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
 tempfile = { workspace = true }
 walkdir = { workspace = true }

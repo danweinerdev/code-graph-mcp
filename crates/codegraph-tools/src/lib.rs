@@ -8,9 +8,7 @@
 //!   table, and `require_indexed`. (Phase 3.1)
 //! - [`discovery`] — parallel filesystem walker. (Phase 3.2)
 //! - [`indexer`] — per-job rayon parsing pool, edge resolution, progress
-//!   reporting trait. (Phase 3.3, with [`indexer::ProgressSink`] shipped
-//!   here in Phase 3.1 so 3.2 and 3.3 can both depend on it without
-//!   circularity.)
+//!   reporting trait, and the tokio bridge sink. (Phase 3.3.)
 
 pub mod discovery;
 pub mod indexer;
