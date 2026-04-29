@@ -19,7 +19,7 @@ tasks:
     verification: "file_symbols returns Vec (never Option) for known and unknown paths — empty for unknown so JSON serializes as []; symbol_detail returns Some for known IDs and None for unknown; SearchParams supports pattern (regex with case-insensitive substring fallback), kind, namespace (substring), language (NEW — exact match, optional), limit (default 20), offset (default 0); SearchResult has `symbols` and `total`; results sorted by SymbolID for stable pagination; tests cover regex match, substring fallback when regex invalid, kind filter, namespace filter, language filter, all-filters-combined, empty pattern, offset beyond total returns empty with correct total; symbol_summary groups by namespace and kind, handles file=None (whole graph) and file=Some(path) (scoped); empty graph returns empty map (not null)"
   - id: "2.3"
     title: "Call graph: callers, callees BFS; orphans; file_dependencies"
-    status: planned
+    status: complete
     depends_on: ["2.1"]
     verification: "callers and callees BFS visit each node at most once via a HashSet visited; depth=0 treated as 1 (matches Go); cycles do not infinite-loop (verified by a 3-node cycle fixture); CallChain carries SymbolID, file, line, depth; orphans returns symbols with no incoming Call edges, defaults to callables only when kind=None, accepts kind filter; file_dependencies returns Vec<PathBuf> never Option, empty Vec for unknown paths"
   - id: "2.4"
@@ -82,14 +82,14 @@ This phase has zero MCP dependency — `codegraph-graph` is unit-testable with n
 ## 2.3: Call graph: callers, callees BFS; orphans; file_dependencies
 
 ### Subtasks
-- [ ] `callers(&self, id: &SymbolId, depth: u32) -> Vec<CallChain>` — BFS over radj filtering by `EdgeKind::Calls`
-- [ ] `callees(&self, id: &SymbolId, depth: u32) -> Vec<CallChain>` — BFS over adj
-- [ ] BFS uses HashSet<SymbolId> visited to handle cycles without infinite loop
-- [ ] depth=0 normalized to 1 (matches Go behavior; otherwise an agent passing depth=0 gets empty results which is confusing)
-- [ ] CallChain { symbol_id, file, line, depth }
-- [ ] `orphans(&self, kind: Option<SymbolKind>) -> Vec<Symbol>` — symbols with no incoming Calls edges; default (kind=None) = callables only (Function or Method)
-- [ ] `file_dependencies(&self, path: &Path) -> Vec<PathBuf>` — never Option; empty Vec for unknown paths
-- [ ] Tests: linear chain (3 nodes, depth=2); diamond; 3-node cycle; unknown symbol returns empty; depth=0 normalized; orphan defaults exclude classes/structs; orphan with kind=Class returns class symbols; file_dependencies for known path; file_dependencies for unknown path returns []
+- [x] `callers(&self, id: &SymbolId, depth: u32) -> Vec<CallChain>` — BFS over radj filtering by `EdgeKind::Calls`
+- [x] `callees(&self, id: &SymbolId, depth: u32) -> Vec<CallChain>` — BFS over adj
+- [x] BFS uses HashSet<SymbolId> visited to handle cycles without infinite loop
+- [x] depth=0 normalized to 1 (matches Go behavior; otherwise an agent passing depth=0 gets empty results which is confusing)
+- [x] CallChain { symbol_id, file, line, depth }
+- [x] `orphans(&self, kind: Option<SymbolKind>) -> Vec<Symbol>` — symbols with no incoming Calls edges; default (kind=None) = callables only (Function or Method)
+- [x] `file_dependencies(&self, path: &Path) -> Vec<PathBuf>` — never Option; empty Vec for unknown paths
+- [x] Tests: linear chain (3 nodes, depth=2); diamond; 3-node cycle; unknown symbol returns empty; depth=0 normalized; orphan defaults exclude classes/structs; orphan with kind=Class returns class symbols; file_dependencies for known path; file_dependencies for unknown path returns []
 
 ## 2.4: Tarjan SCC and diamond-safe class hierarchy
 

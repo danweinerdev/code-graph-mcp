@@ -9,8 +9,10 @@
 //! Subsequent tasks add queries, BFS algorithms, Tarjan SCC, the
 //! diamond-safe class hierarchy, coupling, and the Mermaid renderer.
 
+mod callgraph;
 pub mod graph;
 mod queries;
 
+pub use callgraph::CallChain;
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
 pub use queries::{SearchParams, SearchResult};
