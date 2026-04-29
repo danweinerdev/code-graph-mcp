@@ -50,7 +50,7 @@ use std::path::Path;
 
 use codegraph_core::{FileGraph, Language};
 use codegraph_lang::{LanguagePlugin, ParseError};
-use tree_sitter::{Language as TsLanguage, Parser as TsParser, Query, QueryCursor};
+use tree_sitter::{Language as TsLanguage, Parser as TsParser, Query};
 
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INCLUDE_QUERIES, INHERITANCE_QUERIES};
 
@@ -69,12 +69,20 @@ pub struct CppParser {
     /// `LanguageFn`.
     language: TsLanguage,
     /// Compiled definition query.
+    // TODO(1.5): used by extract_definitions
+    #[allow(dead_code)]
     def_query: Query,
     /// Compiled call query.
+    // TODO(1.5): used by extract_calls
+    #[allow(dead_code)]
     call_query: Query,
     /// Compiled include query.
+    // TODO(1.5): used by extract_includes
+    #[allow(dead_code)]
     incl_query: Query,
     /// Compiled inheritance query.
+    // TODO(1.5): used by extract_inheritance
+    #[allow(dead_code)]
     inh_query: Query,
 }
 
@@ -125,34 +133,18 @@ impl LanguagePlugin for CppParser {
     }
 
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
-        // Phase 1.4 stub: parse the file end-to-end so the grammar + queries
-        // are exercised on every call (catching grammar/version skew at
-        // parse time rather than discovery time), but skip extraction. The
-        // tree, cursor, and four queries are all touched here so that
-        // adding extraction in 1.5 is purely a matter of populating
-        // `symbols`/`edges` from the existing matches loops.
+        // Phase 1.4 stub: parse the source so grammar/version skew surfaces here,
+        // but skip query matching until Phase 1.5 wires up extraction. Returns an
+        // empty FileGraph with the right path and language.
         // TODO(1.5): replace this with extract_definitions / extract_calls /
         // extract_includes / extract_inheritance.
         let mut parser = TsParser::new();
         parser
             .set_language(&self.language)
             .map_err(|e| ParseError::Parse(format!("set_language: {e}")))?;
-        let tree = parser
+        let _tree = parser
             .parse(content, None)
             .ok_or_else(|| ParseError::Parse("tree-sitter returned no tree".to_owned()))?;
-        let root = tree.root_node();
-        let mut cursor = QueryCursor::new();
-
-        // Touch each query so Phase 1.5 can drop in the matches loop without
-        // re-plumbing field access. The cursor is dropped at end of scope.
-        for query in [
-            &self.def_query,
-            &self.call_query,
-            &self.incl_query,
-            &self.inh_query,
-        ] {
-            let _ = cursor.matches(query, root, content);
-        }
 
         Ok(FileGraph {
             path: path.to_string_lossy().into_owned(),

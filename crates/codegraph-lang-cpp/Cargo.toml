@@ -13,6 +13,5 @@ workspace = true
 [dependencies]
 codegraph-core = { path = "../codegraph-core" }
 codegraph-lang = { path = "../codegraph-lang" }
-thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-cpp = { workspace = true }
