@@ -166,13 +166,23 @@ fn rwlock_concurrent_readers_and_writers() {
                 while Instant::now() < deadline {
                     let snapshot = graph.read();
 
-                    // search: result vec length must never exceed `total`.
-                    let result = snapshot.search(SearchParams {
+                    // search: keep the read lock busy traversing every node.
+                    // (`symbols.len() <= total` is a structural invariant of
+                    // SearchResult — slicing a Vec of length `total` cannot
+                    // produce a longer slice — so it cannot detect a half-merged
+                    // snapshot. The seed-symbol lookup below is the actual
+                    // consistency probe.)
+                    let _ = snapshot.search(SearchParams {
                         pattern: format!("caller_{}", iteration % 16),
                         limit: 10,
                         ..Default::default()
                     });
-                    if (result.symbols.len() as u32) > result.total {
+
+                    // The seed file's `callee_0` symbol must always be locatable
+                    // by ID — it is never removed by any writer. If a half-merge
+                    // were observable through the read lock, this lookup could
+                    // miss it transiently.
+                    if snapshot.symbol_detail("/seed.cpp:callee_0").is_none() {
                         consistency_violation.store(true, Ordering::Relaxed);
                     }
 
@@ -216,9 +226,13 @@ fn rwlock_concurrent_readers_and_writers() {
             });
         }
 
-        // 2 writers — each picks paths from a small disjoint pool so they
-        // never deadlock on the same file but do force re-merge churn (the
-        // remove_file_unsafe path inside merge_file_graph).
+        // 2 writers — each cycles through writer-specific paths (w0 vs w1
+        // prefix) so they don't overwrite each other's files (keeping the
+        // final graph contents predictable for the seed-file assertion) and
+        // re-merge their own files on roughly every 4th iteration, exercising
+        // the remove_file_unsafe path inside merge_file_graph. The RwLock
+        // itself prevents lock-level deadlock regardless of which paths are
+        // chosen.
         for writer_idx in 0..2u32 {
             let graph = &graph;
             s.spawn(move || {
