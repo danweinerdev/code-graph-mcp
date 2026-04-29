@@ -29,7 +29,7 @@ tasks:
     verification: "analyze_codebase parameters are `path` (required) and `force` (optional bool); the optional `language` filter mentioned in the design's MCP Tools table is **out of scope for this rewrite** — analyze always indexes all registered languages — and is captured as Open Question 7 in the design for future work; analyze_codebase loads .code-graph.toml, runs discovery → parse → resolve → merge inside spawn_blocking, sends progress notifications, returns AnalyzeResult JSON with files/symbols/edges/root_path/warnings — surfaces concurrency-clamp warnings if config exceeded NumCPU; get_file_symbols returns Vec<symbolResult> never null even when top_level_only filters everything out (initialize as `Vec::with_capacity(...)`); brief defaults to true on both get_file_symbols and search_symbols; search_symbols requires at least one of query/kind/namespace/language — language-only search is explicitly accepted; pagination envelope `{results, total, offset, limit}`; get_symbol_detail returns full detail (brief=false semantics) and produces did-you-mean suggestions from a 100-candidate pool on not-found; get_symbol_summary handles optional file param; get_callers/get_callees use BFS depth (default 1), did-you-mean on unknown symbol; get_dependencies returns [] (never null) for unknown or include-empty files; integration tests cover happy paths + each error path with exact wording"
   - id: "3.5"
     title: "P1+P2 tool handlers (5 real + 2 stubs): detect_cycles, get_orphans, get_class_hierarchy, get_coupling, generate_diagram, watch_start stub, watch_stop stub"
-    status: planned
+    status: complete
     depends_on: ["3.4"]
     verification: "After this task, `tools/list` returns exactly 15 tools — task 3.4 ships 8 P0 handlers (analyze_codebase, get_file_symbols, search_symbols, get_symbol_detail, get_symbol_summary, get_callers, get_callees, get_dependencies); task 3.5 ships 5 substantive P1+P2 handlers (detect_cycles, get_orphans, get_class_hierarchy, get_coupling, generate_diagram) plus 2 stubs (watch_start, watch_stop); 8 + 5 + 2 = 15. Per handler: detect_cycles returns [] (not null) on acyclic graphs, [[a,b],...] on cycles; get_orphans defaults to callables, accepts kind filter; get_class_hierarchy uses widened {Class, Struct, Interface, Trait} root filter, depth (default 1) supports transitive walk, did-you-mean on unknown class; get_coupling supports direction in {outgoing(default), incoming, both}; generate_diagram dispatches by exclusive parameter (symbol|file|class), depth default 1, max_nodes default 30, format in {edges(default), mermaid}, styled bool default false; mermaid output is valid graph syntax; edges format returns [] never null on empty; all error paths produce exact Go-matching error wording; watch_start and watch_stop registered as tool stubs that return McpError with 'watch mode not yet implemented in this build' (Phase 4 replaces both with real implementations)"
   - id: "3.6"
@@ -146,13 +146,22 @@ Every handler returns `Ok(CallToolResult)` even for user errors — `Err(McpErro
 ## 3.5: P1+P2 tool handlers (4) + watch_start/watch_stop stubs
 
 ### Subtasks
-- [ ] **`detect_cycles`** — no params; cycles always Vec, never null
-- [ ] **`get_orphans`** — params: `kind`; default callables only; brief mode for symbol results
-- [ ] **`get_class_hierarchy`** — params: `class`, `depth` (default 1); did-you-mean on unknown
-- [ ] **`get_coupling`** — params: `file`, `direction` (default outgoing); 'both' merges outgoing+incoming
-- [ ] **`generate_diagram`** — params: `symbol` | `file` | `class` (exactly one), `depth` (default 1), `max_nodes` (default 30), `format` (default edges), `styled` (default false); dispatch to diagram_call_graph / diagram_file_graph / diagram_inheritance based on which exclusive param is set; format=edges returns `Vec<DiagramEdge>` (never null); format=mermaid returns rendered string
-- [ ] **`watch_start` stub** — returns `McpError::tool_error("watch mode not yet implemented in this build")` (Phase 4 fills in the real handler)
-- [ ] **`watch_stop` stub** — same
+- [x] **`detect_cycles`** — no params; cycles always Vec, never null
+- [x] **`get_orphans`** — params: `kind`; default callables only; brief mode for symbol results
+- [x] **`get_class_hierarchy`** — params: `class`, `depth` (default 1); did-you-mean on unknown
+- [x] **`get_coupling`** — params: `file`, `direction` (default outgoing); 'both' merges outgoing+incoming
+- [x] **`generate_diagram`** — params: `symbol` | `file` | `class` (exactly one), `depth` (default 1), `max_nodes` (default 30), `format` (default edges), `styled` (default false); dispatch to diagram_call_graph / diagram_file_graph / diagram_inheritance based on which exclusive param is set; format=edges returns `Vec<DiagramEdge>` (never null); format=mermaid returns rendered string
+- [x] **`watch_start` stub** — returns the tool-level error envelope (`is_error: true`) carrying `"watch mode not yet implemented in this build"` (Phase 4 fills in the real handler). The stub uses `Ok(CallToolResult::error(...))` rather than `Err(McpError)` so the wire envelope matches every other tool error in the suite.
+- [x] **`watch_stop` stub** — same
+
+### Notes
+
+- **Did-you-mean filtered to class-like kinds for `get_class_hierarchy` / `generate_diagram(class=...)`.** The shared `suggest_symbols` helper from 3.4 doesn't filter by kind — using it for class lookups would let a Function named `FooBar` show up as a "class did you mean" suggestion for `Foo`. Both class-aware paths walk `Graph::search_symbols(name, None)` directly and filter to `{Class, Struct, Interface, Trait}` before joining the top 5 names.
+- **`get_coupling` invalid-direction wording diverges from Go.** Go: `'direction' must be 'incoming', 'outgoing', or 'both'`. Rust: `invalid direction: <direction>. Expected one of: outgoing, incoming, both`. The Rust form mirrors the `invalid kind: <kind>` and `invalid format: <format>` shapes used elsewhere in the handler suite, and includes the bad value verbatim so users can self-correct. This is a deliberate Rust-idiom divergence (per the Phase 3.4 carry-forward principle); 3.7's snapshot suite locks the new wording in.
+- **`generate_diagram` exclusive-param wording.** Go: `one of 'symbol', 'file', or 'class' is required`. Rust: `exactly one of 'symbol', 'file', or 'class' is required`. The "exactly" disambiguates the n=2 / n=3 cases the Go message silently allows. Empty strings count as absent so `{"symbol": ""}` doesn't pass the check.
+- **`generate_diagram` mermaid direction is hardcoded to `TD`.** Go uses `BT` for inheritance and `TD` otherwise. Per the task brief the Rust port unifies on `TD` so diagrams stay visually consistent regardless of which view a user requested.
+- **`PathBuf` serialization stringified explicitly.** `detect_cycles` and `get_coupling` both convert their `PathBuf`-keyed results to `String` via `to_string_lossy().into_owned()` before serializing. Serde's default `PathBuf` serialization works on Unix but is non-portable on Windows (where `OsStr` can be a non-UTF-8 surrogate); the explicit conversion makes the output platform-independent at the cost of one allocation per path.
+- **Watch stubs skip `require_indexed`.** The stub message is the same regardless of indexed state. Adding the gate would mean an indexed-then-not-implemented path masks the not-implemented one — making it harder for clients to tell whether the binary lacks watch support or just hasn't indexed yet. The require_indexed call returns when 3.5 ships the real implementation in Phase 4.
 
 ## 3.6: Persistence: cache v2 with atomic save
 

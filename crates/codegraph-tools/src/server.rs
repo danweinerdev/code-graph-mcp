@@ -329,13 +329,6 @@ pub struct GenerateDiagramArgs {
 
 // Tool router --------------------------------------------------------------
 
-/// Stub error returned by every tool handler in Phase 3.1. The phase tag
-/// in the message lets `tools/list` consumers see which task is on the
-/// hook for filling in each handler.
-fn not_yet_implemented(phase: &'static str) -> McpError {
-    McpError::internal_error(format!("not yet implemented ({phase})"), None)
-}
-
 #[tool_router]
 impl CodeGraphServer {
     // -- P0 (Phase 3.4) ----------------------------------------------------
@@ -481,31 +474,54 @@ impl CodeGraphServer {
         &self,
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::structure::detect_cycles(&self.inner.graph))
     }
 
     #[tool(description = "Find symbols with no incoming call edges (uncalled functions/methods)")]
     async fn get_orphans(
         &self,
-        Parameters(_args): Parameters<GetOrphansArgs>,
+        Parameters(args): Parameters<GetOrphansArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::structure::get_orphans(
+            &self.inner.graph,
+            args.kind.as_deref(),
+        ))
     }
 
     #[tool(description = "Get the inheritance tree for a class (base classes and derived classes)")]
     async fn get_class_hierarchy(
         &self,
-        Parameters(_args): Parameters<GetClassHierarchyArgs>,
+        Parameters(args): Parameters<GetClassHierarchyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::structure::get_class_hierarchy(
+            &self.inner.graph,
+            &args.class,
+            args.depth,
+        ))
     }
 
     #[tool(description = "Get cross-file dependency counts for a file")]
     async fn get_coupling(
         &self,
-        Parameters(_args): Parameters<GetCouplingArgs>,
+        Parameters(args): Parameters<GetCouplingArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::structure::get_coupling(
+            &self.inner.graph,
+            &args.file,
+            args.direction.as_deref(),
+        ))
     }
 
     #[tool(
@@ -513,9 +529,24 @@ impl CodeGraphServer {
     )]
     async fn generate_diagram(
         &self,
-        Parameters(_args): Parameters<GenerateDiagramArgs>,
+        Parameters(args): Parameters<GenerateDiagramArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let input = handlers::structure::GenerateDiagramInput {
+            symbol: args.symbol.as_deref(),
+            file: args.file.as_deref(),
+            class: args.class.as_deref(),
+            depth: args.depth,
+            max_nodes: args.max_nodes,
+            format: args.format.as_deref(),
+            styled: args.styled.unwrap_or(false),
+        };
+        Ok(handlers::structure::generate_diagram(
+            &self.inner.graph,
+            input,
+        ))
     }
 
     #[tool(
@@ -525,7 +556,12 @@ impl CodeGraphServer {
         &self,
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        // Phase 3.5 ships only the stub. Phase 4 will replace this with
+        // the real fsnotify-debouncer-full implementation. The require_indexed
+        // gate is intentionally NOT applied here: the stub message is the
+        // same regardless of indexed state, and adding the gate would mean
+        // an indexed-then-not-implemented path masks the not-implemented one.
+        Ok(handlers::watch::watch_start_stub())
     }
 
     #[tool(description = "Stop watching for file changes")]
@@ -533,7 +569,8 @@ impl CodeGraphServer {
         &self,
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
-        Err(not_yet_implemented("Phase 3.5"))
+        // See `watch_start` for why we skip require_indexed.
+        Ok(handlers::watch::watch_stop_stub())
     }
 }
 
@@ -817,18 +854,174 @@ mod tests {
         );
     }
 
-    /// Symmetrical assertion for the Phase 3.5 stub family.
+    // -- Phase 3.5 require_indexed gates -----------------------------------
+    //
+    // Each P1+P2 handler enforces the require_indexed gate before doing
+    // any work. Same exact-text assertion as the P0 family above.
+
     #[tokio::test]
-    async fn p1_handler_stub_reports_phase_3_5() {
+    async fn detect_cycles_requires_indexed_before_running() {
         let server = empty_server();
-        let err = server
+        let r = server
             .detect_cycles(Parameters(EmptyParams::default()))
             .await
-            .expect_err("Phase 3.1 must stub all P1+P2+watch handlers");
-        assert!(
-            err.message.contains("Phase 3.5"),
-            "P1 stub must mention Phase 3.5, got {:?}",
-            err.message,
-        );
+            .expect("tool-level errors return Ok(CallToolResult)");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn get_orphans_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_orphans(Parameters(GetOrphansArgs { kind: None }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn get_class_hierarchy_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_class_hierarchy(Parameters(GetClassHierarchyArgs {
+                class: "Anything".to_string(),
+                depth: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn get_coupling_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .get_coupling(Parameters(GetCouplingArgs {
+                file: "/x.cpp".to_string(),
+                direction: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[tokio::test]
+    async fn generate_diagram_requires_indexed_before_running() {
+        let server = empty_server();
+        let r = server
+            .generate_diagram(Parameters(GenerateDiagramArgs {
+                symbol: Some("/x.cpp:foo".to_string()),
+                file: None,
+                class: None,
+                depth: None,
+                max_nodes: None,
+                format: None,
+                styled: None,
+            }))
+            .await
+            .expect("Ok envelope on require_indexed failure");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
+    }
+
+    // -- Phase 3.5 watch stubs ---------------------------------------------
+    //
+    // The exact stub message is locked here so the snapshot suite in 3.7
+    // and Phase 4's swap-in implementation both have a single source of
+    // truth to assert against.
+
+    #[tokio::test]
+    async fn watch_start_returns_not_implemented_error() {
+        let server = empty_server();
+        let r = server
+            .watch_start(Parameters(EmptyParams::default()))
+            .await
+            .expect("watch stub returns Ok(CallToolResult)");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "watch mode not yet implemented in this build");
+    }
+
+    #[tokio::test]
+    async fn watch_stop_returns_not_implemented_error() {
+        let server = empty_server();
+        let r = server
+            .watch_stop(Parameters(EmptyParams::default()))
+            .await
+            .expect("watch stub returns Ok(CallToolResult)");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "watch mode not yet implemented in this build");
+    }
+
+    /// Smoke test: with the indexed flag set, a P1 handler runs its happy
+    /// path through the in-module handler function instead of short-
+    /// circuiting on require_indexed. Detailed assertions live in
+    /// `handlers/structure.rs` tests.
+    #[tokio::test]
+    async fn p1_handler_passes_require_indexed_when_flag_set() {
+        let server = empty_server();
+        server
+            .inner
+            .indexed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Empty graph → detect_cycles returns []. Confirms require_indexed
+        // doesn't block the call once the flag is set.
+        let r = server
+            .detect_cycles(Parameters(EmptyParams::default()))
+            .await
+            .unwrap();
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "[]");
     }
 }

@@ -1,8 +1,8 @@
-//! P0 tool handler bodies.
+//! Tool handler bodies.
 //!
-//! Phase 3.4 fills in the eight P0 handlers declared in
-//! [`crate::server::CodeGraphServer`]. The `#[tool]` shells in `server.rs`
-//! delegate here so each handler stays focused, testable, and short.
+//! The `#[tool]` shells in `crate::server::CodeGraphServer` delegate here
+//! so each handler stays focused, testable, and short. Phase 3.4 filled in
+//! the P0 handlers; Phase 3.5 fills in P1+P2 plus watch stubs.
 //!
 //! Module layout:
 //! - `analyze` — `analyze_codebase` (the big one: progress bridge, cache,
@@ -10,6 +10,10 @@
 //! - `symbols` — `get_file_symbols`, `search_symbols`, `get_symbol_detail`,
 //!   `get_symbol_summary`.
 //! - `query` — `get_callers`, `get_callees`, `get_dependencies`.
+//! - `structure` — `detect_cycles`, `get_orphans`, `get_class_hierarchy`,
+//!   `get_coupling`, `generate_diagram`.
+//! - `watch` — `watch_start` and `watch_stop` Phase 3.5 stubs (Phase 4
+//!   replaces these with real implementations).
 //!
 //! All public functions in these submodules return `CallToolResult` (never
 //! `McpError`), matching the wire-envelope rule the design pinned in
@@ -19,7 +23,9 @@
 
 pub mod analyze;
 pub mod query;
+pub mod structure;
 pub mod symbols;
+pub mod watch;
 
 use codegraph_core::{symbol_id, Language, Symbol, SymbolKind};
 use rmcp::model::{CallToolResult, Content};
