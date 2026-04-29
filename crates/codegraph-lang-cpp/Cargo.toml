@@ -16,3 +16,7 @@ codegraph-lang = { path = "../codegraph-lang" }
 tree-sitter = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 streaming-iterator = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+pretty_assertions = { workspace = true }
