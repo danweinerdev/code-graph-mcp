@@ -42,7 +42,7 @@ use crate::graph::Node;
 use crate::Graph;
 
 /// One labeled edge in a [`DiagramResult`]. The `from`/`to` are display
-/// names already (post-[`mermaid_label`] for symbol diagrams, basename for
+/// names already (post `mermaid_label` for symbol diagrams, basename for
 /// file diagrams, raw class name for inheritance) — [`DiagramResult::render_mermaid`]
 /// does not transform them further.
 ///

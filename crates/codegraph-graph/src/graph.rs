@@ -85,7 +85,7 @@ impl Graph {
     /// Add or replace all symbols and edges from a parsed [`FileGraph`].
     ///
     /// If the path is already known, its previous contents are removed first
-    /// (via [`Graph::remove_file_unsafe`]) so re-merging is naturally
+    /// (via `remove_file_unsafe`) so re-merging is naturally
     /// idempotent — the post-state depends only on the input `fg`, not on
     /// whether the path was previously merged.
     ///
