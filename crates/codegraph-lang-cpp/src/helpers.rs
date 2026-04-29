@@ -5,11 +5,9 @@
 //! (`TestSplitQualified`, `TestStripIncludePath`, `TestTruncateSignature`,
 //! `TestTruncateSignatureByteFallback`, `TestTruncateSignatureUTF8Boundary`).
 //!
-//! Visibility note: helpers are `pub` (not `pub(crate)`) so the dead-code
-//! lint sees them as a public surface during the Phase 1.4 transition where
-//! they are unit-tested but not yet wired into `extract_*`. Phase 1.5 plugs
-//! them into the extraction pipeline; downgrading to `pub(crate)` at that
-//! point is a one-line change.
+//! The module itself is `pub(crate)`; the individual functions are `pub` as
+//! a crate-internal convention so callers within `lib.rs` can `use` them
+//! freely. The effective visibility cap remains crate-internal.
 
 use tree_sitter::Node;
 
