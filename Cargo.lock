@@ -51,6 +51,9 @@ dependencies = [
 [[package]]
 name = "codegraph-graph"
 version = "0.1.0"
+dependencies = [
+ "codegraph-core",
+]
 
 [[package]]
 name = "codegraph-lang"

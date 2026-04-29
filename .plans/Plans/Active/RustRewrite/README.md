@@ -22,7 +22,7 @@ phases:
     doc: "01-Foundation-And-Cpp-Parser.md"
   - id: 2
     title: "Graph Engine & LLM Optimizations"
-    status: planned
+    status: in-progress
     doc: "02-Graph-Engine-And-LLM-Optimizations.md"
     depends_on: [1]
   - id: 3
