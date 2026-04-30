@@ -49,3 +49,15 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 schemars = "1"
 insta = { version = "1", features = ["json", "redactions", "filters"] }
+
+# Release profile tuned for the Phase 4.3 cross-compile workflow.
+# `strip = "symbols"` keeps debug-info size out of every cross-target binary
+# without requiring `llvm-strip` post-steps (notably for the windows-gnu target,
+# where stripping in the recipe would need a separate toolchain).
+# `lto = "thin"` and `codegen-units = 1` shrink the binary further; the
+# 30 MB ceiling in the Phase 4.3 verification budget is well within reach
+# for the host (linux-x86_64-gnu) target — see commit message for sizes.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

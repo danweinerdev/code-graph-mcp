@@ -189,6 +189,52 @@ make clean          # Remove build artifacts
 
 Cross-compilation requires platform-specific C toolchains since tree-sitter uses CGo. The Makefile auto-detects the host platform and skips targets whose cross-compiler is not found.
 
+## Building from source / Cross-compilation (Rust)
+
+The Phase 4 Rust rewrite cross-compiles all 6 supported targets from a single
+Linux host using [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild),
+which routes the C compiler through `zig cc`. This replaces the per-platform
+toolchain hunting in the Go `Makefile`.
+
+**One-time setup (Fedora; adapt the package manager line for other distros):**
+
+```bash
+# 1. Rust targets
+rustup target add \
+  x86_64-unknown-linux-gnu \
+  x86_64-unknown-linux-musl \
+  aarch64-unknown-linux-musl \
+  x86_64-apple-darwin \
+  aarch64-apple-darwin \
+  x86_64-pc-windows-gnu
+
+# 2. cargo-zigbuild
+cargo install cargo-zigbuild
+
+# 3. zig itself
+sudo dnf install zig          # Fedora
+# brew install zig            # macOS
+# sudo apt install zig        # Debian/Ubuntu (may need backports)
+```
+
+**Build:**
+
+```bash
+make release-all              # all 6 targets in sequence
+make release-all -j6          # build them in parallel
+make release-linux-x86_64-gnu # one specific target
+make release-host-smoke       # host-only sanity build (used in dev)
+```
+
+Output binaries land at `bin/<rust-triple>/code-graph-mcp(.exe)`. The release
+profile in the workspace `Cargo.toml` strips symbols and applies thin LTO with
+`codegen-units = 1`; the host (`x86_64-unknown-linux-gnu`) binary is well under
+the 30 MB ceiling.
+
+**CI:** see `.github/workflows/release.yml` for a `workflow_dispatch` job that
+reproduces `make release-all` on a Linux runner and uploads the `bin/` tree as
+a workflow artifact.
+
 ## Architecture
 
 ```

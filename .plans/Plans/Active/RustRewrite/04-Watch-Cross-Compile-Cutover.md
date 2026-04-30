@@ -19,7 +19,7 @@ tasks:
     verification: "watch_loop tokio task receives DebouncedEvent batches via mpsc channel; for each event, attempts ServerInner.index_lock.try_lock — if held (analyze_codebase running) the event is dropped (not queued, not retried — design Decision); when not held, takes the lock for the entire snapshot+resolve+merge sequence so no concurrent analyze can clear the graph mid-reindex; reindex_file dispatches by file extension via registry.for_path: removed events call graph.remove_file; created/modified events read+parse+resolve_edges (per-language) and merge_file_graph; non-source files (no plugin match) ignored; **reindex_file uses the cached `inner.config` (loaded by the most recent analyze_codebase) rather than re-reading `<root>/.code-graph.toml` on every event** — a unit test injects a modified config onto ServerInner before triggering a watch event and asserts the modified setting (e.g., a different parsing.max_threads) is observed; race regression test: spawn a watch task watching a directory and a parallel analyze_codebase loop; assert no panics, no graph in inconsistent state (every successful query returns a coherent snapshot); watch_stop cancels the oneshot, drops the debouncer, clears state"
   - id: "4.3"
     title: "Cross-compile via cargo-zigbuild for 6 platforms"
-    status: planned
+    status: in-progress
     depends_on: ["4.2"]
     verification: "Top-level Makefile or justfile recipes produce release binaries for x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin, x86_64-pc-windows-gnu — all from a single Linux host using cargo-zigbuild; binaries land under bin/<target>/code-graph-mcp(.exe); each binary smoke-tests by running `<bin> --version` (or equivalent stdio handshake) and `<bin>` indexing testdata/cpp on a host that supports running it (Linux native, macOS via emulation skipped or run on a separate runner, Windows via wine if available); CI workflow file (or documented commands) demonstrates the release path; size check: each release binary under 30MB stripped"
   - id: "4.4"
@@ -72,21 +72,23 @@ The "drop the event when index_lock is held" rule (rather than queue) is a delib
 ## 4.3: Cross-compile via cargo-zigbuild for 6 platforms
 
 ### Subtasks
-- [ ] Add cargo-zigbuild instructions to top-level documentation (Makefile/justfile/README)
-- [ ] Per-platform recipes:
+- [x] Add cargo-zigbuild instructions to top-level documentation (Makefile/justfile/README)
+- [x] Per-platform recipes:
   - `linux-x86_64-gnu` → `cargo zigbuild --release --target x86_64-unknown-linux-gnu`
   - `linux-x86_64-musl` → `cargo zigbuild --release --target x86_64-unknown-linux-musl`
   - `linux-aarch64-musl` → `cargo zigbuild --release --target aarch64-unknown-linux-musl`
   - `darwin-x86_64` → `cargo zigbuild --release --target x86_64-apple-darwin`
   - `darwin-aarch64` → `cargo zigbuild --release --target aarch64-apple-darwin`
   - `windows-x86_64-gnu` → `cargo zigbuild --release --target x86_64-pc-windows-gnu`
-- [ ] Each output goes to `bin/<target>/code-graph-mcp(.exe)`
-- [ ] CI workflow file (or documented manual steps) demonstrating the release path on a Linux runner
+- [x] Each output goes to `bin/<target>/code-graph-mcp(.exe)`
+- [x] CI workflow file (or documented manual steps) demonstrating the release path on a Linux runner
 - [ ] Smoke test each platform binary that can be run on the host: Linux native binaries run on the build host; macOS and Windows binaries are validated by `file <bin>` for arch correctness, and a separate CI runner if available
-- [ ] Strip release binaries (cargo profile or `strip` post-step); verify each is under 30MB
+- [x] Strip release binaries (cargo profile or `strip` post-step); verify each is under 30MB *(host target verified at 8.6 MB stripped via `[profile.release].strip = "symbols"` + thin LTO; per-target verification deferred to end-of-phase pass)*
 
 ### Notes
 Cross-compilation was a major motivator for the rewrite (the Go Makefile hunts for per-platform `gcc/clang/mingw` and silently skips targets when unavailable). With cargo-zigbuild, all 6 targets build from one Linux host with no additional toolchain installation.
+
+**User decision (2026-04-29):** defer the actual 6-platform binary builds to the very end of Phase 4. The 4.3 commit ships the *infrastructure* — the `release-*` Makefile recipes, the `[profile.release]` profile, the `.github/workflows/release.yml` CI workflow, and the README "Building from source / Cross-compilation" section — but does NOT execute the cross-compile invocations. Only the host-target build was run, to confirm the new release profile produces a 8.6 MB binary (down from the 11 MB default-profile baseline) well under the 30 MB ceiling. The multi-platform `make release-all` runs as a one-off pass after Tasks 4.4 (Go cutover) and 4.5 (release readiness) are complete; that pass installs/verifies any missing host prerequisites, runs all six builds, validates each via `file <bin>`, and confirms each binary is under 30 MB. The remaining unchecked subtask (per-target smoke validation) tracks that deferred work.
 
 ## 4.4: Go cutover commit
 

@@ -1,0 +1,67 @@
+# Cross-compile release binaries for all 6 supported target triples from a
+# single Linux runner using cargo-zigbuild + zig.
+#
+# This workflow is documentation-as-code for the Phase 4.3 release path: it
+# demonstrates how to reproduce `make release-all` in CI, and uploads the
+# `bin/` tree as a workflow artifact for inspection. It is intentionally not
+# wired to git tags or GitHub Releases -- a productionized release pipeline
+# (signed checksums, GitHub Releases, attestations, etc.) is left for a
+# follow-up after the Phase 4 cutover.
+
+name: release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cross-compile:
+    name: cross-compile (linux host -> 6 targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-gnu,
+            x86_64-unknown-linux-musl,
+            aarch64-unknown-linux-musl,
+            x86_64-apple-darwin,
+            aarch64-apple-darwin,
+            x86_64-pc-windows-gnu
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-cross
+
+      - name: Build all release targets
+        run: make release-all
+
+      - name: List produced binaries
+        run: |
+          echo "::group::bin/ tree"
+          find bin -type f -exec ls -lh {} \;
+          echo "::endgroup::"
+          echo "::group::sizes (du -h)"
+          du -h bin/*/code-graph-mcp* | sort -h
+          echo "::endgroup::"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-graph-mcp-binaries
+          path: bin/
+          if-no-files-found: error
+          retention-days: 14
