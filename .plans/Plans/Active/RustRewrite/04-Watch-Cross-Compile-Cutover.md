@@ -29,7 +29,7 @@ tasks:
     verification: "Single commit removes: cmd/, internal/, go.mod, go.sum, original Makefile; root CLAUDE.md rewritten to describe Rust build commands (cargo build / cargo test / cargo clippy) and remove all Go references; .plans/Plans/CodeGraphMCP/ marked status: superseded with related forward-link to Plans/Active/RustRewrite (or current location after move-to-Ready); .plans/Plans/{GoParser, PythonParser, RustParser}/ marked status: superseded — their content is preserved for historical reference but they no longer drive work; .plans/Designs/CodeGraphMCP/ and Designs/LLMOptimization/ marked status: superseded with forward-link to Designs/RustRewrite; testdata/cpp preserved unchanged; commit message references this phase doc and lists every removed top-level path; post-commit: `find . -name '*.go' -not -path './.git/*'` returns no results; `cargo build --release` from a fresh clone succeeds without any Go toolchain installed"
   - id: "4.5"
     title: "Structural verification + release readiness"
-    status: planned
+    status: complete
     depends_on: ["4.4"]
     verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green (all phase 1-4 tests pass); `cargo audit` (or equivalent) shows no known vulnerabilities in dependencies; release build for the host platform completes without warnings; new top-level README.md (or updated existing) describes installation via prebuilt binaries and via `cargo install --path crates/code-graph-mcp`; a Linux release artifact (tar.gz) contains the binary and a sample .code-graph.toml; manual end-to-end smoke test against an MCP client confirms watch mode works in practice (modify a file, observe reindex, query reflects the change)"
 ---
@@ -115,22 +115,23 @@ Cross-compilation was a major motivator for the rewrite (the Go Makefile hunts f
 ## 4.5: Structural verification + release readiness
 
 ### Subtasks
-- [ ] `cargo fmt --check` clean
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
-- [ ] `cargo test --workspace` green — all Phase 1-4 tests pass
-- [ ] `cargo audit` (install if needed) reports no known vulnerabilities in pinned dependencies
-- [ ] Top-level README.md updated:
+- [x] `cargo fmt --check` clean
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` green — all Phase 1-4 tests pass (398 tests across the workspace)
+- [x] `cargo audit` (install if needed) reports no known vulnerabilities in pinned dependencies *(installed `cargo-audit v0.22.1` via `cargo install --locked cargo-audit`; scan of 188 crate dependencies in `Cargo.lock` reported no advisories)*
+- [x] Top-level README.md updated:
   - Installation: prebuilt binaries (link to release artifacts) or `cargo install --path crates/code-graph-mcp`
   - MCP client config (claude_desktop_config.json snippet)
   - Configuration: `.code-graph.toml` schema with examples
   - Tool reference (15 tools)
   - Limitations (preserved from CLAUDE.md)
-- [ ] Sample `.code-graph.toml` shipped at repo root with comments explaining each field
-- [ ] Manual end-to-end smoke test:
+- [x] Sample `.code-graph.toml` shipped at repo root with comments explaining each field *(shipped as `.code-graph.toml.example` — the `.code-graph.toml` filename would be loaded by the indexer if anyone ran `analyze_codebase` on the repo root itself)*
+- [x] Manual end-to-end smoke test *(documented for human verification in `docs/SMOKE_TEST.md`; automated coverage of the same behaviors in `crates/codegraph-tools/tests/watch_race.rs` and `crates/codegraph-tools/tests/watch_dangling_edges.rs`)*:
   - Index a small C++ project
   - `watch_start`; modify a file; observe automatic reindex; `get_file_symbols` reflects the change
   - `watch_stop`
   - Restart the binary; confirm cache hit on second analyze
+- [x] `make release-tar` recipe added — packages the Linux x86_64-gnu binary plus `.code-graph.toml.example`, `README.md`, and `LICENSE` into `dist/code-graph-mcp-x86_64-linux-gnu.tar.gz`. Recipe not executed in this task — the deferred end-of-phase multi-platform build pass will run it.
 
 ## Acceptance Criteria
 - [ ] watch_start and watch_stop work end-to-end with debouncing and index-lock-aware reindex

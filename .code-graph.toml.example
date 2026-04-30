@@ -1,0 +1,34 @@
+# Optional configuration for code-graph-mcp.
+#
+# Place this file at the root of the project you want to index, named exactly
+# `.code-graph.toml` (without the `.example` suffix). Missing file → defaults
+# below are used. Malformed TOML → analyze_codebase fails with a parse error
+# (no silent fallback).
+#
+# All keys are optional; defaults are shown.
+
+[discovery]
+# Number of threads for the parallel filesystem walker (`ignore::WalkBuilder`).
+# 0 = auto (`std::thread::available_parallelism`). Values exceeding the host's
+# logical CPU count are clamped at load time, and a warning is surfaced via
+# `analyze_codebase`'s `warnings` array.
+max_threads = 0
+
+# If true, the walker honors `.gitignore`, `.ignore`, and global ignore files
+# (matches `ignore::WalkBuilder` defaults). Default: true.
+respect_gitignore = true
+
+# If true, the walker follows symlinks. Default: false (avoids cycles).
+follow_symlinks = false
+
+# Additional gitignore-style globs to exclude from discovery, layered on top
+# of the gitignore handling above. Patterns follow the `ignore` crate's
+# gitignore syntax.
+extra_ignore = ["build/", "node_modules/", "vendor/"]
+
+[parsing]
+# Number of threads for the rayon parsing pool. 0 = auto. Same clamping rule
+# as `discovery.max_threads`. The discovery and parsing pools share the host
+# concurrency budget — the indexer caps the sum at the host's logical CPU
+# count.
+max_threads = 0

@@ -78,7 +78,7 @@ RUST_TARGETS := \
 	aarch64-apple-darwin \
 	x86_64-pc-windows-gnu
 
-.PHONY: release-all release-host-smoke \
+.PHONY: release-all release-host-smoke release-tar \
 	release-linux-x86_64-gnu release-linux-x86_64-musl release-linux-aarch64-musl \
 	release-darwin-x86_64 release-darwin-aarch64 release-windows-x86_64-gnu
 
@@ -116,6 +116,22 @@ release-windows-x86_64-gnu:
 	cargo zigbuild --release --target x86_64-pc-windows-gnu -p $(RUST_BIN)
 	mkdir -p bin/x86_64-pc-windows-gnu
 	cp target/x86_64-pc-windows-gnu/release/$(RUST_BIN).exe bin/x86_64-pc-windows-gnu/$(RUST_BIN).exe
+
+# Linux release tarball: bundles the Linux x86_64-gnu binary plus the sample
+# config, README, and LICENSE into dist/code-graph-mcp-x86_64-linux-gnu.tar.gz.
+# Depends on `release-linux-x86_64-gnu` so the binary is fresh. Run on a host
+# that has the cross-compile prerequisites installed (cargo-zigbuild + zig).
+release-tar: release-linux-x86_64-gnu
+	mkdir -p dist
+	rm -rf dist/code-graph-mcp-x86_64-linux-gnu
+	mkdir -p dist/code-graph-mcp-x86_64-linux-gnu
+	cp bin/x86_64-unknown-linux-gnu/$(RUST_BIN) dist/code-graph-mcp-x86_64-linux-gnu/$(RUST_BIN)
+	cp .code-graph.toml.example dist/code-graph-mcp-x86_64-linux-gnu/.code-graph.toml.example
+	cp README.md dist/code-graph-mcp-x86_64-linux-gnu/README.md
+	cp LICENSE dist/code-graph-mcp-x86_64-linux-gnu/LICENSE
+	tar -czf dist/code-graph-mcp-x86_64-linux-gnu.tar.gz -C dist code-graph-mcp-x86_64-linux-gnu
+	rm -rf dist/code-graph-mcp-x86_64-linux-gnu
+	@echo ">>> dist/code-graph-mcp-x86_64-linux-gnu.tar.gz built ($$(du -h dist/code-graph-mcp-x86_64-linux-gnu.tar.gz | cut -f1))"
 
 # Host-only smoke check. Used during Phase 4.3 to confirm the release
 # profile builds without invoking the full multi-platform cross-build.
