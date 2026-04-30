@@ -16,11 +16,12 @@
 //! its own [`tokio::sync::oneshot::Receiver`] for shutdown — `watch_stop`
 //! sends `()` on the paired sender to end the loop cleanly.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codegraph_core::EdgeKind;
+use codegraph_core::{symbol_id, EdgeKind, FileGraph, SymbolId};
 use codegraph_lang::CallContext;
 use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
@@ -183,8 +184,12 @@ fn forward_events(events_tx: mpsc::Sender<Vec<DebouncedEvent>>) -> impl Fn(Debou
 /// for the watch loop's debug logging — production callers don't branch on
 /// it (a re-index that fails for any reason gets logged and the watcher
 /// keeps running).
+///
+/// Exposed `pub` so `tests/watch_dangling_edges.rs` (an integration test
+/// that drives a single `try_reindex_file` call to deterministically
+/// exercise the rename path) can match on the variants.
 #[derive(Debug)]
-pub(crate) enum ReindexOutcome {
+pub enum ReindexOutcome {
     /// File was re-parsed (or removed) and merged into the graph.
     Reindexed,
     /// `index_lock` was held (an `analyze_codebase` is in flight). The event
@@ -224,7 +229,7 @@ pub(crate) enum ReindexOutcome {
 /// 5. On create/modify: parse, reconstruct symbol/file indexes from the
 ///    current graph plus the new file, language-aware-resolve the new
 ///    file's edges, and merge.
-pub(crate) async fn try_reindex_file(
+pub async fn try_reindex_file(
     inner: &Arc<ServerInner>,
     path: &Path,
     is_remove: bool,
@@ -236,71 +241,143 @@ pub(crate) async fn try_reindex_file(
         return ReindexOutcome::LockContended;
     };
 
-    let Some(plugin) = inner.registry.for_path(path) else {
+    if inner.registry.for_path(path).is_none() {
         return ReindexOutcome::NotASource;
-    };
+    }
 
     // Canonical contract: the watch path uses the cached `inner.config`,
     // not a fresh `RootConfig::load(<root>/.code-graph.toml)` per event.
     // The most recent successful `analyze_codebase` is the source of truth
     // for parsing/discovery settings; re-reading on every event would let a
-    // stale on-disk config diverge from the live indexer state. The clone
-    // also drops the read guard so we don't hold it across the parse.
+    // stale on-disk config diverge from the live indexer state.
     //
-    // Today's parse path doesn't need any field of `RootConfig` directly
-    // (the C++ plugin reads file bytes and parses; concurrency settings
-    // affect the rayon pool, not single-file reindex), but the clone makes
-    // the contract explicit and gives future plugin work a hook without
-    // touching this call site.
-    let _cfg_snapshot = inner.config.read().clone();
+    // The read-and-drop here doesn't capture a value because today's
+    // single-file reindex doesn't consume any RootConfig field directly
+    // (concurrency settings affect the rayon pool, not per-file work).
+    // It exists as a load-bearing assertion: if a future refactor adds a
+    // per-event config-load (the wrong direction), this line is the seam
+    // it must delete first, and code review will catch the deletion.
+    let _ = inner.config.read().clone();
 
     if is_remove {
         let mut g = inner.graph.write();
+        // Capture the file's pre-existing symbol IDs *before* dropping the
+        // file from the graph — they're the truly-removed set for the
+        // dangling-edge prune. If the path was unknown to the graph, this
+        // is empty and the prune is a no-op.
+        let removed_ids: HashSet<SymbolId> = g
+            .file_symbols(path)
+            .into_iter()
+            .map(|s| symbol_id(&s))
+            .collect();
         g.remove_file(path);
+        g.prune_dangling_edges(&removed_ids);
         return ReindexOutcome::Reindexed;
     }
 
-    let content = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => return ReindexOutcome::Error(format!("read {}: {e}", path.display())),
-    };
-
-    let mut new_fg = match plugin.parse_file(path, &content) {
-        Ok(fg) => fg,
-        Err(e) => return ReindexOutcome::Error(format!("parse {}: {e}", path.display())),
-    };
-
-    // Snapshot every existing FileGraph (symbols only — edges aren't
-    // needed for index construction) and append the freshly-parsed file's
-    // symbols. With the new file's symbols included in the index, the
-    // resolver can rewrite calls/includes that point INTO the new file
-    // from elsewhere on subsequent reindexes, and calls FROM the new file
-    // resolve against the rest of the graph in one pass.
+    // Read + parse on the blocking pool. Parity with `analyze_codebase`,
+    // which wraps its parse phase in `spawn_blocking` (handlers/analyze.rs)
+    // for the same reason: `std::fs::read` and `plugin.parse_file` are
+    // synchronous and can stall a tokio worker thread (slow disk, network
+    // mounts, large templated headers). The `index_lock` guard above is
+    // held across the await — `tokio::sync::Mutex` permits this, and the
+    // canonical contract is "the watch path serializes behind any in-flight
+    // analyze for the entire snapshot+resolve+merge sequence", so releasing
+    // the lock here would re-open the merge race.
     //
-    // Note: `Graph::file_graphs_snapshot` returns a FileGraph for every
-    // file currently stored — including the one we're about to replace.
-    // That's fine: `build_symbol_index` only reads `symbols`/`language`,
-    // and including the stale entry is harmless because we'll merge_file_graph
-    // (which calls remove_file_unsafe internally) before the next
-    // resolve call. The new_fg's symbols supersede the stale ones in this
-    // very-this-call's index because we push it onto the snapshot below.
-    let mut all_graphs = {
+    // We move `Arc<ServerInner>` into the blocking task so it can re-lookup
+    // the plugin via `registry.for_path` (the registry stores
+    // `Box<dyn LanguagePlugin>` and only hands out borrows). The for_path
+    // call is O(extension-count) and re-checks defensively — the same path
+    // we already accepted above won't have changed plugin between here and
+    // the blocking task.
+    let inner_for_blocking = Arc::clone(inner);
+    let path_owned = path.to_path_buf();
+    let parse_result: Result<FileGraph, ReindexOutcome> = tokio::task::spawn_blocking(move || {
+        let plugin = match inner_for_blocking.registry.for_path(&path_owned) {
+            Some(p) => p,
+            None => return Err(ReindexOutcome::NotASource),
+        };
+        let content = match std::fs::read(&path_owned) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(ReindexOutcome::Error(format!(
+                    "read {}: {e}",
+                    path_owned.display()
+                )))
+            }
+        };
+        match plugin.parse_file(&path_owned, &content) {
+            Ok(fg) => Ok(fg),
+            Err(e) => Err(ReindexOutcome::Error(format!(
+                "parse {}: {e}",
+                path_owned.display()
+            ))),
+        }
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(ReindexOutcome::Error(format!(
+            "blocking task panicked while parsing {}: {join_err}",
+            path.display()
+        )))
+    });
+    let mut new_fg = match parse_result {
+        Ok(fg) => fg,
+        Err(outcome) => return outcome,
+    };
+
+    // Compute the IDs that *truly* disappeared from this file: the previous
+    // snapshot's IDs minus the IDs the freshly-parsed file produces. On a
+    // routine modify (no rename) this is empty; on a rename it's typically
+    // 1; on a wholesale rewrite it's the full pre-existing set. We snapshot
+    // pre-existing IDs from `Graph::files` while we still hold the read
+    // lock for the file_graphs_snapshot below — same critical section, no
+    // extra walk.
+    let mut all_graphs;
+    let pre_existing_ids: HashSet<SymbolId>;
+    {
         let g = inner.graph.read();
+        pre_existing_ids = g
+            .file_symbols(path)
+            .into_iter()
+            .map(|s| symbol_id(&s))
+            .collect();
+        // Snapshot every existing FileGraph (symbols only — edges aren't
+        // needed for index construction) and append the freshly-parsed
+        // file's symbols. With the new file's symbols included in the
+        // index, the resolver can rewrite calls/includes that point INTO
+        // the new file from elsewhere on subsequent reindexes, and calls
+        // FROM the new file resolve against the rest of the graph in one
+        // pass.
         let mut snapshot = g.file_graphs_snapshot();
         // Drop the stale entry for this path (if any) so the index built
         // below sees only the new file's symbols, not both old and new.
         snapshot.retain(|fg| Path::new(&fg.path) != path);
-        snapshot
-    };
+        all_graphs = snapshot;
+    }
     all_graphs.push(new_fg.clone());
     let symbol_index = build_symbol_index(&all_graphs);
     let file_index = build_file_index(&all_graphs);
+
+    let new_ids: HashSet<SymbolId> = new_fg.symbols.iter().map(symbol_id).collect();
+    let removed_ids: HashSet<SymbolId> = pre_existing_ids
+        .into_iter()
+        .filter(|id| !new_ids.contains(id))
+        .collect();
 
     // Resolve only the new file's edges in place. The existing graph's
     // edges are already stored as resolved edge entries (in adj/radj/
     // includes); they don't need re-resolution. The `resolve_all_edges`
     // helper walks every graph in its slice, but since we own only
     // `new_fg`, we inline the per-edge dispatch here.
+    //
+    // The plugin re-lookup here mirrors the one in the blocking parse
+    // task above. It's bounded (HashMap-of-extensions probe) and avoids
+    // borrowing the registry across the spawn_blocking boundary.
+    let Some(plugin) = inner.registry.for_path(path) else {
+        return ReindexOutcome::NotASource;
+    };
     let path_for_ctx = std::path::PathBuf::from(&new_fg.path);
     for edge in &mut new_fg.edges {
         match edge.kind {
@@ -326,11 +403,19 @@ pub(crate) async fn try_reindex_file(
         }
     }
 
-    // Merge under the graph write lock. `merge_file_graph` calls
-    // `remove_file_unsafe` internally if the path was previously merged,
-    // so re-merging is idempotent.
+    // Merge + dangling-edge prune under one write lock. `merge_file_graph`
+    // calls `remove_file_unsafe` internally which scrubs *outbound* edges
+    // (those with `file == path`) but leaves *inbound* cross-file edges
+    // pointing at any symbol that disappeared from this file — e.g. a
+    // rename of `A:old_fn → A:new_fn` leaves `B:caller → A:old_fn` in B's
+    // adjacency. `prune_dangling_edges` cleans those, scoped to the
+    // truly-removed symbol IDs so it's O(edges-touching-removed-IDs), not
+    // O(all edges). Inbound re-resolution (rebinding B's call to the new
+    // name) is intentionally out of scope — that requires re-parsing B,
+    // which the watch event for A doesn't warrant.
     let mut g = inner.graph.write();
     g.merge_file_graph(new_fg);
+    g.prune_dangling_edges(&removed_ids);
     ReindexOutcome::Reindexed
 }
 

@@ -14,7 +14,7 @@
 //! [`SymbolId`] in `codegraph-core`) because they are arbitrary identifiers,
 //! not filesystem paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use codegraph_core::{symbol_id, EdgeKind, FileGraph, Language, Symbol, SymbolId};
@@ -196,6 +196,54 @@ impl Graph {
     fn retain_edges_not_from(map: &mut HashMap<SymbolId, Vec<EdgeEntry>>, path: &Path) {
         map.retain(|_, entries| {
             entries.retain(|e| e.file != path);
+            !entries.is_empty()
+        });
+    }
+
+    /// Scrub every adjacency entry that points at a symbol in `removed_ids`.
+    ///
+    /// `remove_file_unsafe` only deletes edges whose `file` equals the
+    /// removed path. That covers edges *originating from* the file, but
+    /// leaves dangling cross-file edges that *target* a now-removed symbol:
+    /// e.g. file `B`'s call edge `B:caller → A:old_fn` is stored with
+    /// `file = B` and survives a `remove_file(A)`, even though `A:old_fn`
+    /// is gone from `nodes`. The watch-mode reindex path uses this method,
+    /// scoped to the symbol IDs that genuinely disappeared during a
+    /// rename / delete, to keep `adj`/`radj` consistent with `nodes`.
+    ///
+    /// Cost: O(edges touching the removed IDs), not O(all edges). The
+    /// `HashSet` lookup is O(1), and most reindexes have a removed-set of
+    /// size 0 or 1 (a routine modify with no rename touches no IDs at all).
+    ///
+    /// Inbound re-resolution — rebinding `B:caller`'s call to a renamed
+    /// `A:new_fn` — is intentionally **out of scope**: that requires
+    /// re-parsing `B`, which the watch event for `A` does not warrant. The
+    /// agent sees `B:caller` with no recorded callee instead of phantom
+    /// data; a subsequent edit to `B` will re-resolve naturally.
+    pub fn prune_dangling_edges(&mut self, removed_ids: &HashSet<SymbolId>) {
+        if removed_ids.is_empty() {
+            return;
+        }
+        Self::retain_edges_not_targeting(&mut self.adj, removed_ids);
+        Self::retain_edges_not_targeting(&mut self.radj, removed_ids);
+        // Also drop any radj keys for removed symbols: their incoming-edge
+        // list belongs to a node that no longer exists. (The same-file
+        // incoming entries were already cleaned by remove_file_unsafe; this
+        // catches cross-file ones.)
+        for id in removed_ids {
+            self.radj.remove(id);
+            self.adj.remove(id);
+        }
+    }
+
+    /// Filter edge map entries: drop edges whose `target` is in `removed`,
+    /// and drop keys whose retained vec is empty.
+    fn retain_edges_not_targeting(
+        map: &mut HashMap<SymbolId, Vec<EdgeEntry>>,
+        removed: &HashSet<SymbolId>,
+    ) {
+        map.retain(|_, entries| {
+            entries.retain(|e| !removed.contains(&e.target));
             !entries.is_empty()
         });
     }
@@ -660,5 +708,104 @@ mod tests {
         g.merge_file_graph(fg);
         let second = g.stats();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn prune_dangling_edges_drops_cross_file_targets_to_removed_symbols() {
+        // Watch-mode rename scenario: A defines old_fn; B calls old_fn.
+        // After A is reindexed without old_fn, the cross-file edge from
+        // B is left dangling (its `file` is B, not A). prune_dangling_edges
+        // — given the truly-removed ID set — must scrub it.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("old_fn", SymbolKind::Function, "/a.cpp")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("caller", SymbolKind::Function, "/b.cpp")],
+            // file=B for the cross-file edge — that's the bug-trigger shape.
+            vec![call_edge("/b.cpp:caller", "/a.cpp:old_fn", "/b.cpp", 7)],
+        ));
+
+        // Sanity: pre-prune, B's caller targets old_fn.
+        assert_eq!(g.adj()["/b.cpp:caller"][0].target, "/a.cpp:old_fn");
+        assert!(g.radj().contains_key("/a.cpp:old_fn"));
+
+        // Simulate the "old_fn was truly removed" set the watch path computes.
+        let mut removed = HashSet::new();
+        removed.insert("/a.cpp:old_fn".to_string());
+        g.prune_dangling_edges(&removed);
+
+        // The dangling edge is gone, so `adj["/b.cpp:caller"]` either has
+        // no entries left (key dropped) or no entry targeting old_fn.
+        assert!(
+            g.adj()
+                .get("/b.cpp:caller")
+                .is_none_or(|v| v.iter().all(|e| e.target != "/a.cpp:old_fn")),
+            "dangling forward edge to removed symbol must be gone"
+        );
+        // radj key for old_fn fully cleared — the symbol no longer exists.
+        assert!(!g.radj().contains_key("/a.cpp:old_fn"));
+    }
+
+    #[test]
+    fn prune_dangling_edges_empty_set_is_noop() {
+        // Routine reindex (no rename) should produce an empty removed set;
+        // the method must be a true no-op so the watch hot path costs
+        // nothing on the common case.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("foo", SymbolKind::Function, "/a.cpp"),
+                sym("bar", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1)],
+        ));
+        let before = g.stats();
+        g.prune_dangling_edges(&HashSet::new());
+        assert_eq!(g.stats(), before);
+        assert_eq!(g.adj()["/a.cpp:foo"][0].target, "/a.cpp:bar");
+    }
+
+    #[test]
+    fn prune_dangling_edges_preserves_unrelated_edges() {
+        // Only the entry whose `target ∈ removed_ids` should be scrubbed —
+        // other entries on the same key, and entries to non-removed
+        // symbols, must survive.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("old_fn", SymbolKind::Function, "/a.cpp"),
+                sym("kept_fn", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("caller", SymbolKind::Function, "/b.cpp")],
+            vec![
+                call_edge("/b.cpp:caller", "/a.cpp:old_fn", "/b.cpp", 1),
+                call_edge("/b.cpp:caller", "/a.cpp:kept_fn", "/b.cpp", 2),
+            ],
+        ));
+
+        let mut removed = HashSet::new();
+        removed.insert("/a.cpp:old_fn".to_string());
+        g.prune_dangling_edges(&removed);
+
+        let entries = g.adj().get("/b.cpp:caller").expect("caller key kept");
+        assert_eq!(entries.len(), 1, "exactly the unrelated edge survives");
+        assert_eq!(entries[0].target, "/a.cpp:kept_fn");
+        assert!(g.radj().contains_key("/a.cpp:kept_fn"));
+        assert!(!g.radj().contains_key("/a.cpp:old_fn"));
     }
 }
