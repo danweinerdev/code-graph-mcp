@@ -2,51 +2,99 @@
 
 ## Project: code-graph-mcp
 
-MCP server that builds an in-memory semantic code graph from source files using tree-sitter, exposing graph query tools for AI agents.
+Rust MCP server that builds an in-memory semantic code graph from source files using tree-sitter, exposing graph query tools for AI agents over stdio.
 
 ## Build
 
 ```bash
-make build    # bin/<platform>/code-graph-mcp
-make test     # go test -race ./...
-make vet      # go vet ./...
+make build                                            # cargo build --release -p code-graph-mcp
+make test                                             # cargo test --workspace
+make lint                                             # cargo clippy --workspace --all-targets -- -D warnings
+make fmt-check                                        # cargo fmt --all --check
+
+# Or invoke cargo directly:
+cargo build --release -p code-graph-mcp               # host-target release binary
+cargo test --workspace                                # full workspace test suite
+cargo clippy --workspace --all-targets -- -D warnings # lint
+cargo fmt --check                                     # format check
 ```
 
-Requires `CGO_ENABLED=1` (tree-sitter is a C library).
+No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter grammars) link via their pure-Rust `cc`-built crates.
 
 ## Test
 
 ```bash
-# Unit tests
-go test -race ./...
+# Full workspace test suite (unit + integration tests)
+cargo test --workspace
 
-# Integration tests (when available)
-go test -tags integration -race ./internal/tools/ -v
+# Run a single crate's tests
+cargo test -p codegraph-tools
 
-# Parse test harness (manual inspection)
-go run ./cmd/parse-test <directory>
+# Parse-test harness (manual inspection: parse one file/dir and dump symbols+edges)
+cargo run -p codegraph-parse-test -- <directory>
 ```
+
+Cross-platform release builds: see the `release-*` targets in the `Makefile` (cargo-zigbuild driven; produces all 6 target binaries from one Linux host).
 
 ## Architecture
 
+The workspace is split into language-agnostic core crates plus per-language plugin crates:
+
+| Crate | Responsibility |
+|-------|----------------|
+| `crates/code-graph-mcp` | Binary — `rmcp`-based stdio MCP server entry point |
+| `crates/codegraph-core` | Shared types (`Symbol`, `Edge`, `SymbolKind`, `EdgeKind`), `RootConfig` for `.code-graph.toml` |
+| `crates/codegraph-lang` | `LanguagePlugin` trait + `LanguageRegistry` (extension → plugin dispatch) |
+| `crates/codegraph-graph` | In-memory `Graph` (nodes, forward + reverse adjacency, file index), JSON cache persistence |
+| `crates/codegraph-tools` | Tool handlers, parallel `analyze_codebase` discovery + indexer, watcher (notify-debouncer-full) |
+| `crates/codegraph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
+
+Phases 5/6/7 of the rewrite plan add `codegraph-lang-rust`, `codegraph-lang-go`, `codegraph-lang-python` (scaffolded, not wired). As of the Phase 4 cutover, **C++ is the only language live**.
+
 ```
-AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
+AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
                               |
                      +--------+--------+
                      |                 |
-              [Tool Handlers]    [Graph Engine]
-              (internal/tools)   (internal/graph)
+              [Tool Handlers]    [Graph]
+              (codegraph-tools)  (codegraph-graph)
                      |                 |
-              [Parser Registry]   [In-Memory Graph]
-              (internal/parser)
+              [LanguageRegistry] [In-memory graph + JSON cache]
+              (codegraph-lang)
                      |
-              [C++ Parser]
-              (internal/lang/cpp)
+              [C++ Plugin] [Rust*] [Go*] [Python*]
+              (codegraph-lang-cpp + future plugins)
                      |
-              [go-tree-sitter + tree-sitter-cpp]
+              [tree-sitter + tree-sitter-cpp]
+```
+*Rust/Go/Python plugins scaffolded but not wired as of Phase 4.*
+
+## Configuration
+
+Each indexed root may contain a `.code-graph.toml` controlling discovery and parsing knobs. The file is read once per `analyze_codebase` call from `<root>/.code-graph.toml` and cached on the server for subsequent watch events.
+
+Schema (all keys optional; defaults shown):
+
+```toml
+[discovery]
+# Glob patterns added to the default ignore set (.git, target, node_modules, etc.).
+# Patterns follow the `ignore` crate's gitignore syntax.
+extra_ignores = []
+
+# Maximum parallel discovery threads (0 = num_cpus).
+max_threads = 0
+
+[parsing]
+# Maximum parallel parse threads (0 = num_cpus). The two thread pools share
+# the host concurrency budget — the indexer caps the sum at num_cpus.
+max_threads = 0
 ```
 
+A sample `.code-graph.toml` ships at the repo root (Task 4.5).
+
 ## MCP Tools (15 total)
+
+The tool surface is unchanged from the Go implementation — only the implementation language changed. Tools are grouped by purpose:
 
 **Indexing:** `analyze_codebase` (with JSON cache + mtime-based incremental re-index)
 **Symbol queries:** `get_file_symbols` (with `top_level_only`/`brief`), `search_symbols` (with `namespace`, `limit`/`offset`, `brief` default true), `get_symbol_detail`, `get_symbol_summary` (counts by namespace/kind)
@@ -54,17 +102,17 @@ AI Agent <-stdio/MCP-> [Go MCP Server (mcp-go)]
 **Dependencies:** `get_dependencies`
 **Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy` (with `depth` for transitive walk), `get_coupling` (outgoing/incoming/both)
 **Visualization:** `generate_mermaid` (call graph, file deps, or inheritance tree)
-**Watch mode:** `watch_start`, `watch_stop` (auto-reindex on file changes via fsnotify)
+**Watch mode:** `watch_start`, `watch_stop` (auto-reindex on file changes via notify-debouncer-full)
 
 ## Code Conventions
 
-- All tool handlers return `(*mcp.CallToolResult, error)` — use `mcp.NewToolResultError()` for user errors, never return non-nil Go error
-- State guards check indexed state before executing query handlers
-- Parser interface: `Extensions()`, `ParseFile(path, content)`, `Close()`
+- All tool handlers return `Result<CallToolResult, McpError>`; user-visible errors travel as `CallToolResult` with the error flag set, not `Err`
+- State guards check indexed state via `ServerInner::require_indexed()` before executing query handlers
+- `LanguagePlugin` trait: `extensions()`, `parse_file(path, content)`, `resolve_edges(symbols, file_graph, registry)`
 - All stored file paths are absolute
 - Symbol ID format: `file:name` for free functions, `file:Parent::name` for methods
-- `SymbolKind` and `EdgeKind` are string types for readable JSON serialization
-- Integration tests use `//go:build integration` tag
+- `SymbolKind` and `EdgeKind` derive `Serialize`/`Deserialize` and serialize as readable JSON strings (e.g. `"function"`, `"calls"`)
+- Snapshot tests for tool wire format use `insta` (snapshots in `crates/codegraph-tools/tests/snapshots/`)
 
 ## C++ Parser Limitations
 

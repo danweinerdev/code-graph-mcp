@@ -1,9 +1,9 @@
 ---
 title: "Rust Language Parser"
 type: plan
-status: draft
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 tags: [parser, rust, tree-sitter]
 related: [Research/multi-language-parsers, Plans/GoParser, Plans/PythonParser]
 phases:
@@ -24,6 +24,8 @@ phases:
 ---
 
 # Rust Language Parser
+
+**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

@@ -3,9 +3,9 @@ title: "Integration & Registration"
 type: phase
 plan: GoParser
 phase: 3
-status: planned
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 deliverable: "GoParser registered in MCP server, integration tests via tools, docs updated"
 tasks:
   - id: "3.1"
@@ -35,6 +35,8 @@ tasks:
 ---
 
 # Phase 3: Integration & Registration
+
+**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

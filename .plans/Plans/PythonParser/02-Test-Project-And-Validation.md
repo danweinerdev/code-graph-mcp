@@ -3,9 +3,9 @@ title: "Python Test Project & Validation"
 type: phase
 plan: PythonParser
 phase: 2
-status: planned
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 deliverable: "Comprehensive Python test project, unit test corpus, CLI validation"
 tasks:
   - id: "2.1"
@@ -50,6 +50,8 @@ tasks:
 ---
 
 # Phase 2: Python Test Project & Validation
+
+**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

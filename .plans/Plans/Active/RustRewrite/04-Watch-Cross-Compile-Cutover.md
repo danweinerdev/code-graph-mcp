@@ -24,7 +24,7 @@ tasks:
     verification: "Top-level Makefile or justfile recipes produce release binaries for x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin, x86_64-pc-windows-gnu — all from a single Linux host using cargo-zigbuild; binaries land under bin/<target>/code-graph-mcp(.exe); each binary smoke-tests by running `<bin> --version` (or equivalent stdio handshake) and `<bin>` indexing testdata/cpp on a host that supports running it (Linux native, macOS via emulation skipped or run on a separate runner, Windows via wine if available); CI workflow file (or documented commands) demonstrates the release path; size check: each release binary under 30MB stripped"
   - id: "4.4"
     title: "Go cutover commit"
-    status: planned
+    status: complete
     depends_on: ["4.3"]
     verification: "Single commit removes: cmd/, internal/, go.mod, go.sum, original Makefile; root CLAUDE.md rewritten to describe Rust build commands (cargo build / cargo test / cargo clippy) and remove all Go references; .plans/Plans/CodeGraphMCP/ marked status: superseded with related forward-link to Plans/Active/RustRewrite (or current location after move-to-Ready); .plans/Plans/{GoParser, PythonParser, RustParser}/ marked status: superseded — their content is preserved for historical reference but they no longer drive work; .plans/Designs/CodeGraphMCP/ and Designs/LLMOptimization/ marked status: superseded with forward-link to Designs/RustRewrite; testdata/cpp preserved unchanged; commit message references this phase doc and lists every removed top-level path; post-commit: `find . -name '*.go' -not -path './.git/*'` returns no results; `cargo build --release` from a fresh clone succeeds without any Go toolchain installed"
   - id: "4.5"
@@ -93,24 +93,24 @@ Cross-compilation was a major motivator for the rewrite (the Go Makefile hunts f
 ## 4.4: Go cutover commit
 
 ### Subtasks
-- [ ] Remove `cmd/`, `internal/`, `go.mod`, `go.sum`, original `Makefile`
-- [ ] Rewrite root `CLAUDE.md`:
+- [x] Remove `cmd/`, `internal/`, `go.mod`, `go.sum`, original `Makefile` (Makefile rewritten in place to a Rust-only file rather than removed; old `bin/linux-amd64/` Go-era output dir also removed)
+- [x] Rewrite root `CLAUDE.md`:
   - Replace "Go MCP server" with "Rust MCP server"
   - Update Build section: `cargo build --release`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`
   - Remove `CGO_ENABLED=1` references
   - Update Architecture section to reflect the Rust crate layout
   - Keep the C++ Parser Limitations section unchanged (those are intentional and still accurate)
   - Add a "Configuration" section pointing at `<root>/.code-graph.toml`
-- [ ] Mark old planning artifacts `status: superseded`:
-  - `.plans/Plans/CodeGraphMCP/` README and all phase docs
-  - `.plans/Plans/{GoParser, PythonParser, RustParser}/` READMEs and phase docs
-  - `.plans/Designs/CodeGraphMCP/README.md`
-  - `.plans/Designs/LLMOptimization/README.md`
-  - Each gets a one-line note at the top: `**Superseded by [Plans/Active/RustRewrite](...)**`
-- [ ] Move this plan from `Plans/Ready/RustRewrite/` (after the post-approval move) to `Plans/Active/RustRewrite/` once Phase 1 starts; this Phase-4 cutover task confirms the plan is currently in `Active/` and updates the README's `status: active` if not already set
-- [ ] `testdata/cpp/` preserved unchanged
-- [ ] Commit message lists every removed path and references this phase doc
-- [ ] Post-commit verification: `find . -name '*.go' -not -path './.git/*' -not -path './.plans/*'` returns no results; fresh clone + `cargo build --release` succeeds without Go toolchain
+- [x] Mark old planning artifacts `status: superseded` *(scope narrowed by user: only draft/review-status artifacts are marked superseded; completed/implemented artifacts stay unchanged as historical record)*:
+  - ~~`.plans/Plans/CodeGraphMCP/` README and all phase docs~~ — left unchanged (status: `complete`, per user rule "old plans that reference Go which are COMPLETED do not change")
+  - `.plans/Plans/{GoParser, PythonParser, RustParser}/` READMEs and phase docs (all were `status: planned`/`draft` — superseded)
+  - `.plans/Designs/CodeGraphMCP/README.md` (was `status: review` — superseded)
+  - ~~`.plans/Designs/LLMOptimization/README.md`~~ — left unchanged (status: `implemented`, completed work)
+  - Each superseded artifact gets a one-line note at the top: `**Superseded by [Plans/Active/RustRewrite](...)**`
+- [x] Plan currently lives in `Plans/Active/RustRewrite/`; README `status: active` confirmed (no change needed)
+- [x] `testdata/cpp/` preserved unchanged
+- [x] Commit message lists every removed path and references this phase doc
+- [x] Post-commit verification: `find . -name '*.go' -not -path './.git/*' -not -path './.plans/*'` returns no results; `cargo build --release` succeeds without Go toolchain
 
 ## 4.5: Structural verification + release readiness
 

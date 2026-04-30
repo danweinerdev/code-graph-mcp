@@ -3,9 +3,9 @@ title: "Python Parser Core"
 type: phase
 plan: PythonParser
 phase: 1
-status: planned
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 deliverable: "PythonParser with all extraction methods"
 tasks:
   - id: "1.1"
@@ -50,6 +50,8 @@ tasks:
 ---
 
 # Phase 1: Python Parser Core
+
+**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

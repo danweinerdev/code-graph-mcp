@@ -3,9 +3,9 @@ title: "Go Test Project & Validation"
 type: phase
 plan: GoParser
 phase: 2
-status: planned
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 deliverable: "Comprehensive Go test project, unit test corpus, CLI validation"
 tasks:
   - id: "2.1"
@@ -55,6 +55,8 @@ tasks:
 ---
 
 # Phase 2: Go Test Project & Validation
+
+**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

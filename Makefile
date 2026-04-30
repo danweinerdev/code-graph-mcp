@@ -1,88 +1,35 @@
-BINARY := code-graph-mcp
+# Rust workspace build targets.
+#
+# The host-target convenience targets (`build`, `test`, etc.) build/run
+# against the host triple via plain cargo. The `release-*` targets cross-
+# compile via cargo-zigbuild — see the "Rust release builds" block below.
 
-GOOS := $(shell go env GOOS)
-GOARCH := $(shell go env GOARCH)
-PLATFORM := $(GOOS)-$(GOARCH)
-
-PLATFORMS := linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
-
-.PHONY: build build-all $(PLATFORMS) test test-integration vet clean \
+.PHONY: build test lint fmt fmt-check clean \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
-build: $(PLATFORM)
-
-build-all: $(PLATFORMS)
-
-linux-amd64:
-ifeq ($(GOOS)-$(GOARCH),linux-amd64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-else
-	@command -v x86_64-linux-gnu-gcc >/dev/null 2>&1 || { echo "Skipping $@ (x86_64-linux-gnu-gcc not found)"; exit 0; }
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=x86_64-linux-gnu-gcc go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-endif
-
-linux-arm64:
-ifeq ($(GOOS)-$(GOARCH),linux-arm64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-else
-	@command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && \
-		CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc go build -o bin/$@/$(BINARY) ./cmd/$(BINARY) || \
-		echo "Skipping $@ (aarch64-linux-gnu-gcc not found)"
-endif
-
-darwin-amd64:
-ifeq ($(GOOS)-$(GOARCH),darwin-amd64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-else
-	@command -v o64-clang >/dev/null 2>&1 && \
-		CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC=o64-clang go build -o bin/$@/$(BINARY) ./cmd/$(BINARY) || \
-		echo "Skipping $@ (o64-clang not found)"
-endif
-
-darwin-arm64:
-ifeq ($(GOOS)-$(GOARCH),darwin-arm64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-else
-	@command -v oa64-clang >/dev/null 2>&1 && \
-		CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC=oa64-clang go build -o bin/$@/$(BINARY) ./cmd/$(BINARY) || \
-		echo "Skipping $@ (oa64-clang not found)"
-endif
-
-windows-amd64:
-ifeq ($(GOOS)-$(GOARCH),windows-amd64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY)
-else
-	@command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 && \
-		CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY) || \
-		echo "Skipping $@ (x86_64-w64-mingw32-gcc not found)"
-endif
-
-windows-arm64:
-ifeq ($(GOOS)-$(GOARCH),windows-arm64)
-	CGO_ENABLED=1 go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY)
-else
-	@command -v /opt/llvm-mingw/bin/aarch64-w64-mingw32-gcc >/dev/null 2>&1 && \
-		CGO_ENABLED=1 GOOS=windows GOARCH=arm64 CC=/opt/llvm-mingw/bin/aarch64-w64-mingw32-gcc go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY) || \
-		echo "Skipping $@ (aarch64-w64-mingw32-gcc not found)"
-endif
+# Default `build` is a host-target release build of the binary crate.
+build:
+	cargo build --release -p code-graph-mcp
 
 test:
-	CGO_ENABLED=1 go test -race ./...
+	cargo test --workspace
 
-test-integration:
-	CGO_ENABLED=1 go test -tags integration -race ./internal/tools/ -v
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
 
-vet:
-	go vet ./...
+fmt:
+	cargo fmt --all
+
+fmt-check:
+	cargo fmt --all --check
 
 clean:
+	cargo clean
 	rm -rf bin/
 
-# ---- Rust workspace targets (Phase 1+ rewrite) -------------------------
-# These coexist with the Go targets above. The Go tree is removed in
-# Phase 4 of the RustRewrite plan; until then both build systems live
-# side-by-side. All Rust recipes are prefixed `rust-` to avoid colliding
-# with the existing Go `build`/`test`/`vet`/`clean` targets.
+# ---- Rust workspace targets (rust-prefixed aliases) -------------------
+# These coexist with the unprefixed defaults above for callers that want
+# explicit `rust-` naming (kept stable across the Phase 4 cutover).
 
 rust-build:
 	cargo build --workspace

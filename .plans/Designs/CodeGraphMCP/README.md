@@ -1,14 +1,16 @@
 ---
 title: "Code Graph MCP Server"
 type: design
-status: review
+status: superseded
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-04-29
 tags: [architecture, mcp, code-graph, tree-sitter, golang, cpp]
 related: [Brainstorm/code-graph-mcp-architecture]
 ---
 
 # Code Graph MCP Server — Technical Design
+
+**Superseded by [Plans/Active/RustRewrite](../../Plans/Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 
