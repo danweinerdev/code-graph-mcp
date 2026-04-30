@@ -3,6 +3,11 @@
 //! Cargo treats each `tests/*.rs` file as an independent crate, so a shared
 //! module needs the special-cased `tests/common/mod.rs` path. Test files
 //! pull these in with `mod common;`.
+//!
+//! `#[allow(dead_code)]` on each helper because cargo recompiles this
+//! module once per test crate and not every crate uses every helper —
+//! e.g. the watch-race tests don't seed from `testdata/cpp` and so don't
+//! call `testdata_cpp_path`/`copy_testdata`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +16,7 @@ use rmcp::model::CallToolResult;
 /// Resolve the source `testdata/cpp` directory used to seed each
 /// per-test TempDir copy. Canonicalizes to defeat symlink-based path
 /// surprises in CI environments.
+#[allow(dead_code)]
 pub fn testdata_cpp_path() -> PathBuf {
     let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -24,6 +30,7 @@ pub fn testdata_cpp_path() -> PathBuf {
 /// Recursively copy every file in `testdata_cpp_path()` into `dest`. Each
 /// test using this gets its own TempDir so concurrent `analyze_codebase`
 /// calls don't race on the shared `.code-graph-cache.json` write.
+#[allow(dead_code)]
 pub fn copy_testdata(dest: &Path) {
     let src = testdata_cpp_path();
     for entry in walkdir::WalkDir::new(&src) {
@@ -48,6 +55,7 @@ pub fn copy_testdata(dest: &Path) {
 /// Pull the first text block out of a `CallToolResult`. All callers route
 /// through here so a future change to rmcp's `Content` shape surfaces in
 /// one place rather than across every test.
+#[allow(dead_code)]
 pub fn first_text(r: &CallToolResult) -> String {
     r.content
         .first()

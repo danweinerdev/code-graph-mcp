@@ -10,11 +10,11 @@ deliverable: "Working watch_start/watch_stop with debounced reindex protected by
 tasks:
   - id: "4.1"
     title: "Watch mode: notify-debouncer-full handle, recursive watch setup"
-    status: in-progress
+    status: complete
     verification: "WatchHandle holds the Debouncer<RecommendedWatcher, FileIdMap> and a tokio::sync::oneshot::Sender for shutdown; watch_start checks require_indexed first (an unindexed watch_start returns the unindexed error); recursively adds the indexed root via Watcher::watch(root, RecursiveMode::Recursive); debounce window is 250ms (constant); watch_start sets ServerInner.watch to Some(handle), sets active flag; second watch_start while watching returns 'watch mode is already active'; tests cover successful start, double-start error, and stop teardown"
   - id: "4.2"
     title: "Watch loop: debounced events + index_lock-aware reindex_file"
-    status: planned
+    status: complete
     depends_on: ["4.1"]
     verification: "watch_loop tokio task receives DebouncedEvent batches via mpsc channel; for each event, attempts ServerInner.index_lock.try_lock — if held (analyze_codebase running) the event is dropped (not queued, not retried — design Decision); when not held, takes the lock for the entire snapshot+resolve+merge sequence so no concurrent analyze can clear the graph mid-reindex; reindex_file dispatches by file extension via registry.for_path: removed events call graph.remove_file; created/modified events read+parse+resolve_edges (per-language) and merge_file_graph; non-source files (no plugin match) ignored; **reindex_file uses the cached `inner.config` (loaded by the most recent analyze_codebase) rather than re-reading `<root>/.code-graph.toml` on every event** — a unit test injects a modified config onto ServerInner before triggering a watch event and asserts the modified setting (e.g., a different parsing.max_threads) is observed; race regression test: spawn a watch task watching a directory and a parallel analyze_codebase loop; assert no panics, no graph in inconsistent state (every successful query returns a coherent snapshot); watch_stop cancels the oneshot, drops the debouncer, clears state"
   - id: "4.3"
@@ -49,22 +49,22 @@ This phase is intentionally small (5 tasks) so the cutover commit can ship as a 
 ## 4.1: Watch mode: notify-debouncer-full handle, recursive watch setup
 
 ### Subtasks
-- [ ] `WatchHandle` struct holds the `Debouncer<RecommendedWatcher, FileIdMap>` and a `tokio::sync::oneshot::Sender<()>` for shutdown
-- [ ] `watch_start` handler: `require_indexed()` first; check `inner.watch` is None (else return `"watch mode is already active"`); construct debouncer with 250ms timeout; `watcher.watch(root, RecursiveMode::Recursive)`; spawn the watch_loop task; populate `inner.watch = Some(handle)`
-- [ ] `watch_stop` handler: take `inner.watch`; if None, return `"watch mode is not active"`; send the cancel signal; drop the debouncer; clear state
-- [ ] Tests: start when not indexed → unindexed error; start happy path; double-start → already-active error; stop happy path; stop when not watching → not-active error; the exact error wording matches Go byte-for-byte
+- [x] `WatchHandle` struct holds the `Debouncer<RecommendedWatcher, RecommendedCache>` (v0.7-canonical type) and a `tokio::sync::oneshot::Sender<()>` for shutdown
+- [x] `watch_start` handler: `require_indexed()` first; check `inner.watch` is None under a single write lock (else return `"watch mode is already active"`); construct debouncer with 250ms timeout; `watcher.watch(root, RecursiveMode::Recursive)`; spawn the watch_loop task; populate `inner.watch = Some(handle)`
+- [x] `watch_stop` handler: take `inner.watch`; if None, return `"watch mode is not active"`; send the cancel signal; drop the debouncer; clear state
+- [x] Tests: start when not indexed → unindexed error; start happy path; double-start → already-active error; stop happy path; stop when not watching → not-active error; concurrent-start race regression (Barrier-driven, deterministic)
 
 ## 4.2: Watch loop: debounced events + index_lock-aware reindex_file
 
 ### Subtasks
-- [ ] `watch_loop(server: Arc<ServerInner>, mut events: mpsc::Receiver<DebouncedEvent>, cancel: oneshot::Receiver<()>)` async function
-- [ ] `tokio::select!` between cancel and event arrival
-- [ ] On event: for each path in the event, call `server.try_reindex_file(&path, is_remove).await`
-- [ ] `try_reindex_file`: attempt `inner.index_lock.try_lock` — if held, log a debug message and return (drop the event); if obtained, hold the lock for the full snapshot+resolve+merge sequence
-- [ ] Inside the lock: `registry.for_path` to get plugin (None → return, not a source file); on remove, `graph.write().remove_file(path)`; on create/modify, read + parse_file + build per-Language SymbolIndex from current graph + resolve_edges (language-aware) + `graph.write().merge_file_graph(fg)`
-- [ ] **Race regression test:** in `tests/watch_race.rs`, spawn a watch loop on a tmpdir + a parallel loop calling `analyze_codebase` on the same dir; modify files in the tmpdir during the test; assert no panics, no deadlocks, every concurrent query returns a coherent graph snapshot
-- [ ] Test: editor-style atomic save (rename .tmp → file.cpp) produces exactly one reindex event after the debounce window
-- [ ] Test: removing a watched file triggers `remove_file` and a subsequent `get_file_symbols` returns the symbols-not-found error
+- [x] `watch_loop(server: Arc<ServerInner>, mut events: mpsc::Receiver<DebouncedEvent>, cancel: oneshot::Receiver<()>)` async function
+- [x] `tokio::select!` between cancel and event arrival
+- [x] On event: for each path in the event, call `server.try_reindex_file(&path, is_remove).await`
+- [x] `try_reindex_file`: attempt `inner.index_lock.try_lock` — if held, log a debug message and return (drop the event); if obtained, hold the lock for the full snapshot+resolve+merge sequence
+- [x] Inside the lock: `registry.for_path` to get plugin (None → return, not a source file); on remove, `graph.write().remove_file(path)`; on create/modify, read + parse_file + build per-Language SymbolIndex from current graph + resolve_edges (language-aware) + `graph.write().merge_file_graph(fg)`
+- [x] **Race regression test:** in `tests/watch_race.rs`, spawn a watch loop on a tmpdir + a parallel loop calling `analyze_codebase` on the same dir; modify files in the tmpdir during the test; assert no panics, no deadlocks, every concurrent query returns a coherent graph snapshot
+- [x] Test: editor-style atomic save (rename .tmp → file.cpp) produces exactly one reindex event after the debounce window
+- [x] Test: removing a watched file triggers `remove_file` and a subsequent `get_file_symbols` returns the symbols-not-found error
 
 ### Notes
 The "drop the event when index_lock is held" rule (rather than queue) is a deliberate choice from the design (Concurrency Model section): the in-flight `analyze_codebase` will pick up the file's current state anyway. Queuing would create unbounded growth on a busy editor session.

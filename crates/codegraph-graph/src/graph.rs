@@ -209,6 +209,40 @@ impl Graph {
         self.includes.clear();
     }
 
+    /// Reconstruct a `Vec<FileGraph>` from internal storage with the
+    /// `symbols` populated (in insertion order) and `edges` left empty.
+    ///
+    /// This is the cheap snapshot the watch-mode incremental reindex
+    /// path needs: to call language-aware edge resolution
+    /// (`codegraph_tools::indexer::resolve_all_edges`) on a single
+    /// re-parsed file, the resolver builds a `(Language, name)`-keyed
+    /// `SymbolIndex` plus a basename-keyed `FileIndex` over the *whole*
+    /// graph. Both indexes look at `fg.symbols` and `fg.language` only —
+    /// `fg.edges` is irrelevant to index construction — so this snapshot
+    /// can leave `edges` empty and still produce a complete index.
+    ///
+    /// Cost: O(symbols) clones plus one `Vec<FileGraph>` allocation.
+    /// Iteration order over `files` is HashMap-defined, but the resolver
+    /// does not depend on order (it's an inverted index).
+    pub fn file_graphs_snapshot(&self) -> Vec<FileGraph> {
+        let mut out = Vec::with_capacity(self.files.len());
+        for (path, entry) in &self.files {
+            let mut symbols = Vec::with_capacity(entry.symbol_ids.len());
+            for id in &entry.symbol_ids {
+                if let Some(node) = self.nodes.get(id) {
+                    symbols.push(node.symbol.clone());
+                }
+            }
+            out.push(FileGraph {
+                path: path.to_string_lossy().into_owned(),
+                language: entry.language,
+                symbols,
+                edges: Vec::new(),
+            });
+        }
+        out
+    }
+
     /// Storage-size summary. `edges` sums adjacency entries and include
     /// edges, matching Go's `Stats()` (which counts each include once and
     /// each call/inherit once via the forward `adj` map only — the reverse
@@ -553,6 +587,50 @@ mod tests {
         let entry = g.files().get(&PathBuf::from("/a.cpp")).unwrap();
         assert_eq!(entry.language, Language::Cpp);
         assert_eq!(entry.symbol_ids, vec!["/a.cpp:foo".to_string()]);
+    }
+
+    #[test]
+    fn file_graphs_snapshot_returns_one_entry_per_file_with_no_edges() {
+        // Phase 4.2 watch-mode helper: must reconstruct one FileGraph per
+        // stored file with the file's symbols (in insertion order) and an
+        // empty `edges` Vec — edges are merged into adj/radj/includes at
+        // merge time and aren't recoverable from internal storage in
+        // FileGraph form, but the watch path only needs symbols+language
+        // for index construction.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("foo", SymbolKind::Function, "/a.cpp"),
+                sym("bar", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1)],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("baz", SymbolKind::Function, "/b.cpp")],
+            vec![],
+        ));
+
+        let snapshot = g.file_graphs_snapshot();
+        assert_eq!(snapshot.len(), 2, "one FileGraph per stored file");
+        for fg in &snapshot {
+            assert!(
+                fg.edges.is_empty(),
+                "snapshot leaves edges empty (merged into adj/radj/includes already)"
+            );
+            assert_eq!(fg.language, Language::Cpp);
+        }
+        // Find /a.cpp's snapshot — order is HashMap-defined.
+        let a = snapshot
+            .iter()
+            .find(|fg| fg.path == "/a.cpp")
+            .expect("/a.cpp present");
+        assert_eq!(a.symbols.len(), 2);
+        assert_eq!(a.symbols[0].name, "foo");
+        assert_eq!(a.symbols[1].name, "bar");
     }
 
     #[test]

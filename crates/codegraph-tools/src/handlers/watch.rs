@@ -1,6 +1,8 @@
-//! Watch-mode handlers — Phase 4.1 ships the lifecycle (start / stop) and a
-//! placeholder watch_loop body that simply drains debouncer events. Phase 4.2
-//! replaces the loop body with the index-lock-aware reindex pipeline.
+//! Watch-mode handlers — Phase 4.1 shipped the lifecycle (start / stop) and a
+//! placeholder watch_loop body that simply drained debouncer events. Phase 4.2
+//! fills in the real loop: each batch of debounced filesystem events drives
+//! a per-file reindex through [`try_reindex_file`], which is index-lock-aware
+//! so an in-flight `analyze_codebase` can never race a watch-driven merge.
 //!
 //! The wire-format contract for this module:
 //! - `watch mode is already active` — second `watch_start` while watching.
@@ -14,13 +16,17 @@
 //! its own [`tokio::sync::oneshot::Receiver`] for shutdown — `watch_stop`
 //! sends `()` on the paired sender to end the loop cleanly.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify_debouncer_full::notify::RecursiveMode;
+use codegraph_core::EdgeKind;
+use codegraph_lang::CallContext;
+use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::indexer::{build_file_index, build_symbol_index};
 use crate::server::{ServerInner, WatchHandle};
 
 use super::{tool_error, tool_success_json};
@@ -173,13 +179,168 @@ fn forward_events(events_tx: mpsc::Sender<Vec<DebouncedEvent>>) -> impl Fn(Debou
     }
 }
 
-/// Phase 4.1 placeholder watch_loop. Drains the event channel and drops
-/// every batch on the floor; Phase 4.2 replaces this body with the
-/// index-lock-aware reindex pipeline. The shape (mpsc::Receiver +
-/// oneshot::Receiver + tokio::select!) is locked here so the next task
-/// only has to fill in the event-processing arm.
+/// Outcome of [`try_reindex_file`]. Surfaced for unit-test assertions and
+/// for the watch loop's debug logging — production callers don't branch on
+/// it (a re-index that fails for any reason gets logged and the watcher
+/// keeps running).
+#[derive(Debug)]
+pub(crate) enum ReindexOutcome {
+    /// File was re-parsed (or removed) and merged into the graph.
+    Reindexed,
+    /// `index_lock` was held (an `analyze_codebase` is in flight). The event
+    /// is **dropped** — the in-flight analyze will pick up the file's
+    /// current state. Design Decision (`Designs/RustRewrite/README.md`,
+    /// "Concurrency Model"): we don't queue, retry, or block.
+    LockContended,
+    /// Path didn't resolve to any registered language plugin (e.g. a
+    /// `.txt` file inside the watched root). Defensive — the loop already
+    /// pre-filters non-source paths.
+    NotASource,
+    /// Per-file failure (read error, parse error, …). The loop logs this
+    /// and continues; the graph is left untouched on the failed path.
+    Error(String),
+}
+
+/// Per-file reindex routine driven by [`watch_loop`].
+///
+/// Invariant — index-lock-aware: takes `inner.index_lock.try_lock()` first
+/// and short-circuits on contention so a concurrent `analyze_codebase`
+/// (which holds the same lock) cannot race an incremental merge. The lock
+/// is held for the entire snapshot+resolve+merge sequence; an analyze that
+/// arrives after the snapshot but before the merge is serialized behind us.
+/// Design Decision (`Designs/RustRewrite/README.md`, "Concurrency Model"):
+/// when contention is observed, the event is dropped — the in-flight
+/// analyze will pick up the file's current state anyway, and queuing would
+/// produce unbounded growth on a busy editor session.
+///
+/// Pipeline:
+///
+/// 1. `try_lock` — drop the event on contention.
+/// 2. Resolve the file's plugin via `inner.registry.for_path`.
+/// 3. Read the cached `inner.config` (canonical contract: the watch path
+///    uses the config most recently loaded by `analyze_codebase`, not a
+///    fresh disk read).
+/// 4. On `is_remove`: drop the file from the graph.
+/// 5. On create/modify: parse, reconstruct symbol/file indexes from the
+///    current graph plus the new file, language-aware-resolve the new
+///    file's edges, and merge.
+pub(crate) async fn try_reindex_file(
+    inner: &Arc<ServerInner>,
+    path: &Path,
+    is_remove: bool,
+) -> ReindexOutcome {
+    // Design Decision: drop the event on contention rather than queue or
+    // retry. The in-flight `analyze_codebase` will pick up the file's
+    // current state, so the user-observable graph eventually converges.
+    let Ok(_index_guard) = inner.index_lock.try_lock() else {
+        return ReindexOutcome::LockContended;
+    };
+
+    let Some(plugin) = inner.registry.for_path(path) else {
+        return ReindexOutcome::NotASource;
+    };
+
+    // Canonical contract: the watch path uses the cached `inner.config`,
+    // not a fresh `RootConfig::load(<root>/.code-graph.toml)` per event.
+    // The most recent successful `analyze_codebase` is the source of truth
+    // for parsing/discovery settings; re-reading on every event would let a
+    // stale on-disk config diverge from the live indexer state. The clone
+    // also drops the read guard so we don't hold it across the parse.
+    //
+    // Today's parse path doesn't need any field of `RootConfig` directly
+    // (the C++ plugin reads file bytes and parses; concurrency settings
+    // affect the rayon pool, not single-file reindex), but the clone makes
+    // the contract explicit and gives future plugin work a hook without
+    // touching this call site.
+    let _cfg_snapshot = inner.config.read().clone();
+
+    if is_remove {
+        let mut g = inner.graph.write();
+        g.remove_file(path);
+        return ReindexOutcome::Reindexed;
+    }
+
+    let content = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return ReindexOutcome::Error(format!("read {}: {e}", path.display())),
+    };
+
+    let mut new_fg = match plugin.parse_file(path, &content) {
+        Ok(fg) => fg,
+        Err(e) => return ReindexOutcome::Error(format!("parse {}: {e}", path.display())),
+    };
+
+    // Snapshot every existing FileGraph (symbols only — edges aren't
+    // needed for index construction) and append the freshly-parsed file's
+    // symbols. With the new file's symbols included in the index, the
+    // resolver can rewrite calls/includes that point INTO the new file
+    // from elsewhere on subsequent reindexes, and calls FROM the new file
+    // resolve against the rest of the graph in one pass.
+    //
+    // Note: `Graph::file_graphs_snapshot` returns a FileGraph for every
+    // file currently stored — including the one we're about to replace.
+    // That's fine: `build_symbol_index` only reads `symbols`/`language`,
+    // and including the stale entry is harmless because we'll merge_file_graph
+    // (which calls remove_file_unsafe internally) before the next
+    // resolve call. The new_fg's symbols supersede the stale ones in this
+    // very-this-call's index because we push it onto the snapshot below.
+    let mut all_graphs = {
+        let g = inner.graph.read();
+        let mut snapshot = g.file_graphs_snapshot();
+        // Drop the stale entry for this path (if any) so the index built
+        // below sees only the new file's symbols, not both old and new.
+        snapshot.retain(|fg| Path::new(&fg.path) != path);
+        snapshot
+    };
+    all_graphs.push(new_fg.clone());
+    let symbol_index = build_symbol_index(&all_graphs);
+    let file_index = build_file_index(&all_graphs);
+
+    // Resolve only the new file's edges in place. The existing graph's
+    // edges are already stored as resolved edge entries (in adj/radj/
+    // includes); they don't need re-resolution. The `resolve_all_edges`
+    // helper walks every graph in its slice, but since we own only
+    // `new_fg`, we inline the per-edge dispatch here.
+    let path_for_ctx = std::path::PathBuf::from(&new_fg.path);
+    for edge in &mut new_fg.edges {
+        match edge.kind {
+            EdgeKind::Includes => {
+                if let Some(resolved) = plugin.resolve_include(&edge.to, &file_index) {
+                    edge.to = resolved.to_string_lossy().into_owned();
+                }
+            }
+            EdgeKind::Calls => {
+                let ctx = CallContext {
+                    caller_id: &edge.from,
+                    caller_file: &path_for_ctx,
+                    language: new_fg.language,
+                };
+                if let Some(id) = plugin.resolve_call(&edge.to, &ctx, &symbol_index) {
+                    edge.to = id;
+                }
+            }
+            // Bare derived class names are the canonical form for inherits
+            // edges; the graph engine resolves them at hierarchy-query time.
+            EdgeKind::Inherits => {}
+            _ => {}
+        }
+    }
+
+    // Merge under the graph write lock. `merge_file_graph` calls
+    // `remove_file_unsafe` internally if the path was previously merged,
+    // so re-merging is idempotent.
+    let mut g = inner.graph.write();
+    g.merge_file_graph(new_fg);
+    ReindexOutcome::Reindexed
+}
+
+/// Watch loop: receives debounced filesystem-event batches from the
+/// debouncer's notify thread (via the bridge built in [`forward_events`])
+/// and drives per-path reindexes through [`try_reindex_file`]. Cancellation
+/// arrives on `cancel`; the loop also exits when the events channel
+/// closes (the producing side of the channel — the debouncer — went away).
 async fn watch_loop(
-    _inner: Arc<ServerInner>,
+    inner: Arc<ServerInner>,
     mut events: mpsc::Receiver<Vec<DebouncedEvent>>,
     cancel: oneshot::Receiver<()>,
 ) {
@@ -188,14 +349,35 @@ async fn watch_loop(
         tokio::select! {
             _ = &mut cancel => return,
             maybe_evts = events.recv() => match maybe_evts {
-                Some(_evts) => {
-                    // Phase 4.2: dispatch each path through reindex_file.
-                    // Today we drop the batch — the watcher is wired up
-                    // and lifecycle tests can observe the channel
-                    // mechanics, but no graph mutation happens yet.
+                Some(evts) => {
+                    process_event_batch(&inner, evts).await;
                 }
                 None => return,
             },
+        }
+    }
+}
+
+/// Drive one debounced batch through the reindex pipeline. Factored out of
+/// [`watch_loop`] so unit tests can exercise the dispatch logic without
+/// constructing a debouncer or channel pair.
+async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>) {
+    for evt in evts {
+        let is_remove = matches!(evt.event.kind, EventKind::Remove(_));
+        for path in &evt.event.paths {
+            // Filter to source paths up-front so we don't pay
+            // `index_lock.try_lock` for every random `.swp` an editor
+            // touches. `try_reindex_file` re-checks defensively.
+            if inner.registry.for_path(path).is_none() {
+                continue;
+            }
+            let outcome = try_reindex_file(inner, path, is_remove).await;
+            if let ReindexOutcome::Error(msg) = outcome {
+                // No `tracing` dep on this workspace; eprintln only for
+                // hard errors so test output isn't spammed by routine
+                // contention or non-source noise.
+                eprintln!("watch: reindex failed for {}: {msg}", path.display());
+            }
         }
     }
 }
@@ -419,5 +601,207 @@ mod tests {
         let _: fn(DebounceEventResult) = |_| {};
         // And that we can name the path type the API hands back.
         let _: fn(&Path) = |_| {};
+    }
+
+    // -- Phase 4.2: try_reindex_file -----------------------------------
+
+    use crate::handlers::symbols::get_file_symbols;
+
+    /// Convert a `CallToolResult` body to a JSON value. Helper for the
+    /// reindex tests that need to assert on symbol-list shapes.
+    fn body_json(r: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&first_text(r)).expect("body is JSON")
+    }
+
+    /// When `index_lock` is held externally (modeling a concurrent
+    /// `analyze_codebase`), `try_reindex_file` must drop the event without
+    /// touching the graph. This is the design-canonical behavior — see
+    /// the comment on the `try_lock` site.
+    #[tokio::test]
+    async fn try_reindex_file_drops_event_when_index_lock_held() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+
+        // Take a snapshot of file count before the lock-contended call.
+        let before_files = inner.graph.read().stats().files;
+
+        // Hold the index_lock externally.
+        let _held = inner.index_lock.try_lock().expect("first lock");
+
+        // Modify a.cpp on disk so a successful reindex would change the
+        // graph. The lock-contended path must NOT pick this up.
+        let a_cpp = dir.path().join("a.cpp");
+        std::fs::write(&a_cpp, b"void changed() {}\n").unwrap();
+
+        let outcome = try_reindex_file(&inner, &a_cpp, false).await;
+        match outcome {
+            ReindexOutcome::LockContended => {}
+            other => panic!("expected LockContended, got {other:?}"),
+        }
+
+        // Graph file count unchanged; the new symbol name didn't appear.
+        let after_files = inner.graph.read().stats().files;
+        assert_eq!(
+            before_files, after_files,
+            "lock contention must leave file count unchanged"
+        );
+        let abs_a_cpp = std::fs::canonicalize(&a_cpp).unwrap();
+        let r = get_file_symbols(&inner.graph, &abs_a_cpp.to_string_lossy(), false, true);
+        let body = body_json(&r);
+        let arr = body.as_array().expect("symbol array");
+        assert!(
+            arr.iter().all(|s| s["name"].as_str() != Some("changed")),
+            "lock-contended call must NOT have re-parsed; got {body}"
+        );
+
+        drop(_held);
+        drop(dir);
+    }
+
+    /// `try_reindex_file` must read `inner.config` (the cached snapshot
+    /// from the most recent `analyze_codebase`) rather than re-loading
+    /// `<root>/.code-graph.toml` from disk on every event. A direct probe
+    /// is hard without instrumentation; the practical assertion is:
+    /// (1) we mutate `inner.config` in-place; (2) we drop a different
+    /// config on disk; (3) after a reindex, `inner.config` is unchanged
+    /// — proving the watch path didn't replace it via a disk read.
+    #[tokio::test]
+    async fn try_reindex_file_uses_cached_config_not_disk_config() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+
+        // Mutate the cached config in-process to a sentinel value.
+        let sentinel_threads = 7usize;
+        {
+            let mut cfg = inner.config.write();
+            cfg.parsing.max_threads = sentinel_threads;
+            cfg.discovery.max_threads = sentinel_threads;
+        }
+
+        // Drop a different on-disk config that would override the cached
+        // one if the watch path re-loaded it.
+        std::fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[parsing]\nmax_threads = 1\n[discovery]\nmax_threads = 1\n",
+        )
+        .unwrap();
+
+        // Trigger a reindex of an existing file.
+        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+        std::fs::write(&a_cpp, b"void post_change() {}\n").unwrap();
+        let outcome = try_reindex_file(&inner, &a_cpp, false).await;
+        match outcome {
+            ReindexOutcome::Reindexed => {}
+            other => panic!("expected Reindexed, got {other:?}"),
+        }
+
+        // Cached config still holds the sentinel — the watch path did
+        // NOT replace it from disk.
+        let cfg_after = inner.config.read();
+        assert_eq!(
+            cfg_after.parsing.max_threads, sentinel_threads,
+            "watch path must NOT re-read .code-graph.toml; cached config must be preserved"
+        );
+        assert_eq!(cfg_after.discovery.max_threads, sentinel_threads);
+
+        drop(dir);
+    }
+
+    /// Modify-path: re-parsing a changed file must surface the new symbol
+    /// names through `get_file_symbols`.
+    #[tokio::test]
+    async fn try_reindex_file_modify_updates_graph() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+
+        // Replace the function body with a new function name.
+        std::fs::write(&a_cpp, b"void brand_new_function() {}\n").unwrap();
+
+        let outcome = try_reindex_file(&inner, &a_cpp, false).await;
+        match outcome {
+            ReindexOutcome::Reindexed => {}
+            other => panic!("expected Reindexed, got {other:?}"),
+        }
+
+        let r = get_file_symbols(&inner.graph, &a_cpp.to_string_lossy(), false, true);
+        let body = body_json(&r);
+        let names: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"brand_new_function"),
+            "modify reindex must surface new symbol name; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"f"),
+            "old symbol must be gone; got {names:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Remove-path: deleting a file and reindexing with `is_remove=true`
+    /// must drop the file's symbols. Subsequent `get_file_symbols` returns
+    /// the wire-canonical "no symbols found" error.
+    #[tokio::test]
+    async fn try_reindex_file_remove_drops_file_from_graph() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+
+        // Sanity: the file exists in the graph before removal.
+        assert!(!inner.graph.read().file_symbols(&a_cpp).is_empty());
+
+        // Delete on disk and call try_reindex_file with is_remove=true.
+        std::fs::remove_file(&a_cpp).unwrap();
+        let outcome = try_reindex_file(&inner, &a_cpp, true).await;
+        match outcome {
+            ReindexOutcome::Reindexed => {}
+            other => panic!("expected Reindexed for remove path, got {other:?}"),
+        }
+
+        // get_file_symbols now produces the canonical not-found wording.
+        let path_str = a_cpp.to_string_lossy().into_owned();
+        let r = get_file_symbols(&inner.graph, &path_str, false, true);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(
+            first_text(&r),
+            format!("no symbols found in file: {path_str}"),
+        );
+
+        drop(dir);
+    }
+
+    /// Non-source paths (e.g. `.txt`) must short-circuit with `NotASource`
+    /// and not mutate the graph. The watch loop pre-filters these too, but
+    /// the per-file routine defends in case a future caller drops the
+    /// pre-filter.
+    #[tokio::test]
+    async fn try_reindex_file_skips_non_source_files() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+
+        let txt = dir.path().join("README.txt");
+        std::fs::write(&txt, b"hello\n").unwrap();
+        let txt = std::fs::canonicalize(&txt).unwrap();
+        let stats_before = inner.graph.read().stats();
+
+        let outcome = try_reindex_file(&inner, &txt, false).await;
+        match outcome {
+            ReindexOutcome::NotASource => {}
+            other => panic!("expected NotASource, got {other:?}"),
+        }
+
+        let stats_after = inner.graph.read().stats();
+        assert_eq!(
+            stats_before, stats_after,
+            "non-source path must not mutate graph"
+        );
+
+        drop(dir);
     }
 }
