@@ -2,7 +2,8 @@
 //!
 //! The `#[tool]` shells in `crate::server::CodeGraphServer` delegate here
 //! so each handler stays focused, testable, and short. Phase 3.4 filled in
-//! the P0 handlers; Phase 3.5 fills in P1+P2 plus watch stubs.
+//! the P0 handlers; Phase 3.5 filled in P1+P2 plus watch stubs; Phase 4.1
+//! has now replaced the watch stubs with the real lifecycle.
 //!
 //! Module layout:
 //! - `analyze` — `analyze_codebase` (the big one: progress bridge, cache,
@@ -12,8 +13,8 @@
 //! - `query` — `get_callers`, `get_callees`, `get_dependencies`.
 //! - `structure` — `detect_cycles`, `get_orphans`, `get_class_hierarchy`,
 //!   `get_coupling`, `generate_diagram`.
-//! - `watch` — `watch_start` and `watch_stop` Phase 3.5 stubs (Phase 4
-//!   replaces these with real implementations).
+//! - `watch` — `watch_start` and `watch_stop` (lifecycle: Phase 4.1;
+//!   reindex pipeline: Phase 4.2).
 //!
 //! All public functions in these submodules return `CallToolResult` (never
 //! `McpError`), matching the wire-envelope rule the design pinned in

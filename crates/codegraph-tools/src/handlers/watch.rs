@@ -30,7 +30,7 @@ use super::{tool_error, tool_success_json};
 /// window into a single `DebouncedEvent`. 250 ms is the design's pick: it
 /// rides through editor save patterns (atomic-rename, multi-event saves)
 /// while still feeling instant for an interactive `watch_start` user.
-pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Bound for the in-process channel between the debouncer's notify thread
 /// and the watch_loop tokio task. Events are best-effort — when the
@@ -39,35 +39,38 @@ pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
 /// dropped at the producer.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// JSON body for a successful `watch_start`. Mirrors the minimal-shape
-/// success body from Go (an empty object). The `watching: true` flag is
-/// the explicit "we just started" marker so the snapshot test can lock on
-/// the wire format — Go returned `{}`, but the boolean costs nothing on
-/// the wire and gives clients a single field to assert against.
+/// JSON body for both `watch_start` and `watch_stop`. The single boolean
+/// carries the difference: `true` from `watch_start`, `false` from
+/// `watch_stop`. Mirrors the minimal-shape success body from Go (an empty
+/// object) — Go returned `{}`, but the boolean costs nothing on the wire
+/// and gives clients a single field to assert against, locked in by the
+/// snapshot tests.
 #[derive(serde::Serialize)]
-struct WatchStartResponse {
-    watching: bool,
-}
-
-/// JSON body for a successful `watch_stop`. Symmetric to
-/// [`WatchStartResponse`]: `watching: false` confirms the post-stop state.
-#[derive(serde::Serialize)]
-struct WatchStopResponse {
+struct WatchResponse {
     watching: bool,
 }
 
 /// `watch_start` body. Caller must already have passed `require_indexed`.
 ///
 /// Steps:
-/// 1. Refuse if `inner.watch` already holds a [`WatchHandle`].
+/// 1. Acquire `inner.watch` for write and refuse if a [`WatchHandle`] is
+///    already installed. The check-and-store happens under one lock so two
+///    concurrent `watch_start` calls cannot both observe `None` and race
+///    to overwrite each other (TOCTOU).
 /// 2. Read the indexed `root_path` (set by the most recent successful
 ///    `analyze_codebase`).
 /// 3. Construct the debouncer with [`DEBOUNCE_TIMEOUT`].
 /// 4. Recursively watch `root_path`.
 /// 5. Spawn the watch_loop task and store the resulting [`WatchHandle`]
-///    on `inner.watch`.
+///    on `inner.watch` — still under the same write lock.
+///
+/// Holding the parking_lot write lock across `new_debouncer` +
+/// `Debouncer::watch` is intentional: those are bounded OS operations
+/// (no IO on user input, no blocking on async work), and the alternative
+/// (two-phase lock-build-lock) reintroduces the very race we're closing.
 pub fn watch_start(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
-    if inner.watch.read().is_some() {
+    let mut watch_guard = inner.watch.write();
+    if watch_guard.is_some() {
         return tool_error("watch mode is already active");
     }
 
@@ -103,13 +106,12 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
 
     tokio::spawn(watch_loop(Arc::clone(inner), events_rx, cancel_rx));
 
-    let handle = WatchHandle {
+    *watch_guard = Some(WatchHandle {
         debouncer,
         cancel: cancel_tx,
-    };
-    *inner.watch.write() = Some(handle);
+    });
 
-    tool_success_json(&WatchStartResponse { watching: true })
+    tool_success_json(&WatchResponse { watching: true })
 }
 
 /// `watch_stop` body. Caller must already have passed `require_indexed`.
@@ -131,7 +133,7 @@ pub fn watch_stop(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
     let _ = cancel.send(());
     drop(debouncer);
 
-    tool_success_json(&WatchStopResponse { watching: false })
+    tool_success_json(&WatchResponse { watching: false })
 }
 
 /// Build the `Fn(DebounceEventResult)` closure that the debouncer's notify
@@ -347,6 +349,61 @@ mod tests {
         assert_eq!(r3.is_error, Some(true));
         assert_eq!(first_text(&r3), "watch mode is not active");
 
+        drop(dir);
+    }
+
+    /// Regression test for the TOCTOU race that the read-then-write split
+    /// in `watch_start` previously exposed: two concurrent callers could
+    /// both observe `inner.watch == None` and both proceed to install a
+    /// handle, with the second silently overwriting the first.
+    ///
+    /// With the single-write-lock fix, exactly one of N concurrent
+    /// `watch_start` calls succeeds and the rest return the
+    /// "watch mode is already active" error. A `Barrier` forces all
+    /// tasks to enter `watch_start` at the same time so the test has the
+    /// best chance of catching a regression — without the fix this would
+    /// be probabilistic; with the fix it is deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn watch_start_is_race_free_under_concurrent_callers() {
+        use std::sync::Barrier;
+
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+
+        const TASKS: usize = 4;
+        let barrier = Arc::new(Barrier::new(TASKS));
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let inner = Arc::clone(&inner);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::task::spawn_blocking(move || {
+                // Synchronous Barrier inside spawn_blocking — `watch_start`
+                // is itself synchronous, so the race window we care about
+                // is between the lock acquisitions, not across .await
+                // points. The blocking pool gives us real OS threads.
+                barrier.wait();
+                watch_start(&inner)
+            }));
+        }
+
+        let mut successes = 0;
+        let mut already_active = 0;
+        for h in handles {
+            let r = h.await.expect("task join");
+            if r.is_error == Some(true) {
+                assert_eq!(first_text(&r), "watch mode is already active");
+                already_active += 1;
+            } else {
+                assert_eq!(first_text(&r), "{\"watching\":true}");
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1, "exactly one watch_start must win");
+        assert_eq!(already_active, TASKS - 1);
+        assert_watch_handle_present(&server).await;
+
+        let _ = watch_stop(&server.inner);
         drop(dir);
     }
 
