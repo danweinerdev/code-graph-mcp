@@ -15,6 +15,7 @@ codegraph-core = { path = "../codegraph-core" }
 codegraph-lang = { path = "../codegraph-lang" }
 codegraph-graph = { path = "../codegraph-graph" }
 rmcp = { workspace = true }
+notify-debouncer-full = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 schemars = { workspace = true }

@@ -3,7 +3,7 @@ title: "Rust Rewrite of code-graph-mcp"
 type: plan
 status: active
 created: 2026-04-28
-updated: 2026-04-28
+updated: 2026-04-29
 tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 related:
   - Designs/RustRewrite
@@ -32,7 +32,7 @@ phases:
     depends_on: [2]
   - id: 4
     title: "Watch Mode, Cross-Compile & Go Cutover"
-    status: planned
+    status: in-progress
     doc: "04-Watch-Cross-Compile-Cutover.md"
     depends_on: [3]
   - id: 5

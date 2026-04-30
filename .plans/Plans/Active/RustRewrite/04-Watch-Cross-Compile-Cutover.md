@@ -3,14 +3,14 @@ title: "Watch Mode, Cross-Compile & Go Cutover"
 type: phase
 plan: RustRewrite
 phase: 4
-status: planned
+status: in-progress
 created: 2026-04-28
-updated: 2026-04-28
+updated: 2026-04-29
 deliverable: "Working watch_start/watch_stop with debounced reindex protected by the index lock; cargo-zigbuild producing release binaries for all 6 target platforms from one Linux host; the Go source tree removed and old planning artifacts marked superseded — the Rust binary is now the single supported implementation"
 tasks:
   - id: "4.1"
     title: "Watch mode: notify-debouncer-full handle, recursive watch setup"
-    status: planned
+    status: in-progress
     verification: "WatchHandle holds the Debouncer<RecommendedWatcher, FileIdMap> and a tokio::sync::oneshot::Sender for shutdown; watch_start checks require_indexed first (an unindexed watch_start returns the unindexed error); recursively adds the indexed root via Watcher::watch(root, RecursiveMode::Recursive); debounce window is 250ms (constant); watch_start sets ServerInner.watch to Some(handle), sets active flag; second watch_start while watching returns 'watch mode is already active'; tests cover successful start, double-start error, and stop teardown"
   - id: "4.2"
     title: "Watch loop: debounced events + index_lock-aware reindex_file"

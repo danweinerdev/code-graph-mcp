@@ -29,6 +29,8 @@ use std::sync::Arc;
 use codegraph_core::RootConfig;
 use codegraph_graph::Graph;
 use codegraph_lang::LanguageRegistry;
+use notify_debouncer_full::notify::RecommendedWatcher;
+use notify_debouncer_full::{Debouncer, RecommendedCache};
 use parking_lot::RwLock as PlRwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -37,16 +39,30 @@ use rmcp::service::RoleServer;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::handlers;
 
-/// Placeholder for the active filesystem watcher's handle. Phase 4 replaces
-/// this with the real `notify-debouncer-full` handle plus the channel /
-/// task that drains its events. The unit struct is enough today to satisfy
-/// the `Option<WatchHandle>` shape the design pinned in
-/// `Designs/RustRewrite/README.md`.
-pub struct WatchHandle;
+/// Active filesystem-watcher state stored on [`ServerInner::watch`].
+///
+/// Owns the running [`Debouncer`] (drop to stop the underlying
+/// `RecommendedWatcher` on the OS) and a [`oneshot::Sender`] used to ask the
+/// async watch_loop task to exit cleanly. Constructed by
+/// [`crate::handlers::watch::watch_start`]; consumed by
+/// [`crate::handlers::watch::watch_stop`].
+///
+/// Not `Clone` — the debouncer + sender ownership must move once into
+/// `ServerInner.watch` and then back out for shutdown.
+pub struct WatchHandle {
+    /// Live debouncer over `notify`'s `RecommendedWatcher`. Dropping the
+    /// debouncer tears down the underlying OS watch and closes its event
+    /// channel.
+    pub debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    /// Cancel signal for the watch_loop task. `watch_stop` sends `()` so
+    /// the loop's `tokio::select!` cancel arm fires and the task drops.
+    pub cancel: oneshot::Sender<()>,
+}
 
 /// Shared state owned by the running MCP server.
 ///
@@ -75,7 +91,9 @@ pub struct ServerInner {
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
-    /// Active watcher, if any. Phase 4 fills [`WatchHandle`] in.
+    /// Active watcher, if any. Populated by
+    /// [`crate::handlers::watch::watch_start`] and cleared by
+    /// [`crate::handlers::watch::watch_stop`].
     pub watch: PlRwLock<Option<WatchHandle>>,
     /// Last-loaded `<root>/.code-graph.toml`. Defaults to
     /// [`RootConfig::default`] until `analyze_codebase` reads it from disk.
@@ -564,14 +582,10 @@ impl CodeGraphServer {
         &self,
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Phase 3.5 ships only the stub. Phase 4 will replace this with
-        // the real fsnotify-debouncer-full implementation. The require_indexed
-        // gate is intentionally NOT applied here: the stub message is the
-        // same regardless of indexed state, and adding the gate would mean
-        // an indexed-then-not-implemented path masks the not-implemented one.
-        // **Phase 4 must restore the `require_indexed` gate** that the Go
-        // reference enforces before spawning the watcher.
-        Ok(handlers::watch::watch_start_stub())
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::watch::watch_start(&self.inner))
     }
 
     #[tool(description = "Stop watching for file changes")]
@@ -579,8 +593,10 @@ impl CodeGraphServer {
         &self,
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
-        // See `watch_start` for why we skip require_indexed.
-        Ok(handlers::watch::watch_stop_stub())
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::watch::watch_stop(&self.inner))
     }
 }
 
@@ -968,19 +984,20 @@ mod tests {
         assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
-    // -- Phase 3.5 watch stubs ---------------------------------------------
+    // -- Phase 4.1 watch require_indexed gates -----------------------------
     //
-    // The exact stub message is locked here so the snapshot suite in 3.7
-    // and Phase 4's swap-in implementation both have a single source of
-    // truth to assert against.
+    // Both watch handlers must short-circuit on require_indexed before
+    // touching debouncer state. Phase 3.5's stubs deliberately skipped
+    // this; Phase 4 restores it. Lifecycle tests live in
+    // `handlers/watch.rs`.
 
     #[tokio::test]
-    async fn watch_start_returns_not_implemented_error() {
+    async fn watch_start_requires_indexed_before_running() {
         let server = empty_server();
         let r = server
             .watch_start(Parameters(EmptyParams::default()))
             .await
-            .expect("watch stub returns Ok(CallToolResult)");
+            .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));
         let text = r
             .content
@@ -988,16 +1005,16 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.to_string())
             .unwrap_or_default();
-        assert_eq!(text, "watch mode not yet implemented in this build");
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
     #[tokio::test]
-    async fn watch_stop_returns_not_implemented_error() {
+    async fn watch_stop_requires_indexed_before_running() {
         let server = empty_server();
         let r = server
             .watch_stop(Parameters(EmptyParams::default()))
             .await
-            .expect("watch stub returns Ok(CallToolResult)");
+            .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));
         let text = r
             .content
@@ -1005,7 +1022,7 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.to_string())
             .unwrap_or_default();
-        assert_eq!(text, "watch mode not yet implemented in this build");
+        assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
     /// Smoke test: with the indexed flag set, a P1 handler runs its happy
