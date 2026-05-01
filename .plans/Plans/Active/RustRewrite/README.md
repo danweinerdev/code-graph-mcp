@@ -32,7 +32,7 @@ phases:
     depends_on: [2]
   - id: 4
     title: "Watch Mode, Cross-Compile & Go Cutover"
-    status: in-progress
+    status: complete
     doc: "04-Watch-Cross-Compile-Cutover.md"
     depends_on: [3]
   - id: 5
