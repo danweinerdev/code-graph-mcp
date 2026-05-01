@@ -3,10 +3,10 @@ title: "Watch Mode, Cross-Compile & Go Cutover"
 type: phase
 plan: RustRewrite
 phase: 4
-status: in-progress
+status: complete
 created: 2026-04-28
-updated: 2026-04-29
-deliverable: "Working watch_start/watch_stop with debounced reindex protected by the index lock; cargo-zigbuild producing release binaries for all 6 target platforms from one Linux host; the Go source tree removed and old planning artifacts marked superseded — the Rust binary is now the single supported implementation"
+updated: 2026-04-30
+deliverable: "Working watch_start/watch_stop with debounced reindex protected by the index lock; the Go source tree removed and old planning artifacts marked superseded — the Rust binary is now the single supported implementation. Cross-compile infrastructure was added then removed by user decision (2026-04-30): build natively on each platform via `make release`."
 tasks:
   - id: "4.1"
     title: "Watch mode: notify-debouncer-full handle, recursive watch setup"
@@ -18,10 +18,10 @@ tasks:
     depends_on: ["4.1"]
     verification: "watch_loop tokio task receives DebouncedEvent batches via mpsc channel; for each event, attempts ServerInner.index_lock.try_lock — if held (analyze_codebase running) the event is dropped (not queued, not retried — design Decision); when not held, takes the lock for the entire snapshot+resolve+merge sequence so no concurrent analyze can clear the graph mid-reindex; reindex_file dispatches by file extension via registry.for_path: removed events call graph.remove_file; created/modified events read+parse+resolve_edges (per-language) and merge_file_graph; non-source files (no plugin match) ignored; **reindex_file uses the cached `inner.config` (loaded by the most recent analyze_codebase) rather than re-reading `<root>/.code-graph.toml` on every event** — a unit test injects a modified config onto ServerInner before triggering a watch event and asserts the modified setting (e.g., a different parsing.max_threads) is observed; race regression test: spawn a watch task watching a directory and a parallel analyze_codebase loop; assert no panics, no graph in inconsistent state (every successful query returns a coherent snapshot); watch_stop cancels the oneshot, drops the debouncer, clears state"
   - id: "4.3"
-    title: "Cross-compile via cargo-zigbuild for 6 platforms"
-    status: in-progress
+    title: "Cross-compile infra removed (per-platform native builds)"
+    status: complete
     depends_on: ["4.2"]
-    verification: "Top-level Makefile or justfile recipes produce release binaries for x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin, x86_64-pc-windows-gnu — all from a single Linux host using cargo-zigbuild; binaries land under bin/<target>/code-graph-mcp(.exe); each binary smoke-tests by running `<bin> --version` (or equivalent stdio handshake) and `<bin>` indexing testdata/cpp on a host that supports running it (Linux native, macOS via emulation skipped or run on a separate runner, Windows via wine if available); CI workflow file (or documented commands) demonstrates the release path; size check: each release binary under 30MB stripped"
+    verification: "Per user decision (2026-04-30), the cross-compile pipeline was removed. Build natively on each platform via `make release` (host-target `cargo build --release`). Removed: Makefile `release-*` cross-targets, `.github/workflows/release.yml`, `bin/` cross-compile artifacts, README cross-compile section. The `[profile.release]` profile (strip + thin LTO + codegen-units=1) is retained for the host build."
   - id: "4.4"
     title: "Go cutover commit"
     status: complete
@@ -31,17 +31,17 @@ tasks:
     title: "Structural verification + release readiness"
     status: complete
     depends_on: ["4.4"]
-    verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green (all phase 1-4 tests pass); `cargo audit` (or equivalent) shows no known vulnerabilities in dependencies; release build for the host platform completes without warnings; new top-level README.md (or updated existing) describes installation via prebuilt binaries and via `cargo install --path crates/code-graph-mcp`; a Linux release artifact (tar.gz) contains the binary and a sample .code-graph.toml; manual end-to-end smoke test against an MCP client confirms watch mode works in practice (modify a file, observe reindex, query reflects the change)"
+    verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green (all phase 1-4 tests pass); `cargo audit` (or equivalent) shows no known vulnerabilities in dependencies; release build for the host platform completes without warnings; new top-level README.md (or updated existing) describes installation via `cargo install --path crates/code-graph-mcp` or `make release` (no prebuilt binaries — build natively per platform); manual end-to-end smoke test against an MCP client confirms watch mode works in practice (modify a file, observe reindex, query reflects the change)"
 ---
 
 # Phase 4: Watch Mode, Cross-Compile & Go Cutover
 
 ## Overview
 
-The cutover phase. After this phase ships green, the Go binary is gone — the Rust binary is the single supported implementation. Three deliverables:
+The cutover phase. After this phase ships green, the Go binary is gone — the Rust binary is the single supported implementation. Originally three deliverables; the second was reverted at end-of-phase:
 
 1. **Watch mode**: `notify-debouncer-full` driving an index-lock-aware reindex loop that closes the race the Go implementation has (snapshot+resolve+merge under a separate lock from the analyze path).
-2. **Cross-compilation**: `cargo-zigbuild` producing all 6 platform binaries from one Linux host — replacing the Go Makefile's per-platform-toolchain hunting.
+2. ~~**Cross-compilation**: `cargo-zigbuild` producing all 6 platform binaries from one Linux host~~ — **infra removed (2026-04-30)**: the macOS targets needed an Apple SDK at link time, the operational cost of vendoring one wasn't worth it, and per-platform native builds via `make release` are the supported path.
 3. **Cutover commit**: Go source tree removed, old plans and designs marked `superseded`, root CLAUDE.md rewritten.
 
 This phase is intentionally small (5 tasks) so the cutover commit can ship as a single coherent diff with full test coverage.
@@ -69,26 +69,21 @@ This phase is intentionally small (5 tasks) so the cutover commit can ship as a 
 ### Notes
 The "drop the event when index_lock is held" rule (rather than queue) is a deliberate choice from the design (Concurrency Model section): the in-flight `analyze_codebase` will pick up the file's current state anyway. Queuing would create unbounded growth on a busy editor session.
 
-## 4.3: Cross-compile via cargo-zigbuild for 6 platforms
+## 4.3: Cross-compile infra removed (per-platform native builds)
 
-### Subtasks
-- [x] Add cargo-zigbuild instructions to top-level documentation (Makefile/justfile/README)
-- [x] Per-platform recipes:
-  - `linux-x86_64-gnu` → `cargo zigbuild --release --target x86_64-unknown-linux-gnu`
-  - `linux-x86_64-musl` → `cargo zigbuild --release --target x86_64-unknown-linux-musl`
-  - `linux-aarch64-musl` → `cargo zigbuild --release --target aarch64-unknown-linux-musl`
-  - `darwin-x86_64` → `cargo zigbuild --release --target x86_64-apple-darwin`
-  - `darwin-aarch64` → `cargo zigbuild --release --target aarch64-apple-darwin`
-  - `windows-x86_64-gnu` → `cargo zigbuild --release --target x86_64-pc-windows-gnu`
-- [x] Each output goes to `bin/<target>/code-graph-mcp(.exe)`
-- [x] CI workflow file (or documented manual steps) demonstrating the release path on a Linux runner
-- [ ] Smoke test each platform binary that can be run on the host: Linux native binaries run on the build host; macOS and Windows binaries are validated by `file <bin>` for arch correctness, and a separate CI runner if available
-- [x] Strip release binaries (cargo profile or `strip` post-step); verify each is under 30MB *(host target verified at 8.6 MB stripped via `[profile.release].strip = "symbols"` + thin LTO; per-target verification deferred to end-of-phase pass)*
+**User decision (2026-04-30):** the cargo-zigbuild cross-compile pipeline was removed. Three Linux targets and the Windows `.exe` built cleanly during the deferred end-of-phase pass (8.6 MB / 8.3 MB / 7.8 MB / 8.2 MB), but the macOS targets (`x86_64-apple-darwin`, `aarch64-apple-darwin`) failed because cargo-zigbuild needs an Apple-framework-bearing macOS SDK at link time (`CoreFoundation`, `CoreServices`) — not a problem zig itself solves. Rather than carry the operational complexity of vendoring or downloading a macOS SDK on every build host (and the corresponding licensing question), the project switched to native per-platform builds: `make release` runs `cargo build --release -p code-graph-mcp` on whichever host needs the binary.
 
-### Notes
-Cross-compilation was a major motivator for the rewrite (the Go Makefile hunts for per-platform `gcc/clang/mingw` and silently skips targets when unavailable). With cargo-zigbuild, all 6 targets build from one Linux host with no additional toolchain installation.
+### Removed in this commit
+- `Makefile` `release-all`, `release-{linux,darwin,windows}-*`, `release-tar`, `release-host-smoke` recipes
+- `.github/workflows/release.yml` (cross-compile CI workflow)
+- `bin/` cross-compile output tree
+- `README.md` "Building from source / Cross-compilation" section
+- `CLAUDE.md` "Cross-platform release builds" pointer
+- Cargo.toml comment language tying `[profile.release]` to the cross-compile workflow (the profile itself stays — it benefits the host build too)
 
-**User decision (2026-04-29):** defer the actual 6-platform binary builds to the very end of Phase 4. The 4.3 commit ships the *infrastructure* — the `release-*` Makefile recipes, the `[profile.release]` profile, the `.github/workflows/release.yml` CI workflow, and the README "Building from source / Cross-compilation" section — but does NOT execute the cross-compile invocations. Only the host-target build was run, to confirm the new release profile produces a 8.6 MB binary (down from the 11 MB default-profile baseline) well under the 30 MB ceiling. The multi-platform `make release-all` runs as a one-off pass after Tasks 4.4 (Go cutover) and 4.5 (release readiness) are complete; that pass installs/verifies any missing host prerequisites, runs all six builds, validates each via `file <bin>`, and confirms each binary is under 30 MB. The remaining unchecked subtask (per-target smoke validation) tracks that deferred work.
+### Retained
+- `[profile.release]` with `strip = "symbols"`, `lto = "thin"`, `codegen-units = 1` (host build is ~8.6 MB)
+- `.code-graph.toml.example` (independent of the build path)
 
 ## 4.4: Go cutover commit
 
@@ -131,13 +126,13 @@ Cross-compilation was a major motivator for the rewrite (the Go Makefile hunts f
   - `watch_start`; modify a file; observe automatic reindex; `get_file_symbols` reflects the change
   - `watch_stop`
   - Restart the binary; confirm cache hit on second analyze
-- [x] `make release-tar` recipe added — packages the Linux x86_64-gnu binary plus `.code-graph.toml.example`, `README.md`, and `LICENSE` into `dist/code-graph-mcp-x86_64-linux-gnu.tar.gz`. Recipe not executed in this task — the deferred end-of-phase multi-platform build pass will run it.
+- [~] ~~`make release-tar` recipe — packages the Linux x86_64-gnu binary plus `.code-graph.toml.example`, `README.md`, and `LICENSE` into `dist/code-graph-mcp-x86_64-linux-gnu.tar.gz`~~ — removed alongside the rest of the cross-compile infra (see Task 4.3). Per-platform builders can `tar -czf code-graph-mcp.tar.gz target/release/code-graph-mcp .code-graph.toml.example README.md LICENSE` directly if they want a tarball.
 
 ## Acceptance Criteria
-- [ ] watch_start and watch_stop work end-to-end with debouncing and index-lock-aware reindex
-- [ ] Race regression test passes (watch + analyze_codebase concurrent)
-- [ ] All 6 platform binaries built from one Linux host
-- [ ] Go source tree removed; CLAUDE.md and old plans/designs marked superseded
-- [ ] Fresh clone builds with only Rust toolchain (no Go)
-- [ ] Lint, format, test gates green
-- [ ] Manual smoke test on a real MCP client confirms watch mode works in practice
+- [x] watch_start and watch_stop work end-to-end with debouncing and index-lock-aware reindex
+- [x] Race regression test passes (watch + analyze_codebase concurrent)
+- [~] ~~All 6 platform binaries built from one Linux host~~ — superseded by per-platform native builds (Task 4.3 was reverted, 2026-04-30)
+- [x] Go source tree removed; CLAUDE.md and old plans/designs marked superseded
+- [x] Fresh clone builds with only Rust toolchain (no Go)
+- [x] Lint, format, test gates green
+- [x] Manual smoke test on a real MCP client confirms watch mode works in practice

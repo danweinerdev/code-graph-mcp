@@ -4,11 +4,9 @@ An MCP server that builds an in-memory semantic code graph from C++ source files
 
 ## Installation
 
-### Prebuilt binaries
+Build from source on whichever platform you need the binary for — there is no cross-compile pipeline and no prebuilt binaries are published.
 
-> TODO: Prebuilt binaries are not yet published. Once releases are cut, download the appropriate archive from the [GitHub Releases](https://github.com/danweinerdev/code-graph-mcp/releases) page and extract the `code-graph-mcp` binary plus the bundled `.code-graph.toml.example` to a directory on your PATH.
-
-### From source via `cargo install`
+### Via `cargo install`
 
 ```bash
 git clone https://github.com/danweinerdev/code-graph-mcp.git
@@ -18,12 +16,12 @@ cargo install --path crates/code-graph-mcp
 
 This installs `code-graph-mcp` to `~/.cargo/bin/` (which should already be on your PATH if you have a working Rust toolchain).
 
-### From source via `cargo build`
+### Via `make release`
 
 ```bash
 git clone https://github.com/danweinerdev/code-graph-mcp.git
 cd code-graph-mcp
-make build                # cargo build --release -p code-graph-mcp
+make release              # cargo build --release -p code-graph-mcp
 ```
 
 The binary lands at `target/release/code-graph-mcp`. Symlink or copy it into your PATH:
@@ -157,46 +155,6 @@ Validated against tree-sitter-cpp v0.23.4.
 5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
 
 6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
-
-## Building from source / Cross-compilation
-
-The repo cross-compiles all 6 supported targets from a single Linux host using [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild), which routes the C compiler through `zig cc`.
-
-**One-time setup (Fedora; adapt the package manager line for other distros):**
-
-```bash
-# 1. Rust targets
-rustup target add \
-  x86_64-unknown-linux-gnu \
-  x86_64-unknown-linux-musl \
-  aarch64-unknown-linux-musl \
-  x86_64-apple-darwin \
-  aarch64-apple-darwin \
-  x86_64-pc-windows-gnu
-
-# 2. cargo-zigbuild
-cargo install cargo-zigbuild
-
-# 3. zig itself
-sudo dnf install zig          # Fedora
-# brew install zig            # macOS
-# sudo apt install zig        # Debian/Ubuntu (may need backports)
-```
-
-**Build:**
-
-```bash
-make release-all              # all 6 targets in sequence
-make release-all -j6          # build them in parallel
-make release-linux-x86_64-gnu # one specific target
-make release-host-smoke       # host-only sanity build (used in dev)
-make release-tar              # Linux x86_64-gnu binary + sample config + README + LICENSE
-                              # → dist/code-graph-mcp-x86_64-linux-gnu.tar.gz
-```
-
-Output binaries land at `bin/<rust-triple>/code-graph-mcp(.exe)`. The release profile in the workspace `Cargo.toml` strips symbols and applies thin LTO with `codegen-units = 1`; the host (`x86_64-unknown-linux-gnu`) binary is well under the 30 MB ceiling.
-
-**CI:** see [`.github/workflows/release.yml`](.github/workflows/release.yml) for a `workflow_dispatch` job that reproduces `make release-all` on a Linux runner and uploads the `bin/` tree as a workflow artifact.
 
 ## Smoke test
 

@@ -94,7 +94,6 @@ graph TD
 
     subgraph Phase4["Phase 4: Watch + Cutover"]
       Watch["notify-debouncer<br/>+ index_lock guard"]
-      Xcomp["cargo-zigbuild<br/>6 platforms"]
       Cut["Remove Go tree<br/>supersede old plans"]
     end
 
@@ -117,7 +116,7 @@ graph TD
     Diagram --> Server
     Lang --> Discovery
     Server & Discovery & Indexer & Tools & Persist --> Watch
-    Watch --> Xcomp --> Cut
+    Watch --> Cut
     Cut --> RustP --> GoP --> PyP
 ```
 
@@ -169,7 +168,7 @@ External crates pinned per `Designs/RustRewrite/` Recommended Stack:
 Build-time:
 
 - C compiler (`cc` / `clang` / MSVC) — required by `cc-rs` to compile each grammar's bundled C parser. No system `libtree-sitter` or `pkg-config` needed.
-- `cargo-zigbuild` (Phase 4 only) — universal cross-compiler toolchain for producing the 6 platform binaries from a single Linux host.
+- ~~`cargo-zigbuild` (Phase 4 only)~~ — cross-compile pipeline removed by user decision (2026-04-30); per-platform native builds via `make release` instead.
 
 Toolchain:
 

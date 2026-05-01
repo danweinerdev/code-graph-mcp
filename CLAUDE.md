@@ -19,7 +19,7 @@ cargo clippy --workspace --all-targets -- -D warnings # lint
 cargo fmt --check                                     # format check
 ```
 
-No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter grammars) link via their pure-Rust `cc`-built crates.
+No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter grammars) link via their pure-Rust `cc`-built crates. Build natively on each platform you need the binary for; there is no cross-compile pipeline.
 
 ## Test
 
@@ -33,8 +33,6 @@ cargo test -p codegraph-tools
 # Parse-test harness (manual inspection: parse one file/dir and dump symbols+edges)
 cargo run -p codegraph-parse-test -- <directory>
 ```
-
-Cross-platform release builds: see the `release-*` targets in the `Makefile` (cargo-zigbuild driven; produces all 6 target binaries from one Linux host).
 
 ## Architecture
 
