@@ -1,0 +1,18 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 20,
+  "offset": 0,
+  "results": [
+    {
+      "file": "[testdata]/foo.rs",
+      "id": "[testdata]/foo.rs:helper",
+      "kind": "function",
+      "line": 9,
+      "name": "helper"
+    }
+  ],
+  "total": 1
+}

@@ -14,6 +14,7 @@ workspace = true
 codegraph-core = { path = "../codegraph-core" }
 codegraph-lang = { path = "../codegraph-lang" }
 codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
+codegraph-lang-rust = { path = "../codegraph-lang-rust" }
 codegraph-graph = { path = "../codegraph-graph" }
 codegraph-tools = { path = "../codegraph-tools" }
 rmcp = { workspace = true }

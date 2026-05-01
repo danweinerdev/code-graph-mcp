@@ -1,0 +1,10 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "edges": 0,
+  "files": 2,
+  "root_path": "[testdata]",
+  "symbols": 2
+}

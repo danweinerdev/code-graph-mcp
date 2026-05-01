@@ -131,6 +131,7 @@ dependencies = [
  "codegraph-graph",
  "codegraph-lang",
  "codegraph-lang-cpp",
+ "codegraph-lang-rust",
  "codegraph-tools",
  "rmcp",
  "serde_json",

@@ -29,11 +29,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{copy_testdata, first_text};
+use common::{
+    copy_testdata, copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path,
+};
 
 use codegraph_core::Language;
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
+use codegraph_lang_rust::RustParser;
 use codegraph_tools::handlers::analyze::analyze_codebase;
 use codegraph_tools::handlers::query::{callers_or_callees, get_dependencies, Direction};
 use codegraph_tools::handlers::structure::{
@@ -650,4 +653,158 @@ fn cpp_parser_registers_for_cpp_language() {
         .register(Box::new(CppParser::new().unwrap()))
         .unwrap();
     assert!(registry.plugin_for(Language::Cpp).is_some());
+}
+
+/// Sanity check for the Rust parser registration alongside C++ — mirrors
+/// the registration block in `crates/code-graph-mcp/src/main.rs` so a
+/// silent removal of `codegraph_lang_rust::RustParser::new()` from the
+/// binary trips this test before any of the Rust-specific snapshots.
+#[test]
+fn rust_parser_registers_for_rust_language() {
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    assert!(registry.plugin_for(Language::Rust).is_some());
+    assert!(registry.plugin_for(Language::Cpp).is_some());
+}
+
+// --- Phase 5.6 Rust-side snapshots --------------------------------------
+//
+// These four snapshots lock the wire format for representative responses
+// driven by the Rust language plugin (registered alongside the C++ one,
+// matching the binary):
+//
+//   * analyze_codebase on `testdata/mixed/` — exercises mixed C++ + Rust
+//     indexing through the registry.
+//   * search_symbols(query="helper", language=Rust) — exercises the
+//     language filter path on `testdata/mixed/`.
+//   * get_class_hierarchy on `Greet` — exercises the widened
+//     {Class, Struct, Interface, Trait} root filter from Phase 2 against
+//     the testdata/rust corpus.
+//   * generate_diagram(class="Compute", format="edges") — exercises the
+//     Inherits-edge dispatch for a Rust trait with two impls.
+
+/// Mirror of [`build_indexed_fixture`] that uses `testdata/mixed/` and
+/// registers BOTH parsers (the binary's runtime shape). Returns the
+/// `IndexedFixture` so the per-test TempDir path is available for
+/// snapshot redaction.
+async fn build_indexed_fixture_for_dir_with_cpp_and_rust(src: &Path) -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for testdata copy");
+    copy_testdata_from(src, dir.path());
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    registry
+        .register(Box::new(RustParser::new().expect("RustParser::new")))
+        .expect("register RustParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+#[tokio::test]
+async fn response_analyze_codebase_testdata_mixed() {
+    // Capture the analyze response itself rather than discarding it inside
+    // the helper — same pattern as `response_analyze_codebase_testdata_cpp`.
+    let dir = TempDir::new().unwrap();
+    copy_testdata_from(&testdata_mixed_path(), dir.path());
+    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    let server = CodeGraphServer::new(registry);
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_search_symbols_helper_language_rust() {
+    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_mixed_path()).await;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("helper"),
+            language: Some("rust"),
+            brief: true,
+            ..Default::default()
+        },
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_class_hierarchy_rust_trait_greet() {
+    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_rust_path()).await;
+    // `Greet` is a trait that `Greeter` implements (testdata/rust/src/traits.rs).
+    // Pre-Phase-2 the lookup would have rejected the trait kind; this
+    // snapshot is the wire-format counterpart to the integration test
+    // `get_class_hierarchy_for_rust_trait`.
+    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_generate_diagram_rust_trait_compute() {
+    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_rust_path()).await;
+    let r = generate_diagram(
+        &fx.inner.graph,
+        GenerateDiagramInput {
+            class: Some("Compute"),
+            format: Some("edges"),
+            depth: Some(2),
+            ..Default::default()
+        },
+    );
+    let body = first_text(&r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("class-edges response is JSON");
+    let normalized = sort_diagram_edges(parsed);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(normalized);
+    });
 }

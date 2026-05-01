@@ -1,6 +1,15 @@
 # code-graph-mcp
 
-An MCP server that builds an in-memory semantic code graph from C++ source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
+An MCP server that builds an in-memory semantic code graph from C++ and Rust source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
+
+## Supported languages
+
+| Language | Extensions | Plugin crate |
+|----------|------------|--------------|
+| C++      | `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp`, `.hxx` | `codegraph-lang-cpp` |
+| Rust     | `.rs`      | `codegraph-lang-rust` |
+
+Go and Python plugins are scaffolded but not yet wired into the binary (Phases 6 and 7).
 
 ## Installation
 
@@ -155,6 +164,35 @@ Validated against tree-sitter-cpp v0.23.4.
 5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
 
 6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
+
+## Rust Parser Limitations
+
+Validated against tree-sitter-rust v0.24.0.
+
+### Supported Rust Patterns
+
+- Free functions, methods inside `impl` blocks (`Type::method`), default methods inside `trait` blocks
+- Structs, enums (all variant kinds), traits, type aliases (`type` items)
+- Generics — both type-bound (`fn foo<T: Display>`) and where-clause (`fn foo<T> where T: Display`) forms
+- Lifetime parameters (`fn longest<'a>(x: &'a str)`)
+- `async fn`, `const fn`, `unsafe fn` — all extracted as `Function` (or `Method` inside an `impl`)
+- Nested modules — `mod a { mod b { fn x() {} } }` populates `Symbol.namespace = "a::b"`
+- All `use`-tree forms expanded to dotted paths: simple, scoped, grouped (`use foo::{a, b}`), nested grouped (`use std::{io::{self, Read}, collections::HashMap}`), wildcard (`use foo::*`), aliased (`use foo as bar` records `foo`), `self`-in-list, and `extern crate alloc`
+- All call patterns: direct (`foo()`), method via `field_expression` (`obj.foo()`), scoped (`foo::bar::baz()`), turbofish (`foo::<u32>()`), macro invocation (`println!()`), chained calls
+- Trait impls (`impl Trait for Type`) produce `Inherits` edges from the implementing type to the trait — including generic impls (`impl<T> Trait for Vec<T>`) and impls with `where` clauses
+- Closure bodies — calls inside `|| foo()` report the enclosing function as `from`
+
+### Known Limitations
+
+1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `codegraph-lang-rust` asserts that `macro_rules! foo { ... }` yields zero Symbol records.
+
+2. **`#[derive(...)]` and other proc-macro attributes are NOT captured as call edges.** They parse as `attribute_item` nodes, not `macro_invocation`, and the call queries only target `macro_invocation`. Multiple `#[derive(Debug, Clone, ...)]` attributes on a struct contribute zero `Calls` edges.
+
+3. **Forward declarations excluded.** Trait method declarations without bodies (`fn bar();`) parse as `function_signature_item` and do NOT produce Symbol records — only `function_item` (which requires a body) is matched. Default methods inside trait bodies (with bodies) and methods inside `impl` blocks DO produce symbols.
+
+4. **Call resolution is heuristic** — same as C++. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic.
+
+5. **Complex use trees expanded but lifetime/generic constraints not represented.** Each terminal path in a `use` tree becomes one edge; lifetime parameters and generic bounds in the surrounding code are not part of the graph. Generic impls record the type-field text verbatim — the parent of methods in `impl<T> Trait for Vec<T>` is `Vec<T>` (with the generic in the parent string), not bare `Vec`.
 
 ## Smoke test
 

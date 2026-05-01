@@ -46,8 +46,9 @@ The workspace is split into language-agnostic core crates plus per-language plug
 | `crates/codegraph-graph` | In-memory `Graph` (nodes, forward + reverse adjacency, file index), JSON cache persistence |
 | `crates/codegraph-tools` | Tool handlers, parallel `analyze_codebase` discovery + indexer, watcher (notify-debouncer-full) |
 | `crates/codegraph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
+| `crates/codegraph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
 
-Phases 5/6/7 of the rewrite plan add `codegraph-lang-rust`, `codegraph-lang-go`, `codegraph-lang-python` (scaffolded, not wired). As of the Phase 4 cutover, **C++ is the only language live**.
+Phases 6/7 of the rewrite plan add `codegraph-lang-go` and `codegraph-lang-python` (scaffolded, not wired). As of the Phase 5 cutover, **C++ and Rust are live**.
 
 ```
 AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
@@ -60,12 +61,12 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
               [LanguageRegistry] [In-memory graph + JSON cache]
               (codegraph-lang)
                      |
-              [C++ Plugin] [Rust*] [Go*] [Python*]
-              (codegraph-lang-cpp + future plugins)
+              [C++ Plugin] [Rust Plugin] [Go*] [Python*]
+              (codegraph-lang-cpp, codegraph-lang-rust + future plugins)
                      |
-              [tree-sitter + tree-sitter-cpp]
+              [tree-sitter + tree-sitter-cpp + tree-sitter-rust]
 ```
-*Rust/Go/Python plugins scaffolded but not wired as of Phase 4.*
+*Go/Python plugins scaffolded but not wired as of Phase 5.*
 
 ## Configuration
 
@@ -140,3 +141,32 @@ Validated against tree-sitter-cpp v0.23.4.
 5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
 
 6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
+
+## Rust Parser Limitations
+
+Validated against tree-sitter-rust v0.24.0.
+
+### Supported Rust Patterns
+
+- Free functions, methods inside `impl` blocks (`Type::method`), default methods inside `trait` blocks (extracted as `Function`, not `Method` — only `impl` ancestry promotes to `Method`)
+- Structs, enums (all variant kinds), traits, type aliases (`type` items)
+- Generics — both type-bound (`fn foo<T: Display>`) and where-clause (`fn foo<T> where T: Display`) forms
+- Lifetime parameters (`fn longest<'a>(x: &'a str)`)
+- `async fn`, `const fn`, `unsafe fn` — extracted as `Function` (or `Method` inside an `impl`)
+- Nested modules — `mod a { mod b { fn x() {} } }` populates `Symbol.namespace = "a::b"`; `mod_item`s themselves are namespace anchors and do NOT produce Symbol records
+- All `use`-tree forms expanded to dotted paths: simple, scoped, grouped, nested grouped (`use std::{io::{self, Read}, collections::HashMap}` → 3 edges), wildcard (`use foo::*`), aliased (`use foo as bar` records the path `foo`), `self`-in-list, and `extern crate alloc`
+- All call patterns: direct, method via `field_expression`, scoped, turbofish, macro invocation, chained calls
+- Trait impls (`impl Trait for Type`) produce `Inherits` edges from the implementing type to the trait — including generic impls (`impl<T> Trait for Vec<T>`) and impls with `where` clauses
+- Trait-impl method parent disambiguation: in `impl Trait for Type { fn m() }` the method's parent is `Type`, never `Trait`. The trait identity lives only on the `Inherits` edge.
+
+### Known Limitations
+
+1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `codegraph-lang-rust` (`macro_rules_definition_produces_zero_symbols`) asserts that `macro_rules! foo { ... }` yields zero Symbol records.
+
+2. **`#[derive(...)]` and proc-macro attributes are NOT captured as call edges.** They parse as `attribute_item` nodes, not `macro_invocation`, and the call queries only target `macro_invocation`. Multiple `#[derive(Debug, Clone, ...)]` attributes on a struct contribute zero `Calls` edges.
+
+3. **Forward declarations excluded.** Trait method declarations without bodies (`fn bar();`) parse as `function_signature_item` and do NOT produce Symbol records — only `function_item` (which requires a body) is matched. Default methods inside trait bodies (with bodies) and methods inside `impl` blocks DO produce symbols.
+
+4. **Call resolution is heuristic** — same as C++. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
+
+5. **Complex use trees expanded but lifetime/generic constraints not represented.** Each terminal path in a `use` tree becomes one edge; lifetime parameters and generic bounds in the surrounding code are not part of the graph. Generic impls record the type-field text verbatim — methods inside `impl<T> Trait for Vec<T>` carry parent `Vec<T>` (with the generic in the parent string), not bare `Vec`. The `Inherits` edge's `from` field follows the same rule.
