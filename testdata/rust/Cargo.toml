@@ -1,0 +1,18 @@
+# Standalone Cargo manifest for the Rust parser corpus.
+#
+# This file exists so the directory is a recognizable Cargo project shape;
+# the parser walks `.rs` files directly and does not need cargo to build
+# anything. Kept dependency-free on purpose — the corpus must parse as
+# pure tree-sitter input without any external crates resolved.
+[package]
+name = "code-graph-rust-corpus"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "code-graph-rust-corpus"
+path = "src/main.rs"

@@ -71,3 +71,27 @@ Expect zero parse time / a "cache hit" indication in the response — the JSON c
 - All five steps complete without errors.
 - The new symbol `g` appears in `get_file_symbols` after the file edit (step 3).
 - Restarting the binary loads the cache without re-parsing (step 5).
+
+## Rust parser dogfood pass
+
+In addition to the MCP smoke test above, the `parse-test` developer harness can be run against the workspace itself to confirm the Rust parser handles a real production codebase. This was the Phase 5.5 dogfood gate.
+
+### Procedure
+
+```bash
+cargo build --release -p codegraph-parse-test
+./target/release/codegraph-parse-test crates/
+```
+
+### Pass criteria
+
+- 0 crashes (the binary exits with status 0).
+- 0 warnings (the `=== Warnings (N) ===` section is absent or empty).
+- The trailing `Done:` line reports a non-zero file/symbol/edge count.
+- Spot-check that `LanguagePlugin` appears as a `[trait]` symbol in `crates/codegraph-lang/src/lib.rs`.
+- Spot-check that an `[inherits]` edge `CppParser -> LanguagePlugin` is present.
+- Spot-check that an `[inherits]` edge `RustParser -> LanguagePlugin` is present.
+- Spot-check that `Graph::merge_file_graph` appears as a `[method]` with parent `Graph` (line in `crates/codegraph-graph/src/graph.rs`).
+- Phase 5.5 baseline (host-target, this repo, `crates/`): 43 files, 835 symbols, 7651 edges, 0 warnings — drift here is a sign the Rust parser changed behavior, not necessarily a regression. Update this number when the workspace itself changes.
+
+The harness is exploratory by design — there is no automated assertion for the workspace-wide totals (the workspace evolves; the assertion would either be brittle or meaningless). The Phase 5.5 corpus test (`crates/codegraph-lang-rust/tests/corpus.rs`) is the deterministic regression gate; this dogfood pass is the "does it survive contact with reality" check.

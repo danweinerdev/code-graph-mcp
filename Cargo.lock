@@ -215,6 +215,7 @@ dependencies = [
  "codegraph-core",
  "codegraph-lang",
  "codegraph-lang-cpp",
+ "codegraph-lang-rust",
  "codegraph-tools",
 ]
 
@@ -227,6 +228,7 @@ dependencies = [
  "codegraph-graph",
  "codegraph-lang",
  "codegraph-lang-cpp",
+ "codegraph-lang-rust",
  "crossbeam-channel",
  "ignore",
  "insta",

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use codegraph_core::{DiscoveryConfig, Edge, EdgeKind, Symbol, SymbolKind};
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
+use codegraph_lang_rust::RustParser;
 use codegraph_tools::discovery::discover;
 
 fn main() -> ExitCode {
@@ -39,15 +40,28 @@ fn main() -> ExitCode {
     }
 
     let mut registry = LanguageRegistry::new();
-    let parser = match CppParser::new() {
+    let cpp_parser = match CppParser::new() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error initializing parser: {e}");
+            eprintln!("Error initializing C++ parser: {e}");
             return ExitCode::from(1);
         }
     };
-    if let Err(e) = registry.register(Box::new(parser)) {
-        eprintln!("Error registering parser: {e}");
+    if let Err(e) = registry.register(Box::new(cpp_parser)) {
+        eprintln!("Error registering C++ parser: {e}");
+        return ExitCode::from(1);
+    }
+    // Phase 5.5: register the Rust parser so the dogfood pass against this
+    // workspace's `crates/` tree can extract symbols from `.rs` files.
+    let rust_parser = match RustParser::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error initializing Rust parser: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry.register(Box::new(rust_parser)) {
+        eprintln!("Error registering Rust parser: {e}");
         return ExitCode::from(1);
     }
 
