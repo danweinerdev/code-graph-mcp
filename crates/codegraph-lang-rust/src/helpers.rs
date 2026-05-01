@@ -1,9 +1,9 @@
 //! Helper routines for the Rust parser.
 //!
 //! Phase status: Phase 5.1 ships the small ancestor-walk helpers
-//! ([`find_enclosing_impl`], [`resolve_mod_namespace`]) in working form,
-//! plus [`split_use_path`] as a stub returning `vec![]`. Phase 5.3 fills the
-//! recursive use-tree walker.
+//! ([`find_enclosing_impl`], [`resolve_mod_namespace`]) in working form;
+//! Phase 5.3 promotes [`split_use_path`] from a stub to a full recursive
+//! walker over `use_tree` variants.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub` as
 //! a crate-internal convention so callers within `lib.rs` can `use` them
@@ -11,27 +11,113 @@
 
 use tree_sitter::Node;
 
-/// Walk a `use_tree` (the `argument` field of a `use_declaration`) and
-/// produce one fully-qualified path string per terminal leaf.
+/// Walk a `use_tree` (the `argument` field of a `use_declaration`, or any
+/// node nested inside a `scoped_use_list`/`use_list`) and produce one
+/// fully-qualified path string per terminal leaf.
 ///
-/// Phase 5.3 implements this. Expected behavior (from the phase-doc verification):
-/// - `use foo` → `["foo"]`
-/// - `use foo::bar` → `["foo::bar"]`
-/// - `use foo::{a, b}` → `["foo::a", "foo::b"]`
-/// - `use foo::*` → `["foo::*"]`
-/// - `use foo as bar` → `["foo"]` (alias dropped; the path is what we record)
-/// - `use std::{io::{self, Read}, collections::HashMap}` →
+/// Behavior (from Phase 5.3's verification):
+/// - `use foo;` → `["foo"]`
+/// - `use foo::bar;` → `["foo::bar"]`
+/// - `use foo::{a, b};` → `["foo::a", "foo::b"]`
+/// - `use foo::{a, b::c};` → `["foo::a", "foo::b::c"]`
+/// - `use foo::*;` → `["foo::*"]`
+/// - `use foo as bar;` → `["foo"]` (alias dropped)
+/// - `use std::io::{self, Read};` → `["std::io", "std::io::Read"]`
+/// - `use std::{io::{self, Read}, collections::HashMap};` →
 ///   `["std::io", "std::io::Read", "std::collections::HashMap"]`
 ///
-/// Until Phase 5.3 lands, this returns an empty `Vec` so the surrounding
-/// extractor compiles and the queries-compile gate (`RustParser::new()` →
-/// `Ok`) is the only behavior under test in 5.1.
-// TODO(5.3): recursive walk over use_tree variants (identifier,
-// scoped_identifier, scoped_use_list, use_list, use_wildcard,
-// use_as_clause, self).
-#[allow(dead_code)] // wired in Phase 5.3
-pub fn split_use_path(_use_tree: Node<'_>, _content: &str) -> Vec<String> {
-    Vec::new()
+/// Top-level callers pass the use_declaration's `argument` node and an
+/// empty scope. The function recurses inside grouped/nested forms with the
+/// running scope joined by `::`.
+pub fn split_use_path(use_tree: Node<'_>, content: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    walk_use_tree(use_tree, "", content, &mut out);
+    out
+}
+
+/// Inner recursive walker. `scope` is the dotted prefix accumulated from
+/// enclosing `scoped_use_list` paths (e.g. `"std::io"` when descending into
+/// the `{self, Read}` of `use std::io::{self, Read}`).
+fn walk_use_tree(node: Node<'_>, scope: &str, content: &str, out: &mut Vec<String>) {
+    let bytes = content.as_bytes();
+    match node.kind() {
+        // Terminal: bare identifier or dotted path. The source text already
+        // is the full path (`foo` or `foo::bar::baz`), so we just glue it
+        // onto the running scope.
+        "identifier" | "scoped_identifier" | "crate" | "super" | "metavariable" => {
+            let leaf = node.utf8_text(bytes).unwrap_or("");
+            out.push(join_scope(scope, leaf));
+        }
+
+        // Bare `self` inside a use_list: emits the parent scope itself as a
+        // leaf path. Example: `use std::io::{self, Read};` produces
+        // `std::io` from the `self` token (with scope `std::io`).
+        // `use self;` at top level (scope empty) is grammatically odd and
+        // not in the spec; we skip it via the empty-scope guard.
+        "self" if !scope.is_empty() => {
+            out.push(scope.to_owned());
+        }
+
+        // `foo::{a, b, ...}`: the `path` field is a prefix; the `list`
+        // field is a use_list whose children are nested use_trees.
+        "scoped_use_list" => {
+            let path_text = node
+                .child_by_field_name("path")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .unwrap_or("");
+            let new_scope = join_scope(scope, path_text);
+            if let Some(list) = node.child_by_field_name("list") {
+                walk_use_tree(list, &new_scope, content, out);
+            }
+        }
+
+        // `{a, b, c::d}`: walk each named child with the same scope.
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_use_tree(child, scope, content, out);
+            }
+        }
+
+        // `foo::*`: the named child (if any) is the prefix path; emit one
+        // entry of `<scope>::<prefix>::*` (or `<scope>::*` if no prefix).
+        "use_wildcard" => {
+            let prefix = node
+                .named_children(&mut node.walk())
+                .next()
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .unwrap_or("");
+            let combined = join_scope(scope, prefix);
+            let star = if combined.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("{combined}::*")
+            };
+            out.push(star);
+        }
+
+        // `foo as bar`: alias is dropped, recurse on the `path` field.
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                walk_use_tree(path, scope, content, out);
+            }
+        }
+
+        // Defensive: an unexpected node type contributes nothing. Keeping
+        // silent rather than panicking matches the C++ extractor's posture
+        // toward unrecognized captures.
+        _ => {}
+    }
+}
+
+/// Join a running scope with a leaf segment using `::`. Either side may be
+/// empty: empty scope returns the leaf as-is; empty leaf returns the scope.
+fn join_scope(scope: &str, leaf: &str) -> String {
+    match (scope.is_empty(), leaf.is_empty()) {
+        (true, _) => leaf.to_owned(),
+        (false, true) => scope.to_owned(),
+        (false, false) => format!("{scope}::{leaf}"),
+    }
 }
 
 /// Walk `node`'s parent chain and return the first ancestor that is an
@@ -121,14 +207,84 @@ mod tests {
         None
     }
 
+    /// Locate the `argument` node of the (first) `use_declaration` in
+    /// `tree`. Phase 5.3 helper tests drive `split_use_path` against this
+    /// node directly to verify per-form behavior in isolation from
+    /// `extract_uses`.
+    fn use_argument<'a>(tree: &'a tree_sitter::Tree) -> tree_sitter::Node<'a> {
+        let decl = find_first(tree.root_node(), "use_declaration")
+            .expect("source must contain a use_declaration");
+        decl.child_by_field_name("argument")
+            .expect("use_declaration must expose an `argument` field")
+    }
+
     #[test]
-    fn split_use_path_stub_returns_empty() {
-        // Phase 5.1 stub: walker returns no paths until 5.3 fills it in.
+    fn split_use_path_simple_identifier() {
         let src = "use foo;";
         let tree = parse(src);
-        let use_tree =
-            find_first(tree.root_node(), "identifier").expect("identifier inside use_declaration");
-        assert!(split_use_path(use_tree, src).is_empty());
+        assert_eq!(split_use_path(use_argument(&tree), src), vec!["foo"]);
+    }
+
+    #[test]
+    fn split_use_path_scoped_identifier() {
+        let src = "use foo::bar;";
+        let tree = parse(src);
+        assert_eq!(split_use_path(use_argument(&tree), src), vec!["foo::bar"]);
+    }
+
+    #[test]
+    fn split_use_path_use_list_flat() {
+        let src = "use foo::{a, b};";
+        let tree = parse(src);
+        assert_eq!(
+            split_use_path(use_argument(&tree), src),
+            vec!["foo::a", "foo::b"]
+        );
+    }
+
+    #[test]
+    fn split_use_path_use_list_nested_path() {
+        let src = "use foo::{a, b::c};";
+        let tree = parse(src);
+        assert_eq!(
+            split_use_path(use_argument(&tree), src),
+            vec!["foo::a", "foo::b::c"]
+        );
+    }
+
+    #[test]
+    fn split_use_path_wildcard() {
+        let src = "use foo::*;";
+        let tree = parse(src);
+        assert_eq!(split_use_path(use_argument(&tree), src), vec!["foo::*"]);
+    }
+
+    #[test]
+    fn split_use_path_as_clause_drops_alias() {
+        let src = "use foo as bar;";
+        let tree = parse(src);
+        assert_eq!(split_use_path(use_argument(&tree), src), vec!["foo"]);
+    }
+
+    #[test]
+    fn split_use_path_self_in_list_emits_parent_scope() {
+        let src = "use std::io::{self, Read};";
+        let tree = parse(src);
+        // `self` becomes `std::io`; `Read` becomes `std::io::Read`.
+        assert_eq!(
+            split_use_path(use_argument(&tree), src),
+            vec!["std::io", "std::io::Read"]
+        );
+    }
+
+    #[test]
+    fn split_use_path_deeply_nested() {
+        let src = "use std::{io::{self, Read}, collections::HashMap};";
+        let tree = parse(src);
+        assert_eq!(
+            split_use_path(use_argument(&tree), src),
+            vec!["std::io", "std::io::Read", "std::collections::HashMap"]
+        );
     }
 
     #[test]

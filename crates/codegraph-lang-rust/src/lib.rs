@@ -11,11 +11,9 @@
 //! with cached `Query` objects, and the `LanguagePlugin` impl with a
 //! stubbed `parse_file` that returns an empty `FileGraph`.
 //!
-//! Phase 5.2 wires `extract_definitions` into `parse_file`. Phases 5.3 and
-//! 5.4 fill in:
+//! Phase 5.2 wires `extract_definitions` into `parse_file`. Phase 5.3 wires
+//! `extract_uses` (use-tree expansion + `extern crate`). Phase 5.4 fills in:
 //!
-//! - **Phase 5.3** — use-tree expansion (recursive walk for grouped /
-//!   wildcard / aliased imports) and `extern crate`
 //! - **Phase 5.4** — call extraction (direct, method, scoped, macro) and
 //!   inheritance edges (`impl Trait for Type`)
 //!
@@ -54,14 +52,16 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use codegraph_core::{FileGraph, Language, Symbol, SymbolKind};
+use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use codegraph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
-use crate::helpers::{find_enclosing_impl, resolve_mod_namespace, truncate_signature};
+use crate::helpers::{
+    find_enclosing_impl, resolve_mod_namespace, split_use_path, truncate_signature,
+};
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, USE_QUERIES};
 
 /// File extensions the Rust parser claims.
@@ -83,8 +83,7 @@ pub struct RustParser {
     /// Compiled call query.
     #[allow(dead_code)] // wired in Phase 5.4
     call_query: Query,
-    /// Compiled use-declaration query.
-    #[allow(dead_code)] // wired in Phase 5.3
+    /// Compiled use-declaration query (wired in Phase 5.3).
     use_query: Query,
     /// Compiled inheritance / trait-impl query.
     #[allow(dead_code)] // wired in Phase 5.4
@@ -144,7 +143,7 @@ impl RustParser {
         };
 
         self.extract_definitions(root, content, &path_str, &mut fg);
-        // TODO(Phase 5.3): self.extract_uses(root, content, &path_str, &mut fg);
+        self.extract_uses(root, content, &path_str, &mut fg);
         // TODO(Phase 5.4): self.extract_calls(root, content, &path_str, &mut fg);
         // TODO(Phase 5.4): self.extract_inheritance(root, content, &path_str, &mut fg);
 
@@ -289,6 +288,81 @@ impl RustParser {
                     // ancestor chain on the symbols defined *inside* a
                     // mod block to populate `Symbol.namespace`.
                     "mod.name" => {}
+
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Run the use/extern-crate query and produce `Includes` edges. Mirrors
+    /// the C++ plugin's `extract_includes` shape: the edge `from` is the
+    /// source file path (not a symbol ID) and the `to` is the dotted
+    /// import path; the `Graph` engine routes `Includes` edges into a
+    /// per-file map keyed by `from` (see `Graph::merge_file_graph`).
+    ///
+    /// Per-capture behavior:
+    ///
+    /// - `use.tree` — the `argument` field of a `use_declaration`. Handed
+    ///   to [`split_use_path`] which recursively expands grouped
+    ///   (`use_list`/`scoped_use_list`), wildcard (`use_wildcard`),
+    ///   aliased (`use_as_clause`), and `self`-in-list forms. Each
+    ///   returned path produces one edge; the line number is taken from
+    ///   the `use_declaration` start position so all edges from a single
+    ///   `use` statement share the same line.
+    /// - `extern.name` — the `name` field of an
+    ///   `extern_crate_declaration` (i.e. `extern crate alloc;` →
+    ///   `"alloc"`). The `as bar` alias is dropped, mirroring the
+    ///   `use foo as bar` rule. The line number comes from the
+    ///   `extern_crate_declaration` itself.
+    fn extract_uses(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.use_query, root, content);
+        let cap_names = self.use_query.capture_names();
+        let content_str = std::str::from_utf8(content).unwrap_or("");
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+
+                match cap_name {
+                    "use.tree" => {
+                        // Anchor the line at the enclosing `use_declaration`
+                        // so all paths from one statement share a line.
+                        let line_node =
+                            find_enclosing_kind(cap_node, "use_declaration").unwrap_or(cap_node);
+                        let line = line_node.start_position().row as u32 + 1;
+                        for to in split_use_path(cap_node, content_str) {
+                            fg.edges.push(Edge {
+                                from: path.to_owned(),
+                                to,
+                                kind: EdgeKind::Includes,
+                                file: path.to_owned(),
+                                line,
+                            });
+                        }
+                    }
+
+                    "extern.name" => {
+                        let name = cap_node.utf8_text(content).unwrap_or("").to_owned();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let line_node = find_enclosing_kind(cap_node, "extern_crate_declaration")
+                            .unwrap_or(cap_node);
+                        let line = line_node.start_position().row as u32 + 1;
+                        fg.edges.push(Edge {
+                            from: path.to_owned(),
+                            to: name,
+                            kind: EdgeKind::Includes,
+                            file: path.to_owned(),
+                            line,
+                        });
+                    }
 
                     _ => {}
                 }
@@ -661,5 +735,136 @@ mod tests {
         let fg = parse("fn foo() { let _ = 42; let _ = \"abc\"; }");
         let s = sym(&fg, "foo");
         assert_eq!(s.signature, "fn foo()");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5.3 — use-tree expansion + extern crate edges
+    // ----------------------------------------------------------------
+
+    /// Collect just the `Includes`-kind edges from a `FileGraph`. Phase 5.3
+    /// only emits `Includes`; this filter future-proofs the helpers
+    /// against Phase 5.4 adding `Calls`/`Inherits` to the same fixture.
+    fn includes(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    /// Just the `to` fields of every include edge, in emission order.
+    fn include_targets(fg: &FileGraph) -> Vec<&str> {
+        includes(fg).into_iter().map(|e| e.to.as_str()).collect()
+    }
+
+    /// Verify that every include edge points at the synthetic test path,
+    /// is `Kind=Includes`, and has a non-zero line. Used by every Phase
+    /// 5.3 test below to keep the per-edge invariants out of the body.
+    fn assert_include_edge_invariants(fg: &FileGraph) {
+        for e in includes(fg) {
+            assert_eq!(e.kind, EdgeKind::Includes, "edge kind must be Includes");
+            assert_eq!(
+                e.from, "/tmp/test.rs",
+                "include edge `from` must be the source file path"
+            );
+            assert_eq!(
+                e.file, "/tmp/test.rs",
+                "include edge `file` must be the source file path"
+            );
+            assert!(
+                e.line >= 1,
+                "include edge line must be 1-indexed and populated, got: {}",
+                e.line
+            );
+        }
+    }
+
+    #[test]
+    fn use_simple() {
+        let fg = parse("use foo;");
+        assert_eq!(include_targets(&fg), vec!["foo"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_scoped() {
+        let fg = parse("use foo::bar;");
+        assert_eq!(include_targets(&fg), vec!["foo::bar"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_list() {
+        let fg = parse("use foo::{a, b};");
+        assert_eq!(include_targets(&fg), vec!["foo::a", "foo::b"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_nested_list() {
+        let fg = parse("use foo::{a, b::c};");
+        assert_eq!(include_targets(&fg), vec!["foo::a", "foo::b::c"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_wildcard() {
+        let fg = parse("use foo::*;");
+        assert_eq!(include_targets(&fg), vec!["foo::*"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_as_clause() {
+        let fg = parse("use foo as bar;");
+        // Alias dropped — the wire format records the path, not the local
+        // name, matching the `use std::io as IO` documented behavior.
+        assert_eq!(include_targets(&fg), vec!["foo"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_self_in_list() {
+        let fg = parse("use std::io::{self, Read};");
+        // `self` re-emits the parent scope, so two edges: std::io and
+        // std::io::Read.
+        assert_eq!(include_targets(&fg), vec!["std::io", "std::io::Read"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_deeply_nested() {
+        let fg = parse("use std::{io::{self, Read}, collections::HashMap};");
+        assert_eq!(
+            include_targets(&fg),
+            vec!["std::io", "std::io::Read", "std::collections::HashMap"]
+        );
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn extern_crate_simple() {
+        let fg = parse("extern crate alloc;");
+        assert_eq!(include_targets(&fg), vec!["alloc"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn extern_crate_with_alias() {
+        // Alias dropped, same rule as `use foo as bar;`.
+        let fg = parse("extern crate foo as bar;");
+        assert_eq!(include_targets(&fg), vec!["foo"]);
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn use_edge_line_matches_use_declaration() {
+        // Verify the line number is anchored at the `use_declaration`
+        // (not at the inner identifier) and survives across all paths
+        // expanded from a single statement.
+        let src = "fn _placeholder() {}\n\nuse foo::{a, b};";
+        let fg = parse(src);
+        let lines: Vec<u32> = includes(&fg).iter().map(|e| e.line).collect();
+        // Both expanded paths share the use_declaration's start line (3).
+        assert_eq!(lines, vec![3, 3]);
     }
 }
