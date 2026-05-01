@@ -3,7 +3,7 @@ title: "Rust Language Parser"
 type: phase
 plan: RustRewrite
 phase: 5
-status: planned
+status: complete
 created: 2026-04-28
 updated: 2026-04-30
 deliverable: "codegraph-lang-rust crate parsing .rs files with full impl/trait/use-tree/macro support; registered in the main binary; testdata/rust/ + dogfood-validation against this Rust workspace itself"

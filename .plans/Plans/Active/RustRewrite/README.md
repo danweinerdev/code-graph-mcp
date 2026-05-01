@@ -37,7 +37,7 @@ phases:
     depends_on: [3]
   - id: 5
     title: "Rust Language Parser"
-    status: planned
+    status: complete
     doc: "05-Rust-Parser.md"
     depends_on: [4]
   - id: 6
