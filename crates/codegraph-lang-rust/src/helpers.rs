@@ -40,7 +40,6 @@ pub fn split_use_path(_use_tree: Node<'_>, _content: &str) -> Vec<String> {
 /// Used by Phase 5.2's definition extractor to decide whether a
 /// `function_item` is a free function or a method, and to look up the
 /// impl block's `type` field for the parent.
-#[allow(dead_code)] // wired in Phase 5.2
 pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(n) = current {
@@ -52,12 +51,32 @@ pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// Truncate a signature at the first `{` or `;`, dropping the body and any
+/// trailing whitespace. Falls back to a 200-byte cutoff when neither marker
+/// is found, returning `<prefix>...`. Mirrors the C++ plugin's
+/// `truncate_signature` byte-for-byte so signatures across languages share
+/// the same shape.
+///
+/// The cutoff is computed via `char_indices`, so the slice boundary is
+/// guaranteed to land on a UTF-8 char boundary by construction. Multi-byte
+/// content past 200 bytes does not panic.
+pub fn truncate_signature(s: &str) -> String {
+    for (i, c) in s.char_indices() {
+        if c == '{' || c == ';' {
+            return s[..i].trim_end_matches([' ', '\t', '\n', '\r']).to_owned();
+        }
+        if i >= 200 {
+            return format!("{}...", &s[..i]);
+        }
+    }
+    s.to_owned()
+}
+
 /// Walk `node`'s parent chain, collecting the names of every enclosing
 /// `mod_item`, and join them outermost-first with `::`.
 ///
 /// `mod a { mod b { fn x() {} } }` → for the `fn x` node, returns `"a::b"`.
 /// A node with no enclosing `mod_item` returns the empty string.
-#[allow(dead_code)] // wired in Phase 5.2
 pub fn resolve_mod_namespace(node: Node<'_>, content: &str) -> String {
     let bytes = content.as_bytes();
     let mut parts: Vec<String> = Vec::new();
@@ -152,5 +171,22 @@ mod tests {
         let tree = parse(src);
         let func = find_first(tree.root_node(), "function_item").expect("function_item");
         assert_eq!(resolve_mod_namespace(func, src), "a::b::c");
+    }
+
+    #[test]
+    fn truncate_signature_stops_at_brace() {
+        // Body opener strips for fn signatures.
+        assert_eq!(truncate_signature("fn foo() { return; }"), "fn foo()");
+    }
+
+    #[test]
+    fn truncate_signature_stops_at_semicolon() {
+        // Trait method declarations end in `;` (function_signature_item).
+        assert_eq!(truncate_signature("fn foo();"), "fn foo()");
+    }
+
+    #[test]
+    fn truncate_signature_trims_trailing_whitespace_before_brace() {
+        assert_eq!(truncate_signature("fn foo()   \t\n{ return; }"), "fn foo()");
     }
 }
