@@ -179,6 +179,65 @@ pub fn resolve_mod_namespace(node: Node<'_>, content: &str) -> String {
     parts.join("::")
 }
 
+/// Build a `path:fn_name` (free fn) or `path:Type::fn_name` (impl method)
+/// symbol-ID anchor for the function enclosing `node`. Mirrors the C++
+/// plugin's `enclosing_function_id` and matches the `symbol_id()` shape
+/// produced by Phase 5.2's definition extractor so call edges' `from`
+/// fields line up exactly with definition IDs.
+///
+/// Behavior:
+/// - No enclosing `function_item` (e.g. a call at module-level inside a
+///   `static` initializer) → returns `path` (the bare file path), matching
+///   the C++ top-level-call rule.
+/// - `function_item` with no enclosing `impl_item` → returns
+///   `<path>:<fn_name>`.
+/// - `function_item` inside an `impl_item` → returns
+///   `<path>:<Type>::<fn_name>` where `Type` is the impl's `type` field
+///   text. For `impl Trait for Type { fn m() }` the prefix is `Type`,
+///   never `Trait` — matches Phase 5.2's trait-impl disambiguation.
+/// - Closures (`closure_expression`) are transparent: a call inside a
+///   closure walks past the closure and reports the closure's enclosing
+///   `function_item` as the `from`.
+pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
+    let Some(func) = find_enclosing_kind(node, "function_item") else {
+        return path.to_owned();
+    };
+    let Some(name_node) = func.child_by_field_name("name") else {
+        return path.to_owned();
+    };
+    let fn_name = name_node.utf8_text(content).unwrap_or("");
+
+    match find_enclosing_impl(func) {
+        Some(impl_node) => {
+            let parent_type = impl_node
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(content).ok())
+                .unwrap_or("");
+            if parent_type.is_empty() {
+                format!("{path}:{fn_name}")
+            } else {
+                format!("{path}:{parent_type}::{fn_name}")
+            }
+        }
+        None => format!("{path}:{fn_name}"),
+    }
+}
+
+/// Walk `node`'s parent chain, returning the first ancestor (including
+/// `node` itself) whose kind matches `kind`. Crate-internal helper used
+/// by [`enclosing_function_id`] (mirrors the same-named helper in `lib.rs`,
+/// kept here so the helper module is self-contained for testing).
+fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +403,61 @@ mod tests {
     #[test]
     fn truncate_signature_trims_trailing_whitespace_before_brace() {
         assert_eq!(truncate_signature("fn foo()   \t\n{ return; }"), "fn foo()");
+    }
+
+    // ---- enclosing_function_id ---------------------------------------
+
+    #[test]
+    fn enclosing_function_id_for_call_in_free_fn() {
+        let src = "fn outer() { foo(); }";
+        let tree = parse(src);
+        // The `foo` identifier inside the call is what real callers pass.
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs:outer");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_at_module_level_returns_bare_path() {
+        // `static X: i32 = compute();` — call lives outside any function_item.
+        // Expected `from` = the file path itself (matches the C++ top-level
+        // call rule).
+        let src = "static X: i32 = compute();";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_in_impl_method_uses_type_prefix() {
+        let src = "struct Foo; impl Foo { fn bar(&self) { baz(); } }";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs:Foo::bar");
+    }
+
+    /// Anti-regression: for `impl Trait for Type { fn m() { ... } }` the
+    /// `from` of any inner call must be `Type::m`, never `Trait::m`.
+    #[test]
+    fn enclosing_function_id_for_call_in_trait_impl_uses_type_not_trait() {
+        let src = "trait Trait {} struct Foo; impl Trait for Foo { fn bar(&self) { baz(); } }";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs:Foo::bar");
+        assert_ne!(id, "/tmp/test.rs:Trait::bar");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_inside_closure_walks_past_closure() {
+        // `outer()` contains a closure that calls `foo()`. The closure has
+        // no name; the call's `from` must be `outer`, not the path.
+        let src = "fn outer() { let _ = || foo(); }";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs:outer");
     }
 }

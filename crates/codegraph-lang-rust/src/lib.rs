@@ -12,10 +12,10 @@
 //! stubbed `parse_file` that returns an empty `FileGraph`.
 //!
 //! Phase 5.2 wires `extract_definitions` into `parse_file`. Phase 5.3 wires
-//! `extract_uses` (use-tree expansion + `extern crate`). Phase 5.4 fills in:
-//!
-//! - **Phase 5.4** — call extraction (direct, method, scoped, macro) and
-//!   inheritance edges (`impl Trait for Type`)
+//! `extract_uses` (use-tree expansion + `extern crate`). Phase 5.4 wires
+//! `extract_calls` (direct, method, scoped, macro) and `extract_inheritance`
+//! (`impl Trait for Type`). After 5.4, `parse_file` is fully populated and
+//! every extractor is live.
 //!
 //! # Known Rust parser limitations
 //!
@@ -60,7 +60,8 @@ use tree_sitter::{
 };
 
 use crate::helpers::{
-    find_enclosing_impl, resolve_mod_namespace, split_use_path, truncate_signature,
+    enclosing_function_id, find_enclosing_impl, resolve_mod_namespace, split_use_path,
+    truncate_signature,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, USE_QUERIES};
 
@@ -81,12 +82,10 @@ pub struct RustParser {
     /// Compiled definition query.
     def_query: Query,
     /// Compiled call query.
-    #[allow(dead_code)] // wired in Phase 5.4
     call_query: Query,
-    /// Compiled use-declaration query (wired in Phase 5.3).
+    /// Compiled use-declaration query.
     use_query: Query,
     /// Compiled inheritance / trait-impl query.
-    #[allow(dead_code)] // wired in Phase 5.4
     inh_query: Query,
 }
 
@@ -144,8 +143,8 @@ impl RustParser {
 
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_uses(root, content, &path_str, &mut fg);
-        // TODO(Phase 5.4): self.extract_calls(root, content, &path_str, &mut fg);
-        // TODO(Phase 5.4): self.extract_inheritance(root, content, &path_str, &mut fg);
+        self.extract_calls(root, content, &path_str, &mut fg);
+        self.extract_inheritance(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -367,6 +366,135 @@ impl RustParser {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Run the call query and produce `Calls` edges. Mirrors the C++
+    /// plugin's `extract_calls`: each capture is a callee identifier (or
+    /// dotted path), the line is anchored at the enclosing
+    /// `call_expression` (or `macro_invocation` for macro forms), and the
+    /// `from` field is built by [`enclosing_function_id`] so it matches
+    /// the `symbol_id()` of the surrounding function/method.
+    ///
+    /// Per-capture behavior:
+    ///
+    /// - `call.name` — bare identifier (direct call `foo()`, method call
+    ///   `obj.foo()` via `field_expression > field`, turbofish bare-ident
+    ///   `foo::<T>()`, or macro invocation `println!()`). The `to` is the
+    ///   identifier text.
+    /// - `call.qname` — scoped path (`foo::bar::baz()`, scoped turbofish
+    ///   `foo::bar::<T>()`, or scoped macro `foo::bar!()`). The full
+    ///   dotted path is preserved as `to` (callers downstream may split
+    ///   it; the wire format records the unmodified text).
+    ///
+    /// Lines come from the enclosing `call_expression` or
+    /// `macro_invocation`. For chained calls `a.b().c()` tree-sitter
+    /// produces nested `call_expression` nodes, each with its own
+    /// `field_expression` capture, so two edges fall out naturally (one
+    /// per chain link). Closure bodies are walked transparently — calls
+    /// inside a `closure_expression` have the enclosing `function_item`'s
+    /// ID as `from`, matching the C++ behavior for lambda bodies.
+    fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.call_query, root, content);
+        let cap_names = self.call_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "call.name" && cap_name != "call.qname" {
+                    continue;
+                }
+
+                let callee = cap_node.utf8_text(content).unwrap_or("");
+                if callee.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing call/macro form so the
+                // reported line tracks the call site, not the inner
+                // identifier (which can be on a continuation line for
+                // multi-line chains).
+                let call_node = find_enclosing_kind(cap_node, "call_expression")
+                    .or_else(|| find_enclosing_kind(cap_node, "macro_invocation"))
+                    .unwrap_or(cap_node);
+                let from = enclosing_function_id(cap_node, content, path);
+
+                fg.edges.push(Edge {
+                    from,
+                    to: callee.to_owned(),
+                    kind: EdgeKind::Calls,
+                    file: path.to_owned(),
+                    line: call_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
+
+    /// Run the inheritance query and produce `Inherits` edges for trait
+    /// impls. Mirrors the C++ plugin's `extract_inheritance` for the
+    /// single-base case (Rust's `impl Trait for Type` is always one base
+    /// per impl block; multi-trait impls are written as separate blocks).
+    ///
+    /// The query (`INHERITANCE_QUERIES`) requires both the `type` AND
+    /// `trait` fields to be present — inherent impls (no `trait`) do not
+    /// match, so no edge is emitted. Generic impls
+    /// (`impl<T> Trait for Vec<T>`) and impls with `where` clauses match
+    /// the same way; the `type` and `trait` field text is captured
+    /// verbatim (`Vec<T>` and `Trait`), with generics included as written.
+    ///
+    /// Edge shape: `from = type_text, to = trait_text, kind = Inherits,
+    /// file = path, line = impl_item.start_position().row + 1`. The
+    /// implementing type is the `from` (the "child" in the inheritance
+    /// hierarchy); the trait is the `to` (the "parent"). Matches the C++
+    /// `derived → base` direction.
+    fn extract_inheritance(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.inh_query, root, content);
+        let cap_names = self.inh_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            let mut type_text = String::new();
+            let mut trait_text = String::new();
+            let mut impl_node: Option<Node<'_>> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                let text = cap_node.utf8_text(content).unwrap_or("").to_owned();
+
+                match cap_name {
+                    "impl.type" => type_text = text,
+                    "impl.trait" => trait_text = text,
+                    "impl.def" => impl_node = Some(cap_node),
+                    _ => {}
+                }
+            }
+
+            // Defensive: the query requires both fields, so both should be
+            // populated; skip silently rather than emitting a half-formed
+            // edge if either is missing.
+            if type_text.is_empty() || trait_text.is_empty() {
+                continue;
+            }
+
+            let line = impl_node
+                .map(|n| n.start_position().row as u32 + 1)
+                .unwrap_or(0);
+            fg.edges.push(Edge {
+                from: type_text,
+                to: trait_text,
+                kind: EdgeKind::Inherits,
+                file: path.to_owned(),
+                line,
+            });
         }
     }
 }
@@ -866,5 +994,254 @@ mod tests {
         let lines: Vec<u32> = includes(&fg).iter().map(|e| e.line).collect();
         // Both expanded paths share the use_declaration's start line (3).
         assert_eq!(lines, vec![3, 3]);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5.4 — call extraction
+    // ----------------------------------------------------------------
+
+    /// Just the call edges from a `FileGraph`, in emission order.
+    fn calls(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect()
+    }
+
+    /// Just the inheritance edges from a `FileGraph`, in emission order.
+    fn inherits(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect()
+    }
+
+    #[test]
+    fn direct_call_produces_calls_edge() {
+        let fg = parse("fn caller() { foo(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "foo");
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+        assert_eq!(e.file, "/tmp/test.rs");
+        assert!(e.line >= 1);
+    }
+
+    #[test]
+    fn method_call_via_field_expression() {
+        let fg = parse("fn caller() { obj.method(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(
+            e.to, "method",
+            "method-call `to` must be the field_identifier, not the receiver"
+        );
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+    }
+
+    #[test]
+    fn scoped_call() {
+        // `foo::bar::baz()` — the full scoped path is preserved as `to`.
+        let fg = parse("fn caller() { foo::bar::baz(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "foo::bar::baz");
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+    }
+
+    #[test]
+    fn macro_invocation_call() {
+        let fg = parse("fn caller() { println!(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(
+            e.to, "println",
+            "macro name must be the bare identifier (no `!`)"
+        );
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+    }
+
+    #[test]
+    fn turbofish_call() {
+        // `foo::<u32>()` — the turbofish wraps a bare identifier so the
+        // capture name is `call.name` and `to` is the underlying ident.
+        let fg = parse("fn caller() { foo::<u32>(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(
+            e.to, "foo",
+            "turbofish bare-ident call must record the underlying identifier"
+        );
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+    }
+
+    #[test]
+    fn turbofish_scoped_call() {
+        // `foo::bar::<u32>()` — turbofish wrapping a scoped_identifier
+        // produces a `call.qname` capture with the full path as `to`.
+        let fg = parse("fn caller() { foo::bar::<u32>(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "foo::bar");
+        assert_eq!(e.from, "/tmp/test.rs:caller");
+    }
+
+    #[test]
+    fn chained_call_produces_two_edges() {
+        // `a.b().c()` produces nested call_expressions; each method-call
+        // capture yields one edge.
+        let fg = parse("fn caller() { a.b().c(); }");
+        let cs = calls(&fg);
+        let names: Vec<&str> = cs.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            cs.len(),
+            2,
+            "expected 2 Calls edges for chained call, got {names:?}"
+        );
+        assert!(
+            names.contains(&"b"),
+            "chained call must include `b`, got {names:?}"
+        );
+        assert!(
+            names.contains(&"c"),
+            "chained call must include `c`, got {names:?}"
+        );
+        for e in cs {
+            assert_eq!(e.from, "/tmp/test.rs:caller");
+        }
+    }
+
+    #[test]
+    fn closure_calls_have_enclosing_fn_as_from() {
+        // Closures have no name; calls inside a closure must walk past the
+        // closure node and report the enclosing function as `from`.
+        let fg = parse("fn outer() { let _ = || foo(); }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "foo");
+        assert_eq!(
+            e.from, "/tmp/test.rs:outer",
+            "closure body call must use enclosing fn as `from`"
+        );
+    }
+
+    #[test]
+    fn call_inside_impl_method_has_qualified_from() {
+        let fg = parse("struct Foo; impl Foo { fn bar(&self) { baz(); } }");
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "baz");
+        assert_eq!(e.from, "/tmp/test.rs:Foo::bar");
+    }
+
+    /// CRITICAL anti-regression: for `impl Trait for Foo { fn bar(...) }`
+    /// the `from` of any inner call MUST be `Foo::bar`, never `Trait::bar`.
+    /// Mirrors the trait-impl disambiguation enforced by 5.2's definition
+    /// extractor — call edges must use the same prefix scheme.
+    #[test]
+    fn call_inside_trait_impl_method_has_type_qualified_from_not_trait() {
+        let src = "trait Trait {} struct Foo; impl Trait for Foo { fn bar(&self) { baz(); } }";
+        let fg = parse(src);
+        let cs = calls(&fg);
+        assert_eq!(cs.len(), 1, "expected 1 Calls edge, got {cs:?}");
+        let e = cs[0];
+        assert_eq!(e.to, "baz");
+        assert_eq!(
+            e.from, "/tmp/test.rs:Foo::bar",
+            "trait-impl inner call `from` must be the implementing type, not the trait"
+        );
+        assert_ne!(
+            e.from, "/tmp/test.rs:Trait::bar",
+            "trait-impl inner call must NOT use trait name as `from`"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5.4 — inheritance edges (impl Trait for Type)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn inherent_impl_produces_no_inheritance_edge() {
+        // `impl Foo { ... }` (no `trait` field) must not emit an Inherits
+        // edge; the INHERITANCE_QUERIES require both `type` AND `trait`.
+        let fg = parse("struct Foo; impl Foo { fn x(&self) {} }");
+        let is = inherits(&fg);
+        assert!(
+            is.is_empty(),
+            "inherent impl must produce zero Inherits edges, got {is:?}"
+        );
+    }
+
+    #[test]
+    fn trait_impl_produces_one_inheritance_edge() {
+        let fg = parse("trait Trait {} struct Foo; impl Trait for Foo {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 1, "expected 1 Inherits edge, got {is:?}");
+        let e = is[0];
+        assert_eq!(
+            e.from, "Foo",
+            "Inherits `from` must be the implementing type"
+        );
+        assert_eq!(
+            e.to, "Trait",
+            "Inherits `to` must be the trait being implemented"
+        );
+        assert_eq!(e.file, "/tmp/test.rs");
+        assert!(e.line >= 1, "line must be 1-indexed and populated");
+    }
+
+    #[test]
+    fn generic_trait_impl() {
+        // `impl<T> Trait for Vec<T> {}` — the `type` field text is `Vec<T>`
+        // (generics included as written in the source), and the `trait`
+        // field text is the bare `Trait`.
+        let fg = parse("trait Trait {} impl<T> Trait for Vec<T> {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 1, "expected 1 Inherits edge, got {is:?}");
+        let e = is[0];
+        assert_eq!(e.from, "Vec<T>", "type field text includes generics");
+        assert_eq!(e.to, "Trait");
+    }
+
+    #[test]
+    fn generic_impl_with_where_clause() {
+        // The `where` clause is a sibling of the `type`/`trait` fields and
+        // doesn't change their captured text.
+        let fg =
+            parse("trait Trait {} struct Foo<T>(T); impl<T> Trait for Foo<T> where T: Send {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 1, "expected 1 Inherits edge, got {is:?}");
+        let e = is[0];
+        assert_eq!(e.from, "Foo<T>");
+        assert_eq!(e.to, "Trait");
+    }
+
+    #[test]
+    fn multiple_trait_impls_per_type() {
+        // Each `impl Trait for Type {}` block is its own match → one
+        // Inherits edge per block.
+        let fg = parse("trait A {} trait B {} struct Foo; impl A for Foo {} impl B for Foo {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 2, "expected 2 Inherits edges, got {is:?}");
+        let pairs: Vec<(&str, &str)> = is
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("Foo", "A")),
+            "expected Foo -> A, got {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("Foo", "B")),
+            "expected Foo -> B, got {pairs:?}"
+        );
     }
 }
