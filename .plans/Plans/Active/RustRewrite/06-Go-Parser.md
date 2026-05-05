@@ -3,23 +3,23 @@ title: "Go Language Parser"
 type: phase
 plan: RustRewrite
 phase: 6
-status: planned
+status: in-progress
 created: 2026-04-28
-updated: 2026-04-30
+updated: 2026-05-05
 deliverable: "codegraph-lang-go crate parsing .go files with method-receiver extraction, structs, interfaces, all import forms, and direct + selector-expression call patterns; registered in the main binary; testdata/go/ + real-world validation"
 tasks:
   - id: "6.1"
     title: "codegraph-lang-go crate scaffold + queries.rs + Cargo.toml dependencies"
-    status: planned
+    status: complete
     verification: "`tree-sitter-go = \"=0.25.0\"` added to workspace `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention); `crates/codegraph-lang-go/Cargo.toml` `[dependencies]` populated (tree-sitter, tree-sitter-go, streaming-iterator, codegraph-core, codegraph-lang, thiserror, anyhow) and `[dev-dependencies]` populated (rstest, pretty_assertions, insta); `cargo build -p codegraph-lang-go` green before any parser code lands; `GoParser::new() -> anyhow::Result<GoParser>` compiles all queries against tree-sitter-go 0.25 without error; `extensions()` returns `[\".go\"]`; `id()` returns `Language::Go` (already defined in `crates/codegraph-core/src/lib.rs:29` from Phase 1 — no codegraph-core change needed); **object-safety + id() verified by a single `#[test] fn go_parser_is_object_safe_via_box_dyn() { let p: Box<dyn LanguagePlugin> = Box::new(GoParser::new().unwrap()); assert_eq!(p.id(), Language::Go); }` matching the Phase 1 C++ test at `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly**; `GoParser` does NOT override `resolve_call` or `resolve_include` — `resolve_call` accepts the default scope-aware heuristic; `resolve_include` accepts the default basename match against the FileIndex, which is a no-op for Go import paths because they are module paths (e.g. `\"github.com/sirupsen/logrus\"`), not filesystem paths — leaving them unresolved is the intended behavior; query categories: definitions (function_declaration, method_declaration with receiver, type_spec→struct_type, type_spec→interface_type, type_spec→type alias), calls (call_expression with identifier, call_expression with selector_expression), imports (import_spec with interpreted_string_literal), package_clause for namespace; helpers extract_receiver_type (handles pointer_type and value type_identifier), extract_package_name unit-tested"
   - id: "6.2"
     title: "Definition extraction with method receiver as parent"
-    status: planned
+    status: complete
     depends_on: ["6.1"]
     verification: "function_declaration → Kind=Function with no parent; method_declaration → Kind=Method with parent=receiver type name; receiver type extracted whether pointer (`func (s *Server) M()` → parent=Server) or value (`func (s Server) M()` → parent=Server); struct via type_spec+struct_type → Kind=Struct; interface via type_spec+interface_type → Kind=Interface; type alias (type ID = string) → Kind=Typedef; package name from package_clause populates Symbol.namespace; init() and main() functions extracted as ordinary functions; generic functions (Go 1.18+ `func Map[T any](...)` ) extracted without crash; signature truncated by shared truncate_signature; tests cover each case"
   - id: "6.3"
     title: "Call site extraction (direct + selector_expression)"
-    status: planned
+    status: in-progress
     depends_on: ["6.1"]
     verification: "Direct calls (foo()) via call_expression > function: identifier produce edge with To=callee name; method/package-qualified calls (obj.Method(), fmt.Println()) via call_expression > function: selector_expression > field: field_identifier produce edges with To=field name; chained calls (a.B().C()) produce 2 edges (To=B, To=C); go statements (go foo()) produce call edges naturally because the child of go_statement is a call_expression already matched by the query; defer statements likewise (defer conn.Close() → edge To=Close); call inside closure literal still produces edges with the enclosing function as From; tests for each pattern"
   - id: "6.4"
@@ -57,24 +57,24 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.1: codegraph-lang-go crate scaffold + queries.rs + Cargo.toml dependencies
 
 ### Subtasks
-- [ ] Add `tree-sitter-go = "=0.25.0"` to workspace `Cargo.toml` `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention)
-- [ ] `crates/codegraph-lang-go/Cargo.toml`:
+- [x] Add `tree-sitter-go = "=0.25.0"` to workspace `Cargo.toml` `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention)
+- [x] `crates/codegraph-lang-go/Cargo.toml`:
   - `[dependencies]`: tree-sitter, tree-sitter-go (workspace = true), streaming-iterator, codegraph-core, codegraph-lang, thiserror, anyhow
   - `[dev-dependencies]`: rstest, pretty_assertions, insta
-- [ ] **Compile gate:** `cargo build -p codegraph-lang-go` succeeds (empty crate, deps resolve) before any parser code is written
-- [ ] `GoParser` with cached Query objects (definitions, calls, imports)
-- [ ] `GoParser::new() -> anyhow::Result<GoParser>`
-- [ ] `extensions()` returns `[".go"]`
-- [ ] `id()` returns `Language::Go` — already defined in `crates/codegraph-core/src/lib.rs:29` (scaffolded in Phase 1); no `codegraph-core` change needed
-- [ ] **Default trait methods:** `GoParser` does NOT override `resolve_call` or `resolve_include`. Rationale: `resolve_call` accepts the default scope-aware heuristic matching the C++ pattern; `resolve_include` accepts the default basename match against the FileIndex, which is a no-op for Go import paths because they are module paths (e.g. `"github.com/sirupsen/logrus"`), not filesystem paths — leaving them unresolved is the intended behavior.
-- [ ] `queries.rs`:
+- [x] **Compile gate:** `cargo build -p codegraph-lang-go` succeeds (empty crate, deps resolve) before any parser code is written
+- [x] `GoParser` with cached Query objects (definitions, calls, imports)
+- [x] `GoParser::new() -> anyhow::Result<GoParser>`
+- [x] `extensions()` returns `[".go"]`
+- [x] `id()` returns `Language::Go` — already defined in `crates/codegraph-core/src/lib.rs:29` (scaffolded in Phase 1); no `codegraph-core` change needed
+- [x] **Default trait methods:** `GoParser` does NOT override `resolve_call` or `resolve_include`. Rationale: `resolve_call` accepts the default scope-aware heuristic matching the C++ pattern; `resolve_include` accepts the default basename match against the FileIndex, which is a no-op for Go import paths because they are module paths (e.g. `"github.com/sirupsen/logrus"`), not filesystem paths — leaving them unresolved is the intended behavior.
+- [x] `queries.rs`:
   - `DEFINITION_QUERIES`: function_declaration, method_declaration, type_spec with struct_type / interface_type, type_alias
   - `CALL_QUERIES`: identifier (direct), selector_expression (method/package-qualified)
   - `IMPORT_QUERIES`: import_spec with interpreted_string_literal
-- [ ] Helpers in `helpers.rs`:
+- [x] Helpers in `helpers.rs`:
   - `extract_receiver_type(receiver_node, content)` — handles `(parameter_list (parameter_declaration type: (pointer_type (type_identifier))))` and `(parameter_list (parameter_declaration type: (type_identifier)))`
   - `extract_package_name(root, content)` — finds `package_clause`
-- [ ] **Object-safety + id() test** in `#[cfg(test)] mod tests` (mirrors `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly):
+- [x] **Object-safety + id() test** in `#[cfg(test)] mod tests` (mirrors `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly):
   ```rust
   #[test]
   fn go_parser_is_object_safe_via_box_dyn() {
@@ -86,21 +86,21 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.2: Definition extraction with method receiver as parent
 
 ### Subtasks
-- [ ] `function_declaration` → Function, no parent
-- [ ] `method_declaration`:
+- [x] `function_declaration` → Function, no parent
+- [x] `method_declaration`:
   - Extract `receiver: parameter_list` field
   - Walk the parameter_declaration's `type` field
   - If `pointer_type`, descend into its child `type_identifier`
   - Otherwise read `type_identifier` directly
   - Set `Symbol.parent` to the type name
-- [ ] `type_spec` containing `struct_type` → Kind=Struct, name from `type_identifier`
-- [ ] `type_spec` containing `interface_type` → Kind=Interface
-- [ ] `type_spec` with non-struct/non-interface body → Kind=Typedef (e.g., `type ID = string`, `type Handler func(...)`)
-- [ ] `package_clause > (package_identifier)` → set Symbol.namespace (single-level; Go packages are flat)
-- [ ] Generic functions (Go 1.18+) — `function_declaration` carries a `type_parameters` field as a sibling of `name: (identifier)`. Confirm via a unit fixture: `func Map[T any](s []T) []T {}` → name=`Map`, Kind=Function, parent empty, signature truncates correctly via `truncate_signature` (which already handles bracketed type params before `{`)
-- [ ] init() and main() are ordinary functions
-- [ ] **Embedded struct fields produce NO Inherits edge.** `type Foo struct { Bar }` is structural composition (method-set promotion at runtime), not inheritance — no edge is emitted. Anti-regression test asserts a fixture with an embedded field yields zero `Inherits` edges.
-- [ ] Tests for each form, including value vs pointer receiver, exported vs unexported names, generic functions, embedded struct fields
+- [x] `type_spec` containing `struct_type` → Kind=Struct, name from `type_identifier`
+- [x] `type_spec` containing `interface_type` → Kind=Interface
+- [x] `type_spec` with non-struct/non-interface body → Kind=Typedef (e.g., `type ID = string`, `type Handler func(...)`)
+- [x] `package_clause > (package_identifier)` → set Symbol.namespace (single-level; Go packages are flat)
+- [x] Generic functions (Go 1.18+) — `function_declaration` carries a `type_parameters` field as a sibling of `name: (identifier)`. Confirm via a unit fixture: `func Map[T any](s []T) []T {}` → name=`Map`, Kind=Function, parent empty, signature truncates correctly via `truncate_signature` (which already handles bracketed type params before `{`)
+- [x] init() and main() are ordinary functions
+- [x] **Embedded struct fields produce NO Inherits edge.** `type Foo struct { Bar }` is structural composition (method-set promotion at runtime), not inheritance — no edge is emitted. Anti-regression test asserts a fixture with an embedded field yields zero `Inherits` edges.
+- [x] Tests for each form, including value vs pointer receiver, exported vs unexported names, generic functions, embedded struct fields
 
 ## 6.3: Call site extraction
 

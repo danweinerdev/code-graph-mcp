@@ -130,6 +130,67 @@ pub fn extract_package_name(root: Node<'_>, content: &[u8]) -> String {
     String::new()
 }
 
+/// Build a `path:fn_name` (free fn) or `path:Parent::fn_name` (method)
+/// symbol-ID anchor for the function enclosing `node`. Mirrors the C++/Rust
+/// plugins' `enclosing_function_id` and matches the [`codegraph_core::symbol_id`]
+/// shape produced by Phase 6.2's definition extractor so call edges' `from`
+/// fields line up exactly with definition IDs.
+///
+/// Behavior:
+/// - No enclosing `function_declaration` or `method_declaration` (e.g. a
+///   call inside a package-level closure assigned to a global, like
+///   `var H = func() { foo() }`) → returns `path` (the bare file path),
+///   matching the C++ lambda-at-global-scope rule.
+/// - `function_declaration` → returns `<path>:<fn_name>`.
+/// - `method_declaration` → returns `<path>:<ReceiverType>::<fn_name>`.
+///   Receiver-type extraction goes through [`extract_receiver_type`] so
+///   pointer / value / generic / anonymous receiver forms all collapse to
+///   the bare type name.
+/// - Closures (`func_literal`) are transparent: a call inside a closure
+///   walks past the closure node and reports the closure's enclosing
+///   `function_declaration` or `method_declaration` as the `from`. The
+///   parent-chain walk does not stop at closure boundaries.
+pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        match n.kind() {
+            "function_declaration" => {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(content).ok())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return path.to_owned();
+                }
+                return format!("{path}:{name}");
+            }
+            "method_declaration" => {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(content).ok())
+                    .unwrap_or("");
+                let parent = n
+                    .child_by_field_name("receiver")
+                    .map(|r| extract_receiver_type(r, content))
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return path.to_owned();
+                }
+                if parent.is_empty() {
+                    return format!("{path}:{name}");
+                }
+                return format!("{path}:{parent}::{name}");
+            }
+            _ => {}
+        }
+        current = n.parent();
+    }
+    // Fallback: package-level closure (e.g. `var H = func() { foo() }`) —
+    // no enclosing function/method declaration. Mirrors the C++ lambda-at-
+    // global-scope behavior: report the bare file path.
+    path.to_owned()
+}
+
 /// Truncate a signature at the first `{` or `;`, dropping the body and any
 /// trailing whitespace. Falls back to a 200-byte cutoff when neither marker
 /// is found, returning `<prefix>...`. Mirrors the C++ plugin's
@@ -327,5 +388,18 @@ mod tests {
             truncate_signature("func Foo()   \t\n{ return }"),
             "func Foo()"
         );
+    }
+
+    #[test]
+    fn truncate_signature_byte_fallback_300_chars() {
+        // 300 ASCII characters with no `{` or `;` — must hit the 200-byte
+        // fallback. Mirrors the C++ test at
+        // `crates/codegraph-lang-cpp/src/helpers.rs` so the Go copy carries
+        // the same regression coverage of the byte-cutoff branch.
+        let long = "a".repeat(300);
+        let got = truncate_signature(&long);
+        assert!(got.ends_with("..."), "expected trailing '...', got {got:?}");
+        // Prefix must be 200 bytes, plus the 3-byte "...".
+        assert_eq!(got.len(), 203);
     }
 }

@@ -3,7 +3,7 @@ title: "Rust Rewrite of code-graph-mcp"
 type: plan
 status: active
 created: 2026-04-28
-updated: 2026-04-29
+updated: 2026-05-05
 tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 related:
   - Designs/RustRewrite
@@ -42,7 +42,7 @@ phases:
     depends_on: [4]
   - id: 6
     title: "Go Language Parser"
-    status: planned
+    status: in-progress
     doc: "06-Go-Parser.md"
     depends_on: [5]
   - id: 7

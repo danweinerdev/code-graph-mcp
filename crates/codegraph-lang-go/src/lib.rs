@@ -15,7 +15,13 @@
 //! package-clause-as-namespace. Embedded struct fields produce no
 //! `Inherits` edge (anti-regression test in `tests` module).
 //!
-//! Phase 6.3 wires `extract_calls` (direct and selector_expression calls).
+//! Phase 6.3 wires `extract_calls` — direct calls, selector-expression
+//! calls (method / package-qualified / chained), `go` and `defer` statements
+//! (naturally captured because they wrap a `call_expression`), and calls
+//! inside closure literals (the enclosing function/method's symbol ID is
+//! recorded as the edge's `from`; package-level closures fall back to the
+//! file path).
+//!
 //! Phase 6.4 wires `extract_imports` (single, grouped, aliased, dot, blank).
 //! After 6.4, `parse_file` is fully populated and every extractor is live.
 //!
@@ -60,14 +66,16 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use codegraph_core::{FileGraph, Language, Symbol, SymbolKind};
+use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use codegraph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
-use crate::helpers::{extract_package_name, extract_receiver_type, truncate_signature};
+use crate::helpers::{
+    enclosing_function_id, extract_package_name, extract_receiver_type, truncate_signature,
+};
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES};
 
 /// File extensions the Go parser claims.
@@ -86,8 +94,7 @@ pub struct GoParser {
     language: TsLanguage,
     /// Compiled definition query (wired in Phase 6.2).
     def_query: Query,
-    /// Compiled call query.
-    #[allow(dead_code)] // wired in Phase 6.3
+    /// Compiled call query (wired in Phase 6.3).
     call_query: Query,
     /// Compiled import query.
     #[allow(dead_code)] // wired in Phase 6.4
@@ -128,9 +135,11 @@ impl GoParser {
     }
 
     /// Parse `content` (UTF-8 bytes) as Go and produce a [`FileGraph`].
-    /// Used internally by [`Self::parse_file`] (the trait method) and by
-    /// the inline tests; kept crate-private so the public surface stays
-    /// the trait method.
+    /// Internal entry point for [`Self::parse_file`] (the trait method);
+    /// kept crate-private so the public surface stays the trait method
+    /// while each per-extractor method (`extract_definitions`,
+    /// `extract_calls`, future `extract_imports`) can be tested via
+    /// `parse_file` without exposing them.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -145,7 +154,8 @@ impl GoParser {
         };
 
         self.extract_definitions(root, content, &path_str, &package_name, &mut fg);
-        // Phases 6.3 and 6.4 will populate calls and imports respectively.
+        self.extract_calls(root, content, &path_str, &mut fg);
+        // Phase 6.4 will populate imports.
 
         Ok(fg)
     }
@@ -205,6 +215,13 @@ impl GoParser {
             // interface_type vs other) to pick the right SymbolKind, so
             // collect it once per match before dispatching on capture
             // names. type_alias matches don't contribute (always Typedef).
+            //
+            // The scan is unconditional (not gated on match-pattern) for
+            // simplicity — at most a handful of captures per match, with
+            // an early `break` the moment `type.body` is found, so the
+            // cost on non-type matches (func/method/alias/package) is
+            // bounded by the per-match capture count and is not worth
+            // gating on the matched query pattern.
             let mut type_body_kind: Option<&str> = None;
             for capture in m.captures {
                 let cap_name = capture_name_for_index(cap_names, capture.index);
@@ -321,6 +338,74 @@ impl GoParser {
             }
         }
     }
+
+    /// Run the call query and produce `Calls` edges. Mirrors the C++/Rust
+    /// plugins' `extract_calls`: each capture is a callee identifier, the
+    /// line is anchored at the enclosing `call_expression`, and the `from`
+    /// field is built by [`enclosing_function_id`] so it matches the
+    /// `symbol_id()` shape produced by [`Self::extract_definitions`].
+    ///
+    /// Per-capture-name behavior:
+    ///
+    /// - `call.name` from the direct-call pattern (`function: identifier`)
+    ///   → edge `to` = identifier text (the callee name).
+    /// - `call.name` from the selector pattern (`function: selector_expression
+    ///   > field: field_identifier`) → edge `to` = field text. This handles
+    ///   method calls (`obj.M()`), package-qualified calls (`fmt.Println()`),
+    ///   and chained calls (`a.B().C()`). For chains, tree-sitter produces
+    ///   one `call_expression` per chain link, each with its own selector,
+    ///   so two edges fall out naturally for `a.B().C()` (one for `B`, one
+    ///   for `C`).
+    ///
+    /// `go foo()` and `defer conn.Close()` produce edges naturally because
+    /// the child of `go_statement` / `defer_statement` is a `call_expression`
+    /// already matched by the queries — no special-casing.
+    ///
+    /// Closures (function literals, `func_literal`) are walked transparently
+    /// by [`enclosing_function_id`]: a call inside a closure body reports
+    /// the closure's enclosing `function_declaration` or `method_declaration`
+    /// as the `from`. A closure at package level (e.g. `var H = func() { foo() }`)
+    /// has no enclosing function, so the `from` falls back to the file path
+    /// — matching the C++ lambda-at-global-scope behavior.
+    fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.call_query, root, content);
+        let cap_names = self.call_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "call.name" {
+                    continue;
+                }
+
+                let callee = cap_node.utf8_text(content).unwrap_or("");
+                if callee.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing call_expression so the
+                // reported line tracks the call site, not the inner
+                // identifier (which can be on a continuation line for
+                // multi-line chains).
+                let call_node =
+                    find_enclosing_kind(cap_node, "call_expression").unwrap_or(cap_node);
+                let from = enclosing_function_id(cap_node, content, path);
+
+                fg.edges.push(Edge {
+                    from,
+                    to: callee.to_owned(),
+                    kind: EdgeKind::Calls,
+                    file: path.to_owned(),
+                    line: call_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for GoParser {
@@ -334,8 +419,8 @@ impl LanguagePlugin for GoParser {
 
     /// Parse `content` (UTF-8 bytes) as Go and produce a [`FileGraph`].
     ///
-    /// Phase 6.2 wires definition extraction; calls (6.3) and imports
-    /// (6.4) are still stubbed to empty.
+    /// Phases 6.2 (definitions) and 6.3 (calls) are wired; imports (6.4)
+    /// are still stubbed to empty.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -415,10 +500,10 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 6.1 structural smoke tests + Phase 6.2 definition extraction
-    //! coverage. Behavioral coverage for calls (6.3) and imports (6.4)
-    //! lands alongside the corresponding `extract_*` loops.
+    //! + Phase 6.3 call extraction coverage. Behavioral coverage for
+    //!   imports (6.4) lands alongside that extractor.
     use super::*;
-    use codegraph_core::{symbol_id, EdgeKind};
+    use codegraph_core::{symbol_id, Edge, EdgeKind};
 
     // ----------------------------------------------------------------
     // Phase 6.1 — structural smoke tests
@@ -732,5 +817,156 @@ func Helper() {}
         let fg = parse("package server\nfunc Public() {}\nfunc private() {}\n");
         assert_eq!(sym(&fg, "Public").kind, SymbolKind::Function);
         assert_eq!(sym(&fg, "private").kind, SymbolKind::Function);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 6.3 — call extraction
+    // ----------------------------------------------------------------
+
+    /// Filter `Calls` edges from a FileGraph for assertion convenience.
+    fn calls(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect()
+    }
+
+    #[test]
+    fn direct_call_in_free_function_produces_one_edge() {
+        // `func f() { foo() }` → 1 edge; To=foo; From=path:f.
+        let fg = parse("package main\nfunc f() { foo() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "foo");
+        assert_eq!(edges[0].from, "/tmp/test.go:f");
+        assert_eq!(edges[0].file, "/tmp/test.go");
+    }
+
+    #[test]
+    fn selector_call_in_free_function_records_field_name_only() {
+        // `func f() { s.Start() }` → 1 edge; To=Start (field name only).
+        let fg = parse("package main\nfunc f() { s.Start() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "Start");
+        assert_eq!(edges[0].from, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn package_qualified_call_records_field_name_only() {
+        // `func f() { fmt.Println("x") }` → 1 edge; To=Println.
+        let fg = parse("package main\nfunc f() { fmt.Println(\"x\") }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "Println");
+        assert_eq!(edges[0].from, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn method_call_inside_method_uses_receiver_qualified_from() {
+        // `func (s *Server) M() { s.Start() }` → 1 edge; To=Start;
+        // From=path:Server::M.
+        let fg = parse("package main\nfunc (s *Server) M() { s.Start() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "Start");
+        assert_eq!(edges[0].from, "/tmp/test.go:Server::M");
+    }
+
+    #[test]
+    fn go_statement_call_is_captured_naturally() {
+        // `go handler()` — the child of go_statement is a call_expression
+        // already matched by the direct-call query, so no special-casing
+        // is needed.
+        let fg = parse("package main\nfunc f() { go handler() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "handler");
+        assert_eq!(edges[0].from, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn defer_statement_call_is_captured_naturally() {
+        // `defer conn.Close()` — defer_statement's child is the
+        // call_expression; the selector-pattern query matches the field.
+        let fg = parse("package main\nfunc f() { defer conn.Close() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "Close");
+        assert_eq!(edges[0].from, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn chained_call_produces_two_edges_one_per_link() {
+        // `a.B().C()` — tree-sitter produces nested call_expression nodes,
+        // each with its own selector_expression. Two edges fall out
+        // naturally: outer match To=C, inner match To=B.
+        let fg = parse("package main\nfunc f() { a.B().C() }\n");
+        let edges = calls(&fg);
+        let to: std::collections::HashSet<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected exactly 2 Calls edges (one per chain link): {edges:?}"
+        );
+        assert!(
+            to.contains("B") && to.contains("C"),
+            "edges must cover both B and C, got: {to:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.from, "/tmp/test.go:f", "all chain edges share the From");
+        }
+    }
+
+    #[test]
+    fn call_inside_local_closure_attributes_to_enclosing_function() {
+        // `func f() { fn := func() { inner() }; fn() }` — the call to
+        // `inner` is inside a closure (`func_literal`) inside f. The
+        // enclosing-walk must skip past the closure and report
+        // From=path:f. The trailing `fn()` is also a call edge to fn.
+        let src = "package main\nfunc f() { fn := func() { inner() }; fn() }\n";
+        let fg = parse(src);
+        let edges = calls(&fg);
+        let inner: Vec<_> = edges.iter().filter(|e| e.to == "inner").collect();
+        assert!(
+            !inner.is_empty(),
+            "expected at least one edge with To=inner, got: {edges:?}"
+        );
+        for e in &inner {
+            assert_eq!(
+                e.from, "/tmp/test.go:f",
+                "closure-body call must attribute to enclosing fn"
+            );
+        }
+    }
+
+    /// CRITICAL anti-regression for the package-level closure fallback.
+    /// `var H = func() { foo() }` has no enclosing `function_declaration`
+    /// or `method_declaration` — the call to `foo` lives inside a
+    /// `func_literal` directly under the source-file root (via
+    /// `var_declaration`). The walk must reach the root and fall back to
+    /// the bare file path as `from`. Mirrors the C++ lambda-at-global-scope
+    /// behavior.
+    #[test]
+    fn package_level_closure_call_uses_file_path_as_from() {
+        let fg = parse("package main\nvar H = func() { foo() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "foo");
+        assert_eq!(
+            edges[0].from, "/tmp/test.go",
+            "package-level closure must fall back to the bare file path"
+        );
+    }
+
+    #[test]
+    fn empty_function_body_produces_no_call_edges() {
+        // Sanity: a function with no calls produces zero Calls edges.
+        let fg = parse("package main\nfunc f() {}\n");
+        assert!(
+            calls(&fg).is_empty(),
+            "empty body must yield no Calls edges, got: {:?}",
+            fg.edges
+        );
     }
 }
