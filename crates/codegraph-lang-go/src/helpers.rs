@@ -24,16 +24,26 @@ use tree_sitter::Node;
 /// Extract the receiver-type name from a `method_declaration`'s `receiver`
 /// field (a `parameter_list` containing one `parameter_declaration`).
 ///
-/// Handles both forms:
+/// Handles all receiver forms produced by tree-sitter-go 0.25:
 /// - Pointer receiver: `func (s *Server) M()` → `parameter_declaration.type`
 ///   is a `pointer_type` whose child is a `type_identifier` → returns
 ///   `"Server"`.
 /// - Value receiver: `func (s Server) M()` → `parameter_declaration.type` is
 ///   a `type_identifier` directly → returns `"Server"`.
+/// - Generic pointer receiver: `func (s *Server[T]) M()` →
+///   `pointer_type → generic_type → type_identifier` → returns `"Server"`.
+///   The generic-type arguments are dropped; only the bare type name is
+///   recorded so symbol IDs and call-resolution lookups stay textual.
+/// - Generic value receiver: `func (s Server[T]) M()` →
+///   `generic_type → type_identifier` → returns `"Server"`.
+/// - Anonymous receivers (no parameter name): `func (*Foo) M()` and
+///   `func (Foo) M()` — the parameter_declaration's `type` field may be
+///   absent in this form; tree-sitter-go parses the bare type as a single
+///   nameless `parameter_declaration` whose first named child is the
+///   type. The fallback path below handles both.
 ///
 /// Returns the empty string if the receiver shape is unexpected (defensive:
 /// matches the C++ extractor's posture toward malformed AST).
-#[allow(dead_code)] // wired in Phase 6.2
 pub fn extract_receiver_type(receiver: Node<'_>, content: &[u8]) -> String {
     // Find the (first) parameter_declaration child of the parameter_list.
     let mut cursor = receiver.walk();
@@ -44,28 +54,53 @@ pub fn extract_receiver_type(receiver: Node<'_>, content: &[u8]) -> String {
         return String::new();
     };
 
-    // The parameter_declaration's `type` field is either a pointer_type
-    // (whose child is a type_identifier) or a type_identifier directly.
-    let Some(type_node) = param_decl.child_by_field_name("type") else {
+    // Prefer the `type` field when present; fall back to the first named
+    // child for anonymous receivers (`func (*Foo) M()` or `func (Foo) M()`)
+    // where tree-sitter-go records the type as the parameter_declaration's
+    // sole child rather than under a `type` field.
+    let type_node = param_decl
+        .child_by_field_name("type")
+        .or_else(|| param_decl.named_child(0));
+    let Some(type_node) = type_node else {
         return String::new();
     };
 
+    receiver_type_name(type_node, content)
+}
+
+/// Resolve a receiver-type AST node to its bare type-identifier text.
+///
+/// Centralises the descent rules used by [`extract_receiver_type`] so that
+/// pointer-of-generic and bare-generic forms share the same logic. Returns
+/// the empty string on any unexpected shape (matches the parent function's
+/// defensive posture).
+fn receiver_type_name(type_node: Node<'_>, content: &[u8]) -> String {
     match type_node.kind() {
+        "type_identifier" => type_node.utf8_text(content).unwrap_or("").to_owned(),
         "pointer_type" => {
             // Descend into the pointer's inner type. The first named child is
-            // the pointee type. For `*Server` this is a `type_identifier`.
+            // the pointee type — either a bare `type_identifier` (`*Server`)
+            // or a `generic_type` (`*Server[T]`).
             let mut cursor = type_node.walk();
             let inner = type_node.named_children(&mut cursor).next();
             match inner {
-                Some(n) if n.kind() == "type_identifier" => {
-                    n.utf8_text(content).unwrap_or("").to_owned()
-                }
-                _ => String::new(),
+                Some(n) => receiver_type_name(n, content),
+                None => String::new(),
             }
         }
-        "type_identifier" => type_node.utf8_text(content).unwrap_or("").to_owned(),
-        // Any other shape (e.g. generic type instantiation) — defensive
-        // fallback to empty.
+        "generic_type" => {
+            // `generic_type` wraps a `type_identifier` (the bare type name)
+            // followed by `type_arguments`. Drop the arguments and record
+            // only the bare type name so receiver lookups stay textual.
+            let mut cursor = type_node.walk();
+            let ident = type_node
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "type_identifier");
+            match ident {
+                Some(n) => n.utf8_text(content).unwrap_or("").to_owned(),
+                None => String::new(),
+            }
+        }
         _ => String::new(),
     }
 }
@@ -77,7 +112,6 @@ pub fn extract_receiver_type(receiver: Node<'_>, content: &[u8]) -> String {
 ///
 /// Returns the empty string if no `package_clause` is found (e.g. a
 /// pathological fixture or partial parse).
-#[allow(dead_code)] // wired in Phase 6.2
 pub fn extract_package_name(root: Node<'_>, content: &[u8]) -> String {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -105,7 +139,6 @@ pub fn extract_package_name(root: Node<'_>, content: &[u8]) -> String {
 /// The cutoff is computed via `char_indices`, so the slice boundary is
 /// guaranteed to land on a UTF-8 char boundary by construction. Multi-byte
 /// content past 200 bytes does not panic.
-#[allow(dead_code)] // wired in Phase 6.2
 pub fn truncate_signature(s: &str) -> String {
     for (i, c) in s.char_indices() {
         if c == '{' || c == ';' {
@@ -188,6 +221,52 @@ mod tests {
         assert_eq!(extract_receiver_type(receiver, src.as_bytes()), "Foo");
     }
 
+    #[test]
+    fn extract_receiver_type_anonymous_receiver_value() {
+        // Anonymous value receiver: `func (Foo) M() {}` — no parameter name,
+        // bare type_identifier as receiver. Mirrors the pointer-anonymous
+        // test for the value form. The helper's `named_child(0)` fallback
+        // path catches the receiver type when no `type` field is set.
+        let src = "package main\nfunc (Foo) M() {}\n";
+        let tree = parse(src);
+        let method =
+            find_first(tree.root_node(), "method_declaration").expect("method_declaration");
+        let receiver = method
+            .child_by_field_name("receiver")
+            .expect("receiver field");
+        assert_eq!(extract_receiver_type(receiver, src.as_bytes()), "Foo");
+    }
+
+    #[test]
+    fn extract_receiver_type_generic_pointer_form() {
+        // Generic pointer receiver: `func (s *Server[T]) M() {}`.
+        // tree-sitter-go parses this as pointer_type → generic_type →
+        // type_identifier. The helper drops the generic arguments and
+        // records the bare type name "Server".
+        let src = "package main\nfunc (s *Server[T]) M() {}\n";
+        let tree = parse(src);
+        let method =
+            find_first(tree.root_node(), "method_declaration").expect("method_declaration");
+        let receiver = method
+            .child_by_field_name("receiver")
+            .expect("receiver field");
+        assert_eq!(extract_receiver_type(receiver, src.as_bytes()), "Server");
+    }
+
+    #[test]
+    fn extract_receiver_type_generic_value_form() {
+        // Generic value receiver: `func (s Server[T]) M() {}` —
+        // generic_type → type_identifier. Same bare-name extraction rule.
+        let src = "package main\nfunc (s Server[T]) M() {}\n";
+        let tree = parse(src);
+        let method =
+            find_first(tree.root_node(), "method_declaration").expect("method_declaration");
+        let receiver = method
+            .child_by_field_name("receiver")
+            .expect("receiver field");
+        assert_eq!(extract_receiver_type(receiver, src.as_bytes()), "Server");
+    }
+
     // ---- extract_package_name ---------------------------------------------
 
     #[test]
@@ -220,25 +299,33 @@ mod tests {
 
     // ---- truncate_signature -----------------------------------------------
     //
-    // These three tests are byte-identical to the corresponding tests in
-    // `codegraph-lang-rust/src/helpers.rs` (which are in turn byte-identical
-    // to the C++ copies). Keeping them in lockstep is the cheap insurance
-    // against a drift between language plugins.
+    // The function itself is language-agnostic and is byte-identical to the
+    // C++ and Rust copies. The test inputs here are Go-idiomatic so the
+    // coverage matches the language this crate parses; the underlying
+    // truncation logic is exercised the same way regardless of input
+    // language.
 
     #[test]
     fn truncate_signature_stops_at_brace() {
-        // Body opener strips for fn signatures.
-        assert_eq!(truncate_signature("fn foo() { return; }"), "fn foo()");
+        // Body opener strips for func signatures.
+        assert_eq!(truncate_signature("func Foo() { return }"), "func Foo()");
     }
 
     #[test]
     fn truncate_signature_stops_at_semicolon() {
-        // Trait method declarations end in `;` (function_signature_item).
-        assert_eq!(truncate_signature("fn foo();"), "fn foo()");
+        // Go uses semicolons rarely (gofmt strips them), but the function
+        // is language-agnostic — keep coverage of the `;` branch with a
+        // valid Go statement. Single-line `for` clauses contain `;`s but
+        // truncate_signature stops at the FIRST one, so a top-level
+        // semicolon-terminated declaration is the cleanest fixture.
+        assert_eq!(truncate_signature("var x int;"), "var x int");
     }
 
     #[test]
     fn truncate_signature_trims_trailing_whitespace_before_brace() {
-        assert_eq!(truncate_signature("fn foo()   \t\n{ return; }"), "fn foo()");
+        assert_eq!(
+            truncate_signature("func Foo()   \t\n{ return }"),
+            "func Foo()"
+        );
     }
 }
