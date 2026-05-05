@@ -22,8 +22,9 @@
 //! recorded as the edge's `from`; package-level closures fall back to the
 //! file path).
 //!
-//! Phase 6.4 wires `extract_imports` (single, grouped, aliased, dot, blank).
-//! After 6.4, `parse_file` is fully populated and every extractor is live.
+//! Phase 6.4 wires `extract_imports` (single, grouped, aliased, dot, blank
+//! — quotes stripped, alias names dropped). With 6.4 wired, `parse_file`
+//! is fully populated and every extractor is live.
 //!
 //! # Default trait methods
 //!
@@ -96,8 +97,7 @@ pub struct GoParser {
     def_query: Query,
     /// Compiled call query (wired in Phase 6.3).
     call_query: Query,
-    /// Compiled import query.
-    #[allow(dead_code)] // wired in Phase 6.4
+    /// Compiled import query (wired in Phase 6.4).
     import_query: Query,
 }
 
@@ -138,8 +138,8 @@ impl GoParser {
     /// Internal entry point for [`Self::parse_file`] (the trait method);
     /// kept crate-private so the public surface stays the trait method
     /// while each per-extractor method (`extract_definitions`,
-    /// `extract_calls`, future `extract_imports`) can be tested via
-    /// `parse_file` without exposing them.
+    /// `extract_calls`, `extract_imports`) can be tested via `parse_file`
+    /// without exposing them.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -155,7 +155,7 @@ impl GoParser {
 
         self.extract_definitions(root, content, &path_str, &package_name, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
-        // Phase 6.4 will populate imports.
+        self.extract_imports(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -406,6 +406,87 @@ impl GoParser {
             }
         }
     }
+
+    /// Run the import query and produce `Includes` edges. Mirrors the C++
+    /// plugin's `extract_includes` and the Rust plugin's `extract_uses`:
+    /// the edge `from` is the source-file path (not a symbol ID) and the
+    /// `to` is the import path with the surrounding double quotes stripped.
+    /// The `Graph` engine routes `Includes` edges into a per-file map keyed
+    /// by `from` (see `Graph::merge_file_graph`).
+    ///
+    /// Per-capture behavior:
+    ///
+    /// - `import.path` — the `path` field of an `import_spec`, which is
+    ///   always an `interpreted_string_literal` whose text includes the
+    ///   surrounding `"`s. We strip the quotes to record the bare module
+    ///   path. The line is anchored at the enclosing `import_declaration`
+    ///   so all paths from a single grouped `import (...)` block share the
+    ///   same line number.
+    ///
+    /// All Go import forms parse as `import_spec` with the same `path`
+    /// field, so a single capture covers them all:
+    ///
+    /// - Single: `import "fmt"` → 1 edge, `to = "fmt"`.
+    /// - Grouped: `import ( "fmt"; "os" )` → 2 edges (one per inner
+    ///   `import_spec`).
+    /// - Aliased: `import f "fmt"` — the `name: package_identifier` field
+    ///   carries the alias and the `path` carries the module path. We
+    ///   capture the path only, so `to = "fmt"` (alias dropped).
+    /// - Dot: `import . "testing"` — the `name` field is the literal `.`;
+    ///   we ignore it and record `to = "testing"`.
+    /// - Blank: `import _ "image/png"` — the `name` field is `_`; we
+    ///   ignore it and record `to = "image/png"`.
+    ///
+    /// Backtick-delimited (`raw_string_literal`) import paths are valid
+    /// grammar but not idiomatic and not produced by `gofmt`; the import
+    /// query intentionally only matches `interpreted_string_literal`. See
+    /// the `IMPORT_QUERIES` doc-comment in `queries.rs`.
+    fn extract_imports(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.import_query, root, content);
+        let cap_names = self.import_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "import.path" {
+                    continue;
+                }
+
+                // Strip the surrounding double quotes from the
+                // interpreted_string_literal text. Defensive: if the literal
+                // is malformed and lacks the expected quotes, fall back to
+                // the raw text rather than panicking.
+                let raw = cap_node.utf8_text(content).unwrap_or("");
+                let to = raw
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(raw)
+                    .to_owned();
+                if to.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing import_declaration so
+                // every path from one grouped `import (...)` shares a line.
+                let line_node =
+                    find_enclosing_kind(cap_node, "import_declaration").unwrap_or(cap_node);
+                let line = line_node.start_position().row as u32 + 1;
+
+                fg.edges.push(Edge {
+                    from: path.to_owned(),
+                    to,
+                    kind: EdgeKind::Includes,
+                    file: path.to_owned(),
+                    line,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for GoParser {
@@ -419,8 +500,8 @@ impl LanguagePlugin for GoParser {
 
     /// Parse `content` (UTF-8 bytes) as Go and produce a [`FileGraph`].
     ///
-    /// Phases 6.2 (definitions) and 6.3 (calls) are wired; imports (6.4)
-    /// are still stubbed to empty.
+    /// All three extractors are wired: definitions (6.2), calls (6.3), and
+    /// imports (6.4).
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -500,8 +581,7 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 6.1 structural smoke tests + Phase 6.2 definition extraction
-    //! + Phase 6.3 call extraction coverage. Behavioral coverage for
-    //!   imports (6.4) lands alongside that extractor.
+    //! + Phase 6.3 call extraction + Phase 6.4 import extraction coverage.
     use super::*;
     use codegraph_core::{symbol_id, Edge, EdgeKind};
 
@@ -924,20 +1004,31 @@ func Helper() {}
         // `inner` is inside a closure (`func_literal`) inside f. The
         // enclosing-walk must skip past the closure and report
         // From=path:f. The trailing `fn()` is also a call edge to fn.
+        // Design intent is exactly two edges total: one for `inner`
+        // (inside the closure body) and one for `fn` (in f's body).
         let src = "package main\nfunc f() { fn := func() { inner() }; fn() }\n";
         let fg = parse(src);
         let edges = calls(&fg);
         let inner: Vec<_> = edges.iter().filter(|e| e.to == "inner").collect();
-        assert!(
-            !inner.is_empty(),
-            "expected at least one edge with To=inner, got: {edges:?}"
+        let fn_edges: Vec<_> = edges.iter().filter(|e| e.to == "fn").collect();
+        assert_eq!(
+            inner.len(),
+            1,
+            "expected exactly 1 edge with To=inner (closure-body call), got: {edges:?}"
         );
-        for e in &inner {
-            assert_eq!(
-                e.from, "/tmp/test.go:f",
-                "closure-body call must attribute to enclosing fn"
-            );
-        }
+        assert_eq!(
+            fn_edges.len(),
+            1,
+            "expected exactly 1 edge with To=fn (the closure invocation in f's body), got: {edges:?}"
+        );
+        assert_eq!(
+            inner[0].from, "/tmp/test.go:f",
+            "closure-body call must attribute to enclosing fn"
+        );
+        assert_eq!(
+            fn_edges[0].from, "/tmp/test.go:f",
+            "fn() in f's body must attribute to f"
+        );
     }
 
     /// CRITICAL anti-regression for the package-level closure fallback.
@@ -966,6 +1057,150 @@ func Helper() {}
         assert!(
             calls(&fg).is_empty(),
             "empty body must yield no Calls edges, got: {:?}",
+            fg.edges
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 6.4 — import extraction
+    // ----------------------------------------------------------------
+
+    /// Filter `Includes` edges from a FileGraph for assertion convenience.
+    fn includes(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    #[test]
+    fn single_import_produces_one_includes_edge_with_quotes_stripped() {
+        // `import "fmt"` → 1 edge, To=fmt, Kind=Includes, From=path.
+        let fg = parse("package main\nimport \"fmt\"\n");
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly 1 Includes edge: {edges:?}"
+        );
+        assert_eq!(edges[0].to, "fmt");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+        assert_eq!(edges[0].from, "/tmp/test.go");
+        assert_eq!(edges[0].file, "/tmp/test.go");
+    }
+
+    #[test]
+    fn grouped_import_produces_one_edge_per_spec() {
+        // `import ( "fmt"; "os" )` → 2 edges, one per inner import_spec.
+        let src = "package main\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n";
+        let fg = parse(src);
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected exactly 2 Includes edges (one per spec): {edges:?}"
+        );
+        let to: std::collections::HashSet<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(
+            to.contains("fmt") && to.contains("os"),
+            "edges must cover both fmt and os, got: {to:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.kind, EdgeKind::Includes);
+            assert_eq!(e.from, "/tmp/test.go");
+        }
+    }
+
+    #[test]
+    fn aliased_import_records_path_not_alias() {
+        // `import f "fmt"` — alias "f" lives in `name: package_identifier`,
+        // path "fmt" lives in `path: interpreted_string_literal`. Capture
+        // the path; alias is dropped.
+        let fg = parse("package main\nimport f \"fmt\"\n");
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly 1 Includes edge: {edges:?}"
+        );
+        assert_eq!(
+            edges[0].to, "fmt",
+            "aliased import must record path, not alias"
+        );
+        assert_ne!(edges[0].to, "f", "alias must NOT appear as the To");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn dot_import_records_path_only() {
+        // `import . "testing"` — name is the literal dot; path is the
+        // module path. Capture the path.
+        let fg = parse("package main\nimport . \"testing\"\n");
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly 1 Includes edge: {edges:?}"
+        );
+        assert_eq!(edges[0].to, "testing");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn blank_import_records_path_only() {
+        // `import _ "image/png"` — name is `_` (blank identifier); path
+        // is the module path. Capture the path.
+        let fg = parse("package main\nimport _ \"image/png\"\n");
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly 1 Includes edge: {edges:?}"
+        );
+        assert_eq!(edges[0].to, "image/png");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn grouped_import_with_alias_dot_blank_records_paths_only() {
+        // Mixed grouped block exercising every import-spec form in one
+        // statement: alias, dot, blank, plain. Every edge captures the
+        // path; aliases / `.` / `_` are all dropped. The line is anchored
+        // at the enclosing import_declaration so all four edges share a
+        // line.
+        let src = "package main\nimport (\n\tf \"fmt\"\n\t. \"testing\"\n\t_ \"image/png\"\n\t\"os\"\n)\n";
+        let fg = parse(src);
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            4,
+            "expected 4 Includes edges (one per spec): {edges:?}"
+        );
+        let to: std::collections::HashSet<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        for expected in ["fmt", "testing", "image/png", "os"] {
+            assert!(
+                to.contains(expected),
+                "edges must include {expected:?}, got: {to:?}"
+            );
+        }
+        // Aliases / blank / dot must NOT leak into the To field.
+        assert!(
+            !to.contains("f") && !to.contains("_") && !to.contains("."),
+            "alias / blank / dot must not appear as To, got: {to:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.kind, EdgeKind::Includes);
+            assert_eq!(e.from, "/tmp/test.go");
+        }
+    }
+
+    #[test]
+    fn no_import_block_produces_no_includes_edges() {
+        // Sanity: a file with no imports produces zero Includes edges.
+        let fg = parse("package main\nfunc f() {}\n");
+        assert!(
+            includes(&fg).is_empty(),
+            "expected zero Includes edges, got: {:?}",
             fg.edges
         );
     }

@@ -19,12 +19,12 @@ tasks:
     verification: "function_declaration → Kind=Function with no parent; method_declaration → Kind=Method with parent=receiver type name; receiver type extracted whether pointer (`func (s *Server) M()` → parent=Server) or value (`func (s Server) M()` → parent=Server); struct via type_spec+struct_type → Kind=Struct; interface via type_spec+interface_type → Kind=Interface; type alias (type ID = string) → Kind=Typedef; package name from package_clause populates Symbol.namespace; init() and main() functions extracted as ordinary functions; generic functions (Go 1.18+ `func Map[T any](...)` ) extracted without crash; signature truncated by shared truncate_signature; tests cover each case"
   - id: "6.3"
     title: "Call site extraction (direct + selector_expression)"
-    status: in-progress
+    status: complete
     depends_on: ["6.1"]
     verification: "Direct calls (foo()) via call_expression > function: identifier produce edge with To=callee name; method/package-qualified calls (obj.Method(), fmt.Println()) via call_expression > function: selector_expression > field: field_identifier produce edges with To=field name; chained calls (a.B().C()) produce 2 edges (To=B, To=C); go statements (go foo()) produce call edges naturally because the child of go_statement is a call_expression already matched by the query; defer statements likewise (defer conn.Close() → edge To=Close); call inside closure literal still produces edges with the enclosing function as From; tests for each pattern"
   - id: "6.4"
     title: "Import extraction"
-    status: planned
+    status: in-progress
     depends_on: ["6.1"]
     verification: "Single import (import \"fmt\") → 1 edge with To='fmt' (quotes stripped); grouped import (import ( \"fmt\"; \"os\" )) → 2 edges; aliased import (import f \"fmt\") → 1 edge with To='fmt' (path preserved, alias dropped); dot import (import . \"testing\") → 1 edge with To='testing'; blank import (import _ \"image/png\") → 1 edge with To='image/png'; relative imports not applicable in Go (modules system handles this); each edge has Kind=Includes; tests cover every form"
   - id: "6.5"
@@ -105,13 +105,13 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.3: Call site extraction
 
 ### Subtasks
-- [ ] `extract_calls`:
+- [x] `extract_calls`:
   - `call_expression > function: identifier` → direct call (To = identifier text)
   - `call_expression > function: selector_expression > field: field_identifier` → method or package-qualified call (To = field text)
-- [ ] Enclosing function: walk up from the call node to `function_declaration` or `method_declaration`; extract function name; build From = `path:funcName` or `path:Parent::Name` for methods. **Fallback: if the walk reaches the source file root without finding a function/method declaration (e.g., a call inside a package-level closure assigned to a global: `var H = func() { foo() }`), set From = the file path.** Matches the C++ lambda-at-global-scope behavior.
-- [ ] `go` and `defer` statements naturally captured because they wrap a `call_expression` that the query already matches
-- [ ] Closures (function literals) — calls inside them have the enclosing top-level function as From
-- [ ] Tests:
+- [x] Enclosing function: walk up from the call node to `function_declaration` or `method_declaration`; extract function name; build From = `path:funcName` or `path:Parent::Name` for methods. **Fallback: if the walk reaches the source file root without finding a function/method declaration (e.g., a call inside a package-level closure assigned to a global: `var H = func() { foo() }`), set From = the file path.** Matches the C++ lambda-at-global-scope behavior.
+- [x] `go` and `defer` statements naturally captured because they wrap a `call_expression` that the query already matches
+- [x] Closures (function literals) — calls inside them have the enclosing top-level function as From
+- [x] Tests:
   - `func f() { foo() }` → edge To=foo
   - `func f() { s.Start() }` → edge To=Start
   - `func f() { fmt.Println("x") }` → edge To=Println

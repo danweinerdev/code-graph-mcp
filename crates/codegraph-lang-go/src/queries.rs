@@ -71,17 +71,23 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 ///
 /// `go` and `defer` statements wrap a `call_expression` directly, so the same
 /// queries naturally cover `go foo()` and `defer conn.Close()`.
+///
+/// Only `@call.name` is captured — `extract_calls` consumes that single
+/// capture and re-anchors the line by walking up to the enclosing
+/// `call_expression` via [`crate::find_enclosing_kind`]. We deliberately do
+/// not bind a `@call.expr` capture on the outer `call_expression`: it would
+/// be emitted on every match but never read, so it is dead weight.
 pub(crate) const CALL_QUERIES: &str = r#"
 ; Direct call: foo()
 (call_expression
-  function: (identifier) @call.name) @call.expr
+  function: (identifier) @call.name)
 
 ; Method or package-qualified call: obj.Method() / fmt.Println() / a.B().C()
 ; Each chain link is its own call_expression with its own selector_expression,
 ; so chained calls naturally produce one edge per link.
 (call_expression
   function: (selector_expression
-    field: (field_identifier) @call.name)) @call.expr
+    field: (field_identifier) @call.name))
 "#;
 
 /// Import queries: `import_spec` carrying an `interpreted_string_literal`

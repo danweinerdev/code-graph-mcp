@@ -402,4 +402,61 @@ mod tests {
         // Prefix must be 200 bytes, plus the 3-byte "...".
         assert_eq!(got.len(), 203);
     }
+
+    // ---- enclosing_function_id ---------------------------------------
+    //
+    // Direct unit tests for the helper so its behavior is pinned at this
+    // layer too — not just transitively through `extract_calls`. Mirrors
+    // the Rust sibling tests at
+    // `crates/codegraph-lang-rust/src/helpers.rs:408-462`.
+
+    #[test]
+    fn enclosing_function_id_for_call_in_free_function() {
+        // `func f() { foo() }` — the call's `from` must be `<path>:f`.
+        let src = "package main\nfunc f() { foo() }\n";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.go");
+        assert_eq!(id, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_in_method_with_pointer_receiver() {
+        // `func (s *Server) M() { foo() }` — the call's `from` must be
+        // `<path>:Server::M` (pointer-receiver type extracted via
+        // `extract_receiver_type`).
+        let src = "package main\nfunc (s *Server) M() { foo() }\n";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.go");
+        assert_eq!(id, "/tmp/test.go:Server::M");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_in_package_level_func_literal_returns_bare_path() {
+        // `var H = func() { foo() }` — the call lives inside a
+        // `func_literal` directly under the source-file root, with no
+        // enclosing `function_declaration` / `method_declaration`. The
+        // walk must reach the root and fall back to the bare path.
+        let src = "package main\nvar H = func() { foo() }\n";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.go");
+        assert_eq!(id, "/tmp/test.go");
+    }
+
+    #[test]
+    fn enclosing_function_id_for_call_inside_local_closure_walks_past_closure() {
+        // `func f() { fn := func() { foo() }; _ = fn }` — the inner
+        // `foo()` is inside a closure inside f. The walk must skip past
+        // the `func_literal` and report `<path>:f`. Anti-regression for
+        // the rule that closures are transparent in the parent walk.
+        let src = "package main\nfunc f() { fn := func() { foo() }; _ = fn }\n";
+        let tree = parse(src);
+        // First call_expression in document order is `foo()` (inside the
+        // closure), since `_ = fn` is an assignment, not a call.
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.go");
+        assert_eq!(id, "/tmp/test.go:f");
+    }
 }
