@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use codegraph_core::{DiscoveryConfig, Edge, EdgeKind, Symbol, SymbolKind};
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
+use codegraph_lang_go::GoParser;
 use codegraph_lang_rust::RustParser;
 use codegraph_tools::discovery::discover;
 
@@ -62,6 +63,20 @@ fn main() -> ExitCode {
     };
     if let Err(e) = registry.register(Box::new(rust_parser)) {
         eprintln!("Error registering Rust parser: {e}");
+        return ExitCode::from(1);
+    }
+    // Phase 6.5: register the Go parser so `parse-test testdata/go` and the
+    // logrus dogfood pass against /tmp/logrus extract symbols from `.go`
+    // files. Mirrors the C++ and Rust registration blocks above.
+    let go_parser = match GoParser::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error initializing Go parser: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry.register(Box::new(go_parser)) {
+        eprintln!("Error registering Go parser: {e}");
         return ExitCode::from(1);
     }
 

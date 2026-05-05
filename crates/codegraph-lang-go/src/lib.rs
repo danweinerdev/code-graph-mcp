@@ -1076,6 +1076,8 @@ func Helper() {}
     #[test]
     fn single_import_produces_one_includes_edge_with_quotes_stripped() {
         // `import "fmt"` → 1 edge, To=fmt, Kind=Includes, From=path.
+        // The line is anchored at the enclosing import_declaration so a
+        // single import (line 2 in this fixture, 1-indexed) reports line 2.
         let fg = parse("package main\nimport \"fmt\"\n");
         let edges = includes(&fg);
         assert_eq!(
@@ -1087,11 +1089,21 @@ func Helper() {}
         assert_eq!(edges[0].kind, EdgeKind::Includes);
         assert_eq!(edges[0].from, "/tmp/test.go");
         assert_eq!(edges[0].file, "/tmp/test.go");
+        assert_eq!(
+            edges[0].line, 2,
+            "single import on line 2 must report line 2 (anchored at \
+             import_declaration)"
+        );
     }
 
     #[test]
     fn grouped_import_produces_one_edge_per_spec() {
         // `import ( "fmt"; "os" )` → 2 edges, one per inner import_spec.
+        // The line is anchored at the enclosing import_declaration, so
+        // every edge from one grouped block shares the same line — the
+        // line of the `import (` keyword (line 2 here), NOT the per-spec
+        // line (3 / 4). This locks in the line-anchoring rule documented
+        // in `extract_imports` against a regression to per-spec lines.
         let src = "package main\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n";
         let fg = parse(src);
         let edges = includes(&fg);
@@ -1108,7 +1120,32 @@ func Helper() {}
         for e in &edges {
             assert_eq!(e.kind, EdgeKind::Includes);
             assert_eq!(e.from, "/tmp/test.go");
+            assert_eq!(
+                e.line, 2,
+                "grouped imports must share the import_declaration line \
+                 (line 2), not the per-spec lines"
+            );
         }
+    }
+
+    /// CRITICAL anti-regression: backtick-quoted import paths
+    /// (`raw_string_literal` in tree-sitter-go) are valid grammar but not
+    /// idiomatic and not produced by `gofmt`. `IMPORT_QUERIES` only
+    /// matches `interpreted_string_literal` (double-quoted) on purpose;
+    /// backtick imports must produce zero `Includes` edges. Mirrors the
+    /// rationale documented in `queries.rs` for the import query.
+    #[test]
+    fn backtick_import_produces_no_includes_edge() {
+        // `import ` + backtick + `fmt` + backtick + newline. Built piece-by-
+        // piece to keep the surrounding raw string compatible with rustfmt.
+        let src = String::from("package main\nimport `fmt`\n");
+        let fg = parse(&src);
+        let edges = includes(&fg);
+        assert!(
+            edges.is_empty(),
+            "backtick (raw_string_literal) imports must produce zero \
+             Includes edges; got: {edges:?}"
+        );
     }
 
     #[test]

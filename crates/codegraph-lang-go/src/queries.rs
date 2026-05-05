@@ -102,8 +102,16 @@ pub(crate) const CALL_QUERIES: &str = r#"
 /// `raw_string_literal` (backtick-quoted import paths) is a valid grammar
 /// alternative for the `path` field but is not idiomatic Go and is not
 /// produced by `gofmt`; capturing only `interpreted_string_literal` matches
-/// the documented brief.
+/// the documented brief. The Phase 6.5 anti-regression test
+/// `backtick_import_produces_no_includes_edge` pins this behavior.
+///
+/// Only `@import.path` is captured. `extract_imports` consumes the path
+/// capture and re-anchors the line by walking up to the enclosing
+/// `import_declaration` via [`crate::find_enclosing_kind`]. We deliberately
+/// do not bind a `@import.spec` capture on the outer `import_spec`: it
+/// would be emitted on every match but never read, so it is dead weight —
+/// same rationale that removed `@call.expr` from `CALL_QUERIES` in 6.4.
 pub(crate) const IMPORT_QUERIES: &str = r#"
 (import_spec
-  path: (interpreted_string_literal) @import.path) @import.spec
+  path: (interpreted_string_literal) @import.path)
 "#;
