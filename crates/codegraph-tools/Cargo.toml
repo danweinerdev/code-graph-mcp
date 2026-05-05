@@ -29,6 +29,7 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 codegraph-lang-cpp = { path = "../codegraph-lang-cpp" }
+codegraph-lang-go = { path = "../codegraph-lang-go" }
 codegraph-lang-rust = { path = "../codegraph-lang-rust" }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
