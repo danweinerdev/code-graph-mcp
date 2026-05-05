@@ -24,12 +24,12 @@ tasks:
     verification: "Direct calls (foo()) via call_expression > function: identifier produce edge with To=callee name; method/package-qualified calls (obj.Method(), fmt.Println()) via call_expression > function: selector_expression > field: field_identifier produce edges with To=field name; chained calls (a.B().C()) produce 2 edges (To=B, To=C); go statements (go foo()) produce call edges naturally because the child of go_statement is a call_expression already matched by the query; defer statements likewise (defer conn.Close() → edge To=Close); call inside closure literal still produces edges with the enclosing function as From; tests for each pattern"
   - id: "6.4"
     title: "Import extraction"
-    status: in-progress
+    status: complete
     depends_on: ["6.1"]
     verification: "Single import (import \"fmt\") → 1 edge with To='fmt' (quotes stripped); grouped import (import ( \"fmt\"; \"os\" )) → 2 edges; aliased import (import f \"fmt\") → 1 edge with To='fmt' (path preserved, alias dropped); dot import (import . \"testing\") → 1 edge with To='testing'; blank import (import _ \"image/png\") → 1 edge with To='image/png'; relative imports not applicable in Go (modules system handles this); each edge has Kind=Includes; tests cover every form"
   - id: "6.5"
     title: "testdata/go + corpus tests + real-world validation + watch-mode reindex regression"
-    status: planned
+    status: in-progress
     depends_on: ["6.2", "6.3", "6.4"]
     verification: "testdata/go/ multi-package project covers: structs with exported/unexported methods, interface definition, structural implementation (interface satisfied by concrete type, no edge), pointer and value receivers, goroutines (go fn()), defer, multiple import styles, init() function, closures, embedded structs, generic functions; MANIFEST.md documents expected symbols and edges; corpus tests cover all definition forms, all call patterns, all import forms, and edge cases (empty file with only package clause, interface embedding interface, anonymous struct field, blank identifier function); parse-test testdata/go matches MANIFEST counts; **watch-mode reindex regression: start a watch on a temp Go project, modify a `.go` file (add a function, remove a method), confirm `get_file_symbols` reflects the change after the debounce window, confirm `Graph::prune_dangling_edges` invariant holds (no adj/radj entries point at removed symbols) — mirrors the Phase 4 watch-test structure**; **real-world dogfood**: parse-test against `github.com/sirupsen/logrus` (small, stable Go library) cloned to /tmp at a pinned tag (v1.9.3) — 0 crashes, 0 warnings, approximate symbol count between 200 and 500 recorded as a regression baseline in a committed fixture file"
   - id: "6.6"
@@ -124,12 +124,12 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.4: Import extraction
 
 ### Subtasks
-- [ ] `extract_imports` iterates import_spec matches
-- [ ] Strip surrounding quotes from `interpreted_string_literal`
-- [ ] Aliased imports: `import f "fmt"` — the import_spec has both a `name: package_identifier` (the alias) and a `path: interpreted_string_literal`; capture the path, not the alias
-- [ ] Dot imports (`import . "testing"`) and blank imports (`import _ "image/png"`) — same treatment, capture the path
-- [ ] Grouped imports — each import_spec inside `import_declaration > import_spec_list` produces its own edge
-- [ ] Tests for each form
+- [x] `extract_imports` iterates import_spec matches
+- [x] Strip surrounding quotes from `interpreted_string_literal`
+- [x] Aliased imports: `import f "fmt"` — the import_spec has both a `name: package_identifier` (the alias) and a `path: interpreted_string_literal`; capture the path, not the alias
+- [x] Dot imports (`import . "testing"`) and blank imports (`import _ "image/png"`) — same treatment, capture the path
+- [x] Grouped imports — each import_spec inside `import_declaration > import_spec_list` produces its own edge
+- [x] Tests for each form
 
 ## 6.5: testdata/go + corpus tests + real-world validation + watch-mode regression
 
