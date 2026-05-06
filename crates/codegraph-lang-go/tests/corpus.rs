@@ -651,17 +651,30 @@ fn two_init_functions_coexist_in_distinct_packages() {
 /// (e.g. `cargo test -p codegraph-lang-go -- --ignored
 /// logrus_dogfood_baseline_within_ten_percent`). The baseline file is
 /// committed; the test reads it at runtime.
+///
+/// **Setup is environment-only, not a real failure.** When `/tmp/logrus`
+/// is missing this test silently skips with an `eprintln!` setup hint
+/// rather than panicking. Without this skip, `cargo test --
+/// --include-ignored` (which runs every `#[ignore]`-gated test in one
+/// pass) would fail loudly on machines that haven't cloned the dogfood
+/// fixture — the panic message reads as a setup instruction, not a code
+/// bug, and shouldn't be a hard failure. The `eprintln! + return` form
+/// matches how other dogfood-style tests in the workspace handle their
+/// optional dependencies. Reading the committed baseline file IS still a
+/// hard failure (the file is in-tree; if it's gone, that's a real bug),
+/// hence the panic on `read_to_string` below.
 #[test]
 #[ignore]
 fn logrus_dogfood_baseline_within_ten_percent() {
     let logrus_root = Path::new("/tmp/logrus");
     if !logrus_root.is_dir() {
-        panic!(
-            "logrus dogfood baseline test requires /tmp/logrus to exist \
+        eprintln!(
+            "skipping logrus dogfood baseline test: /tmp/logrus not present \
              — clone https://github.com/sirupsen/logrus.git at v1.9.3 \
              (commit d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd) into \
              /tmp/logrus before running this test"
         );
+        return;
     }
 
     let baseline_path = corpus_root().join("logrus-baseline.txt");
