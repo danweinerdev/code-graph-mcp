@@ -3,7 +3,7 @@ title: "Go Language Parser"
 type: phase
 plan: RustRewrite
 phase: 6
-status: in-progress
+status: complete
 created: 2026-04-28
 updated: 2026-05-05
 deliverable: "codegraph-lang-go crate parsing .go files with method-receiver extraction, structs, interfaces, all import forms, and direct + selector-expression call patterns; registered in the main binary; testdata/go/ + real-world validation"

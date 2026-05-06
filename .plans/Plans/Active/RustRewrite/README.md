@@ -42,7 +42,7 @@ phases:
     depends_on: [4]
   - id: 6
     title: "Go Language Parser"
-    status: in-progress
+    status: complete
     doc: "06-Go-Parser.md"
     depends_on: [5]
   - id: 7
