@@ -1,6 +1,6 @@
 # code-graph-mcp
 
-An MCP server that builds an in-memory semantic code graph from C++ and Rust source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
+An MCP server that builds an in-memory semantic code graph from C++, Rust, and Go source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
 
 ## Supported languages
 
@@ -8,8 +8,9 @@ An MCP server that builds an in-memory semantic code graph from C++ and Rust sou
 |----------|------------|--------------|
 | C++      | `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp`, `.hxx` | `codegraph-lang-cpp` |
 | Rust     | `.rs`      | `codegraph-lang-rust` |
+| Go       | `.go`      | `codegraph-lang-go` |
 
-Go and Python plugins are scaffolded but not yet wired into the binary (Phases 6 and 7).
+The Python plugin is scaffolded but not yet wired into the binary (Phase 7).
 
 ## Installation
 
@@ -193,6 +194,35 @@ Validated against tree-sitter-rust v0.24.0.
 4. **Call resolution is heuristic** — same as C++. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic.
 
 5. **Complex use trees expanded but lifetime/generic constraints not represented.** Each terminal path in a `use` tree becomes one edge; lifetime parameters and generic bounds in the surrounding code are not part of the graph. Generic impls record the type-field text verbatim — the parent of methods in `impl<T> Trait for Vec<T>` is `Vec<T>` (with the generic in the parent string), not bare `Vec`.
+
+## Go Parser Limitations
+
+Validated against tree-sitter-go v0.25.0.
+
+### Supported Go Patterns
+
+- Free functions, methods (with receiver type as parent — both pointer `(s *T)` and value `(s T)` forms, including generic receivers `(s *T[U])`)
+- Structs (`type T struct { ... }`), interfaces (`type T interface { ... }`), type aliases (`type ID = string`), defined types (`type Count int`, `type Handler func(...)`)
+- Generic functions (Go 1.18+, `func Map[T any](...)`) — type parameters preserved in the captured signature
+- `init()` and `main()` are extracted as ordinary functions (no special-casing)
+- Package name from `package_clause` populates `Symbol.namespace` (Go packages are flat — single-level)
+- All call patterns: direct (`foo()`), method/field selector (`obj.M()`), package-qualified (`fmt.Println()`), chained (`a.B().C()` → 2 edges), `go fn()`, `defer fn()`, calls inside closure literals (`func_literal`)
+- All import forms: single (`import "fmt"`), grouped (`import (...)`), aliased (`import f "fmt"` — alias dropped, path captured), dot (`import . "testing"`), blank (`import _ "image/png"`)
+- Package-level closure fallback: a call inside a `var H = func() { foo() }` reports the file path as `from` (no enclosing function declaration)
+
+### Known Limitations
+
+1. **Structural interface implementation produces no edges.** Go interfaces are satisfied structurally — a concrete type implements an interface by having the right method set, with no syntactic declaration. The parser emits zero `Inherits` edges for Go. `get_class_hierarchy` on a Go interface returns the interface as a leaf node with empty `bases` and `derived`.
+
+2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion), not inheritance — no edge is emitted. An anti-regression test in `codegraph-lang-go` asserts a fixture with an embedded field yields zero `Inherits` edges.
+
+3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different receiver types that share a name may resolve to the wrong candidate.
+
+4. **`go.mod` and vendor directories are not consulted.** Discovery walks files and respects `.gitignore`; module-path resolution is out of scope. Import paths (e.g. `"github.com/sirupsen/logrus"`) are recorded verbatim in the `Includes` edge's `to` field — the default `resolve_include` basename match against the FileIndex is correctly a no-op for module paths.
+
+5. **Generic type parameters and constraints not represented in symbol records.** Generic types are recognized in receiver positions (`func (s *Server[T]) M()` → parent `Server`), but the type-parameter list `[T]` and any constraints (`[T any]`, `[T comparable]`) are not part of the symbol record. They survive in the captured signature text only.
+
+6. **`raw_string_literal` (backtick) imports are intentionally not matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `codegraph-lang-go` asserts backtick imports produce zero `Includes` edges.
 
 ## Smoke test
 

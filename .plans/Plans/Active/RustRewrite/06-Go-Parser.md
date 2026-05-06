@@ -29,12 +29,12 @@ tasks:
     verification: "Single import (import \"fmt\") → 1 edge with To='fmt' (quotes stripped); grouped import (import ( \"fmt\"; \"os\" )) → 2 edges; aliased import (import f \"fmt\") → 1 edge with To='fmt' (path preserved, alias dropped); dot import (import . \"testing\") → 1 edge with To='testing'; blank import (import _ \"image/png\") → 1 edge with To='image/png'; relative imports not applicable in Go (modules system handles this); each edge has Kind=Includes; tests cover every form"
   - id: "6.5"
     title: "testdata/go + corpus tests + real-world validation + watch-mode reindex regression"
-    status: in-progress
+    status: complete
     depends_on: ["6.2", "6.3", "6.4"]
     verification: "testdata/go/ multi-package project covers: structs with exported/unexported methods, interface definition, structural implementation (interface satisfied by concrete type, no edge), pointer and value receivers, goroutines (go fn()), defer, multiple import styles, init() function, closures, embedded structs, generic functions; MANIFEST.md documents expected symbols and edges; corpus tests cover all definition forms, all call patterns, all import forms, and edge cases (empty file with only package clause, interface embedding interface, anonymous struct field, blank identifier function); parse-test testdata/go matches MANIFEST counts; **watch-mode reindex regression: start a watch on a temp Go project, modify a `.go` file (add a function, remove a method), confirm `get_file_symbols` reflects the change after the debounce window, confirm `Graph::prune_dangling_edges` invariant holds (no adj/radj entries point at removed symbols) — mirrors the Phase 4 watch-test structure**; **real-world dogfood**: parse-test against `github.com/sirupsen/logrus` (small, stable Go library) cloned to /tmp at a pinned tag (v1.9.3) — 0 crashes, 0 warnings, approximate symbol count between 200 and 500 recorded as a regression baseline in a committed fixture file"
   - id: "6.6"
     title: "Register parser, integration tests, documentation"
-    status: planned
+    status: in-progress
     depends_on: ["6.5"]
     verification: "main.rs registers GoParser using the shipped Box+context pattern: `.register(Box::new(GoParser::new().context(\"initialize Go language plugin\")?,)).context(\"register Go language plugin\")?;` (mirroring `crates/code-graph-mcp/src/main.rs:20-23`); analyze_codebase on a directory with .cpp + .rs + .go indexes all three; mixed-language search and language-filter queries verified for the new combination; cross-language symbol-collision regression: a function named 'init' in Go and 'init' in C++ both exist after analyze, neither resolves to the other's calls (verified by checking the (Language, name) keying of SymbolIndex from Phase 3 — `crates/codegraph-lang/src/lib.rs:116`); Go interface get_class_hierarchy returns the interface as root with no bases or derived (interfaces are structural in Go, no inheritance edges); wire-format snapshot tests extended with Go-specific responses; README and CLAUDE.md updated to list Go and any Go-specific limitations (structural interface implementation not represented; method dispatch is heuristic; go.mod/vendor handling is not in scope — discovery walks files and respects .gitignore, no module-path resolution)"
   - id: "6.7"
@@ -134,7 +134,7 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.5: testdata/go + corpus tests + real-world validation + watch-mode regression
 
 ### Subtasks
-- [ ] `testdata/go/` multi-package project:
+- [x] `testdata/go/` multi-package project:
   - `main.go` — package main, imports, calls into other packages
   - `server/server.go` — Server struct with methods (pointer + value receivers), interface implementation
   - `server/handler.go` — HTTP handler functions, closures
@@ -142,14 +142,14 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
   - `models/repo.go` — interface, generic function
   - `utils/helpers.go` — free functions, type alias, init()
   - `MANIFEST.md` — expected symbols and edges
-- [ ] Corpus tests in `tests.rs` covering every definition, call, import form + edge cases (empty file, mod-only, interface-embedding-interface, anonymous struct field)
-- [ ] `parse-test testdata/go` matches MANIFEST
-- [ ] **Watch-mode reindex regression** — new test in `crates/codegraph-tools/tests/watch_go_reindex.rs`:
+- [x] Corpus tests in `tests.rs` covering every definition, call, import form + edge cases (empty file, mod-only, interface-embedding-interface, anonymous struct field)
+- [x] `parse-test testdata/go` matches MANIFEST
+- [x] **Watch-mode reindex regression** — new test in `crates/codegraph-tools/tests/watch_go_reindex.rs`:
   - Spawn watch on a temp directory containing `srv.go` with `func (s *Server) Alpha()` and `func (s *Server) Beta()`
   - Modify `srv.go`: remove `Beta`, add `func (s *Server) Gamma()`
   - After debounce, assert `get_file_symbols` shows `Alpha` + `Gamma`, no `Beta`
   - Assert no dangling edges remain (any prior caller of `Server.Beta` is pruned per `Graph::prune_dangling_edges`)
-- [ ] Real-world dogfood: clone `github.com/sirupsen/logrus` (a stable, well-known, mid-sized Go library) to `/tmp/logrus` at a pinned tag (e.g. v1.9.3), run `parse-test /tmp/logrus`, expect 0 crashes, 0 warnings, and an approximate symbol count between 200 and 500 — record the actual count in `testdata/go/logrus-baseline.txt` (one line: `symbols: N`); a follow-up test asserts the recorded count stays within ±10% as a regression gate
+- [x] Real-world dogfood: clone `github.com/sirupsen/logrus` (a stable, well-known, mid-sized Go library) to `/tmp/logrus` at a pinned tag (e.g. v1.9.3), run `parse-test /tmp/logrus`, expect 0 crashes, 0 warnings, and an approximate symbol count between 200 and 500 — record the actual count in `testdata/go/logrus-baseline.txt` (one line: `symbols: N`); a follow-up test asserts the recorded count stays within ±10% as a regression gate
 
 ## 6.6: Register parser, integration tests, documentation
 
