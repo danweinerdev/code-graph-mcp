@@ -29,7 +29,7 @@ tasks:
     verification: "import foo → 1 edge with To='foo'; import foo.bar → 1 edge with To='foo.bar'; import foo as f → 1 edge with To='foo' (alias dropped, path preserved — same rule as Go); from foo import bar → 1 edge with To='foo' (the module path, NOT 'bar' — the imported symbol name is not the dependency); from foo.bar import baz → 1 edge with To='foo.bar'; from . import utils → 1 edge with To='.utils' (relative import preserved as written); from typing import List → 1 edge with To='typing'; from __future__ import annotations → 1 edge with To='__future__' (dunder module name handled correctly); each edge has Kind=Includes; for `from . import utils` the default `resolve_include` returns None (no filesystem path is matched), confirming relative imports are stored verbatim and never accidentally resolved; tests cover every form including the relative form, the from-form-vs-module-path distinction, and the dunder __future__ case"
   - id: "7.5"
     title: "Inheritance extraction"
-    status: planned
+    status: complete
     depends_on: ["7.1"]
     verification: "class D(B) → 1 inherits edge from D to B; class D(A, B) → 2 inherits edges (multiple inheritance, common in Python); class D(module.Base) → 1 inherits edge from D to 'module.Base' (qualified base preserved); class C: (no parens) → 0 inherits edges; class C(metaclass=Meta) → metaclass keyword arg ignored (not a base); ABC inheritance (`class C(ABC)`) treated like any other base; tests for each form"
   - id: "7.6"
@@ -151,13 +151,13 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 ## 7.5: Inheritance extraction
 
 ### Subtasks
-- [ ] `(class_definition superclasses: (argument_list ...))` — walk children for identifiers and dotted_names
-- [ ] Each base produces an Edge { from: derived class name, to: base name, kind: Inherits }
-- [ ] Multiple inheritance handled: `class D(A, B, C)` → 3 edges
-- [ ] Qualified bases: `class D(module.Base)` → 1 edge with to='module.Base'
-- [ ] No base (`class C:`) → 0 inheritance edges
-- [ ] Keyword arguments in superclasses (`class C(metaclass=Meta)`) — these appear as `keyword_argument` nodes inside the argument_list and are ignored (not bases)
-- [ ] Tests for each form including ABC inheritance
+- [x] `(class_definition superclasses: (argument_list ...))` — walk children for identifiers and dotted_names
+- [x] Each base produces an Edge { from: derived class name, to: base name, kind: Inherits }
+- [x] Multiple inheritance handled: `class D(A, B, C)` → 3 edges
+- [x] Qualified bases: `class D(module.Base)` → 1 edge with to='module.Base'
+- [x] No base (`class C:`) → 0 inheritance edges
+- [x] Keyword arguments in superclasses (`class C(metaclass=Meta)`) — these appear as `keyword_argument` nodes inside the argument_list and are ignored (not bases)
+- [x] Tests for each form including ABC inheritance
 
 ## 7.6: testdata/python + corpus tests + real-world dogfood + watch-mode reindex regression
 

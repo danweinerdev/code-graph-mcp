@@ -33,8 +33,16 @@
 //! top-level guard in `extract_imports` so the dependency graph stays
 //! stable across files that guard imports behind feature flags.
 //!
-//! Phase 7.5 wires `extract_inheritance`. After 7.5, `parse_file` is
-//! fully populated and every extractor is live.
+//! Phase 7.5 wires `extract_inheritance` — single (`class D(B)`),
+//! multiple (`class D(A, B, C)`), and qualified (`class D(module.Base)`)
+//! bases all produce `Inherits` edges with `from = bare derived class
+//! name` (matching C++/Rust so `class_hierarchy` adjacency lookups work)
+//! and `to = base name as written` (qualified bases preserve the dotted
+//! text verbatim). Keyword-argument metaclass kwargs (`metaclass=Meta`,
+//! `total=False`) parse as `keyword_argument` nodes inside the
+//! `argument_list` and are silently filtered — neither inheritance query
+//! pattern matches them. After 7.5, `parse_file` is fully populated and
+//! every extractor is live.
 //!
 //! # Default trait methods
 //!
@@ -114,7 +122,6 @@ pub struct PythonParser {
     /// Compiled import query (wired in 7.4).
     import_query: Query,
     /// Compiled inheritance query (wired in 7.5).
-    #[allow(dead_code)]
     inheritance_query: Query,
 }
 
@@ -177,6 +184,7 @@ impl PythonParser {
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_imports(root, content, &path_str, &mut fg);
+        self.extract_inheritance(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -397,8 +405,10 @@ impl PythonParser {
     /// - `import.from_module` — the `module_name` field of an
     ///   `import_from_statement` when it is a `dotted_name`. Records the
     ///   *module*, not the imported symbol(s) — `from foo import bar, qux`
-    ///   yields exactly one edge with `to = "foo"`. Dunder modules
-    ///   (`__future__`) flow through this same path with no special-casing.
+    ///   yields exactly one edge with `to = "foo"`. Note: `from __future__
+    ///   import ...` is NOT an `import_from_statement` in tree-sitter-
+    ///   python — it is a `future_import_statement` and is handled by the
+    ///   `import.future` capture arm instead.
     /// - `import.from_module_relative` — the `module_name` field when it is
     ///   a `relative_import` (leading-dot form: `from . import x`,
     ///   `from .utils import y`, `from ..pkg import z`).
@@ -549,6 +559,81 @@ impl PythonParser {
             }
         }
     }
+
+    /// Run the inheritance query and produce `Inherits` edges. Mirrors the
+    /// C++ plugin's `extract_inheritance`: emits one edge per (derived,
+    /// base) pair with `from = bare derived class name` (matching C++ and
+    /// Rust — the engine's `class_hierarchy` walks the adjacency map by
+    /// bare class name, so a path-prefixed `from` would break hierarchy
+    /// lookups). The `to` is the base name as written: a bare identifier
+    /// for `class D(B)` (`to = "B"`), or the qualified attribute text for
+    /// `class D(module.Base)` (`to = "module.Base"` — the verbatim
+    /// `attribute` node text preserves the qualification).
+    ///
+    /// Tree-sitter emits one match per base in the `argument_list`, so
+    /// multiple inheritance falls out naturally — `class D(A, B, C)`
+    /// produces three matches and three edges. Keyword arguments
+    /// (`metaclass=Meta`, `total=False`) parse as `keyword_argument`
+    /// nodes inside the `argument_list` and are NOT bases — neither query
+    /// pattern matches them, so they are silently filtered. `class C:`
+    /// (no parens, no `superclasses` field) and `class C():` (empty
+    /// `argument_list`) both produce zero matches and zero edges.
+    ///
+    /// Edge shape: `from = derived_name, to = base_text, kind = Inherits,
+    /// file = path, line = class_definition.start_position().row + 1`.
+    /// The line is anchored at the enclosing `class_definition` so each
+    /// base in a multi-inheritance list shares a single line (matches the
+    /// C++/Rust convention for multi-base classes).
+    fn extract_inheritance(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.inheritance_query, root, content);
+        let cap_names = self.inheritance_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            let mut derived_name = String::new();
+            let mut base_text = String::new();
+            let mut class_node: Option<Node<'_>> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                let text = cap_node.utf8_text(content).unwrap_or("").to_owned();
+
+                match cap_name {
+                    "class.name" => {
+                        derived_name = text;
+                        // The captured name is the `name` field of the
+                        // enclosing class_definition; walk up one step to
+                        // anchor the line at the class itself.
+                        class_node = find_enclosing_kind(cap_node, "class_definition");
+                    }
+                    // Both bare-identifier and qualified-attribute bases
+                    // surface here; the captured node's verbatim utf8 text
+                    // is the `to` field (`B` or `module.Base`).
+                    "base.name" | "base.attr" => base_text = text,
+                    _ => {}
+                }
+            }
+
+            if derived_name.is_empty() || base_text.is_empty() {
+                continue;
+            }
+
+            let line = class_node
+                .map(|n| n.start_position().row as u32 + 1)
+                .unwrap_or(0);
+            fg.edges.push(Edge {
+                from: derived_name,
+                to: base_text,
+                kind: EdgeKind::Inherits,
+                file: path.to_owned(),
+                line,
+            });
+        }
+    }
 }
 
 impl LanguagePlugin for PythonParser {
@@ -565,7 +650,9 @@ impl LanguagePlugin for PythonParser {
     /// Phase 7.2 wires the definition extractor; Phase 7.3 wires the call
     /// extractor; Phase 7.4 wires the import extractor (both forms plus
     /// the special `future_import_statement` node and the conditional-
-    /// import filter); inheritance (7.5) follows.
+    /// import filter); Phase 7.5 wires the inheritance extractor (single,
+    /// multi, and qualified bases; keyword-argument metaclass kwargs
+    /// silently filtered). After 7.5 every extractor is live.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -1447,5 +1534,372 @@ import a, b
             assert_eq!(e.kind, EdgeKind::Includes);
             assert_eq!(e.from, "/tmp/test.py");
         }
+    }
+
+    #[test]
+    fn from_relative_dot_only_multi_name_produces_one_edge_per_name() {
+        // `from . import a, b` — the `module_name` is a dots-only
+        // `relative_import`, so each imported name is a sibling module
+        // and contributes its own dependency edge with `to = .<name>`.
+        // This pins the dots-only multi-name expansion documented in the
+        // `import.from_module_relative` arm of `extract_imports`.
+        let fg = parse("from . import a, b\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&".a"), "expected To='.a', got {tos:?}");
+        assert!(tos.contains(&".b"), "expected To='.b', got {tos:?}");
+        for e in &edges {
+            assert_eq!(e.kind, EdgeKind::Includes);
+            assert_eq!(e.from, "/tmp/test.py");
+        }
+    }
+
+    #[test]
+    fn from_relative_double_dot_only_multi_name_produces_one_edge_per_name() {
+        // `from .. import a, b` — same dots-only rule, two leading dots
+        // preserved verbatim. Belt-and-suspenders for the dots-only
+        // expansion across the single-dot and double-dot cases.
+        let fg = parse("from .. import a, b\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"..a"), "expected To='..a', got {tos:?}");
+        assert!(tos.contains(&"..b"), "expected To='..b', got {tos:?}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7.5 — inheritance extraction
+    // ----------------------------------------------------------------
+
+    /// Filter `fg.edges` to just the `Inherits` edges for ergonomic asserts.
+    fn inherits(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect()
+    }
+
+    #[test]
+    fn class_with_single_base_produces_one_inherits_edge() {
+        // `class D(B): pass` → 1 edge, From=D (bare), To=B, kind=Inherits.
+        // The `from` is the bare derived class name (matching C++/Rust),
+        // not a path-prefixed symbol ID — `class_hierarchy` looks up
+        // adjacency by class name, so a `path:D` form would break
+        // hierarchy queries.
+        let fg = parse("class D(B):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        let e = edges[0];
+        assert_eq!(e.from, "D");
+        assert_eq!(e.to, "B");
+        assert_eq!(e.kind, EdgeKind::Inherits);
+        assert_eq!(e.file, "/tmp/test.py");
+        assert_eq!(e.line, 1, "line anchored at the class_definition");
+    }
+
+    #[test]
+    fn class_with_two_bases_produces_two_inherits_edges() {
+        // `class D(A, B): pass` — multiple inheritance is common in
+        // Python (mixins, ABC + concrete base, etc.). The argument_list
+        // emits one match per base.
+        let fg = parse("class D(A, B):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"A"), "expected To=A, got {tos:?}");
+        assert!(tos.contains(&"B"), "expected To=B, got {tos:?}");
+        for e in &edges {
+            assert_eq!(e.from, "D", "all bases share the same derived name");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+    }
+
+    #[test]
+    fn class_with_three_bases_produces_three_inherits_edges() {
+        // `class D(A, B, C): pass` — three-base case, common when a class
+        // mixes a protocol + a mixin + a concrete base.
+        let fg = parse("class D(A, B, C):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        for expected in ["A", "B", "C"] {
+            assert!(
+                tos.contains(&expected),
+                "expected To={expected:?} in {tos:?}"
+            );
+        }
+        for e in &edges {
+            assert_eq!(e.from, "D");
+        }
+    }
+
+    #[test]
+    fn class_with_qualified_base_preserves_dotted_text() {
+        // `class D(module.Base): pass` → 1 edge, To='module.Base' (the
+        // attribute node's verbatim text). Qualified bases preserve the
+        // dotted text so downstream consumers can distinguish a
+        // module-qualified base from a bare-name base.
+        let fg = parse("class D(module.Base):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "D");
+        assert_eq!(
+            edges[0].to, "module.Base",
+            "qualified base text preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn class_with_no_parens_produces_zero_inherits_edges() {
+        // `class C: pass` (no parens, no `superclasses` field) — zero
+        // matches from the inheritance query, zero edges emitted.
+        let fg = parse("class C:\n    pass\n");
+        let edges = inherits(&fg);
+        assert!(
+            edges.is_empty(),
+            "no-parens class has no bases, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn class_with_empty_parens_produces_zero_inherits_edges() {
+        // `class C(): pass` — empty `argument_list` (only the `(` and
+        // `)` tokens, no identifier or attribute children). The
+        // inheritance query patterns require at least one such child, so
+        // zero matches and zero edges.
+        let fg = parse("class C():\n    pass\n");
+        let edges = inherits(&fg);
+        assert!(
+            edges.is_empty(),
+            "empty-parens class has no bases, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn class_with_only_metaclass_kwarg_produces_zero_inherits_edges() {
+        // `class C(metaclass=Meta): pass` — the metaclass kwarg parses
+        // as a `keyword_argument` node inside the `argument_list`.
+        // Neither inheritance query pattern matches `keyword_argument`,
+        // so it is silently filtered: zero edges. (This is the
+        // canonical PEP 3115 / type-system metaclass pattern.)
+        let fg = parse("class C(metaclass=Meta):\n    pass\n");
+        let edges = inherits(&fg);
+        assert!(
+            edges.is_empty(),
+            "metaclass kwarg is not a base, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn class_with_base_and_metaclass_kwarg_produces_one_edge_to_base_only() {
+        // `class D(A, metaclass=Meta): pass` — exactly one base (A) and
+        // one metaclass kwarg (filtered). Anti-regression for the kwarg
+        // filter: the presence of a kwarg must NOT prevent the bare
+        // base's edge from being emitted.
+        let fg = parse("class D(A, metaclass=Meta):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "D");
+        assert_eq!(edges[0].to, "A");
+    }
+
+    #[test]
+    fn class_with_qualified_base_and_metaclass_kwarg_produces_one_edge_to_qualified_only() {
+        // `class D(module.Base, metaclass=Meta): pass` — the qualified
+        // base goes through the `attribute` query pattern, the kwarg is
+        // filtered; one edge to `module.Base`. Belt-and-suspenders for
+        // the kwarg filter against the attribute pattern.
+        let fg = parse("class D(module.Base, metaclass=Meta):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "D");
+        assert_eq!(edges[0].to, "module.Base");
+    }
+
+    #[test]
+    fn class_with_abc_base_emits_inherits_edge() {
+        // `class C(ABC): pass` — ABC inheritance receives no special
+        // handling; ABC is just an ordinary identifier base. The
+        // `abc.ABC` mixin pattern is the canonical Python abstract-class
+        // form, so we want a clear regression test for it.
+        let fg = parse("class C(ABC):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "C");
+        assert_eq!(edges[0].to, "ABC");
+    }
+
+    #[test]
+    fn class_with_bases_and_methods_does_not_conflate_methods_with_bases() {
+        // Sanity: a class with multiple bases AND methods must not
+        // produce spurious Inherits edges for methods, and must not
+        // skip method symbols. `class D(A, B): def m(self): pass` →
+        // 2 Inherits edges (D→A, D→B) and the usual D + m symbols
+        // through definition extraction. No edge with `to = "m"`.
+        let fg = parse("class D(A, B):\n    def m(self):\n        pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"A"));
+        assert!(tos.contains(&"B"));
+        assert!(
+            !tos.contains(&"m"),
+            "method name must not appear as an Inherits target, got {tos:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.from, "D");
+        }
+        // Confirm the method symbol still extracts (no regression in
+        // definition extraction from the inheritance wiring).
+        let m = sym(&fg, "m");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.parent, "D");
+    }
+
+    // ---- Spec-named coverage (Task 7.5 verification) ----------------
+    //
+    // The tests below mirror the names listed in the Task 7.5 spec so a
+    // grep against the spec finds the exact assertion. The behavioral
+    // coverage overlaps with the more granular tests above; these are
+    // kept as the canonical "spec passes" entry points.
+
+    #[test]
+    fn class_with_multiple_bases_produces_one_edge_per_base() {
+        // Spec example: `class D(A, B, C): pass` → 3 Inherits edges, one
+        // per base. Multi-inheritance support is the load-bearing case
+        // for Python (mixins, ABC + concrete base, etc.).
+        let fg = parse("class D(A, B, C):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        for expected in ["A", "B", "C"] {
+            assert!(
+                tos.contains(&expected),
+                "expected To={expected:?} in {tos:?}"
+            );
+        }
+        for e in &edges {
+            assert_eq!(e.from, "D");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+    }
+
+    #[test]
+    fn class_with_qualified_base_preserves_dotted_path() {
+        // `class D(module.Base): pass` → `to = "module.Base"` (dotted
+        // text verbatim — no resolution against any module map).
+        let fg = parse("class D(module.Base):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "D");
+        assert_eq!(edges[0].to, "module.Base");
+    }
+
+    #[test]
+    fn class_without_parens_produces_zero_inherits_edges() {
+        // `class C: pass` — no `superclasses` field, zero matches.
+        let fg = parse("class C:\n    pass\n");
+        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
+    }
+
+    #[test]
+    fn class_with_no_bases_just_parens_produces_zero_inherits_edges() {
+        // Defensive: `class C(): pass` — empty argument_list, zero edges.
+        let fg = parse("class C():\n    pass\n");
+        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
+    }
+
+    #[test]
+    fn metaclass_keyword_argument_is_not_a_base() {
+        // `class C(metaclass=Meta): pass` — metaclass kwarg is filtered.
+        let fg = parse("class C(metaclass=Meta):\n    pass\n");
+        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
+    }
+
+    #[test]
+    fn mixed_bases_and_metaclass() {
+        // `class C(Base, metaclass=Meta): pass` → 1 edge to Base; the
+        // metaclass kwarg is filtered out by the query patterns (which
+        // never match `keyword_argument` children).
+        let fg = parse("class C(Base, metaclass=Meta):\n    pass\n");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "C");
+        assert_eq!(edges[0].to, "Base");
+    }
+
+    #[test]
+    fn abc_inheritance_is_treated_like_any_other_base() {
+        // `from abc import ABC; class C(ABC): pass` — ABC has no special
+        // handling; it parses as a plain identifier base. The
+        // `from abc import ABC` line additionally produces one Includes
+        // edge to `abc`; the assertion isolates the inheritance edges.
+        let src = "from abc import ABC\nclass C(ABC):\n    pass\n";
+        let fg = parse(src);
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].from, "C");
+        assert_eq!(edges[0].to, "ABC");
+    }
+
+    #[test]
+    fn nested_class_inheritance_uses_qualified_parent_id() {
+        // `class Outer:\n    class Inner(Base): pass`
+        //
+        // Contract pin: the `from` of an `Inherits` edge is the **bare
+        // derived class name** (`"Inner"`), NOT a path-prefixed symbol
+        // ID and NOT a qualified `Outer::Inner`. This matches the C++
+        // and Rust plugins' existing inheritance shape and is required
+        // for `Graph::class_hierarchy` lookups, which key the adjacency
+        // map by bare class name (see
+        // `crates/codegraph-graph/src/algorithms.rs::class_hierarchy`).
+        // Using a path-prefixed `from` here would silently break
+        // `class_hierarchy("Inner")` queries.
+        //
+        // Trade-off: a top-level `Inner` and an `Outer.Inner` defined in
+        // the same file would collide on `class_hierarchy` lookups.
+        // That's the same trade-off the C++/Rust plugins make and is
+        // documented in the Python parser limitations once 7.7 lands.
+        let src = "class Outer:\n    class Inner(Base):\n        pass\n";
+        let fg = parse(src);
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        let e = edges[0];
+        assert_eq!(
+            e.from, "Inner",
+            "Inherits.from is the bare derived name, matching C++/Rust"
+        );
+        assert_eq!(e.to, "Base");
+    }
+
+    #[test]
+    fn from_field_uses_correct_symbol_id_format() {
+        // Pin the `from`-field shape against the `Inherits`-edge
+        // contract: bare derived class name, matching C++/Rust and
+        // required by `Graph::class_hierarchy` (which keys adjacency by
+        // bare name). This intentionally diverges from the `path:Name`
+        // shape used for `Calls`-edge `from` fields — `Calls` resolution
+        // routes through the (Language, name)-keyed `SymbolIndex` while
+        // `Inherits` routes through the bare-name `adj` map.
+        //
+        // The corresponding Class symbol's `symbol_id` is
+        // `"<path>:<name>"` (e.g. `"/tmp/test.py:D"`), so the
+        // `Inherits.from` is the *symbol-name suffix* of the symbol ID,
+        // not the full ID. This test pins both shapes for a single
+        // top-level class so the relationship is unambiguous.
+        let fg = parse("class D(B):\n    pass\n");
+        let d = sym(&fg, "D");
+        assert_eq!(symbol_id(d), "/tmp/test.py:D");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(
+            edges[0].from, "D",
+            "Inherits.from is the bare class name (NOT the full symbol_id), \
+             matching C++/Rust and required by Graph::class_hierarchy"
+        );
     }
 }
