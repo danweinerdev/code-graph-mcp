@@ -19,9 +19,11 @@
 //! class as its parent), and `.pyi` stub-file parity (stubs use the same
 //! grammar — `def f() -> int: ...` is still a `function_definition`).
 //!
-//! Phase 7.3 wires `extract_calls`. Phase 7.4 wires `extract_imports`. Phase
-//! 7.5 wires `extract_inheritance`. After 7.5, `parse_file` is fully populated
-//! and every extractor is live.
+//! Phase 7.3 wires `extract_calls` — direct calls, attribute calls,
+//! chained calls, and the module-top-level fallback (`from = path` when
+//! there is no enclosing `function_definition`). Phase 7.4 wires
+//! `extract_imports`. Phase 7.5 wires `extract_inheritance`. After 7.5,
+//! `parse_file` is fully populated and every extractor is live.
 //!
 //! # Default trait methods
 //!
@@ -65,14 +67,14 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use codegraph_core::{FileGraph, Language, Symbol, SymbolKind};
+use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use codegraph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
-use crate::helpers::{find_enclosing_class, truncate_signature};
+use crate::helpers::{enclosing_function_id, find_enclosing_class, truncate_signature};
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITANCE_QUERIES};
 
 /// File extensions the Python parser claims. Both `.py` (regular sources)
@@ -95,7 +97,6 @@ pub struct PythonParser {
     /// Compiled definition query (wired in 7.2).
     def_query: Query,
     /// Compiled call query (wired in 7.3).
-    #[allow(dead_code)]
     call_query: Query,
     /// Compiled import query (wired in 7.4).
     #[allow(dead_code)]
@@ -162,6 +163,7 @@ impl PythonParser {
         };
 
         self.extract_definitions(root, content, &path_str, &mut fg);
+        self.extract_calls(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -292,6 +294,75 @@ impl PythonParser {
             }
         }
     }
+
+    /// Run the call query and produce `Calls` edges. Mirrors the C++/Rust/
+    /// Go plugins' `extract_calls`: each capture is a callee identifier,
+    /// the line is anchored at the enclosing `call` node, and the `from`
+    /// field is built by [`enclosing_function_id`] so it lines up exactly
+    /// with the `symbol_id()` shape produced by [`Self::extract_definitions`].
+    ///
+    /// Per-capture-name behavior (single capture name `call.name` shared
+    /// across both query patterns):
+    ///
+    /// - Direct call (`(call function: (identifier) @call.name)`) →
+    ///   edge `to` = identifier text. Covers `foo()`, constructor calls
+    ///   (`MyClass()` → `to = "MyClass"`; the agent interprets the edge
+    ///   as construction), `super()`, and built-in calls (`print`, `len`).
+    /// - Attribute call (`(call function: (attribute attribute:
+    ///   (identifier) @call.name))`) → edge `to` = trailing-attribute
+    ///   identifier text. Covers method calls (`obj.method()`),
+    ///   module-qualified calls (`mod.func()`), and chained calls
+    ///   (`a.b().c()` produces 2 edges — one for `b`, one for `c` —
+    ///   because tree-sitter parses each chain link as its own `call`
+    ///   node, each with its own attribute trailer).
+    ///
+    /// Calls inside list/set/dict comprehensions, lambdas, and default
+    /// arguments are walked transparently by [`enclosing_function_id`]:
+    /// none of those are `function_definition` nodes, so the walk passes
+    /// through them and reports the enclosing top-level function/method
+    /// as the `from`. A call at module top level (no enclosing
+    /// `function_definition`, e.g. `print("hi")` at the top of a file)
+    /// falls back to the bare file path as the `from` — matching the
+    /// C++/Rust/Go top-level-call rule.
+    fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.call_query, root, content);
+        let cap_names = self.call_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "call.name" {
+                    continue;
+                }
+
+                let callee = cap_node.utf8_text(content).unwrap_or("");
+                if callee.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing `call` node so the
+                // reported line tracks the call site, not the inner
+                // identifier (which can be on a continuation line for
+                // multi-line chains). Note tree-sitter-python uses the
+                // node kind `call`, NOT `call_expression`.
+                let call_node = find_enclosing_kind(cap_node, "call").unwrap_or(cap_node);
+                let from = enclosing_function_id(cap_node, content, path);
+
+                fg.edges.push(Edge {
+                    from,
+                    to: callee.to_owned(),
+                    kind: EdgeKind::Calls,
+                    file: path.to_owned(),
+                    line: call_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for PythonParser {
@@ -305,8 +376,8 @@ impl LanguagePlugin for PythonParser {
 
     /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
     ///
-    /// Phase 7.2 wires the definition extractor; calls (7.3), imports
-    /// (7.4), and inheritance (7.5) follow.
+    /// Phase 7.2 wires the definition extractor; Phase 7.3 wires the call
+    /// extractor; imports (7.4) and inheritance (7.5) follow.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -510,11 +581,10 @@ mod tests {
         );
         assert_eq!(s.language, Language::Python);
         assert_eq!(symbol_id(s), "/tmp/test.py:foo");
-        // `truncate_signature` stops at `:` is NOT a thing — the helper
-        // truncates at `{` or `;`. Python `def`s end in `:` and have no
-        // brace, so the signature retains the full def line. We assert the
-        // signature contains the def-line head and excludes the `pass`
-        // body.
+        // `truncate_signature` stops at `{` or `;` — neither appears in
+        // Python source. The signature is the entire function node text
+        // because Python bodies use `:`, not `{` or `;`. We assert the
+        // signature contains the def-line head.
         assert!(
             s.signature.contains("def foo()"),
             "signature must contain `def foo()`, got: {:?}",
@@ -742,5 +812,161 @@ mod tests {
         let m = sym(&fg, "m");
         assert_eq!(m.kind, SymbolKind::Method);
         assert_eq!(m.parent, "C");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7.3 — call extraction
+    // ----------------------------------------------------------------
+
+    /// Filter `fg.edges` to just the `Calls` edges for ergonomic asserts.
+    fn calls(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect()
+    }
+
+    #[test]
+    fn direct_call_in_free_function_produces_one_calls_edge() {
+        // `def f(): foo()` → 1 edge, To=foo, From=path:f.
+        let fg = parse("def f():\n    foo()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        let e = edges[0];
+        assert_eq!(e.to, "foo");
+        assert_eq!(e.from, "/tmp/test.py:f");
+        assert_eq!(e.kind, EdgeKind::Calls);
+        assert_eq!(e.file, "/tmp/test.py");
+    }
+
+    #[test]
+    fn builtin_call_is_captured_as_direct_call() {
+        // `def f(): print("x")` → 1 edge, To=print. Built-ins receive no
+        // special handling; they look like any other identifier callee.
+        let fg = parse("def f():\n    print(\"x\")\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "print");
+        assert_eq!(edges[0].from, "/tmp/test.py:f");
+    }
+
+    #[test]
+    fn attribute_call_records_trailing_identifier() {
+        // `def f(): obj.method()` → 1 edge, To=method (the trailing
+        // attribute), From=path:f.
+        let fg = parse("def f():\n    obj.method()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "method");
+        assert_eq!(edges[0].from, "/tmp/test.py:f");
+    }
+
+    #[test]
+    fn chained_call_produces_two_edges() {
+        // `def f(): a.b().c()` — outer call has attribute=c, inner call
+        // has attribute=b. Each chain link is its own `call` node, so
+        // two edges fall out naturally.
+        let fg = parse("def f():\n    a.b().c()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"b"), "expected To=b, got {tos:?}");
+        assert!(tos.contains(&"c"), "expected To=c, got {tos:?}");
+        for e in &edges {
+            assert_eq!(e.from, "/tmp/test.py:f");
+        }
+    }
+
+    #[test]
+    fn constructor_call_is_captured_as_direct_call() {
+        // `def f(): MyClass()` → 1 edge, To=MyClass. Constructor calls
+        // naturally match the direct-call pattern; the agent interprets
+        // class-named edges as construction.
+        let fg = parse("def f():\n    MyClass()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "MyClass");
+        assert_eq!(edges[0].from, "/tmp/test.py:f");
+    }
+
+    #[test]
+    fn super_dot_init_produces_two_edges_super_then_init() {
+        // `def f(): super().__init__()` — the outer call's attribute is
+        // `__init__`, the inner call's function is the bare identifier
+        // `super`. Two edges: To=super (direct) and To=__init__ (attr).
+        let fg = parse("def f():\n    super().__init__()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"super"), "expected To=super, got {tos:?}");
+        assert!(
+            tos.contains(&"__init__"),
+            "expected To=__init__, got {tos:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.from, "/tmp/test.py:f");
+        }
+    }
+
+    #[test]
+    fn method_call_records_class_qualified_from() {
+        // `class C: def m(self): self.helper()` — From=path:C::m,
+        // To=helper. The enclosing-function walk in `enclosing_function_id`
+        // finds the `function_definition` first and the `class_definition`
+        // ancestor, so the From carries the class prefix.
+        let fg = parse("class C:\n    def m(self):\n        self.helper()\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "helper");
+        assert_eq!(edges[0].from, "/tmp/test.py:C::m");
+    }
+
+    #[test]
+    fn calls_inside_lambda_attribute_to_enclosing_function() {
+        // `def f(): list(map(lambda x: x+1, items))` — at minimum two
+        // edges: To=list (the outer direct call) and To=map (the
+        // identifier passed to list). Both From=path:f because the
+        // lambda is transparent (not a function_definition).
+        let fg = parse("def f():\n    list(map(lambda x: x+1, items))\n");
+        let edges = calls(&fg);
+        assert!(edges.len() >= 2, "expected >=2 edges, got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"list"), "expected To=list, got {tos:?}");
+        assert!(tos.contains(&"map"), "expected To=map, got {tos:?}");
+        for e in &edges {
+            assert_eq!(
+                e.from, "/tmp/test.py:f",
+                "all edges (including the call inside the lambda) must \
+                 attribute From to the enclosing top-level function"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_inside_list_comprehension_attribute_to_enclosing_function() {
+        // `def f(): [foo(x) for x in items]` → 1 edge, To=foo, From=path:f.
+        // List comprehensions are not function_definitions, so the walk
+        // passes through transparently.
+        let fg = parse("def f():\n    [foo(x) for x in items]\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "foo");
+        assert_eq!(edges[0].from, "/tmp/test.py:f");
+    }
+
+    #[test]
+    fn module_level_call_falls_back_to_bare_file_path() {
+        // `print("hi")` at the top of the file — no enclosing
+        // function_definition, so the From falls back to the bare file
+        // path (no `:name` suffix). Mirrors the C++/Rust/Go top-level-
+        // call rule.
+        let fg = parse("print(\"hi\")\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "print");
+        assert_eq!(
+            edges[0].from, "/tmp/test.py",
+            "module-level call's From must be the bare file path"
+        );
     }
 }

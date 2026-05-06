@@ -117,7 +117,6 @@ pub fn extract_module_path(import_node: Node<'_>, content: &[u8]) -> String {
 ///   finds the `function_definition` first (the inner node), then the
 ///   `class_definition` ancestor — the `decorated_definition` is passed
 ///   through silently.
-#[allow(dead_code)] // wired in Phase 7.3
 pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
     let mut current = node.parent();
     let mut func: Option<Node<'_>> = None;

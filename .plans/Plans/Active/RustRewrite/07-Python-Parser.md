@@ -14,12 +14,12 @@ tasks:
     verification: "`tree-sitter-python = \"=0.25.0\"` added to workspace `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention); `crates/codegraph-lang-python/Cargo.toml` `[dependencies]` populated (tree-sitter, tree-sitter-python, streaming-iterator, codegraph-core, codegraph-lang, thiserror, anyhow) and `[dev-dependencies]` populated (rstest, pretty_assertions, insta); `cargo build -p codegraph-lang-python` green before any parser code lands; `PythonParser::new() -> anyhow::Result<PythonParser>` compiles all queries against tree-sitter-python 0.25 without error; `extensions()` returns `[\".py\", \".pyi\"]` (both extensions dispatch to the same parser; `.pyi` stub files use the same grammar — no separate query path); `id()` returns `Language::Python` (already defined in `crates/codegraph-core/src/lib.rs:29` from Phase 1); **object-safety + id() verified by a single `#[test] fn python_parser_is_object_safe_via_box_dyn() { let p: Box<dyn LanguagePlugin> = Box::new(PythonParser::new().unwrap()); assert_eq!(p.id(), Language::Python); }` matching the Phase 1 C++ test at `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly**; `PythonParser` does NOT override `resolve_call` or `resolve_include` — `resolve_call` accepts the default scope-aware heuristic (Python's dynamic typing makes any static call resolution inherently noisy; the default heuristic is the documented contract); `resolve_include` accepts the default basename match against the FileIndex, which is a no-op for Python module paths because `from foo.bar import baz` records `foo.bar` as a dotted module path, not a filesystem path; query categories: definitions (function_definition, class_definition — tree-sitter-python 0.25 wraps `async def` as a `function_definition` node, NOT a separate `async_function_definition`, so no extra query is needed; confirmed by fixture), calls (`call` — Python's tree-sitter uses 'call' not 'call_expression'), imports (import_statement with dotted_name, import_from_statement with module_name), inheritance (class_definition with superclasses argument_list); helpers find_enclosing_class, extract_module_path, walk_decorator_unwrap unit-tested"
   - id: "7.2"
     title: "Definition extraction with method-vs-function context, decorator transparency, async methods"
-    status: in-progress
+    status: complete
     depends_on: ["7.1"]
     verification: "function_definition without enclosing class_definition → Kind=Function; function_definition with enclosing class_definition → Kind=Method, parent=class name; async def methods (`class Server: async def handle(self): ...`) produce Kind=Method with parent=class — confirmed by fixture; class_definition → Kind=Class; @decorator wrapping a function/class produces decorated_definition wrapping the inner node — queries match the inner node directly because tree-sitter queries search the entire tree, so decorator presence does not block extraction (verified by a fixture with `@property def x(self)` producing a Method symbol); __init__, __str__, __repr__ are ordinary methods (no special handling); nested classes (class inside class) handled — outer class is the parent for the inner class; namespace stays empty for Python (Python's module concept is captured in the file path itself, not in a namespace tag); `.pyi` stub files extract symbols identically to `.py` files (function_definition with `...` body still parses as a function_definition; corpus tests assert this); tests cover each case"
   - id: "7.3"
     title: "Call site extraction"
-    status: planned
+    status: complete
     depends_on: ["7.1"]
     verification: "Python's tree-sitter uses node kind 'call' (NOT 'call_expression'); call > function: identifier → direct call (foo()); call > function: attribute > attribute: identifier → method/attribute call (obj.method()); chained calls (a.b().c()) produce 2 edges; constructor calls (MyClass()) treated as direct calls (To=MyClass) — these naturally produce edges that look like 'calls to a class', which the agent can interpret as construction; super() calls captured; built-in calls (print, len) captured; calls inside list comprehensions, lambdas, default arguments — all captured with the enclosing function as From; tests for each pattern"
   - id: "7.4"
@@ -93,16 +93,16 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
 ## 7.2: Definition extraction with decorator transparency and async methods
 
 ### Subtasks
-- [ ] `function_definition` with no enclosing class_definition → Kind=Function, no parent
-- [ ] `function_definition` enclosed in class_definition → Kind=Method, parent = class name
-- [ ] `class_definition` → Kind=Class
-- [ ] **async def in class:** `class Server: async def handle(self): ...` produces a Method with parent=Server (tree-sitter-python 0.25 represents `async def` as `function_definition`, so the same query path applies — confirmed by fixture)
-- [ ] Decorated definitions: tree-sitter wraps them in `decorated_definition` but the queries match the inner `function_definition` / `class_definition` nodes directly (this is how tree-sitter queries work — they search the whole tree)
-- [ ] Nested classes: a class defined inside another class produces a Class symbol whose parent is the outer class
-- [ ] `__init__`, `__str__`, `__repr__`, `__call__` are ordinary methods — no special handling
-- [ ] Namespace stays empty for Python; the file path encodes the module location
-- [ ] `.pyi` stub files extract symbols identically to `.py` files — `def foo(x: int) -> str: ...` (a stub with `...` body) still parses as `function_definition` and produces a Function symbol
-- [ ] Tests:
+- [x] `function_definition` with no enclosing class_definition → Kind=Function, no parent
+- [x] `function_definition` enclosed in class_definition → Kind=Method, parent = class name
+- [x] `class_definition` → Kind=Class
+- [x] **async def in class:** `class Server: async def handle(self): ...` produces a Method with parent=Server (tree-sitter-python 0.25 represents `async def` as `function_definition`, so the same query path applies — confirmed by fixture)
+- [x] Decorated definitions: tree-sitter wraps them in `decorated_definition` but the queries match the inner `function_definition` / `class_definition` nodes directly (this is how tree-sitter queries work — they search the whole tree)
+- [x] Nested classes: a class defined inside another class produces a Class symbol whose parent is the outer class
+- [x] `__init__`, `__str__`, `__repr__`, `__call__` are ordinary methods — no special handling
+- [x] Namespace stays empty for Python; the file path encodes the module location
+- [x] `.pyi` stub files extract symbols identically to `.py` files — `def foo(x: int) -> str: ...` (a stub with `...` body) still parses as `function_definition` and produces a Function symbol
+- [x] Tests:
   - `def foo(): ...` → Function
   - `class C: def m(self): ...` → C is Class, m is Method with parent=C
   - `class Server: async def handle(self): ...` → handle is Method with parent=Server (async-method-in-class fixture)
@@ -114,14 +114,14 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
 ## 7.3: Call site extraction
 
 ### Subtasks
-- [ ] `extract_calls`:
+- [x] `extract_calls`:
   - `(call function: (identifier))` → direct call (To = identifier text)
   - `(call function: (attribute attribute: (identifier)))` → method/attribute call (To = the attribute identifier)
-- [ ] Enclosing function: walk up to `function_definition`; if found, From = `path:funcName` or `path:Parent::funcName`
-- [ ] Constructor calls: `MyClass()` is just `(call function: (identifier))` matching the direct-call query — produces an edge To=MyClass; this naturally captures construction (the agent can interpret it)
-- [ ] super() calls captured as direct calls (To=super)
-- [ ] Calls inside list/dict/set comprehensions, lambdas, default arguments all produce edges with the enclosing top-level function as From
-- [ ] Tests for each pattern
+- [x] Enclosing function: walk up to `function_definition`; if found, From = `path:funcName` or `path:Parent::funcName`; module-level fallback (no enclosing `function_definition`) → From = bare file path
+- [x] Constructor calls: `MyClass()` is just `(call function: (identifier))` matching the direct-call query — produces an edge To=MyClass; this naturally captures construction (the agent can interpret it)
+- [x] super() calls captured as direct calls (To=super)
+- [x] Calls inside list/dict/set comprehensions, lambdas, default arguments all produce edges with the enclosing top-level function as From
+- [x] Tests for each pattern
 
 ## 7.4: Import extraction
 
