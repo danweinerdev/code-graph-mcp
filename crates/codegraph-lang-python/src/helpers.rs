@@ -71,7 +71,6 @@ pub fn find_enclosing_class(node: Node<'_>) -> Option<Node<'_>> {
 /// so downstream consumers can distinguish relative imports from absolute.
 /// The default `resolve_include` correctly returns `None` against these
 /// dotted module strings because they are not filesystem paths.
-#[allow(dead_code)] // wired in Phase 7.4
 pub fn extract_module_path(import_node: Node<'_>, content: &[u8]) -> String {
     match import_node.kind() {
         "dotted_name" => import_node.utf8_text(content).unwrap_or("").to_owned(),

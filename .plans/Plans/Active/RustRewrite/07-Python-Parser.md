@@ -24,7 +24,7 @@ tasks:
     verification: "Python's tree-sitter uses node kind 'call' (NOT 'call_expression'); call > function: identifier → direct call (foo()); call > function: attribute > attribute: identifier → method/attribute call (obj.method()); chained calls (a.b().c()) produce 2 edges; constructor calls (MyClass()) treated as direct calls (To=MyClass) — these naturally produce edges that look like 'calls to a class', which the agent can interpret as construction; super() calls captured; built-in calls (print, len) captured; calls inside list comprehensions, lambdas, default arguments — all captured with the enclosing function as From; tests for each pattern"
   - id: "7.4"
     title: "Import extraction with module path semantics"
-    status: planned
+    status: complete
     depends_on: ["7.1"]
     verification: "import foo → 1 edge with To='foo'; import foo.bar → 1 edge with To='foo.bar'; import foo as f → 1 edge with To='foo' (alias dropped, path preserved — same rule as Go); from foo import bar → 1 edge with To='foo' (the module path, NOT 'bar' — the imported symbol name is not the dependency); from foo.bar import baz → 1 edge with To='foo.bar'; from . import utils → 1 edge with To='.utils' (relative import preserved as written); from typing import List → 1 edge with To='typing'; from __future__ import annotations → 1 edge with To='__future__' (dunder module name handled correctly); each edge has Kind=Includes; for `from . import utils` the default `resolve_include` returns None (no filesystem path is matched), confirming relative imports are stored verbatim and never accidentally resolved; tests cover every form including the relative form, the from-form-vs-module-path distinction, and the dunder __future__ case"
   - id: "7.5"

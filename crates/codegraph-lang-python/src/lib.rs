@@ -21,9 +21,20 @@
 //!
 //! Phase 7.3 wires `extract_calls` — direct calls, attribute calls,
 //! chained calls, and the module-top-level fallback (`from = path` when
-//! there is no enclosing `function_definition`). Phase 7.4 wires
-//! `extract_imports`. Phase 7.5 wires `extract_inheritance`. After 7.5,
-//! `parse_file` is fully populated and every extractor is live.
+//! there is no enclosing `function_definition`).
+//!
+//! Phase 7.4 wires `extract_imports` — both `import_statement` (`import
+//! foo`, `import foo.bar`, `import foo as f`, `import a, b`) and
+//! `import_from_statement` (`from foo import bar`, `from foo.bar import
+//! baz`, `from foo import bar, qux`, `from . import utils`, `from
+//! ..pkg.mod import x`) plus the dedicated `future_import_statement`
+//! node kind for `from __future__ import annotations`. Conditional
+//! imports (`if TYPE_CHECKING: import x`) are filtered by the module-
+//! top-level guard in `extract_imports` so the dependency graph stays
+//! stable across files that guard imports behind feature flags.
+//!
+//! Phase 7.5 wires `extract_inheritance`. After 7.5, `parse_file` is
+//! fully populated and every extractor is live.
 //!
 //! # Default trait methods
 //!
@@ -74,7 +85,9 @@ use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
-use crate::helpers::{enclosing_function_id, find_enclosing_class, truncate_signature};
+use crate::helpers::{
+    enclosing_function_id, extract_module_path, find_enclosing_class, truncate_signature,
+};
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITANCE_QUERIES};
 
 /// File extensions the Python parser claims. Both `.py` (regular sources)
@@ -99,7 +112,6 @@ pub struct PythonParser {
     /// Compiled call query (wired in 7.3).
     call_query: Query,
     /// Compiled import query (wired in 7.4).
-    #[allow(dead_code)]
     import_query: Query,
     /// Compiled inheritance query (wired in 7.5).
     #[allow(dead_code)]
@@ -164,6 +176,7 @@ impl PythonParser {
 
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
+        self.extract_imports(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -363,6 +376,179 @@ impl PythonParser {
             }
         }
     }
+
+    /// Run the import query and produce `Includes` edges. Mirrors the C++
+    /// plugin's `extract_includes`, the Rust plugin's `extract_uses`, and
+    /// the Go plugin's `extract_imports`: the edge `from` is the source-
+    /// file path (not a symbol ID) and the `to` is the dotted module path.
+    /// The `Graph` engine routes `Includes` edges into a per-file map keyed
+    /// by `from` (see `Graph::merge_file_graph`).
+    ///
+    /// Per-capture behavior:
+    ///
+    /// - `import.module` — the `name` field of an `import_statement`
+    ///   (either a bare `dotted_name` or the inner `dotted_name` reached
+    ///   through an `aliased_import` wrapper). Each captured node's text is
+    ///   the dotted path — `foo`, `foo.bar`, etc. Aliases (`import foo as
+    ///   f`) are dropped: only the path is captured, never the alias name.
+    ///   Multi-name imports (`import a, b`) produce one capture per name
+    ///   because `import_statement` allows multiple `name:` field children
+    ///   and the query matches each one.
+    /// - `import.from_module` — the `module_name` field of an
+    ///   `import_from_statement` when it is a `dotted_name`. Records the
+    ///   *module*, not the imported symbol(s) — `from foo import bar, qux`
+    ///   yields exactly one edge with `to = "foo"`. Dunder modules
+    ///   (`__future__`) flow through this same path with no special-casing.
+    /// - `import.from_module_relative` — the `module_name` field when it is
+    ///   a `relative_import` (leading-dot form: `from . import x`,
+    ///   `from .utils import y`, `from ..pkg import z`).
+    ///   * If the `relative_import` text contains a module name after the
+    ///     dots (`.utils`, `..pkg.mod`), it is recorded verbatim — the
+    ///     imported names are dropped, matching the absolute-form rule.
+    ///   * If the `relative_import` text is dots-only (`.`, `..`), the
+    ///     imported names are sibling modules of the current package, not
+    ///     names inside one module. We emit one edge per imported name
+    ///     with `to = <dots><name>` — `from . import a, b` produces two
+    ///     edges (`.a`, `.b`); `from . import utils` produces one edge
+    ///     (`.utils`). This matches the 7.4 verification field's
+    ///     `from . import utils → To='.utils'` rule and preserves the
+    ///     leading-dot prefix so consumers can distinguish relative from
+    ///     absolute.
+    ///
+    ///   The default `resolve_include` (basename-match against the
+    ///   FileIndex) returns `None` for any of these dotted strings — they
+    ///   are not filesystem paths — so the wire format records the
+    ///   relative path verbatim and the engine never accidentally
+    ///   resolves it.
+    ///
+    /// The line is anchored at the enclosing `import_statement` /
+    /// `import_from_statement` so multi-name imports share a single line
+    /// (matches the C++/Rust/Go convention for multi-spec import groups).
+    ///
+    /// **Conditional imports are NOT extracted by design.** Patterns like
+    /// `if TYPE_CHECKING: import x` parse with the inner `import_statement`
+    /// nested inside an `if_statement > block`. Tree-sitter queries walk
+    /// the whole tree, so the inner `import_statement` would normally
+    /// match — but the `extract_imports` walk filters out matches whose
+    /// enclosing import-statement is not a direct child of the `module`
+    /// root. This keeps the dependency graph stable across files that
+    /// guard imports behind feature flags or runtime checks.
+    fn extract_imports(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.import_query, root, content);
+        let cap_names = self.import_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+
+                // Resolve the enclosing import statement so we can:
+                //   1. anchor `line` at the statement (multi-name imports
+                //      share a line),
+                //   2. filter out conditional imports (those whose
+                //      statement is nested inside an `if_statement`,
+                //      `try_statement`, `with_statement`, or other
+                //      non-module ancestor).
+                let stmt_kind = match cap_name {
+                    "import.module" => "import_statement",
+                    "import.from_module" | "import.from_module_relative" => "import_from_statement",
+                    "import.future" => "future_import_statement",
+                    _ => continue,
+                };
+                let Some(stmt_node) = find_enclosing_kind(cap_node, stmt_kind) else {
+                    continue;
+                };
+                if !is_module_top_level(stmt_node) {
+                    continue;
+                }
+                let line = stmt_node.start_position().row as u32 + 1;
+
+                match cap_name {
+                    "import.future" => {
+                        // `from __future__ import X[, Y, ...]` — emit a
+                        // single edge with the synthetic module name
+                        // `__future__`. The actual feature names (the
+                        // `name:` field children) are dropped, matching
+                        // the absolute-import "module is the dependency,
+                        // not the imported symbol" rule.
+                        fg.edges.push(Edge {
+                            from: path.to_owned(),
+                            to: "__future__".to_owned(),
+                            kind: EdgeKind::Includes,
+                            file: path.to_owned(),
+                            line,
+                        });
+                    }
+                    "import.module" => {
+                        let to = cap_node.utf8_text(content).unwrap_or("").to_owned();
+                        if to.is_empty() {
+                            continue;
+                        }
+                        fg.edges.push(Edge {
+                            from: path.to_owned(),
+                            to,
+                            kind: EdgeKind::Includes,
+                            file: path.to_owned(),
+                            line,
+                        });
+                    }
+                    "import.from_module" => {
+                        let to = extract_module_path(cap_node, content);
+                        if to.is_empty() {
+                            continue;
+                        }
+                        fg.edges.push(Edge {
+                            from: path.to_owned(),
+                            to,
+                            kind: EdgeKind::Includes,
+                            file: path.to_owned(),
+                            line,
+                        });
+                    }
+                    "import.from_module_relative" => {
+                        // Relative-import bookkeeping. The relative_import
+                        // node text is either dots-only (`.`, `..`) or
+                        // dots-plus-module (`.utils`, `..pkg.mod`).
+                        let rel_text = extract_module_path(cap_node, content);
+                        if rel_text.is_empty() {
+                            continue;
+                        }
+                        if rel_text.chars().all(|c| c == '.') {
+                            // Dots-only: each imported name is a sibling
+                            // module. Walk the import_from_statement's
+                            // `name:` field children and emit one edge
+                            // per imported name with `to = <dots><name>`.
+                            for name in imported_names(stmt_node, content) {
+                                fg.edges.push(Edge {
+                                    from: path.to_owned(),
+                                    to: format!("{rel_text}{name}"),
+                                    kind: EdgeKind::Includes,
+                                    file: path.to_owned(),
+                                    line,
+                                });
+                            }
+                        } else {
+                            // Dots-plus-module: the dependency target is
+                            // the relative_import text itself; imported
+                            // names are dropped (same as absolute form).
+                            fg.edges.push(Edge {
+                                from: path.to_owned(),
+                                to: rel_text,
+                                kind: EdgeKind::Includes,
+                                file: path.to_owned(),
+                                line,
+                            });
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for PythonParser {
@@ -377,7 +563,9 @@ impl LanguagePlugin for PythonParser {
     /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
     ///
     /// Phase 7.2 wires the definition extractor; Phase 7.3 wires the call
-    /// extractor; imports (7.4) and inheritance (7.5) follow.
+    /// extractor; Phase 7.4 wires the import extractor (both forms plus
+    /// the special `future_import_statement` node and the conditional-
+    /// import filter); inheritance (7.5) follows.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -425,6 +613,52 @@ fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         current = n.parent();
     }
     None
+}
+
+/// Return `true` when `stmt` is a direct child of the `module` root — i.e.
+/// a top-level statement, not nested inside a conditional / try / with /
+/// function / class block.
+///
+/// Used by [`PythonParser::extract_imports`] to filter out conditional
+/// imports such as:
+///
+/// ```python
+/// if TYPE_CHECKING:
+///     import expensive_module
+/// ```
+///
+/// Tree-sitter queries walk the entire tree by default, so the inner
+/// `import_statement` would otherwise match `IMPORT_QUERIES`. The phase 7.4
+/// contract is that conditional imports are excluded from the dependency
+/// graph: a file's import edges should reflect what it depends on
+/// unconditionally at module load. This filter is the enforcement point.
+fn is_module_top_level(stmt: Node<'_>) -> bool {
+    stmt.parent().map(|p| p.kind() == "module").unwrap_or(false)
+}
+
+/// Return the imported-name texts from an `import_from_statement` —
+/// the `name:` field children. Each child is a `dotted_name` (single
+/// identifier or qualified) or an `aliased_import` wrapping one; in either
+/// case we return the path text and drop any alias.
+///
+/// Used by [`PythonParser::extract_imports`] when the `module_name` is a
+/// dots-only `relative_import` (`from . import a, b`): each imported name
+/// is a separate sibling module and contributes its own dependency edge.
+fn imported_names<'a>(stmt: Node<'a>, content: &'a [u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = stmt.walk();
+    for child in stmt.children_by_field_name("name", &mut cursor) {
+        let path_node = if child.kind() == "aliased_import" {
+            child.child_by_field_name("name").unwrap_or(child)
+        } else {
+            child
+        };
+        let text = path_node.utf8_text(content).unwrap_or("");
+        if !text.is_empty() {
+            out.push(text.to_owned());
+        }
+    }
+    out
 }
 
 /// Build a [`Symbol`] from a definition node. Centralises the row/column/
@@ -923,16 +1157,24 @@ mod tests {
 
     #[test]
     fn calls_inside_lambda_attribute_to_enclosing_function() {
-        // `def f(): list(map(lambda x: x+1, items))` — at minimum two
-        // edges: To=list (the outer direct call) and To=map (the
-        // identifier passed to list). Both From=path:f because the
-        // lambda is transparent (not a function_definition).
-        let fg = parse("def f():\n    list(map(lambda x: x+1, items))\n");
+        // `def f(): g = lambda: helper(); g()` — the body of the lambda
+        // contains a real `call` (`helper()`). Lambda is NOT a
+        // function_definition, so `enclosing_function_id`'s walk passes
+        // through it. The expected edges include To=helper (called inside
+        // the lambda) and To=g (the lambda invocation). All edges'
+        // From=path:f exercises the lambda-transparent walk end-to-end.
+        let fg = parse("def f():\n    g = lambda: helper()\n    g()\n");
         let edges = calls(&fg);
         assert!(edges.len() >= 2, "expected >=2 edges, got: {:?}", fg.edges);
         let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
-        assert!(tos.contains(&"list"), "expected To=list, got {tos:?}");
-        assert!(tos.contains(&"map"), "expected To=map, got {tos:?}");
+        assert!(
+            tos.contains(&"helper"),
+            "expected To=helper (call inside lambda body), got {tos:?}"
+        );
+        assert!(
+            tos.contains(&"g"),
+            "expected To=g (the lambda invocation), got {tos:?}"
+        );
         for e in &edges {
             assert_eq!(
                 e.from, "/tmp/test.py:f",
@@ -968,5 +1210,242 @@ mod tests {
             edges[0].from, "/tmp/test.py",
             "module-level call's From must be the bare file path"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7.4 — import extraction
+    // ----------------------------------------------------------------
+
+    /// Filter `fg.edges` to just the `Includes` edges for ergonomic asserts.
+    fn includes(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    #[test]
+    fn import_simple_records_one_edge_with_module_path() {
+        // `import foo` → 1 edge, To='foo', From=path, kind=Includes.
+        let fg = parse("import foo\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        let e = edges[0];
+        assert_eq!(e.to, "foo");
+        assert_eq!(e.from, "/tmp/test.py");
+        assert_eq!(e.kind, EdgeKind::Includes);
+        assert_eq!(e.file, "/tmp/test.py");
+    }
+
+    #[test]
+    fn import_dotted_records_full_module_path() {
+        // `import foo.bar` → 1 edge, To='foo.bar' (NOT 'foo' or 'bar').
+        let fg = parse("import foo.bar\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "foo.bar");
+    }
+
+    #[test]
+    fn import_aliased_drops_alias_records_path() {
+        // `import foo as f` → 1 edge, To='foo' (alias dropped). The
+        // `aliased_import` query targets the inner `dotted_name` directly,
+        // so the alias never reaches the extractor.
+        let fg = parse("import foo as f\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "foo");
+    }
+
+    #[test]
+    fn import_multi_name_produces_one_edge_per_name() {
+        // `import a, b` → 2 edges, To='a' and To='b'. Tree-sitter parses
+        // this as one `import_statement` with two `name:` field children;
+        // the query matches each one.
+        let fg = parse("import a, b\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", fg.edges);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"a"), "expected To=a, got {tos:?}");
+        assert!(tos.contains(&"b"), "expected To=b, got {tos:?}");
+        for e in &edges {
+            assert_eq!(e.from, "/tmp/test.py");
+            assert_eq!(e.kind, EdgeKind::Includes);
+        }
+    }
+
+    #[test]
+    fn from_import_records_module_not_imported_name() {
+        // `from foo import bar` → 1 edge, To='foo' (NOT 'bar'). The
+        // dependency target is the *module*, not the imported symbol.
+        let fg = parse("from foo import bar\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(
+            edges[0].to, "foo",
+            "from-import's To must be the module, not the imported name"
+        );
+    }
+
+    #[test]
+    fn from_import_dotted_records_full_module_path() {
+        // `from foo.bar import baz` → 1 edge, To='foo.bar'.
+        let fg = parse("from foo.bar import baz\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "foo.bar");
+    }
+
+    #[test]
+    fn from_import_multi_name_records_one_edge() {
+        // `from foo import bar, qux` → still 1 edge, To='foo'. Multiple
+        // imported names share one module, so they share one edge.
+        let fg = parse("from foo import bar, qux\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "foo");
+    }
+
+    #[test]
+    fn from_typing_import_list_dict_records_one_edge() {
+        // `from typing import List, Dict` → 1 edge, To='typing'. Belt-and-
+        // suspenders for the multi-name rule with a real-world case.
+        let fg = parse("from typing import List, Dict\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "typing");
+    }
+
+    #[test]
+    fn from_relative_import_preserves_dot() {
+        // `from . import utils` → 1 edge, To='.utils' (relative_import
+        // preserves the leading dot verbatim — distinguishes relative
+        // from absolute imports for downstream consumers).
+        // Pin edge.line to anchor the line at the statement (not the
+        // inner `relative_import` node).
+        let fg = parse("from . import utils\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, ".utils");
+        assert_eq!(
+            edges[0].line, 1,
+            "line is anchored at the import_from_statement"
+        );
+    }
+
+    #[test]
+    fn from_relative_double_dot_import_preserves_double_dot() {
+        // `from ..pkg import x` → 1 edge, To='..pkg' — both leading dots
+        // preserved. Belt-and-suspenders for the relative-import rule.
+        let fg = parse("from ..pkg import x\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "..pkg");
+    }
+
+    #[test]
+    fn from_future_import_records_dunder_module() {
+        // `from __future__ import annotations` → 1 edge, To='__future__'.
+        // tree-sitter-python parses this as a *distinct* node kind
+        // `future_import_statement` (NOT `import_from_statement`) — the
+        // grammar special-cases `__future__` imports because they have
+        // unique runtime semantics. The IMPORT_QUERIES match this node
+        // kind too so the dunder case lands here.
+        let fg = parse("from __future__ import annotations\n");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        assert_eq!(edges[0].to, "__future__");
+    }
+
+    #[test]
+    fn conditional_import_inside_if_block_produces_zero_edges() {
+        // Anti-regression: `if TYPE_CHECKING: import expensive_module`
+        // parses with the inner `import_statement` nested inside an
+        // `if_statement > block`. The 7.4 contract is that conditional
+        // imports do NOT contribute to the dependency graph — `is_module_top_level`
+        // filters out matches whose enclosing import-statement is not a
+        // direct child of the `module` root.
+        //
+        // This file should produce zero `Includes` edges. (The
+        // `TYPE_CHECKING = False` line and `if TYPE_CHECKING:` itself
+        // contain no calls or imports that would cause noise in this
+        // assertion.)
+        let src = "TYPE_CHECKING = False\nif TYPE_CHECKING:\n    import expensive_module\n";
+        let fg = parse(src);
+        let edges = includes(&fg);
+        assert!(
+            edges.is_empty(),
+            "conditional imports must not produce Includes edges, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn conditional_from_import_inside_try_block_produces_zero_edges() {
+        // Belt-and-suspenders for the conditional-import filter: imports
+        // inside a `try_statement > block` are also filtered.
+        let src = "try:\n    from foo import bar\nexcept ImportError:\n    pass\n";
+        let fg = parse(src);
+        let edges = includes(&fg);
+        assert!(
+            edges.is_empty(),
+            "imports inside try blocks must not produce Includes edges, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn relative_import_records_to_field_verbatim_for_default_resolve_include() {
+        // The default `resolve_include` (basename match against the
+        // FileIndex) is a no-op for Python's dotted module strings. End-to-
+        // end this means an edge from `src/app.py` containing `from .
+        // import utils` records `to = ".utils"` verbatim — no resolution
+        // happens at parse_file. This test pins the wire format directly
+        // (no need to invoke `resolve_edges` — the default trait method's
+        // no-op behavior is asserted by structure: parse_file produces
+        // an `Includes` edge whose `to` is the literal dotted/relative
+        // module string, never a resolved file path).
+        let fg = parse_at("from . import utils\n", "/repo/src/app.py");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
+        let e = edges[0];
+        assert_eq!(
+            e.to, ".utils",
+            "wire format records the relative module string verbatim"
+        );
+        assert_eq!(e.from, "/repo/src/app.py");
+        assert_eq!(e.file, "/repo/src/app.py");
+        assert_eq!(e.kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn mixed_imports_produce_distinct_edges() {
+        // Sanity: a module with several import forms produces the
+        // expected union — one edge per distinct module reference, alias
+        // dropped, multi-name expanded for `import a, b` and collapsed
+        // for `from foo import a, b`.
+        let src = "\
+import foo
+import bar.baz
+import qux as q
+from typing import List, Dict
+from . import utils
+import a, b
+";
+        let fg = parse(src);
+        let edges = includes(&fg);
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        // Expected Tos: foo, bar.baz, qux, typing, .utils, a, b
+        assert_eq!(edges.len(), 7, "expected 7 Includes edges, got {:?}", tos);
+        for expected in ["foo", "bar.baz", "qux", "typing", ".utils", "a", "b"] {
+            assert!(
+                tos.contains(&expected),
+                "expected To={expected:?} in {tos:?}"
+            );
+        }
+        for e in &edges {
+            assert_eq!(e.kind, EdgeKind::Includes);
+            assert_eq!(e.from, "/tmp/test.py");
+        }
     }
 }

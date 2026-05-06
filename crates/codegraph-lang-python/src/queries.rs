@@ -110,7 +110,8 @@ pub(crate) const CALL_QUERIES: &str = r#"
 
 /// Import queries: `import foo`, `import foo.bar`, `import foo as f`, and
 /// `from foo import bar`, `from foo.bar import baz`, `from . import x`,
-/// `from foo import (a, b)`, `from foo import *`.
+/// `from foo import (a, b)`, `from foo import *`, plus the special
+/// `from __future__ import annotations` form.
 ///
 /// **Field reference (tree-sitter-python 0.25.0):**
 /// - `import_statement` → `name: (dotted_name | aliased_import)+` (multiple
@@ -123,19 +124,27 @@ pub(crate) const CALL_QUERIES: &str = r#"
 ///   symbol(s) but is NOT the dependency target (the *module* is what we
 ///   depend on, not the symbol). 7.4's extractor reads `module_name` and
 ///   ignores the `name` field by design.
+/// - `future_import_statement` → tree-sitter-python parses
+///   `from __future__ import annotations` as a **distinct node kind**,
+///   NOT as an `import_from_statement`. The grammar special-cases the
+///   dunder module because `__future__` imports have unique compile-time
+///   semantics. The node has a `name:` field carrying the imported
+///   feature(s) but no `module_name:` field — the module is implicit.
+///   We match it directly and synthesize the dependency target as the
+///   string `"__future__"` (no field text needed).
 ///
 /// We capture only the path nodes — `@import.module` from
-/// `import_statement` and `@import.from_module` from
-/// `import_from_statement`. Extraction time at 7.4 walks each capture to
-/// recover the dotted path (handling `dotted_name` directly and
-/// `relative_import` for `from . import x` style imports — preserved
-/// verbatim, including leading dots, per the 7.4 verification field's
-/// rule).
+/// `import_statement`, `@import.from_module` /
+/// `@import.from_module_relative` from `import_from_statement`, and
+/// `@import.future` from `future_import_statement`. Extraction time at 7.4
+/// walks each capture to recover the dotted path (handling `dotted_name`
+/// directly, `relative_import` for `from . import x` style imports —
+/// preserved verbatim, including leading dots — and the
+/// `future_import_statement` form by emitting a fixed `__future__` edge).
 ///
 /// Following the Phase 6.4 cleanup, we do NOT bind a dead `@import.stmt`
 /// capture on the outer statement — the line is recovered by walking up
-/// to the enclosing `import_statement` / `import_from_statement` at
-/// extraction time.
+/// to the enclosing import-statement node at extraction time.
 pub(crate) const IMPORT_QUERIES: &str = r#"
 ; import foo / import foo.bar / import foo as f / import a, b
 ; The `name` field is the dotted_name path or an aliased_import wrapping a
@@ -156,10 +165,17 @@ pub(crate) const IMPORT_QUERIES: &str = r#"
 
 ; from . import utils / from .. import x — relative import. 7.4 records
 ; the relative_import text verbatim (e.g. `.utils` if a dotted_name follows
-; the dots, or `.` for a bare relative import). Captured here as a separate
+; the dots, or combines the dots with the imported name(s) for the
+; dots-only form `from . import utils`). Captured here as a separate
 ; capture name so the extractor branches on relative-vs-absolute form.
 (import_from_statement
   module_name: (relative_import) @import.from_module_relative)
+
+; from __future__ import annotations — tree-sitter-python uses a distinct
+; `future_import_statement` node kind. The synthetic capture lets the
+; extractor emit a single edge with `to = "__future__"` regardless of
+; which feature(s) are imported.
+(future_import_statement) @import.future
 "#;
 
 /// Inheritance queries: `class_definition` with a `superclasses` argument
