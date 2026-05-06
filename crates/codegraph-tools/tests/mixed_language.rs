@@ -37,7 +37,9 @@ use codegraph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
 mod common;
-use common::{copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path};
+use common::{
+    copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path, GO_INTERFACE_FIXTURE,
+};
 
 /// Fresh server with the C++, Rust, and Go language plugins registered —
 /// mirrors the registration block in `crates/code-graph-mcp/src/main.rs`.
@@ -412,13 +414,13 @@ async fn search_init_returns_both_languages() {
     // would collapse them into one entry on call lookup.
     let cpp_count = languages.iter().filter(|l| **l == "cpp").count();
     let go_count = languages.iter().filter(|l| **l == "go").count();
-    assert!(
-        cpp_count >= 1,
-        "expected at least 1 C++ init, got languages: {languages:?}"
+    assert_eq!(
+        cpp_count, 1,
+        "expected exactly 1 C++ init, got languages: {languages:?}"
     );
-    assert!(
-        go_count >= 1,
-        "expected at least 1 Go init, got languages: {languages:?}"
+    assert_eq!(
+        go_count, 1,
+        "expected exactly 1 Go init, got languages: {languages:?}"
     );
 }
 
@@ -518,17 +520,10 @@ async fn build_go_interface_fixture() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for Go interface fixture");
     // `Reader` is the interface; `MyReader` structurally implements it
     // by having a `Read()` method. The parser must NOT emit an Inherits
-    // edge for that relationship.
-    std::fs::write(
-        dir.path().join("reader.go"),
-        "package main\n\n\
-         type Reader interface {\n\
-         \tRead() error\n\
-         }\n\n\
-         type MyReader struct{}\n\n\
-         func (m *MyReader) Read() error { return nil }\n",
-    )
-    .expect("write reader.go");
+    // edge for that relationship. Source string is shared with the
+    // matching snapshot fixture in `snapshot_responses.rs` via
+    // `common::GO_INTERFACE_FIXTURE`.
+    std::fs::write(dir.path().join("reader.go"), GO_INTERFACE_FIXTURE).expect("write reader.go");
     build_indexed_from_dir(dir).await
 }
 

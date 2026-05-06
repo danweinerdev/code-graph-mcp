@@ -31,6 +31,7 @@ use std::sync::Arc;
 mod common;
 use common::{
     copy_testdata, copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path,
+    GO_INTERFACE_FIXTURE,
 };
 
 use codegraph_core::Language;
@@ -882,16 +883,9 @@ async fn response_search_symbols_helper_language_go() {
 /// get_file_symbols snapshots below.
 async fn build_indexed_fixture_with_go_interface() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for Go interface fixture");
-    std::fs::write(
-        dir.path().join("reader.go"),
-        "package main\n\n\
-         type Reader interface {\n\
-         \tRead() error\n\
-         }\n\n\
-         type MyReader struct{}\n\n\
-         func (m *MyReader) Read() error { return nil }\n",
-    )
-    .expect("write reader.go");
+    // Fixture body lives in `common::GO_INTERFACE_FIXTURE` so this and
+    // the matching mixed-language test stay byte-identical.
+    std::fs::write(dir.path().join("reader.go"), GO_INTERFACE_FIXTURE).expect("write reader.go");
     let indexed_root =
         std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
 

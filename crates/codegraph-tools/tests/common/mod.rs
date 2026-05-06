@@ -79,6 +79,22 @@ pub fn copy_testdata_from(src: &Path, dest: &Path) {
     }
 }
 
+/// Inline Go fixture used by both `mixed_language.rs` and
+/// `snapshot_responses.rs` to exercise `get_class_hierarchy` /
+/// `get_file_symbols` against a Go interface plus a struct that
+/// structurally implements it. The struct must NOT show up as `derived`
+/// for the interface — Go interfaces are structural, so the parser emits
+/// zero `Inherits` edges (Phase 6.2 design). Centralized here so both
+/// call sites stay byte-identical and any future shape tweak lands in
+/// one place.
+#[allow(dead_code)]
+pub const GO_INTERFACE_FIXTURE: &str = "package main\n\n\
+     type Reader interface {\n\
+     \tRead() error\n\
+     }\n\n\
+     type MyReader struct{}\n\n\
+     func (m *MyReader) Read() error { return nil }\n";
+
 /// Pull the first text block out of a `CallToolResult`. All callers route
 /// through here so a future change to rmcp's `Content` shape surfaces in
 /// one place rather than across every test.

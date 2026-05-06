@@ -34,12 +34,12 @@ tasks:
     verification: "testdata/go/ multi-package project covers: structs with exported/unexported methods, interface definition, structural implementation (interface satisfied by concrete type, no edge), pointer and value receivers, goroutines (go fn()), defer, multiple import styles, init() function, closures, embedded structs, generic functions; MANIFEST.md documents expected symbols and edges; corpus tests cover all definition forms, all call patterns, all import forms, and edge cases (empty file with only package clause, interface embedding interface, anonymous struct field, blank identifier function); parse-test testdata/go matches MANIFEST counts; **watch-mode reindex regression: start a watch on a temp Go project, modify a `.go` file (add a function, remove a method), confirm `get_file_symbols` reflects the change after the debounce window, confirm `Graph::prune_dangling_edges` invariant holds (no adj/radj entries point at removed symbols) — mirrors the Phase 4 watch-test structure**; **real-world dogfood**: parse-test against `github.com/sirupsen/logrus` (small, stable Go library) cloned to /tmp at a pinned tag (v1.9.3) — 0 crashes, 0 warnings, approximate symbol count between 200 and 500 recorded as a regression baseline in a committed fixture file"
   - id: "6.6"
     title: "Register parser, integration tests, documentation"
-    status: in-progress
+    status: complete
     depends_on: ["6.5"]
     verification: "main.rs registers GoParser using the shipped Box+context pattern: `.register(Box::new(GoParser::new().context(\"initialize Go language plugin\")?,)).context(\"register Go language plugin\")?;` (mirroring `crates/code-graph-mcp/src/main.rs:20-23`); analyze_codebase on a directory with .cpp + .rs + .go indexes all three; mixed-language search and language-filter queries verified for the new combination; cross-language symbol-collision regression: a function named 'init' in Go and 'init' in C++ both exist after analyze, neither resolves to the other's calls (verified by checking the (Language, name) keying of SymbolIndex from Phase 3 — `crates/codegraph-lang/src/lib.rs:116`); Go interface get_class_hierarchy returns the interface as root with no bases or derived (interfaces are structural in Go, no inheritance edges); wire-format snapshot tests extended with Go-specific responses; README and CLAUDE.md updated to list Go and any Go-specific limitations (structural interface implementation not represented; method dispatch is heuristic; go.mod/vendor handling is not in scope — discovery walks files and respects .gitignore, no module-path resolution)"
   - id: "6.7"
     title: "Structural verification"
-    status: planned
+    status: complete
     depends_on: ["6.6"]
     verification: "`make release` (host-target only; cross-compile was removed in Phase 4) succeeds and produces a binary that includes the Go plugin; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including the new codegraph-lang-go; `cargo test --workspace` green — every Phase 1-6 test passes; `cargo audit` clean; no new unsafe (workspace `unsafe_code = \"forbid\"`); no allow attributes suppressing findings"
 ---
@@ -154,7 +154,7 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.6: Register parser, integration tests, documentation
 
 ### Subtasks
-- [ ] `crates/code-graph-mcp/src/main.rs` registers GoParser using the shipped Box+context pattern (mirrors the C++ block at `main.rs:20-23`):
+- [x] `crates/code-graph-mcp/src/main.rs` registers GoParser using the shipped Box+context pattern (mirrors the C++ block at `main.rs:20-23`):
   ```rust
   .register(Box::new(
       codegraph_lang_go::GoParser::new()
@@ -162,11 +162,11 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
   ))
   .context("register Go language plugin")?;
   ```
-- [ ] **Mixed-language test (extends Phase 5 fixture):** add `foo.go` defining `func helper() {}` to the existing `testdata/mixed/` directory created in Phase 5.6 (which already contains `foo.cpp` and `foo.rs` defining `helper`); run `analyze_codebase` on the extended fixture and confirm all three are indexed; `search_symbols` for `helper` without language filter returns three entries; with each `language=` filter returns only that language's match
-- [ ] **Cross-language collision regression test:** a fixture with `func init()` in Go and `void init()` in C++; analyze; assert `search_symbols` without language filter returns both; assert `get_callers` against the Go init does NOT return the C++ init's callers (and vice versa) — verifying the `(Language, name)`-keyed SymbolIndex isolation (Phase 3 invariant at `crates/codegraph-lang/src/lib.rs:116`)
-- [ ] `get_class_hierarchy` for a Go interface returns the interface as root; bases and derived are empty (no structural inheritance edges in Go); the lookup itself succeeds (Phase 2 widened root filter)
-- [ ] Wire-format snapshot tests extended with Go-specific responses
-- [ ] README + CLAUDE.md updated:
+- [x] **Mixed-language test (extends Phase 5 fixture):** add `foo.go` defining `func helper() {}` to the existing `testdata/mixed/` directory created in Phase 5.6 (which already contains `foo.cpp` and `foo.rs` defining `helper`); run `analyze_codebase` on the extended fixture and confirm all three are indexed; `search_symbols` for `helper` without language filter returns three entries; with each `language=` filter returns only that language's match
+- [x] **Cross-language collision regression test:** a fixture with `func init()` in Go and `void init()` in C++; analyze; assert `search_symbols` without language filter returns both; assert `get_callers` against the Go init does NOT return the C++ init's callers (and vice versa) — verifying the `(Language, name)`-keyed SymbolIndex isolation (Phase 3 invariant at `crates/codegraph-lang/src/lib.rs:116`)
+- [x] `get_class_hierarchy` for a Go interface returns the interface as root; bases and derived are empty (no structural inheritance edges in Go); the lookup itself succeeds (Phase 2 widened root filter)
+- [x] Wire-format snapshot tests extended with Go-specific responses
+- [x] README + CLAUDE.md updated:
   - Add Go to supported languages (extension `.go`)
   - Update `crates/code-graph-mcp/src/main.rs` module-level doc comment (currently "C++ only — Phases 5/6/7 add Rust, Go, Python") to reflect Go is now live alongside C++ and Rust
   - Limitations: structural interface implementation not represented as edges (`type T struct { Embedded }` produces no `Inherits` edge); method dispatch resolved heuristically; go.mod / vendor handling is not in scope (discovery walks files and respects .gitignore; module-path resolution is not performed)
@@ -174,18 +174,18 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 (
 ## 6.7: Structural verification
 
 ### Subtasks
-- [ ] `make release` (host-target only) succeeds and produces a binary that includes the Go plugin
-- [ ] `cargo fmt --check` clean across the workspace
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
-- [ ] `cargo test --workspace` green — Phase 1-6 tests all pass
-- [ ] `cargo audit` clean (no new advisories)
-- [ ] No new `unsafe` or `#[allow]` suppressions
+- [x] `make release` (host-target only) succeeds and produces a binary that includes the Go plugin
+- [x] `cargo fmt --check` clean across the workspace
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` green — Phase 1-6 tests all pass
+- [x] `cargo audit` clean (no new advisories)
+- [x] No new `unsafe` or `#[allow]` suppressions
 
 ## Acceptance Criteria
-- [ ] GoParser implements LanguagePlugin (object-safety check passes)
-- [ ] All extraction patterns working including method receiver extraction, all import forms, direct + selector_expression calls
-- [ ] testdata/go passes; real-world Go project (logrus@v1.9.3) parses cleanly within recorded baseline
-- [ ] Mixed C++ + Rust + Go indexing works
-- [ ] Cross-language collision regression passes (`init` in C++ vs Go stays isolated)
-- [ ] Watch-mode reindex regression passes (incremental reindex + dangling-edge prune)
-- [ ] All Phase 1-6 tests pass; lint, format, audit gates clean
+- [x] GoParser implements LanguagePlugin (object-safety check passes)
+- [x] All extraction patterns working including method receiver extraction, all import forms, direct + selector_expression calls
+- [x] testdata/go passes; real-world Go project (logrus@v1.9.3) parses cleanly within recorded baseline
+- [x] Mixed C++ + Rust + Go indexing works
+- [x] Cross-language collision regression passes (`init` in C++ vs Go stays isolated)
+- [x] Watch-mode reindex regression passes (incremental reindex + dangling-edge prune)
+- [x] All Phase 1-6 tests pass; lint, format, audit gates clean
