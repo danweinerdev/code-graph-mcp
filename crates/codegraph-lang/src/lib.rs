@@ -14,6 +14,8 @@
 //! [`CallContext`], [`SymbolIndex`], [`FileIndex`] now carry real fields
 //! populated by the Phase 3.3 indexer.
 
+pub mod helpers;
+
 use codegraph_core::{FileGraph, Language, SymbolId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -1,23 +1,17 @@
 //! Helper routines for the Go parser.
 //!
-//! Phase status: Phase 6.1 ships the small structural helpers
-//! ([`extract_receiver_type`], [`extract_package_name`], [`truncate_signature`])
-//! used by the Phase 6.2 definition extractor.
+//! Phase status: Phase 6.1 shipped the small structural helpers
+//! ([`extract_receiver_type`], [`extract_package_name`]) used by the
+//! Phase 6.2 definition extractor; Phase 7.1 consolidated `truncate_signature`
+//! into the shared `codegraph_lang::helpers` module (see the `pub use`
+//! below) so the Python plugin could reuse the same logic without spawning
+//! a fourth byte-identical copy.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub` as a
 //! crate-internal convention so callers within `lib.rs` can `use` them
 //! freely. The effective visibility cap remains crate-internal.
-//!
-//! ## `truncate_signature` consolidation
-//!
-//! This helper is byte-identical to the copy in
-//! `codegraph-lang-rust/src/helpers.rs` (which is in turn byte-identical to
-//! the copy in `codegraph-lang-cpp/src/helpers.rs`). The Phase 5 debrief
-//! flagged consolidation to a shared module as the natural follow-up once a
-//! third copy lands. **That consolidation is intentionally NOT done in
-//! Phase 6.1** — it is scope creep for the scaffold task. With three copies
-//! now in tree, the consolidation is a clean follow-up that can land
-//! independently.
+
+pub use codegraph_lang::helpers::truncate_signature;
 
 use tree_sitter::Node;
 
@@ -191,27 +185,6 @@ pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> Stri
     path.to_owned()
 }
 
-/// Truncate a signature at the first `{` or `;`, dropping the body and any
-/// trailing whitespace. Falls back to a 200-byte cutoff when neither marker
-/// is found, returning `<prefix>...`. Mirrors the C++ plugin's
-/// `truncate_signature` byte-for-byte so signatures across languages share
-/// the same shape.
-///
-/// The cutoff is computed via `char_indices`, so the slice boundary is
-/// guaranteed to land on a UTF-8 char boundary by construction. Multi-byte
-/// content past 200 bytes does not panic.
-pub fn truncate_signature(s: &str) -> String {
-    for (i, c) in s.char_indices() {
-        if c == '{' || c == ';' {
-            return s[..i].trim_end_matches([' ', '\t', '\n', '\r']).to_owned();
-        }
-        if i >= 200 {
-            return format!("{}...", &s[..i]);
-        }
-    }
-    s.to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,50 +331,10 @@ mod tests {
         assert_eq!(extract_package_name(tree.root_node(), src.as_bytes()), "π");
     }
 
-    // ---- truncate_signature -----------------------------------------------
-    //
-    // The function itself is language-agnostic and is byte-identical to the
-    // C++ and Rust copies. The test inputs here are Go-idiomatic so the
-    // coverage matches the language this crate parses; the underlying
-    // truncation logic is exercised the same way regardless of input
-    // language.
-
-    #[test]
-    fn truncate_signature_stops_at_brace() {
-        // Body opener strips for func signatures.
-        assert_eq!(truncate_signature("func Foo() { return }"), "func Foo()");
-    }
-
-    #[test]
-    fn truncate_signature_stops_at_semicolon() {
-        // Go uses semicolons rarely (gofmt strips them), but the function
-        // is language-agnostic — keep coverage of the `;` branch with a
-        // valid Go statement. Single-line `for` clauses contain `;`s but
-        // truncate_signature stops at the FIRST one, so a top-level
-        // semicolon-terminated declaration is the cleanest fixture.
-        assert_eq!(truncate_signature("var x int;"), "var x int");
-    }
-
-    #[test]
-    fn truncate_signature_trims_trailing_whitespace_before_brace() {
-        assert_eq!(
-            truncate_signature("func Foo()   \t\n{ return }"),
-            "func Foo()"
-        );
-    }
-
-    #[test]
-    fn truncate_signature_byte_fallback_300_chars() {
-        // 300 ASCII characters with no `{` or `;` — must hit the 200-byte
-        // fallback. Mirrors the C++ test at
-        // `crates/codegraph-lang-cpp/src/helpers.rs` so the Go copy carries
-        // the same regression coverage of the byte-cutoff branch.
-        let long = "a".repeat(300);
-        let got = truncate_signature(&long);
-        assert!(got.ends_with("..."), "expected trailing '...', got {got:?}");
-        // Prefix must be 200 bytes, plus the 3-byte "...".
-        assert_eq!(got.len(), 203);
-    }
+    // truncate_signature behavior is exhaustively tested at the
+    // codegraph_lang::helpers layer where the function now lives. The
+    // `pub use` re-export above keeps callers (in lib.rs via
+    // `crate::helpers::truncate_signature`) working unchanged.
 
     // ---- enclosing_function_id ---------------------------------------
     //

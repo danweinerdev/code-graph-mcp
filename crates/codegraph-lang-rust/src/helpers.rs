@@ -8,6 +8,14 @@
 //! The module itself is `pub(crate)`; the individual functions are `pub` as
 //! a crate-internal convention so callers within `lib.rs` can `use` them
 //! freely. The effective visibility cap remains crate-internal.
+//!
+//! `truncate_signature` is re-exported from `codegraph_lang::helpers` (the
+//! shared cross-language module). Phase 7.1 consolidated the previously
+//! byte-identical C++/Rust/Go copies into one canonical implementation; this
+//! `pub use` keeps the historical `crate::helpers::truncate_signature` import
+//! path working from `lib.rs`.
+
+pub use codegraph_lang::helpers::truncate_signature;
 
 use tree_sitter::Node;
 
@@ -135,27 +143,6 @@ pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
         current = n.parent();
     }
     None
-}
-
-/// Truncate a signature at the first `{` or `;`, dropping the body and any
-/// trailing whitespace. Falls back to a 200-byte cutoff when neither marker
-/// is found, returning `<prefix>...`. Mirrors the C++ plugin's
-/// `truncate_signature` byte-for-byte so signatures across languages share
-/// the same shape.
-///
-/// The cutoff is computed via `char_indices`, so the slice boundary is
-/// guaranteed to land on a UTF-8 char boundary by construction. Multi-byte
-/// content past 200 bytes does not panic.
-pub fn truncate_signature(s: &str) -> String {
-    for (i, c) in s.char_indices() {
-        if c == '{' || c == ';' {
-            return s[..i].trim_end_matches([' ', '\t', '\n', '\r']).to_owned();
-        }
-        if i >= 200 {
-            return format!("{}...", &s[..i]);
-        }
-    }
-    s.to_owned()
 }
 
 /// Walk `node`'s parent chain, collecting the names of every enclosing
@@ -388,22 +375,10 @@ mod tests {
         assert_eq!(resolve_mod_namespace(func, src), "a::b::c");
     }
 
-    #[test]
-    fn truncate_signature_stops_at_brace() {
-        // Body opener strips for fn signatures.
-        assert_eq!(truncate_signature("fn foo() { return; }"), "fn foo()");
-    }
-
-    #[test]
-    fn truncate_signature_stops_at_semicolon() {
-        // Trait method declarations end in `;` (function_signature_item).
-        assert_eq!(truncate_signature("fn foo();"), "fn foo()");
-    }
-
-    #[test]
-    fn truncate_signature_trims_trailing_whitespace_before_brace() {
-        assert_eq!(truncate_signature("fn foo()   \t\n{ return; }"), "fn foo()");
-    }
+    // truncate_signature behavior is exhaustively tested at the
+    // codegraph_lang::helpers layer where the function now lives. The
+    // `pub use` re-export above keeps callers (in lib.rs via
+    // `crate::helpers::truncate_signature`) working unchanged.
 
     // ---- enclosing_function_id ---------------------------------------
 
