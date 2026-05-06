@@ -1,0 +1,8 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+assertion_line: 939
+expression: parsed
+---
+{
+  "name": "Reader"
+}

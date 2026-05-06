@@ -1,10 +1,11 @@
 ---
 source: crates/codegraph-tools/tests/snapshot_responses.rs
+assertion_line: 786
 expression: parsed
 ---
 {
   "edges": 0,
-  "files": 2,
+  "files": 3,
   "root_path": "[testdata]",
-  "symbols": 2
+  "symbols": 3
 }

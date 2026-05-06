@@ -36,6 +36,7 @@ use common::{
 use codegraph_core::Language;
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
+use codegraph_lang_go::GoParser;
 use codegraph_lang_rust::RustParser;
 use codegraph_tools::handlers::analyze::analyze_codebase;
 use codegraph_tools::handlers::query::{callers_or_callees, get_dependencies, Direction};
@@ -672,6 +673,28 @@ fn rust_parser_registers_for_rust_language() {
     assert!(registry.plugin_for(Language::Cpp).is_some());
 }
 
+/// Sanity check for the Go parser registration alongside C++ and Rust —
+/// mirrors the Phase 6.6 registration block in
+/// `crates/code-graph-mcp/src/main.rs` so a silent removal of
+/// `codegraph_lang_go::GoParser::new()` from the binary trips this test
+/// before any of the Go-specific snapshots below.
+#[test]
+fn go_parser_registers_for_go_language() {
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(GoParser::new().unwrap()))
+        .unwrap();
+    assert!(registry.plugin_for(Language::Go).is_some());
+    assert!(registry.plugin_for(Language::Rust).is_some());
+    assert!(registry.plugin_for(Language::Cpp).is_some());
+}
+
 // --- Phase 5.6 Rust-side snapshots --------------------------------------
 //
 // These four snapshots lock the wire format for representative responses
@@ -689,10 +712,10 @@ fn rust_parser_registers_for_rust_language() {
 //     Inherits-edge dispatch for a Rust trait with two impls.
 
 /// Mirror of [`build_indexed_fixture`] that uses `testdata/mixed/` and
-/// registers BOTH parsers (the binary's runtime shape). Returns the
+/// registers all three parsers (the binary's runtime shape). Returns the
 /// `IndexedFixture` so the per-test TempDir path is available for
 /// snapshot redaction.
-async fn build_indexed_fixture_for_dir_with_cpp_and_rust(src: &Path) -> IndexedFixture {
+async fn build_indexed_fixture_for_dir_with_all_parsers(src: &Path) -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for testdata copy");
     copy_testdata_from(src, dir.path());
     let indexed_root =
@@ -705,6 +728,9 @@ async fn build_indexed_fixture_for_dir_with_cpp_and_rust(src: &Path) -> IndexedF
     registry
         .register(Box::new(RustParser::new().expect("RustParser::new")))
         .expect("register RustParser");
+    registry
+        .register(Box::new(GoParser::new().expect("GoParser::new")))
+        .expect("register GoParser");
     let server = CodeGraphServer::new(registry);
 
     let r = analyze_codebase(
@@ -730,6 +756,8 @@ async fn build_indexed_fixture_for_dir_with_cpp_and_rust(src: &Path) -> IndexedF
 async fn response_analyze_codebase_testdata_mixed() {
     // Capture the analyze response itself rather than discarding it inside
     // the helper — same pattern as `response_analyze_codebase_testdata_cpp`.
+    // Registers all three parsers (Phase 6.6) so the snapshot reflects the
+    // post-Phase-6 binary's runtime shape (foo.cpp + foo.rs + foo.go).
     let dir = TempDir::new().unwrap();
     copy_testdata_from(&testdata_mixed_path(), dir.path());
     let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
@@ -740,6 +768,9 @@ async fn response_analyze_codebase_testdata_mixed() {
         .unwrap();
     registry
         .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(GoParser::new().unwrap()))
         .unwrap();
     let server = CodeGraphServer::new(registry);
     let r = analyze_codebase(
@@ -758,7 +789,7 @@ async fn response_analyze_codebase_testdata_mixed() {
 
 #[tokio::test]
 async fn response_search_symbols_helper_language_rust() {
-    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_mixed_path()).await;
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
@@ -776,7 +807,7 @@ async fn response_search_symbols_helper_language_rust() {
 
 #[tokio::test]
 async fn response_get_class_hierarchy_rust_trait_greet() {
-    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_rust_path()).await;
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
     // `Greet` is a trait that `Greeter` implements (testdata/rust/src/traits.rs).
     // Pre-Phase-2 the lookup would have rejected the trait kind; this
     // snapshot is the wire-format counterpart to the integration test
@@ -790,7 +821,7 @@ async fn response_get_class_hierarchy_rust_trait_greet() {
 
 #[tokio::test]
 async fn response_generate_diagram_rust_trait_compute() {
-    let fx = build_indexed_fixture_for_dir_with_cpp_and_rust(&testdata_rust_path()).await;
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
     let r = generate_diagram(
         &fx.inner.graph,
         GenerateDiagramInput {
@@ -806,5 +837,120 @@ async fn response_generate_diagram_rust_trait_compute() {
     let normalized = sort_diagram_edges(parsed);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(normalized);
+    });
+}
+
+// --- Phase 6.6 Go-side snapshots ----------------------------------------
+//
+// These snapshots lock the wire format for representative responses
+// driven by the Go language plugin (registered alongside C++ and Rust):
+//
+//   * search_symbols(query="helper", language=go) — exercises the
+//     language=go filter path on `testdata/mixed/`.
+//   * get_class_hierarchy on a Go interface — exercises the widened
+//     {Class, Struct, Interface, Trait} root filter from Phase 2 with a
+//     Go interface as the root, asserting empty bases and derived
+//     (structural implementation produces no Inherits edges in Go).
+//   * get_file_symbols on a Go file — exercises the per-file symbol
+//     listing for Go content.
+//
+// The Go-interface and get_file_symbols snapshots use a synthesized
+// in-TempDir Go file rather than the larger `testdata/go/` corpus so
+// the snapshot stays small and readable.
+
+#[tokio::test]
+async fn response_search_symbols_helper_language_go() {
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("helper"),
+            language: Some("go"),
+            brief: true,
+            ..Default::default()
+        },
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+/// Per-test fixture with a single synthetic Go file under a TempDir. The
+/// file declares a `Reader` interface plus a `MyReader` struct that
+/// structurally implements it. Used by the get_class_hierarchy and
+/// get_file_symbols snapshots below.
+async fn build_indexed_fixture_with_go_interface() -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for Go interface fixture");
+    std::fs::write(
+        dir.path().join("reader.go"),
+        "package main\n\n\
+         type Reader interface {\n\
+         \tRead() error\n\
+         }\n\n\
+         type MyReader struct{}\n\n\
+         func (m *MyReader) Read() error { return nil }\n",
+    )
+    .expect("write reader.go");
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    registry
+        .register(Box::new(RustParser::new().expect("RustParser::new")))
+        .expect("register RustParser");
+    registry
+        .register(Box::new(GoParser::new().expect("GoParser::new")))
+        .expect("register GoParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+#[tokio::test]
+async fn response_get_class_hierarchy_go_interface_reader() {
+    let fx = build_indexed_fixture_with_go_interface().await;
+    // Wire-format counterpart to the `get_class_hierarchy_for_go_interface`
+    // integration test in `mixed_language.rs`. Locks in the leaf-node
+    // shape (just `{"name":"Reader"}`) — `bases` and `derived` are
+    // skipped because they are empty (Go produces no Inherits edges).
+    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_file_symbols_go_reader() {
+    let fx = build_indexed_fixture_with_go_interface().await;
+    let file = fx
+        .indexed_root
+        .join("reader.go")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
     });
 }

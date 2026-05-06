@@ -1,0 +1,32 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+assertion_line: 954
+expression: parsed
+---
+[
+  {
+    "file": "[testdata]/reader.go",
+    "id": "[testdata]/reader.go:Reader",
+    "kind": "interface",
+    "line": 3,
+    "name": "Reader",
+    "namespace": "main"
+  },
+  {
+    "file": "[testdata]/reader.go",
+    "id": "[testdata]/reader.go:MyReader",
+    "kind": "struct",
+    "line": 7,
+    "name": "MyReader",
+    "namespace": "main"
+  },
+  {
+    "file": "[testdata]/reader.go",
+    "id": "[testdata]/reader.go:MyReader::Read",
+    "kind": "method",
+    "line": 9,
+    "name": "Read",
+    "namespace": "main",
+    "parent": "MyReader"
+  }
+]
