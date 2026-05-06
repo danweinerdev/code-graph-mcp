@@ -12,10 +12,8 @@
 
 // Re-export the cross-language `truncate_signature` so call sites within
 // this crate import it as `crate::helpers::truncate_signature` — same
-// shape as the C++/Rust/Go plugins post-consolidation. Phase 7.2's
-// definition extractor will drive this re-export; Phase 7.1 has no
-// callers yet.
-#[allow(unused_imports)] // wired in Phase 7.2
+// shape as the C++/Rust/Go plugins post-consolidation. Wired by Phase
+// 7.2's definition extractor.
 pub use codegraph_lang::helpers::truncate_signature;
 
 use tree_sitter::Node;
@@ -38,7 +36,6 @@ use tree_sitter::Node;
 /// nearest enclosing class), not `Outer`. 7.2 uses that to set
 /// `Symbol.parent = "Inner"`, and reads the *parent of `Inner`* to
 /// populate the parent's namespace if needed.
-#[allow(dead_code)] // wired in Phase 7.2
 pub fn find_enclosing_class(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(n) = current {
@@ -58,8 +55,8 @@ pub fn find_enclosing_class(node: Node<'_>) -> Option<Node<'_>> {
 /// - `import_node` — a `dotted_name` or `relative_import` node captured
 ///   by [`crate::queries::IMPORT_QUERIES`]. For `dotted_name` we read the
 ///   node's text directly (it is already in canonical `a.b.c` form). For
-///   `relative_import` we walk children and reconstruct, preserving the
-///   leading-dot prefix.
+///   `relative_import` we read the whole node's text directly — it already
+///   includes the leading dots verbatim (e.g. `.utils`, `..pkg`).
 /// - `content` — the source-file bytes the AST was parsed from.
 ///
 /// Returns the empty string if the node text cannot be decoded as UTF-8
@@ -282,6 +279,52 @@ mod tests {
         let tree = parse(src);
         let rel = find_first(tree.root_node(), "relative_import").expect("relative_import");
         assert_eq!(extract_module_path(rel, src.as_bytes()), "..pkg");
+    }
+
+    #[test]
+    fn extract_module_path_handles_multi_name_import_statement() {
+        // `import a, b` — tree-sitter-python parses this as one
+        // `import_statement` whose `name` field holds both `dotted_name`
+        // children (`a` and `b`). The IMPORT_QUERIES doc-string claims
+        // multi-name imports are supported; this pins the behavior at
+        // the helper layer (each `dotted_name` round-trips to its own
+        // path string) before 7.4 wires the import extractor.
+        let src = "import a, b\n";
+        let tree = parse(src);
+        // Walk the entire tree collecting every `dotted_name` node so we
+        // exercise both children, not just the first.
+        fn collect_kind<'a>(
+            node: tree_sitter::Node<'a>,
+            kind: &str,
+            out: &mut Vec<tree_sitter::Node<'a>>,
+        ) {
+            if node.kind() == kind {
+                out.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_kind(child, kind, out);
+            }
+        }
+        let mut dotted = Vec::new();
+        collect_kind(tree.root_node(), "dotted_name", &mut dotted);
+        assert_eq!(
+            dotted.len(),
+            2,
+            "expected two dotted_name nodes for `import a, b`, got {dotted:?}"
+        );
+        let paths: Vec<String> = dotted
+            .iter()
+            .map(|n| extract_module_path(*n, src.as_bytes()))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "a"),
+            "expected a path `a`, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "b"),
+            "expected a path `b`, got {paths:?}"
+        );
     }
 
     #[test]

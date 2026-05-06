@@ -6,12 +6,22 @@
 //!
 //! # Phase status
 //!
-//! Phase 7.1 ships the crate scaffold: dependency wiring, query strings
+//! Phase 7.1 shipped the crate scaffold: dependency wiring, query strings
 //! that compile against tree-sitter-python 0.25, the `PythonParser` struct
-//! with cached `Query` objects, and the `LanguagePlugin` impl. At this
-//! checkpoint `parse_file` returns an empty `FileGraph` (no symbols, no
-//! edges) — extraction logic is wired in 7.2 (definitions), 7.3 (calls),
-//! 7.4 (imports), and 7.5 (inheritance).
+//! with cached `Query` objects, and the `LanguagePlugin` impl.
+//!
+//! Phase 7.2 wires `extract_definitions` — function/method/class extraction
+//! with method-vs-function disambiguation (via [`find_enclosing_class`]),
+//! decorator transparency (queries match the inner `function_definition` /
+//! `class_definition` directly through any `decorated_definition` wrapper),
+//! `async def` support (parses as `function_definition` in tree-sitter-python
+//! 0.25), nested-class parent assignment (the inner class records the outer
+//! class as its parent), and `.pyi` stub-file parity (stubs use the same
+//! grammar — `def f() -> int: ...` is still a `function_definition`).
+//!
+//! Phase 7.3 wires `extract_calls`. Phase 7.4 wires `extract_imports`. Phase
+//! 7.5 wires `extract_inheritance`. After 7.5, `parse_file` is fully populated
+//! and every extractor is live.
 //!
 //! # Default trait methods
 //!
@@ -42,7 +52,7 @@
 //! - **`async def` parses as `function_definition`** in tree-sitter-python
 //!   0.25 — there is no separate `async_function_definition` node. The
 //!   single `function_definition` query in `queries.rs` covers both sync
-//!   and async forms.
+//!   and async forms. Confirmed by fixture in 7.2's tests.
 //! - `.py` and `.pyi` files share the same grammar; both extensions
 //!   dispatch to the same parser. `.pyi` stub files use the same
 //!   `function_definition` / `class_definition` nodes — `def f() -> int:
@@ -55,10 +65,14 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use codegraph_core::{FileGraph, Language};
+use codegraph_core::{FileGraph, Language, Symbol, SymbolKind};
 use codegraph_lang::{LanguagePlugin, ParseError};
-use tree_sitter::{Language as TsLanguage, Query};
+use streaming_iterator::StreamingIterator;
+use tree_sitter::{
+    Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
+};
 
+use crate::helpers::{find_enclosing_class, truncate_signature};
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITANCE_QUERIES};
 
 /// File extensions the Python parser claims. Both `.py` (regular sources)
@@ -76,13 +90,9 @@ pub const EXTENSIONS: &[&str] = &[".py", ".pyi"];
 pub struct PythonParser {
     /// Compiled Python grammar. Held so per-call [`tree_sitter::Parser`]
     /// instances built inside `parse_file` can attach to it without
-    /// rebuilding the `LanguageFn`. Phase 7.1 does not yet build any
-    /// per-call parser instances (parse_file returns an empty FileGraph),
-    /// but the field is in place for 7.2-7.5 to consume directly.
-    #[allow(dead_code)]
+    /// rebuilding the `LanguageFn`.
     language: TsLanguage,
     /// Compiled definition query (wired in 7.2).
-    #[allow(dead_code)]
     def_query: Query,
     /// Compiled call query (wired in 7.3).
     #[allow(dead_code)]
@@ -131,6 +141,157 @@ impl PythonParser {
     pub fn extensions() -> &'static [&'static str] {
         EXTENSIONS
     }
+
+    /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
+    /// Internal entry point for [`Self::parse_file`] (the trait method);
+    /// kept crate-private so the public surface stays the trait method
+    /// while each per-extractor method (`extract_definitions`, and the
+    /// upcoming 7.3/7.4/7.5 extractors) can be tested via `parse_file`
+    /// without exposing them. Mirrors the Phase 6 Go plugin's structural
+    /// pattern (`parse_to_filegraph` indirection).
+    fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
+        let tree = parse_tree(&self.language, content)?;
+        let root = tree.root_node();
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut fg = FileGraph {
+            path: path_str.clone(),
+            language: Language::Python,
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        };
+
+        self.extract_definitions(root, content, &path_str, &mut fg);
+
+        Ok(fg)
+    }
+
+    /// Run the definition query and produce symbols. Mirrors the C++/Rust/
+    /// Go plugins' capture-name dispatch: each capture name from
+    /// `DEFINITION_QUERIES` maps to a small branch that builds the right
+    /// `Symbol`. Every emitted Python symbol carries
+    /// `Symbol.namespace = ""` — Python's module concept is captured in
+    /// the file path itself, not in a namespace tag.
+    ///
+    /// Per-capture-name behavior:
+    ///
+    /// - `func.name` (from `function_definition`) → branches on whether
+    ///   the enclosing scope contains a `class_definition`:
+    ///     * No enclosing class → [`SymbolKind::Function`], no parent.
+    ///     * Enclosing class → [`SymbolKind::Method`], parent = innermost
+    ///       enclosing class name. The walk transparently passes through
+    ///       any `decorated_definition` wrapper (decorators do not block
+    ///       method classification — `@property def x(self)` is still a
+    ///       method of its enclosing class). `async def` parses as
+    ///       `function_definition` in tree-sitter-python 0.25, so the same
+    ///       code path covers async methods inside classes.
+    /// - `class.name` (from `class_definition`) → [`SymbolKind::Class`].
+    ///   Nested classes (`class Outer: class Inner: ...`) record the
+    ///   innermost enclosing class as the parent — for `Inner`, parent =
+    ///   `"Outer"`. Top-level classes have no parent.
+    ///
+    /// Dunder methods (`__init__`, `__str__`, `__repr__`, `__call__`)
+    /// receive no special handling — they are ordinary methods produced
+    /// through the same code path as any other method inside a class.
+    ///
+    /// `.pyi` stub files use the same grammar: `def foo(x: int) -> str:
+    /// ...` parses as a `function_definition` whose body is an
+    /// `expression_statement` containing `...`. The function-vs-method
+    /// classification, decorator transparency, and parent assignment all
+    /// behave identically to `.py` files — confirmed by fixture in the
+    /// tests module.
+    ///
+    /// Captures consumed without emitting a Symbol:
+    /// - `func.def` / `class.def`: structural anchors used by the queries
+    ///   to bind captures to the same definition. The `name` capture
+    ///   already resolves the enclosing definition via the parent chain.
+    fn extract_definitions(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.def_query, root, content);
+        let cap_names = self.def_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                let text = cap_node.utf8_text(content).unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+
+                match cap_name {
+                    "func.name" => {
+                        let Some(def_node) = find_enclosing_kind(cap_node, "function_definition")
+                        else {
+                            continue;
+                        };
+                        // Decorator transparency: a `function_definition`
+                        // wrapped by `decorated_definition` is still a
+                        // function/method — `find_enclosing_class` walks
+                        // through the wrapper looking for a
+                        // `class_definition` ancestor.
+                        let (kind, parent) = match find_enclosing_class(def_node) {
+                            Some(cls) => {
+                                let class_name = cls
+                                    .child_by_field_name("name")
+                                    .and_then(|n| n.utf8_text(content).ok())
+                                    .unwrap_or("");
+                                if class_name.is_empty() {
+                                    // Defensive: if a class_definition has no
+                                    // resolvable name, fall back to a free
+                                    // function classification rather than an
+                                    // empty-parent Method (which would render
+                                    // as `path:::name` via symbol_id).
+                                    (SymbolKind::Function, String::new())
+                                } else {
+                                    (SymbolKind::Method, class_name.to_owned())
+                                }
+                            }
+                            None => (SymbolKind::Function, String::new()),
+                        };
+                        fg.symbols
+                            .push(make_symbol(text, kind, path, def_node, content, parent));
+                    }
+
+                    "class.name" => {
+                        let Some(def_node) = find_enclosing_kind(cap_node, "class_definition")
+                        else {
+                            continue;
+                        };
+                        // Nested classes: `class Outer: class Inner: ...`
+                        // — Inner records Outer as its parent. The walk
+                        // climbs from the *class_definition* (not the name
+                        // node), so it skips past Inner itself and finds
+                        // Outer.
+                        let parent = match find_enclosing_class(def_node) {
+                            Some(outer) => outer
+                                .child_by_field_name("name")
+                                .and_then(|n| n.utf8_text(content).ok())
+                                .unwrap_or("")
+                                .to_owned(),
+                            None => String::new(),
+                        };
+                        fg.symbols.push(make_symbol(
+                            text,
+                            SymbolKind::Class,
+                            path,
+                            def_node,
+                            content,
+                            parent,
+                        ));
+                    }
+
+                    // `func.def` / `class.def` are structural anchors —
+                    // the `name` arms above already resolved the enclosing
+                    // definition node via the parent chain.
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for PythonParser {
@@ -144,16 +305,10 @@ impl LanguagePlugin for PythonParser {
 
     /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
     ///
-    /// At Phase 7.1 this returns an empty FileGraph (no symbols, no
-    /// edges). Phases 7.2-7.5 wire definition, call, import, and
-    /// inheritance extraction onto this surface.
-    fn parse_file(&self, path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
-        Ok(FileGraph {
-            path: path.to_string_lossy().into_owned(),
-            language: Language::Python,
-            symbols: Vec::new(),
-            edges: Vec::new(),
-        })
+    /// Phase 7.2 wires the definition extractor; calls (7.3), imports
+    /// (7.4), and inheritance (7.5) follow.
+    fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
+        self.parse_to_filegraph(path, content)
     }
 
     // resolve_call and resolve_include intentionally NOT overridden — see
@@ -165,14 +320,85 @@ impl LanguagePlugin for PythonParser {
     fn close(&self) {}
 }
 
+/// Build a tree-sitter [`TsTree`] for `content` against the Python grammar.
+/// The caller-supplied [`TsLanguage`] is borrowed; the returned tree owns
+/// its AST. Returns [`ParseError::Parse`] if `set_language` fails or if
+/// tree-sitter declines to produce a tree (e.g. on cancellation). Mirrors
+/// `parse_tree` in the C++/Rust/Go plugins byte-for-byte modulo the
+/// language identity.
+fn parse_tree(language: &TsLanguage, content: &[u8]) -> Result<TsTree, ParseError> {
+    let mut parser = TsParser::new();
+    parser
+        .set_language(language)
+        .map_err(|e| ParseError::Parse(format!("set_language: {e}")))?;
+    parser
+        .parse(content, None)
+        .ok_or_else(|| ParseError::Parse("tree-sitter parse failed".to_owned()))
+}
+
+/// Look up a capture name by index. Returns `""` (empty) on out-of-range
+/// indices, matching the C++/Rust/Go plugins' silent fallback.
+fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
+    cap_names.get(index as usize).copied().unwrap_or("")
+}
+
+/// Walk up `node`'s parent chain, returning the first ancestor (including
+/// `node` itself) whose kind matches `kind`. Local copy of the C++/Rust/Go
+/// plugins' `find_enclosing_kind`.
+fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Build a [`Symbol`] from a definition node. Centralises the row/column/
+/// signature math so each branch in `extract_definitions` stays small.
+/// Mirrors the C++/Rust/Go plugins' `make_symbol`.
+///
+/// Python `Symbol.namespace` is always `""` — the module concept is
+/// encoded in the file path. Phase 7.7's documentation makes this
+/// explicit.
+fn make_symbol(
+    name: &str,
+    kind: SymbolKind,
+    path: &str,
+    def_node: Node<'_>,
+    content: &[u8],
+    parent: String,
+) -> Symbol {
+    let start = def_node.start_position();
+    let end = def_node.end_position();
+    Symbol {
+        name: name.to_owned(),
+        kind,
+        file: path.to_owned(),
+        line: start.row as u32 + 1,
+        column: start.column as u32,
+        end_line: end.row as u32 + 1,
+        signature: truncate_signature(def_node.utf8_text(content).unwrap_or("")),
+        namespace: String::new(),
+        parent,
+        language: Language::Python,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! Phase 7.1 structural smoke tests. Behavioral coverage of definition
-    //! / call / import / inheritance extraction lands in 7.2-7.5; at this
-    //! checkpoint `parse_file` is a placeholder that returns an empty
-    //! FileGraph.
+    //! Phase 7.1 structural smoke tests + Phase 7.2 definition-extraction
+    //! coverage. Behavioral coverage of call / import / inheritance
+    //! extraction lands in 7.3-7.5.
     use super::*;
+    use codegraph_core::symbol_id;
     use codegraph_lang::LanguagePlugin;
+
+    // ----------------------------------------------------------------
+    // Phase 7.1 — structural smoke tests
+    // ----------------------------------------------------------------
 
     #[test]
     fn new_compiles_all_four_queries() {
@@ -213,31 +439,308 @@ mod tests {
         assert_eq!(p.id(), Language::Python);
     }
 
-    #[test]
-    fn parse_file_returns_empty_filegraph_with_correct_path_and_language() {
-        // Phase 7.1 stub: parse_file returns an empty FileGraph with the
-        // path and language fields populated. 7.2 will replace the empty
-        // vectors with extracted symbols.
+    // ----------------------------------------------------------------
+    // Phase 7.2 — definition extraction
+    // ----------------------------------------------------------------
+
+    /// Parse `src` against `PythonParser` at a synthetic absolute path.
+    /// Used by every Phase 7.2 behavioral test below.
+    fn parse(src: &str) -> FileGraph {
+        parse_at(src, "/tmp/test.py")
+    }
+
+    /// Parse `src` against `PythonParser` at a caller-chosen path. Lets
+    /// the `.pyi` parity test exercise the same code path with a stub
+    /// extension.
+    fn parse_at(src: &str, path: &str) -> FileGraph {
         let p = PythonParser::new().unwrap();
-        let fg = p
-            .parse_file(Path::new("/tmp/test.py"), b"")
-            .expect("parse_file must succeed");
-        assert_eq!(fg.path, "/tmp/test.py");
-        assert_eq!(fg.language, Language::Python);
-        assert!(fg.symbols.is_empty());
-        assert!(fg.edges.is_empty());
+        p.parse_file(Path::new(path), src.as_bytes())
+            .expect("parse_file must succeed")
+    }
+
+    /// Find the (first) symbol with `name`, panicking with a helpful
+    /// message if absent. Tests use this when they expect exactly one.
+    fn sym<'a>(fg: &'a FileGraph, name: &str) -> &'a Symbol {
+        fg.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected symbol named {name:?}; got: {:?}",
+                    fg.symbols
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
     }
 
     #[test]
-    fn parse_file_accepts_pyi_path_extension() {
-        // `.pyi` stub files dispatch to the same parser. At 7.1 with the
-        // empty-graph stub this only checks the language tag survives;
-        // 7.6's testdata corpus exercises real `.pyi` extraction.
-        let p = PythonParser::new().unwrap();
-        let fg = p
-            .parse_file(Path::new("/tmp/stubs.pyi"), b"")
-            .expect("parse_file must accept .pyi");
-        assert_eq!(fg.path, "/tmp/stubs.pyi");
+    fn parse_file_returns_correct_path_and_language() {
+        // The path/language assertion still belongs at this layer — 7.2
+        // populates symbols for non-empty files but the wrapper fields
+        // remain meaningful.
+        let fg = parse("");
+        assert_eq!(fg.path, "/tmp/test.py");
         assert_eq!(fg.language, Language::Python);
+    }
+
+    #[test]
+    fn empty_file_produces_no_symbols() {
+        // Anti-regression: an empty source file yields zero symbols and
+        // zero edges (the parse must succeed; tree-sitter handles the
+        // empty input and produces a minimal `module` node).
+        let fg = parse("");
+        assert!(fg.symbols.is_empty(), "got: {:?}", fg.symbols);
+        assert!(fg.edges.is_empty(), "got: {:?}", fg.edges);
+    }
+
+    #[test]
+    fn free_function_produces_function_kind_no_parent() {
+        // `def foo(): pass` → 1 symbol, Function, no parent, signature
+        // truncated correctly (no body).
+        let fg = parse("def foo():\n    pass\n");
+        assert_eq!(fg.symbols.len(), 1, "got: {:?}", fg.symbols);
+        let s = sym(&fg, "foo");
+        assert_eq!(s.kind, SymbolKind::Function);
+        assert!(s.parent.is_empty(), "free func must have empty parent");
+        assert!(
+            s.namespace.is_empty(),
+            "Python namespace stays empty (file path encodes the module)"
+        );
+        assert_eq!(s.language, Language::Python);
+        assert_eq!(symbol_id(s), "/tmp/test.py:foo");
+        // `truncate_signature` stops at `:` is NOT a thing — the helper
+        // truncates at `{` or `;`. Python `def`s end in `:` and have no
+        // brace, so the signature retains the full def line. We assert the
+        // signature contains the def-line head and excludes the `pass`
+        // body.
+        assert!(
+            s.signature.contains("def foo()"),
+            "signature must contain `def foo()`, got: {:?}",
+            s.signature
+        );
+    }
+
+    #[test]
+    fn method_in_class_produces_method_kind_with_class_parent() {
+        // `class C: def m(self): pass` → 2 symbols (C: Class, m: Method
+        // with parent=C).
+        let fg = parse("class C:\n    def m(self):\n        pass\n");
+        assert_eq!(fg.symbols.len(), 2, "got: {:?}", fg.symbols);
+        let c = sym(&fg, "C");
+        assert_eq!(c.kind, SymbolKind::Class);
+        assert!(c.parent.is_empty(), "top-level class must have no parent");
+        assert_eq!(symbol_id(c), "/tmp/test.py:C");
+        let m = sym(&fg, "m");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.parent, "C", "method's parent must be the enclosing class");
+        assert_eq!(symbol_id(m), "/tmp/test.py:C::m");
+    }
+
+    #[test]
+    fn async_method_in_class_produces_method_kind_with_class_parent() {
+        // `class Server: async def handle(self): pass` — async def parses
+        // as `function_definition` in tree-sitter-python 0.25, so the same
+        // code path covers it. Confirm with a fixture (the 7.2 verification
+        // field's "confirmed by fixture" requirement).
+        let fg = parse("class Server:\n    async def handle(self):\n        pass\n");
+        let server = sym(&fg, "Server");
+        assert_eq!(server.kind, SymbolKind::Class);
+        let handle = sym(&fg, "handle");
+        assert_eq!(
+            handle.kind,
+            SymbolKind::Method,
+            "async def in class must be Method, not Function"
+        );
+        assert_eq!(handle.parent, "Server");
+        assert_eq!(symbol_id(handle), "/tmp/test.py:Server::handle");
+    }
+
+    #[test]
+    fn async_free_function_produces_function_kind_no_parent() {
+        // `async def fetch(): pass` at module scope → Function, no parent.
+        // Same code path as the sync form.
+        let fg = parse("async def fetch():\n    pass\n");
+        let s = sym(&fg, "fetch");
+        assert_eq!(s.kind, SymbolKind::Function);
+        assert!(s.parent.is_empty());
+    }
+
+    #[test]
+    fn decorated_free_function_is_function_kind() {
+        // `@property def x(): pass` at module scope. Even though
+        // `@property` is conventionally used inside classes, applying it
+        // to a free function is syntactically valid Python and tree-sitter
+        // wraps it in `decorated_definition > function_definition`. The
+        // queries match the inner node directly — decorator transparency.
+        let fg = parse("@property\ndef x():\n    pass\n");
+        let s = sym(&fg, "x");
+        assert_eq!(
+            s.kind,
+            SymbolKind::Function,
+            "free function with decorator stays a Function (decorator transparent)"
+        );
+        assert!(s.parent.is_empty());
+    }
+
+    #[test]
+    fn decorated_method_is_method_kind_with_class_parent() {
+        // `class A: @property def x(self): pass` — decorated method.
+        // The `decorated_definition` wrapper does not block the
+        // class-ancestor walk; `find_enclosing_class` finds A through it.
+        let fg = parse("class A:\n    @property\n    def x(self):\n        return 1\n");
+        let x = sym(&fg, "x");
+        assert_eq!(
+            x.kind,
+            SymbolKind::Method,
+            "decorated method stays a Method (decorator transparent)"
+        );
+        assert_eq!(x.parent, "A");
+        assert_eq!(symbol_id(x), "/tmp/test.py:A::x");
+    }
+
+    #[test]
+    fn staticmethod_decorated_method_is_method_kind() {
+        // `class A: @staticmethod def s(): pass` — same decorator-
+        // transparency rule. `@staticmethod` is the canonical case:
+        // omitting `self` is legal because of the decorator.
+        let fg = parse("class A:\n    @staticmethod\n    def s():\n        pass\n");
+        let s = sym(&fg, "s");
+        assert_eq!(s.kind, SymbolKind::Method);
+        assert_eq!(s.parent, "A");
+    }
+
+    #[test]
+    fn nested_class_records_outer_class_as_parent() {
+        // `class A: class B: pass` — A is a top-level Class with no
+        // parent; B is a Class with parent=A.
+        let fg = parse("class A:\n    class B:\n        pass\n");
+        let a = sym(&fg, "A");
+        assert_eq!(a.kind, SymbolKind::Class);
+        assert!(a.parent.is_empty(), "top-level class must have no parent");
+        let b = sym(&fg, "B");
+        assert_eq!(b.kind, SymbolKind::Class);
+        assert_eq!(
+            b.parent, "A",
+            "inner class's parent must be the outer class"
+        );
+        assert_eq!(symbol_id(b), "/tmp/test.py:A::B");
+    }
+
+    #[test]
+    fn method_in_nested_class_records_innermost_class_as_parent() {
+        // `class Outer: class Inner: def m(self): pass` — m is a Method
+        // with parent=Inner (the innermost enclosing class), NOT Outer
+        // and NOT "Outer::Inner". This matches the
+        // `enclosing_function_id` and `find_enclosing_class` rules
+        // documented in `helpers.rs`.
+        let src = "class Outer:\n    class Inner:\n        def m(self):\n            pass\n";
+        let fg = parse(src);
+        let m = sym(&fg, "m");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(
+            m.parent, "Inner",
+            "innermost enclosing class wins for nested-class methods"
+        );
+        assert_eq!(symbol_id(m), "/tmp/test.py:Inner::m");
+    }
+
+    #[test]
+    fn dunder_init_is_ordinary_method() {
+        // `__init__` receives no special handling — ordinary method.
+        let fg = parse("class C:\n    def __init__(self):\n        pass\n");
+        let init = sym(&fg, "__init__");
+        assert_eq!(init.kind, SymbolKind::Method);
+        assert_eq!(init.parent, "C");
+        assert_eq!(symbol_id(init), "/tmp/test.py:C::__init__");
+    }
+
+    #[test]
+    fn dunder_str_repr_call_are_ordinary_methods() {
+        // Belt-and-suspenders for the "no special handling for dunders"
+        // rule documented in 7.2.
+        let src = "class C:\n    def __str__(self):\n        return ''\n    def __repr__(self):\n        return ''\n    def __call__(self):\n        pass\n";
+        let fg = parse(src);
+        for name in &["__str__", "__repr__", "__call__"] {
+            let s = sym(&fg, name);
+            assert_eq!(s.kind, SymbolKind::Method, "{name} must be Method");
+            assert_eq!(s.parent, "C", "{name} parent must be C");
+        }
+    }
+
+    #[test]
+    fn class_with_base_still_emits_class_symbol() {
+        // `class D(B): pass` — the `superclasses: argument_list` doesn't
+        // change the Class symbol. Inheritance edges land in 7.5; here we
+        // only verify that the presence of bases doesn't break definition
+        // extraction.
+        let fg = parse("class D(B):\n    pass\n");
+        let d = sym(&fg, "D");
+        assert_eq!(d.kind, SymbolKind::Class);
+        assert!(
+            d.parent.is_empty(),
+            "top-level class with base has no parent symbol"
+        );
+    }
+
+    #[test]
+    fn line_and_end_line_are_one_indexed_and_populated() {
+        // Sanity check that line/end_line track the def/class span
+        // (1-indexed). The function below starts at row 0 (line 1).
+        let fg = parse("def foo():\n    pass\n");
+        let s = sym(&fg, "foo");
+        assert_eq!(s.line, 1, "def on line 1");
+        // end_line is the last line of the function_definition node,
+        // which includes the body (the `pass` on line 2).
+        assert!(s.end_line >= s.line, "end_line >= line");
+        assert_eq!(s.column, 0, "def starts at column 0");
+    }
+
+    #[test]
+    fn signature_truncates_to_def_line() {
+        // `def foo(): pass` on a single physical line. `truncate_signature`
+        // stops at `;` or `{` which Python lacks; the def's text is the
+        // whole statement, so the signature contains both the head and
+        // the body marker. The contract is "no body brace", which Python
+        // trivially satisfies.
+        let fg = parse("def foo(x, y):\n    return x + y\n");
+        let s = sym(&fg, "foo");
+        assert!(
+            s.signature.contains("def foo(x, y)"),
+            "signature must contain the def head, got: {:?}",
+            s.signature
+        );
+    }
+
+    #[test]
+    fn pyi_stub_file_extracts_function_identically_to_py() {
+        // `.pyi` parity (verification field requirement): parsing a
+        // snippet at a path ending in `.pyi` must produce the same Symbol
+        // shape as the `.py` equivalent. Stub bodies (`...`) parse as
+        // expression_statement, not as a separate node kind, so the
+        // function_definition query matches and the function symbol is
+        // emitted.
+        let src = "def foo(x: int) -> str: ...\n";
+        let fg = parse_at(src, "/tmp/stubs.pyi");
+        assert_eq!(fg.path, "/tmp/stubs.pyi");
+        let s = sym(&fg, "foo");
+        assert_eq!(s.kind, SymbolKind::Function);
+        assert!(s.parent.is_empty());
+        assert_eq!(s.language, Language::Python);
+        assert_eq!(symbol_id(s), "/tmp/stubs.pyi:foo");
+    }
+
+    #[test]
+    fn pyi_stub_file_extracts_class_with_method_stub_identically_to_py() {
+        // Class stub with a method stub: both symbols must extract.
+        let src = "class C:\n    def m(self) -> int: ...\n";
+        let fg = parse_at(src, "/tmp/stubs.pyi");
+        assert_eq!(fg.symbols.len(), 2, "got: {:?}", fg.symbols);
+        let c = sym(&fg, "C");
+        assert_eq!(c.kind, SymbolKind::Class);
+        let m = sym(&fg, "m");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.parent, "C");
     }
 }

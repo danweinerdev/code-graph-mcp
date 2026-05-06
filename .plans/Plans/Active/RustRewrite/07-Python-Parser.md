@@ -3,18 +3,18 @@ title: "Python Language Parser"
 type: phase
 plan: RustRewrite
 phase: 7
-status: planned
+status: in-progress
 created: 2026-04-28
-updated: 2026-04-30
+updated: 2026-05-05
 deliverable: "codegraph-lang-python crate parsing .py and .pyi files with class/method/decorator handling, both import forms, multi-base inheritance, and the Python-specific call node type; registered in the main binary; testdata/python/ + real-world validation; the four-language MCP is complete and the RustRewrite plan moves to Plans/Complete/"
 tasks:
   - id: "7.1"
     title: "codegraph-lang-python crate scaffold + queries.rs + Cargo.toml dependencies"
-    status: planned
+    status: complete
     verification: "`tree-sitter-python = \"=0.25.0\"` added to workspace `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention); `crates/codegraph-lang-python/Cargo.toml` `[dependencies]` populated (tree-sitter, tree-sitter-python, streaming-iterator, codegraph-core, codegraph-lang, thiserror, anyhow) and `[dev-dependencies]` populated (rstest, pretty_assertions, insta); `cargo build -p codegraph-lang-python` green before any parser code lands; `PythonParser::new() -> anyhow::Result<PythonParser>` compiles all queries against tree-sitter-python 0.25 without error; `extensions()` returns `[\".py\", \".pyi\"]` (both extensions dispatch to the same parser; `.pyi` stub files use the same grammar — no separate query path); `id()` returns `Language::Python` (already defined in `crates/codegraph-core/src/lib.rs:29` from Phase 1); **object-safety + id() verified by a single `#[test] fn python_parser_is_object_safe_via_box_dyn() { let p: Box<dyn LanguagePlugin> = Box::new(PythonParser::new().unwrap()); assert_eq!(p.id(), Language::Python); }` matching the Phase 1 C++ test at `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly**; `PythonParser` does NOT override `resolve_call` or `resolve_include` — `resolve_call` accepts the default scope-aware heuristic (Python's dynamic typing makes any static call resolution inherently noisy; the default heuristic is the documented contract); `resolve_include` accepts the default basename match against the FileIndex, which is a no-op for Python module paths because `from foo.bar import baz` records `foo.bar` as a dotted module path, not a filesystem path; query categories: definitions (function_definition, class_definition — tree-sitter-python 0.25 wraps `async def` as a `function_definition` node, NOT a separate `async_function_definition`, so no extra query is needed; confirmed by fixture), calls (`call` — Python's tree-sitter uses 'call' not 'call_expression'), imports (import_statement with dotted_name, import_from_statement with module_name), inheritance (class_definition with superclasses argument_list); helpers find_enclosing_class, extract_module_path, walk_decorator_unwrap unit-tested"
   - id: "7.2"
     title: "Definition extraction with method-vs-function context, decorator transparency, async methods"
-    status: planned
+    status: in-progress
     depends_on: ["7.1"]
     verification: "function_definition without enclosing class_definition → Kind=Function; function_definition with enclosing class_definition → Kind=Method, parent=class name; async def methods (`class Server: async def handle(self): ...`) produce Kind=Method with parent=class — confirmed by fixture; class_definition → Kind=Class; @decorator wrapping a function/class produces decorated_definition wrapping the inner node — queries match the inner node directly because tree-sitter queries search the entire tree, so decorator presence does not block extraction (verified by a fixture with `@property def x(self)` producing a Method symbol); __init__, __str__, __repr__ are ordinary methods (no special handling); nested classes (class inside class) handled — outer class is the parent for the inner class; namespace stays empty for Python (Python's module concept is captured in the file path itself, not in a namespace tag); `.pyi` stub files extract symbols identically to `.py` files (function_definition with `...` body still parses as a function_definition; corpus tests assert this); tests cover each case"
   - id: "7.3"
@@ -62,25 +62,25 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
 ## 7.1: codegraph-lang-python crate scaffold + queries.rs + Cargo.toml dependencies
 
 ### Subtasks
-- [ ] Add `tree-sitter-python = "=0.25.0"` to workspace `Cargo.toml` `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention)
-- [ ] `crates/codegraph-lang-python/Cargo.toml`:
+- [x] Add `tree-sitter-python = "=0.25.0"` to workspace `Cargo.toml` `[workspace.dependencies]` (strict `=` pin matching the Phase 1 C++ convention)
+- [x] `crates/codegraph-lang-python/Cargo.toml`:
   - `[dependencies]`: tree-sitter, tree-sitter-python (workspace = true), streaming-iterator, codegraph-core, codegraph-lang, thiserror, anyhow
   - `[dev-dependencies]`: rstest, pretty_assertions, insta
-- [ ] **Compile gate:** `cargo build -p codegraph-lang-python` succeeds (empty crate, deps resolve) before any parser code is written
-- [ ] `PythonParser` with cached Query objects (definitions, calls, imports, inheritance)
-- [ ] `PythonParser::new() -> anyhow::Result<PythonParser>`
-- [ ] `extensions()` returns `[".py", ".pyi"]` — both extensions dispatch to the same parser; `.pyi` stub files use the same grammar
-- [ ] `id()` returns `Language::Python` — already defined in `crates/codegraph-core/src/lib.rs:29`; no codegraph-core change needed
-- [ ] **Default trait methods:** `PythonParser` does NOT override `resolve_call` or `resolve_include`. Rationale: Python's dynamic typing means *no* static call resolution is fully accurate; the default scope-aware heuristic is the documented contract. Default `resolve_include` is a no-op for Python module paths because `from foo.bar import baz` records `foo.bar` as the dotted module path, not a filesystem path.
-- [ ] `queries.rs`:
+- [x] **Compile gate:** `cargo build -p codegraph-lang-python` succeeds (empty crate, deps resolve) before any parser code is written
+- [x] `PythonParser` with cached Query objects (definitions, calls, imports, inheritance)
+- [x] `PythonParser::new() -> anyhow::Result<PythonParser>`
+- [x] `extensions()` returns `[".py", ".pyi"]` — both extensions dispatch to the same parser; `.pyi` stub files use the same grammar
+- [x] `id()` returns `Language::Python` — already defined in `crates/codegraph-core/src/lib.rs:29`; no codegraph-core change needed
+- [x] **Default trait methods:** `PythonParser` does NOT override `resolve_call` or `resolve_include`. Rationale: Python's dynamic typing means *no* static call resolution is fully accurate; the default scope-aware heuristic is the documented contract. Default `resolve_include` is a no-op for Python module paths because `from foo.bar import baz` records `foo.bar` as the dotted module path, not a filesystem path.
+- [x] `queries.rs`:
   - `DEFINITION_QUERIES`: function_definition, class_definition. **Note:** tree-sitter-python 0.25 wraps `async def` as a `function_definition` node (not a separate `async_function_definition`), so no extra query is needed — confirm by fixture in 7.2.
   - `CALL_QUERIES`: `(call function: (identifier))` and `(call function: (attribute attribute: (identifier)))` — note `call`, not `call_expression`
   - `IMPORT_QUERIES`: import_statement and import_from_statement
   - `INHERITANCE_QUERIES`: `(class_definition superclasses: (argument_list (identifier) @base) ...)` plus dotted_name variant for qualified bases
-- [ ] Helpers in `helpers.rs`:
+- [x] Helpers in `helpers.rs`:
   - `find_enclosing_class(node)` — walks up to class_definition
   - `extract_module_path(import_node, content)` — produces the dotted module path string
-- [ ] **Object-safety + id() test** in `#[cfg(test)] mod tests` (mirrors `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly):
+- [x] **Object-safety + id() test** in `#[cfg(test)] mod tests` (mirrors `crates/codegraph-lang-cpp/src/lib.rs:542-545` exactly):
   ```rust
   #[test]
   fn python_parser_is_object_safe_via_box_dyn() {
@@ -88,6 +88,7 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
       assert_eq!(p.id(), Language::Python);
   }
   ```
+- [x] **Bundled consolidation:** `truncate_signature` extracted to `crates/codegraph-lang/src/helpers.rs`; cpp/rust/go plugins re-export via `pub use codegraph_lang::helpers::truncate_signature;`. Eliminates the 4-copy state Phase 6 debrief flagged.
 
 ## 7.2: Definition extraction with decorator transparency and async methods
 

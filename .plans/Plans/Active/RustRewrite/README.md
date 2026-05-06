@@ -4,6 +4,8 @@ type: plan
 status: active
 created: 2026-04-28
 updated: 2026-05-05
+
+
 tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 related:
   - Designs/RustRewrite
@@ -47,7 +49,7 @@ phases:
     depends_on: [5]
   - id: 7
     title: "Python Language Parser"
-    status: planned
+    status: in-progress
     doc: "07-Python-Parser.md"
     depends_on: [6]
 ---
