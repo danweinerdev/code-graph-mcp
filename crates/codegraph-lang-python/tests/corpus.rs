@@ -309,6 +309,15 @@ fn broken_file_recovers_around_error_nodes_without_panic() {
         names.contains(&"good"),
         "post-error `good` must still extract; got: {names:?}"
     );
+    // `foo` is the load-bearing function with ERROR children — pre-fix
+    // a regression that lost `foo` would still pass via `len == 2 + good`
+    // if a third spurious symbol slipped in. Pinning `foo` by name closes
+    // that gap so both halves of the recovery contract stay enforced.
+    assert!(
+        names.contains(&"foo"),
+        "pre-error `foo` (the function with ERROR children) must still \
+         extract; got: {names:?}"
+    );
     // Both `foo` (with ERROR children) and `good` (clean) extract.
     assert_eq!(
         broken.symbols.len(),

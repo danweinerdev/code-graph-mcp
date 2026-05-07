@@ -48,8 +48,9 @@ The workspace is split into language-agnostic core crates plus per-language plug
 | `crates/codegraph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
 | `crates/codegraph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
 | `crates/codegraph-lang-go` | Go language plugin — tree-sitter-go queries; method-receiver extraction, all import forms (single/grouped/aliased/dot/blank), direct + selector_expression calls |
+| `crates/codegraph-lang-python` | Python language plugin — tree-sitter-python queries; class/method/decorator handling, both import forms (`import` + `from … import`), multi-base inheritance, `.py` and `.pyi` |
 
-Phase 7 of the rewrite plan adds `codegraph-lang-python` (scaffolded, not wired). As of the Phase 6 cutover, **C++, Rust, and Go are live**.
+As of the Phase 7 cutover, **all four languages — C++, Rust, Go, and Python — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, and Python) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/codegraph-lang/src/lib.rs:116`.
 
 ```
 AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
@@ -62,12 +63,11 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
               [LanguageRegistry] [In-memory graph + JSON cache]
               (codegraph-lang)
                      |
-              [C++ Plugin] [Rust Plugin] [Go Plugin] [Python*]
-              (codegraph-lang-cpp, codegraph-lang-rust, codegraph-lang-go + future Python plugin)
+              [C++ Plugin] [Rust Plugin] [Go Plugin] [Python Plugin]
+              (codegraph-lang-cpp, codegraph-lang-rust, codegraph-lang-go, codegraph-lang-python)
                      |
-              [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go]
+              [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go + tree-sitter-python]
 ```
-*Python plugin scaffolded but not wired as of Phase 6.*
 
 ## Configuration
 
@@ -202,3 +202,33 @@ Validated against tree-sitter-go v0.25.0.
 6. **`raw_string_literal` (backtick) imports are intentionally NOT matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `codegraph-lang-go` (`backtick_import_produces_no_includes_edge`) asserts backtick imports produce zero `Includes` edges.
 
 7. **Forward declarations excluded.** Interface method elements (`type R interface { Read() }`) parse as `method_elem` nodes (no body) and are NOT matched by the definition query — only `method_declaration` (with a body and receiver) produces method symbols. The interface method set is implicit; only the interface type itself becomes a `Symbol`.
+
+## Python Parser Limitations
+
+Validated against tree-sitter-python v0.25.0.
+
+### Supported Python Patterns
+
+- Free functions, methods inside classes (parent = enclosing class name), nested classes (inner class records the *immediate* enclosing outer class as parent — not a dotted path)
+- `async def` — extracted as `Function` (or `Method` inside a class) with no separate kind. tree-sitter-python 0.25 wraps `async def` as a `function_definition`, not a separate `async_function_definition` node, so a single query path covers both sync and async forms.
+- `class` definitions with single (`class D(B)`), multiple (`class D(A, B, C)` → 3 `Inherits` edges), and qualified (`class D(module.Base)` → 1 edge with `to = "module.Base"`) inheritance. Keyword arguments in superclasses (`class C(metaclass=Meta)`, `class C(total=False)`) are filtered as non-bases.
+- Decorators are transparent for definition extraction. `@property` / `@staticmethod` / `@classmethod` / `@abstractmethod` / custom decorators all wrap `decorated_definition > function_definition`; queries match the inner `function_definition` directly.
+- All call patterns: direct (`foo()`), attribute (`obj.method()`), chained (`a.b().c()` → 2 edges, one per chain link), constructor calls (`MyClass()` — recorded as a call to `MyClass`, agent interprets as construction), `super()`, calls inside list/dict/set comprehensions, calls inside `lambda` (lambda is transparent for the enclosing-function walk), calls inside default argument expressions
+- All import forms: `import foo` → `to = "foo"`; `import foo.bar` → `to = "foo.bar"`; `import foo as f` → `to = "foo"` (alias dropped); `from foo import bar` → `to = "foo"` (the *module* is the dependency, NOT the imported name); `from foo.bar import baz` → `to = "foo.bar"`; `from . import utils` → `to = ".utils"` (relative imports preserved verbatim); `from typing import List, Dict` → 1 edge with `to = "typing"`; `from __future__ import annotations` → `to = "__future__"`
+- `.pyi` stub files indexed identically to `.py`. `def f(x: int) -> str: ...` (a stub with `...` body) still parses as `function_definition` and produces a Function symbol.
+
+### Known Limitations
+
+1. **Call resolution is especially noisy due to dynamic typing.** `PythonParser` does NOT override `resolve_call` — the default scope-aware heuristic (same file > same class > same namespace > global) is the documented contract. Python's runtime polymorphism means most call resolutions are best-effort: `obj.foo()` cannot be resolved to a concrete `foo` without type inference, which is out of scope for a tree-sitter-based static analyzer. (Rationale documented in the Phase 7.1 verification: `PythonParser` accepts the default `resolve_call` for this reason.)
+
+2. **Decorators are transparent for definition extraction.** `@property` / `@staticmethod` / `@classmethod` produce ordinary `Method` symbols with no separate flag. `@abstractmethod` is NOT flagged as a separate kind — it parses as a method like any other. The decoration metadata is not preserved as a structured field in the symbol record.
+
+3. **Type hints not extracted as edges.** `def f(x: SomeType) -> OtherType` does not produce edges to `SomeType` or `OtherType`. Only call sites and explicit imports drive the dependency graph.
+
+4. **Conditional imports NOT extracted.** Patterns like `if TYPE_CHECKING: import expensive_module` are wrapped in `if_statement > block` and the import queries do not enter conditional bodies — `extract_imports`'s module-top-level guard filters them out. `try: import x except ImportError: ...` is filtered for the same reason. Anti-regression tests in the Python plugin's import tests cover both the `if`-block and `try`-block forms.
+
+5. **`from __future__` records `__future__` as the module path.** `from __future__ import annotations` produces an `Includes` edge with `to = "__future__"`. Handled via the dedicated `future_import_statement` node kind, NOT `import_from_statement` — tree-sitter-python 0.25 tags the future-import line with its own node type.
+
+6. **Forward declarations don't apply.** Python doesn't have C/Go-style forward declarations. `.pyi` stubs are indexed identically to `.py` files (the grammar is the same; `...` body still parses as a function body).
+
+7. **Method dispatch is heuristic.** Same as the C++/Rust/Go plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different classes that share a name may resolve to the wrong candidate, especially given Python's duck-typing tradition.

@@ -1,0 +1,17 @@
+---
+source: crates/codegraph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "bases": [
+    {
+      "derived": [
+        {
+          "name": "Dog"
+        }
+      ],
+      "name": "Animal"
+    }
+  ],
+  "name": "Dog"
+}

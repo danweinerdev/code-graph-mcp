@@ -166,6 +166,38 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
          got {pre_derived:?}"
     );
 
+    // Pre-edit Calls-edge sanity (7.6 carry-over): confirm that
+    // `Delta::use_beta` actually has a `Calls` edge to `Beta` BEFORE we
+    // remove Beta. Without this, a regression where the call was never
+    // captured at all would silently pass the post-edit "no dangling Beta
+    // callee" assertion below — both halves would trivially hold for the
+    // wrong reason. Mirrors the Go watch test
+    // (`watch_go_reindex.rs:136-151`).
+    let r = callers_or_callees(
+        &server.inner.graph,
+        &delta_use_beta_id,
+        Some(1),
+        Direction::Callees,
+    );
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "pre-edit get_callees(Delta::use_beta) must succeed: {r:?}"
+    );
+    let pre_callee_body: serde_json::Value =
+        serde_json::from_str(&first_text(&r)).expect("get_callees response is JSON");
+    let pre_callee_ids: Vec<String> = pre_callee_body
+        .as_array()
+        .expect("callees is an array")
+        .iter()
+        .filter_map(|c| c["symbol_id"].as_str().map(String::from))
+        .collect();
+    assert!(
+        pre_callee_ids.iter().any(|t| t == &beta_id),
+        "pre-edit Delta::use_beta's callees must include {beta_id} \
+         (anchors the dangling-Calls-edge assertion below); got \
+         {pre_callee_ids:?}"
+    );
+
     // Edit: remove Beta entirely; remove Delta and its use_beta method;
     // add Gamma(Alpha). Alpha is left untouched. The post-edit shape
     // must:

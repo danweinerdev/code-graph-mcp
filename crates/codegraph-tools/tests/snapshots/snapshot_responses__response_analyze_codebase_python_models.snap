@@ -3,8 +3,8 @@ source: crates/codegraph-tools/tests/snapshot_responses.rs
 expression: parsed
 ---
 {
-  "edges": 0,
-  "files": 4,
+  "edges": 3,
+  "files": 1,
   "root_path": "[testdata]",
-  "symbols": 4
+  "symbols": 5
 }

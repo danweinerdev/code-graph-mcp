@@ -1,6 +1,6 @@
 # code-graph-mcp
 
-An MCP server that builds an in-memory semantic code graph from C++, Rust, and Go source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
+An MCP server that builds an in-memory semantic code graph from C++, Rust, Go, and Python source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
 
 ## Supported languages
 
@@ -9,8 +9,7 @@ An MCP server that builds an in-memory semantic code graph from C++, Rust, and G
 | C++      | `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp`, `.hxx` | `codegraph-lang-cpp` |
 | Rust     | `.rs`      | `codegraph-lang-rust` |
 | Go       | `.go`      | `codegraph-lang-go` |
-
-The Python plugin is scaffolded but not yet wired into the binary (Phase 7).
+| Python   | `.py`, `.pyi` | `codegraph-lang-python` |
 
 ## Installation
 
@@ -223,6 +222,36 @@ Validated against tree-sitter-go v0.25.0.
 5. **Generic type parameters and constraints not represented in symbol records.** Generic types are recognized in receiver positions (`func (s *Server[T]) M()` → parent `Server`), but the type-parameter list `[T]` and any constraints (`[T any]`, `[T comparable]`) are not part of the symbol record. They survive in the captured signature text only.
 
 6. **`raw_string_literal` (backtick) imports are intentionally not matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `codegraph-lang-go` asserts backtick imports produce zero `Includes` edges.
+
+## Python Parser Limitations
+
+Validated against tree-sitter-python v0.25.0.
+
+### Supported Python Patterns
+
+- Free functions, methods inside classes (`Class::method`), nested classes (inner class records the immediate-enclosing outer class as parent)
+- `async def` — extracted as `Function` (or `Method` inside a class), no separate kind. `async def` parses as `function_definition` in tree-sitter-python 0.25.
+- `class` definitions — single, multiple (`class D(A, B)`), and qualified (`class D(module.Base)`) inheritance all produce `Inherits` edges
+- Decorators are transparent for definition extraction. `@property`, `@staticmethod`, `@classmethod`, `@abstractmethod`, custom decorators — all wrap `decorated_definition > function_definition` and the queries match the inner `function_definition` directly. The decoration metadata is not preserved as a separate flag.
+- All call patterns: direct (`foo()`), attribute (`obj.method()`), chained (`a.b().c()` → 2 edges), constructor calls (`MyClass()` — recorded as a call to `MyClass`), `super()`, calls inside list/dict/set comprehensions, calls inside lambdas (lambda is transparent for the enclosing-function walk), calls inside default arguments
+- All import forms: `import foo`, `import foo.bar`, `import foo as f` (alias dropped, dotted path captured), `from foo import bar` (records `foo`, NOT `bar` — the module is the dependency), `from foo.bar import baz`, `from . import utils` (records `.utils`), `from __future__ import annotations` (records `__future__`)
+- `.pyi` stub files indexed identically to `.py` files. `def f() -> int: ...` parses as a `function_definition` and produces a Function symbol; class stubs with method stubs produce Class + Method symbols.
+
+### Known Limitations
+
+1. **Call resolution is especially noisy due to dynamic typing.** `PythonParser` does not override `resolve_call` — the default scope-aware heuristic (same file > same class > same namespace > global) is the documented contract. Python's runtime polymorphism means most call resolutions are best-effort: `obj.foo()` cannot be resolved to a concrete `foo` without type inference, which is out of scope for a tree-sitter-based static analyzer.
+
+2. **Decorators are transparent for definition extraction.** `@property` / `@staticmethod` / `@classmethod` produce ordinary `Method` symbols with no separate flag. `@abstractmethod` is NOT flagged as a separate kind — it parses as a method like any other. The decorator type is not part of the symbol record.
+
+3. **Type hints not extracted as edges.** `def f(x: SomeType) -> OtherType` does not produce `Includes`/`Calls` edges to `SomeType` or `OtherType`. Only call sites and explicit imports drive the dependency graph.
+
+4. **Conditional imports NOT extracted.** Patterns like `if TYPE_CHECKING: import expensive_module` are wrapped in `if_statement > block` and the import queries do not enter conditional bodies — module-top-level guard in `extract_imports` filters them out. `try: import x except ImportError: ...` is filtered for the same reason. Anti-regression tests in the Python plugin's import tests cover both forms.
+
+5. **`from __future__` records `__future__` as the module path.** `from __future__ import annotations` produces an `Includes` edge with `to = "__future__"`. The dunder module is handled via the dedicated `future_import_statement` node kind, NOT via `import_from_statement`.
+
+6. **Forward declarations don't apply.** Python doesn't have C-style forward declarations. `.pyi` stubs are indexed identically to `.py` files (the grammar is the same; `...` body still parses as a function body).
+
+7. **Method dispatch is heuristic.** Same as the C++/Rust/Go plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic.
 
 ## Smoke test
 

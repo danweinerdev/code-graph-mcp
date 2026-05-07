@@ -132,6 +132,7 @@ dependencies = [
  "codegraph-lang",
  "codegraph-lang-cpp",
  "codegraph-lang-go",
+ "codegraph-lang-python",
  "codegraph-lang-rust",
  "codegraph-tools",
  "rmcp",
@@ -171,6 +172,8 @@ version = "0.1.0"
 dependencies = [
  "codegraph-core",
  "thiserror",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]

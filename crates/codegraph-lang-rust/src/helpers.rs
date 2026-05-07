@@ -9,13 +9,15 @@
 //! a crate-internal convention so callers within `lib.rs` can `use` them
 //! freely. The effective visibility cap remains crate-internal.
 //!
-//! `truncate_signature` is re-exported from `codegraph_lang::helpers` (the
-//! shared cross-language module). Phase 7.1 consolidated the previously
-//! byte-identical C++/Rust/Go copies into one canonical implementation; this
-//! `pub use` keeps the historical `crate::helpers::truncate_signature` import
-//! path working from `lib.rs`.
+//! `truncate_signature` and `find_enclosing_kind` are re-exported from
+//! `codegraph_lang::helpers` (the shared cross-language module). Phase 7.1
+//! consolidated `truncate_signature`; Phase 7.7 consolidated
+//! `find_enclosing_kind` (previously five byte-identical copies — including
+//! one in this crate's `lib.rs` and one in this very file). The `pub use`
+//! re-export keeps `crate::helpers::find_enclosing_kind` working unchanged
+//! and `lib.rs` calls into it from one canonical place.
 
-pub use codegraph_lang::helpers::truncate_signature;
+pub use codegraph_lang::helpers::{find_enclosing_kind, truncate_signature};
 
 use tree_sitter::Node;
 
@@ -208,21 +210,6 @@ pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> Stri
         }
         None => format!("{path}:{fn_name}"),
     }
-}
-
-/// Walk `node`'s parent chain, returning the first ancestor (including
-/// `node` itself) whose kind matches `kind`. Crate-internal helper used
-/// by [`enclosing_function_id`] (mirrors the same-named helper in `lib.rs`,
-/// kept here so the helper module is self-contained for testing).
-fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut current = Some(node);
-    while let Some(n) = current {
-        if n.kind() == kind {
-            return Some(n);
-        }
-        current = n.parent();
-    }
-    None
 }
 
 #[cfg(test)]

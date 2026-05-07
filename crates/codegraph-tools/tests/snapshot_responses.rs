@@ -38,6 +38,7 @@ use codegraph_core::Language;
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
 use codegraph_lang_go::GoParser;
+use codegraph_lang_python::PythonParser;
 use codegraph_lang_rust::RustParser;
 use codegraph_tools::handlers::analyze::analyze_codebase;
 use codegraph_tools::handlers::query::{callers_or_callees, get_dependencies, Direction};
@@ -696,6 +697,32 @@ fn go_parser_registers_for_go_language() {
     assert!(registry.plugin_for(Language::Cpp).is_some());
 }
 
+/// Sanity check for the Python parser registration alongside the other
+/// three plugins — mirrors the Phase 7.7 registration block in
+/// `crates/code-graph-mcp/src/main.rs` so a silent removal of
+/// `codegraph_lang_python::PythonParser::new()` from the binary trips
+/// this test before any of the Python-specific snapshots below.
+#[test]
+fn python_parser_registers_for_python_language() {
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(GoParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(PythonParser::new().unwrap()))
+        .unwrap();
+    assert!(registry.plugin_for(Language::Python).is_some());
+    assert!(registry.plugin_for(Language::Go).is_some());
+    assert!(registry.plugin_for(Language::Rust).is_some());
+    assert!(registry.plugin_for(Language::Cpp).is_some());
+}
+
 // --- Phase 5.6 Rust-side snapshots --------------------------------------
 //
 // These four snapshots lock the wire format for representative responses
@@ -732,6 +759,9 @@ async fn build_indexed_fixture_for_dir_with_all_parsers(src: &Path) -> IndexedFi
     registry
         .register(Box::new(GoParser::new().expect("GoParser::new")))
         .expect("register GoParser");
+    registry
+        .register(Box::new(PythonParser::new().expect("PythonParser::new")))
+        .expect("register PythonParser");
     let server = CodeGraphServer::new(registry);
 
     let r = analyze_codebase(
@@ -772,6 +802,9 @@ async fn response_analyze_codebase_testdata_mixed() {
         .unwrap();
     registry
         .register(Box::new(GoParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(PythonParser::new().unwrap()))
         .unwrap();
     let server = CodeGraphServer::new(registry);
     let r = analyze_codebase(
@@ -899,6 +932,9 @@ async fn build_indexed_fixture_with_go_interface() -> IndexedFixture {
     registry
         .register(Box::new(GoParser::new().expect("GoParser::new")))
         .expect("register GoParser");
+    registry
+        .register(Box::new(PythonParser::new().expect("PythonParser::new")))
+        .expect("register PythonParser");
     let server = CodeGraphServer::new(registry);
 
     let r = analyze_codebase(
@@ -943,6 +979,190 @@ async fn response_get_file_symbols_go_reader() {
         .to_string_lossy()
         .into_owned();
     let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- Phase 7.7 Python-side snapshots ------------------------------------
+//
+// These snapshots lock the wire format for representative responses
+// driven by the Python language plugin (registered alongside C++, Rust,
+// and Go — the four-language binary shape):
+//
+//   * analyze_codebase on a Python-only directory — exercises the full
+//     analyze path against `.py` files end-to-end.
+//   * search_symbols(query="helper", language=python) — exercises the
+//     language=python filter path on `testdata/mixed/`.
+//   * get_file_symbols on a Python file with classes + methods — locks
+//     the per-file symbol-listing shape for Python content.
+//   * get_class_hierarchy on a Python class with bases — exercises the
+//     Inherits-edge dispatch for Python's single-inheritance form.
+//   * get_dependencies on a Python file with imports — exercises the
+//     Includes-edge wire format for both `import_statement` and
+//     `import_from_statement` shapes.
+//
+// Python fixtures use small synthesized sources rather than the larger
+// `testdata/python/` corpus so the snapshots stay readable.
+
+/// Build a Python-only indexed fixture from a single inline source. The
+/// `models.py` file declares an `Animal` base class plus a `Dog` subclass
+/// (`class Dog(Animal):`) so the inheritance and class-hierarchy
+/// snapshots have a non-trivial Inherits edge to lock. Imports cover both
+/// `import` and `from ... import` forms so the dependency snapshot
+/// exercises the dotted-module-path wire format. Parsers registered
+/// match the binary's runtime shape (all four).
+async fn build_indexed_fixture_with_python_models() -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for Python models fixture");
+    // Two-class single-inheritance fixture with both import forms.
+    // Sized to keep the per-file snapshot readable (~10 symbols).
+    let source = "import abc\nfrom typing import List\n\n\
+                  class Animal:\n    \
+                  def __init__(self, name):\n        self.name = name\n    \
+                  def speak(self):\n        return self.name\n\n\
+                  class Dog(Animal):\n    \
+                  def speak(self):\n        return \"woof\"\n";
+    std::fs::write(dir.path().join("models.py"), source).expect("write models.py");
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    registry
+        .register(Box::new(RustParser::new().expect("RustParser::new")))
+        .expect("register RustParser");
+    registry
+        .register(Box::new(GoParser::new().expect("GoParser::new")))
+        .expect("register GoParser");
+    registry
+        .register(Box::new(PythonParser::new().expect("PythonParser::new")))
+        .expect("register PythonParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+#[tokio::test]
+async fn response_analyze_codebase_python_models() {
+    // Capture the analyze response itself rather than discarding it
+    // inside the helper — same pattern as the existing analyze
+    // snapshots. Locks the file/symbol/edge counters for a Python-only
+    // index.
+    let dir = TempDir::new().unwrap();
+    let source = "import abc\nfrom typing import List\n\n\
+                  class Animal:\n    \
+                  def __init__(self, name):\n        self.name = name\n    \
+                  def speak(self):\n        return self.name\n\n\
+                  class Dog(Animal):\n    \
+                  def speak(self):\n        return \"woof\"\n";
+    std::fs::write(dir.path().join("models.py"), source).unwrap();
+    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(GoParser::new().unwrap()))
+        .unwrap();
+    registry
+        .register(Box::new(PythonParser::new().unwrap()))
+        .unwrap();
+    let server = CodeGraphServer::new(registry);
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_search_symbols_helper_language_python() {
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("helper"),
+            language: Some("python"),
+            brief: true,
+            ..Default::default()
+        },
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_file_symbols_python_models() {
+    let fx = build_indexed_fixture_with_python_models().await;
+    let file = fx
+        .indexed_root
+        .join("models.py")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_class_hierarchy_python_dog() {
+    let fx = build_indexed_fixture_with_python_models().await;
+    // `Dog` inherits from `Animal`. The hierarchy snapshot locks both
+    // `bases` (Dog -> Animal) and the leaf-node shape for the upward
+    // walk (Animal has no bases, so it serializes without the field).
+    let r = get_class_hierarchy(&fx.inner.graph, "Dog", Some(2));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_dependencies_python_models() {
+    let fx = build_indexed_fixture_with_python_models().await;
+    let file = fx
+        .indexed_root
+        .join("models.py")
+        .to_string_lossy()
+        .into_owned();
+    // models.py imports `abc` and `typing` — both record verbatim as the
+    // dotted module path (the from-form points at the module, not the
+    // imported name). The snapshot pins this contract for Python.
+    let r = get_dependencies(&fx.inner.graph, &file);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

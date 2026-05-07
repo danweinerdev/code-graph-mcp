@@ -60,8 +60,8 @@ use tree_sitter::{
 };
 
 use crate::helpers::{
-    enclosing_function_id, find_enclosing_impl, resolve_mod_namespace, split_use_path,
-    truncate_signature,
+    enclosing_function_id, find_enclosing_impl, find_enclosing_kind, resolve_mod_namespace,
+    split_use_path, truncate_signature,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, USE_QUERIES};
 
@@ -542,21 +542,6 @@ fn parse_tree(language: &TsLanguage, content: &[u8]) -> Result<TsTree, ParseErro
 /// indices, matching the C++ plugin's silent fallback.
 fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
     cap_names.get(index as usize).copied().unwrap_or("")
-}
-
-/// Walk up `node`'s parent chain, returning the first ancestor (including
-/// `node` itself) whose kind matches `kind`. Local copy of the C++
-/// plugin's `find_enclosing_kind` — used to find the `function_item`,
-/// `struct_item`, etc. that contains a captured `name` node.
-fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut current = Some(node);
-    while let Some(n) = current {
-        if n.kind() == kind {
-            return Some(n);
-        }
-        current = n.parent();
-    }
-    None
 }
 
 /// Build a [`Symbol`] from a definition node. Centralizes the row/column/

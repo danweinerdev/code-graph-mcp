@@ -39,7 +39,7 @@ tasks:
     verification: "testdata/python/ project covers: classes with __init__/__str__/__repr__, @property/@staticmethod/@classmethod decorators, single + multiple + qualified inheritance, ABC with @abstractmethod (extracted as ordinary methods), async def methods inside classes, generators (yield), context managers, type hints, all import forms (incl. `from __future__ import annotations`); a `stubs.pyi` file demonstrates `.pyi` stub extraction; MANIFEST.md documents expected symbols and edges with separate counts for the `.pyi` file; corpus tests cover every definition form, every call pattern, every import form, every inheritance form, and edge cases (empty file, comments-only file, syntax error file → parser skips error nodes gracefully, deeply nested classes, method-with-same-name-as-free-function, *args/**kwargs in signature, generator function, property decorator, `.pyi` stub file); parse-test testdata/python matches MANIFEST; **watch-mode reindex regression** (in `crates/codegraph-tools/tests/watch_python_reindex.rs`): start watch on a temp directory containing `models.py` with `class Alpha:`, `class Beta(Alpha):`, and `class Delta: def use_beta(self): Beta()`; modify `models.py`: remove `Beta` and `Delta.use_beta`, add `class Gamma(Alpha):`; after debounce, assert `get_file_symbols` shows `Alpha` + `Gamma`, no `Beta` or `Delta.use_beta`; assert `get_class_hierarchy` for `Alpha` shows `Gamma` as derived (not `Beta`); assert no dangling Inherits edge from `Beta` and no dangling Calls edge from `Delta.use_beta` to `Beta` — both kinds of edges go through `Graph::prune_dangling_edges`; real-world dogfood: clone `github.com/psf/requests` (well-known mid-sized Python library) to `/tmp/requests` at a pinned tag (v2.32.3), run `parse-test /tmp/requests/src/requests`, expect 0 crashes, 0 warnings, approximate symbol count between 400 and 1000 recorded as `testdata/python/requests-baseline.txt` (one line: `symbols: N`); follow-up test asserts the recorded count stays within ±10% as a regression gate"
   - id: "7.7"
     title: "Register parser, four-language integration, cross-language collision regression, snapshots, documentation"
-    status: planned
+    status: complete
     depends_on: ["7.6"]
     verification: "main.rs registers PythonParser using the shipped Box+context pattern (mirroring the C++/Rust/Go blocks at `main.rs:20-23`); full four-language analyze on a directory containing .cpp + .rs + .go + .py — extends the `testdata/mixed/` fixture (created in 5.6, extended in 6.6) by adding `foo.py` defining `def helper(): pass`; analyze indexes all four; search without language filter returns from all four; with each `language=` filter returns only that language's match; **4-way cross-language collision regression**: `init` exists in C++, Go, and Python (`def init(): ...` at module scope) — assert `search_symbols` returns three entries, and `get_callers` against any one does NOT return the others' callers (verifying the `(Language, name)`-keyed SymbolIndex isolation from Phase 3 at `crates/codegraph-lang/src/lib.rs:116`); wire-format snapshot tests extended with Python responses (cargo insta accept on the new fixtures); README + CLAUDE.md final update — all four languages listed in supported-languages table (C++ `.cpp/.cc/.h/.hpp`, Rust `.rs`, Go `.go`, Python `.py/.pyi`); update `crates/code-graph-mcp/src/main.rs` module-level doc comment to reflect all four languages are now live; Python-specific limitations documented: call resolution especially noisy due to dynamic typing; decorators transparent for definition extraction but @abstractmethod not flagged as a separate kind; type hints not extracted as edges; conditional imports (`if TYPE_CHECKING: import ...`) NOT extracted because tree-sitter sees them as block-level statements inside an `if_statement`, not as top-level `import_statement` nodes"
   - id: "7.8"
@@ -183,7 +183,7 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 ## 7.7: Register parser, four-language integration, snapshots, documentation
 
 ### Subtasks
-- [ ] Register PythonParser in `crates/code-graph-mcp/src/main.rs` using the shipped Box+context pattern (mirrors C++/Rust/Go blocks):
+- [x] Register PythonParser in `crates/code-graph-mcp/src/main.rs` using the shipped Box+context pattern (mirrors C++/Rust/Go blocks):
   ```rust
   .register(Box::new(
       codegraph_lang_python::PythonParser::new()
@@ -191,11 +191,11 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
   ))
   .context("register Python language plugin")?;
   ```
-- [ ] **Four-language fixture:** extend `testdata/mixed/` (created in 5.6 with `foo.cpp` + `foo.rs`, extended in 6.6 with `foo.go`) by adding `foo.py` defining `def helper(): pass`; the four files share the anchor name `helper`
-- [ ] Full four-language integration test: `analyze_codebase` on `testdata/mixed/` indexes all four; `search_symbols` for `helper` without language filter returns four entries; with each `language=` filter returns only that language's match
-- [ ] **4-way cross-language collision regression:** `init` exists in C++ (`void init()`), Go (`func init()`), and Python (`def init(): pass` at module scope). Assert `search_symbols` returns three entries; assert `get_callers` against any one does NOT return the others' callers — verifying the `(Language, name)`-keyed `SymbolIndex` isolation from Phase 3 at `crates/codegraph-lang/src/lib.rs:116` extends cleanly to four languages
-- [ ] Wire-format snapshot tests extended with Python-specific responses (`cargo insta accept` on the new fixtures)
-- [ ] README + CLAUDE.md final update:
+- [x] **Four-language fixture:** extend `testdata/mixed/` (created in 5.6 with `foo.cpp` + `foo.rs`, extended in 6.6 with `foo.go`) by adding `foo.py` defining `def helper(): pass`; the four files share the anchor name `helper`
+- [x] Full four-language integration test: `analyze_codebase` on `testdata/mixed/` indexes all four; `search_symbols` for `helper` without language filter returns four entries; with each `language=` filter returns only that language's match
+- [x] **4-way cross-language collision regression:** `init` exists in C++ (`void init()`), Go (`func init()`), and Python (`def init(): pass` at module scope). Assert `search_symbols` returns three entries; assert `get_callers` against any one does NOT return the others' callers — verifying the `(Language, name)`-keyed `SymbolIndex` isolation from Phase 3 at `crates/codegraph-lang/src/lib.rs:116` extends cleanly to four languages
+- [x] Wire-format snapshot tests extended with Python-specific responses (`cargo insta accept` on the new fixtures)
+- [x] README + CLAUDE.md final update:
   - All four languages listed in the supported-languages table (C++ `.cpp/.cc/.h/.hpp`, Rust `.rs`, Go `.go`, Python `.py/.pyi`)
   - Update `crates/code-graph-mcp/src/main.rs` module-level doc comment (currently "C++ only — Phases 5/6/7 add Rust, Go, Python") to reflect all four languages are now live
   - Python-specific limitations:
@@ -203,6 +203,7 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
     - Decorators are transparent for definition extraction but `@abstractmethod` is not flagged as a separate kind
     - Type hints not extracted as edges
     - Conditional imports (`if TYPE_CHECKING: import ...`) NOT extracted because tree-sitter sees them as block-level statements inside an `if_statement`, not as top-level `import_statement` nodes
+- [x] **Bundled consolidation:** `find_enclosing_kind` extracted to `crates/codegraph-lang/src/helpers.rs` alongside `truncate_signature`. The five byte-identical copies (C++ helpers, Rust helpers, Rust lib, Go lib, Python lib) are now one canonical implementation. Each plugin re-exports via `pub use codegraph_lang::helpers::find_enclosing_kind;` so call-site syntax stays unchanged.
 
 ## 7.8: Structural verification + plan close-out
 

@@ -68,6 +68,7 @@ pub(crate) mod queries;
 use std::path::Path;
 
 use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use codegraph_lang::helpers::find_enclosing_kind;
 use codegraph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -534,20 +535,6 @@ fn parse_tree(language: &TsLanguage, content: &[u8]) -> Result<TsTree, ParseErro
 /// indices, matching the C++/Rust plugins' silent fallback.
 fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
     cap_names.get(index as usize).copied().unwrap_or("")
-}
-
-/// Walk up `node`'s parent chain, returning the first ancestor (including
-/// `node` itself) whose kind matches `kind`. Local copy of the C++/Rust
-/// plugins' `find_enclosing_kind`.
-fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut current = Some(node);
-    while let Some(n) = current {
-        if n.kind() == kind {
-            return Some(n);
-        }
-        current = n.parent();
-    }
-    None
 }
 
 /// Build a [`Symbol`] from a definition node. Centralises the row/column/

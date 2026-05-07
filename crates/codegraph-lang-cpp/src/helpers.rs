@@ -9,13 +9,14 @@
 //! a crate-internal convention so callers within `lib.rs` can `use` them
 //! freely. The effective visibility cap remains crate-internal.
 //!
-//! `truncate_signature` is re-exported from `codegraph_lang::helpers` (the
-//! shared cross-language module). Phase 7.1 consolidated the previously
-//! byte-identical C++/Rust/Go copies into one canonical implementation; this
-//! `pub use` keeps the historical `crate::helpers::truncate_signature` import
-//! path working from `lib.rs`.
+//! `truncate_signature` and `find_enclosing_kind` are re-exported from
+//! `codegraph_lang::helpers` (the shared cross-language module). Phase 7.1
+//! consolidated `truncate_signature`; Phase 7.7 consolidated
+//! `find_enclosing_kind` (previously five byte-identical copies). The
+//! `pub use` re-exports keep the historical `crate::helpers::*` import
+//! paths working from `lib.rs`.
 
-pub use codegraph_lang::helpers::truncate_signature;
+pub use codegraph_lang::helpers::{find_enclosing_kind, truncate_signature};
 
 use tree_sitter::Node;
 
@@ -51,20 +52,6 @@ pub fn is_cpp_cast(name: &str) -> bool {
         name,
         "static_cast" | "dynamic_cast" | "const_cast" | "reinterpret_cast"
     )
-}
-
-/// Walk up `node`'s parent chain, returning the first ancestor (including
-/// `node` itself) whose kind matches `kind`. Mirrors `findEnclosingKind`
-/// in cpp.go.
-pub fn find_enclosing_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut current = Some(node);
-    while let Some(n) = current {
-        if n.kind() == kind {
-            return Some(n);
-        }
-        current = n.parent();
-    }
-    None
 }
 
 /// Resolve the namespace path of `node` by walking its ancestors, collecting

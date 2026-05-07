@@ -2,9 +2,7 @@
 source: crates/codegraph-tools/tests/snapshot_responses.rs
 expression: parsed
 ---
-{
-  "edges": 0,
-  "files": 4,
-  "root_path": "[testdata]",
-  "symbols": 4
-}
+[
+  "abc",
+  "typing"
+]
