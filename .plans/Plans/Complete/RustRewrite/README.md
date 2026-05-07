@@ -1,9 +1,9 @@
 ---
 title: "Rust Rewrite of code-graph-mcp"
 type: plan
-status: active
+status: complete
 created: 2026-04-28
-updated: 2026-05-05
+updated: 2026-05-07
 
 
 tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
@@ -49,7 +49,7 @@ phases:
     depends_on: [5]
   - id: 7
     title: "Python Language Parser"
-    status: in-progress
+    status: complete
     doc: "07-Python-Parser.md"
     depends_on: [6]
 ---

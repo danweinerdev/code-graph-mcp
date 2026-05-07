@@ -241,12 +241,8 @@ mod tests {
 
     #[test]
     fn find_enclosing_kind_returns_innermost_for_nested_matches() {
-        // `impl Foo { impl_item; fn bar(&self) { ... } }` — the inner
-        // function_item lives inside an impl_item. Walking up from the
-        // function's body must find that impl_item, not look further up.
-        // (Rust grammar doesn't actually allow nested impls; we use
-        // function_item instead which can nest via inner closures only.
-        // For nesting, use mod_item which does nest.)
+        // Nested mod_item — mod outer { mod inner { fn x() {} } }.
+        // Walking from function_item must return inner, not outer.
         let src = "mod outer { mod inner { fn x() {} } }";
         let tree = parse(src);
         let func = find_first(tree.root_node(), "function_item").expect("function_item");

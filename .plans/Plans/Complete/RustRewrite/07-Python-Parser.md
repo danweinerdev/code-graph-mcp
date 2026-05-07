@@ -3,9 +3,9 @@ title: "Python Language Parser"
 type: phase
 plan: RustRewrite
 phase: 7
-status: in-progress
+status: complete
 created: 2026-04-28
-updated: 2026-05-05
+updated: 2026-05-07
 deliverable: "codegraph-lang-python crate parsing .py and .pyi files with class/method/decorator handling, both import forms, multi-base inheritance, and the Python-specific call node type; registered in the main binary; testdata/python/ + real-world validation; the four-language MCP is complete and the RustRewrite plan moves to Plans/Complete/"
 tasks:
   - id: "7.1"
@@ -44,7 +44,7 @@ tasks:
     verification: "main.rs registers PythonParser using the shipped Box+context pattern (mirroring the C++/Rust/Go blocks at `main.rs:20-23`); full four-language analyze on a directory containing .cpp + .rs + .go + .py — extends the `testdata/mixed/` fixture (created in 5.6, extended in 6.6) by adding `foo.py` defining `def helper(): pass`; analyze indexes all four; search without language filter returns from all four; with each `language=` filter returns only that language's match; **4-way cross-language collision regression**: `init` exists in C++, Go, and Python (`def init(): ...` at module scope) — assert `search_symbols` returns three entries, and `get_callers` against any one does NOT return the others' callers (verifying the `(Language, name)`-keyed SymbolIndex isolation from Phase 3 at `crates/codegraph-lang/src/lib.rs:116`); wire-format snapshot tests extended with Python responses (cargo insta accept on the new fixtures); README + CLAUDE.md final update — all four languages listed in supported-languages table (C++ `.cpp/.cc/.h/.hpp`, Rust `.rs`, Go `.go`, Python `.py/.pyi`); update `crates/code-graph-mcp/src/main.rs` module-level doc comment to reflect all four languages are now live; Python-specific limitations documented: call resolution especially noisy due to dynamic typing; decorators transparent for definition extraction but @abstractmethod not flagged as a separate kind; type hints not extracted as edges; conditional imports (`if TYPE_CHECKING: import ...`) NOT extracted because tree-sitter sees them as block-level statements inside an `if_statement`, not as top-level `import_statement` nodes"
   - id: "7.8"
     title: "Structural verification + plan close-out"
-    status: planned
+    status: complete
     depends_on: ["7.7"]
     verification: "`make release` (host-target only) succeeds and produces a four-language-capable binary; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including codegraph-lang-python; `cargo test --workspace` green — every Phase 1-7 test passes; `cargo audit` clean; no new `unsafe` (workspace `unsafe_code = \"forbid\"`); no `#[allow(clippy::...)]` suppressions; **plan close-out (in this exact order)**: (1) write Phase 7 debrief to `notes/07-Python-Parser.md` while the plan is still in `Plans/Active/` (so the debrief captures the actual implementation experience, not a retrospective); (2) update plan README `phases[7].status` to `complete` and the README top-level `status` to `complete`; (3) `git mv .plans/Plans/Active/RustRewrite .plans/Plans/Complete/RustRewrite`; (4) commit with subject `[RustRewrite/Phase 7] plan close-out — RustRewrite complete`; the four-language MCP is shipped and the SharedDaemon plan (in `Designs/SharedDaemon/`, status `draft`) is unblocked and ready for `/planner:plan`"
 ---
@@ -126,7 +126,7 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
 ## 7.4: Import extraction
 
 ### Subtasks
-- [ ] `extract_imports`:
+- [x] `extract_imports`:
   - `import foo` → `(import_statement name: (dotted_name))` → To='foo'
   - `import foo.bar` → To='foo.bar'
   - `import foo as f` → To='foo' (alias dropped via the `aliased_import` wrapper — pull from `name:` field)
@@ -135,8 +135,8 @@ This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 a
   - `from . import utils` → To='.utils' (relative imports preserved as written)
   - `from typing import List, Dict` → 1 edge with To='typing' (the module is the dependency, not each imported name)
   - `from __future__ import annotations` → To='__future__' (dunder module name handled correctly)
-- [ ] **Default `resolve_include` no-op test:** for a fixture file `src/app.py` containing `from . import utils`, assert `get_dependencies("src/app.py")` returns the list `[".utils"]` (literal, not resolved against the FileIndex) — confirms the default basename resolver returns None for relative-import paths and the wire format records them verbatim
-- [ ] Tests for every form including the relative form, the from-form-vs-module-path distinction, the dunder __future__ case, and the resolve_include no-op confirmation
+- [x] **Default `resolve_include` no-op test:** for a fixture file `src/app.py` containing `from . import utils`, assert `get_dependencies("src/app.py")` returns the list `[".utils"]` (literal, not resolved against the FileIndex) — confirms the default basename resolver returns None for relative-import paths and the wire format records them verbatim
+- [x] Tests for every form including the relative form, the from-form-vs-module-path distinction, the dunder __future__ case, and the resolve_include no-op confirmation
 
 ### Notes
 The "from-form points at the module, not the imported name" rule comes from the original `Plans/PythonParser/01-Parser-Core.md` task 1.6 notes and is preserved verbatim. An agent searching for "what does this file depend on?" wants modules, not names — and the imported name is already in scope after the import statement.
@@ -208,31 +208,31 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 ## 7.8: Structural verification + plan close-out
 
 ### Subtasks
-- [ ] `make release` (host-target only) succeeds and produces a four-language-capable binary
-- [ ] `cargo fmt --check` clean
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
-- [ ] `cargo test --workspace` green — every Phase 1-7 test passes
-- [ ] `cargo audit` clean (no new advisories)
-- [ ] No new `unsafe` blocks; no `#[allow(clippy::...)]` suppressions
-- [ ] **Plan close-out (in this exact order — debrief MUST be written while the plan is still in `Plans/Active/`):**
+- [x] `make release` (host-target only) succeeds and produces a four-language-capable binary
+- [x] `cargo fmt --check` clean
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` green — every Phase 1-7 test passes
+- [x] `cargo audit` clean (no new advisories)
+- [x] No new `unsafe` blocks; no `#[allow(clippy::...)]` suppressions
+- [x] **Plan close-out (in this exact order — debrief MUST be written while the plan is still in `Plans/Active/`):**
   1. Write Phase 7 debrief to `notes/07-Python-Parser.md` — captures the actual implementation experience, decisions made, deviations, lessons learned, and the SharedDaemon handoff context
   2. Update `Plans/Active/RustRewrite/README.md`:
      - `phases[7].status` → `complete`
      - top-level `status:` → `complete`
   3. `git mv .plans/Plans/Active/RustRewrite .plans/Plans/Complete/RustRewrite`
   4. Commit with subject `[RustRewrite/Phase 7] plan close-out — RustRewrite complete` and a body listing all four newly-supported languages and pointing at SharedDaemon as the next planned work
-- [ ] **The rewrite is complete.** SharedDaemon plan (`Designs/SharedDaemon/`, status `draft`) is unblocked; next step is `/planner:plan` against that design
+- [x] **The rewrite is complete.** SharedDaemon plan (`Designs/SharedDaemon/`, status `draft`) is unblocked; next step is `/planner:plan` against that design
 
 ## Acceptance Criteria
-- [ ] PythonParser implements LanguagePlugin (object-safety + id() test passes)
-- [ ] All extraction patterns working: definitions with decorator transparency AND async methods inside classes, both call patterns (note `call` not `call_expression`), all import forms with module-not-name-dependency rule (incl. `__future__`), multiple/qualified inheritance
-- [ ] `.pyi` stub files indexed identically to `.py` (covered by `stubs.pyi` fixture)
-- [ ] testdata/python passes; real-world Python project (requests@v2.32.3) parses cleanly within recorded baseline
-- [ ] Four-language mixed indexing works
-- [ ] 4-way cross-language collision regression passes (C++/Go/Python `init` stay isolated)
-- [ ] Watch-mode reindex regression passes — exercises both inheritance-edge AND call-edge pruning through `Graph::prune_dangling_edges`
-- [ ] All Phase 1-7 tests pass; lint, format, audit gates clean
-- [ ] Documentation lists all four languages; conditional-imports limitation documented
-- [ ] Phase 7 debrief written
-- [ ] Plan moved from `Plans/Active/` to `Plans/Complete/` via `git mv`; plan README status flipped to `complete`
-- [ ] SharedDaemon plan is unblocked and ready for `/planner:plan`
+- [x] PythonParser implements LanguagePlugin (object-safety + id() test passes)
+- [x] All extraction patterns working: definitions with decorator transparency AND async methods inside classes, both call patterns (note `call` not `call_expression`), all import forms with module-not-name-dependency rule (incl. `__future__`), multiple/qualified inheritance
+- [x] `.pyi` stub files indexed identically to `.py` (covered by `stubs.pyi` fixture)
+- [x] testdata/python passes; real-world Python project (requests@v2.32.3) parses cleanly within recorded baseline
+- [x] Four-language mixed indexing works
+- [x] 3-way cross-language collision regression passes (C++/Go/Python `init` stay isolated; Rust excluded by design)
+- [x] Watch-mode reindex regression passes — exercises both inheritance-edge AND call-edge pruning through `Graph::prune_dangling_edges`
+- [x] All Phase 1-7 tests pass; lint, format, audit gates clean
+- [x] Documentation lists all four languages; conditional-imports limitation documented
+- [x] Phase 7 debrief written
+- [x] Plan moved from `Plans/Active/` to `Plans/Complete/` via `git mv`; plan README status flipped to `complete`
+- [x] SharedDaemon plan is unblocked and ready for `/planner:plan`

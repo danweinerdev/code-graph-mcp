@@ -400,21 +400,22 @@ async fn generate_diagram_for_rust_trait_inheritance() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6.6 / 7.7 — cross-language `init` collision regression (3-way).
+// Phase 6.6 / 7.7 — 3-way collision fixture across the 4-language
+// registry — Rust excluded by design.
 //
 // A function named `init` exists in C++, Go, AND Python; the
 // `(Language, name)`-keyed `SymbolIndex` from Phase 3 must keep them
-// isolated during call resolution across all three languages. Each
-// language's caller resolves to its own-language `init`; nothing leaks
-// across language boundaries. Inline fixture so it stays close to the
-// assertions and doesn't pollute the shared `testdata/mixed/` corpus.
+// isolated during call resolution. Each language's caller resolves to
+// its own-language `init`; nothing leaks across language boundaries.
+// Inline fixture so it stays close to the assertions and doesn't
+// pollute the shared `testdata/mixed/` corpus.
 //
 // Phase 6.6 shipped this as a 2-way (C++ + Go) regression; Phase 7.7
 // widens it to 3-way (C++ + Go + Python) to confirm the SymbolIndex
-// keying scales with the fourth plugin. Rust is intentionally NOT
-// included — Rust's `init` would parse as an ordinary function and
-// would add no new structural pressure (the load-bearing assertion is
-// asymmetric isolation across distinct *languages*, not the pair count).
+// keying scales with the fourth plugin. Rust is excluded by design:
+// Rust's `init` would parse as an ordinary function and would add no
+// new structural pressure (the load-bearing assertion is asymmetric
+// isolation across distinct *languages*, not the pair count).
 // ---------------------------------------------------------------------
 
 /// Synthesize a TempDir with a C++ file, a Go file, AND a Python file,
