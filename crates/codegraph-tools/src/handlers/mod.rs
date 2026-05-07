@@ -63,6 +63,23 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// Shared pagination envelope for list-shaped tool responses.
+///
+/// Field-declaration order — `results`, `total`, `offset`, `limit` — is the
+/// wire-format contract: `serde` serializes derived structs in declaration
+/// order, so reordering these fields is a breaking JSON change. The insta
+/// snapshot harness alphabetizes keys via `parsed_sorted` before recording,
+/// so snapshot files do not preserve declaration order — the struct itself
+/// is the source of truth, not the snapshots. Integer fields stay `u32`
+/// (not `usize`) so JSON output is byte-identical across platforms.
+#[derive(Debug, Serialize)]
+pub struct Page<T: Serialize> {
+    pub results: Vec<T>,
+    pub total: u32,
+    pub offset: u32,
+    pub limit: u32,
+}
+
 /// Convert a [`Symbol`] to a [`SymbolResult`]. In `brief` mode, `column`,
 /// `end_line`, and `signature` are reset to defaults so they drop out of
 /// the JSON output via `skip_serializing_if`. Mirrors Go's `symbolToResult`.

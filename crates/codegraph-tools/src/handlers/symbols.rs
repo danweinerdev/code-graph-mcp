@@ -11,11 +11,10 @@ use std::path::Path;
 use codegraph_graph::{Graph, SearchParams};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
-use serde::Serialize;
 
 use super::{
     kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result, tool_error,
-    tool_success_json, SymbolResult,
+    tool_success_json, Page, SymbolResult,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty,
@@ -52,16 +51,6 @@ pub fn get_file_symbols(
     }
 
     tool_success_json(&results)
-}
-
-/// `search_symbols` response envelope. Field order mirrors Go's anonymous
-/// struct in `handleSearchSymbols`.
-#[derive(Debug, Serialize)]
-struct SearchResponse {
-    results: Vec<SymbolResult>,
-    total: u32,
-    offset: u32,
-    limit: u32,
 }
 
 /// Inputs to [`search_symbols`]. Bundled into a struct so the handler
@@ -135,7 +124,7 @@ pub fn search_symbols(graph: &RwLock<Graph>, input: SearchSymbolsInput<'_>) -> C
         .map(|s| symbol_to_result(s, input.brief))
         .collect();
 
-    let response = SearchResponse {
+    let response = Page::<SymbolResult> {
         results,
         total: sr.total,
         offset: resolved_offset,
