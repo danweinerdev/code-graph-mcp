@@ -67,10 +67,11 @@ async fn analyze_then_query_pipeline() {
 
     // get_file_symbols on engine.cpp returns symbols.
     let engine_cpp = path.join("engine.cpp").to_string_lossy().into_owned();
-    let sr = get_file_symbols(&server.inner.graph, &engine_cpp, false, true);
+    let sr = get_file_symbols(&server.inner.graph, &engine_cpp, false, true, None, None);
     assert!(sr.is_error.is_none() || sr.is_error == Some(false));
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&sr)).unwrap();
-    let arr = parsed.as_array().expect("array of symbols");
+    // Phase 3: response is now a Page<SymbolResult> envelope.
+    let arr = parsed["results"].as_array().expect("results array");
     assert!(!arr.is_empty(), "engine.cpp has at least one symbol");
 
     // Summary returns a non-empty namespace map.

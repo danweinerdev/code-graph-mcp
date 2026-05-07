@@ -227,6 +227,12 @@ pub struct GetFileSymbolsArgs {
     #[schemars(description = "Omit signature, column, end_line for compact output (default true)")]
     #[serde(default)]
     pub brief: Option<bool>,
+    #[schemars(description = "Maximum results to return (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N matches for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -280,6 +286,12 @@ pub struct GetCallersArgs {
     #[schemars(description = "Maximum traversal depth (default 1)")]
     #[serde(default)]
     pub depth: Option<u32>,
+    #[schemars(description = "Maximum callers to return per page (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N callers for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -289,6 +301,12 @@ pub struct GetCalleesArgs {
     #[schemars(description = "Maximum traversal depth (default 1)")]
     #[serde(default)]
     pub depth: Option<u32>,
+    #[schemars(description = "Maximum callees to return per page (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N callees for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -388,7 +406,9 @@ impl CodeGraphServer {
         .await)
     }
 
-    #[tool(description = "List all symbols (functions, classes, etc.) defined in a file")]
+    #[tool(
+        description = "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope. Default limit is 100 (max 1000); pass limit/offset to page through large files."
+    )]
     async fn get_file_symbols(
         &self,
         Parameters(args): Parameters<GetFileSymbolsArgs>,
@@ -401,6 +421,8 @@ impl CodeGraphServer {
             &args.file,
             args.top_level_only.unwrap_or(false),
             args.brief.unwrap_or(true),
+            args.limit,
+            args.offset,
         ))
     }
 
@@ -456,7 +478,9 @@ impl CodeGraphServer {
         ))
     }
 
-    #[tool(description = "Find functions that call the given symbol (upstream call chain)")]
+    #[tool(
+        description = "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit is 100 (max 1000)."
+    )]
     async fn get_callers(
         &self,
         Parameters(args): Parameters<GetCallersArgs>,
@@ -469,10 +493,14 @@ impl CodeGraphServer {
             &args.symbol,
             args.depth,
             handlers::query::Direction::Callers,
+            args.limit,
+            args.offset,
         ))
     }
 
-    #[tool(description = "Find functions called by the given symbol (downstream call chain)")]
+    #[tool(
+        description = "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit is 100 (max 1000)."
+    )]
     async fn get_callees(
         &self,
         Parameters(args): Parameters<GetCalleesArgs>,
@@ -485,6 +513,8 @@ impl CodeGraphServer {
             &args.symbol,
             args.depth,
             handlers::query::Direction::Callees,
+            args.limit,
+            args.offset,
         ))
     }
 
@@ -726,6 +756,8 @@ mod tests {
                 file: "/never.cpp".to_string(),
                 top_level_only: None,
                 brief: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .expect("tool-level errors return Ok(CallToolResult)");
@@ -807,6 +839,8 @@ mod tests {
             .get_callers(Parameters(GetCallersArgs {
                 symbol: "/x.cpp:foo".to_string(),
                 depth: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -820,6 +854,8 @@ mod tests {
             .get_callees(Parameters(GetCalleesArgs {
                 symbol: "/x.cpp:foo".to_string(),
                 depth: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -857,6 +893,8 @@ mod tests {
                 file: "/never.cpp".to_string(),
                 top_level_only: None,
                 brief: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .unwrap();

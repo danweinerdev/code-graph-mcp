@@ -357,6 +357,7 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::{body_text, page_parts};
     use super::*;
     use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
@@ -411,14 +412,6 @@ mod tests {
 
     fn locked(g: Graph) -> RwLock<Graph> {
         RwLock::new(g)
-    }
-
-    fn body_text(r: &CallToolResult) -> String {
-        r.content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.to_string())
-            .unwrap_or_default()
     }
 
     // --- detect_cycles ---
@@ -496,17 +489,6 @@ mod tests {
             edges: vec![call_edge("/x.cpp:foo", "/x.cpp:bar", "/x.cpp")],
         });
         g
-    }
-
-    /// Helper: parse the `Page<SymbolResult>` envelope from a `get_orphans`
-    /// response. Returns `(results_array, total, offset, limit)`.
-    fn page_parts(r: &CallToolResult) -> (Vec<serde_json::Value>, u32, u32, u32) {
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
-        let results = parsed["results"].as_array().cloned().unwrap_or_default();
-        let total = parsed["total"].as_u64().unwrap_or(0) as u32;
-        let offset = parsed["offset"].as_u64().unwrap_or(0) as u32;
-        let limit = parsed["limit"].as_u64().unwrap_or(0) as u32;
-        (results, total, offset, limit)
     }
 
     #[test]

@@ -2,43 +2,48 @@
 source: crates/codegraph-tools/tests/snapshot_responses.rs
 expression: parsed
 ---
-[
-  {
-    "file": "[testdata]/models.py",
-    "id": "[testdata]/models.py:Animal",
-    "kind": "class",
-    "line": 4,
-    "name": "Animal"
-  },
-  {
-    "file": "[testdata]/models.py",
-    "id": "[testdata]/models.py:Animal::__init__",
-    "kind": "method",
-    "line": 5,
-    "name": "__init__",
-    "parent": "Animal"
-  },
-  {
-    "file": "[testdata]/models.py",
-    "id": "[testdata]/models.py:Animal::speak",
-    "kind": "method",
-    "line": 7,
-    "name": "speak",
-    "parent": "Animal"
-  },
-  {
-    "file": "[testdata]/models.py",
-    "id": "[testdata]/models.py:Dog",
-    "kind": "class",
-    "line": 10,
-    "name": "Dog"
-  },
-  {
-    "file": "[testdata]/models.py",
-    "id": "[testdata]/models.py:Dog::speak",
-    "kind": "method",
-    "line": 11,
-    "name": "speak",
-    "parent": "Dog"
-  }
-]
+{
+  "limit": 100,
+  "offset": 0,
+  "results": [
+    {
+      "file": "[testdata]/models.py",
+      "id": "[testdata]/models.py:Animal",
+      "kind": "class",
+      "line": 4,
+      "name": "Animal"
+    },
+    {
+      "file": "[testdata]/models.py",
+      "id": "[testdata]/models.py:Animal::__init__",
+      "kind": "method",
+      "line": 5,
+      "name": "__init__",
+      "parent": "Animal"
+    },
+    {
+      "file": "[testdata]/models.py",
+      "id": "[testdata]/models.py:Animal::speak",
+      "kind": "method",
+      "line": 7,
+      "name": "speak",
+      "parent": "Animal"
+    },
+    {
+      "file": "[testdata]/models.py",
+      "id": "[testdata]/models.py:Dog",
+      "kind": "class",
+      "line": 10,
+      "name": "Dog"
+    },
+    {
+      "file": "[testdata]/models.py",
+      "id": "[testdata]/models.py:Dog::speak",
+      "kind": "method",
+      "line": 11,
+      "name": "speak",
+      "parent": "Dog"
+    }
+  ],
+  "total": 5
+}

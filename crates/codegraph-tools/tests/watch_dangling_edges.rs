@@ -87,13 +87,21 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     let old_fn_id = format!("{}:old_fn", a_path.display());
 
     // Pre-rename sanity: B's caller has A:old_fn as a callee.
-    let r = callers_or_callees(&server.inner.graph, &caller_id, Some(1), Direction::Callees);
+    let r = callers_or_callees(
+        &server.inner.graph,
+        &caller_id,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-rename callees must succeed: {r:?}"
     );
     let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-    let pre_targets: Vec<&str> = body
+    // Phase 3: callees response is now a Page<CallChain> envelope.
+    let pre_targets: Vec<&str> = body["results"]
         .as_array()
         .unwrap()
         .iter()
@@ -117,11 +125,19 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     // Post-rename: B::caller's callees must NOT contain the dangling
     // A:old_fn ID. Acceptable: empty list (inbound re-resolution is out
     // of scope) OR rebound to A:new_fn (no-op forward-compatible).
-    let r = callers_or_callees(&server.inner.graph, &caller_id, Some(1), Direction::Callees);
+    let r = callers_or_callees(
+        &server.inner.graph,
+        &caller_id,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+    );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {
         let parsed: serde_json::Value = serde_json::from_str(&post_text).unwrap();
-        let post_targets: Vec<String> = parsed
+        // Phase 3: callees response is now a Page<CallChain> envelope.
+        let post_targets: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()
             .iter()

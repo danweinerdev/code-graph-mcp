@@ -70,10 +70,12 @@ fn seed_rust_project_with_alpha_beta_caller() -> (TempDir, PathBuf) {
 }
 
 /// Pull symbol names out of a `get_file_symbols` JSON response body.
+/// Phase 3: response is now a `Page<SymbolResult>` envelope with the rows
+/// under `results`.
 fn symbol_names_from(body: &str) -> Vec<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).expect("get_file_symbols body must be JSON");
-    parsed
+    parsed["results"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -119,7 +121,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
 
     // Pre-edit sanity: file symbols list contains all three; caller's
     // callees include beta.
-    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true);
+    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true, None, None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -132,13 +134,21 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         );
     }
 
-    let r = callers_or_callees(&server.inner.graph, &caller_id, Some(1), Direction::Callees);
+    let r = callers_or_callees(
+        &server.inner.graph,
+        &caller_id,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit callees must succeed: {r:?}"
     );
     let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-    let pre_callee_ids: Vec<String> = body
+    // Phase 3: callees response is now a Page<CallChain> envelope.
+    let pre_callee_ids: Vec<String> = body["results"]
         .as_array()
         .unwrap()
         .iter()
@@ -168,7 +178,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
 
     // Post-edit: file symbols must contain alpha + caller + gamma, and
     // must NOT contain beta.
-    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true);
+    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true, None, None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -188,11 +198,19 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // Dangling-edge invariant: caller's callees must NOT include the
     // removed beta ID. Acceptable: empty list (caller now has no body
     // calls) — anything else (notably `beta` returning) is a regression.
-    let r = callers_or_callees(&server.inner.graph, &caller_id, Some(1), Direction::Callees);
+    let r = callers_or_callees(
+        &server.inner.graph,
+        &caller_id,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+    );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {
         let parsed: serde_json::Value = serde_json::from_str(&post_text).unwrap();
-        let post_callee_ids: Vec<String> = parsed
+        // Phase 3: callees response is now a Page<CallChain> envelope.
+        let post_callee_ids: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()
             .iter()

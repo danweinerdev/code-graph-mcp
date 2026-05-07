@@ -138,10 +138,16 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
             for _ in 0..30 {
                 for i in 0..4 {
                     let p = root.join(format!("f{i}.cpp"));
-                    let r =
-                        get_file_symbols(&server.inner.graph, &p.to_string_lossy(), false, true);
+                    let r = get_file_symbols(
+                        &server.inner.graph,
+                        &p.to_string_lossy(),
+                        false,
+                        true,
+                        None,
+                        None,
+                    );
                     // Either:
-                    //  - success: body is a JSON array of symbol results, or
+                    //  - success: body is a Page<SymbolResult> envelope, or
                     //  - error: "no symbols found in file: <path>".
                     // Both are coherent. A panic, deadlock, or invalid
                     // JSON would show up here as a test failure.
@@ -154,7 +160,8 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                     } else {
                         let parsed: serde_json::Value =
                             serde_json::from_str(&body).expect("body is JSON");
-                        assert!(parsed.is_array(), "non-array body: {body}");
+                        // Phase 3: expect Page<SymbolResult> envelope.
+                        assert!(parsed["results"].is_array(), "non-envelope body: {body}");
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(8)).await;
@@ -211,6 +218,8 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         &final_path.to_string_lossy(),
         false,
         true,
+        None,
+        None,
     );
     let body = first_text(&r);
     assert!(
@@ -218,7 +227,8 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         "expected file to be reindexed; got error: {body}"
     );
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    let arr = parsed.as_array().expect("array");
+    // Phase 3: response is now a Page<SymbolResult> envelope.
+    let arr = parsed["results"].as_array().expect("results array");
     let names: Vec<&str> = arr.iter().filter_map(|s| s["name"].as_str()).collect();
     assert_eq!(
         names,
@@ -242,7 +252,14 @@ async fn watch_loop_handles_file_removal_end_to_end() {
 
     let target = root.join("f1.cpp");
     // Sanity: file is in the graph pre-delete.
-    let pre = get_file_symbols(&server.inner.graph, &target.to_string_lossy(), false, true);
+    let pre = get_file_symbols(
+        &server.inner.graph,
+        &target.to_string_lossy(),
+        false,
+        true,
+        None,
+        None,
+    );
     assert!(
         pre.is_error.is_none() || pre.is_error == Some(false),
         "pre-delete: file expected in graph: {pre:?}"
@@ -259,7 +276,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let path_str = target.to_string_lossy().into_owned();
-    let r = get_file_symbols(&server.inner.graph, &path_str, false, true);
+    let r = get_file_symbols(&server.inner.graph, &path_str, false, true, None, None);
     assert_eq!(
         r.is_error,
         Some(true),

@@ -531,10 +531,12 @@ async fn cross_language_init_callers_stay_isolated() {
 
     /// Pull the `symbol_id` field from each entry in a `get_callers`
     /// response. Local helper — not pulled out to module scope because
-    /// only this test consumes the shape.
-    fn caller_ids(arr: &serde_json::Value) -> Vec<String> {
-        arr.as_array()
-            .expect("callers is an array")
+    /// only this test consumes the shape. Phase 3: callers response is now
+    /// a `Page<CallChain>` envelope with the rows under `results`.
+    fn caller_ids(envelope: &serde_json::Value) -> Vec<String> {
+        envelope["results"]
+            .as_array()
+            .expect("results is an array")
             .iter()
             .filter_map(|c| c["symbol_id"].as_str().map(str::to_owned))
             .collect()
@@ -542,8 +544,14 @@ async fn cross_language_init_callers_stay_isolated() {
 
     // C++ init's callers — must include caller_cpp and must NOT include
     // either caller_go or caller_py.
-    let cpp_callers =
-        callers_or_callees(&fx.inner.graph, &cpp_init_id, Some(1), Direction::Callers);
+    let cpp_callers = callers_or_callees(
+        &fx.inner.graph,
+        &cpp_init_id,
+        Some(1),
+        Direction::Callers,
+        None,
+        None,
+    );
     let cpp_arr: serde_json::Value =
         serde_json::from_str(&first_text(&cpp_callers)).expect("get_callers response is JSON");
     let cpp_caller_names = caller_ids(&cpp_arr);
@@ -564,7 +572,14 @@ async fn cross_language_init_callers_stay_isolated() {
 
     // Go init's callers — must include caller_go and must NOT include
     // caller_cpp or caller_py.
-    let go_callers = callers_or_callees(&fx.inner.graph, &go_init_id, Some(1), Direction::Callers);
+    let go_callers = callers_or_callees(
+        &fx.inner.graph,
+        &go_init_id,
+        Some(1),
+        Direction::Callers,
+        None,
+        None,
+    );
     let go_arr: serde_json::Value =
         serde_json::from_str(&first_text(&go_callers)).expect("get_callers response is JSON");
     let go_caller_names = caller_ids(&go_arr);
@@ -591,6 +606,8 @@ async fn cross_language_init_callers_stay_isolated() {
         &python_init_id,
         Some(1),
         Direction::Callers,
+        None,
+        None,
     );
     let python_arr: serde_json::Value =
         serde_json::from_str(&first_text(&python_callers)).expect("get_callers response is JSON");

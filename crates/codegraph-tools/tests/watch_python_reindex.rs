@@ -70,10 +70,12 @@ fn seed_python_project_with_alpha_beta_delta() -> (TempDir, PathBuf) {
 }
 
 /// Pull symbol names out of a `get_file_symbols` JSON response body.
+/// Phase 3: response is now a `Page<SymbolResult>` envelope with the rows
+/// under `results`.
 fn symbol_names_from(body: &str) -> Vec<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).expect("get_file_symbols body must be JSON");
-    parsed
+    parsed["results"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -141,7 +143,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // Pre-edit sanity: file symbols list contains all three classes
     // plus their methods; class_hierarchy on Alpha includes Beta as
     // derived.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true);
+    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -178,6 +180,8 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
+        None,
+        None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -185,9 +189,10 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     );
     let pre_callee_body: serde_json::Value =
         serde_json::from_str(&first_text(&r)).expect("get_callees response is JSON");
-    let pre_callee_ids: Vec<String> = pre_callee_body
+    // Phase 3: callees response is now a Page<CallChain> envelope.
+    let pre_callee_ids: Vec<String> = pre_callee_body["results"]
         .as_array()
-        .expect("callees is an array")
+        .expect("results array")
         .iter()
         .filter_map(|c| c["symbol_id"].as_str().map(String::from))
         .collect();
@@ -221,7 +226,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Post-edit: file symbols must contain Alpha + Gamma (and their m
     // methods), and must NOT contain Beta, Delta, or Delta::use_beta.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true);
+    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -295,6 +300,8 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
+        None,
+        None,
     );
     if r.is_error == Some(true) {
         // Canonical post-fix shape: Delta::use_beta itself was deleted
@@ -310,7 +317,8 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         // Defensive branch — in case the deleted-from symbol survives
         // somehow, we still must not see Beta as a callee.
         let parsed: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-        let post_callee_ids: Vec<String> = parsed
+        // Phase 3: callees response is now a Page<CallChain> envelope.
+        let post_callee_ids: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()
             .iter()

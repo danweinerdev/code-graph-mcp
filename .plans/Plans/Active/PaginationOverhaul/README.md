@@ -21,7 +21,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "List-shaped tools: file_symbols, callers, callees"
-    status: planned
+    status: complete
     doc: "03-List-Shaped-Tools.md"
     depends_on: [1]
   - id: 4

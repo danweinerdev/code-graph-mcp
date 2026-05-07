@@ -192,6 +192,37 @@ pub fn suggest_symbols(graph: &codegraph_graph::Graph, name: &str, limit: usize)
     out
 }
 
+/// Test-only helpers shared across handler submodules. Lifted out of each
+/// submodule's `mod tests` to avoid identical copy-paste in every paginated
+/// handler test file. Submodules opt in via `use super::test_helpers::*`.
+#[cfg(test)]
+pub(super) mod test_helpers {
+    use rmcp::model::CallToolResult;
+
+    /// Extract the text body from a successful (or error) `CallToolResult`.
+    /// Returns the empty string if the result has no text content.
+    pub fn body_text(r: &CallToolResult) -> String {
+        r.content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Parse the shared `Page<T>` envelope into `(results_array, total,
+    /// offset, limit)` for assertion convenience. Used by every paginated
+    /// tool's tests (`get_orphans`, `get_file_symbols`, `get_callers`,
+    /// `get_callees`).
+    pub fn page_parts(r: &CallToolResult) -> (Vec<serde_json::Value>, u32, u32, u32) {
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
+        let results = parsed["results"].as_array().cloned().unwrap_or_default();
+        let total = parsed["total"].as_u64().unwrap_or(0) as u32;
+        let offset = parsed["offset"].as_u64().unwrap_or(0) as u32;
+        let limit = parsed["limit"].as_u64().unwrap_or(0) as u32;
+        (results, total, offset, limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

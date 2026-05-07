@@ -4,13 +4,33 @@ expression: "tool_entry(\"get_callers\")"
 ---
 {
   "name": "get_callers",
-  "description": "Find functions that call the given symbol (upstream call chain)",
+  "description": "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit is 100 (max 1000).",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
       "depth": {
         "default": null,
         "description": "Maximum traversal depth (default 1)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum callers to return per page (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N callers for pagination (default 0)",
         "format": "uint32",
         "minimum": 0,
         "type": [

@@ -192,7 +192,7 @@ async fn response_get_file_symbols_engine_cpp() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -255,8 +255,17 @@ async fn response_get_callers_engine_update() {
         "{}:Engine::update",
         fx.indexed_root.join("engine.cpp").display()
     );
-    let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callers);
-    let parsed = sort_chains_by_symbol_id(parsed_sorted(&r));
+    let r = callers_or_callees(
+        &fx.inner.graph,
+        &id,
+        Some(2),
+        Direction::Callers,
+        None,
+        None,
+    );
+    // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
+    // No further normalization needed; the envelope itself is deterministic.
+    let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
     });
@@ -269,32 +278,27 @@ async fn response_get_callees_engine_update() {
         "{}:Engine::update",
         fx.indexed_root.join("engine.cpp").display()
     );
-    let r = callers_or_callees(&fx.inner.graph, &id, Some(2), Direction::Callees);
-    let parsed = sort_chains_by_symbol_id(parsed_sorted(&r));
+    let r = callers_or_callees(
+        &fx.inner.graph,
+        &id,
+        Some(2),
+        Direction::Callees,
+        None,
+        None,
+    );
+    // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
+    let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
     });
 }
 
-/// Sort a JSON array of `CallChain` objects by their `symbol_id` field.
-/// Defends against future changes to BFS emission order (which depends on
-/// HashMap iteration order in the graph engine). Today the order is stable
-/// because both edges originate from a single-file single-parse merge, but
-/// adding a second file that interleaves edges into the same adjacency
-/// entry would surface non-determinism here.
-fn sort_chains_by_symbol_id(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(mut arr) => {
-            arr.sort_by(|a, b| {
-                let ka = a["symbol_id"].as_str().unwrap_or("");
-                let kb = b["symbol_id"].as_str().unwrap_or("");
-                ka.cmp(kb)
-            });
-            serde_json::Value::Array(arr)
-        }
-        other => other,
-    }
-}
+// (Phase 3) `sort_chains_by_symbol_id` removed: the handler now sorts the
+// `Vec<CallChain>` by `(depth, symbol_id)` ascending and wraps in the
+// `Page<CallChain>` envelope, so test-side normalization is no longer
+// needed. `parsed_sorted` only normalizes object key order, which is the
+// correct behavior for the envelope (it preserves the handler's array
+// ordering rather than re-sorting the rows).
 
 // --- get_dependencies ----------------------------------------------------
 
@@ -452,6 +456,171 @@ async fn build_indexed_fixture_with_many_orphans(n: usize) -> IndexedFixture {
         indexed_root,
         inner: server.inner.clone(),
     }
+}
+
+// --- Phase 3 paginated-offset snapshots ----------------------------------
+//
+// These three snapshots exercise the page-2 path for the new
+// `Page<T>`-wrapped tools: `get_file_symbols`, `get_callers`, `get_callees`.
+// Fixtures are sized so the offset/limit combo selects a non-trivial slice
+// of the post-sort result set.
+
+/// Build an indexed fixture with `n` free functions in a single C++ file,
+/// used by `response_get_file_symbols_paginated_offset` to exercise the
+/// handler's sort+slice path against a known cardinality. Names are
+/// zero-padded so `symbol_id` ascending order is predictable in the
+/// snapshot.
+async fn build_indexed_fixture_with_many_file_symbols(n: usize) -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for many-file-symbols fixture");
+    let mut source = String::new();
+    for i in 0..n {
+        source.push_str(&format!("void func_{i:03}() {{}}\n"));
+    }
+    std::fs::write(dir.path().join("big.cpp"), source).expect("write big.cpp");
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+/// Build an indexed fixture with a single hub symbol `target` that is
+/// called by `n` distinct callers, plus a separate `entry` symbol that
+/// itself calls `n` distinct callees. Used by the callers/callees
+/// paginated-offset snapshots so the sort by `(depth, symbol_id)` produces
+/// a deterministic page-2 slice. The depth=1 fan is wide enough (>50) to
+/// exercise the limit=50 page semantics.
+async fn build_indexed_fixture_with_high_fan() -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for high-fan fixture");
+    let n = 60;
+    let mut source = String::new();
+    // Hub symbols.
+    source.push_str("void target() {}\nvoid entry() {\n");
+    for i in 0..n {
+        source.push_str(&format!("    callee_{i:03}();\n"));
+    }
+    source.push_str("}\n");
+    // n distinct callers, each one calling target. They are zero-padded
+    // so symbol_id ascending order is predictable in the snapshot.
+    for i in 0..n {
+        source.push_str(&format!("void caller_{i:03}() {{ target(); }}\n"));
+    }
+    // n callee declarations the entry hub references. Each is an orphan
+    // free function — entry's body is the only call site.
+    for i in 0..n {
+        source.push_str(&format!("void callee_{i:03}() {{}}\n"));
+    }
+    std::fs::write(dir.path().join("hub.cpp"), source).expect("write hub.cpp");
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
+    }
+}
+
+#[tokio::test]
+async fn response_get_file_symbols_paginated_offset() {
+    // Page-2 snapshot: 110 free functions in a single file (>100 default
+    // page size). Request offset=100 limit=50 — slice taken from the
+    // sorted full match set. Expected: results.len() = 10 (only 10 left
+    // after offset=100 in a 110-row set), total=110, offset=100, limit=50.
+    let fx = build_indexed_fixture_with_many_file_symbols(110).await;
+    let file = fx
+        .indexed_root
+        .join("big.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, Some(50), Some(100));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_callers_paginated_offset() {
+    // Page-2 snapshot: hub symbol with 60 callers. Request
+    // offset=50 limit=50 — slice taken from the sorted (depth, symbol_id)
+    // result set. Expected: results.len() = 10, total=60, offset=50,
+    // limit=50.
+    let fx = build_indexed_fixture_with_high_fan().await;
+    let id = format!("{}:target", fx.indexed_root.join("hub.cpp").display());
+    let r = callers_or_callees(
+        &fx.inner.graph,
+        &id,
+        Some(1),
+        Direction::Callers,
+        Some(50),
+        Some(50),
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_callees_paginated_offset() {
+    // Page-2 snapshot: hub symbol with 60 callees. Request
+    // offset=50 limit=50 — slice taken from the sorted (depth, symbol_id)
+    // result set. Expected: results.len() = 10, total=60, offset=50,
+    // limit=50.
+    let fx = build_indexed_fixture_with_high_fan().await;
+    let id = format!("{}:entry", fx.indexed_root.join("hub.cpp").display());
+    let r = callers_or_callees(
+        &fx.inner.graph,
+        &id,
+        Some(1),
+        Direction::Callees,
+        Some(50),
+        Some(50),
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
 }
 
 // --- get_class_hierarchy -------------------------------------------------
@@ -1038,7 +1207,7 @@ async fn response_get_file_symbols_go_reader() {
         .join("reader.go")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1191,7 +1360,7 @@ async fn response_get_file_symbols_python_models() {
         .join("models.py")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

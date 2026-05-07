@@ -4,7 +4,7 @@ expression: "tool_entry(\"get_file_symbols\")"
 ---
 {
   "name": "get_file_symbols",
-  "description": "List all symbols (functions, classes, etc.) defined in a file",
+  "description": "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope. Default limit is 100 (max 1000); pass limit/offset to page through large files.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
@@ -19,6 +19,26 @@ expression: "tool_entry(\"get_file_symbols\")"
       "file": {
         "description": "Absolute path to the source file",
         "type": "string"
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum results to return (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N matches for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
       },
       "top_level_only": {
         "default": null,

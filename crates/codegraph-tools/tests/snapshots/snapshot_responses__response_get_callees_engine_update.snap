@@ -1,19 +1,23 @@
 ---
 source: crates/codegraph-tools/tests/snapshot_responses.rs
-assertion_line: 308
 expression: parsed
 ---
-[
-  {
-    "depth": 1,
-    "file": "[testdata]/engine.cpp",
-    "line": 9,
-    "symbol_id": "[testdata]/utils.cpp:clamp"
-  },
-  {
-    "depth": 1,
-    "file": "[testdata]/engine.cpp",
-    "line": 7,
-    "symbol_id": "[testdata]/utils.cpp:lerp"
-  }
-]
+{
+  "limit": 100,
+  "offset": 0,
+  "results": [
+    {
+      "depth": 1,
+      "file": "[testdata]/engine.cpp",
+      "line": 9,
+      "symbol_id": "[testdata]/utils.cpp:clamp"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/engine.cpp",
+      "line": 7,
+      "symbol_id": "[testdata]/utils.cpp:lerp"
+    }
+  ],
+  "total": 2
+}

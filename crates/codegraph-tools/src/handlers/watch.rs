@@ -731,9 +731,17 @@ mod tests {
             "lock contention must leave file count unchanged"
         );
         let abs_a_cpp = std::fs::canonicalize(&a_cpp).unwrap();
-        let r = get_file_symbols(&inner.graph, &abs_a_cpp.to_string_lossy(), false, true);
+        let r = get_file_symbols(
+            &inner.graph,
+            &abs_a_cpp.to_string_lossy(),
+            false,
+            true,
+            None,
+            None,
+        );
         let body = body_json(&r);
-        let arr = body.as_array().expect("symbol array");
+        // Phase 3: response is now a Page<SymbolResult> envelope.
+        let arr = body["results"].as_array().expect("results array");
         assert!(
             arr.iter().all(|s| s["name"].as_str() != Some("changed")),
             "lock-contended call must NOT have re-parsed; got {body}"
@@ -809,9 +817,17 @@ mod tests {
             other => panic!("expected Reindexed, got {other:?}"),
         }
 
-        let r = get_file_symbols(&inner.graph, &a_cpp.to_string_lossy(), false, true);
+        let r = get_file_symbols(
+            &inner.graph,
+            &a_cpp.to_string_lossy(),
+            false,
+            true,
+            None,
+            None,
+        );
         let body = body_json(&r);
-        let names: Vec<&str> = body
+        // Phase 3: response is now a Page<SymbolResult> envelope.
+        let names: Vec<&str> = body["results"]
             .as_array()
             .unwrap()
             .iter()
@@ -851,7 +867,7 @@ mod tests {
 
         // get_file_symbols now produces the canonical not-found wording.
         let path_str = a_cpp.to_string_lossy().into_owned();
-        let r = get_file_symbols(&inner.graph, &path_str, false, true);
+        let r = get_file_symbols(&inner.graph, &path_str, false, true, None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             first_text(&r),
