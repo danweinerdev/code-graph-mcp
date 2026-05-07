@@ -34,7 +34,7 @@ tasks:
     verification: "class D(B) → 1 inherits edge from D to B; class D(A, B) → 2 inherits edges (multiple inheritance, common in Python); class D(module.Base) → 1 inherits edge from D to 'module.Base' (qualified base preserved); class C: (no parens) → 0 inherits edges; class C(metaclass=Meta) → metaclass keyword arg ignored (not a base); ABC inheritance (`class C(ABC)`) treated like any other base; tests for each form"
   - id: "7.6"
     title: "testdata/python + corpus tests + real-world dogfood + watch-mode reindex regression"
-    status: planned
+    status: complete
     depends_on: ["7.2", "7.3", "7.4", "7.5"]
     verification: "testdata/python/ project covers: classes with __init__/__str__/__repr__, @property/@staticmethod/@classmethod decorators, single + multiple + qualified inheritance, ABC with @abstractmethod (extracted as ordinary methods), async def methods inside classes, generators (yield), context managers, type hints, all import forms (incl. `from __future__ import annotations`); a `stubs.pyi` file demonstrates `.pyi` stub extraction; MANIFEST.md documents expected symbols and edges with separate counts for the `.pyi` file; corpus tests cover every definition form, every call pattern, every import form, every inheritance form, and edge cases (empty file, comments-only file, syntax error file → parser skips error nodes gracefully, deeply nested classes, method-with-same-name-as-free-function, *args/**kwargs in signature, generator function, property decorator, `.pyi` stub file); parse-test testdata/python matches MANIFEST; **watch-mode reindex regression** (in `crates/codegraph-tools/tests/watch_python_reindex.rs`): start watch on a temp directory containing `models.py` with `class Alpha:`, `class Beta(Alpha):`, and `class Delta: def use_beta(self): Beta()`; modify `models.py`: remove `Beta` and `Delta.use_beta`, add `class Gamma(Alpha):`; after debounce, assert `get_file_symbols` shows `Alpha` + `Gamma`, no `Beta` or `Delta.use_beta`; assert `get_class_hierarchy` for `Alpha` shows `Gamma` as derived (not `Beta`); assert no dangling Inherits edge from `Beta` and no dangling Calls edge from `Delta.use_beta` to `Beta` — both kinds of edges go through `Graph::prune_dangling_edges`; real-world dogfood: clone `github.com/psf/requests` (well-known mid-sized Python library) to `/tmp/requests` at a pinned tag (v2.32.3), run `parse-test /tmp/requests/src/requests`, expect 0 crashes, 0 warnings, approximate symbol count between 400 and 1000 recorded as `testdata/python/requests-baseline.txt` (one line: `symbols: N`); follow-up test asserts the recorded count stays within ±10% as a regression gate"
   - id: "7.7"
@@ -162,7 +162,7 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 ## 7.6: testdata/python + corpus tests + real-world dogfood + watch-mode reindex regression
 
 ### Subtasks
-- [ ] `testdata/python/` package:
+- [x] `testdata/python/` package:
   - `__init__.py` — package init, public exports
   - `app.py` — main module with calls into other modules, includes `from __future__ import annotations`
   - `models.py` — classes with `__init__`/`__str__`/`__repr__`, dataclasses, ABC + @abstractmethod, single and multiple inheritance
@@ -170,15 +170,15 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
   - `utils.py` — free functions, type aliases via `Type = ...`, generators (yield)
   - `stubs.pyi` — representative stub-only declarations: `def foo(x: int) -> str: ...`, a class stub with method stubs, a stubbed protocol with abstract methods (covers the .pyi extension dispatch path)
   - `MANIFEST.md` — expected symbols and edges; explicit row for `stubs.pyi` showing `.pyi` symbols are extracted identically to `.py`
-- [ ] Corpus tests covering every form + edge cases (empty file, comments-only, syntax error file → parser skips error nodes gracefully, deeply nested classes, method same name as free function in another file, *args/**kwargs, async fn, generator, property decorator, `.pyi` stub file)
-- [ ] `parse-test testdata/python` matches MANIFEST
-- [ ] **Watch-mode reindex regression** — new test in `crates/codegraph-tools/tests/watch_python_reindex.rs` (covers BOTH inheritance-edge and call-edge pruning):
+- [x] Corpus tests covering every form + edge cases (empty file, comments-only, syntax error file → parser skips error nodes gracefully, deeply nested classes, method same name as free function in another file, *args/**kwargs, async fn, generator, property decorator, `.pyi` stub file)
+- [x] `parse-test testdata/python` matches MANIFEST
+- [x] **Watch-mode reindex regression** — new test in `crates/codegraph-tools/tests/watch_python_reindex.rs` (covers BOTH inheritance-edge and call-edge pruning):
   - Spawn watch on a temp directory containing `models.py` with `class Alpha:`, `class Beta(Alpha):`, and `class Delta: def use_beta(self): Beta()`
   - Modify `models.py`: remove `Beta` and `Delta.use_beta`, add `class Gamma(Alpha):`
   - After debounce, assert `get_file_symbols` shows `Alpha` + `Gamma`, no `Beta` or `Delta.use_beta`
   - Assert `get_class_hierarchy` for `Alpha` shows `Gamma` as derived (not `Beta`)
   - Assert no dangling `Inherits` edge from `Beta` and no dangling `Calls` edge from `Delta.use_beta` to `Beta` — exercises both edge kinds through `Graph::prune_dangling_edges`
-- [ ] **Real-world dogfood:** clone `github.com/psf/requests` (well-known mid-sized Python library) to `/tmp/requests` at a pinned tag (v2.32.3), run `parse-test /tmp/requests/src/requests`, expect 0 crashes, 0 warnings, approximate symbol count between 400 and 1000 — record the actual count in `testdata/python/requests-baseline.txt` (one line: `symbols: N`); follow-up test asserts the recorded count stays within ±10% as a regression gate
+- [x] **Real-world dogfood:** clone `github.com/psf/requests` (well-known mid-sized Python library) to `/tmp/requests` at a pinned tag (v2.32.3), run `parse-test /tmp/requests/src/requests`, expect 0 crashes, 0 warnings, approximate symbol count between 400 and 1000 — record the actual count in `testdata/python/requests-baseline.txt` (one line: `symbols: N`); follow-up test asserts the recorded count stays within ±10% as a regression gate
 
 ## 7.7: Register parser, four-language integration, snapshots, documentation
 

@@ -242,6 +242,7 @@ dependencies = [
  "codegraph-lang",
  "codegraph-lang-cpp",
  "codegraph-lang-go",
+ "codegraph-lang-python",
  "codegraph-lang-rust",
  "codegraph-tools",
 ]
@@ -256,6 +257,7 @@ dependencies = [
  "codegraph-lang",
  "codegraph-lang-cpp",
  "codegraph-lang-go",
+ "codegraph-lang-python",
  "codegraph-lang-rust",
  "crossbeam-channel",
  "ignore",

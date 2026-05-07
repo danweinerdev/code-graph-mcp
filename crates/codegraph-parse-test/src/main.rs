@@ -21,6 +21,7 @@ use codegraph_core::{DiscoveryConfig, Edge, EdgeKind, Symbol, SymbolKind};
 use codegraph_lang::LanguageRegistry;
 use codegraph_lang_cpp::CppParser;
 use codegraph_lang_go::GoParser;
+use codegraph_lang_python::PythonParser;
 use codegraph_lang_rust::RustParser;
 use codegraph_tools::discovery::discover;
 
@@ -77,6 +78,20 @@ fn main() -> ExitCode {
     };
     if let Err(e) = registry.register(Box::new(go_parser)) {
         eprintln!("Error registering Go parser: {e}");
+        return ExitCode::from(1);
+    }
+    // Phase 7.6: register the Python parser so `parse-test testdata/python`
+    // and the requests dogfood pass against /tmp/requests extract symbols
+    // from `.py` and `.pyi` files. Mirrors the C++/Rust/Go blocks above.
+    let python_parser = match PythonParser::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error initializing Python parser: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry.register(Box::new(python_parser)) {
+        eprintln!("Error registering Python parser: {e}");
         return ExitCode::from(1);
     }
 

@@ -1612,6 +1612,7 @@ import a, b
         for e in &edges {
             assert_eq!(e.from, "D", "all bases share the same derived name");
             assert_eq!(e.kind, EdgeKind::Inherits);
+            assert_eq!(e.line, 1, "line anchored at the class_definition");
         }
     }
 
@@ -1762,89 +1763,9 @@ import a, b
 
     // ---- Spec-named coverage (Task 7.5 verification) ----------------
     //
-    // The tests below mirror the names listed in the Task 7.5 spec so a
-    // grep against the spec finds the exact assertion. The behavioral
-    // coverage overlaps with the more granular tests above; these are
-    // kept as the canonical "spec passes" entry points.
-
-    #[test]
-    fn class_with_multiple_bases_produces_one_edge_per_base() {
-        // Spec example: `class D(A, B, C): pass` → 3 Inherits edges, one
-        // per base. Multi-inheritance support is the load-bearing case
-        // for Python (mixins, ABC + concrete base, etc.).
-        let fg = parse("class D(A, B, C):\n    pass\n");
-        let edges = inherits(&fg);
-        assert_eq!(edges.len(), 3, "got: {:?}", fg.edges);
-        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
-        for expected in ["A", "B", "C"] {
-            assert!(
-                tos.contains(&expected),
-                "expected To={expected:?} in {tos:?}"
-            );
-        }
-        for e in &edges {
-            assert_eq!(e.from, "D");
-            assert_eq!(e.kind, EdgeKind::Inherits);
-        }
-    }
-
-    #[test]
-    fn class_with_qualified_base_preserves_dotted_path() {
-        // `class D(module.Base): pass` → `to = "module.Base"` (dotted
-        // text verbatim — no resolution against any module map).
-        let fg = parse("class D(module.Base):\n    pass\n");
-        let edges = inherits(&fg);
-        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
-        assert_eq!(edges[0].from, "D");
-        assert_eq!(edges[0].to, "module.Base");
-    }
-
-    #[test]
-    fn class_without_parens_produces_zero_inherits_edges() {
-        // `class C: pass` — no `superclasses` field, zero matches.
-        let fg = parse("class C:\n    pass\n");
-        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
-    }
-
-    #[test]
-    fn class_with_no_bases_just_parens_produces_zero_inherits_edges() {
-        // Defensive: `class C(): pass` — empty argument_list, zero edges.
-        let fg = parse("class C():\n    pass\n");
-        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
-    }
-
-    #[test]
-    fn metaclass_keyword_argument_is_not_a_base() {
-        // `class C(metaclass=Meta): pass` — metaclass kwarg is filtered.
-        let fg = parse("class C(metaclass=Meta):\n    pass\n");
-        assert!(inherits(&fg).is_empty(), "got: {:?}", fg.edges);
-    }
-
-    #[test]
-    fn mixed_bases_and_metaclass() {
-        // `class C(Base, metaclass=Meta): pass` → 1 edge to Base; the
-        // metaclass kwarg is filtered out by the query patterns (which
-        // never match `keyword_argument` children).
-        let fg = parse("class C(Base, metaclass=Meta):\n    pass\n");
-        let edges = inherits(&fg);
-        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
-        assert_eq!(edges[0].from, "C");
-        assert_eq!(edges[0].to, "Base");
-    }
-
-    #[test]
-    fn abc_inheritance_is_treated_like_any_other_base() {
-        // `from abc import ABC; class C(ABC): pass` — ABC has no special
-        // handling; it parses as a plain identifier base. The
-        // `from abc import ABC` line additionally produces one Includes
-        // edge to `abc`; the assertion isolates the inheritance edges.
-        let src = "from abc import ABC\nclass C(ABC):\n    pass\n";
-        let fg = parse(src);
-        let edges = inherits(&fg);
-        assert_eq!(edges.len(), 1, "got: {:?}", fg.edges);
-        assert_eq!(edges[0].from, "C");
-        assert_eq!(edges[0].to, "ABC");
-    }
+    // The tests below pin contract shapes that the granular tests above
+    // do not cover: nested-class `from`-field shape and the bare-name
+    // contract for `Inherits.from` (vs the path-prefixed `Calls.from`).
 
     #[test]
     fn nested_class_inheritance_uses_qualified_parent_id() {
