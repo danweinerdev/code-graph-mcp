@@ -7,41 +7,51 @@ expression: parsed
   "offset": 0,
   "results": [
     {
+      "end_line": 22,
       "file": "[testdata]/engine.cpp",
       "id": "[testdata]/engine.cpp:DebugEngine::dumpState",
       "kind": "method",
       "line": 20,
       "name": "dumpState",
-      "parent": "DebugEngine"
+      "parent": "DebugEngine",
+      "signature": "void DebugEngine::dumpState()"
     },
     {
+      "end_line": 4,
       "file": "[testdata]/engine.cpp",
       "id": "[testdata]/engine.cpp:Engine::Engine",
       "kind": "method",
       "line": 4,
       "name": "Engine",
-      "parent": "Engine"
+      "parent": "Engine",
+      "signature": "Engine::Engine() : position_"
     },
     {
+      "end_line": 18,
       "file": "[testdata]/main.cpp",
       "id": "[testdata]/main.cpp:main",
       "kind": "function",
       "line": 9,
-      "name": "main"
+      "name": "main",
+      "signature": "int main()"
     },
     {
+      "end_line": 9,
       "file": "[testdata]/orphan.cpp",
       "id": "[testdata]/orphan.cpp:alsoOrphaned",
       "kind": "function",
       "line": 7,
-      "name": "alsoOrphaned"
+      "name": "alsoOrphaned",
+      "signature": "int alsoOrphaned(int x)"
     },
     {
+      "end_line": 5,
       "file": "[testdata]/orphan.cpp",
       "id": "[testdata]/orphan.cpp:neverCalled",
       "kind": "function",
       "line": 3,
-      "name": "neverCalled"
+      "name": "neverCalled",
+      "signature": "void neverCalled()"
     }
   ],
   "total": 5

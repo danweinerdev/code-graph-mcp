@@ -16,7 +16,7 @@ phases:
     doc: "01-Shared-Envelope.md"
   - id: 2
     title: "get_orphans P0 fix"
-    status: planned
+    status: complete
     doc: "02-Get-Orphans-P0-Fix.md"
     depends_on: [1]
   - id: 3

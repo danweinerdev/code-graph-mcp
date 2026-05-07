@@ -10,13 +10,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use codegraph_core::SymbolKind;
+use codegraph_core::{symbol_id, SymbolKind};
 use codegraph_graph::{DiagramEdge, Graph};
 use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, Content};
 
 use super::{
-    parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json, SymbolResult,
+    parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json, Page,
+    SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -50,10 +51,23 @@ pub fn detect_cycles(graph: &RwLock<Graph>) -> CallToolResult {
 /// Unknown kind strings return `"invalid kind: <kind>"` in line with
 /// `search_symbols`.
 ///
-/// Output is a JSON array of brief-mode [`SymbolResult`] entries —
-/// matches the Go binary's behavior of always passing `brief=true` to
-/// `symbolToResult` for orphan output.
-pub fn get_orphans(graph: &RwLock<Graph>, kind: Option<&str>) -> CallToolResult {
+/// Output is the shared [`Page`]`<`[`SymbolResult`]`>` envelope — the full
+/// match set is collected from `Graph::orphans`, sorted by `symbol_id`
+/// ascending for stable pagination across calls, then sliced by the
+/// resolved offset/limit. `total` reports the pre-pagination match count
+/// so clients can render "page X of Y" UIs.
+///
+/// Defaults: `limit = 20`, `offset = 0`, `brief = true`. `limit = 0`
+/// means "use the default" (mirrors `search_symbols`); `limit` is
+/// silently clamped at 1000. `offset >= total` returns an empty `results`
+/// page with the correct `total`.
+pub fn get_orphans(
+    graph: &RwLock<Graph>,
+    kind: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    brief: Option<bool>,
+) -> CallToolResult {
     let parsed_kind: Option<SymbolKind> =
         match kind.and_then(|s| if s.is_empty() { None } else { Some(s) }) {
             None => None,
@@ -63,9 +77,37 @@ pub fn get_orphans(graph: &RwLock<Graph>, kind: Option<&str>) -> CallToolResult 
             },
         };
 
-    let orphans = graph.read().orphans(parsed_kind);
-    let results: Vec<SymbolResult> = orphans.iter().map(|s| symbol_to_result(s, true)).collect();
-    tool_success_json(&results)
+    // Resolve defaults: zero-or-missing limit -> 20; clamp at 1000.
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+    let resolved_brief = brief.unwrap_or(true);
+
+    let mut matches = graph.read().orphans(parsed_kind);
+    let total = matches.len() as u32;
+
+    // Sort by symbol_id ascending so page 1 + page 2 partition the result
+    // deterministically across calls. Graph::orphans walks a HashMap and
+    // returns symbols in non-deterministic order; symbol_id is unique by
+    // construction, so this canonicalizes the sequence without needing
+    // tie-break rules.
+    matches.sort_by_key(symbol_id);
+
+    // Bounds-safe slice: skip+take never panics on out-of-range offsets,
+    // unlike direct indexing.
+    let results: Vec<SymbolResult> = matches
+        .iter()
+        .skip(resolved_offset as usize)
+        .take(resolved_limit as usize)
+        .map(|s| symbol_to_result(s, resolved_brief))
+        .collect();
+
+    let response = Page::<SymbolResult> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+    };
+    tool_success_json(&response)
 }
 
 // ----- get_class_hierarchy -----
@@ -456,12 +498,22 @@ mod tests {
         g
     }
 
+    /// Helper: parse the `Page<SymbolResult>` envelope from a `get_orphans`
+    /// response. Returns `(results_array, total, offset, limit)`.
+    fn page_parts(r: &CallToolResult) -> (Vec<serde_json::Value>, u32, u32, u32) {
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
+        let results = parsed["results"].as_array().cloned().unwrap_or_default();
+        let total = parsed["total"].as_u64().unwrap_or(0) as u32;
+        let offset = parsed["offset"].as_u64().unwrap_or(0) as u32;
+        let limit = parsed["limit"].as_u64().unwrap_or(0) as u32;
+        (results, total, offset, limit)
+    }
+
     #[test]
     fn orphans_default_returns_callables() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None);
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
+        let r = get_orphans(&g, None, None, None, None);
+        let (arr, total, offset, limit) = page_parts(&r);
         // foo and baz have no callers; bar is called by foo. cls is a Class
         // and is excluded by the default callable-only filter.
         let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
@@ -470,32 +522,39 @@ mod tests {
         assert!(names.contains(&"baz"));
         assert!(!names.contains(&"bar"));
         assert!(!names.contains(&"cls"));
+        assert_eq!(total, 2);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 20);
     }
 
     #[test]
     fn orphans_kind_class_returns_only_classes() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some("class"));
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
+        let r = get_orphans(&g, Some("class"), None, None, None);
+        let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], serde_json::json!("cls"));
         assert_eq!(arr[0]["kind"], serde_json::json!("class"));
+        assert_eq!(total, 1);
     }
 
     #[test]
     fn orphans_invalid_kind_errors() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, Some("widget"));
+        let r = get_orphans(&g, Some("widget"), None, None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
     }
 
     #[test]
-    fn orphans_empty_graph_returns_empty_array() {
+    fn orphans_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, None);
-        assert_eq!(body_text(&r), "[]");
+        let r = get_orphans(&g, None, None, None, None);
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 20);
     }
 
     #[test]
@@ -504,25 +563,181 @@ mod tests {
         // kind — Go's `req.GetArguments()["kind"].(string)` ignores empty
         // strings via the `&& k != ""` check.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some(""));
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
+        let r = get_orphans(&g, Some(""), None, None, None);
+        let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2, "empty kind => default callables-only");
     }
 
     #[test]
     fn orphans_brief_mode_omits_signature() {
-        // Output is always brief — assert signature is dropped from the
-        // serialized form even though our test fixture has a non-empty
+        // Output is brief by default — assert signature is dropped from
+        // the serialized form even though our test fixture has a non-empty
         // signature on each symbol.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None);
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
+        let r = get_orphans(&g, None, None, None, None);
+        let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
                 entry.get("signature").is_none(),
                 "brief output must omit signature: {entry:?}",
+            );
+        }
+    }
+
+    // --- Phase 2 pagination invariants ------------------------------------
+
+    /// Build a graph with exactly `n` orphan functions named `func_000`,
+    /// `func_001`, ..., zero-padded to 3 digits so the natural sort order
+    /// (`symbol_id` ascending) is predictable for assertions. All symbols
+    /// live in `/big.cpp` so the symbol_id format is `[/big.cpp:func_000`,
+    /// `/big.cpp:func_001`, ...]`.
+    fn graph_with_n_orphan_functions(n: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(n);
+        for i in 0..n {
+            symbols.push(sym(
+                &format!("func_{i:03}"),
+                SymbolKind::Function,
+                "/big.cpp",
+            ));
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/big.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges: vec![],
+        });
+        g
+    }
+
+    #[test]
+    fn orphans_default_limit_is_20() {
+        // 25 orphans: default limit (20) returns the first 20; total = 25.
+        let g = locked(graph_with_n_orphan_functions(25));
+        let r = get_orphans(&g, None, None, None, None);
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert_eq!(arr.len(), 20);
+        assert_eq!(total, 25);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn orphans_page_1_and_page_2_cover_full_set() {
+        // 30 orphans: page 1 (offset=0, limit=20) ∪ page 2 (offset=20, limit=20)
+        // covers all 30 with no overlap.
+        let g = locked(graph_with_n_orphan_functions(30));
+
+        let p1 = get_orphans(&g, None, Some(20), Some(0), None);
+        let (a1, t1, _, _) = page_parts(&p1);
+        let p2 = get_orphans(&g, None, Some(20), Some(20), None);
+        let (a2, t2, _, _) = page_parts(&p2);
+
+        assert_eq!(a1.len(), 20);
+        assert_eq!(a2.len(), 10);
+        assert_eq!(t1, 30);
+        assert_eq!(t2, 30);
+
+        // Union covers all 30, no duplicates.
+        let mut ids: Vec<String> = a1
+            .iter()
+            .chain(a2.iter())
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 30, "page1 ∪ page2 must cover all 30 with no dup");
+    }
+
+    #[test]
+    fn orphans_total_is_pre_pagination_count() {
+        // Same fixture, three different pages — total is identical across all.
+        let g = locked(graph_with_n_orphan_functions(30));
+        let r1 = get_orphans(&g, None, Some(20), Some(0), None);
+        let r2 = get_orphans(&g, None, Some(20), Some(20), None);
+        let r3 = get_orphans(&g, None, Some(5), Some(10), None);
+        let (_, t1, _, _) = page_parts(&r1);
+        let (_, t2, _, _) = page_parts(&r2);
+        let (_, t3, _, _) = page_parts(&r3);
+        assert_eq!(t1, 30);
+        assert_eq!(t2, 30);
+        assert_eq!(t3, 30);
+    }
+
+    #[test]
+    fn orphans_limit_clamps_at_1000() {
+        // limit = 999_999 silently clamps to 1000; the response echoes the
+        // clamped value so the agent sees what was actually used. The
+        // 5-item fixture also verifies all 5 results return — confirming
+        // take(1000) doesn't accidentally drop entries on a small set.
+        let g = locked(graph_with_n_orphan_functions(5));
+        let r = get_orphans(&g, None, Some(999_999), None, None);
+        let (arr, _, _, limit) = page_parts(&r);
+        assert_eq!(limit, 1000);
+        assert_eq!(arr.len(), 5);
+    }
+
+    #[test]
+    fn orphans_zero_limit_uses_default() {
+        // limit = 0 is treated as "unset"; resolves to default 20.
+        let g = locked(graph_with_n_orphan_functions(5));
+        let r = get_orphans(&g, None, Some(0), None, None);
+        let (_, _, _, limit) = page_parts(&r);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn orphans_offset_beyond_total_returns_empty() {
+        // offset >= total returns empty results with the correct total.
+        let g = locked(graph_with_orphans());
+        let r = get_orphans(&g, None, None, Some(999), None);
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 2);
+        assert_eq!(offset, 999);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn orphans_kind_filter_combined_with_pagination() {
+        // Mixed-kind fixture: 12 class orphans + 5 function orphans. With
+        // kind="class" and limit=10, we get 10 class entries (all "class"
+        // kind) and total=12.
+        let mut g = Graph::new();
+        let mut symbols: Vec<Symbol> = Vec::new();
+        for i in 0..12 {
+            symbols.push(sym(&format!("Class_{i:03}"), SymbolKind::Class, "/m.cpp"));
+        }
+        for i in 0..5 {
+            symbols.push(sym(&format!("func_{i:03}"), SymbolKind::Function, "/m.cpp"));
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/m.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges: vec![],
+        });
+        let g = locked(g);
+        let r = get_orphans(&g, Some("class"), Some(10), None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 10);
+        assert_eq!(total, 12);
+        for entry in &arr {
+            assert_eq!(entry["kind"], serde_json::json!("class"));
+        }
+    }
+
+    #[test]
+    fn orphans_brief_false_includes_signature() {
+        // brief=false surfaces signature/column/end_line on each row.
+        let g = locked(graph_with_orphans());
+        let r = get_orphans(&g, None, None, None, Some(false));
+        let (arr, _, _, _) = page_parts(&r);
+        assert!(!arr.is_empty());
+        for entry in &arr {
+            assert!(
+                entry.get("signature").is_some(),
+                "brief=false must include signature: {entry:?}",
             );
         }
     }

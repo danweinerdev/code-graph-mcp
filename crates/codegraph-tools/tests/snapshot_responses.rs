@@ -21,9 +21,10 @@
 //! in the handler) keeps the JSON wire format unchanged for clients that
 //! don't depend on key order while letting the snapshots stay stable.
 //!
-//! Vec-of-Symbol responses are sorted by the graph layer; Vec-of-orphans
-//! and BFS edge collections are not, so they are sorted in the test via
-//! [`sort_array_by_id`] / [`sort_diagram_edges`] / [`sort_mermaid_lines`].
+//! Vec-of-Symbol responses are sorted by the graph layer; orphans are
+//! now sorted by `symbol_id` ascending in the handler itself (Phase 2);
+//! BFS edge collections are not, so they are sorted in the test via
+//! [`sort_diagram_edges`] / [`sort_mermaid_lines`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -364,33 +365,92 @@ async fn response_detect_cycles() {
 #[tokio::test]
 async fn response_get_orphans_default_callables() {
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None);
-    // `Graph::orphans` walks the symbol map (HashMap) in iteration order,
-    // so the resulting Vec ordering varies across runs. Sort by `id` for
-    // stable snapshot output. (Within-array ordering is not part of the
-    // wire contract — clients are expected to sort or hash to compare.)
-    let body = first_text(&r);
-    let parsed: serde_json::Value = serde_json::from_str(&body).expect("orphans response is JSON");
-    let normalized = sort_array_by_id(parsed);
+    let r = get_orphans(&fx.inner.graph, None, None, None, None);
+    // The handler now sorts by `symbol_id` ascending and wraps in the
+    // `Page<SymbolResult>` envelope. The envelope itself is deterministic;
+    // `parsed_sorted` only normalizes object key order (not array order).
+    let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
-        insta::assert_json_snapshot!(normalized);
+        insta::assert_json_snapshot!(parsed);
     });
 }
 
-/// Sort a JSON array of objects by their `id` field (string compare).
-/// Used to stabilize orphans / search-results output where the underlying
-/// graph traversal walks a HashMap.
-fn sort_array_by_id(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(mut arr) => {
-            arr.sort_by(|a, b| {
-                let ka = a["id"].as_str().unwrap_or("");
-                let kb = b["id"].as_str().unwrap_or("");
-                ka.cmp(kb)
-            });
-            serde_json::Value::Array(arr.into_iter().map(sort_json).collect())
-        }
-        other => sort_json(other),
+#[tokio::test]
+async fn response_get_orphans_paginated_offset() {
+    // Page-2 snapshot: build a synthetic 25-orphan fixture, request
+    // offset=20 limit=20, snapshot the response. Confirms the slice is
+    // taken from the *sorted* full match set, not the BFS-visit order.
+    let fx = build_indexed_fixture_with_many_orphans(25).await;
+    let r = get_orphans(&fx.inner.graph, Some("function"), Some(20), Some(20), None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_orphans_brief_false() {
+    // brief=false surfaces signature/column/end_line on each row. Reuse
+    // the small testdata/cpp fixture so the snapshot stays readable.
+    let fx = build_indexed_fixture().await;
+    let r = get_orphans(&fx.inner.graph, None, None, None, Some(false));
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_orphans_offset_beyond_total() {
+    // offset=999 against a small fixture: results=[], total=<full count>.
+    let fx = build_indexed_fixture().await;
+    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+/// Build an indexed fixture from a single synthesized C++ file containing
+/// `n` orphan functions named `func_NNN`. Used by the paginated-offset
+/// snapshot to exercise the handler's sort+slice path against a known
+/// cardinality.
+async fn build_indexed_fixture_with_many_orphans(n: usize) -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for many-orphans fixture");
+    let mut source = String::new();
+    for i in 0..n {
+        // Each function is a free, parameterless, void-returning function
+        // with no body content — all become orphans because nothing calls
+        // them. Zero-padded to 3 digits so symbol_id ascending sort order
+        // is predictable in the snapshot.
+        source.push_str(&format!("void func_{i:03}() {{}}\n"));
+    }
+    std::fs::write(dir.path().join("orphans.cpp"), source).expect("write orphans.cpp");
+    let indexed_root =
+        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(CppParser::new().expect("CppParser::new")))
+        .expect("register CppParser");
+    let server = CodeGraphServer::new(registry);
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "analyze_codebase failed: {r:?}",
+    );
+    IndexedFixture {
+        _dir: dir,
+        indexed_root,
+        inner: server.inner.clone(),
     }
 }
 

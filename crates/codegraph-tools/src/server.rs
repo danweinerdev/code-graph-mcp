@@ -302,6 +302,15 @@ pub struct GetOrphansArgs {
     #[schemars(description = "Filter by symbol kind: function, method (default: all callables)")]
     #[serde(default)]
     pub kind: Option<String>,
+    #[schemars(description = "Maximum results to return (default 20, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N matches for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[schemars(description = "Omit signature, column, end_line (default true)")]
+    #[serde(default)]
+    pub brief: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -506,7 +515,9 @@ impl CodeGraphServer {
         Ok(handlers::structure::detect_cycles(&self.inner.graph))
     }
 
-    #[tool(description = "Find symbols with no incoming call edges (uncalled functions/methods)")]
+    #[tool(
+        description = "Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the {results, total, offset, limit} envelope. Default brief mode omits signatures for token efficiency."
+    )]
     async fn get_orphans(
         &self,
         Parameters(args): Parameters<GetOrphansArgs>,
@@ -517,6 +528,9 @@ impl CodeGraphServer {
         Ok(handlers::structure::get_orphans(
             &self.inner.graph,
             args.kind.as_deref(),
+            args.limit,
+            args.offset,
+            args.brief,
         ))
     }
 
@@ -906,7 +920,12 @@ mod tests {
     async fn get_orphans_requires_indexed_before_running() {
         let server = empty_server();
         let r = server
-            .get_orphans(Parameters(GetOrphansArgs { kind: None }))
+            .get_orphans(Parameters(GetOrphansArgs {
+                kind: None,
+                limit: None,
+                offset: None,
+                brief: None,
+            }))
             .await
             .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));

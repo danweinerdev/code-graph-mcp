@@ -106,7 +106,7 @@ pub fn search_symbols(graph: &RwLock<Graph>, input: SearchSymbolsInput<'_>) -> C
         }
     };
 
-    let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20);
+    let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
 
     let sr = graph.read().search(SearchParams {

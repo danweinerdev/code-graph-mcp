@@ -4,15 +4,43 @@ expression: "tool_entry(\"get_orphans\")"
 ---
 {
   "name": "get_orphans",
-  "description": "Find symbols with no incoming call edges (uncalled functions/methods)",
+  "description": "Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the {results, total, offset, limit} envelope. Default brief mode omits signatures for token efficiency.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
+      "brief": {
+        "default": null,
+        "description": "Omit signature, column, end_line (default true)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "kind": {
         "default": null,
         "description": "Filter by symbol kind: function, method (default: all callables)",
         "type": [
           "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum results to return (default 20, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N matches for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
           "null"
         ]
       }
