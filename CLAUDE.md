@@ -140,11 +140,21 @@ Tree-shaped `get_class_hierarchy` returns `{ hierarchy: HierarchyNode, truncated
 
 - All tool handlers return `Result<CallToolResult, McpError>`; user-visible errors travel as `CallToolResult` with the error flag set, not `Err`
 - State guards check indexed state via `ServerInner::require_indexed()` before executing query handlers
-- `LanguagePlugin` trait: `extensions()`, `parse_file(path, content)`, `resolve_edges(symbols, file_graph, registry)`
+- `LanguagePlugin` trait: `extensions()`, `parse_file(path, content)`, `preprocess(content, cfg)`, `resolve_edges(symbols, file_graph, registry)` — `preprocess` is a default-impl hook for byte-level transformations (e.g. C++ `[cpp].macro_strip`); plugins inherit `Cow::Borrowed(content)` unless they need to rewrite
 - All stored file paths are absolute
 - Symbol ID format: `file:name` for free functions, `file:Parent::name` for methods
 - `SymbolKind` and `EdgeKind` derive `Serialize`/`Deserialize` and serialize as readable JSON strings (e.g. `"function"`, `"calls"`)
 - Snapshot tests for tool wire format use `insta` (snapshots in `crates/codegraph-tools/tests/snapshots/`)
+
+### Test conventions
+
+- **Shared test helpers live in `super::test_helpers::*`.** When adding a paginated handler test module, `use super::test_helpers::{body_text, page_parts}` rather than defining local copies. The `test_helpers` module is `pub(super)` under `crates/codegraph-tools/src/handlers/mod.rs` and is the canonical home for assertion utilities every paginated tool's tests need. Re-creating these locally is a duplication the codebase already cleaned up once.
+- **Diagnostic sentinels before discriminator assertions in timing-dependent tests.** When a test depends on async timing or file IO (watch-mode reindex tests are the canonical case), assert a low-stakes baseline first ("a no-macro class extracts") before asserting the discriminator ("a macro-prefixed class extracts"). The baseline assertion's failure message names the most likely root cause (timing, IO, file-write race) so the failure mode is self-diagnosing. The pattern in `tests/watch_cpp_macro_strip.rs` (`UObject` sentinel before `AActor` check) is the example.
+- **Test fixtures with names matching the project's `.gitignore` rules need `git add -f`.** `.code-graph.toml` is gitignored because it's a per-user-root config users shouldn't commit, but test fixtures sometimes need that exact filename for `RootConfig::load` to find them (e.g. `testdata/ue/.code-graph.toml`). When adding such a fixture, `git add -f <path>` is required, and `git status` must show the file as staged before commit. The `cargo test` command does NOT catch a silently-excluded fixture — the test runs against the local-filesystem copy and passes locally; only a fresh-checkout CI run reveals the missing file. If you're unsure whether a test fixture is in this trap, run `git check-ignore <path>` — a hit means you need `-f`.
+
+### Implementer conventions
+
+- **Verify a workspace dependency exists before adopting it.** When a task instruction names a dep (e.g. "use `tracing::warn!`"), check `Cargo.toml` first. If the dep isn't present, that's a signal: the instruction may be derived from a convention assumption that doesn't apply to this workspace. Flag the deviation in your report and ask for confirmation rather than silently adding the dep (which is scope expansion) or shipping broken code (which doesn't compile). The workspace's deliberate "no `tracing` dep" convention (per `crates/codegraph-tools/src/handlers/watch.rs`) is the canonical example: `eprintln!` is the established channel for out-of-handler warnings.
 
 ## C++ Parser Limitations
 
