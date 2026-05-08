@@ -36,6 +36,15 @@ pub fn testdata_rust_path() -> PathBuf {
     testdata_subdir("rust")
 }
 
+/// Resolve the source `testdata/ue` directory (CppMacroStrip Phase 3.1
+/// fixture: a hand-crafted UE-style header with API-export macros plus a
+/// `.code-graph.toml` declaring the matching `[cpp].macro_strip`).
+/// Canonicalizes for the same reason as `testdata_cpp_path`.
+#[allow(dead_code)]
+pub fn testdata_ue_path() -> PathBuf {
+    testdata_subdir("ue")
+}
+
 /// Shared workhorse for the per-language `testdata_*_path` helpers.
 fn testdata_subdir(name: &str) -> PathBuf {
     let raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

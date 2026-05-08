@@ -1,0 +1,2 @@
+[cpp]
+macro_strip = ["CORE_API", "ENGINE_API", "GAMEPLAY_API", "FOO_API", "BAR_EXTRA"]

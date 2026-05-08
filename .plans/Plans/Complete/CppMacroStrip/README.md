@@ -1,7 +1,7 @@
 ---
 title: "C++ Macro-Strip — recover class extraction from API-export macros"
 type: plan
-status: active
+status: complete
 created: 2026-05-07
 updated: 2026-05-07
 tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
@@ -20,7 +20,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Fixture, snapshot, docs, cutover"
-    status: planned
+    status: complete
     doc: "03-Fixture-And-Docs.md"
     depends_on: [2]
 ---

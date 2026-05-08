@@ -32,3 +32,27 @@ extra_ignore = ["build/", "node_modules/", "vendor/"]
 # concurrency budget — the indexer caps the sum at the host's logical CPU
 # count.
 max_threads = 0
+
+# C++-specific knobs. The `macro_strip` list contains identifier tokens to
+# whole-word-replace with spaces in C++ source bytes before tree-sitter
+# parses. Use this for API-export macros that confuse the tree-sitter-cpp
+# grammar by occupying the position between `class` and the class name —
+# `class CORE_API MyClass : public Base {};` is invisible to the parser
+# until `CORE_API` is stripped. Replacement preserves byte length (and
+# therefore line/column offsets) so reported symbol positions match the
+# original source on disk. Default: omit `[cpp]` entirely (equivalent to
+# `macro_strip = []`).
+#
+# After changing this list, re-run analyze_codebase with force=true to
+# invalidate the mtime-based cache. Without `force=true`, files whose
+# mtime hasn't changed since the last index will skip preprocessing and
+# the new strip list will appear to have no effect.
+#
+# Suggested list for Unreal Engine codebases (uncomment to opt in, then
+# add any project-local <PROJECTNAME>_API macros):
+# [cpp]
+# macro_strip = [
+#   "CORE_API", "ENGINE_API", "UMG_API", "SLATE_API",
+#   "RENDERCORE_API", "NIAGARA_API", "ONLINESUBSYSTEM_API",
+#   "GAMEPLAYABILITIES_API",
+# ]

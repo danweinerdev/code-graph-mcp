@@ -32,7 +32,7 @@ use std::sync::Arc;
 mod common;
 use common::{
     copy_testdata, copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path,
-    GO_INTERFACE_FIXTURE,
+    testdata_ue_path, GO_INTERFACE_FIXTURE,
 };
 
 use codegraph_core::Language;
@@ -1415,6 +1415,59 @@ async fn response_get_dependencies_python_models() {
     // dotted module path (the from-form points at the module, not the
     // imported name). The snapshot pins this contract for Python.
     let r = get_dependencies(&fx.inner.graph, &file);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- CppMacroStrip Phase 3.2 UE-side snapshots --------------------------
+//
+// These two snapshots prove the user-facing payoff for the CppMacroStrip
+// plan: with `[cpp].macro_strip` listed in `.code-graph.toml`, classes
+// declared with API-export macros (`class CORE_API AActor : public UObject {};`)
+// extract correctly through the public `get_class_hierarchy` tool surface.
+//
+// Fixture lives at `testdata/ue/MyActor.h` plus `testdata/ue/.code-graph.toml`
+// — the latter declares `macro_strip = ["CORE_API", "ENGINE_API",
+// "GAMEPLAY_API", "FOO_API", "BAR_EXTRA"]` so all five test macros are
+// recognized. `build_indexed_fixture_for_dir_with_all_parsers` copies both
+// the `.h` and the hidden `.code-graph.toml` into the per-test TempDir,
+// then runs `analyze_codebase` against that copy — exactly the path a UE
+// user would hit.
+//
+// The first snapshot exercises the chained inheritance case (AActor at
+// depth=2: bases include UObject; derived includes APawn, UDoubleMacro,
+// UNoMacro; APawn's derived includes ACharacter). The second snapshot
+// exercises the multi-macro case (UDoubleMacro carries both FOO_API and
+// BAR_EXTRA prefixes; both must be stripped for the class to extract with
+// AActor as parent).
+
+#[tokio::test]
+async fn response_get_class_hierarchy_ue_aactor() {
+    // Index `testdata/ue/` (with its `.code-graph.toml` declaring the
+    // macro-strip list) and walk the AActor hierarchy at depth=2. With the
+    // CORE_API/ENGINE_API/GAMEPLAY_API stripping in effect, the snapshot
+    // locks the chained-inheritance shape: AActor -> UObject upward, and
+    // AActor -> {APawn -> ACharacter, UDoubleMacro, UNoMacro} downward.
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_ue_path()).await;
+    let r = get_class_hierarchy(&fx.inner.graph, "AActor", Some(2), None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_class_hierarchy_ue_double_macro() {
+    // The two-macro case: `class FOO_API BAR_EXTRA UDoubleMacro : public AActor {};`
+    // requires both FOO_API and BAR_EXTRA to be stripped before
+    // tree-sitter sees a parseable `class UDoubleMacro : public AActor`.
+    // Snapshotting at default depth=1 locks the AActor parent edge through
+    // the public tool surface — proving multi-macro stripping works
+    // end-to-end and not just in the Phase 1 unit test.
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_ue_path()).await;
+    let r = get_class_hierarchy(&fx.inner.graph, "UDoubleMacro", None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

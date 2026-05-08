@@ -88,9 +88,30 @@ max_threads = 0
 # Maximum parallel parse threads (0 = num_cpus). The two thread pools share
 # the host concurrency budget — the indexer caps the sum at num_cpus.
 max_threads = 0
+
+[cpp]
+# Identifier tokens to remove from C++ source bytes before tree-sitter parses
+# them. Each occurrence is whole-word matched (bordered by non-identifier
+# bytes on both sides) and overwritten with spaces of the same length, so
+# byte offsets, line numbers, and column numbers reported in extracted
+# symbols match the original source. Default: `[]` (no rewriting).
+#
+# Use this for API-export macros that confuse the tree-sitter-cpp grammar
+# by occupying the position between `class` and the class name. UE example:
+#
+#   [cpp]
+#   macro_strip = ["CORE_API", "ENGINE_API", "UMG_API", "MYGAME_API"]
+#
+# With the list above, `class CORE_API AActor : public UObject {};` extracts
+# correctly as a Class symbol with a UObject `Inherits` edge.
+macro_strip = []
 ```
 
-A sample `.code-graph.toml` ships at the repo root (Task 4.5).
+A sample `.code-graph.toml.example` ships at the repo root; copy it to `.code-graph.toml` in any indexed root and customize as needed.
+
+### Cache invalidation
+
+Changes to `[cpp].macro_strip` between `analyze_codebase` calls do NOT retroactively re-parse files whose mtime is unchanged (the cache uses mtime-based stale checking). To apply a new `macro_strip` list to already-indexed files, re-run `analyze_codebase` with `force=true`.
 
 ## MCP Tools (15 total)
 
@@ -134,6 +155,7 @@ Validated against tree-sitter-cpp v0.23.4.
 - Nested classes/structs (Parent field set correctly)
 - Lambda call edges (calls inside and to lambdas)
 - All call patterns: free, method, arrow, qualified, template
+- Macro-prefixed class declarations (`class CORE_API MyClass : public Base {};`) when listed in `[cpp].macro_strip` (see the Configuration section). Default behavior with no `[cpp]` section leaves these declarations broken, preserving zero behavior change for non-UE users — see Known Limitation 7 below for the raw-string-delimiter caveat that comes with this opt-in.
 
 ### Known Limitations
 
@@ -148,6 +170,8 @@ Validated against tree-sitter-cpp v0.23.4.
 5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
 
 6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
+
+7. **`macro_strip` raw-string-delimiter collision** — when `[cpp].macro_strip` is configured, the C++ plugin's `preprocess` hook whole-word-replaces each listed macro with same-length spaces before tree-sitter parses. A raw string literal whose delimiter tag is also a stripped macro (e.g. `R"CORE_API(content)CORE_API"` with `CORE_API` in `macro_strip`) has both delimiters overwritten and tree-sitter fails to close the raw string — the rest of the file becomes an `ERROR` node and zero symbols extract from it. The pattern does not occur in any known codebase (a raw-string tag that is also an API-export macro is contrived) but is documented because the failure mode is silent at the file level. Workaround: drop the offending macro from `macro_strip` for the affected file or rename the raw-string tag in the source.
 
 ## Rust Parser Limitations
 

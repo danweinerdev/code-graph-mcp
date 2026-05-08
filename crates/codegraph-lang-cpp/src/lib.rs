@@ -12,6 +12,19 @@
 //! the inline tests at the bottom of this file cover one representative
 //! example of every extraction path so regressions surface immediately.
 //!
+//! # Macro stripping (`preprocess` / [`strip_macros`])
+//!
+//! The CppMacroStrip plan (Phases 1–3) added a [`LanguagePlugin::preprocess`]
+//! override on `CppParser` that whole-word-replaces identifier tokens listed
+//! in `[cpp].macro_strip` (from `.code-graph.toml`) with spaces of the same
+//! length before tree-sitter parses. This recovers class extraction for
+//! UE-style declarations such as `class CORE_API AActor : public UObject {};`
+//! that the tree-sitter-cpp v0.23.4 grammar otherwise drops as an `ERROR`
+//! node. The default behavior is unchanged — an empty `macro_strip` list
+//! short-circuits to `Cow::Borrowed` with zero allocation. See
+//! [`strip_macros`] for the substitution algorithm and the
+//! `Designs/CppMacroStrip` design doc for rationale.
+//!
 //! # Known C++ parser limitations
 //!
 //! These were validated against tree-sitter-cpp v0.23.4 and apply to the Go
@@ -73,6 +86,14 @@ pub const EXTENSIONS: &[&str] = &[".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".h
 ///
 /// Construct with [`CppParser::new`]; share across threads (queries are
 /// `Send + Sync`).
+///
+/// `CppParser` overrides [`LanguagePlugin::preprocess`] to apply
+/// [`strip_macros`] against `cfg.cpp.macro_strip` from the per-root
+/// `.code-graph.toml`. With an empty list (the default), preprocessing
+/// is a zero-cost `Cow::Borrowed`; with a non-empty list, listed
+/// identifiers are whole-word-replaced with spaces before tree-sitter
+/// parses. The replacement preserves byte offsets so symbol line/column
+/// positions match the original source on disk.
 pub struct CppParser {
     /// Compiled C++ grammar; held so [`tree_sitter::Parser`] instances built
     /// per `parse_file` call can attach to it without re-building the
@@ -436,6 +457,16 @@ impl CppParser {
     }
 }
 
+/// `LanguagePlugin` implementation for C++.
+///
+/// The [`preprocess`](LanguagePlugin::preprocess) override forwards to
+/// [`strip_macros`] with the per-root `cfg.cpp.macro_strip` list. The
+/// indexer (and watch handler) call `preprocess` on the raw file bytes
+/// before passing them to [`parse_file`](LanguagePlugin::parse_file), so
+/// `parse_file` always sees post-substitution bytes when `macro_strip` is
+/// non-empty. The override is the entry point for the CppMacroStrip
+/// feature; everything else (queries, extraction loops, edge resolution)
+/// runs unchanged.
 impl LanguagePlugin for CppParser {
     fn id(&self) -> Language {
         Language::Cpp
