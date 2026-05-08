@@ -11,14 +11,45 @@
 //! slicing) follows the Go semantics exactly so existing MCP clients see
 //! identical envelopes.
 
-use std::cmp::min;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
 use codegraph_core::{symbol_id, Language, Symbol, SymbolKind};
 use regex::Regex;
 
 use crate::Graph;
+
+/// Heap entry for the bounded-top-N search algorithm. Keyed by `id`
+/// (the precomputed `symbol_id`), with a borrowed `Symbol` reference so
+/// the heap doesn't clone every match. The Ord impl makes
+/// `BinaryHeap<TopEntry>` a max-heap by `id` — pushing a smaller-id
+/// entry after eviction of the current max converges on the N
+/// smallest-id matches.
+struct TopEntry<'a> {
+    id: String,
+    sym: &'a Symbol,
+}
+
+impl PartialEq for TopEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TopEntry<'_> {}
+
+impl PartialOrd for TopEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopEntry<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
+}
 
 /// Filters and paging for [`Graph::search`].
 ///
@@ -90,6 +121,20 @@ impl Graph {
     /// case-insensitive substring match so user-supplied input never
     /// crashes the search. Results are sorted by [`symbol_id`] for
     /// deterministic pagination across repeat queries.
+    ///
+    /// **Memory + time complexity (per the PaginationOverhaul retro):**
+    /// The original implementation cloned every match into a `Vec<Symbol>`
+    /// then sorted the full set — O(M) memory and O(M log M) time for any
+    /// query where M is the match count. On UE-scale codebases (M ≈ 500k),
+    /// a broad query like `kind=function` allocated 500k Symbol clones
+    /// just to return 20 rows. The current implementation maintains a
+    /// bounded max-heap of size `(offset + limit)` keyed by [`symbol_id`],
+    /// keeping only the N lexicographically-smallest IDs seen. `total`
+    /// stays exact (incremented on every match). Memory drops to
+    /// O(offset + limit); time drops to O(M log(offset + limit)). For
+    /// typical pagination (offset=0, limit=20) on M=500k, this is ~25,000×
+    /// less memory and ~5× fewer comparisons than the previous algorithm
+    /// — and `total` is still exact, unlike an early-exit approach.
     pub fn search(&self, mut params: SearchParams) -> SearchResult {
         if params.limit == 0 {
             params.limit = 20;
@@ -107,7 +152,15 @@ impl Graph {
         };
         let lower_ns = params.namespace.to_lowercase();
 
-        let mut matches: Vec<Symbol> = Vec::new();
+        // Bounded max-heap: holds at most (offset + limit) entries, the N
+        // lexicographically-smallest symbol IDs seen so far. Eviction
+        // happens when a new match's ID is smaller than the current max
+        // (the heap's root). Initial capacity is bounded so an obscene
+        // offset doesn't pre-allocate gigabytes; the heap grows as needed.
+        let cap = params.offset.saturating_add(params.limit) as usize;
+        let mut top: BinaryHeap<TopEntry<'_>> = BinaryHeap::with_capacity(cap.min(1024));
+        let mut total: u32 = 0;
+
         for node in self.nodes.values() {
             let s = &node.symbol;
 
@@ -142,23 +195,35 @@ impl Graph {
                 }
             }
 
-            matches.push(s.clone());
+            // This match counts toward `total` regardless of whether it
+            // makes it into the top-N heap. The exact total is what the
+            // pagination envelope's `total` field surfaces.
+            total = total.saturating_add(1);
+            if cap == 0 {
+                continue;
+            }
+            let id = symbol_id(s);
+            if top.len() < cap {
+                top.push(TopEntry { id, sym: s });
+            } else if let Some(top_max) = top.peek() {
+                if id < top_max.id {
+                    top.pop();
+                    top.push(TopEntry { id, sym: s });
+                }
+            }
         }
 
-        // Sort by SymbolID for stable pagination. `sort_by_key` is stable in
-        // Rust's std, mirroring Go's `sort.Slice` (which is *not* stable in
-        // Go but the SymbolID comparator produces a total order on unique
-        // IDs, so stability is moot for the sort key itself).
-        matches.sort_by_key(symbol_id);
+        // `into_sorted_vec` consumes the heap and returns entries in
+        // ascending order by `Ord::cmp` (i.e. ascending by `id`). This is
+        // the canonical pagination order — same as the previous algorithm's
+        // `sort_by_key(symbol_id)` would have produced. Slicing [offset..]
+        // drops the first `offset` items so the returned page contains the
+        // [offset..offset+limit) slice of the full sorted set.
+        let items = top.into_sorted_vec();
+        let start = (params.offset as usize).min(items.len());
+        let symbols: Vec<Symbol> = items[start..].iter().map(|e| e.sym.clone()).collect();
 
-        let total = matches.len() as u32;
-        let start = min(params.offset as usize, matches.len());
-        let end = min(start + params.limit as usize, matches.len());
-
-        SearchResult {
-            symbols: matches[start..end].to_vec(),
-            total,
-        }
+        SearchResult { symbols, total }
     }
 
     /// Legacy convenience wrapper used by the did-you-mean suggester. Returns
