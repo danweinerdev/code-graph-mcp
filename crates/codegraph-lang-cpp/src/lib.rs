@@ -43,7 +43,10 @@
 //!    `parenthesized_declarator > pointer_declarator > type_identifier`).
 
 pub(crate) mod helpers;
+pub(crate) mod preprocess;
 pub(crate) mod queries;
+
+pub use preprocess::strip_macros;
 
 use std::path::Path;
 

@@ -377,6 +377,7 @@ mod tests {
                 ..Default::default()
             },
             parsing: ParsingConfig { max_threads: n },
+            ..Default::default()
         }
     }
 

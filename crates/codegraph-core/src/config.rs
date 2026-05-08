@@ -21,8 +21,8 @@ fn default_true() -> bool {
 
 /// Top-level project configuration loaded from `<root>/.code-graph.toml`.
 ///
-/// Both sections are `#[serde(default)]` so an empty file or a file that
-/// omits one section still produces a valid config — every field has a
+/// All sections are `#[serde(default)]` so an empty file or a file that
+/// omits a section still produces a valid config — every field has a
 /// documented default.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RootConfig {
@@ -30,6 +30,8 @@ pub struct RootConfig {
     pub discovery: DiscoveryConfig,
     #[serde(default)]
     pub parsing: ParsingConfig,
+    #[serde(default)]
+    pub cpp: CppConfig,
 }
 
 /// Discovery walker tunables. Controls how source files are found and which
@@ -78,6 +80,29 @@ pub struct ParsingConfig {
     pub max_threads: usize,
 }
 
+/// C++-specific knobs. Currently the only field is `macro_strip` — a list of
+/// identifier tokens (typically API-export macros like `CORE_API`) that are
+/// blanked out of C++ source bytes before tree-sitter parses them.
+///
+/// **Empty-string entries are filtered at load time.** An empty pattern would
+/// match every byte position with zero advancement and infinite-loop the
+/// substitution scan in production. [`RootConfig::load`] drains empty entries
+/// and warns once per drop. The substitution algorithm (Phase 1.2) is allowed
+/// to assume every pattern has length > 0.
+///
+/// The field is `Vec<String>` (not `Vec<&'static str>`); patterns are checked
+/// for emptiness only — non-identifier-character patterns are not validated
+/// here because the substitution layer does literal byte-equality matching.
+/// See `Designs/CppMacroStrip/README.md` Decision 7 and Error Handling.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CppConfig {
+    /// Identifier tokens to remove from C++ source bytes before tree-sitter
+    /// parses them. Empty by default. Empty-string entries are filtered out
+    /// at load time (see [`RootConfig::load`]).
+    #[serde(default)]
+    pub macro_strip: Vec<String>,
+}
+
 /// Errors returned by [`RootConfig::load`]. We deliberately split I/O from
 /// TOML parse so callers can distinguish a missing/inaccessible file from a
 /// malformed one.
@@ -109,7 +134,24 @@ impl RootConfig {
             }
             Err(e) => return Err(ConfigError::Io(e)),
         };
-        let parsed: Self = toml::from_str(&content)?;
+        let mut parsed: Self = toml::from_str(&content)?;
+        // Drain empty-string entries from `[cpp].macro_strip`. An empty
+        // pattern would match every byte position with zero advancement and
+        // infinite-loop the substitution scan in release builds — the
+        // substitution algorithm (Phase 1.2) is allowed to assume every
+        // pattern has length > 0, so the filter must run unconditionally.
+        // We use `eprintln!` rather than `tracing::warn!` because this
+        // workspace deliberately has no `tracing` dependency
+        // (see `crates/codegraph-tools/src/handlers/watch.rs:461`).
+        parsed.cpp.macro_strip.retain(|s| {
+            let keep = !s.is_empty();
+            if !keep {
+                eprintln!(
+                    "code-graph-mcp: dropping empty entry from .code-graph.toml [cpp].macro_strip"
+                );
+            }
+            keep
+        });
         Ok(parsed)
     }
 
@@ -326,6 +368,99 @@ mod tests {
         assert_eq!(
             back.discovery.respect_gitignore,
             cfg.discovery.respect_gitignore
+        );
+    }
+
+    // --- CppConfig tests (CppMacroStrip Phase 1.1) -------------------------
+
+    #[test]
+    fn cpp_config_default_is_empty() {
+        // Zero-config users see an empty `macro_strip` list. The substitution
+        // layer (Phase 1.2) short-circuits on empty list to `Cow::Borrowed`.
+        let cfg = RootConfig::default();
+        assert!(
+            cfg.cpp.macro_strip.is_empty(),
+            "default macro_strip must be empty (opt-in), got: {:?}",
+            cfg.cpp.macro_strip
+        );
+    }
+
+    #[test]
+    fn cpp_section_absent_yields_default() {
+        // Backward compatibility: every existing `.code-graph.toml` in the
+        // wild has no `[cpp]` section. Loading must produce an empty
+        // `macro_strip` with no error.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[discovery]\nmax_threads = 0\n[parsing]\nmax_threads = 0\n",
+        )
+        .unwrap();
+        let cfg =
+            RootConfig::load(dir.path()).expect("config without [cpp] section must load cleanly");
+        assert!(
+            cfg.cpp.macro_strip.is_empty(),
+            "absent [cpp] section must default to empty macro_strip"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_filters_empty_strings() {
+        // Anti-regression for the infinite-loop risk documented in
+        // Designs/CppMacroStrip Error Handling. An empty pattern would
+        // advance 0 bytes per iteration in the substitution scan; the filter
+        // at config-load is the *only* safe place to enforce non-emptiness.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"\", \"CORE_API\", \"\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["CORE_API".to_string()],
+            "empty entries must be drained, leaving only valid patterns"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_empty_array_no_warnings() {
+        // Explicit `macro_strip = []` is the same as omitting the section —
+        // produces an empty list and (implicitly) emits no warnings. We can't
+        // capture stderr portably without test infrastructure, so we verify
+        // the resulting Vec and that load succeeds.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = []\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("[cpp] with empty array must load cleanly");
+        assert!(
+            cfg.cpp.macro_strip.is_empty(),
+            "explicit empty array must yield empty macro_strip"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_preserves_order() {
+        // The filter uses `Vec::retain` which preserves the relative order of
+        // surviving elements. Order is not algorithmically required for
+        // correctness (the whole-word check makes prefix-overlap order-safe
+        // — see Designs/CppMacroStrip Architecture), but preserving the
+        // user's listed order is the principle of least surprise.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"B\", \"A\", \"C\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load must succeed");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["B".to_string(), "A".to_string(), "C".to_string()],
+            "macro_strip must preserve user-listed order"
         );
     }
 }
