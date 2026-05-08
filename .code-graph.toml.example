@@ -85,6 +85,8 @@ max_threads = 0
 #   rust   : .rs
 #   go     : .go
 #   python : .py .pyi
+#   csharp : .cs
+#   java   : .java
 #
 # [extensions]
 # # Suppress C headers from a Python-heavy repo with vendored C/C++:
@@ -93,3 +95,6 @@ max_threads = 0
 # cpp = [".cu", ".inl"]
 # # Treat Cython sources as Python:
 # python = [".pyx"]
+# # Per-language additive lists for the remaining plugins:
+# csharp = []
+# java   = []

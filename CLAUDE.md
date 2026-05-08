@@ -152,12 +152,14 @@ macro_strip = []
 # Each entry must start with `.` and is lowercased at load. Empty strings
 # are dropped with an `eprintln!` notice. Built-in defaults per language:
 # cpp = [.cpp .cc .cxx .c .h .hpp .hxx], rust = [.rs], go = [.go],
-# python = [.py .pyi].
+# python = [.py .pyi], csharp = [.cs], java = [.java].
 disabled = []
 cpp = []
 rust = []
 go = []
 python = []
+csharp = []
+java = []
 ```
 
 A sample `.code-graph.toml.example` ships at the repo root; copy it to `.code-graph.toml` in any indexed root and customize as needed.

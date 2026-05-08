@@ -1012,6 +1012,43 @@ mod tests {
     }
 
     #[test]
+    fn with_config_disabled_blocks_csharp_additive_claim() {
+        // Pins the disabled-precedence contract for the C# additive list:
+        // even when `[extensions].csharp = [".cs"]` deliberately claims
+        // `.cs`, a `[extensions].disabled = [".cs"]` entry suppresses
+        // dispatch entirely. No C# plugin is registered yet (Phase 2),
+        // so this test only exercises the dispatch — it asserts `None`,
+        // which is also what we'd see if no plugin is present and no
+        // additive claimed the extension. The discriminator is the
+        // additive: without `disabled`, `language_for_path_with_config`
+        // would return `Some(Language::CSharp)` even with no plugin
+        // registered, because the dispatch is purely config-driven.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg_additive_only = ExtensionsConfig {
+            csharp: vec![".cs".to_string()],
+            ..Default::default()
+        };
+        // Sanity check: with only the additive, dispatch resolves to C#.
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cs"), &cfg_additive_only),
+            Some(Language::CSharp),
+            "additive csharp must claim .cs when not disabled"
+        );
+        // Disabled wins: with both, dispatch returns None.
+        let cfg = ExtensionsConfig {
+            csharp: vec![".cs".to_string()],
+            disabled: vec![".cs".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cs"), &cfg),
+            None,
+            "disabled must win over csharp additive"
+        );
+    }
+
+    #[test]
     fn with_config_extensionless_file_returns_none() {
         let mut reg = LanguageRegistry::new();
         reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();

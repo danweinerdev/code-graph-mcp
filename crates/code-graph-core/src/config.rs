@@ -146,6 +146,12 @@ pub struct ExtensionsConfig {
     /// Additional extensions claimed by the Python plugin.
     #[serde(default)]
     pub python: Vec<String>,
+    /// Additional extensions claimed by the C# plugin.
+    #[serde(default)]
+    pub csharp: Vec<String>,
+    /// Additional extensions claimed by the Java plugin.
+    #[serde(default)]
+    pub java: Vec<String>,
 }
 
 impl ExtensionsConfig {
@@ -167,6 +173,12 @@ impl ExtensionsConfig {
         if self.python.iter().any(|e| e == ext) {
             return Some(Language::Python);
         }
+        if self.csharp.iter().any(|e| e == ext) {
+            return Some(Language::CSharp);
+        }
+        if self.java.iter().any(|e| e == ext) {
+            return Some(Language::Java);
+        }
         None
     }
 
@@ -179,27 +191,31 @@ impl ExtensionsConfig {
     /// Iterate every `(label, list)` pair so load-time validation can scan
     /// each list uniformly. The label is the field name as it appears in
     /// `.code-graph.toml` (`"disabled"`, `"cpp"`, `"rust"`, `"go"`,
-    /// `"python"`).
+    /// `"python"`, `"csharp"`, `"java"`).
     fn lists_mut(
         &mut self,
-    ) -> [(&'static str, &mut Vec<String>); 5] {
+    ) -> [(&'static str, &mut Vec<String>); 7] {
         [
             ("disabled", &mut self.disabled),
             ("cpp", &mut self.cpp),
             ("rust", &mut self.rust),
             ("go", &mut self.go),
             ("python", &mut self.python),
+            ("csharp", &mut self.csharp),
+            ("java", &mut self.java),
         ]
     }
 
     /// Iterate every additive `(label, list)` pair (excluding `disabled`)
     /// for cross-language collision detection.
-    fn additive_lists(&self) -> [(&'static str, &Vec<String>); 4] {
+    fn additive_lists(&self) -> [(&'static str, &Vec<String>); 6] {
         [
             ("cpp", &self.cpp),
             ("rust", &self.rust),
             ("go", &self.go),
             ("python", &self.python),
+            ("csharp", &self.csharp),
+            ("java", &self.java),
         ]
     }
 }
@@ -618,6 +634,8 @@ mod tests {
         assert!(cfg.extensions.rust.is_empty());
         assert!(cfg.extensions.go.is_empty());
         assert!(cfg.extensions.python.is_empty());
+        assert!(cfg.extensions.csharp.is_empty());
+        assert!(cfg.extensions.java.is_empty());
     }
 
     #[test]
@@ -651,6 +669,80 @@ python = [".pyx"]
             Some(Language::Python)
         );
         assert_eq!(cfg.extensions.lookup_additional(".rs"), None);
+    }
+
+    #[test]
+    fn extensions_csharp_additive_lookup_returns_csharp() {
+        // Round-trip: a `[extensions].csharp = [".aspx"]` TOML deserializes
+        // and `lookup_additional(".aspx")` returns `Some(Language::CSharp)`.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+csharp = [".aspx"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load valid csharp additive list");
+        assert_eq!(
+            cfg.extensions.lookup_additional(".aspx"),
+            Some(Language::CSharp)
+        );
+        assert_eq!(cfg.extensions.csharp, vec![".aspx".to_string()]);
+    }
+
+    #[test]
+    fn extensions_java_additive_lookup_returns_java() {
+        // Round-trip: a `[extensions].java = [".jav"]` TOML deserializes
+        // and `lookup_additional(".jav")` returns `Some(Language::Java)`.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+java = [".jav"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load valid java additive list");
+        assert_eq!(
+            cfg.extensions.lookup_additional(".jav"),
+            Some(Language::Java)
+        );
+        assert_eq!(cfg.extensions.java, vec![".jav".to_string()]);
+    }
+
+    #[test]
+    fn extensions_csharp_java_cross_additive_conflict_errors() {
+        // Cross-additive collision between two newly-added languages must
+        // surface the same `ExtensionConflict` as any other pair — the
+        // `additive_lists` widening from 4 → 6 keeps both new languages in
+        // the O(n²) collision scan.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+csharp = [".x"]
+java = [".x"]
+"#,
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path())
+            .expect_err("csharp/java cross-additive conflict must error");
+        match err {
+            ConfigError::ExtensionConflict {
+                extension,
+                first,
+                second,
+            } => {
+                assert_eq!(extension, ".x");
+                assert_eq!(first, "csharp");
+                assert_eq!(second, "java");
+            }
+            other => panic!("expected ExtensionConflict, got: {other:?}"),
+        }
     }
 
     #[test]
