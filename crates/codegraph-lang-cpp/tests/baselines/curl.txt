@@ -1,0 +1,4 @@
+repo: curl/curl
+tag: curl-8_20_0
+commit: a05f34973e
+symbols: 5846

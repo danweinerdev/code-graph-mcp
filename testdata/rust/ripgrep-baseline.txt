@@ -1,0 +1,4 @@
+repo: BurntSushi/ripgrep
+tag: 15.1.0
+commit: af60c2d
+symbols: 3104

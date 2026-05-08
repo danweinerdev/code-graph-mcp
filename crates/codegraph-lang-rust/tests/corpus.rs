@@ -494,3 +494,88 @@ fn unsafe_block_does_not_break_extraction() {
         "Greeter::do_unsafe must extract despite unsafe block in body"
     );
 }
+
+/// Recursively collect every `.rs` file under `dir`. Used by the
+/// ripgrep dogfood test below; not used by the per-file corpus assertions
+/// above (those use a flat `read_dir` over `testdata/rust/src/`).
+fn walk_collect_rust(dir: &Path, out: &mut Vec<PathBuf>) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_collect_rust(&p, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// Dogfood-baseline regression test against the `external/ripgrep`
+/// submodule (pinned to 15.1.0). Walks every `.rs` file under
+/// `external/ripgrep/crates/` and asserts the symbol count stays within
+/// ±10% of the baseline recorded in `testdata/rust/ripgrep-baseline.txt`.
+///
+/// **Auto-skips when the submodule is not initialized.** Run
+/// `git submodule update --init external/ripgrep` (or `make submodules`)
+/// to opt in. The baseline file IS a hard read (it's in-tree); a missing
+/// baseline panics. When the pinned submodule SHA is bumped, the symbol
+/// count will usually drift — re-measure and update the baseline in the
+/// same commit as the SHA bump.
+#[test]
+fn ripgrep_dogfood_baseline_within_ten_percent() {
+    let ripgrep_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("external")
+        .join("ripgrep")
+        .join("crates");
+    if !ripgrep_root.is_dir() {
+        eprintln!(
+            "skipping ripgrep dogfood baseline test: \
+             external/ripgrep/crates not present — run `git submodule \
+             update --init external/ripgrep` (or `make submodules`) to \
+             opt in"
+        );
+        return;
+    }
+
+    let baseline_path = corpus_root().join("ripgrep-baseline.txt");
+    let baseline_text = std::fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|e| panic!("read baseline {baseline_path:?}: {e}"));
+    let baseline_count = baseline_text
+        .lines()
+        .find_map(|line| line.strip_prefix("symbols: "))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "baseline file {baseline_path:?} must contain a \
+                 'symbols: N' line; got: {baseline_text:?}"
+            )
+        });
+
+    let parser = RustParser::new().expect("RustParser::new");
+    let mut files = Vec::new();
+    walk_collect_rust(&ripgrep_root, &mut files);
+    files.sort();
+
+    let mut total_symbols: usize = 0;
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
+        let fg = parser
+            .parse_file(f, &bytes)
+            .unwrap_or_else(|e| panic!("parse {f:?}: {e}"));
+        total_symbols += fg.symbols.len();
+    }
+
+    let lower = (baseline_count as f64 * 0.9).floor() as usize;
+    let upper = (baseline_count as f64 * 1.1).ceil() as usize;
+    assert!(
+        total_symbols >= lower && total_symbols <= upper,
+        "ripgrep parse produced {total_symbols} symbols; expected within \
+         ±10% of baseline {baseline_count} (range [{lower}, {upper}])"
+    );
+}

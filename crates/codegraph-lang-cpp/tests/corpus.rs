@@ -8,11 +8,11 @@
 //! `TestTruncateSignatureByteFallback`, `TestTruncateSignatureUTF8Boundary`)
 //! live in `helpers.rs` — porting them here would duplicate coverage.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codegraph_core::{Edge, EdgeKind, FileGraph, Symbol, SymbolKind};
 use codegraph_lang::LanguagePlugin;
-use codegraph_lang_cpp::CppParser;
+use codegraph_lang_cpp::{CppParser, EXTENSIONS as CPP_EXTENSIONS};
 use pretty_assertions::assert_eq;
 
 // --- Test helpers ---------------------------------------------------------
@@ -587,4 +587,131 @@ fn extension_is_claimed(#[case] ext: &str) {
     let p = CppParser::new().unwrap();
     let exts: &[&str] = LanguagePlugin::extensions(&p);
     assert!(exts.contains(&ext), "extension {ext} must be claimed");
+}
+
+// --- Dogfood baselines against external/ submodules -----------------------
+//
+// Each test below walks the corresponding `external/<repo>` submodule,
+// parses every file whose extension matches `CPP_EXTENSIONS`, sums the
+// symbol counts, and asserts the total stays within ±10% of a baseline
+// recorded under `crates/codegraph-lang-cpp/tests/baselines/<repo>.txt`.
+//
+// Tests auto-skip when the submodule is not initialized (no panic) — run
+// `git submodule update --init external/<repo>` (or `make submodules`)
+// to opt in. When the pinned submodule SHA is bumped, the symbol count
+// will usually drift; re-measure and update the baseline file in the
+// same commit as the SHA bump.
+
+fn baselines_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("baselines")
+}
+
+fn external_repo(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("external")
+        .join(name)
+}
+
+/// Recursively collect every C/C++ source file under `dir`, matched by
+/// extension against [`CPP_EXTENSIONS`].
+fn walk_collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_collect_cpp(&p, out);
+        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+            // CPP_EXTENSIONS includes the leading dot ('.cpp', '.h', …).
+            let dotted = format!(".{ext}");
+            if CPP_EXTENSIONS.contains(&dotted.as_str()) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+fn read_baseline_count(name: &str) -> usize {
+    let path = baselines_dir().join(format!("{name}.txt"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read baseline {path:?}: {e}"));
+    text.lines()
+        .find_map(|line| line.strip_prefix("symbols: "))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!("baseline file {path:?} must contain a 'symbols: N' line; got: {text:?}")
+        })
+}
+
+fn dogfood_within_ten_percent(repo_name: &str, source_subpath: Option<&str>) {
+    let mut root = external_repo(repo_name);
+    if let Some(sub) = source_subpath {
+        root.push(sub);
+    }
+    if !root.is_dir() {
+        eprintln!(
+            "skipping {repo_name} dogfood baseline test: {root:?} not \
+             present — run `git submodule update --init external/{repo_name}` \
+             (or `make submodules`) to opt in"
+        );
+        return;
+    }
+
+    let baseline_count = read_baseline_count(repo_name);
+
+    let parser = CppParser::new().expect("CppParser::new");
+    let mut files = Vec::new();
+    walk_collect_cpp(&root, &mut files);
+    files.sort();
+
+    let mut total_symbols: usize = 0;
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
+        // tree-sitter-cpp parses C as a (mostly) compatible superset.
+        // Idiomatic-C constructs that fail to parse produce ERROR nodes
+        // which the plugin already filters; the file as a whole still
+        // contributes whatever symbols tree-sitter could extract.
+        match parser.parse_file(f, &bytes) {
+            Ok(fg) => total_symbols += fg.symbols.len(),
+            Err(e) => panic!("parse {f:?}: {e}"),
+        }
+    }
+
+    let lower = (baseline_count as f64 * 0.9).floor() as usize;
+    let upper = (baseline_count as f64 * 1.1).ceil() as usize;
+    assert!(
+        total_symbols >= lower && total_symbols <= upper,
+        "{repo_name} parse produced {total_symbols} symbols; expected within \
+         ±10% of baseline {baseline_count} (range [{lower}, {upper}])"
+    );
+}
+
+#[test]
+fn fmt_dogfood_baseline_within_ten_percent() {
+    // fmt's library headers + sources live at the repo root under
+    // `include/fmt/` and `src/`. Walk the whole repo — test-only files
+    // contribute too, which is fine for an aggregate count.
+    dogfood_within_ten_percent("fmt", None);
+}
+
+#[test]
+fn curl_dogfood_baseline_within_ten_percent() {
+    // curl is primarily C; tree-sitter-cpp parses C as a superset. The
+    // bulk of the symbol count comes from `lib/` and `include/curl/`.
+    // Walk the whole repo so headers + sources both contribute.
+    dogfood_within_ten_percent("curl", None);
+}
+
+#[test]
+fn abseil_cpp_dogfood_baseline_within_ten_percent() {
+    // abseil's source lives under `absl/`; everything outside is build
+    // scaffolding (CMake, Bazel, CI) without C++ source files.
+    dogfood_within_ten_percent("abseil-cpp", Some("absl"));
 }

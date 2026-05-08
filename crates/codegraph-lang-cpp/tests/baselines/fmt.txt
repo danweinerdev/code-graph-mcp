@@ -1,0 +1,4 @@
+repo: fmtlib/fmt
+tag: 12.1.0
+commit: 407c905e
+symbols: 5558

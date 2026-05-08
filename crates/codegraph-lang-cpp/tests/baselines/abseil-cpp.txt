@@ -1,0 +1,4 @@
+repo: abseil/abseil-cpp
+tag: 20260107.1
+commit: 255c84da
+symbols: 16294
