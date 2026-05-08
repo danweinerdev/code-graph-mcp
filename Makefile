@@ -2,7 +2,7 @@
 # the binary for — `make release` produces a host-target release build.
 
 .PHONY: build release test lint fmt fmt-check clean \
-	snapshot-clean snapshot-audit install-hooks \
+	snapshot-clean snapshot-audit install-hooks submodules \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -59,6 +59,23 @@ snapshot-clean:
 #   make snapshot-audit ARGS="response_get_orphans tools_list_get_orphans"
 snapshot-audit:
 	@scripts/snapshot-audit.sh $(ARGS)
+
+# Initialize the optional `external/<repo>` git submodules used by the
+# per-language dogfood baseline tests (logrus, requests, ripgrep, fmt,
+# curl, abseil-cpp). Each submodule is pinned to a specific upstream
+# tag — see `.gitmodules` and `tests/baselines/*.txt` /
+# `testdata/<lang>/<name>-baseline.txt` for the recorded pin + symbol
+# count.
+#
+# Dogfood tests auto-skip when their submodule is not initialized, so
+# this target is opt-in: clone what you want to dogfood against. Use
+# `--depth 1` to keep clones small (~55MB total at full depth, mostly
+# curl + abseil).
+#
+# Single submodule: `git submodule update --init external/<name>`.
+submodules:
+	@git submodule update --init --depth 1 external/
+	@echo "✓ External submodules initialized — dogfood tests will now run."
 
 # One-time setup: point git at the tracked hook scripts under
 # scripts/hooks/ so pre-commit checks fire on every commit. Run this

@@ -1,0 +1,18 @@
+[submodule "external/ripgrep"]
+	path = external/ripgrep
+	url = https://github.com/BurntSushi/ripgrep.git
+[submodule "external/fmt"]
+	path = external/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "external/curl"]
+	path = external/curl
+	url = https://github.com/curl/curl.git
+[submodule "external/abseil-cpp"]
+	path = external/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "external/logrus"]
+	path = external/logrus
+	url = https://github.com/sirupsen/logrus.git
+[submodule "external/requests"]
+	path = external/requests
+	url = https://github.com/psf/requests.git
