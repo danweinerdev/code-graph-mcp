@@ -1,1 +1,4 @@
-symbols: 407
+repo: sirupsen/logrus
+tag: v1.9.4
+commit: b61f268
+symbols: 414

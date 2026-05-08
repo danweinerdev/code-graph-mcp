@@ -66,8 +66,8 @@ fn main() -> ExitCode {
         eprintln!("Error registering Rust parser: {e}");
         return ExitCode::from(1);
     }
-    // Phase 6.5: register the Go parser so `parse-test testdata/go` and the
-    // logrus dogfood pass against /tmp/logrus extract symbols from `.go`
+    // Register the Go parser so `parse-test testdata/go` and the logrus
+    // dogfood test against `external/logrus` extract symbols from `.go`
     // files. Mirrors the C++ and Rust registration blocks above.
     let go_parser = match GoParser::new() {
         Ok(p) => p,
@@ -80,8 +80,8 @@ fn main() -> ExitCode {
         eprintln!("Error registering Go parser: {e}");
         return ExitCode::from(1);
     }
-    // Phase 7.6: register the Python parser so `parse-test testdata/python`
-    // and the requests dogfood pass against /tmp/requests extract symbols
+    // Register the Python parser so `parse-test testdata/python` and the
+    // requests dogfood test against `external/requests` extract symbols
     // from `.py` and `.pyi` files. Mirrors the C++/Rust/Go blocks above.
     let python_parser = match PythonParser::new() {
         Ok(p) => p,

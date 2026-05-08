@@ -1,8 +1,4 @@
-# requests@v2.32.3 dogfood baseline (Phase 7.6, recorded 2026-05-07)
-# Source: parse-test /tmp/requests/src/requests
-# 18 .py files; 0 warnings.
-# Plan brief expected [400, 1000] but the actual count for src/requests
-# (the published package; the project's tests + docs + scripts are out of
-# scope per the brief) is 284. The corpus regression test asserts ±10%
-# against this recorded baseline.
+repo: psf/requests
+tag: v2.33.1
+commit: 111d2b77
 symbols: 284

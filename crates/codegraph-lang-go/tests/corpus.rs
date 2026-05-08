@@ -642,37 +642,44 @@ fn two_init_functions_coexist_in_distinct_packages() {
     assert_eq!(helpers_init.namespace, "utils");
 }
 
-/// Phase 6.5 dogfood-baseline regression test — gated on
-/// `/tmp/logrus` being present. Runs `parse_file` over every `.go`
-/// file in `/tmp/logrus` and asserts the symbol count stays within
-/// ±10% of the baseline recorded in `testdata/go/logrus-baseline.txt`.
+/// Dogfood-baseline regression test against the `external/logrus`
+/// submodule (pinned to v1.9.4). Runs `parse_file` over every `.go` file
+/// and asserts the symbol count stays within ±10% of the baseline
+/// recorded in `testdata/go/logrus-baseline.txt`.
 ///
-/// Marked `#[ignore]` so it does not run unless explicitly opted into
-/// (e.g. `cargo test -p codegraph-lang-go -- --ignored
-/// logrus_dogfood_baseline_within_ten_percent`). The baseline file is
-/// committed; the test reads it at runtime.
+/// **Auto-skips when the submodule is not initialized.** When
+/// `external/logrus` is empty (the submodule has not been cloned) this
+/// test prints a setup hint via `eprintln!` and returns — it does NOT
+/// panic. Run `git submodule update --init external/logrus` (or `make
+/// submodules`) to opt in. Reading the committed baseline file IS still
+/// a hard failure (the file is in-tree; if it's gone, that's a real
+/// bug), hence the panic on `read_to_string` below.
 ///
-/// **Setup is environment-only, not a real failure.** When `/tmp/logrus`
-/// is missing this test silently skips with an `eprintln!` setup hint
-/// rather than panicking. Without this skip, `cargo test --
-/// --include-ignored` (which runs every `#[ignore]`-gated test in one
-/// pass) would fail loudly on machines that haven't cloned the dogfood
-/// fixture — the panic message reads as a setup instruction, not a code
-/// bug, and shouldn't be a hard failure. The `eprintln! + return` form
-/// matches how other dogfood-style tests in the workspace handle their
-/// optional dependencies. Reading the committed baseline file IS still a
-/// hard failure (the file is in-tree; if it's gone, that's a real bug),
-/// hence the panic on `read_to_string` below.
+/// When the pinned submodule SHA is bumped, the symbol count will
+/// usually drift. Re-measure and update `logrus-baseline.txt` in the
+/// same commit as the SHA bump.
 #[test]
-#[ignore]
 fn logrus_dogfood_baseline_within_ten_percent() {
-    let logrus_root = Path::new("/tmp/logrus");
-    if !logrus_root.is_dir() {
+    let logrus_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("external")
+        .join("logrus");
+    // A submodule path that exists but is empty (not yet `git submodule
+    // update --init`'d) presents as a directory with only a `.git` file
+    // and no source. Detect by checking for any `.go` file at the root.
+    if !logrus_root.is_dir()
+        || std::fs::read_dir(&logrus_root)
+            .map(|rd| {
+                !rd.flatten()
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("go"))
+            })
+            .unwrap_or(true)
+    {
         eprintln!(
-            "skipping logrus dogfood baseline test: /tmp/logrus not present \
-             — clone https://github.com/sirupsen/logrus.git at v1.9.3 \
-             (commit d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd) into \
-             /tmp/logrus before running this test"
+            "skipping logrus dogfood baseline test: external/logrus is \
+             not initialized — run `git submodule update --init \
+             external/logrus` (or `make submodules`) to opt in"
         );
         return;
     }
@@ -693,7 +700,7 @@ fn logrus_dogfood_baseline_within_ten_percent() {
 
     let parser = GoParser::new().expect("GoParser::new");
     let mut files = Vec::new();
-    walk_collect_go(logrus_root, &mut files);
+    walk_collect_go(&logrus_root, &mut files);
     files.sort();
 
     let mut total_symbols: usize = 0;

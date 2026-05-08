@@ -20,8 +20,9 @@
 //!   - `@property` decorator (transparent — Method, no flag)
 //!   - `.pyi` stub: function + class with method stubs extract identically
 //!
-//! The dogfood-baseline regression test (`requests_v2_32_3_dogfood_baseline_within_ten_percent`)
-//! lives at the bottom and is `#[ignore]`-gated on `/tmp/requests`.
+//! The dogfood-baseline regression test (`requests_dogfood_baseline_within_ten_percent`)
+//! lives at the bottom and auto-skips when the `external/requests` git
+//! submodule is not initialized.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -736,31 +737,36 @@ fn no_inherits_edges_for_classes_without_bases() {
     }
 }
 
-/// Phase 7.6 dogfood-baseline regression test — gated on
-/// `/tmp/requests` being present. Runs `parse_file` over every `.py`
-/// file under `/tmp/requests/src/requests` and asserts the symbol count
-/// stays within ±10% of the baseline recorded in
+/// Dogfood-baseline regression test against the `external/requests`
+/// submodule (pinned to v2.33.1). Runs `parse_file` over every `.py`
+/// file under `external/requests/src/requests` and asserts the symbol
+/// count stays within ±10% of the baseline recorded in
 /// `testdata/python/requests-baseline.txt`.
 ///
-/// Marked `#[ignore]` so it does not run unless explicitly opted into
-/// (e.g. `cargo test -p codegraph-lang-python -- --ignored
-/// requests_v2_32_3_dogfood_baseline_within_ten_percent`). Mirrors the
-/// shape of the Phase 6 logrus dogfood test exactly.
+/// **Auto-skips when the submodule is not initialized.** When
+/// `external/requests` is empty (the submodule has not been cloned)
+/// this test prints a setup hint via `eprintln!` and returns — it does
+/// NOT panic. Run `git submodule update --init external/requests` (or
+/// `make submodules`) to opt in.
 ///
-/// **Setup is environment-only, not a real failure.** When
-/// `/tmp/requests` is missing this test silently skips with an
-/// `eprintln!` setup hint rather than panicking, matching the Phase 6
-/// logrus test convention.
+/// When the pinned submodule SHA is bumped, the symbol count will
+/// usually drift. Re-measure and update `requests-baseline.txt` in the
+/// same commit as the SHA bump.
 #[test]
-#[ignore]
-fn requests_v2_32_3_dogfood_baseline_within_ten_percent() {
-    let requests_root = Path::new("/tmp/requests/src/requests");
+fn requests_dogfood_baseline_within_ten_percent() {
+    let requests_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("external")
+        .join("requests")
+        .join("src")
+        .join("requests");
     if !requests_root.is_dir() {
         eprintln!(
             "skipping requests dogfood baseline test: \
-             /tmp/requests/src/requests not present — clone \
-             https://github.com/psf/requests.git at v2.32.3 into \
-             /tmp/requests before running this test"
+             external/requests/src/requests not present — run `git \
+             submodule update --init external/requests` (or `make \
+             submodules`) to opt in"
         );
         return;
     }
@@ -781,7 +787,7 @@ fn requests_v2_32_3_dogfood_baseline_within_ten_percent() {
 
     let parser = PythonParser::new().expect("PythonParser::new");
     let mut files = Vec::new();
-    walk_collect_python(requests_root, &mut files);
+    walk_collect_python(&requests_root, &mut files);
     files.sort();
 
     let mut total_symbols: usize = 0;
