@@ -17,7 +17,8 @@
 //!   codebase (C/C++, Rust, Go, Python) and build the code graph. Must be
 //!   called before any query tools."
 //! - `search_symbols`: keeps the existing description but gains a `language`
-//!   parameter ("Filter by source language: cpp, rust, go, or python").
+//!   parameter ("Filter by source language: cpp, rust, go, python, csharp, or
+//!   java").
 //!
 //! Phase 3.7 captures these strings as wire-format snapshots; any future
 //! divergence triggers `cargo insta review`.
@@ -250,7 +251,7 @@ pub struct SearchSymbolsArgs {
     )]
     #[serde(default)]
     pub namespace: Option<String>,
-    #[schemars(description = "Filter by source language: cpp, rust, go, or python")]
+    #[schemars(description = "Filter by source language: cpp, rust, go, python, csharp, or java")]
     #[serde(default)]
     pub language: Option<String>,
     #[schemars(description = "Maximum results to return (default 20)")]

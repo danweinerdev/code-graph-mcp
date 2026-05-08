@@ -146,6 +146,8 @@ pub fn parse_language(s: &str) -> Option<Language> {
         "rust" => Some(Language::Rust),
         "go" => Some(Language::Go),
         "python" => Some(Language::Python),
+        "csharp" => Some(Language::CSharp),
+        "java" => Some(Language::Java),
         _ => None,
     }
 }
@@ -316,6 +318,8 @@ mod tests {
         assert_eq!(parse_language("rust"), Some(Language::Rust));
         assert_eq!(parse_language("go"), Some(Language::Go));
         assert_eq!(parse_language("python"), Some(Language::Python));
+        assert_eq!(parse_language("csharp"), Some(Language::CSharp));
+        assert_eq!(parse_language("java"), Some(Language::Java));
         assert!(parse_language("ruby").is_none());
         assert!(parse_language("").is_none());
     }

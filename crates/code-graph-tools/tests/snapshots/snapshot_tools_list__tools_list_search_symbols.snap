@@ -26,7 +26,7 @@ expression: "tool_entry(\"search_symbols\")"
       },
       "language": {
         "default": null,
-        "description": "Filter by source language: cpp, rust, go, or python",
+        "description": "Filter by source language: cpp, rust, go, python, csharp, or java",
         "type": [
           "string",
           "null"
