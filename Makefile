@@ -2,7 +2,7 @@
 # the binary for — `make release` produces a host-target release build.
 
 .PHONY: build release test lint fmt fmt-check clean \
-	snapshot-clean install-hooks \
+	snapshot-clean snapshot-audit install-hooks \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -48,6 +48,17 @@ snapshot-clean:
 		exit 1; \
 	fi
 	@echo "✓ No pending snapshots."
+
+# Snapshot delta audit: assert that any modified/untracked snapshot
+# file matches an expected name fragment. Catches accidental cross-tool
+# effects when a wire-format change "improvement" silently regenerates
+# an unrelated tool's snapshot. Invoked per-phase with the known
+# expected fragments — see `scripts/snapshot-audit.sh` for usage.
+#
+# Pass fragments via ARGS:
+#   make snapshot-audit ARGS="response_get_orphans tools_list_get_orphans"
+snapshot-audit:
+	@scripts/snapshot-audit.sh $(ARGS)
 
 # One-time setup: point git at the tracked hook scripts under
 # scripts/hooks/ so pre-commit checks fire on every commit. Run this

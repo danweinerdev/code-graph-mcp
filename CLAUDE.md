@@ -12,6 +12,7 @@ make test                                             # cargo test --workspace
 make lint                                             # cargo clippy --workspace --all-targets -- -D warnings
 make fmt-check                                        # cargo fmt --all --check
 make snapshot-clean                                   # fail if any *.snap.new files exist (stale insta snapshots)
+make snapshot-audit ARGS="<fragments>"                # fail if changed snapshots don't match expected name fragments
 
 # Or invoke cargo directly:
 cargo build --release -p code-graph-mcp               # host-target release binary
