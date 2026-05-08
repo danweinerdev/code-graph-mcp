@@ -82,6 +82,10 @@ pub async fn analyze_codebase(
         Err(ConfigError::Io(e)) => {
             return tool_error(format!("failed to read .code-graph.toml: {e}"));
         }
+        Err(e @ ConfigError::ExtensionMissingDot { .. })
+        | Err(e @ ConfigError::ExtensionConflict { .. }) => {
+            return tool_error(format!("invalid .code-graph.toml: {e}"));
+        }
     };
     let mut warnings = cfg.resolve_concurrency();
 

@@ -16,7 +16,7 @@
 
 pub mod helpers;
 
-use code_graph_core::{FileGraph, Language, RootConfig, SymbolId};
+use code_graph_core::{ExtensionsConfig, FileGraph, Language, RootConfig, SymbolId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -423,6 +423,49 @@ impl LanguageRegistry {
     /// Look up a plugin by language tag, bypassing the extension lookup.
     /// Useful when the caller already has a [`Language`] in hand.
     pub fn plugin_for(&self, lang: Language) -> Option<&dyn LanguagePlugin> {
+        self.plugins.get(&lang).map(|b| &**b)
+    }
+
+    /// Like [`Self::language_for_path`], but consults the per-root
+    /// `[extensions]` config first. Order of precedence:
+    ///
+    /// 1. **`[extensions].disabled`**: matched extensions return `None`
+    ///    even when a plugin (default or additive) would have claimed
+    ///    them. The whole point of the disabled list is to drop files
+    ///    from discovery.
+    /// 2. **`[extensions].<lang>` (additive)**: matched extensions resolve
+    ///    to the user-specified language even when a plugin's defaults
+    ///    would have claimed them. Users override deliberately.
+    /// 3. **Plugin defaults**: the registry's static `by_ext` map.
+    ///
+    /// Cross-additive collisions (same extension in two `[extensions].<lang>`
+    /// lists) are caught at config-load time, so this dispatch never has
+    /// to disambiguate between two additive claims.
+    pub fn language_for_path_with_config(
+        &self,
+        p: &Path,
+        cfg: &ExtensionsConfig,
+    ) -> Option<Language> {
+        let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+        let key = format!(".{ext}");
+        if cfg.is_disabled(&key) {
+            return None;
+        }
+        if let Some(lang) = cfg.lookup_additional(&key) {
+            return Some(lang);
+        }
+        self.by_ext.get(&key).copied()
+    }
+
+    /// Like [`Self::for_path`], but consults the per-root `[extensions]`
+    /// config. See [`Self::language_for_path_with_config`] for precedence
+    /// rules.
+    pub fn for_path_with_config(
+        &self,
+        p: &Path,
+        cfg: &ExtensionsConfig,
+    ) -> Option<&dyn LanguagePlugin> {
+        let lang = self.language_for_path_with_config(p, cfg)?;
         self.plugins.get(&lang).map(|b| &**b)
     }
 }
@@ -861,5 +904,124 @@ mod tests {
         assert_eq!(caller_id_parent(r"C:\proj\foo.cpp:Foo::bar"), "Foo");
         // Windows-style path with a free function.
         assert_eq!(caller_id_parent(r"C:\proj\foo.cpp:plain"), "");
+    }
+
+    // --- _with_config dispatch tests --------------------------------------
+
+    #[test]
+    fn with_config_falls_back_to_defaults_when_config_empty() {
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg = ExtensionsConfig::default();
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cpp"), &cfg),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.unknown"), &cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn with_config_additive_extension_resolves_to_user_language() {
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg = ExtensionsConfig {
+            cpp: vec![".cu".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cu"), &cfg),
+            Some(Language::Cpp)
+        );
+    }
+
+    #[test]
+    fn with_config_disabled_blocks_default_claim() {
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp", ".h"])).unwrap();
+        let cfg = ExtensionsConfig {
+            disabled: vec![".h".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cpp"), &cfg),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.h"), &cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn with_config_disabled_blocks_additive_claim_too() {
+        // Pins precedence: `disabled` wins over an additive on the same
+        // extension. The load-time validator deliberately permits this
+        // overlap (no `ConfigError::ExtensionConflict`), so the dispatch
+        // path is the sole arbiter.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg = ExtensionsConfig {
+            cpp: vec![".cu".to_string()],
+            disabled: vec![".cu".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.cu"), &cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn with_config_additive_overrides_default_claim() {
+        // Pins the redirection contract: a plugin's defaults claim `.h`,
+        // but the user's additive in `python` wins. (The user wrote it
+        // deliberately. `disabled` is the only way to silence `.h`
+        // entirely.)
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp", ".h"])).unwrap();
+        reg.register(fake(Language::Python, &[".py"])).unwrap();
+        let cfg = ExtensionsConfig {
+            python: vec![".h".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.h"), &cfg),
+            Some(Language::Python),
+            "user additive must win over default claim"
+        );
+    }
+
+    #[test]
+    fn with_config_for_path_returns_correct_plugin_after_redirect() {
+        // The plugin returned by `for_path_with_config` must match the
+        // language the dispatch resolved to (not the default plugin).
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        reg.register(fake(Language::Python, &[".py"])).unwrap();
+        let cfg = ExtensionsConfig {
+            python: vec![".cu".to_string()],
+            ..Default::default()
+        };
+        let plugin = reg
+            .for_path_with_config(Path::new("/x.cu"), &cfg)
+            .expect("additive .cu must resolve to a plugin");
+        assert_eq!(plugin.id(), Language::Python);
+    }
+
+    #[test]
+    fn with_config_extensionless_file_returns_none() {
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg = ExtensionsConfig {
+            cpp: vec![".cu".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            reg.language_for_path_with_config(Path::new("/Makefile"), &cfg)
+                .is_none()
+        );
     }
 }

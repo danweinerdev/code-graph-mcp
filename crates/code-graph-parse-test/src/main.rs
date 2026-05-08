@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use code_graph_core::{DiscoveryConfig, Edge, EdgeKind, Symbol, SymbolKind};
+use code_graph_core::{Edge, EdgeKind, RootConfig, Symbol, SymbolKind};
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
 use code_graph_lang_go::GoParser;
@@ -104,7 +104,7 @@ fn main() -> ExitCode {
     // extension filter in-thread and returns a path-sorted Vec — matching
     // the Go binary's `sort.Strings(files)` ordering so the output diff
     // stays byte-clean.
-    let cfg = DiscoveryConfig::default();
+    let cfg = RootConfig::default();
     let discovered = discover(&dir, &registry, &cfg);
     warnings.extend(discovered.warnings);
 

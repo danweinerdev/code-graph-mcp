@@ -131,7 +131,7 @@ pub fn index_directory(
     cfg: &RootConfig,
     progress: &dyn ProgressSink,
 ) -> Result<(Vec<FileGraph>, Vec<String>), IndexError> {
-    let discovered = discovery::discover(root, registry, &cfg.discovery);
+    let discovered = discovery::discover(root, registry, cfg);
     let mut warnings = discovered.warnings.clone();
 
     let pool = rayon::ThreadPoolBuilder::new()

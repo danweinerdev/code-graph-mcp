@@ -10,6 +10,7 @@
 //! [`std::thread::available_parallelism`] and clamp over-cap pinned values
 //! to the host's logical CPU count.
 
+use crate::Language;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -32,6 +33,8 @@ pub struct RootConfig {
     pub parsing: ParsingConfig,
     #[serde(default)]
     pub cpp: CppConfig,
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
 }
 
 /// Discovery walker tunables. Controls how source files are found and which
@@ -103,6 +106,104 @@ pub struct CppConfig {
     pub macro_strip: Vec<String>,
 }
 
+/// Per-language file-extension overrides.
+///
+/// Layered on top of each plugin's built-in extension list (e.g. C++'s
+/// `.cpp/.cc/.cxx/.c/.h/.hpp/.hxx`). Three behaviors:
+///
+/// - **`<lang>` lists** add extensions to that language's claim. A file
+///   whose extension matches `[extensions].cpp` is dispatched to the C++
+///   plugin even if the C++ plugin's defaults wouldn't have claimed it.
+/// - **A user addition silently wins over a default-claim collision.** If
+///   `[extensions].python = [".h"]` and the C++ plugin's defaults also
+///   claim `.h`, `.h` files dispatch to Python. (The user wrote the
+///   override deliberately.) If two `[extensions].<lang>` lists both
+///   claim the same extension, that's a load-time error — there's no
+///   principled tiebreak.
+/// - **`disabled` lists** suppress extensions entirely. A file whose
+///   extension is in `disabled` is dropped at discovery time regardless
+///   of which plugin or override would otherwise claim it. `disabled`
+///   wins over both defaults and additions.
+///
+/// Each entry must start with `.` and is lowercased at load time.
+/// Empty-string entries are dropped at load time with an `eprintln!`
+/// notice (matching the [`CppConfig::macro_strip`] pattern).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ExtensionsConfig {
+    /// Extensions to skip during discovery, regardless of which language
+    /// would claim them.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// Additional extensions claimed by the C++ plugin.
+    #[serde(default)]
+    pub cpp: Vec<String>,
+    /// Additional extensions claimed by the Rust plugin.
+    #[serde(default)]
+    pub rust: Vec<String>,
+    /// Additional extensions claimed by the Go plugin.
+    #[serde(default)]
+    pub go: Vec<String>,
+    /// Additional extensions claimed by the Python plugin.
+    #[serde(default)]
+    pub python: Vec<String>,
+}
+
+impl ExtensionsConfig {
+    /// Look up an additional-claim extension. Returns the language whose
+    /// `[extensions].<lang>` list contains `ext`, or `None`. The caller
+    /// MUST pass `ext` in canonical form (lowercase, leading `.`) — the
+    /// load-time normalization in [`RootConfig::load`] guarantees the
+    /// stored entries are in this form.
+    pub fn lookup_additional(&self, ext: &str) -> Option<Language> {
+        if self.cpp.iter().any(|e| e == ext) {
+            return Some(Language::Cpp);
+        }
+        if self.rust.iter().any(|e| e == ext) {
+            return Some(Language::Rust);
+        }
+        if self.go.iter().any(|e| e == ext) {
+            return Some(Language::Go);
+        }
+        if self.python.iter().any(|e| e == ext) {
+            return Some(Language::Python);
+        }
+        None
+    }
+
+    /// Returns `true` if `ext` is in the global disabled list. `ext` must
+    /// be in canonical form (lowercase, leading `.`).
+    pub fn is_disabled(&self, ext: &str) -> bool {
+        self.disabled.iter().any(|e| e == ext)
+    }
+
+    /// Iterate every `(label, list)` pair so load-time validation can scan
+    /// each list uniformly. The label is the field name as it appears in
+    /// `.code-graph.toml` (`"disabled"`, `"cpp"`, `"rust"`, `"go"`,
+    /// `"python"`).
+    fn lists_mut(
+        &mut self,
+    ) -> [(&'static str, &mut Vec<String>); 5] {
+        [
+            ("disabled", &mut self.disabled),
+            ("cpp", &mut self.cpp),
+            ("rust", &mut self.rust),
+            ("go", &mut self.go),
+            ("python", &mut self.python),
+        ]
+    }
+
+    /// Iterate every additive `(label, list)` pair (excluding `disabled`)
+    /// for cross-language collision detection.
+    fn additive_lists(&self) -> [(&'static str, &Vec<String>); 4] {
+        [
+            ("cpp", &self.cpp),
+            ("rust", &self.rust),
+            ("go", &self.go),
+            ("python", &self.python),
+        ]
+    }
+}
+
 /// Errors returned by [`RootConfig::load`]. We deliberately split I/O from
 /// TOML parse so callers can distinguish a missing/inaccessible file from a
 /// malformed one.
@@ -116,6 +217,26 @@ pub enum ConfigError {
     /// caller can include the row/column diagnostic in its error response.
     #[error("failed to parse .code-graph.toml: {0}")]
     Toml(#[from] toml::de::Error),
+    /// An entry in `[extensions].<list>` did not start with `.`. Without
+    /// the leading dot the lookup path (`format!(".{ext}")`) would never
+    /// match and the override would silently be a no-op.
+    #[error("invalid extension {extension:?} in [extensions].{list}: must start with '.'")]
+    ExtensionMissingDot {
+        extension: String,
+        list: &'static str,
+    },
+    /// Two `[extensions].<lang>` lists claimed the same extension. Unlike
+    /// an additive vs. default collision (where the additive wins
+    /// deliberately), there's no principled tiebreak between two
+    /// additives, so this is a hard error.
+    #[error(
+        "extension {extension:?} is claimed by both [extensions].{first} and [extensions].{second}"
+    )]
+    ExtensionConflict {
+        extension: String,
+        first: &'static str,
+        second: &'static str,
+    },
 }
 
 impl RootConfig {
@@ -152,6 +273,50 @@ impl RootConfig {
             }
             keep
         });
+
+        // Normalize and validate `[extensions]` lists: drain empties (warn),
+        // require leading dot, lowercase, and reject cross-additive
+        // collisions. Done at load time so the dispatch hot path
+        // (`language_for_path_with_config`) can do plain string compares.
+        for (list_name, list) in parsed.extensions.lists_mut() {
+            list.retain(|s| {
+                let keep = !s.is_empty();
+                if !keep {
+                    eprintln!(
+                        "code-graph-mcp: dropping empty entry from .code-graph.toml [extensions].{list_name}"
+                    );
+                }
+                keep
+            });
+            for ext in list.iter() {
+                if !ext.starts_with('.') {
+                    return Err(ConfigError::ExtensionMissingDot {
+                        extension: ext.clone(),
+                        list: list_name,
+                    });
+                }
+            }
+            for ext in list.iter_mut() {
+                ext.make_ascii_lowercase();
+            }
+        }
+        // Cross-additive collision check. O(n²) over four typically-tiny
+        // lists is fine; nobody adds hundreds of file extensions.
+        let additive = parsed.extensions.additive_lists();
+        for i in 0..additive.len() {
+            for j in (i + 1)..additive.len() {
+                for ext in additive[i].1 {
+                    if additive[j].1.contains(ext) {
+                        return Err(ConfigError::ExtensionConflict {
+                            extension: ext.clone(),
+                            first: additive[i].0,
+                            second: additive[j].0,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(parsed)
     }
 
@@ -441,6 +606,173 @@ mod tests {
             cfg.cpp.macro_strip.is_empty(),
             "explicit empty array must yield empty macro_strip"
         );
+    }
+
+    // --- ExtensionsConfig tests --------------------------------------------
+
+    #[test]
+    fn extensions_config_default_is_empty() {
+        let cfg = RootConfig::default();
+        assert!(cfg.extensions.disabled.is_empty());
+        assert!(cfg.extensions.cpp.is_empty());
+        assert!(cfg.extensions.rust.is_empty());
+        assert!(cfg.extensions.go.is_empty());
+        assert!(cfg.extensions.python.is_empty());
+    }
+
+    #[test]
+    fn extensions_section_absent_yields_default() {
+        // Backward compatibility: `.code-graph.toml` files without an
+        // `[extensions]` section must load cleanly with empty overrides.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".code-graph.toml"), "[discovery]\n").unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load without [extensions]");
+        assert!(cfg.extensions.disabled.is_empty());
+        assert!(cfg.extensions.cpp.is_empty());
+    }
+
+    #[test]
+    fn extensions_additive_lists_lookup_returns_correct_language() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = [".cu", ".inl"]
+python = [".pyx"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load valid additive lists");
+        assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
+        assert_eq!(cfg.extensions.lookup_additional(".inl"), Some(Language::Cpp));
+        assert_eq!(
+            cfg.extensions.lookup_additional(".pyx"),
+            Some(Language::Python)
+        );
+        assert_eq!(cfg.extensions.lookup_additional(".rs"), None);
+    }
+
+    #[test]
+    fn extensions_disabled_list_blocks_dispatch() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+disabled = [".h"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load valid disabled list");
+        assert!(cfg.extensions.is_disabled(".h"));
+        assert!(!cfg.extensions.is_disabled(".cpp"));
+    }
+
+    #[test]
+    fn extensions_normalize_to_lowercase_at_load() {
+        // Users may write `.CU` or `.PyX`; lookup is always lowercase, so
+        // normalization happens once at load.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = [".CU"]
+disabled = [".PNG"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load mixed-case entries");
+        assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
+        assert_eq!(cfg.extensions.disabled, vec![".png".to_string()]);
+    }
+
+    #[test]
+    fn extensions_missing_leading_dot_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = ["cu"]
+"#,
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path()).expect_err("dotless extension must error");
+        match err {
+            ConfigError::ExtensionMissingDot { extension, list } => {
+                assert_eq!(extension, "cu");
+                assert_eq!(list, "cpp");
+            }
+            other => panic!("expected ExtensionMissingDot, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensions_cross_additive_conflict_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = [".x"]
+python = [".x"]
+"#,
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path()).expect_err("cross-additive conflict must error");
+        match err {
+            ConfigError::ExtensionConflict {
+                extension,
+                first,
+                second,
+            } => {
+                assert_eq!(extension, ".x");
+                assert_eq!(first, "cpp");
+                assert_eq!(second, "python");
+            }
+            other => panic!("expected ExtensionConflict, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensions_disabled_overlapping_additive_is_silent_and_disabled_wins() {
+        // Documenting the precedence: if `.cu` is in BOTH `cpp` and
+        // `disabled`, the load succeeds (no conflict error — `disabled` is
+        // not in the additive collision check) and `is_disabled` returns
+        // true. The dispatch in `language_for_path_with_config` checks
+        // `is_disabled` before `lookup_additional`, so the file is dropped.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = [".cu"]
+disabled = [".cu"]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("disabled vs additive overlap is allowed");
+        assert!(cfg.extensions.is_disabled(".cu"));
+        assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
+    }
+
+    #[test]
+    fn extensions_empty_entries_dropped() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[extensions]
+cpp = ["", ".cu", ""]
+disabled = [""]
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
+        assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
+        assert!(cfg.extensions.disabled.is_empty());
     }
 
     #[test]

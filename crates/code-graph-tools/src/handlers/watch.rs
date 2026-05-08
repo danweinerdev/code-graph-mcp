@@ -241,10 +241,6 @@ pub async fn try_reindex_file(
         return ReindexOutcome::LockContended;
     };
 
-    if inner.registry.for_path(path).is_none() {
-        return ReindexOutcome::NotASource;
-    }
-
     // Canonical contract: the watch path uses the cached `inner.config`,
     // not a fresh `RootConfig::load(<root>/.code-graph.toml)` per event.
     // The most recent successful `analyze_codebase` is the source of truth
@@ -256,7 +252,25 @@ pub async fn try_reindex_file(
     // a per-file knob and watch-mode reindex must apply the same
     // substitution the most-recent `analyze_codebase` did. The clone is
     // cheap (`RootConfig` is small) and isolates us from the read-lock.
+    //
+    // The clone now also drives the early-out `for_path_with_config` check
+    // below so `[extensions]` overrides take effect on the watch path
+    // (e.g. a file claimed via `[extensions].cpp = [".cu"]` reindexes;
+    // a file in `[extensions].disabled` does not).
     let cfg_for_blocking = inner.config.read().clone();
+    // Pre-clone the extensions slice so the post-spawn_blocking section
+    // (which re-looks up the plugin to resolve edges) sees the same
+    // override snapshot. `cfg_for_blocking` itself is moved into the
+    // blocking task and cannot be borrowed afterwards.
+    let extensions_for_resolve = cfg_for_blocking.extensions.clone();
+
+    if inner
+        .registry
+        .for_path_with_config(path, &cfg_for_blocking.extensions)
+        .is_none()
+    {
+        return ReindexOutcome::NotASource;
+    }
 
     if is_remove {
         let mut g = inner.graph.write();
@@ -293,7 +307,10 @@ pub async fn try_reindex_file(
     let inner_for_blocking = Arc::clone(inner);
     let path_owned = path.to_path_buf();
     let parse_result: Result<FileGraph, ReindexOutcome> = tokio::task::spawn_blocking(move || {
-        let plugin = match inner_for_blocking.registry.for_path(&path_owned) {
+        let plugin = match inner_for_blocking
+            .registry
+            .for_path_with_config(&path_owned, &cfg_for_blocking.extensions)
+        {
             Some(p) => p,
             None => return Err(ReindexOutcome::NotASource),
         };
@@ -374,8 +391,13 @@ pub async fn try_reindex_file(
     //
     // The plugin re-lookup here mirrors the one in the blocking parse
     // task above. It's bounded (HashMap-of-extensions probe) and avoids
-    // borrowing the registry across the spawn_blocking boundary.
-    let Some(plugin) = inner.registry.for_path(path) else {
+    // borrowing the registry across the spawn_blocking boundary. Uses
+    // the pre-cloned `extensions_for_resolve` so the override snapshot
+    // matches the one the blocking task used.
+    let Some(plugin) = inner
+        .registry
+        .for_path_with_config(path, &extensions_for_resolve)
+    else {
         return ReindexOutcome::NotASource;
     };
     let path_for_ctx = std::path::PathBuf::from(&new_fg.path);
@@ -447,13 +469,24 @@ async fn watch_loop(
 /// [`watch_loop`] so unit tests can exercise the dispatch logic without
 /// constructing a debouncer or channel pair.
 async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>) {
+    // Snapshot the `[extensions]` override slice once per batch so the
+    // upfront filter applies the same overrides `try_reindex_file` will
+    // use. `try_reindex_file` re-reads `inner.config` itself, so any
+    // mid-batch config change between this snapshot and the call still
+    // produces a correct result; the snapshot here just keeps the cheap
+    // filter consistent within the batch.
+    let extensions = inner.config.read().extensions.clone();
     for evt in evts {
         let is_remove = matches!(evt.event.kind, EventKind::Remove(_));
         for path in &evt.event.paths {
             // Filter to source paths up-front so we don't pay
             // `index_lock.try_lock` for every random `.swp` an editor
             // touches. `try_reindex_file` re-checks defensively.
-            if inner.registry.for_path(path).is_none() {
+            if inner
+                .registry
+                .for_path_with_config(path, &extensions)
+                .is_none()
+            {
                 continue;
             }
             let outcome = try_reindex_file(inner, path, is_remove).await;

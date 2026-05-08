@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{DiscoveryConfig, Language};
+use code_graph_core::{Language, RootConfig};
 use code_graph_lang::LanguageRegistry;
 
 /// One source file located by the walker.
@@ -47,24 +47,26 @@ pub struct Discovered {
 }
 
 /// Walk `root` in parallel and return every file whose extension is claimed
-/// by a plugin in `registry`.
+/// by a plugin in `registry` (after applying `cfg.extensions` overrides).
 ///
-/// The walker spawns `cfg.max_threads` workers (or `ignore`'s default
-/// heuristic when `cfg.max_threads == 0`), filters by extension in-thread,
-/// and collects results via `crossbeam_channel::unbounded`. Walk errors
-/// (permission denied, glob failures, broken symlinks) become `String`
-/// warnings on the returned [`Discovered`] rather than aborting the walk.
+/// The walker spawns `cfg.discovery.max_threads` workers (or `ignore`'s
+/// default heuristic when `0`), filters by extension in-thread via
+/// [`LanguageRegistry::language_for_path_with_config`] so the per-root
+/// `[extensions]` config takes effect, and collects results via
+/// `crossbeam_channel::unbounded`. Walk errors (permission denied, glob
+/// failures, broken symlinks) become `String` warnings on the returned
+/// [`Discovered`] rather than aborting the walk.
 ///
 /// Results are sorted by path before returning so the binary output is
 /// reproducible across runs and matches the Go binary's
 /// `sort.Strings(files)` ordering byte-for-byte.
-pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig) -> Discovered {
+pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &RootConfig) -> Discovered {
     let (file_tx, file_rx) = crossbeam_channel::unbounded::<DiscoveredFile>();
     let (warn_tx, warn_rx) = crossbeam_channel::unbounded::<String>();
 
     let mut builder = ignore::WalkBuilder::new(root);
     builder
-        .threads(cfg.max_threads)
+        .threads(cfg.discovery.max_threads)
         // standard_filters(true) enables hidden+parents+ignore+git_ignore+
         // git_global+git_exclude as a group; (false) disables them. We
         // override `hidden(false)` afterwards so dotfile directories are
@@ -72,8 +74,8 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig)
         // the Go binary's behavior. (When respect_gitignore=false, the
         // explicit hidden(false) call below is redundant but kept
         // unconditionally for simplicity.)
-        .standard_filters(cfg.respect_gitignore)
-        .follow_links(cfg.follow_symlinks)
+        .standard_filters(cfg.discovery.respect_gitignore)
+        .follow_links(cfg.discovery.follow_symlinks)
         .hidden(false)
         // By default, the `ignore` crate only honors `.gitignore` when a
         // `.git` directory is present. Users routinely point this binary
@@ -84,10 +86,10 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig)
 
     // extra_ignore patterns: feed through OverrideBuilder with `!` prefix
     // (which inverts override→ignore semantics, per the ignore-crate docs).
-    if !cfg.extra_ignore.is_empty() {
+    if !cfg.discovery.extra_ignore.is_empty() {
         let mut ob = ignore::overrides::OverrideBuilder::new(root);
         let mut had_globs = false;
-        for pat in &cfg.extra_ignore {
+        for pat in &cfg.discovery.extra_ignore {
             // If the user already wrote a `!`-prefixed pattern, pass it
             // through verbatim; otherwise prepend `!` to mark it as an
             // ignore.
@@ -124,7 +126,9 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig)
             match entry {
                 Ok(e) => {
                     if e.file_type().is_some_and(|ft| ft.is_file()) {
-                        if let Some(lang) = registry.language_for_path(e.path()) {
+                        if let Some(lang) =
+                            registry.language_for_path_with_config(e.path(), &cfg.extensions)
+                        {
                             let path = e.into_path();
                             let _ = file_tx.send(DiscoveredFile {
                                 path,
@@ -163,10 +167,21 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &DiscoveryConfig)
 mod tests {
     use super::*;
     use code_graph_core::{FileGraph, Language};
+    use code_graph_core::DiscoveryConfig;
     use code_graph_lang::{LanguagePlugin, ParseError};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// Wrap a [`DiscoveryConfig`] in a [`RootConfig`] for the test call sites
+    /// — `discover()` now takes the full root config so it can apply
+    /// `[extensions]` overrides during the walk.
+    fn root(discovery: DiscoveryConfig) -> RootConfig {
+        RootConfig {
+            discovery,
+            ..Default::default()
+        }
+    }
 
     /// Test plugin claiming a fixed extension list. Reused by every
     /// fixture in this module.
@@ -221,7 +236,7 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         let names: Vec<String> = result
             .files
@@ -246,7 +261,7 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         let paths: Vec<String> = result
             .files
@@ -275,7 +290,7 @@ mod tests {
             respect_gitignore: false,
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         let paths: Vec<String> = result
             .files
@@ -303,7 +318,7 @@ mod tests {
             extra_ignore: vec!["build/**".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         let paths: Vec<String> = result
             .files
@@ -331,7 +346,7 @@ mod tests {
             extra_ignore: vec!["!build/**".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         let paths: Vec<String> = result
             .files
@@ -356,7 +371,7 @@ mod tests {
             extra_ignore: vec!["[".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         // The walk still produced files.
         assert!(
@@ -391,7 +406,7 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         // Exactly one a.cpp; no infinite recursion through the symlink.
         let count = result
@@ -420,7 +435,7 @@ mod tests {
             max_threads: 0,
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
         assert_eq!(
             result.files.len(),
             2,
@@ -450,7 +465,7 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         // Restore permissions before any assertion can fail and leave the
         // tempdir un-cleanable.
@@ -497,7 +512,7 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &cfg);
+        let result = discover(dir.path(), &reg, &root(cfg));
 
         assert_eq!(
             result.files.len(),
@@ -543,7 +558,7 @@ mod tests {
         let cfg = DiscoveryConfig::default();
 
         let t0 = Instant::now();
-        let parallel = discover(dir.path(), &reg, &cfg);
+        let parallel = discover(dir.path(), &reg, &root(cfg));
         let parallel_dt = t0.elapsed();
 
         let t1 = Instant::now();

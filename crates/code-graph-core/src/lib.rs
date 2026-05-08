@@ -14,7 +14,7 @@
 
 mod config;
 
-pub use config::{ConfigError, DiscoveryConfig, ParsingConfig, RootConfig};
+pub use config::{ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, RootConfig};
 
 use serde::{Deserialize, Serialize};
 

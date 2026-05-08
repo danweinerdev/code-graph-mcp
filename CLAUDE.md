@@ -133,6 +133,31 @@ max_threads = 0
 # With the list above, `class CORE_API AActor : public UObject {};` extracts
 # correctly as a Class symbol with a UObject `Inherits` edge.
 macro_strip = []
+
+[extensions]
+# Per-language file-extension overrides, layered on top of each plugin's
+# built-in extension list. Three semantics:
+#
+#   1. <lang> lists ADD extensions to that language's claim. A file matching
+#      `[extensions].cpp` dispatches to the C++ plugin even when no
+#      plugin's defaults claim it.
+#   2. A user addition WINS over a default-claim collision. If
+#      `[extensions].python = [".h"]`, `.h` files dispatch to Python even
+#      though C++ defaults claim `.h`. Two `[extensions].<lang>` lists
+#      claiming the same extension is a load-time error (no tiebreak).
+#   3. `disabled` SUPPRESSES extensions entirely, regardless of which
+#      plugin or override would claim them. `disabled` wins over both
+#      defaults and additions.
+#
+# Each entry must start with `.` and is lowercased at load. Empty strings
+# are dropped with an `eprintln!` notice. Built-in defaults per language:
+# cpp = [.cpp .cc .cxx .c .h .hpp .hxx], rust = [.rs], go = [.go],
+# python = [.py .pyi].
+disabled = []
+cpp = []
+rust = []
+go = []
+python = []
 ```
 
 A sample `.code-graph.toml.example` ships at the repo root; copy it to `.code-graph.toml` in any indexed root and customize as needed.
@@ -140,6 +165,8 @@ A sample `.code-graph.toml.example` ships at the repo root; copy it to `.code-gr
 ### Cache invalidation
 
 Changes to `[cpp].macro_strip` between `analyze_codebase` calls do NOT retroactively re-parse files whose mtime is unchanged (the cache uses mtime-based stale checking). To apply a new `macro_strip` list to already-indexed files, re-run `analyze_codebase` with `force=true`.
+
+Same caveat applies to `[extensions]` changes. Adding a new extension to `[extensions].<lang>` brings new files into discovery and they're parsed normally. But moving an extension *into* `[extensions].disabled` does NOT remove already-cached entries for those files — the cache file retains them until re-run with `force=true`. The watch path picks up `[extensions]` changes immediately for new events (it consults the cached `RootConfig`'s extensions slice on every reindex), so files that move into `disabled` simply stop reindexing on subsequent edits, but their pre-existing graph entries persist until the next forced rebuild.
 
 ## MCP Tools (15 total)
 
