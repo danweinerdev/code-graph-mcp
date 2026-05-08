@@ -134,7 +134,9 @@ impl JavaParser {
             edges: Vec::new(),
         };
 
-        // Extractors land in 3.2-3.5:
+        // Extractors land in 3.2-3.5. The 3.2 implementer should rebind
+        // `_tree` to `tree` and pull `let root = tree.root_node();`,
+        // then call:
         //   self.extract_definitions(root, content, &path_str, &mut fg);
         //   self.extract_calls(root, content, &path_str, &mut fg);
         //   self.extract_imports(root, content, &path_str, &mut fg);

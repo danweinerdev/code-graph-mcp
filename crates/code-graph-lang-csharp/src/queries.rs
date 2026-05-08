@@ -10,18 +10,18 @@
 
 /// Query for class/struct/interface/enum/method/constructor/free-function
 /// definitions. Filled in Phase 2.2.
-pub const DEFINITION_QUERY: &str = "";
+pub(crate) const DEFINITION_QUERIES: &str = "";
 
 /// Query for `invocation_expression` and `object_creation_expression`
 /// (constructor calls). Filled in Phase 2.3.
-pub const CALL_QUERY: &str = "";
+pub(crate) const CALL_QUERIES: &str = "";
 
 /// Query for `using_directive` in all forms (plain, `using static`,
 /// alias, `global using`). Filled in Phase 2.4.
-pub const IMPORT_QUERY: &str = "";
+pub(crate) const IMPORT_QUERIES: &str = "";
 
 /// Query for `base_list` on classes, structs, and interfaces. C# does not
 /// syntactically distinguish class extension from interface implementation
 /// in the base list — both produce `Inherits` edges per Decision 2. Filled
 /// in Phase 2.5.
-pub const INHERITANCE_QUERY: &str = "";
+pub(crate) const INHERITANCE_QUERIES: &str = "";

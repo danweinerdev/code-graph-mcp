@@ -66,7 +66,7 @@ use code_graph_core::{FileGraph, Language};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use tree_sitter::{Language as TsLanguage, Query};
 
-use crate::queries::{CALL_QUERY, DEFINITION_QUERY, IMPORT_QUERY, INHERITANCE_QUERY};
+use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITANCE_QUERIES};
 
 /// File extensions the C# parser claims. Single extension `.cs` —
 /// C# does not have a stub-file analogue (no `.pyi`-equivalent), and
@@ -80,23 +80,26 @@ pub const EXTENSIONS: &[&str] = &[".cs"];
 ///
 /// Construct with [`CSharpParser::new`]; share across threads (queries
 /// are `Send + Sync`).
+//
+// 2.1 NOTE: `language` and the four `Query` fields are cached but not
+// yet read by `parse_to_filegraph` — the extractors that consume them
+// land in 2.2-2.5. The `#[allow(dead_code)]` annotation is a
+// one-task-only suppression: 2.2 wires `def_query` into
+// `extract_definitions` and removes this annotation as part of that
+// task. The same applies field-by-field through 2.5.
+#[allow(dead_code)]
 pub struct CSharpParser {
     /// Compiled C# grammar. Held so per-call [`tree_sitter::Parser`]
     /// instances built inside `parse_file` can attach to it without
     /// rebuilding the `LanguageFn`.
-    #[allow(dead_code)] // Used by Phases 2.2-2.5 extractors.
     language: TsLanguage,
     /// Compiled definition query (wired in 2.2).
-    #[allow(dead_code)]
     def_query: Query,
     /// Compiled call query (wired in 2.3).
-    #[allow(dead_code)]
     call_query: Query,
     /// Compiled import query (wired in 2.4).
-    #[allow(dead_code)]
     import_query: Query,
     /// Compiled inheritance query (wired in 2.5).
-    #[allow(dead_code)]
     inheritance_query: Query,
 }
 
@@ -114,13 +117,13 @@ impl CSharpParser {
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_c_sharp::LANGUAGE.into();
 
-        let def_query = Query::new(&language, DEFINITION_QUERY)
+        let def_query = Query::new(&language, DEFINITION_QUERIES)
             .map_err(|e| anyhow::anyhow!("definition query: {e}"))?;
         let call_query =
-            Query::new(&language, CALL_QUERY).map_err(|e| anyhow::anyhow!("call query: {e}"))?;
-        let import_query = Query::new(&language, IMPORT_QUERY)
+            Query::new(&language, CALL_QUERIES).map_err(|e| anyhow::anyhow!("call query: {e}"))?;
+        let import_query = Query::new(&language, IMPORT_QUERIES)
             .map_err(|e| anyhow::anyhow!("import query: {e}"))?;
-        let inheritance_query = Query::new(&language, INHERITANCE_QUERY)
+        let inheritance_query = Query::new(&language, INHERITANCE_QUERIES)
             .map_err(|e| anyhow::anyhow!("inheritance query: {e}"))?;
 
         Ok(Self {
