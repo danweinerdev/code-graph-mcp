@@ -27,6 +27,28 @@ No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter 
 
 Run `make install-hooks` once after cloning. This sets `git config core.hooksPath scripts/hooks`, pointing git at the tracked hook scripts under `scripts/hooks/` so commits run pre-commit checks automatically. Currently the only check is `make snapshot-clean` — a `git commit` is refused if any `*.snap.new` files remain in the working tree (run `cargo insta review` to accept or reject pending snapshots first). Bypass with `git commit --no-verify` only when you understand the consequences (committing with pending snapshots means the recorded snapshot is stale and CI will fail on a clean checkout).
 
+### Optional: dogfood-baseline submodules
+
+Each language plugin has a dogfood-baseline test that parses a real upstream repo and asserts the symbol count stays within ±10% of a recorded baseline. The repos are git submodules under `external/`, pinned by tag. Tests **auto-skip** with an `eprintln!` setup hint when the submodule is not initialized — they do NOT panic and do NOT need `--ignored` to opt in. Run them by initializing the submodule(s) you care about:
+
+```bash
+make submodules                                       # init all six (shallow clones)
+git submodule update --init external/ripgrep          # or just one
+```
+
+| Language | Submodule | Pin | Baseline file |
+|----------|-----------|-----|---------------|
+| Rust | `external/ripgrep` (BurntSushi/ripgrep) | `15.1.0` | `testdata/rust/ripgrep-baseline.txt` |
+| Go | `external/logrus` (sirupsen/logrus) | `v1.9.4` | `testdata/go/logrus-baseline.txt` |
+| Python | `external/requests` (psf/requests) | `v2.33.1` | `testdata/python/requests-baseline.txt` |
+| C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/codegraph-lang-cpp/tests/baselines/fmt.txt` |
+| C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/codegraph-lang-cpp/tests/baselines/curl.txt` |
+| C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/codegraph-lang-cpp/tests/baselines/abseil-cpp.txt` |
+
+**Drift expectation when bumping a submodule SHA:** the symbol count almost always shifts. Re-measure with the bumped SHA and update the baseline file's `symbols: N` line + the `tag:` / `commit:` headers in the same commit as the SHA bump. The baseline assertion uses ±10% tolerance, so small drift may pass without an update — but the headers should still match the pinned commit so future readers can tell what was measured. The fmt/curl/abseil baselines deliberately live next to their tests under `crates/codegraph-lang-cpp/tests/baselines/` rather than `testdata/cpp/` because they're tied to the `external/` submodule version, not the in-tree synthetic fixtures the rest of `testdata/cpp/` covers.
+
+curl is primarily C; tree-sitter-cpp parses C as a (mostly compatible) superset and the C++ plugin filters out ERROR nodes, so the per-file parse always succeeds even when the file uses idiomatic C constructs. The aggregate symbol count is the regression contract — whatever tree-sitter-cpp could extract is what the baseline locks in.
+
 ## Test
 
 ```bash
