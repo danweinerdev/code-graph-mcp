@@ -316,7 +316,7 @@ impl RootConfig {
                 ext.make_ascii_lowercase();
             }
         }
-        // Cross-additive collision check. O(n²) over four typically-tiny
+        // Cross-additive collision check. O(n²) over six typically-tiny
         // lists is fine; nobody adds hundreds of file extensions.
         let additive = parsed.extensions.additive_lists();
         for i in 0..additive.len() {

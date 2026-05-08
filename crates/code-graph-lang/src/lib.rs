@@ -1049,6 +1049,35 @@ mod tests {
     }
 
     #[test]
+    fn with_config_disabled_blocks_java_additive_claim() {
+        // Symmetric to with_config_disabled_blocks_csharp_additive_claim:
+        // pins the same disabled-precedence contract for the Java additive
+        // list. Documents that the dispatch behavior is uniform across
+        // both new languages.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        let cfg_additive_only = ExtensionsConfig {
+            java: vec![".java".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.java"), &cfg_additive_only),
+            Some(Language::Java),
+            "additive java must claim .java when not disabled"
+        );
+        let cfg = ExtensionsConfig {
+            java: vec![".java".to_string()],
+            disabled: vec![".java".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.language_for_path_with_config(Path::new("/x.java"), &cfg),
+            None,
+            "disabled must win over java additive"
+        );
+    }
+
+    #[test]
     fn with_config_extensionless_file_returns_none() {
         let mut reg = LanguageRegistry::new();
         reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
