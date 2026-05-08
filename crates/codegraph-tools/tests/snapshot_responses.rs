@@ -420,42 +420,15 @@ async fn response_get_orphans_offset_beyond_total() {
 /// snapshot to exercise the handler's sort+slice path against a known
 /// cardinality.
 async fn build_indexed_fixture_with_many_orphans(n: usize) -> IndexedFixture {
-    let dir = TempDir::new().expect("TempDir for many-orphans fixture");
+    // Each function is a free, parameterless, void-returning function
+    // with no body content — all become orphans because nothing calls
+    // them. Zero-padded to 3 digits so symbol_id ascending sort order
+    // is predictable in the snapshot.
     let mut source = String::new();
     for i in 0..n {
-        // Each function is a free, parameterless, void-returning function
-        // with no body content — all become orphans because nothing calls
-        // them. Zero-padded to 3 digits so symbol_id ascending sort order
-        // is predictable in the snapshot.
         source.push_str(&format!("void func_{i:03}() {{}}\n"));
     }
-    std::fs::write(dir.path().join("orphans.cpp"), source).expect("write orphans.cpp");
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
-
-    let mut registry = LanguageRegistry::new();
-    registry
-        .register(Box::new(CppParser::new().expect("CppParser::new")))
-        .expect("register CppParser");
-    let server = CodeGraphServer::new(registry);
-
-    let r = analyze_codebase(
-        server.inner.clone(),
-        indexed_root.to_string_lossy().into_owned(),
-        true,
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        r.is_error.is_none() || r.is_error == Some(false),
-        "analyze_codebase failed: {r:?}",
-    );
-    IndexedFixture {
-        _dir: dir,
-        indexed_root,
-        inner: server.inner.clone(),
-    }
+    build_cpp_only_fixture(&[("orphans.cpp", &source)]).await
 }
 
 // --- Phase 3 paginated-offset snapshots ----------------------------------
@@ -471,38 +444,11 @@ async fn build_indexed_fixture_with_many_orphans(n: usize) -> IndexedFixture {
 /// zero-padded so `symbol_id` ascending order is predictable in the
 /// snapshot.
 async fn build_indexed_fixture_with_many_file_symbols(n: usize) -> IndexedFixture {
-    let dir = TempDir::new().expect("TempDir for many-file-symbols fixture");
     let mut source = String::new();
     for i in 0..n {
         source.push_str(&format!("void func_{i:03}() {{}}\n"));
     }
-    std::fs::write(dir.path().join("big.cpp"), source).expect("write big.cpp");
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
-
-    let mut registry = LanguageRegistry::new();
-    registry
-        .register(Box::new(CppParser::new().expect("CppParser::new")))
-        .expect("register CppParser");
-    let server = CodeGraphServer::new(registry);
-
-    let r = analyze_codebase(
-        server.inner.clone(),
-        indexed_root.to_string_lossy().into_owned(),
-        true,
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        r.is_error.is_none() || r.is_error == Some(false),
-        "analyze_codebase failed: {r:?}",
-    );
-    IndexedFixture {
-        _dir: dir,
-        indexed_root,
-        inner: server.inner.clone(),
-    }
+    build_cpp_only_fixture(&[("big.cpp", &source)]).await
 }
 
 /// Build an indexed fixture with a single hub symbol `target` that is
@@ -512,7 +458,6 @@ async fn build_indexed_fixture_with_many_file_symbols(n: usize) -> IndexedFixtur
 /// a deterministic page-2 slice. The depth=1 fan is wide enough (>50) to
 /// exercise the limit=50 page semantics.
 async fn build_indexed_fixture_with_high_fan() -> IndexedFixture {
-    let dir = TempDir::new().expect("TempDir for high-fan fixture");
     let n = 60;
     let mut source = String::new();
     // Hub symbols.
@@ -531,7 +476,31 @@ async fn build_indexed_fixture_with_high_fan() -> IndexedFixture {
     for i in 0..n {
         source.push_str(&format!("void callee_{i:03}() {{}}\n"));
     }
-    std::fs::write(dir.path().join("hub.cpp"), source).expect("write hub.cpp");
+    build_cpp_only_fixture(&[("hub.cpp", &source)]).await
+}
+
+/// Shared workhorse for the three Phase 3 paginated-fixture builders
+/// (`build_indexed_fixture_with_many_orphans`,
+/// `build_indexed_fixture_with_many_file_symbols`,
+/// `build_indexed_fixture_with_high_fan`).
+///
+/// Writes the supplied `(filename, content)` pairs into a fresh TempDir,
+/// canonicalizes the root, registers a C++-only `LanguageRegistry`, and
+/// invokes `analyze_codebase` with `force=true`. Returns the populated
+/// `IndexedFixture` ready for tool dispatch.
+///
+/// Scoped to C++ on purpose: every caller is a C++-only paginated-tool
+/// snapshot. The three other fixture builders in this file use different
+/// registry shapes (multi-language, Go-only, Python-only) and would not
+/// benefit from this helper without parameterizing the registry — out of
+/// scope for the retro's stated consolidation. If a fourth C++-only
+/// paginated fixture lands, it should call this helper too.
+async fn build_cpp_only_fixture(files: &[(&str, &str)]) -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for fixture");
+    for (name, content) in files {
+        std::fs::write(dir.path().join(name), content)
+            .unwrap_or_else(|e| panic!("write {name}: {e}"));
+    }
     let indexed_root =
         std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
 
