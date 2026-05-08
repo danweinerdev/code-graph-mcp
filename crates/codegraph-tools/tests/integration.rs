@@ -88,14 +88,21 @@ async fn analyze_then_query_pipeline() {
         "engine.cpp has at least one resolved include",
     );
 
-    // detect_cycles surfaces the circular_a/circular_b cycle.
-    let cycles = detect_cycles(&server.inner.graph);
+    // detect_cycles surfaces the circular_a/circular_b cycle. Wrapped in
+    // the Page<Vec<String>> envelope post-Phase 5 of the deferred-items
+    // ship — the cycle is in `results[0]`, count in `total`.
+    let cycles = detect_cycles(&server.inner.graph, None, None);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&cycles)).unwrap();
-    let arr = parsed.as_array().expect("array of cycles");
+    let arr = parsed["results"].as_array().expect("results array");
     assert_eq!(
         arr.len(),
         1,
         "testdata/cpp has exactly one circular include cycle (circular_a/b)",
+    );
+    assert_eq!(
+        parsed["total"].as_u64().unwrap(),
+        1,
+        "total reports the full cycle count",
     );
 }
 

@@ -23,26 +23,67 @@ use super::{
 
 // ----- detect_cycles -----
 
-/// `detect_cycles` body. No params. Returns the SCCs (size > 1) of the
-/// include graph as a JSON array of arrays of file path strings. An
-/// empty result serializes as `[]` (never `null`) — the Vec wrapper
-/// guarantees this without extra coercion.
-pub fn detect_cycles(graph: &RwLock<Graph>) -> CallToolResult {
+/// `detect_cycles` body. Returns the SCCs (size > 1) of the include
+/// graph wrapped in the shared [`Page`] envelope so a UE-scale codebase
+/// with many circular includes doesn't blow the MCP token ceiling.
+///
+/// Each cycle is a `Vec<String>` of file path strings (PathBuf →
+/// String via `to_string_lossy` for cross-platform stability). For
+/// deterministic pagination the inner cycle paths are sorted, then the
+/// outer cycle list is sorted by each cycle's first path — Tarjan's
+/// SCC output order is stable per build but not lexicographic, so we
+/// canonicalize both axes to keep page boundaries reproducible.
+///
+/// Defaults: `limit = 20`, `offset = 0`. `limit = 0` resolves to 20
+/// (mirrors `search_symbols` / `get_orphans`); `limit` clamps at 1000.
+/// `offset >= total` returns an empty `results` page with the correct
+/// `total`.
+pub fn detect_cycles(
+    graph: &RwLock<Graph>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> CallToolResult {
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
     let cycles: Vec<Vec<PathBuf>> = graph.read().detect_cycles();
+
     // Convert PathBuf -> String for stable JSON output. PathBuf serializes
     // through serde as `String` on Unix, but going through to_string_lossy
     // makes the conversion explicit and is robust on platforms whose
-    // OsStr is not UTF-8 (Windows).
-    let stringified: Vec<Vec<String>> = cycles
+    // OsStr is not UTF-8 (Windows). Sort within each cycle for canonical
+    // representation.
+    let mut stringified: Vec<Vec<String>> = cycles
         .into_iter()
         .map(|cycle| {
-            cycle
+            let mut paths: Vec<String> = cycle
                 .into_iter()
                 .map(|p| p.to_string_lossy().into_owned())
-                .collect()
+                .collect();
+            paths.sort();
+            paths
         })
         .collect();
-    tool_success_json(&stringified)
+
+    // Sort outer Vec by the first path in each cycle. The cycles are
+    // already canonical-sorted internally, so first-path is stable. This
+    // makes page 1 + page 2 partition deterministically across calls.
+    stringified.sort_by(|a, b| a.first().cmp(&b.first()));
+
+    let total = stringified.len() as u32;
+    let results: Vec<Vec<String>> = stringified
+        .into_iter()
+        .skip(resolved_offset as usize)
+        .take(resolved_limit as usize)
+        .collect();
+
+    let response = Page::<Vec<String>> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+    };
+    tool_success_json(&response)
 }
 
 // ----- get_orphans -----
@@ -457,17 +498,45 @@ mod tests {
 
     // --- detect_cycles ---
 
-    #[test]
-    fn detect_cycles_empty_graph_returns_empty_array() {
-        let g = locked(Graph::new());
-        let r = detect_cycles(&g);
-        assert!(r.is_error.is_none() || r.is_error == Some(false));
-        // Empty Vec must serialize as `[]`, never `null`.
-        assert_eq!(body_text(&r), "[]");
+    /// Build a graph with `n` independent 2-node cycles: each pair
+    /// `cycle_NNN_a.h <-> cycle_NNN_b.h` includes the other but no
+    /// other file. Used by the pagination tests to assert page-1+page-2
+    /// partitioning across a known cycle count.
+    fn graph_with_n_cycles(n: usize) -> Graph {
+        let mut g = Graph::new();
+        for i in 0..n {
+            let a = format!("/cycle_{i:03}_a.h");
+            let b = format!("/cycle_{i:03}_b.h");
+            g.merge_file_graph(FileGraph {
+                path: a.clone(),
+                language: Language::Cpp,
+                symbols: vec![],
+                edges: vec![include_edge(&a, &b)],
+            });
+            g.merge_file_graph(FileGraph {
+                path: b.clone(),
+                language: Language::Cpp,
+                symbols: vec![],
+                edges: vec![include_edge(&b, &a)],
+            });
+        }
+        g
     }
 
     #[test]
-    fn detect_cycles_acyclic_graph_returns_empty_array() {
+    fn detect_cycles_empty_graph_returns_empty_envelope() {
+        let g = locked(Graph::new());
+        let r = detect_cycles(&g, None, None);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn detect_cycles_acyclic_graph_returns_empty_envelope() {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/a.h".to_string(),
@@ -482,12 +551,14 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = detect_cycles(&g);
-        assert_eq!(body_text(&r), "[]");
+        let r = detect_cycles(&g, None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
-    fn detect_cycles_two_node_cycle_returns_array_of_paths() {
+    fn detect_cycles_two_node_cycle_returns_envelope_with_one_cycle() {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/a.h".to_string(),
@@ -502,15 +573,81 @@ mod tests {
             edges: vec![include_edge("/b.h", "/a.h")],
         });
         let g = locked(g);
-        let r = detect_cycles(&g);
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "exactly one cycle");
+        let r = detect_cycles(&g, None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 1, "exactly one cycle in results");
+        assert_eq!(total, 1, "total reports the full cycle count");
         let cycle = arr[0].as_array().unwrap();
         assert_eq!(cycle.len(), 2);
-        let mut names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
-        names.sort();
+        // Inner cycle paths sorted in canonical order, no need to sort here.
+        let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(names, vec!["/a.h", "/b.h"]);
+    }
+
+    #[test]
+    fn detect_cycles_default_limit_is_20() {
+        let g = locked(graph_with_n_cycles(25));
+        let r = detect_cycles(&g, None, None);
+        let (arr, total, _, limit) = page_parts(&r);
+        assert_eq!(arr.len(), 20);
+        assert_eq!(total, 25);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn detect_cycles_page_1_and_page_2_cover_full_set_no_overlap() {
+        let g = locked(graph_with_n_cycles(30));
+        let r1 = detect_cycles(&g, Some(20), Some(0));
+        let (arr1, total1, _, _) = page_parts(&r1);
+        let r2 = detect_cycles(&g, Some(20), Some(20));
+        let (arr2, total2, _, _) = page_parts(&r2);
+        assert_eq!(total1, 30);
+        assert_eq!(total2, 30, "total invariant across pages");
+        assert_eq!(arr1.len(), 20);
+        assert_eq!(arr2.len(), 10);
+        // Outer sort is by each cycle's first path; concat must produce no
+        // duplicates and span the full 30-cycle set.
+        let mut all_first_paths: Vec<String> = arr1
+            .iter()
+            .chain(arr2.iter())
+            .map(|c| c.as_array().unwrap()[0].as_str().unwrap().to_string())
+            .collect();
+        let len_before_dedup = all_first_paths.len();
+        all_first_paths.sort();
+        all_first_paths.dedup();
+        assert_eq!(
+            all_first_paths.len(),
+            len_before_dedup,
+            "no overlap between pages"
+        );
+        assert_eq!(all_first_paths.len(), 30, "pages cover the full cycle set");
+    }
+
+    #[test]
+    fn detect_cycles_offset_beyond_total_returns_empty_envelope() {
+        let g = locked(graph_with_n_cycles(3));
+        let r = detect_cycles(&g, None, Some(999));
+        let (arr, total, offset, _) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 3, "total still reports full cycle count");
+        assert_eq!(offset, 999);
+    }
+
+    #[test]
+    fn detect_cycles_limit_clamps_at_1000() {
+        let g = locked(graph_with_n_cycles(3));
+        let r = detect_cycles(&g, Some(999_999), None);
+        let (arr, _, _, limit) = page_parts(&r);
+        assert_eq!(limit, 1000, "echo the clamped limit");
+        assert_eq!(arr.len(), 3, "all 3 cycles returned when data < cap");
+    }
+
+    #[test]
+    fn detect_cycles_zero_limit_uses_default() {
+        let g = locked(graph_with_n_cycles(3));
+        let r = detect_cycles(&g, Some(0), None);
+        let (_, _, _, limit) = page_parts(&r);
+        assert_eq!(limit, 20);
     }
 
     // --- get_orphans ---

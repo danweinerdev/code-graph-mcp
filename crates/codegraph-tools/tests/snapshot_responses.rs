@@ -322,45 +322,16 @@ async fn response_get_dependencies_engine_cpp() {
 #[tokio::test]
 async fn response_detect_cycles() {
     let fx = build_indexed_fixture().await;
-    let r = detect_cycles(&fx.inner.graph);
-    // `detect_cycles` returns a Vec<Vec<String>>; sort the inner cycles for
-    // determinism (DFS visit order can flip pair direction across runs).
-    let body = first_text(&r);
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).expect("detect_cycles response is JSON");
-    let normalized = match parsed {
-        serde_json::Value::Array(outer) => {
-            let mut cycles: Vec<serde_json::Value> = outer
-                .into_iter()
-                .map(|cycle| {
-                    if let serde_json::Value::Array(mut inner) = cycle {
-                        inner
-                            .sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
-                        serde_json::Value::Array(inner)
-                    } else {
-                        cycle
-                    }
-                })
-                .collect();
-            cycles.sort_by(|a, b| {
-                let ka = a
-                    .as_array()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or_default();
-                let kb = b
-                    .as_array()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or_default();
-                ka.as_str().unwrap_or("").cmp(kb.as_str().unwrap_or(""))
-            });
-            serde_json::Value::Array(cycles)
-        }
-        other => other,
-    };
+    let r = detect_cycles(&fx.inner.graph, None, None);
+    // The handler now sorts each cycle's inner paths in canonical order
+    // and sorts the outer cycle list by first path, then wraps in the
+    // shared Page<Vec<String>> envelope. Sort discipline lives in the
+    // handler now; the test-time normalize that used to sort here is no
+    // longer needed. `parsed_sorted` still normalizes object key order
+    // (the envelope itself).
+    let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
-        insta::assert_json_snapshot!(normalized);
+        insta::assert_json_snapshot!(parsed);
     });
 }
 

@@ -315,6 +315,16 @@ pub struct GetDependenciesArgs {
     pub file: String,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DetectCyclesArgs {
+    #[schemars(description = "Maximum cycles to return (default 20, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N cycles for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetOrphansArgs {
     #[schemars(description = "Filter by symbol kind: function, method (default: all callables)")]
@@ -545,15 +555,21 @@ impl CodeGraphServer {
 
     // -- P1+P2 + watch (Phase 3.5) -----------------------------------------
 
-    #[tool(description = "Detect circular include dependencies in the indexed codebase")]
+    #[tool(
+        description = "Detect circular include dependencies (strongly-connected components of the include graph). Returns paginated results in the {results, total, offset, limit} envelope; each `results[i]` is a Vec<String> of file paths in one cycle. Cycles are sorted internally by path; the outer list is sorted by each cycle's first path so pagination is deterministic across calls. Default limit 20 (max 1000); raise `limit` (toward the 1000 cap) when investigating cycle counts on large codebases, use `offset` to page through. Cycles are rare in well-maintained codebases, so the default is small."
+    )]
     async fn detect_cycles(
         &self,
-        Parameters(_args): Parameters<EmptyParams>,
+        Parameters(args): Parameters<DetectCyclesArgs>,
     ) -> Result<CallToolResult, McpError> {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        Ok(handlers::structure::detect_cycles(&self.inner.graph))
+        Ok(handlers::structure::detect_cycles(
+            &self.inner.graph,
+            args.limit,
+            args.offset,
+        ))
     }
 
     #[tool(
@@ -965,7 +981,7 @@ mod tests {
     async fn detect_cycles_requires_indexed_before_running() {
         let server = empty_server();
         let r = server
-            .detect_cycles(Parameters(EmptyParams::default()))
+            .detect_cycles(Parameters(DetectCyclesArgs::default()))
             .await
             .expect("tool-level errors return Ok(CallToolResult)");
         assert_eq!(r.is_error, Some(true));
@@ -1118,10 +1134,11 @@ mod tests {
             .inner
             .indexed
             .store(true, std::sync::atomic::Ordering::Release);
-        // Empty graph → detect_cycles returns []. Confirms require_indexed
+        // Empty graph → detect_cycles returns the Page<Vec<String>>
+        // envelope with results=[], total=0. Confirms require_indexed
         // doesn't block the call once the flag is set.
         let r = server
-            .detect_cycles(Parameters(EmptyParams::default()))
+            .detect_cycles(Parameters(DetectCyclesArgs::default()))
             .await
             .unwrap();
         assert!(r.is_error.is_none() || r.is_error == Some(false));
@@ -1131,6 +1148,8 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.to_string())
             .unwrap_or_default();
-        assert_eq!(text, "[]");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["total"].as_u64().unwrap(), 0);
     }
 }
