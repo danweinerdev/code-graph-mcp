@@ -157,8 +157,9 @@ pub fn index_directory(
                 })?;
                 let content = std::fs::read(&df.path)
                     .map_err(|e| format!("{}: read error: {e}", df.path.display()))?;
+                let cleaned = plugin.preprocess(&content, cfg);
                 let fg = plugin
-                    .parse_file(&df.path, &content)
+                    .parse_file(&df.path, &cleaned)
                     .map_err(|e| format!("{}: parse error: {e}", df.path.display()))?;
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 progress.report(n, total, &format!("Parsing: {}", df.path.display()));

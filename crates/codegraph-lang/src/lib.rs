@@ -16,7 +16,8 @@
 
 pub mod helpers;
 
-use codegraph_core::{FileGraph, Language, SymbolId};
+use codegraph_core::{FileGraph, Language, RootConfig, SymbolId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -292,6 +293,14 @@ pub trait LanguagePlugin: Send + Sync {
     /// `.` (e.g. `".cpp"`). The registry lowercases extensions before
     /// matching, so plugins may return either case here.
     fn extensions(&self) -> &'static [&'static str];
+
+    /// Pre-parse hook for byte-level transformations (macro stripping,
+    /// preprocessor shims, etc.). Default impl borrows the input
+    /// unchanged — zero-cost for plugins that don't need it. The C++
+    /// plugin overrides this to apply `[cpp].macro_strip` substitutions.
+    fn preprocess<'a>(&self, content: &'a [u8], _cfg: &RootConfig) -> Cow<'a, [u8]> {
+        Cow::Borrowed(content)
+    }
 
     /// Parse a single file. `path` is the absolute file path used for symbol
     /// IDs; `content` is the raw file bytes.

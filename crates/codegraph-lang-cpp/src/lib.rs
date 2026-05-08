@@ -48,9 +48,10 @@ pub(crate) mod queries;
 
 pub use preprocess::strip_macros;
 
+use std::borrow::Cow;
 use std::path::Path;
 
-use codegraph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use codegraph_core::{Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind};
 use codegraph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -442,6 +443,10 @@ impl LanguagePlugin for CppParser {
 
     fn extensions(&self) -> &'static [&'static str] {
         EXTENSIONS
+    }
+
+    fn preprocess<'a>(&self, content: &'a [u8], cfg: &RootConfig) -> Cow<'a, [u8]> {
+        crate::preprocess::strip_macros(content, &cfg.cpp.macro_strip)
     }
 
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {

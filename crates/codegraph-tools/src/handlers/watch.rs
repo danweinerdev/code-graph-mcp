@@ -251,13 +251,12 @@ pub async fn try_reindex_file(
     // for parsing/discovery settings; re-reading on every event would let a
     // stale on-disk config diverge from the live indexer state.
     //
-    // The read-and-drop here doesn't capture a value because today's
-    // single-file reindex doesn't consume any RootConfig field directly
-    // (concurrency settings affect the rayon pool, not per-file work).
-    // It exists as a load-bearing assertion: if a future refactor adds a
-    // per-event config-load (the wrong direction), this line is the seam
-    // it must delete first, and code review will catch the deletion.
-    let _ = inner.config.read().clone();
+    // CppMacroStrip Phase 2.3: bind the cached `RootConfig` so we can pass
+    // it into `LanguagePlugin::preprocess` below — `[cpp].macro_strip` is
+    // a per-file knob and watch-mode reindex must apply the same
+    // substitution the most-recent `analyze_codebase` did. The clone is
+    // cheap (`RootConfig` is small) and isolates us from the read-lock.
+    let cfg_for_blocking = inner.config.read().clone();
 
     if is_remove {
         let mut g = inner.graph.write();
@@ -307,7 +306,8 @@ pub async fn try_reindex_file(
                 )))
             }
         };
-        match plugin.parse_file(&path_owned, &content) {
+        let cleaned = plugin.preprocess(&content, &cfg_for_blocking);
+        match plugin.parse_file(&path_owned, &cleaned) {
             Ok(fg) => Ok(fg),
             Err(e) => Err(ReindexOutcome::Error(format!(
                 "parse {}: {e}",

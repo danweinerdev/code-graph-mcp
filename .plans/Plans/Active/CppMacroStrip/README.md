@@ -15,7 +15,7 @@ phases:
     doc: "01-Foundation.md"
   - id: 2
     title: "Wire-through — preprocess hook + call sites + integration"
-    status: planned
+    status: complete
     doc: "02-Wire-Through.md"
     depends_on: [1]
   - id: 3
