@@ -9,6 +9,7 @@ members = [
     "crates/code-graph-lang-cpp",
     "crates/code-graph-lang-csharp",
     "crates/code-graph-lang-go",
+    "crates/code-graph-lang-java",
     "crates/code-graph-lang-python",
     "crates/code-graph-lang-rust",
     "crates/code-graph-parse-test",
