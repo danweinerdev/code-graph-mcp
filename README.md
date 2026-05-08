@@ -6,10 +6,10 @@ An MCP server that builds an in-memory semantic code graph from C++, Rust, Go, a
 
 | Language | Extensions | Plugin crate |
 |----------|------------|--------------|
-| C++      | `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp`, `.hxx` | `codegraph-lang-cpp` |
-| Rust     | `.rs`      | `codegraph-lang-rust` |
-| Go       | `.go`      | `codegraph-lang-go` |
-| Python   | `.py`, `.pyi` | `codegraph-lang-python` |
+| C++      | `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp`, `.hxx` | `code-graph-lang-cpp` |
+| Rust     | `.rs`      | `code-graph-lang-rust` |
+| Go       | `.go`      | `code-graph-lang-go` |
+| Python   | `.py`, `.pyi` | `code-graph-lang-python` |
 
 ## Installation
 
@@ -78,7 +78,7 @@ The file is read once per `analyze_codebase` call from `<root>/.code-graph.toml`
 
 ## Tools
 
-The server exposes 15 tools. Descriptions are copied verbatim from the `#[tool(description = "...")]` attributes in `crates/codegraph-tools/src/server.rs` (the source of truth).
+The server exposes 15 tools. Descriptions are copied verbatim from the `#[tool(description = "...")]` attributes in `crates/code-graph-tools/src/server.rs` (the source of truth).
 
 ### Indexing
 
@@ -184,7 +184,7 @@ Validated against tree-sitter-rust v0.24.0.
 
 ### Known Limitations
 
-1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `codegraph-lang-rust` asserts that `macro_rules! foo { ... }` yields zero Symbol records.
+1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `code-graph-lang-rust` asserts that `macro_rules! foo { ... }` yields zero Symbol records.
 
 2. **`#[derive(...)]` and other proc-macro attributes are NOT captured as call edges.** They parse as `attribute_item` nodes, not `macro_invocation`, and the call queries only target `macro_invocation`. Multiple `#[derive(Debug, Clone, ...)]` attributes on a struct contribute zero `Calls` edges.
 
@@ -213,7 +213,7 @@ Validated against tree-sitter-go v0.25.0.
 
 1. **Structural interface implementation produces no edges.** Go interfaces are satisfied structurally — a concrete type implements an interface by having the right method set, with no syntactic declaration. The parser emits zero `Inherits` edges for Go. `get_class_hierarchy` on a Go interface returns the interface as a leaf node with empty `bases` and `derived`.
 
-2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion), not inheritance — no edge is emitted. An anti-regression test in `codegraph-lang-go` asserts a fixture with an embedded field yields zero `Inherits` edges.
+2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion), not inheritance — no edge is emitted. An anti-regression test in `code-graph-lang-go` asserts a fixture with an embedded field yields zero `Inherits` edges.
 
 3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different receiver types that share a name may resolve to the wrong candidate.
 
@@ -221,7 +221,7 @@ Validated against tree-sitter-go v0.25.0.
 
 5. **Generic type parameters and constraints not represented in symbol records.** Generic types are recognized in receiver positions (`func (s *Server[T]) M()` → parent `Server`), but the type-parameter list `[T]` and any constraints (`[T any]`, `[T comparable]`) are not part of the symbol record. They survive in the captured signature text only.
 
-6. **`raw_string_literal` (backtick) imports are intentionally not matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `codegraph-lang-go` asserts backtick imports produce zero `Includes` edges.
+6. **`raw_string_literal` (backtick) imports are intentionally not matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `code-graph-lang-go` asserts backtick imports produce zero `Includes` edges.
 
 ## Python Parser Limitations
 
@@ -255,7 +255,7 @@ Validated against tree-sitter-python v0.25.0.
 
 ## Smoke test
 
-Watch-mode and incremental-cache behavior have automated coverage in `crates/codegraph-tools/tests/watch_race.rs` and `crates/codegraph-tools/tests/watch_dangling_edges.rs`. For end-to-end validation against an MCP client, see [`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md).
+Watch-mode and incremental-cache behavior have automated coverage in `crates/code-graph-tools/tests/watch_race.rs` and `crates/code-graph-tools/tests/watch_dangling_edges.rs`. For end-to-end validation against an MCP client, see [`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md).
 
 ## License
 

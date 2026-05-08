@@ -1,0 +1,71 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 50,
+  "offset": 50,
+  "results": [
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 53,
+      "symbol_id": "[testdata]/hub.cpp:callee_050"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 54,
+      "symbol_id": "[testdata]/hub.cpp:callee_051"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 55,
+      "symbol_id": "[testdata]/hub.cpp:callee_052"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 56,
+      "symbol_id": "[testdata]/hub.cpp:callee_053"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 57,
+      "symbol_id": "[testdata]/hub.cpp:callee_054"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 58,
+      "symbol_id": "[testdata]/hub.cpp:callee_055"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 59,
+      "symbol_id": "[testdata]/hub.cpp:callee_056"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 60,
+      "symbol_id": "[testdata]/hub.cpp:callee_057"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 61,
+      "symbol_id": "[testdata]/hub.cpp:callee_058"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 62,
+      "symbol_id": "[testdata]/hub.cpp:callee_059"
+    }
+  ],
+  "total": 60
+}

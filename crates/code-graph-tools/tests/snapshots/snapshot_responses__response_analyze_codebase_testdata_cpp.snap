@@ -1,0 +1,10 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "edges": 21,
+  "files": 8,
+  "root_path": "[testdata]",
+  "symbols": 18
+}

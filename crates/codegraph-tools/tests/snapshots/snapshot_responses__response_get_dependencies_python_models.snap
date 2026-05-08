@@ -1,8 +1,0 @@
----
-source: crates/codegraph-tools/tests/snapshot_responses.rs
-expression: parsed
----
-[
-  "abc",
-  "typing"
-]

@@ -1,0 +1,15 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 20,
+  "offset": 0,
+  "results": [
+    [
+      "[testdata]/circular_a.h",
+      "[testdata]/circular_b.h"
+    ]
+  ],
+  "total": 1
+}

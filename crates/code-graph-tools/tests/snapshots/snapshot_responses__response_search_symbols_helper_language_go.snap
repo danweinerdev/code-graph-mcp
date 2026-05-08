@@ -1,0 +1,20 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 875
+expression: parsed
+---
+{
+  "limit": 20,
+  "offset": 0,
+  "results": [
+    {
+      "file": "[testdata]/foo.go",
+      "id": "[testdata]/foo.go:helper",
+      "kind": "function",
+      "line": 12,
+      "name": "helper",
+      "namespace": "mixed"
+    }
+  ],
+  "total": 1
+}

@@ -1,0 +1,52 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_callees\")"
+---
+{
+  "name": "get_callees",
+  "description": "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for symbols with wide fan-out, use `offset` to page through the remainder, or narrow via lower `depth` to scope a specific subtree.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "depth": {
+        "default": null,
+        "description": "Maximum traversal depth (default 1)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum callees to return per page (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N callees for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "symbol": {
+        "description": "Symbol ID in format file:name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "symbol"
+    ],
+    "title": "GetCalleesArgs",
+    "type": "object"
+  }
+}

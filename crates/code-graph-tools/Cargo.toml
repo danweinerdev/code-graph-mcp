@@ -1,0 +1,38 @@
+[package]
+name = "code-graph-tools"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP tool handlers, discovery walker, indexer, and watcher"
+
+[lints]
+workspace = true
+
+[dependencies]
+code-graph-core = { path = "../code-graph-core" }
+code-graph-lang = { path = "../code-graph-lang" }
+code-graph-graph = { path = "../code-graph-graph" }
+rmcp = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+ignore = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
+code-graph-lang-go = { path = "../code-graph-lang-go" }
+code-graph-lang-python = { path = "../code-graph-lang-python" }
+code-graph-lang-rust = { path = "../code-graph-lang-rust" }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+insta = { workspace = true }
+regex = { workspace = true }

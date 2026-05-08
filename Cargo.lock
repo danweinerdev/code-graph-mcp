@@ -123,25 +123,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-graph-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codegraph-core",
- "codegraph-graph",
- "codegraph-lang",
- "codegraph-lang-cpp",
- "codegraph-lang-go",
- "codegraph-lang-python",
- "codegraph-lang-rust",
- "codegraph-tools",
- "rmcp",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "codegraph-core"
+name = "code-graph-core"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -152,10 +134,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-graph"
+name = "code-graph-graph"
 version = "0.1.0"
 dependencies = [
- "codegraph-core",
+ "code-graph-core",
  "indexmap",
  "parking_lot",
  "pretty_assertions",
@@ -167,21 +149,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-lang"
+name = "code-graph-lang"
 version = "0.1.0"
 dependencies = [
- "codegraph-core",
+ "code-graph-core",
  "thiserror",
  "tree-sitter",
  "tree-sitter-rust",
 ]
 
 [[package]]
-name = "codegraph-lang-cpp"
+name = "code-graph-lang-cpp"
 version = "0.1.0"
 dependencies = [
- "codegraph-core",
- "codegraph-lang",
+ "code-graph-core",
+ "code-graph-lang",
  "pretty_assertions",
  "rstest",
  "streaming-iterator",
@@ -190,12 +172,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-lang-go"
+name = "code-graph-lang-go"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codegraph-core",
- "codegraph-lang",
+ "code-graph-core",
+ "code-graph-lang",
  "insta",
  "pretty_assertions",
  "rstest",
@@ -206,12 +188,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-lang-python"
+name = "code-graph-lang-python"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codegraph-core",
- "codegraph-lang",
+ "code-graph-core",
+ "code-graph-lang",
  "insta",
  "pretty_assertions",
  "rstest",
@@ -222,12 +204,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-lang-rust"
+name = "code-graph-lang-rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codegraph-core",
- "codegraph-lang",
+ "code-graph-core",
+ "code-graph-lang",
  "insta",
  "pretty_assertions",
  "rstest",
@@ -238,30 +220,48 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-parse-test"
-version = "0.1.0"
-dependencies = [
- "codegraph-core",
- "codegraph-lang",
- "codegraph-lang-cpp",
- "codegraph-lang-go",
- "codegraph-lang-python",
- "codegraph-lang-rust",
- "codegraph-tools",
-]
-
-[[package]]
-name = "codegraph-tools"
+name = "code-graph-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codegraph-core",
- "codegraph-graph",
- "codegraph-lang",
- "codegraph-lang-cpp",
- "codegraph-lang-go",
- "codegraph-lang-python",
- "codegraph-lang-rust",
+ "code-graph-core",
+ "code-graph-graph",
+ "code-graph-lang",
+ "code-graph-lang-cpp",
+ "code-graph-lang-go",
+ "code-graph-lang-python",
+ "code-graph-lang-rust",
+ "code-graph-tools",
+ "rmcp",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "code-graph-parse-test"
+version = "0.1.0"
+dependencies = [
+ "code-graph-core",
+ "code-graph-lang",
+ "code-graph-lang-cpp",
+ "code-graph-lang-go",
+ "code-graph-lang-python",
+ "code-graph-lang-rust",
+ "code-graph-tools",
+]
+
+[[package]]
+name = "code-graph-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "code-graph-core",
+ "code-graph-graph",
+ "code-graph-lang",
+ "code-graph-lang-cpp",
+ "code-graph-lang-go",
+ "code-graph-lang-python",
+ "code-graph-lang-rust",
  "crossbeam-channel",
  "ignore",
  "insta",

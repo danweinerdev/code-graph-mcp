@@ -1,0 +1,12 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "hierarchy": {
+    "name": "Reader"
+  },
+  "max_nodes": 250,
+  "total_nodes_seen": 1,
+  "truncated": false
+}

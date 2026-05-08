@@ -1,0 +1,18 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 20,
+  "offset": 0,
+  "results": [
+    {
+      "file": "[testdata]/foo.py",
+      "id": "[testdata]/foo.py:helper",
+      "kind": "function",
+      "line": 11,
+      "name": "helper"
+    }
+  ],
+  "total": 1
+}

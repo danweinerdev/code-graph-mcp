@@ -1,0 +1,17 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "hierarchy": {
+    "derived": [
+      {
+        "name": "DebugEngine"
+      }
+    ],
+    "name": "Engine"
+  },
+  "max_nodes": 250,
+  "total_nodes_seen": 2,
+  "truncated": false
+}

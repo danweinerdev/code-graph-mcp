@@ -1,0 +1,23 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_symbol_summary\")"
+---
+{
+  "name": "get_symbol_summary",
+  "description": "Get symbol counts grouped by namespace and kind — useful for codebase orientation",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "file": {
+        "default": null,
+        "description": "Optional absolute path: scope counts to a single file",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "GetSymbolSummaryArgs",
+    "type": "object"
+  }
+}

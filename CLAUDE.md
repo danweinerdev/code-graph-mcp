@@ -41,11 +41,11 @@ git submodule update --init external/ripgrep          # or just one
 | Rust | `external/ripgrep` (BurntSushi/ripgrep) | `15.1.0` | `testdata/rust/ripgrep-baseline.txt` |
 | Go | `external/logrus` (sirupsen/logrus) | `v1.9.4` | `testdata/go/logrus-baseline.txt` |
 | Python | `external/requests` (psf/requests) | `v2.33.1` | `testdata/python/requests-baseline.txt` |
-| C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/codegraph-lang-cpp/tests/baselines/fmt.txt` |
-| C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/codegraph-lang-cpp/tests/baselines/curl.txt` |
-| C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/codegraph-lang-cpp/tests/baselines/abseil-cpp.txt` |
+| C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/code-graph-lang-cpp/tests/baselines/fmt.txt` |
+| C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/code-graph-lang-cpp/tests/baselines/curl.txt` |
+| C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/code-graph-lang-cpp/tests/baselines/abseil-cpp.txt` |
 
-**Drift expectation when bumping a submodule SHA:** the symbol count almost always shifts. Re-measure with the bumped SHA and update the baseline file's `symbols: N` line + the `tag:` / `commit:` headers in the same commit as the SHA bump. The baseline assertion uses ±10% tolerance, so small drift may pass without an update — but the headers should still match the pinned commit so future readers can tell what was measured. The fmt/curl/abseil baselines deliberately live next to their tests under `crates/codegraph-lang-cpp/tests/baselines/` rather than `testdata/cpp/` because they're tied to the `external/` submodule version, not the in-tree synthetic fixtures the rest of `testdata/cpp/` covers.
+**Drift expectation when bumping a submodule SHA:** the symbol count almost always shifts. Re-measure with the bumped SHA and update the baseline file's `symbols: N` line + the `tag:` / `commit:` headers in the same commit as the SHA bump. The baseline assertion uses ±10% tolerance, so small drift may pass without an update — but the headers should still match the pinned commit so future readers can tell what was measured. The fmt/curl/abseil baselines deliberately live next to their tests under `crates/code-graph-lang-cpp/tests/baselines/` rather than `testdata/cpp/` because they're tied to the `external/` submodule version, not the in-tree synthetic fixtures the rest of `testdata/cpp/` covers.
 
 curl is primarily C; tree-sitter-cpp parses C as a (mostly compatible) superset and the C++ plugin filters out ERROR nodes, so the per-file parse always succeeds even when the file uses idiomatic C constructs. The aggregate symbol count is the regression contract — whatever tree-sitter-cpp could extract is what the baseline locks in.
 
@@ -56,10 +56,10 @@ curl is primarily C; tree-sitter-cpp parses C as a (mostly compatible) superset 
 cargo test --workspace
 
 # Run a single crate's tests
-cargo test -p codegraph-tools
+cargo test -p code-graph-tools
 
 # Parse-test harness (manual inspection: parse one file/dir and dump symbols+edges)
-cargo run -p codegraph-parse-test -- <directory>
+cargo run -p code-graph-parse-test -- <directory>
 ```
 
 ## Architecture
@@ -69,16 +69,16 @@ The workspace is split into language-agnostic core crates plus per-language plug
 | Crate | Responsibility |
 |-------|----------------|
 | `crates/code-graph-mcp` | Binary — `rmcp`-based stdio MCP server entry point |
-| `crates/codegraph-core` | Shared types (`Symbol`, `Edge`, `SymbolKind`, `EdgeKind`), `RootConfig` for `.code-graph.toml` |
-| `crates/codegraph-lang` | `LanguagePlugin` trait + `LanguageRegistry` (extension → plugin dispatch) |
-| `crates/codegraph-graph` | In-memory `Graph` (nodes, forward + reverse adjacency, file index), JSON cache persistence |
-| `crates/codegraph-tools` | Tool handlers, parallel `analyze_codebase` discovery + indexer, watcher (notify-debouncer-full) |
-| `crates/codegraph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
-| `crates/codegraph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
-| `crates/codegraph-lang-go` | Go language plugin — tree-sitter-go queries; method-receiver extraction, all import forms (single/grouped/aliased/dot/blank), direct + selector_expression calls |
-| `crates/codegraph-lang-python` | Python language plugin — tree-sitter-python queries; class/method/decorator handling, both import forms (`import` + `from … import`), multi-base inheritance, `.py` and `.pyi` |
+| `crates/code-graph-core` | Shared types (`Symbol`, `Edge`, `SymbolKind`, `EdgeKind`), `RootConfig` for `.code-graph.toml` |
+| `crates/code-graph-lang` | `LanguagePlugin` trait + `LanguageRegistry` (extension → plugin dispatch) |
+| `crates/code-graph-graph` | In-memory `Graph` (nodes, forward + reverse adjacency, file index), JSON cache persistence |
+| `crates/code-graph-tools` | Tool handlers, parallel `analyze_codebase` discovery + indexer, watcher (notify-debouncer-full) |
+| `crates/code-graph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
+| `crates/code-graph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
+| `crates/code-graph-lang-go` | Go language plugin — tree-sitter-go queries; method-receiver extraction, all import forms (single/grouped/aliased/dot/blank), direct + selector_expression calls |
+| `crates/code-graph-lang-python` | Python language plugin — tree-sitter-python queries; class/method/decorator handling, both import forms (`import` + `from … import`), multi-base inheritance, `.py` and `.pyi` |
 
-As of the Phase 7 cutover, **all four languages — C++, Rust, Go, and Python — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, and Python) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/codegraph-lang/src/lib.rs:116`.
+As of the Phase 7 cutover, **all four languages — C++, Rust, Go, and Python — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, and Python) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/code-graph-lang/src/lib.rs:116`.
 
 ```
 AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
@@ -86,13 +86,13 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
                      +--------+--------+
                      |                 |
               [Tool Handlers]    [Graph]
-              (codegraph-tools)  (codegraph-graph)
+              (code-graph-tools)  (code-graph-graph)
                      |                 |
               [LanguageRegistry] [In-memory graph + JSON cache]
-              (codegraph-lang)
+              (code-graph-lang)
                      |
               [C++ Plugin] [Rust Plugin] [Go Plugin] [Python Plugin]
-              (codegraph-lang-cpp, codegraph-lang-rust, codegraph-lang-go, codegraph-lang-python)
+              (code-graph-lang-cpp, code-graph-lang-rust, code-graph-lang-go, code-graph-lang-python)
                      |
               [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go + tree-sitter-python]
 ```
@@ -167,23 +167,23 @@ Tree-shaped `get_class_hierarchy` returns `{ hierarchy: HierarchyNode, truncated
 - All stored file paths are absolute
 - Symbol ID format: `file:name` for free functions, `file:Parent::name` for methods
 - `SymbolKind` and `EdgeKind` derive `Serialize`/`Deserialize` and serialize as readable JSON strings (e.g. `"function"`, `"calls"`)
-- Snapshot tests for tool wire format use `insta` (snapshots in `crates/codegraph-tools/tests/snapshots/`)
+- Snapshot tests for tool wire format use `insta` (snapshots in `crates/code-graph-tools/tests/snapshots/`)
 
 ### Test conventions
 
-- **Shared test helpers live in `super::test_helpers::*`.** When adding a paginated handler test module, `use super::test_helpers::{body_text, page_parts}` rather than defining local copies. The `test_helpers` module is `pub(super)` under `crates/codegraph-tools/src/handlers/mod.rs` and is the canonical home for assertion utilities every paginated tool's tests need. Re-creating these locally is a duplication the codebase already cleaned up once.
+- **Shared test helpers live in `super::test_helpers::*`.** When adding a paginated handler test module, `use super::test_helpers::{body_text, page_parts}` rather than defining local copies. The `test_helpers` module is `pub(super)` under `crates/code-graph-tools/src/handlers/mod.rs` and is the canonical home for assertion utilities every paginated tool's tests need. Re-creating these locally is a duplication the codebase already cleaned up once.
 - **Diagnostic sentinels before discriminator assertions in timing-dependent tests.** When a test depends on async timing or file IO (watch-mode reindex tests are the canonical case), assert a low-stakes baseline first ("a no-macro class extracts") before asserting the discriminator ("a macro-prefixed class extracts"). The baseline assertion's failure message names the most likely root cause (timing, IO, file-write race) so the failure mode is self-diagnosing. The pattern in `tests/watch_cpp_macro_strip.rs` (`UObject` sentinel before `AActor` check) is the example.
 - **Test fixtures with names matching the project's `.gitignore` rules need `git add -f`.** `.code-graph.toml` is gitignored because it's a per-user-root config users shouldn't commit, but test fixtures sometimes need that exact filename for `RootConfig::load` to find them (e.g. `testdata/ue/.code-graph.toml`). When adding such a fixture, `git add -f <path>` is required, and `git status` must show the file as staged before commit. The `cargo test` command does NOT catch a silently-excluded fixture — the test runs against the local-filesystem copy and passes locally; only a fresh-checkout CI run reveals the missing file. If you're unsure whether a test fixture is in this trap, run `git check-ignore <path>` — a hit means you need `-f`.
 
 ### Implementer conventions
 
-- **Verify a workspace dependency exists before adopting it.** When a task instruction names a dep (e.g. "use `tracing::warn!`"), check `Cargo.toml` first. If the dep isn't present, that's a signal: the instruction may be derived from a convention assumption that doesn't apply to this workspace. Flag the deviation in your report and ask for confirmation rather than silently adding the dep (which is scope expansion) or shipping broken code (which doesn't compile). The workspace's deliberate "no `tracing` dep" convention (per `crates/codegraph-tools/src/handlers/watch.rs`) is the canonical example: `eprintln!` is the established channel for out-of-handler warnings.
+- **Verify a workspace dependency exists before adopting it.** When a task instruction names a dep (e.g. "use `tracing::warn!`"), check `Cargo.toml` first. If the dep isn't present, that's a signal: the instruction may be derived from a convention assumption that doesn't apply to this workspace. Flag the deviation in your report and ask for confirmation rather than silently adding the dep (which is scope expansion) or shipping broken code (which doesn't compile). The workspace's deliberate "no `tracing` dep" convention (per `crates/code-graph-tools/src/handlers/watch.rs`) is the canonical example: `eprintln!` is the established channel for out-of-handler warnings.
 
 ### Quality-scanner: project-specific lenses
 
 When dispatching `planner:quality-scanner` for changes in this repo, the standard 5 lenses (Correctness, Safety, Maintainability, Testing, Over-Engineering) apply per the global agent definition. Additionally evaluate against these two repo-local lenses when the diff scope includes them:
 
-**Agent-facing tool descriptions** — applies when the diff touches `#[tool(description=…)]` strings in `crates/codegraph-tools/src/server.rs` (or analogous agent-readable description fields). Description text in these positions is *production behavior*, not documentation — agents pattern-match on it to decide whether to call the tool and with what arguments. A misleading description (e.g. "raise `offset` for more results" when `offset` is a skip-count) is functionally a bug. Writers rarely test their own copy by following the suggested action.
+**Agent-facing tool descriptions** — applies when the diff touches `#[tool(description=…)]` strings in `crates/code-graph-tools/src/server.rs` (or analogous agent-readable description fields). Description text in these positions is *production behavior*, not documentation — agents pattern-match on it to decide whether to call the tool and with what arguments. A misleading description (e.g. "raise `offset` for more results" when `offset` is a skip-count) is functionally a bug. Writers rarely test their own copy by following the suggested action.
 
 Checklist:
 - Every named arg in the description is documented with its default and ceiling.
@@ -253,7 +253,7 @@ Validated against tree-sitter-rust v0.24.0.
 
 ### Known Limitations
 
-1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `codegraph-lang-rust` (`macro_rules_definition_produces_zero_symbols`) asserts that `macro_rules! foo { ... }` yields zero Symbol records.
+1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `code-graph-lang-rust` (`macro_rules_definition_produces_zero_symbols`) asserts that `macro_rules! foo { ... }` yields zero Symbol records.
 
 2. **`#[derive(...)]` and proc-macro attributes are NOT captured as call edges.** They parse as `attribute_item` nodes, not `macro_invocation`, and the call queries only target `macro_invocation`. Multiple `#[derive(Debug, Clone, ...)]` attributes on a struct contribute zero `Calls` edges.
 
@@ -280,9 +280,9 @@ Validated against tree-sitter-go v0.25.0.
 
 ### Known Limitations
 
-1. **Structural interface implementation produces no edges.** Go interfaces are satisfied structurally — a concrete type implements an interface by having the right method set, with no syntactic declaration. The parser emits zero `Inherits` edges for Go. `get_class_hierarchy` on a Go interface returns the interface as a leaf node with empty `bases` and `derived` (anti-regression test in `crates/codegraph-tools/tests/mixed_language.rs::get_class_hierarchy_for_go_interface`).
+1. **Structural interface implementation produces no edges.** Go interfaces are satisfied structurally — a concrete type implements an interface by having the right method set, with no syntactic declaration. The parser emits zero `Inherits` edges for Go. `get_class_hierarchy` on a Go interface returns the interface as a leaf node with empty `bases` and `derived` (anti-regression test in `crates/code-graph-tools/tests/mixed_language.rs::get_class_hierarchy_for_go_interface`).
 
-2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion at runtime), not inheritance — no edge is emitted. An anti-regression test in `codegraph-lang-go` (`embedded_struct_field_produces_no_inherits_edge`) asserts a fixture with an embedded field yields zero `Inherits` edges.
+2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion at runtime), not inheritance — no edge is emitted. An anti-regression test in `code-graph-lang-go` (`embedded_struct_field_produces_no_inherits_edge`) asserts a fixture with an embedded field yields zero `Inherits` edges.
 
 3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different receiver types that share a name may resolve to the wrong candidate.
 
@@ -290,7 +290,7 @@ Validated against tree-sitter-go v0.25.0.
 
 5. **Generic type parameters and constraints not represented in symbol records.** Generic types are recognized in receiver positions (`func (s *Server[T]) M()` → parent recorded as `Server`, not `Server[T]`) so methods on a generic struct group with the bare type name. The type-parameter list `[T]` and any constraints (`[T any]`, `[T comparable]`) survive in the captured signature text only — they are not part of the symbol record's structured fields.
 
-6. **`raw_string_literal` (backtick) imports are intentionally NOT matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `codegraph-lang-go` (`backtick_import_produces_no_includes_edge`) asserts backtick imports produce zero `Includes` edges.
+6. **`raw_string_literal` (backtick) imports are intentionally NOT matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `code-graph-lang-go` (`backtick_import_produces_no_includes_edge`) asserts backtick imports produce zero `Includes` edges.
 
 7. **Forward declarations excluded.** Interface method elements (`type R interface { Read() }`) parse as `method_elem` nodes (no body) and are NOT matched by the definition query — only `method_declaration` (with a body and receiver) produces method symbols. The interface method set is implicit; only the interface type itself becomes a `Symbol`.
 

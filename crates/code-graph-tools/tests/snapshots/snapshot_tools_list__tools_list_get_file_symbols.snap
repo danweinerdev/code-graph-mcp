@@ -1,0 +1,58 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_file_symbols\")"
+---
+{
+  "name": "get_file_symbols",
+  "description": "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 100 (max 1000); pass limit/offset to page through large files (UE generated headers can exceed 100). `brief` defaults to true and omits column/end_line/signature for token efficiency — set false for full detail when investigating a specific symbol.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "brief": {
+        "default": null,
+        "description": "Omit signature, column, end_line for compact output (default true)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "file": {
+        "description": "Absolute path to the source file",
+        "type": "string"
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum results to return (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N matches for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "top_level_only": {
+        "default": null,
+        "description": "Only return top-level symbols (no nested methods/types) (default false)",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "file"
+    ],
+    "title": "GetFileSymbolsArgs",
+    "type": "object"
+  }
+}

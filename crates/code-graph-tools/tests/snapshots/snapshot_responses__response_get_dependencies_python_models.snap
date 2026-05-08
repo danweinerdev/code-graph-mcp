@@ -1,0 +1,8 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+[
+  "abc",
+  "typing"
+]

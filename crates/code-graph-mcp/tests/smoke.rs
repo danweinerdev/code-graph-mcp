@@ -7,7 +7,7 @@
 //! compile-and-handshake gate.
 //!
 //! This complements the unit-level `tool_router_registers_fifteen_tools`
-//! test in `codegraph-tools::server` — that test never starts the IO loop,
+//! test in `code-graph-tools::server` — that test never starts the IO loop,
 //! so it can't catch a regression where the macro generates 15 routes but
 //! `ServerHandler::list_tools` filters them. Running both gives us
 //! belt-and-braces coverage without depending on an external MCP client.

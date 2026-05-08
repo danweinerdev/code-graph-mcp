@@ -1,0 +1,30 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_coupling\")"
+---
+{
+  "name": "get_coupling",
+  "description": "Get cross-file dependency counts for a file",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "direction": {
+        "default": null,
+        "description": "'outgoing' (default), 'incoming', or 'both'",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "file": {
+        "description": "Absolute path to the source file",
+        "type": "string"
+      }
+    },
+    "required": [
+      "file"
+    ],
+    "title": "GetCouplingArgs",
+    "type": "object"
+  }
+}

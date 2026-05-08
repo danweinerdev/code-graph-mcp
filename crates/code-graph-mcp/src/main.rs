@@ -6,12 +6,12 @@
 //! [`RunningService::waiting`].
 
 use anyhow::Context;
-use codegraph_lang::LanguageRegistry;
-use codegraph_lang_cpp::CppParser;
-use codegraph_lang_go::GoParser;
-use codegraph_lang_python::PythonParser;
-use codegraph_lang_rust::RustParser;
-use codegraph_tools::CodeGraphServer;
+use code_graph_lang::LanguageRegistry;
+use code_graph_lang_cpp::CppParser;
+use code_graph_lang_go::GoParser;
+use code_graph_lang_python::PythonParser;
+use code_graph_lang_rust::RustParser;
+use code_graph_tools::CodeGraphServer;
 use rmcp::transport::io::stdio;
 use rmcp::ServiceExt;
 

@@ -2,15 +2,15 @@
 resolver = "3"
 members = [
     "crates/code-graph-mcp",
-    "crates/codegraph-core",
-    "crates/codegraph-lang",
-    "crates/codegraph-graph",
-    "crates/codegraph-tools",
-    "crates/codegraph-lang-cpp",
-    "crates/codegraph-lang-rust",
-    "crates/codegraph-lang-go",
-    "crates/codegraph-lang-python",
-    "crates/codegraph-parse-test",
+    "crates/code-graph-core",
+    "crates/code-graph-lang",
+    "crates/code-graph-graph",
+    "crates/code-graph-tools",
+    "crates/code-graph-lang-cpp",
+    "crates/code-graph-lang-rust",
+    "crates/code-graph-lang-go",
+    "crates/code-graph-lang-python",
+    "crates/code-graph-parse-test",
 ]
 
 [workspace.package]

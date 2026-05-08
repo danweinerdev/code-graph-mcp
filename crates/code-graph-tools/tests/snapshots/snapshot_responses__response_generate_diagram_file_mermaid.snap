@@ -1,0 +1,10 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: normalized
+---
+graph TD
+    n0 -->|includes| n1
+    n0 -->|includes| n2
+    n0["engine.cpp"]
+    n1["engine.h"]
+    n2["utils.h"]

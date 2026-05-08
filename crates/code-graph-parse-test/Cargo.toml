@@ -1,11 +1,11 @@
 [package]
-name = "code-graph-mcp"
+name = "code-graph-parse-test"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "MCP server that builds an in-memory semantic code graph from source files"
+description = "Developer CLI harness for testing language parsers against real codebases"
 
 [lints]
 workspace = true
@@ -17,12 +17,4 @@ code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
 code-graph-lang-go = { path = "../code-graph-lang-go" }
 code-graph-lang-python = { path = "../code-graph-lang-python" }
 code-graph-lang-rust = { path = "../code-graph-lang-rust" }
-code-graph-graph = { path = "../code-graph-graph" }
 code-graph-tools = { path = "../code-graph-tools" }
-rmcp = { workspace = true }
-tokio = { workspace = true }
-anyhow = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
-serde_json = { workspace = true }

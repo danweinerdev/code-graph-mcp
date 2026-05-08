@@ -1,0 +1,14 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "end_line": 10,
+  "file": "[testdata]/engine.cpp",
+  "id": "[testdata]/engine.cpp:Engine::update",
+  "kind": "method",
+  "line": 6,
+  "name": "update",
+  "parent": "Engine",
+  "signature": "void Engine::update(float dt)"
+}

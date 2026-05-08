@@ -1,0 +1,35 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"detect_cycles\")"
+---
+{
+  "name": "detect_cycles",
+  "description": "Detect circular include dependencies (strongly-connected components of the include graph). Returns paginated results in the {results, total, offset, limit} envelope; each `results[i]` is a Vec<String> of file paths in one cycle. Cycles are sorted internally by path; the outer list is sorted by each cycle's first path so pagination is deterministic across calls. Default limit 20 (max 1000); raise `limit` (toward the 1000 cap) when investigating cycle counts on large codebases, use `offset` to page through. Cycles are rare in well-maintained codebases, so the default is small.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "limit": {
+        "default": null,
+        "description": "Maximum cycles to return (default 20, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N cycles for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "title": "DetectCyclesArgs",
+    "type": "object"
+  }
+}
