@@ -628,7 +628,30 @@ async fn response_get_callees_paginated_offset() {
 #[tokio::test]
 async fn response_get_class_hierarchy_engine() {
     let fx = build_indexed_fixture().await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Engine", Some(1));
+    let r = get_class_hierarchy(&fx.inner.graph, "Engine", Some(1), None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+/// Phase 4: truncated-case snapshot.
+///
+/// Reuses an existing fixture with a tiny `max_nodes` budget (2) to force
+/// the Graph layer to flag `truncated: true`. This is the cheapest path —
+/// no need to engineer a 251+ class fixture; the truncation behavior is
+/// budget-driven and fires identically whether the cap is 2 or 250.
+///
+/// The Rust testdata's `Compute` trait has multiple impls (`Foo<T>`,
+/// `Bar<T>`), so a budget of 2 lets the root + one derived in but cuts
+/// off the second. The snapshot locks in: (a) `truncated: true`, (b)
+/// `total_nodes_seen` equal to the budget cap (the unique-name set fills
+/// exactly to the cap), (c) the partial tree is well-formed JSON with
+/// valid `HierarchyNode` structure (no dangling references).
+#[tokio::test]
+async fn response_get_class_hierarchy_truncated() {
+    let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
+    let r = get_class_hierarchy(&fx.inner.graph, "Compute", Some(3), Some(2));
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1075,7 +1098,7 @@ async fn response_get_class_hierarchy_rust_trait_greet() {
     // Pre-Phase-2 the lookup would have rejected the trait kind; this
     // snapshot is the wire-format counterpart to the integration test
     // `get_class_hierarchy_for_rust_trait`.
-    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1192,7 +1215,7 @@ async fn response_get_class_hierarchy_go_interface_reader() {
     // integration test in `mixed_language.rs`. Locks in the leaf-node
     // shape (just `{"name":"Reader"}`) — `bases` and `derived` are
     // skipped because they are empty (Go produces no Inherits edges).
-    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1373,7 +1396,7 @@ async fn response_get_class_hierarchy_python_dog() {
     // `Dog` inherits from `Animal`. The hierarchy snapshot locks both
     // `bases` (Dog -> Animal) and the leaf-node shape for the upward
     // walk (Animal has no bases, so it serializes without the field).
-    let r = get_class_hierarchy(&fx.inner.graph, "Dog", Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, "Dog", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

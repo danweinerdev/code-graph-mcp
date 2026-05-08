@@ -4,7 +4,7 @@ expression: "tool_entry(\"get_file_symbols\")"
 ---
 {
   "name": "get_file_symbols",
-  "description": "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope. Default limit is 100 (max 1000); pass limit/offset to page through large files.",
+  "description": "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 100 (max 1000); pass limit/offset to page through large files (UE generated headers can exceed 100). `brief` defaults to true and omits column/end_line/signature for token efficiency — set false for full detail when investigating a specific symbol.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

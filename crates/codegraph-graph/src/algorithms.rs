@@ -87,7 +87,7 @@ impl Graph {
         tarjan_scc(&all_files, &self.includes)
     }
 
-    /// Inheritance tree rooted at `name`.
+    /// Inheritance tree rooted at `name`, with a global unique-name budget.
     ///
     /// Returns `None` if no symbol with the given name exists in
     /// the graph with a class-like kind (`Class`, `Struct`, `Interface`,
@@ -100,15 +100,39 @@ impl Graph {
     /// Go binary uses `if depth <= 0 { depth = 1 }` so an agent passing
     /// `0` gets the same result as `1` rather than an empty tree.
     ///
+    /// `max_nodes` caps the total number of *unique class names* that
+    /// can appear anywhere in the returned tree. A name is counted once
+    /// in the budget no matter how many paths reach it (so a diamond
+    /// where the shared ancestor is reachable via N arms costs 1 budget
+    /// slot, not N). When the budget is exhausted, recursion stops
+    /// adding new children to subsequent nodes — but already-recursed
+    /// children remain in the tree, so the partial tree is well-formed.
+    /// Callers that want the legacy "unbounded" behavior pass
+    /// `max_nodes = u32::MAX`.
+    ///
+    /// On success returns `(root, total_nodes_seen, truncated)`:
+    /// - `total_nodes_seen` is the number of unique names actually
+    ///   walked (≤ `max_nodes`).
+    /// - `truncated` is `true` when the budget cut at least one child
+    ///   off the tree.
+    ///
     /// **Diamond inheritance**: the DFS uses a *per-path* `on_path` set
     /// rather than a global visited set. This is essential — when a
     /// shared ancestor is reached via two different paths (e.g.
     /// `Derived → MixinA → Base` and `Derived → MixinB → Base`), each
     /// arm must fully expand `Base` independently. A global visited set
     /// would short-circuit the second visit and silently truncate the
-    /// hierarchy. See the `class_hierarchy_diamond_4_level_fixture`
-    /// test for the regression fixture.
-    pub fn class_hierarchy(&self, name: &str, depth: u32) -> Option<HierarchyNode> {
+    /// hierarchy. The `max_nodes` budget is layered on top via a
+    /// separate `visited_unique` set that tracks names globally for the
+    /// budget check; it does NOT replace `on_path`. See the
+    /// `class_hierarchy_diamond_4_level_fixture` and
+    /// `class_hierarchy_diamond_counts_unique_names` tests.
+    pub fn class_hierarchy(
+        &self,
+        name: &str,
+        depth: u32,
+        max_nodes: u32,
+    ) -> Option<(HierarchyNode, u32, bool)> {
         // Verify the class exists with a class-like kind.
         let exists = self.nodes.values().any(|node| {
             node.symbol.name == name
@@ -127,7 +151,24 @@ impl Graph {
         let depth = if depth == 0 { 1 } else { depth };
 
         let mut on_path: HashSet<String> = HashSet::new();
-        Some(self.build_hierarchy(name, depth, &mut on_path))
+        let mut visited_unique: HashSet<String> = HashSet::new();
+        let mut truncated = false;
+        // Seed the global unique-name set with the root before recursing —
+        // the root counts as one unique node in the budget, exactly like
+        // every other class name. If `max_nodes == 0` the recursive helper
+        // will refuse to add any children to the root and the truncated
+        // flag fires on the first attempt.
+        visited_unique.insert(name.to_string());
+        let root = self.build_hierarchy(
+            name,
+            depth,
+            &mut on_path,
+            &mut visited_unique,
+            max_nodes,
+            &mut truncated,
+        );
+        let total = visited_unique.len() as u32;
+        Some((root, total, truncated))
     }
 
     /// Recursive helper for [`Graph::class_hierarchy`].
@@ -138,16 +179,26 @@ impl Graph {
     /// applies to file-include cycles which can chain across thousands
     /// of headers. The plan only requires Tarjan to be iterative.
     ///
-    /// `on_path` is mutated in lockstep with the recursion: the name is
-    /// inserted before recursing into children and removed after both
-    /// the bases and derived loops complete. This is the diamond fix —
-    /// siblings can each fully expand the same ancestor because the set
-    /// only carries the *current path*, not every previously seen node.
+    /// Two visited sets are threaded through:
+    /// - `on_path` (per-DFS-path) is mutated in lockstep with the
+    ///   recursion: the name is inserted before recursing into children
+    ///   and removed after both the bases and derived loops complete.
+    ///   This is the diamond fix — siblings can each fully expand the
+    ///   same ancestor because the set only carries the *current path*,
+    ///   not every previously seen node.
+    /// - `visited_unique` (global) tracks every unique name walked
+    ///   anywhere in the tree, for the `max_nodes` budget. It is *only*
+    ///   inserted into, never removed — diamond inheritance still gets
+    ///   the per-path expansion behavior; only the budget counter
+    ///   collapses identical names.
     fn build_hierarchy(
         &self,
         name: &str,
         depth: u32,
         on_path: &mut HashSet<String>,
+        visited_unique: &mut HashSet<String>,
+        max_nodes: u32,
+        truncated: &mut bool,
     ) -> HierarchyNode {
         // Cycle base case: this name is on the current DFS path. Emit a
         // bare leaf so the caller sees the name without recursing
@@ -198,6 +249,14 @@ impl Graph {
         // recursion only needs `&self`, but cloning the names releases
         // the slice borrow and lets the loop pass `guard.set` (auto-
         // reborrowed as `&mut HashSet<String>`) through the call.
+        //
+        // The budget check happens *before* we recurse into a child:
+        // - if the child's name is already in `visited_unique`, recursion
+        //   is free (no budget cost — the diamond's shared ancestor)
+        // - otherwise, refuse to descend when the budget is at the cap;
+        //   set `truncated` and skip this child entirely so the budget
+        //   check is monotone (once exceeded, it never tries to grow
+        //   again on this branch).
         if let Some(entries) = self.adj.get(name) {
             let bases: Vec<String> = entries
                 .iter()
@@ -205,8 +264,21 @@ impl Graph {
                 .map(|e| e.target.clone())
                 .collect();
             for target in bases {
-                node.bases
-                    .push(self.build_hierarchy(&target, depth - 1, guard.set));
+                if !visited_unique.contains(&target) {
+                    if (visited_unique.len() as u32) >= max_nodes {
+                        *truncated = true;
+                        continue;
+                    }
+                    visited_unique.insert(target.clone());
+                }
+                node.bases.push(self.build_hierarchy(
+                    &target,
+                    depth - 1,
+                    guard.set,
+                    visited_unique,
+                    max_nodes,
+                    truncated,
+                ));
             }
         }
 
@@ -217,8 +289,21 @@ impl Graph {
                 .map(|e| e.target.clone())
                 .collect();
             for target in derived {
-                node.derived
-                    .push(self.build_hierarchy(&target, depth - 1, guard.set));
+                if !visited_unique.contains(&target) {
+                    if (visited_unique.len() as u32) >= max_nodes {
+                        *truncated = true;
+                        continue;
+                    }
+                    visited_unique.insert(target.clone());
+                }
+                node.derived.push(self.build_hierarchy(
+                    &target,
+                    depth - 1,
+                    guard.set,
+                    visited_unique,
+                    max_nodes,
+                    truncated,
+                ));
             }
         }
 
@@ -540,7 +625,7 @@ mod tests {
     #[test]
     fn class_hierarchy_unknown_returns_none() {
         let g = Graph::new();
-        assert!(g.class_hierarchy("Foo", 1).is_none());
+        assert!(g.class_hierarchy("Foo", 1, u32::MAX).is_none());
     }
 
     #[test]
@@ -552,9 +637,12 @@ mod tests {
             vec![sym("MyStruct", SymbolKind::Struct, "/a.cpp")],
             vec![],
         ));
-        let result = g.class_hierarchy("MyStruct", 1);
+        let result = g.class_hierarchy("MyStruct", 1, u32::MAX);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "MyStruct");
+        let (root, total, truncated) = result.unwrap();
+        assert_eq!(root.name, "MyStruct");
+        assert_eq!(total, 1);
+        assert!(!truncated);
     }
 
     #[test]
@@ -568,9 +656,9 @@ mod tests {
             vec![sym("MyTrait", SymbolKind::Trait, "/a.rs")],
             vec![],
         ));
-        let result = g.class_hierarchy("MyTrait", 1);
+        let result = g.class_hierarchy("MyTrait", 1, u32::MAX);
         assert!(result.is_some(), "widened filter must accept Trait kind",);
-        assert_eq!(result.unwrap().name, "MyTrait");
+        assert_eq!(result.unwrap().0.name, "MyTrait");
     }
 
     #[test]
@@ -584,12 +672,12 @@ mod tests {
             vec![sym("MyInterface", SymbolKind::Interface, "/a.go")],
             vec![],
         ));
-        let result = g.class_hierarchy("MyInterface", 1);
+        let result = g.class_hierarchy("MyInterface", 1, u32::MAX);
         assert!(
             result.is_some(),
             "widened filter must accept Interface kind",
         );
-        assert_eq!(result.unwrap().name, "MyInterface");
+        assert_eq!(result.unwrap().0.name, "MyInterface");
     }
 
     #[test]
@@ -602,7 +690,7 @@ mod tests {
             vec![sym("foo", SymbolKind::Function, "/a.cpp")],
             vec![],
         ));
-        assert!(g.class_hierarchy("foo", 1).is_none());
+        assert!(g.class_hierarchy("foo", 1, u32::MAX).is_none());
     }
 
     // --- class_hierarchy: depth semantics ---
@@ -628,7 +716,7 @@ mod tests {
             ],
         ));
 
-        let result = g.class_hierarchy("Mid", 1).expect("Mid found");
+        let (result, _, _) = g.class_hierarchy("Mid", 1, u32::MAX).expect("Mid found");
         assert_eq!(result.name, "Mid");
         assert_eq!(result.bases.len(), 1);
         assert_eq!(result.bases[0].name, "Base");
@@ -658,8 +746,12 @@ mod tests {
             ],
             vec![inherit_edge("Derived", "Base", "/a.cpp")],
         ));
-        let zero = g.class_hierarchy("Derived", 0).expect("Derived found");
-        let one = g.class_hierarchy("Derived", 1).expect("Derived found");
+        let (zero, _, _) = g
+            .class_hierarchy("Derived", 0, u32::MAX)
+            .expect("Derived found");
+        let (one, _, _) = g
+            .class_hierarchy("Derived", 1, u32::MAX)
+            .expect("Derived found");
         assert_eq!(zero, one);
     }
 
@@ -722,7 +814,9 @@ mod tests {
             ],
         ));
 
-        let result = g.class_hierarchy("Derived", 3).expect("Derived found");
+        let (result, _, _) = g
+            .class_hierarchy("Derived", 3, u32::MAX)
+            .expect("Derived found");
         assert_eq!(result.name, "Derived");
         assert_eq!(result.bases.len(), 2, "Derived inherits from both mixins");
 
@@ -757,5 +851,208 @@ mod tests {
         // Sanity: the derived side reports Leaf.
         assert_eq!(result.derived.len(), 1);
         assert_eq!(result.derived[0].name, "Leaf");
+    }
+
+    // --- class_hierarchy: max_nodes budget ---
+
+    /// Build a 12-class linear inheritance chain on the *derived* side:
+    /// `C00 <- C01 <- ... <- C11`. Querying `class_hierarchy("C00", depth,
+    /// max_nodes=10)` walks Root -> ... 11 unique names total in the
+    /// derived direction, so a budget of 10 must truncate after the 10th
+    /// unique node.
+    ///
+    /// Inherits edge direction: child → parent. So `C01 -> C00`,
+    /// `C02 -> C01`, etc. — `radj["Cnn"]` then yields the derived
+    /// children, walked by the down-DFS arm.
+    fn linear_chain_graph(n: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut symbols: Vec<codegraph_core::Symbol> = Vec::with_capacity(n);
+        for i in 0..n {
+            symbols.push(sym(&format!("C{i:02}"), SymbolKind::Class, "/chain.cpp"));
+        }
+        let mut edges: Vec<Edge> = Vec::with_capacity(n - 1);
+        for i in 1..n {
+            // child Ci inherits from parent Ci-1.
+            edges.push(inherit_edge(
+                &format!("C{i:02}"),
+                &format!("C{:02}", i - 1),
+                "/chain.cpp",
+            ));
+        }
+        g.merge_file_graph(make_fg("/chain.cpp", Language::Cpp, symbols, edges));
+        g
+    }
+
+    /// Walk a `HierarchyNode` tree and collect every distinct name
+    /// reachable through `bases` and `derived`. Used by the budget tests
+    /// to count the unique names actually present in the returned tree.
+    fn collect_unique_names(node: &HierarchyNode, out: &mut HashSet<String>) {
+        out.insert(node.name.clone());
+        for b in &node.bases {
+            collect_unique_names(b, out);
+        }
+        for d in &node.derived {
+            collect_unique_names(d, out);
+        }
+    }
+
+    /// Truncation regression: hierarchy with at least 11 unique classes,
+    /// queried with `max_nodes = 10`. Must report `truncated = true`,
+    /// `total_nodes_seen = 10`, and the tree must contain exactly 10
+    /// unique names (the budget cap).
+    #[test]
+    fn class_hierarchy_max_nodes_truncates() {
+        // 12-node chain so the visit count exceeds the 10-node budget.
+        let g = linear_chain_graph(12);
+        // Use a generous depth so the DFS would reach every node if
+        // unbounded — the budget is the truncation mechanism, not depth.
+        let (root, total, truncated) = g.class_hierarchy("C00", 50, 10).expect("C00 found");
+        assert!(
+            truncated,
+            "12-node chain with max_nodes=10 must truncate, got truncated=false"
+        );
+        assert_eq!(total, 10, "total_nodes_seen must equal the budget cap");
+        let mut names: HashSet<String> = HashSet::new();
+        collect_unique_names(&root, &mut names);
+        assert_eq!(
+            names.len(),
+            10,
+            "tree must contain exactly 10 unique names; got {}: {:?}",
+            names.len(),
+            names
+        );
+    }
+
+    /// THE diamond budget regression. Fixture has 4 unique class names
+    /// (`Root`, `Mid1`, `Mid2`, `Leaf`) but the shared root `Root` is
+    /// reachable from `Leaf` via *two* arms (`Leaf -> Mid1 -> Root` AND
+    /// `Leaf -> Mid2 -> Root`), so the total *visit* count is 5, while
+    /// the unique-name count is 4. With `max_nodes = 4` (= unique count,
+    /// strictly < visit count), the budget MUST NOT truncate — every
+    /// unique name fits, the diamond's shared ancestor costs one slot
+    /// even though it appears twice in the tree.
+    ///
+    /// **A naïve visit-counting implementation would truncate at 4 visits
+    /// and miss the second `Root` expansion under `Mid2`.** The combination
+    /// `truncated=false` + all four names present is the discriminator
+    /// between correct unique-name counting and incorrect visit counting.
+    #[test]
+    fn class_hierarchy_diamond_counts_unique_names() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/diamond.cpp",
+            Language::Cpp,
+            vec![
+                sym("Root", SymbolKind::Class, "/diamond.cpp"),
+                sym("Mid1", SymbolKind::Class, "/diamond.cpp"),
+                sym("Mid2", SymbolKind::Class, "/diamond.cpp"),
+                sym("Leaf", SymbolKind::Class, "/diamond.cpp"),
+            ],
+            vec![
+                // child -> parent edges. Diamond:
+                //   Root has two derived children Mid1 and Mid2; both Mids
+                //   have Leaf as their derived child. So Leaf is reachable
+                //   via both Mid1 and Mid2 from Root in the down-DFS, and
+                //   `class_hierarchy("Root", depth, max_nodes)` walks the
+                //   shared `Leaf` twice via two separate paths.
+                inherit_edge("Mid1", "Root", "/diamond.cpp"),
+                inherit_edge("Mid2", "Root", "/diamond.cpp"),
+                inherit_edge("Leaf", "Mid1", "/diamond.cpp"),
+                inherit_edge("Leaf", "Mid2", "/diamond.cpp"),
+            ],
+        ));
+
+        // Generous depth so the down-DFS would otherwise reach Leaf twice.
+        let (root, total, truncated) = g.class_hierarchy("Root", 5, 4).expect("Root found");
+
+        // The load-bearing assertions:
+        assert!(
+            !truncated,
+            "max_nodes=4 (= unique name count) must NOT truncate even \
+             though visit count is 5. truncated=true here means the \
+             budget was charged per-visit instead of per-unique-name."
+        );
+        assert_eq!(
+            total, 4,
+            "total_nodes_seen must count unique names (4), not visits (5)"
+        );
+
+        let mut names: HashSet<String> = HashSet::new();
+        collect_unique_names(&root, &mut names);
+        assert_eq!(
+            names.len(),
+            4,
+            "all four unique names must appear in the tree; got: {names:?}"
+        );
+        for want in ["Root", "Mid1", "Mid2", "Leaf"] {
+            assert!(
+                names.contains(want),
+                "tree missing {want:?}; got: {names:?}. A visit-counting \
+                 budget would have run out before reaching the second arm \
+                 of the diamond."
+            );
+        }
+    }
+
+    /// Backward-compat regression: with `max_nodes = u32::MAX` the
+    /// algorithm must produce the same tree shape as the existing
+    /// `class_hierarchy_diamond_4_level_fixture` test. Asserts the
+    /// new budget plumbing doesn't perturb unbounded queries.
+    #[test]
+    fn class_hierarchy_max_nodes_unbounded_matches_legacy() {
+        // Same fixture as `class_hierarchy_diamond_4_level_fixture`.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("Root", SymbolKind::Class, "/a.cpp"),
+                sym("Base", SymbolKind::Class, "/a.cpp"),
+                sym("MixinA", SymbolKind::Class, "/a.cpp"),
+                sym("MixinB", SymbolKind::Class, "/a.cpp"),
+                sym("Derived", SymbolKind::Class, "/a.cpp"),
+                sym("Leaf", SymbolKind::Class, "/a.cpp"),
+            ],
+            vec![
+                inherit_edge("Base", "Root", "/a.cpp"),
+                inherit_edge("MixinA", "Base", "/a.cpp"),
+                inherit_edge("MixinB", "Base", "/a.cpp"),
+                inherit_edge("Derived", "MixinA", "/a.cpp"),
+                inherit_edge("Derived", "MixinB", "/a.cpp"),
+                inherit_edge("Leaf", "Derived", "/a.cpp"),
+            ],
+        ));
+
+        let (root, _total, truncated) = g
+            .class_hierarchy("Derived", 3, u32::MAX)
+            .expect("Derived found");
+        assert!(!truncated, "u32::MAX budget never truncates");
+
+        // Same shape assertions as the legacy diamond test — both `Base`
+        // copies must fully expand to `Root`. A regression in the new
+        // budget plumbing that accidentally cut off the second `Base`
+        // expansion would surface here.
+        let mut bases = root.bases.clone();
+        bases.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(bases.len(), 2);
+        assert_eq!(bases[0].name, "MixinA");
+        assert_eq!(bases[1].name, "MixinB");
+        assert_eq!(bases[0].bases.len(), 1);
+        assert_eq!(bases[0].bases[0].name, "Base");
+        assert_eq!(bases[1].bases.len(), 1);
+        assert_eq!(bases[1].bases[0].name, "Base");
+        assert!(
+            !bases[0].bases[0].bases.is_empty(),
+            "Base under MixinA must expand to Root (legacy diamond regression)"
+        );
+        assert!(
+            !bases[1].bases[0].bases.is_empty(),
+            "Base under MixinB must expand to Root (legacy diamond regression)"
+        );
+        assert_eq!(bases[0].bases[0].bases[0].name, "Root");
+        assert_eq!(bases[1].bases[0].bases[0].name, "Root");
+
+        assert_eq!(root.derived.len(), 1);
+        assert_eq!(root.derived[0].name, "Leaf");
     }
 }

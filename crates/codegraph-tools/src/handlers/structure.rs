@@ -11,9 +11,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use codegraph_core::{symbol_id, SymbolKind};
-use codegraph_graph::{DiagramEdge, Graph};
+use codegraph_graph::{DiagramEdge, Graph, HierarchyNode};
 use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, Content};
+use serde::Serialize;
 
 use super::{
     parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json, Page,
@@ -112,27 +113,67 @@ pub fn get_orphans(
 
 // ----- get_class_hierarchy -----
 
+/// Wire-format envelope for `get_class_hierarchy`. Tree-shaped tool, so
+/// the wrapper carries `max_nodes` budget metadata instead of the
+/// list-shaped `Page<T>`'s `total/offset/limit`. Field-declaration order
+/// — `hierarchy`, `truncated`, `max_nodes`, `total_nodes_seen` — is the
+/// JSON wire-format contract; reordering is a breaking change. Insta
+/// alphabetizes keys before snapshotting, so the snapshot files do not
+/// preserve declaration order — the struct is the source of truth.
+///
+/// `total_nodes_seen` is the count of *unique* class names actually
+/// walked; equal to `max_nodes` when truncation occurred, less when the
+/// hierarchy fit. Combined with `truncated`, agents can decide whether
+/// to retry with a larger budget.
+#[derive(Debug, Serialize)]
+struct ClassHierarchyResponse {
+    hierarchy: HierarchyNode,
+    truncated: bool,
+    max_nodes: u32,
+    total_nodes_seen: u32,
+}
+
 /// `get_class_hierarchy` body. Required `class` string; optional `depth`
-/// (default 1). Unknown class produces a did-you-mean message filtered
-/// to class-like kinds (`Class`, `Struct`, `Interface`, `Trait`).
+/// (default 1) and `max_nodes` (default 250, clamped at 1000; `0` is
+/// treated as "use default"). Unknown class produces a did-you-mean
+/// message filtered to class-like kinds (`Class`, `Struct`, `Interface`,
+/// `Trait`).
 ///
 /// The did-you-mean wording mirrors the symbol_detail / callers
 /// patterns in 3.4: `class not found: "<name>". Did you mean: a, b, c?`
 /// when suggestions exist; otherwise just `class not found: "<name>"`.
+///
+/// On success, returns the [`ClassHierarchyResponse`] envelope:
+/// `{hierarchy, truncated, max_nodes, total_nodes_seen}`. The Graph
+/// layer's unique-name budget guarantees diamond inheritance doesn't
+/// burn the budget twice for shared ancestors — see
+/// `Graph::class_hierarchy`.
 pub fn get_class_hierarchy(
     graph: &RwLock<Graph>,
     class: &str,
     depth: Option<u32>,
+    max_nodes: Option<u32>,
 ) -> CallToolResult {
     if class.is_empty() {
         return tool_error("'class' is required");
     }
 
     let depth = depth.filter(|&d| d > 0).unwrap_or(1);
+    // Resolve max_nodes: zero-or-missing -> default 250; clamp at 1000.
+    // Matches the Phase 2/3 pagination convention for limit resolution.
+    let resolved_max_nodes = max_nodes.filter(|&n| n != 0).unwrap_or(250).min(1000);
 
     let g = graph.read();
-    if let Some(h) = g.class_hierarchy(class, depth) {
-        return tool_success_json(&h);
+    if let Some((hierarchy, total_nodes_seen, truncated)) =
+        g.class_hierarchy(class, depth, resolved_max_nodes)
+    {
+        let response = ClassHierarchyResponse {
+            hierarchy,
+            truncated,
+            max_nodes: resolved_max_nodes,
+            total_nodes_seen,
+        };
+        return tool_success_json(&response);
     }
     let class_like = suggest_class_symbols(&g, class, 5);
     drop(g);
@@ -753,7 +794,7 @@ mod tests {
     #[test]
     fn class_hierarchy_missing_class_param_errors() {
         let g = locked(Graph::new());
-        let r = get_class_hierarchy(&g, "", None);
+        let r = get_class_hierarchy(&g, "", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'class' is required");
     }
@@ -761,22 +802,30 @@ mod tests {
     #[test]
     fn class_hierarchy_returns_node_tree() {
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Mid", Some(1));
+        let r = get_class_hierarchy(&g, "Mid", Some(1), None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        assert_eq!(parsed["name"], serde_json::json!("Mid"));
-        let bases = parsed["bases"].as_array().unwrap();
+        // Phase 4: response is wrapped in {hierarchy, truncated, max_nodes,
+        // total_nodes_seen}; the tree itself lives under `hierarchy`.
+        let hierarchy = &parsed["hierarchy"];
+        assert_eq!(hierarchy["name"], serde_json::json!("Mid"));
+        let bases = hierarchy["bases"].as_array().unwrap();
         assert_eq!(bases.len(), 1);
         assert_eq!(bases[0]["name"], serde_json::json!("Base"));
-        let derived = parsed["derived"].as_array().unwrap();
+        let derived = hierarchy["derived"].as_array().unwrap();
         assert_eq!(derived.len(), 1);
         assert_eq!(derived[0]["name"], serde_json::json!("Leaf"));
+        // Envelope meta: small fixture fits well under the default budget.
+        assert_eq!(parsed["truncated"], serde_json::json!(false));
+        assert_eq!(parsed["max_nodes"], serde_json::json!(250));
+        // 3 unique names: Mid, Base, Leaf.
+        assert_eq!(parsed["total_nodes_seen"], serde_json::json!(3));
     }
 
     #[test]
     fn class_hierarchy_unknown_with_no_suggestions() {
         let g = locked(Graph::new());
-        let r = get_class_hierarchy(&g, "Nope", None);
+        let r = get_class_hierarchy(&g, "Nope", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "class not found: \"Nope\"");
     }
@@ -786,7 +835,7 @@ mod tests {
         // "B" is a substring of "Base" (Class) and of nothing else. The
         // function `looks_like_a_class_but_isnt` does not contain "B".
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "B", None);
+        let r = get_class_hierarchy(&g, "B", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.starts_with("class not found: \"B\""), "got: {text}");
@@ -812,7 +861,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = get_class_hierarchy(&g, "looks", None);
+        let r = get_class_hierarchy(&g, "looks", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         // No class-like candidates → bare not-found.
@@ -823,9 +872,53 @@ mod tests {
     fn class_hierarchy_depth_zero_normalized_to_one() {
         // A None depth and a Some(0) both become 1.
         let g = locked(class_graph());
-        let with_zero = get_class_hierarchy(&g, "Mid", Some(0));
-        let with_none = get_class_hierarchy(&g, "Mid", None);
+        let with_zero = get_class_hierarchy(&g, "Mid", Some(0), None);
+        let with_none = get_class_hierarchy(&g, "Mid", None, None);
         assert_eq!(body_text(&with_zero), body_text(&with_none));
+    }
+
+    #[test]
+    fn class_hierarchy_handler_zero_max_nodes_uses_default_250() {
+        // max_nodes=0 is the "unset" sentinel — the handler resolves it
+        // to the documented default of 250 before forwarding to the
+        // Graph layer. Matches the convention used by
+        // `orphans_zero_limit_uses_default`. The Graph layer always
+        // receives a non-zero u32; this assertion belongs to the
+        // handler, not the Graph layer.
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(0));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(
+            parsed["max_nodes"],
+            serde_json::json!(250),
+            "max_nodes=0 must resolve to default 250 (echoed in response)"
+        );
+        assert_eq!(parsed["truncated"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn class_hierarchy_handler_max_nodes_clamps_at_1000() {
+        // Mirrors the orphan/limit clamp test; max_nodes=999_999 silently
+        // resolves to the 1000 ceiling and the response echoes the
+        // clamped value.
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(999_999));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["max_nodes"], serde_json::json!(1000));
+    }
+
+    #[test]
+    fn class_hierarchy_handler_truncates_when_budget_exceeded() {
+        // Budget of 2 on the 3-class fixture: Mid + Base reachable via
+        // the up-walk but the budget exhausts before adding Leaf to the
+        // derived side. Asserts the handler propagates `truncated=true`
+        // and the budget cap echo.
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(2));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["truncated"], serde_json::json!(true));
+        assert_eq!(parsed["max_nodes"], serde_json::json!(2));
+        assert_eq!(parsed["total_nodes_seen"], serde_json::json!(2));
     }
 
     // --- get_coupling ---

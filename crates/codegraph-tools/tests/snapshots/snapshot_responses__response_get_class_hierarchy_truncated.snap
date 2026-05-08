@@ -8,15 +8,15 @@ expression: parsed
       {
         "bases": [
           {
-            "name": "Greet"
+            "name": "Compute"
           }
         ],
-        "name": "Greeter"
+        "name": "Foo<T>"
       }
     ],
-    "name": "Greet"
+    "name": "Compute"
   },
-  "max_nodes": 250,
+  "max_nodes": 2,
   "total_nodes_seen": 2,
-  "truncated": false
+  "truncated": true
 }

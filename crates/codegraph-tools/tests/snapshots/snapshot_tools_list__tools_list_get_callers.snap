@@ -4,7 +4,7 @@ expression: "tool_entry(\"get_callers\")"
 ---
 {
   "name": "get_callers",
-  "description": "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit is 100 (max 1000).",
+  "description": "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for hot symbols with high fan-in (e.g. UObject::Serialize), use `offset` to page through the remainder, or narrow the search by lowering `depth`.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

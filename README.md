@@ -92,7 +92,7 @@ The index is cached to `.code-graph-cache.json` in the indexed directory. On sub
 
 | Tool | Description |
 |------|-------------|
-| `get_file_symbols` | List all symbols (functions, classes, etc.) defined in a file |
+| `get_file_symbols` | List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the `{results, total, offset, limit}` envelope. Default `limit` 100 (max 1000); pass `limit`/`offset` to page through large files. |
 | `search_symbols` | Search for symbols by name pattern across the indexed codebase. Returns paginated results. Default brief mode omits signatures for token efficiency. |
 | `get_symbol_detail` | Get full details for a symbol by its ID |
 | `get_symbol_summary` | Get symbol counts grouped by namespace and kind — useful for codebase orientation |
@@ -103,8 +103,8 @@ Symbol IDs use the format `file:name` for free functions and `file:Parent::name`
 
 | Tool | Description |
 |------|-------------|
-| `get_callers` | Find functions that call the given symbol (upstream call chain) |
-| `get_callees` | Find functions called by the given symbol (downstream call chain) |
+| `get_callers` | Find functions that call the given symbol (upstream call chain). Returns paginated results in the `{results, total, offset, limit}` envelope, sorted by `(depth, symbol_id)` ascending so the closest callers appear first. Default `limit` 100 (max 1000). |
+| `get_callees` | Find functions called by the given symbol (downstream call chain). Returns paginated results in the same envelope, sorted by `(depth, symbol_id)`. Default `limit` 100 (max 1000). |
 
 ### Dependencies
 
@@ -117,8 +117,8 @@ Symbol IDs use the format `file:name` for free functions and `file:Parent::name`
 | Tool | Description |
 |------|-------------|
 | `detect_cycles` | Detect circular include dependencies in the indexed codebase |
-| `get_orphans` | Find symbols with no incoming call edges (uncalled functions/methods) |
-| `get_class_hierarchy` | Get the inheritance tree for a class (base classes and derived classes) |
+| `get_orphans` | Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the `{results, total, offset, limit}` envelope. Default `limit` 20 (max 1000); `brief` defaults to true. |
+| `get_class_hierarchy` | Get the inheritance tree for a class. Returns `{hierarchy, truncated, max_nodes, total_nodes_seen}`: `hierarchy` is the tree, `truncated` flags whether the budget cut children, `total_nodes_seen` is the unique-name count actually walked. Default `max_nodes` 250 (max 1000). Diamond inheritance counts shared ancestors once. |
 | `get_coupling` | Get cross-file dependency counts for a file |
 
 ### Visualization

@@ -212,7 +212,7 @@ fn rwlock_concurrent_readers_and_writers() {
                             let _ = snapshot.coupling(Path::new("/seed.cpp"));
                         }
                         _ => {
-                            let _ = snapshot.class_hierarchy("Base_0", 2);
+                            let _ = snapshot.class_hierarchy("Base_0", 2, u32::MAX);
                         }
                     }
 

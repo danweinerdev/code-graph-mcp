@@ -340,6 +340,17 @@ pub struct GetClassHierarchyArgs {
     )]
     #[serde(default)]
     pub depth: Option<u32>,
+    #[schemars(
+        description = "Maximum unique class names to include in the returned tree \
+                       (default 250, max 1000). Each unique name counts once even \
+                       when reached via multiple inheritance paths (diamonds), so \
+                       a shared ancestor doesn't burn the budget twice. The \
+                       response includes `truncated: true` and the partial tree \
+                       when the budget is hit; raise this for deep hierarchies \
+                       (e.g. UE's UObject)."
+    )]
+    #[serde(default)]
+    pub max_nodes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -407,7 +418,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope. Default limit is 100 (max 1000); pass limit/offset to page through large files."
+        description = "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 100 (max 1000); pass limit/offset to page through large files (UE generated headers can exceed 100). `brief` defaults to true and omits column/end_line/signature for token efficiency — set false for full detail when investigating a specific symbol."
     )]
     async fn get_file_symbols(
         &self,
@@ -479,7 +490,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit is 100 (max 1000)."
+        description = "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for hot symbols with high fan-in (e.g. UObject::Serialize), use `offset` to page through the remainder, or narrow the search by lowering `depth`."
     )]
     async fn get_callers(
         &self,
@@ -499,7 +510,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit is 100 (max 1000)."
+        description = "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for symbols with wide fan-out, use `offset` to page through the remainder, or narrow via lower `depth` to scope a specific subtree."
     )]
     async fn get_callees(
         &self,
@@ -546,7 +557,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the {results, total, offset, limit} envelope. Default brief mode omits signatures for token efficiency."
+        description = "Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 20 (max 1000) — small because orphan lists are explored interactively; use `offset` to page through, raise `limit` for a wider page, or filter by `kind` (function, method, class, struct, enum, typedef, interface, trait) to narrow the scope. `brief` defaults to true and omits signatures for token efficiency."
     )]
     async fn get_orphans(
         &self,
@@ -564,7 +575,19 @@ impl CodeGraphServer {
         ))
     }
 
-    #[tool(description = "Get the inheritance tree for a class (base classes and derived classes)")]
+    #[tool(
+        description = "Get the inheritance tree for a class (base classes and derived classes). \
+                       Returns the {hierarchy, truncated, max_nodes, total_nodes_seen} envelope: \
+                       `hierarchy` is the tree rooted at the queried class; `truncated` flags \
+                       whether the `max_nodes` budget cut off any children; `total_nodes_seen` \
+                       is the count of unique class names actually walked. Diamond inheritance \
+                       counts each shared ancestor once in the budget, regardless of how many \
+                       paths reach it. Default `max_nodes` is 250 (max 1000) — sized to fit \
+                       most hierarchies under the MCP token ceiling, but a single deep \
+                       inheritance tree (e.g. UE's UObject) can exceed it. Watch for \
+                       `truncated: true` and raise `max_nodes` (or narrow `depth`) when it \
+                       fires."
+    )]
     async fn get_class_hierarchy(
         &self,
         Parameters(args): Parameters<GetClassHierarchyArgs>,
@@ -576,6 +599,7 @@ impl CodeGraphServer {
             &self.inner.graph,
             &args.class,
             args.depth,
+            args.max_nodes,
         ))
     }
 
@@ -983,6 +1007,7 @@ mod tests {
             .get_class_hierarchy(Parameters(GetClassHierarchyArgs {
                 class: "Anything".to_string(),
                 depth: None,
+                max_nodes: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

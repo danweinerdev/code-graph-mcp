@@ -86,15 +86,16 @@ fn symbol_names_from(body: &str) -> Vec<String> {
 }
 
 /// Pull derived class names out of a `get_class_hierarchy` JSON response
-/// body. The handler returns a `HierarchyNode { name, bases, derived }`
-/// shape — `derived` is a list of `HierarchyNode` objects (each with its
-/// own `name` field), not bare strings. `bases` and `derived` are
-/// `omitempty` (Vec::is_empty), so leaf nodes serialize as just
-/// `{ "name": ... }`.
+/// body. Phase 4 wraps the response: `{hierarchy: {name, bases, derived},
+/// truncated, max_nodes, total_nodes_seen}`. The tree itself lives under
+/// `parsed["hierarchy"]`; `derived` is a list of `HierarchyNode` objects
+/// (each with its own `name` field), not bare strings. `bases` and
+/// `derived` are `omitempty` (Vec::is_empty), so leaf nodes serialize as
+/// just `{ "name": ... }`.
 fn derived_from(body: &str) -> Vec<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).expect("get_class_hierarchy body must be JSON");
-    parsed["derived"]
+    parsed["hierarchy"]["derived"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -156,7 +157,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         );
     }
 
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1));
+    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit class hierarchy for Alpha must succeed: {r:?}"
@@ -249,7 +250,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // Inheritance dangling-edge invariant: class_hierarchy(Alpha) must
     // surface Gamma as derived AND must NOT surface Beta. This is the
     // load-bearing assertion for the Inherits-edge half of the pruner.
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1));
+    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit class_hierarchy(Alpha) must succeed: {r:?}"
@@ -275,7 +276,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // or surface a stale list. Post-fix, both Beta's `nodes` entry and
     // every adj/radj entry referencing Beta are pruned, so
     // class_hierarchy("Beta") must report not-found.
-    let r = get_class_hierarchy(&server.inner.graph, "Beta", Some(1));
+    let r = get_class_hierarchy(&server.inner.graph, "Beta", Some(1), None);
     assert_eq!(
         r.is_error,
         Some(true),

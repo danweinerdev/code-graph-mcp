@@ -323,22 +323,25 @@ async fn get_class_hierarchy_for_rust_trait() {
     // `testdata/rust/src/traits.rs`). Pre-Phase 2 the lookup would have
     // narrowed to {Class, Struct, Interface} and skipped the trait — so
     // the success of this lookup is the regression assertion.
-    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy must succeed for a Rust trait: {r:?}",
     );
 
     let body = first_text(&r);
+    // Phase 4: response is wrapped — `{hierarchy, truncated, ...}`. Tree
+    // assertions read from `parsed["hierarchy"]`.
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("hierarchy is JSON");
+    let hierarchy = &parsed["hierarchy"];
     assert_eq!(
-        parsed["name"].as_str(),
+        hierarchy["name"].as_str(),
         Some("Greet"),
         "hierarchy root must be the queried trait, got: {parsed}",
     );
     // `Greeter` impls `Greet`, so the trait's `derived` list (incoming
     // Inherits edges) must include it.
-    let derived: Vec<&str> = parsed["derived"]
+    let derived: Vec<&str> = hierarchy["derived"]
         .as_array()
         .expect("derived is an array")
         .iter()
@@ -662,7 +665,7 @@ async fn build_go_interface_fixture() -> IndexedFixture {
 #[tokio::test]
 async fn get_class_hierarchy_for_go_interface() {
     let fx = build_go_interface_fixture().await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy must succeed for a Go interface (Phase 2 \
@@ -670,9 +673,11 @@ async fn get_class_hierarchy_for_go_interface() {
     );
 
     let body = first_text(&r);
+    // Phase 4: tree lives under `parsed["hierarchy"]`.
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("hierarchy is JSON");
+    let hierarchy = &parsed["hierarchy"];
     assert_eq!(
-        parsed["name"].as_str(),
+        hierarchy["name"].as_str(),
         Some("Reader"),
         "hierarchy root must be the queried interface, got: {parsed}",
     );
@@ -683,11 +688,11 @@ async fn get_class_hierarchy_for_go_interface() {
     // absent key and an explicit empty array as success; if either field
     // shows up populated, the structural-implementation-not-edges
     // invariant has been violated.
-    let bases_empty = parsed
+    let bases_empty = hierarchy
         .get("bases")
         .map(|v| v.as_array().is_some_and(|a| a.is_empty()))
         .unwrap_or(true);
-    let derived_empty = parsed
+    let derived_empty = hierarchy
         .get("derived")
         .map(|v| v.as_array().is_some_and(|a| a.is_empty()))
         .unwrap_or(true);

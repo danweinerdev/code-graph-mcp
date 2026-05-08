@@ -94,15 +94,21 @@ A sample `.code-graph.toml` ships at the repo root (Task 4.5).
 
 ## MCP Tools (15 total)
 
-The tool surface is unchanged from the Go implementation — only the implementation language changed. Tools are grouped by purpose:
+The tool surface mirrors the Go implementation; the PaginationOverhaul plan retrofitted defensive caps and pagination envelopes for UE-scale codebases. Tools are grouped by purpose:
 
 **Indexing:** `analyze_codebase` (with JSON cache + mtime-based incremental re-index)
-**Symbol queries:** `get_file_symbols` (with `top_level_only`/`brief`), `search_symbols` (with `namespace`, `limit`/`offset`, `brief` default true), `get_symbol_detail`, `get_symbol_summary` (counts by namespace/kind)
-**Call graph:** `get_callers`, `get_callees`
+**Symbol queries:** `get_file_symbols` (with `top_level_only`/`brief` + `limit`/`offset`, default limit 100, max 1000), `search_symbols` (with `namespace`, `limit`/`offset`, `brief` default true), `get_symbol_detail`, `get_symbol_summary` (counts by namespace/kind)
+**Call graph:** `get_callers`, `get_callees` (both with `limit`/`offset`, default limit 100, max 1000)
 **Dependencies:** `get_dependencies`
-**Structural analysis:** `detect_cycles`, `get_orphans`, `get_class_hierarchy` (with `depth` for transitive walk), `get_coupling` (outgoing/incoming/both)
+**Structural analysis:** `detect_cycles`, `get_orphans` (with `kind` + `limit`/`offset`/`brief`, default limit 20, max 1000), `get_class_hierarchy` (with `depth` for transitive walk + `max_nodes` budget, default 250, max 1000), `get_coupling` (outgoing/incoming/both)
 **Visualization:** `generate_mermaid` (call graph, file deps, or inheritance tree)
 **Watch mode:** `watch_start`, `watch_stop` (auto-reindex on file changes via notify-debouncer-full)
+
+### Response shapes
+
+List-shaped paginated tools (`get_orphans`, `get_file_symbols`, `get_callers`, `get_callees`, `search_symbols`) return the shared `Page<T>` envelope: `{ results: T[], total: u32, offset: u32, limit: u32 }`. `total` is the pre-pagination match count; `offset`/`limit` are echoed as the resolved values actually used (so silent clamp-to-1000 is visible to clients). Sort order is `symbol_id` ascending for symbol lists; `(depth, symbol_id)` ascending for `get_callers`/`get_callees` so the closest results appear on page 1. `limit = 0` is treated as "use default".
+
+Tree-shaped `get_class_hierarchy` returns `{ hierarchy: HierarchyNode, truncated: bool, max_nodes: u32, total_nodes_seen: u32 }`. `total_nodes_seen` counts unique class names actually walked — diamond inheritance costs one budget slot per shared ancestor, not one per arm reaching it. When `truncated: true`, the partial tree is well-formed (already-recursed children stay; new children are skipped after the budget is hit) and the agent can retry with a larger `max_nodes`. Hard ceiling: `max_nodes ≤ 1000`.
 
 ## Code Conventions
 

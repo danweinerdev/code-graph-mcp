@@ -1,8 +1,12 @@
 ---
 source: crates/codegraph-tools/tests/snapshot_responses.rs
-assertion_line: 939
 expression: parsed
 ---
 {
-  "name": "Reader"
+  "hierarchy": {
+    "name": "Reader"
+  },
+  "max_nodes": 250,
+  "total_nodes_seen": 1,
+  "truncated": false
 }
