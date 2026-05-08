@@ -28,6 +28,8 @@ pub enum Language {
     Rust,
     Go,
     Python,
+    CSharp,
+    Java,
 }
 
 /// Kind of code symbol. Mirrors the Go `parser.SymbolKind` constants and
@@ -139,6 +141,8 @@ mod tests {
             (Language::Rust, "rust"),
             (Language::Go, "go"),
             (Language::Python, "python"),
+            (Language::CSharp, "csharp"),
+            (Language::Java, "java"),
         ];
         for (lang, expected) in cases {
             let v = serde_json::to_value(lang).unwrap();
@@ -260,6 +264,8 @@ mod tests {
             Language::Rust,
             Language::Go,
             Language::Python,
+            Language::CSharp,
+            Language::Java,
         ];
         for (i, kind) in kinds.iter().enumerate() {
             for language in languages {
