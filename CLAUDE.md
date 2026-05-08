@@ -157,6 +157,29 @@ Tree-shaped `get_class_hierarchy` returns `{ hierarchy: HierarchyNode, truncated
 
 - **Verify a workspace dependency exists before adopting it.** When a task instruction names a dep (e.g. "use `tracing::warn!`"), check `Cargo.toml` first. If the dep isn't present, that's a signal: the instruction may be derived from a convention assumption that doesn't apply to this workspace. Flag the deviation in your report and ask for confirmation rather than silently adding the dep (which is scope expansion) or shipping broken code (which doesn't compile). The workspace's deliberate "no `tracing` dep" convention (per `crates/codegraph-tools/src/handlers/watch.rs`) is the canonical example: `eprintln!` is the established channel for out-of-handler warnings.
 
+### Quality-scanner: project-specific lenses
+
+When dispatching `planner:quality-scanner` for changes in this repo, the standard 5 lenses (Correctness, Safety, Maintainability, Testing, Over-Engineering) apply per the global agent definition. Additionally evaluate against these two repo-local lenses when the diff scope includes them:
+
+**Agent-facing tool descriptions** — applies when the diff touches `#[tool(description=…)]` strings in `crates/codegraph-tools/src/server.rs` (or analogous agent-readable description fields). Description text in these positions is *production behavior*, not documentation — agents pattern-match on it to decide whether to call the tool and with what arguments. A misleading description (e.g. "raise `offset` for more results" when `offset` is a skip-count) is functionally a bug. Writers rarely test their own copy by following the suggested action.
+
+Checklist:
+- Every named arg in the description is documented with its default and ceiling.
+- The verb in any suggested action operationally produces the claimed result. "Raise `limit` to get more results" is correct; "raise `offset` to get more results" is wrong (offset skips, doesn't expand).
+- The response envelope shape is named, not implied. If the tool returns a paginated `{results, total, offset, limit}` wrapper, say so; don't let agents guess they need to index into `["results"]`.
+- When an agent should pick non-default values is at least hinted — "default 100; raise for symbols with high fan-in" beats "default 100, max 1000" alone.
+- Plurality and units match the field type.
+
+This lens caught two real agent-misleading bugs in CppMacroStrip Phase 4 (the "raise via offset" wording on `get_callers`/`get_callees` and the over-confident "typical depth=1/2 walks" claim on `get_class_hierarchy`).
+
+**Documentation read cold** — applies when the diff touches `*.md`, `.code-graph.toml.example`, or other agent-readable docs. Read the modified sections AND the surrounding sections cold — without context from the implementer's commit message or task description — exactly as a future contributor or AI agent would encounter them.
+
+Checklist:
+- **Framing contradictions across sibling sections.** A feature documented in two places (e.g. once under "Supported Patterns" and once under "Known Limitations") should convey consistent signals. A feature that's "supported with caveat X" belongs in one location, not two with conflicting headlines. Caught a real instance in CppMacroStrip Phase 3.
+- **Stale references that became more visible.** A reference like "the sample `.code-graph.toml` ships at the repo root" is wrong if the file is `.code-graph.toml.example`. When new content sits adjacent to a stale reference, fix the stale line — its visibility just doubled.
+- **"Must contain phrase X" load-bearing strings.** Some doc requirements are explicitly that a phrase appears (e.g. `force=true` in both CLAUDE.md and the sample TOML for cache invalidation). When the diff touches either file, grep for the phrase to confirm it survives the edit. Use `make snapshot-audit ARGS=...`-style assertions for this class of check; or just `grep -l <phrase> CLAUDE.md .code-graph.toml.example`.
+- **Documentation that promises behavior must match implementation.** "Default is 250" must match what the code resolves; "supports X" must match what's wired through.
+
 ## C++ Parser Limitations
 
 Validated against tree-sitter-cpp v0.23.4.
