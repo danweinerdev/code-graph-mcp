@@ -2,6 +2,7 @@
 # the binary for — `make release` produces a host-target release build.
 
 .PHONY: build release test lint fmt fmt-check clean \
+	snapshot-clean install-hooks \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -27,6 +28,35 @@ fmt-check:
 
 clean:
 	cargo clean
+
+# Verify no pending insta snapshots in the working tree. `*.snap.new`
+# files exist when a snapshot test produced new output that hasn't been
+# accepted via `cargo insta review`. Forgetting that step ships a
+# "passing" commit whose snapshot is actually stale — CI will fail on
+# the next clean checkout. This target is the gate; it's also what the
+# pre-commit hook (scripts/hooks/pre-commit) calls.
+#
+# Uses `find` rather than `cargo insta pending-snapshots` so the check
+# is fast and works even if `cargo-insta` isn't installed.
+snapshot-clean:
+	@pending=$$(find crates -type f -name '*.snap.new' 2>/dev/null); \
+	if [ -n "$$pending" ]; then \
+		echo "✗ Pending insta snapshots:"; \
+		echo "$$pending" | sed 's/^/    /'; \
+		echo ""; \
+		echo "Run 'cargo insta review' to accept or reject before committing."; \
+		exit 1; \
+	fi
+	@echo "✓ No pending snapshots."
+
+# One-time setup: point git at the tracked hook scripts under
+# scripts/hooks/ so pre-commit checks fire on every commit. Run this
+# once after cloning. The hooks themselves are tracked in the repo, so
+# updates land via `git pull` without re-running this command.
+install-hooks:
+	@git config core.hooksPath scripts/hooks
+	@echo "✓ Hooks installed (core.hooksPath = scripts/hooks)"
+	@echo "  Active hooks: $$(ls scripts/hooks/ | tr '\n' ' ')"
 
 # ---- Rust workspace targets (rust-prefixed aliases) -------------------
 # These coexist with the unprefixed defaults above for callers that want

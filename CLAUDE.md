@@ -11,6 +11,7 @@ make build                                            # cargo build --release -p
 make test                                             # cargo test --workspace
 make lint                                             # cargo clippy --workspace --all-targets -- -D warnings
 make fmt-check                                        # cargo fmt --all --check
+make snapshot-clean                                   # fail if any *.snap.new files exist (stale insta snapshots)
 
 # Or invoke cargo directly:
 cargo build --release -p code-graph-mcp               # host-target release binary
@@ -20,6 +21,10 @@ cargo fmt --check                                     # format check
 ```
 
 No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter grammars) link via their pure-Rust `cc`-built crates. Build natively on each platform you need the binary for; there is no cross-compile pipeline.
+
+### One-time setup: install pre-commit hooks
+
+Run `make install-hooks` once after cloning. This sets `git config core.hooksPath scripts/hooks`, pointing git at the tracked hook scripts under `scripts/hooks/` so commits run pre-commit checks automatically. Currently the only check is `make snapshot-clean` — a `git commit` is refused if any `*.snap.new` files remain in the working tree (run `cargo insta review` to accept or reject pending snapshots first). Bypass with `git commit --no-verify` only when you understand the consequences (committing with pending snapshots means the recorded snapshot is stale and CI will fail on a clean checkout).
 
 ## Test
 

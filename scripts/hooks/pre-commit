@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit hook: refuse to commit while insta snapshots are pending.
+#
+# Installed via `make install-hooks`, which sets
+# `git config core.hooksPath scripts/hooks` so this tracked directory
+# becomes the active hook source for this repo's clone.
+#
+# Why: `cargo test` produces `.snap.new` files when a snapshot
+# diverged. The expected workflow is `cargo insta review` to accept or
+# reject. Forgetting this step ships a "passing" commit whose
+# `.snap.new` file gets ignored on the next clean checkout — CI will
+# fail with a confusing snapshot mismatch. This hook turns the silent
+# failure into a loud commit-time error.
+#
+# Bypass with `git commit --no-verify` only if you understand the
+# consequences (committing with pending snapshots means the recorded
+# snapshot is stale).
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+exec make snapshot-clean
