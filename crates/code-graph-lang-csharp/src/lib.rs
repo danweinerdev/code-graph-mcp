@@ -11,9 +11,9 @@
 //! 0.23.5, the [`CSharpParser`] struct with cached `Query` objects, and
 //! the [`LanguagePlugin`] impl.
 //!
-//! Phase 2.2 wires `extract_definitions` (classes, structs, interfaces,
-//! enums, methods, constructors, local functions) and switches
-//! `parse_to_filegraph` from the empty-graph stub to a real
+//! Phase 2.2 wires `extract_definitions` (classes, records, structs,
+//! interfaces, enums, methods, constructors, local functions) and
+//! switches `parse_to_filegraph` from the empty-graph stub to a real
 //! tree-sitter-driven parse. Partial classes (Decision 3), default
 //! interface methods (Decision 11), and extension methods (Decision 5) are
 //! covered with inline tests.
@@ -50,12 +50,12 @@
 //!   by **presence of a method body**, not by a `default` keyword.
 //!   `interface I { void Foo() { ... } }` produces a Symbol;
 //!   `interface I { void Bar(); }` does not (forward-declaration rule —
-//!   Decision 11). Confirmed against tree-sitter-c-sharp 0.23.5: the
-//!   discriminator is the `body:` field on `method_declaration`. The
-//!   body kind can be `block` (curly-brace body) or
-//!   `arrow_expression_clause` (`int Foo() => 42`); both forms count as
-//!   "has body" and yield a Symbol. Abstract methods have no `body:`
-//!   field at all and yield no Symbol.
+//!   per Decision 11's C# follow-up). Confirmed against tree-sitter-c-
+//!   sharp 0.23.5: the discriminator is the `body:` field on
+//!   `method_declaration`. The body kind can be `block` (curly-brace
+//!   body) or `arrow_expression_clause` (`int Foo() => 42`); both forms
+//!   count as "has body" and yield a Symbol. Abstract methods have no
+//!   `body:` field at all and yield no Symbol.
 //! - **Partial classes** (Decision 3) emit one Class symbol per
 //!   declaration; merging across files is deferred to hierarchy-walk time
 //!   via the bare-name `from`-field rule. The `partial` modifier is not
@@ -73,9 +73,15 @@
 //!   found. Dotted namespace names (`namespace A.B.C { ... }`) parse with
 //!   the `name:` field as a `qualified_name`; the verbatim text (`A.B.C`)
 //!   becomes the namespace string.
-//! - **Records** (`record_declaration`) are NOT extracted by Phase 2.2.
-//!   Adding `Record` support is deliberately scoped out of this task per
-//!   the brief's enumerated declaration list.
+//! - **Records** (`record_declaration`) extract as
+//!   [`SymbolKind::Class`] regardless of class-record vs struct-record
+//!   form. tree-sitter-c-sharp 0.23.5 produces a single
+//!   `record_declaration` node for `record User(string n)`, `record
+//!   class User(string n)`, and `record struct Pt(int x, int y)`; all
+//!   three dispatch to `Class` per Decision 11's C# follow-up (Java
+//!   Decision 6 analog). Methods inside a record are recognised as
+//!   members of the record (parent = record name), not orphan
+//!   functions.
 
 pub(crate) mod helpers;
 pub(crate) mod queries;
@@ -198,37 +204,49 @@ impl CSharpParser {
     /// Per-capture-name behavior:
     ///
     /// - `class.name` from `class_declaration` → [`SymbolKind::Class`].
-    ///   Parent is the immediate enclosing class/struct/interface (or
-    ///   empty for top-level classes; nested classes record the immediate
-    ///   outer class). Partial classes (Decision 3): the `partial`
-    ///   modifier is NOT inspected — each declaration produces its own
-    ///   Symbol; agents disambiguate via path/line.
+    ///   Parent is the immediate enclosing class/struct/interface/record
+    ///   (or empty for top-level classes; nested classes record the
+    ///   immediate outer type). Partial classes (Decision 3): the
+    ///   `partial` modifier is NOT inspected — each declaration produces
+    ///   its own Symbol; agents disambiguate via path/line.
+    /// - `record.name` from `record_declaration` → [`SymbolKind::Class`].
+    ///   Parent computed identically to `class.name`. All record forms
+    ///   (`record User(string n)`, `record class User(string n)`,
+    ///   `record struct Pt(int x, int y)`) parse to the same
+    ///   `record_declaration` node in tree-sitter-c-sharp 0.23.5 and all
+    ///   dispatch to `Class` per Decision 11's C# follow-up.
     /// - `struct.name` from `struct_declaration` → [`SymbolKind::Struct`].
     /// - `interface.name` from `interface_declaration` →
     ///   [`SymbolKind::Interface`].
     /// - `enum.name` from `enum_declaration` → [`SymbolKind::Enum`]. Enum
     ///   members are not extracted (Decision 12 analog for C#).
-    /// - `method.name` from `method_declaration` → branches on enclosing
-    ///   scope:
+    /// - `method.name` from `method_declaration` → Method with parent =
+    ///   enclosing type (defensive Function fallback if no enclosing type
+    ///   is found; not reachable in well-formed C#). Branches on
+    ///   enclosing scope:
     ///     * Inside `interface_declaration` with a `body:` field present →
-    ///       [`SymbolKind::Function`], no parent (Decision 11 — default
-    ///       interface methods extract as Function, matching Rust trait
-    ///       default methods).
+    ///       [`SymbolKind::Function`], no parent (per Decision 11's C#
+    ///       follow-up — default interface methods extract as Function,
+    ///       matching Rust trait default methods).
     ///     * Inside `interface_declaration` with no `body:` field →
     ///       skipped (forward-declaration rule, no Symbol record).
-    ///     * Inside `class_declaration` / `struct_declaration` →
-    ///       [`SymbolKind::Method`] with parent = enclosing type name.
-    ///       Extension methods (Decision 5) extract here too — the
-    ///       `this` parameter modifier is not inspected; the syntactic
-    ///       parent wins.
-    ///     * No enclosing class/struct/interface → [`SymbolKind::Function`]
-    ///       with no parent (defensive: shouldn't happen in well-formed
-    ///       C# but the extractor doesn't assume well-formedness).
+    ///     * Inside `class_declaration` / `struct_declaration` /
+    ///       `record_declaration` → [`SymbolKind::Method`] with parent =
+    ///       enclosing type name. Extension methods (Decision 5) extract
+    ///       here too — the `this` parameter modifier is not inspected;
+    ///       the syntactic parent wins. Methods inside records record
+    ///       the record name as parent.
+    ///     * No enclosing class/struct/interface/record →
+    ///       [`SymbolKind::Function`] with no parent (defensive:
+    ///       shouldn't happen in well-formed C# but the extractor
+    ///       doesn't assume well-formedness).
     /// - `ctor.name` from `constructor_declaration` →
-    ///   [`SymbolKind::Method`] with parent = enclosing class/struct name.
-    ///   The captured name *is* the class/struct identifier (C#
-    ///   constructor syntax — the constructor's name matches its enclosing
-    ///   type's name). When emitted, `Symbol.name` is the constructor
+    ///   [`SymbolKind::Method`] with parent = enclosing
+    ///   class/struct/record name (defensive Function fallback if no
+    ///   enclosing type is found; not reachable in well-formed C#).
+    ///   The captured name *is* the type identifier (C# constructor
+    ///   syntax — the constructor's name matches its enclosing type's
+    ///   name). When emitted, `Symbol.name` is the constructor
     ///   identifier itself; the parent is filled from the enclosing type.
     /// - `local.name` from `local_function_statement` →
     ///   [`SymbolKind::Function`] with no parent. Local functions are
@@ -237,11 +255,11 @@ impl CSharpParser {
     ///   function-shaped declarations.
     ///
     /// Captures consumed without emitting a Symbol:
-    /// - `class.def` / `struct.def` / `interface.def` / `enum.def` /
-    ///   `method.def` / `ctor.def` / `local.def`: structural anchors used
-    ///   by the queries to bind captures to the same definition. The
-    ///   `name`-arm above already resolves the enclosing definition via
-    ///   `find_enclosing_kind`.
+    /// - `class.def` / `record.def` / `struct.def` / `interface.def` /
+    ///   `enum.def` / `method.def` / `ctor.def` / `local.def`: structural
+    ///   anchors used by the queries to bind captures to the same
+    ///   definition. The `name`-arm above already resolves the enclosing
+    ///   definition via `find_enclosing_kind`.
     fn extract_definitions(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.def_query, root, content);
@@ -262,6 +280,24 @@ impl CSharpParser {
                 match cap_name {
                     "class.name" => {
                         let Some(def_node) = find_enclosing_kind(cap_node, "class_declaration")
+                        else {
+                            continue;
+                        };
+                        let parent = enclosing_type_name(def_node, content);
+                        let namespace = enclosing_namespace(def_node, content);
+                        fg.symbols.push(make_symbol(
+                            text,
+                            SymbolKind::Class,
+                            path,
+                            def_node,
+                            content,
+                            parent,
+                            namespace,
+                        ));
+                    }
+
+                    "record.name" => {
+                        let Some(def_node) = find_enclosing_kind(cap_node, "record_declaration")
                         else {
                             continue;
                         };
@@ -480,19 +516,25 @@ fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
     cap_names.get(index as usize).copied().unwrap_or("")
 }
 
-/// Return the immediate enclosing class/struct/interface name for a
-/// declaration node, walking ancestors. Returns `""` when the declaration
-/// is top-level (or only nested inside namespaces). Used to populate the
-/// `parent` field for both nested types and methods/constructors.
+/// Return the immediate enclosing class/record/struct/interface name for
+/// a declaration node, walking ancestors. Returns `""` when the
+/// declaration is top-level (or only nested inside namespaces). Used to
+/// populate the `parent` field for both nested types and
+/// methods/constructors.
 ///
 /// Walks past `cap_node.parent()` so a class at a top-level position
 /// returns `""` (not its own name); a class nested inside another class
-/// records the outer class as parent.
+/// records the outer class as parent. `record_declaration` is recognised
+/// as a type ancestor — methods declared inside a `record` body record
+/// the record name as parent, NOT as orphan free functions.
 fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
     let mut current = def_node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "class_declaration" | "struct_declaration" | "interface_declaration" => {
+            "class_declaration"
+            | "record_declaration"
+            | "struct_declaration"
+            | "interface_declaration" => {
                 if let Some(name_node) = n.child_by_field_name("name") {
                     return name_node.utf8_text(content).unwrap_or("").to_owned();
                 }
@@ -999,6 +1041,77 @@ class C {
             "local function must have empty parent; got {:?}",
             h.parent
         );
+    }
+
+    // ---- Records ---------------------------------------------------
+
+    #[test]
+    fn record_declaration_extracts_as_class_with_methods_as_methods() {
+        // Class-record (`record User(string name)`) extracts as Class;
+        // methods inside the record body extract as Method with parent =
+        // record name (NOT as orphan Function symbols, which was the
+        // pre-fix bug — `enclosing_type_name` did not recognise
+        // `record_declaration` as a type ancestor before this fix).
+        let fg = parse(
+            r#"
+public record User(string name) {
+    public override string ToString() => $"User({name})";
+    public bool IsAdmin() { return name == "admin"; }
+}
+"#,
+        );
+        assert_eq!(
+            fg.symbols.len(),
+            3,
+            "expected 1 record + 2 methods; got: {:?}",
+            fg.symbols
+                .iter()
+                .map(|s| (s.name.as_str(), s.kind))
+                .collect::<Vec<_>>()
+        );
+
+        let user = sym(&fg, "User");
+        assert_eq!(
+            user.kind,
+            SymbolKind::Class,
+            "record extracts as Class (per Decision 11's C# follow-up)"
+        );
+
+        let to_string = sym(&fg, "ToString");
+        assert_eq!(to_string.kind, SymbolKind::Method);
+        assert_eq!(
+            to_string.parent, "User",
+            "method inside record must record record name as parent, not be orphan"
+        );
+
+        let is_admin = sym(&fg, "IsAdmin");
+        assert_eq!(is_admin.kind, SymbolKind::Method);
+        assert_eq!(is_admin.parent, "User");
+    }
+
+    #[test]
+    fn record_struct_extracts_as_class_with_methods_as_methods() {
+        // Struct-record (`record struct Pt(int x, int y)`) — same node
+        // kind as a class-record in tree-sitter-c-sharp 0.23.5, so it
+        // also dispatches to Class. Methods inside parent the struct-
+        // record's name.
+        let fg = parse(
+            r#"
+public record struct Pt(int x, int y) {
+    public int Sum() { return x + y; }
+}
+"#,
+        );
+        let pt = sym(&fg, "Pt");
+        assert_eq!(
+            pt.kind,
+            SymbolKind::Class,
+            "struct-record extracts as Class — both record forms share the same node kind"
+        );
+
+        let sum = sym(&fg, "Sum");
+        assert_eq!(sum.kind, SymbolKind::Method);
+        assert_eq!(sum.parent, "Pt");
     }
 
     // ---- Namespace handling ---------------------------------------

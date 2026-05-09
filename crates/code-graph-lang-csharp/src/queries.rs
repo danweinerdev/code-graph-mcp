@@ -24,22 +24,23 @@
 //!   with no body. `extract_definitions` checks for the file-scoped form
 //!   at compilation_unit level when no `namespace_declaration` ancestor is
 //!   found.
-//! - **Default interface methods** (Decision 11) are detected by presence
-//!   of a `body:` field on a `method_declaration` whose ancestor chain
-//!   contains an `interface_declaration`. The body field can be either
-//!   `(block ...)` or `(arrow_expression_clause ...)` (`int Foo() => 42`)
-//!   — both forms count as "has body" and produce a Function symbol;
-//!   abstract interface methods (no body field at all) produce no symbol.
+//! - **Default interface methods** (per Decision 11's C# follow-up) are
+//!   detected by presence of a `body:` field on a `method_declaration`
+//!   whose ancestor chain contains an `interface_declaration`. The body
+//!   field can be either `(block ...)` or `(arrow_expression_clause ...)`
+//!   (`int Foo() => 42`) — both forms count as "has body" and produce a
+//!   Function symbol; abstract interface methods (no body field at all)
+//!   produce no symbol.
 //! - **`enum_declaration`** wraps its members in
 //!   `(enum_member_declaration_list (enum_member_declaration ...))`. The
 //!   member declarations are NOT extracted as symbols — only the enum
 //!   type itself surfaces, matching the C++/Rust/Go/Python convention
 //!   for enum constants and the analog of Java Decision 12.
 
-/// Definition query: classes, structs, interfaces, enums, methods,
-/// constructors, and local functions. Each top-level pattern uses a
-/// dedicated capture name so the extractor can dispatch on capture name
-/// alone (mirroring the C++/Rust/Go/Python plugins).
+/// Definition query: classes, records, structs, interfaces, enums,
+/// methods, constructors, and local functions. Each top-level pattern
+/// uses a dedicated capture name so the extractor can dispatch on
+/// capture name alone (mirroring the C++/Rust/Go/Python plugins).
 ///
 /// Per-pattern behavior:
 ///
@@ -48,6 +49,14 @@
 ///   — each `partial class Foo {}` declaration produces its own Class
 ///   symbol; merging happens at hierarchy-walk time via the bare-name
 ///   `from`-field rule.
+/// - `record.name` from `record_declaration` → [`SymbolKind::Class`].
+///   Parent computed identically to `class.name`. tree-sitter-c-sharp
+///   0.23.5 produces a single `record_declaration` node for all record
+///   forms — `record User(string n)`, `record class User(string n)`,
+///   and `record struct Pt(int x, int y)` all parse to the same node
+///   kind. Both class-records and struct-records dispatch to `Class`
+///   per Decision 11's C# follow-up (Java Decision 6 analog: records
+///   are ordinary class symbols regardless of value-type semantics).
 /// - `struct.name` from `struct_declaration` → [`SymbolKind::Struct`].
 /// - `interface.name` from `interface_declaration` → [`SymbolKind::Interface`].
 /// - `enum.name` from `enum_declaration` → [`SymbolKind::Enum`]. Enum
@@ -57,8 +66,9 @@
 /// - `method.name` from `method_declaration` → [`SymbolKind::Method`] or
 ///   [`SymbolKind::Function`]. The classification depends on the enclosing
 ///   scope, computed at extraction time:
-///     * Inside `class_declaration` / `struct_declaration` →
-///       [`SymbolKind::Method`] with parent = enclosing type name.
+///     * Inside `class_declaration` / `struct_declaration` /
+///       `record_declaration` → [`SymbolKind::Method`] with parent =
+///       enclosing type name.
 ///     * Inside `interface_declaration` AND with a body present →
 ///       [`SymbolKind::Function`] (no parent), per Decision 11. The
 ///       body-presence check happens at extraction time by inspecting the
@@ -68,22 +78,24 @@
 ///     * Inside `interface_declaration` AND with no body → no symbol
 ///       (forward-declaration rule, mirroring C++/Rust/Go).
 /// - `ctor.name` from `constructor_declaration` → [`SymbolKind::Method`]
-///   with parent = enclosing class/struct name. The captured name is the
-///   class/struct identifier itself (C# constructor syntax).
+///   with parent = enclosing class/struct/record name. The captured name
+///   is the class/struct/record identifier itself (C# constructor
+///   syntax).
 /// - `local.name` from `local_function_statement` → [`SymbolKind::Function`]
 ///   with no parent. Local functions are nested inside method bodies and
 ///   are not members of their enclosing type — treating them as Function
 ///   (no parent) matches the Python/Go conventions for nested function-
 ///   shaped declarations.
-///
-/// **Records intentionally NOT matched.** `record_declaration` is a
-/// distinct node kind in tree-sitter-c-sharp 0.23.5; this task's verification
-/// scope explicitly enumerates the seven supported declarations, and
-/// records are not among them. Adding record support is a follow-up.
 pub(crate) const DEFINITION_QUERIES: &str = r#"
 ; class Foo {} / partial class Foo {} / public class Foo<T> {}
 (class_declaration
   name: (identifier) @class.name) @class.def
+
+; record User(string n) {} / record class User(string n) {} / record struct Pt(int x, int y) {}
+; All three forms produce a single record_declaration node in
+; tree-sitter-c-sharp 0.23.5; the extractor maps every form to Class.
+(record_declaration
+  name: (identifier) @record.name) @record.def
 
 ; struct Pt {}
 (struct_declaration
