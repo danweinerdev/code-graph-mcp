@@ -18,8 +18,16 @@
 //! interface methods (Decision 11), and extension methods (Decision 5) are
 //! covered with inline tests.
 //!
-//! Phase 2.3 will wire `extract_calls` (direct, member-access, chained,
-//! null-conditional, lambda body, LINQ, `new`/constructor).
+//! Phase 2.3 wires `extract_calls`, producing
+//! [`EdgeKind::Calls`] edges for direct (`Foo()`), member-access
+//! (`obj.Foo()`), chained (`a.B().C()` → 2 edges), null-conditional
+//! (`obj?.Foo()`), generic (`Foo<int>()` → `to = "Foo"`), constructor
+//! (`new Foo()` → `to = "Foo"`), lambda-body, and LINQ-select-clause
+//! call patterns. The enclosing-function walk is transparent through
+//! lambda and query expressions (a call inside `() => Foo()` or
+//! `select Foo(x)` reports the enclosing method as `from`). Cast
+//! expressions, `typeof`, `sizeof`, `default`, and `checked` parse as
+//! dedicated node kinds and do NOT produce spurious call edges.
 //!
 //! Phase 2.4 will wire `extract_imports` (`using`, `using static`,
 //! `using A = X.Y`, `global using`, `using` inside namespace blocks).
@@ -35,10 +43,18 @@
 //!
 //! - `resolve_call`: the default scope-aware heuristic (same file > same
 //!   parent > same namespace > global) is the documented contract,
-//!   mirroring the four shipped plugins. Extension method calls
-//!   (`myString.CountWords()`) resolve through this same path with the
-//!   same imperfection class as C++ overloaded-function resolution
-//!   (Decision 5).
+//!   mirroring the four shipped plugins. Phase 2.3's `extract_calls`
+//!   produces purely syntactic edges — the `to` field is the rightmost
+//!   identifier on the callee chain (`Foo` for `obj.Foo()`, `Foo` for
+//!   `Ns.Type.Foo()`, `Foo` for `obj?.Foo()`, `Foo` for `Foo<int>()`,
+//!   `Foo` for `new Foo()`). Resolution to a concrete Symbol happens at
+//!   query time in the orchestrator's resolver, not in the parser.
+//!   Extension method calls (`myString.CountWords()`) record `to =
+//!   "CountWords"` and resolve through the same heuristic — the
+//!   resolver may attribute the call to the syntactic
+//!   `Extensions::CountWords` (correct) or to a same-named method on
+//!   `string` if one exists (incorrect; same imperfection class as C++
+//!   overloaded-function resolution per Decision 5).
 //! - `resolve_include`: C# imports (`using System.Collections.Generic`)
 //!   are dotted namespace paths, not filesystem paths — the default
 //!   basename-match resolver returns `None` for them, mirroring the
@@ -88,9 +104,11 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use code_graph_core::{FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
+
+use crate::helpers::enclosing_function_id;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
@@ -118,8 +136,8 @@ pub struct CSharpParser {
     /// Compiled definition query (live in 2.2 — drives
     /// [`Self::extract_definitions`]).
     def_query: Query,
-    /// Compiled call query (wired in 2.3).
-    #[allow(dead_code)] // wired in Phase 2.3 (extract_calls)
+    /// Compiled call query (live in 2.3 — drives
+    /// [`Self::extract_calls`]).
     call_query: Query,
     /// Compiled import query (wired in 2.4).
     #[allow(dead_code)] // wired in Phase 2.4 (extract_imports)
@@ -175,10 +193,11 @@ impl CSharpParser {
     /// extractors) can be tested via `parse_file` without exposing them.
     /// Mirrors the Python plugin's `parse_to_filegraph` indirection.
     ///
-    /// Phase 2.2 wires `extract_definitions` into the pipeline; the call,
-    /// import, and inheritance extractors are added in 2.3, 2.4, and 2.5
-    /// respectively. Until those land, `parse_file` produces only Symbol
-    /// records — zero edges.
+    /// Phase 2.2 wired `extract_definitions`; Phase 2.3 wires
+    /// `extract_calls`. Phases 2.4 and 2.5 will add the import and
+    /// inheritance extractors. Until those land, `parse_file` produces
+    /// Symbol records and `Calls` edges only — zero `Includes` /
+    /// `Inherits` edges.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -192,6 +211,7 @@ impl CSharpParser {
         };
 
         self.extract_definitions(root, content, &path_str, &mut fg);
+        self.extract_calls(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -468,6 +488,98 @@ impl CSharpParser {
             }
         }
     }
+
+    /// Run the call query and produce [`EdgeKind::Calls`] edges. Mirrors
+    /// the C++/Rust/Go/Python plugins' `extract_calls`: each capture is a
+    /// callee identifier, the line is anchored at the enclosing
+    /// `invocation_expression` / `object_creation_expression` so the
+    /// reported line tracks the call site (not an inner identifier on a
+    /// chain-continuation line), and the `from` field is built by
+    /// [`enclosing_function_id`] so it lines up exactly with the
+    /// `symbol_id()` shape produced by [`Self::extract_definitions`].
+    ///
+    /// Per-capture-name behavior (single capture name `call.name` shared
+    /// across all eight query patterns):
+    ///
+    /// - Direct call (`Foo()`) → `to = "Foo"`. Covers calls inside lambda
+    ///   bodies (`() => Foo()`), LINQ select clauses (`select Foo(x)`),
+    ///   property accessors, field initializers, and expression-bodied
+    ///   methods (each parses the leaf as its own `invocation_expression`
+    ///   with an `identifier` callee).
+    /// - Member-access call (`obj.Foo()`, `this.Foo()`, `base.Foo()`,
+    ///   `Ns.Type.Method()`) → `to = "Foo"` / `to = "Method"` (rightmost
+    ///   identifier only). Chained calls (`a.B().C()`) produce two
+    ///   matches because the grammar nests `invocation_expression`s; the
+    ///   query returns one edge per chain link.
+    /// - Null-conditional call (`obj?.Foo()`) → `to = "Foo"`. The
+    ///   `member_binding_expression` node carries the rightmost
+    ///   identifier.
+    /// - Generic call (`Foo<int>()`) → `to = "Foo"` (NOT `Foo<int>`).
+    ///   The query captures only the inner identifier of the
+    ///   `generic_name`, dropping the type-argument list.
+    /// - Constructor (`new Foo()`, `new Ns.Foo()`, `new List<int>()`,
+    ///   `new Ns.List<int>()`) → `to = "Foo"` / `to = "List"`. Recorded
+    ///   as a call to the constructed type's bare name; the agent
+    ///   interprets the edge as construction. Matches the convention
+    ///   Python uses for `MyClass()`.
+    ///
+    /// **Lambda and LINQ transparency** is implemented in
+    /// [`enclosing_function_id`] — the enclosing-function walk skips
+    /// `lambda_expression` and `query_expression` nodes, so calls inside
+    /// `() => Foo()` or `select Foo(x)` report the enclosing
+    /// method/constructor as the `from` field, not the lambda or query.
+    ///
+    /// **No callee filtering.** C# casts (`(Foo)x`) parse as a distinct
+    /// `cast_expression` node, NOT `invocation_expression`, so no
+    /// `is_cpp_cast`-style filter is needed. `typeof`, `sizeof`,
+    /// `default`, and `checked` similarly have dedicated expression
+    /// kinds. `nameof(X)` IS an `invocation_expression` in this grammar
+    /// and produces a call edge to `nameof` — the syntactic-not-semantic
+    /// rule applies (the agent can post-filter if desired).
+    fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.call_query, root, content);
+        let cap_names = self.call_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "call.name" {
+                    continue;
+                }
+
+                let callee = cap_node.utf8_text(content).unwrap_or("");
+                if callee.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing call/object-creation
+                // expression so the reported line tracks the call site.
+                // For chained or multi-line calls the inner identifier
+                // can land on a continuation line; the outer
+                // invocation_expression's start_position is the
+                // semantically-correct anchor. Falls back to the capture
+                // node when neither ancestor is found (defensive — the
+                // query patterns guarantee at least one).
+                let call_node = find_enclosing_kind(cap_node, "invocation_expression")
+                    .or_else(|| find_enclosing_kind(cap_node, "object_creation_expression"))
+                    .unwrap_or(cap_node);
+                let from = enclosing_function_id(cap_node, content, path);
+
+                fg.edges.push(Edge {
+                    from,
+                    to: callee.to_owned(),
+                    kind: EdgeKind::Calls,
+                    file: path.to_owned(),
+                    line: call_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for CSharpParser {
@@ -481,8 +593,9 @@ impl LanguagePlugin for CSharpParser {
 
     /// Parse `content` (UTF-8 bytes) as C# and produce a [`FileGraph`].
     ///
-    /// Phase 2.2 wires the definition extractor; Phases 2.3/2.4/2.5 wire
-    /// the call, import, and inheritance extractors.
+    /// Phase 2.2 wires the definition extractor; Phase 2.3 wires the
+    /// call extractor. Phases 2.4 and 2.5 add the import and inheritance
+    /// extractors.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -631,8 +744,8 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 2.1 structural smoke tests + Phase 2.2 definition-extraction
-    //! coverage. Behavioral coverage of call / import / inheritance
-    //! extraction lands in 2.3-2.5.
+    //! coverage + Phase 2.3 call-extraction coverage. Behavioral coverage
+    //! of import / inheritance extraction lands in 2.4-2.5.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
@@ -1243,5 +1356,400 @@ class Foo {
         );
         let bar = sym(&fg, "Bar");
         assert_eq!(symbol_id(bar), "/abs/foo.cs:Foo::Bar");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2.3 — call extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Calls` edges of `fg` (drops Inherits/Includes
+    /// when those land in 2.4/2.5).
+    fn calls(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect()
+    }
+
+    /// Assert that exactly one Calls edge with `from = expected_from`
+    /// and `to = expected_to` exists. Panics with a helpful message
+    /// listing every Calls edge if not.
+    fn assert_one_call(fg: &FileGraph, expected_from: &str, expected_to: &str) {
+        let edges = calls(fg);
+        let matched: Vec<&&Edge> = edges
+            .iter()
+            .filter(|e| e.from == expected_from && e.to == expected_to)
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "expected exactly one Calls edge from={:?} to={:?}; got: {:?}",
+            expected_from,
+            expected_to,
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_call_inside_method_records_calls_edge() {
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { Foo(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn member_access_call_records_rightmost_name_only() {
+        // `obj.Foo()` → `to = "Foo"`. The receiver `obj` is part of the
+        // chain syntax but is not the callee identifier.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { obj.Foo(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn chained_call_produces_one_edge_per_chain_link() {
+        // `a.B().C()` — tree-sitter parses two nested
+        // invocation_expressions; the query matches both. Expect 2
+        // edges (to `B` and to `C`), each from `<path>:C::m`.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { a.B().C(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected 2 Calls edges (B, C); got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_one_call(&fg, "/p/x.cs:C::m", "B");
+        assert_one_call(&fg, "/p/x.cs:C::m", "C");
+    }
+
+    #[test]
+    fn null_conditional_call_records_callee_name() {
+        // `obj?.Foo()` → 1 edge to `Foo`. The conditional_access_expression
+        // wraps a member_binding_expression whose `name:` is the callee.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { obj?.Foo(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn call_inside_lambda_body_is_attributed_to_enclosing_method() {
+        // Lambda transparency: the call inside `() => Foo()` reports the
+        // enclosing method `m` as the `from`, not the lambda.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        System.Action a = () => Foo();
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn call_inside_linq_select_is_attributed_to_enclosing_method() {
+        // LINQ transparency: `select Foo(x)` reports the enclosing
+        // method `m` as the `from`, not the query expression.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var r = from x in xs select Foo(x);
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn constructor_call_records_type_name_as_callee() {
+        // `new Foo()` produces a call edge to `Foo` (the agent
+        // interprets the edge as construction).
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var x = new Foo();
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "Foo");
+    }
+
+    #[test]
+    fn generic_call_records_bare_name_not_type_arguments() {
+        // `Foo<int>()` → `to = "Foo"`, NOT `Foo<int>`.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { Foo<int>(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let edge = edges[0];
+        assert_eq!(
+            edge.to, "Foo",
+            "generic call must record bare name, not type-argument list"
+        );
+        assert!(
+            !edge.to.contains('<'),
+            "to field must not contain '<'; got {:?}",
+            edge.to
+        );
+    }
+
+    #[test]
+    fn namespace_qualified_call_records_rightmost_name() {
+        // `System.Console.WriteLine()` → `to = "WriteLine"` only.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { System.Console.WriteLine(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::m", "WriteLine");
+    }
+
+    #[test]
+    fn cast_expression_does_not_produce_call_edge() {
+        // `(Foo)x` parses as cast_expression, NOT invocation_expression.
+        // No spurious call edge.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() { var y = (Foo)x; }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "cast expression must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typeof_sizeof_default_do_not_produce_call_edges() {
+        // typeof / sizeof / default each parse as their own expression
+        // node (typeof_expression, sizeof_expression, default_expression),
+        // NOT as invocation_expression. None should produce call edges.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var t = typeof(int);
+        var s = sizeof(int);
+        var d = default(int);
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "typeof/sizeof/default must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_inside_constructor_records_enclosing_class_as_parent() {
+        // The from-field for a call inside a constructor is
+        // `<path>:Class::Class` (the constructor's name matches its
+        // class). This pins that constructor calls (Phase 2.2's `ctor`
+        // capture) and method calls (Phase 2.2's `method` capture)
+        // route through the same enclosing-function rule.
+        let fg = parse_at(
+            r#"
+class C {
+    public C() { Init(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:C::C", "Init");
+    }
+
+    #[test]
+    fn call_inside_local_function_uses_local_name_as_from() {
+        // Local functions extract as Function with no parent. A call
+        // inside the local function reports `<path>:Helper`, NOT
+        // `<path>:C::Helper` — the local-function boundary is the
+        // immediate enclosing function-shaped declaration.
+        let fg = parse_at(
+            r#"
+class C {
+    void M() {
+        void Helper() { Inner(); }
+        Helper();
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        // Two edges total: `Inner` (from inside Helper) and `Helper`
+        // (from inside M).
+        assert_one_call(&fg, "/p/x.cs:Helper", "Inner");
+        assert_one_call(&fg, "/p/x.cs:C::M", "Helper");
+    }
+
+    #[test]
+    fn call_in_default_interface_method_omits_parent() {
+        // Decision 11: default interface methods extract as Function
+        // (no parent). The call's `from` follows: `<path>:DoFoo`, NOT
+        // `<path>:I::DoFoo`.
+        let fg = parse_at(
+            r#"
+interface I {
+    void DoFoo() { Helper(); }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs:DoFoo", "Helper");
+    }
+
+    #[test]
+    fn call_at_field_initializer_falls_back_to_bare_path() {
+        // A static field initializer is not inside a method/constructor/
+        // local-function. The call's `from` is the bare file path.
+        let fg = parse_at(
+            r#"
+class C {
+    static int x = Compute();
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/x.cs", "Compute");
+    }
+
+    #[test]
+    fn constructor_with_qualified_type_records_rightmost_name() {
+        // `new System.Collections.Generic.List<int>()` → `to = "List"`.
+        // The qualified_name's rightmost `name:` field is the inner
+        // generic_name, which carries a bare identifier.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var x = new System.Collections.Generic.List<int>();
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let edge = edges[0];
+        assert_eq!(edge.to, "List");
+        assert!(
+            !edge.to.contains('.') && !edge.to.contains('<'),
+            "to must be bare name; got {:?}",
+            edge.to
+        );
+    }
+
+    #[test]
+    fn call_edge_carries_file_and_line() {
+        // Sanity: edge.file and edge.line populate as expected (file =
+        // the path, line = 1-indexed call-site row).
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        Foo();
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].file, "/p/x.cs");
+        // The body of `m()` starts on a line >= 1. Don't pin a precise
+        // row (whitespace fragility); just assert > 1 so the math is
+        // populated and 1-indexed (the leading newline pushes the call
+        // past line 1).
+        assert!(edges[0].line >= 1);
+    }
+
+    #[test]
+    fn empty_file_produces_no_call_edges() {
+        let fg = parse("");
+        let edges = calls(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
     }
 }

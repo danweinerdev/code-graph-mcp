@@ -3,16 +3,24 @@
 //! Validated against tree-sitter-c-sharp v0.23.5 — `CSharpParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 2.2 fills in [`DEFINITION_QUERIES`]; the remaining
-//! three constants stay empty until 2.3/2.4/2.5. Empty query strings compile
-//! to a no-op `Query` against any grammar, so the structural smoke test in
-//! `lib.rs` passes against the empty set.
+//! Phase status: Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3 fills
+//! [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and [`INHERITANCE_QUERIES`] stay
+//! empty until 2.4/2.5. Empty query strings compile to a no-op `Query`
+//! against any grammar, so the structural smoke test in `lib.rs` passes
+//! against the empty set for the still-empty queries.
 //!
 //! ## C#-specific node-kind notes (tree-sitter-c-sharp 0.23.5)
 //!
-//! - **Calls** use the `invocation_expression` node kind (verified during
-//!   Phase 2.2 grammar-probing); constructor calls use
-//!   `object_creation_expression`. Phase 2.3 fills [`CALL_QUERIES`].
+//! - **Calls** use the `invocation_expression` node kind for all four
+//!   forms (direct, member-access, null-conditional, generic); each form
+//!   has a different shape on the `function:` field. Constructor calls
+//!   use `object_creation_expression` with a `type:` field that may be a
+//!   bare `identifier`, a `qualified_name`, or a `generic_name`. Phase
+//!   2.3's [`CALL_QUERIES`] documents each shape with its own pattern.
+//!   Cast expressions (`(Foo)x`) parse as `cast_expression`, NOT
+//!   `invocation_expression`, so no C++-style cast-filter is needed;
+//!   `typeof`/`sizeof`/`default`/`checked` similarly have dedicated
+//!   expression node kinds and do not trigger spurious call edges.
 //! - **`namespace_declaration`** wraps its members in a `body:
 //!   (declaration_list ...)` field; nested namespaces (`namespace Outer {
 //!   namespace Inner { ... } }`) walk via repeated `namespace_declaration`
@@ -127,9 +135,110 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
   name: (identifier) @local.name) @local.def
 "#;
 
-/// Query for `invocation_expression` and `object_creation_expression`
-/// (constructor calls). Filled in Phase 2.3.
-pub(crate) const CALL_QUERIES: &str = "";
+/// Call query: every form of `invocation_expression` (direct, member-
+/// access, null-conditional, generic) plus `object_creation_expression`
+/// for constructor calls. All forms share the single capture name
+/// `call.name` so the extractor dispatches uniformly (mirroring the
+/// Python plugin's `call.name` convention).
+///
+/// Per-pattern shape (verified against tree-sitter-c-sharp 0.23.5 via
+/// scratch-crate probe):
+///
+/// - `(invocation_expression function: (identifier))` — direct call
+///   (`Foo()`). The `function:` field is a bare identifier; capture it.
+///   Also covers chained-link inner calls and calls inside lambda /
+///   LINQ-select / property-getter / field-initializer bodies, since
+///   each inner call is its own `invocation_expression`.
+/// - `(invocation_expression function: (member_access_expression
+///   name: (identifier)))` — member-access call (`obj.Foo()`,
+///   `this.Foo()`, `base.Foo()`, namespace-qualified
+///   `System.Console.WriteLine()`). Capture the rightmost `name:` field
+///   only. Chained calls (`a.B().C()`) produce two invocation_expression
+///   matches (one per chain link); each runs through this pattern (or
+///   the direct-call pattern for the leaf).
+/// - `(invocation_expression function: (conditional_access_expression
+///   (member_binding_expression name: (identifier))))` — null-conditional
+///   call (`obj?.Foo()`). The `member_binding_expression` is a distinct
+///   node kind from `member_access_expression`; the `name:` field on it
+///   is the callee identifier.
+/// - `(invocation_expression function: (generic_name (identifier)))` —
+///   generic call (`Foo<int>()`). Capture only the inner identifier so
+///   the recorded `to` is the bare name (`Foo`), NOT `Foo<int>`.
+/// - `(object_creation_expression type: (identifier))` — constructor with
+///   bare type (`new Foo()`). Per Decision-5-style convention: the edge
+///   records `to = "Foo"`; the agent interprets the edge as
+///   construction.
+/// - `(object_creation_expression type: (qualified_name name:
+///   (identifier)))` — constructor with namespace-qualified type
+///   (`new System.Foo()`). Capture the rightmost name (`Foo`).
+/// - `(object_creation_expression type: (generic_name (identifier)))` —
+///   constructor with generic type (`new List<int>()`). Capture the bare
+///   inner name (`List`), dropping the type-argument list.
+/// - `(object_creation_expression type: (qualified_name name:
+///   (generic_name (identifier))))` — constructor with qualified-and-
+///   generic type (`new System.Collections.Generic.List<int>()`). Captures
+///   the rightmost bare name (`List`).
+///
+/// Patterns NOT matched (intentional, per the C# grammar):
+/// - `cast_expression` (`(Foo)x`) — distinct node kind, never an
+///   `invocation_expression`. No filter needed (unlike C++ where casts
+///   appear as call_expression and require `is_cpp_cast` filtering).
+/// - `typeof(T)`, `sizeof(T)`, `default(T)`, `checked(expr)`,
+///   `unchecked(expr)` — each parses as a dedicated expression node
+///   (`typeof_expression`, etc.), NOT `invocation_expression`. No filter
+///   needed.
+/// - `nameof(X)` IS an `invocation_expression function: (identifier)`
+///   in tree-sitter-c-sharp 0.23.5 (the grammar treats `nameof` as an
+///   ordinary call). It produces a `Calls` edge to `nameof`. This
+///   matches the syntactic-not-semantic contract; the agent can choose
+///   to filter `nameof` post-hoc.
+pub(crate) const CALL_QUERIES: &str = r#"
+; Direct call: Foo()
+(invocation_expression
+  function: (identifier) @call.name)
+
+; Member-access call: obj.Foo() / this.Foo() / base.Foo() / Ns.Type.Method()
+; Capture only the rightmost `name:` field — the leftmost subtree
+; (the receiver expression chain) carries the rest of the syntactic chain
+; but is not the callee identifier.
+(invocation_expression
+  function: (member_access_expression
+    name: (identifier) @call.name))
+
+; Null-conditional call: obj?.Foo()
+; The conditional_access_expression's right side is a
+; member_binding_expression, not a member_access_expression.
+(invocation_expression
+  function: (conditional_access_expression
+    (member_binding_expression
+      name: (identifier) @call.name)))
+
+; Generic call: Foo<int>()
+; Capture only the inner identifier so `to` is `Foo` (not `Foo<int>`).
+(invocation_expression
+  function: (generic_name
+    (identifier) @call.name))
+
+; Constructor: new Foo()
+(object_creation_expression
+  type: (identifier) @call.name)
+
+; Constructor with qualified type: new System.Foo()
+(object_creation_expression
+  type: (qualified_name
+    name: (identifier) @call.name))
+
+; Constructor with generic type: new List<int>()
+(object_creation_expression
+  type: (generic_name
+    (identifier) @call.name))
+
+; Constructor with qualified generic type: new System.Collections.Generic.List<int>()
+(object_creation_expression
+  type: (qualified_name
+    name: (generic_name
+      (identifier) @call.name)))
+"#;
 
 /// Query for `using_directive` in all forms (plain, `using static`,
 /// alias, `global using`). Filled in Phase 2.4.
