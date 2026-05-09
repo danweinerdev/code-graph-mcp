@@ -35,12 +35,15 @@
 //! - **Constructors** use `constructor_declaration` with
 //!   `name: (identifier)`. The captured name matches the enclosing class
 //!   identifier (Java constructor syntax — like C#).
-//! - **Default and static interface methods** (Decision 11) are detected
-//!   at extraction time by walking the `modifiers` child of the
-//!   `method_declaration` node and matching keyword tokens of kind
-//!   `"default"` or `"static"`. Modifier kinds in tree-sitter-java 0.23.5
-//!   are anonymous keyword tokens whose `kind()` is the literal modifier
-//!   text (e.g. a `default` keyword has `kind() == "default"`).
+//! - **Default and static interface methods** (Decision 11) are
+//!   classified at extraction time by **presence of the `body:` field**
+//!   on `method_declaration` — the same discriminator the C# plugin
+//!   uses. Any `method_declaration` inside an `interface_declaration`
+//!   that has a body (regardless of `default`, `static`, or Java-9+
+//!   `private` modifier) extracts as `Function` (no parent); any method
+//!   without a body is a forward declaration and is skipped. The body-
+//!   presence rule subsumes the modifier check cleanly and covers the
+//!   Java-9+ private interface method case the brief did not enumerate.
 //! - **Anonymous classes** (Decision 4) parse as `object_creation_expression`
 //!   with an unnamed `class_body` child appearing AFTER the `argument_list`.
 //!   Methods inside the anonymous body are ordinary `method_declaration`

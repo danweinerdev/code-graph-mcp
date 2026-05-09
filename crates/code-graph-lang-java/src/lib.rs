@@ -843,6 +843,33 @@ interface I {
     }
 
     #[test]
+    fn private_interface_method_with_body_extracts_as_function_no_parent() {
+        // Java 9+ allows `private` methods on interfaces (no `default`
+        // or `static` modifier). The body-presence discriminator covers
+        // this case: the method has a body, so it extracts as Function
+        // (no parent) just like `default`/`static`. Pins the claim from
+        // queries.rs / lib.rs docs that body-presence subsumes the
+        // modifier check cleanly across all three Java-9+ method kinds.
+        let fg = parse(
+            r#"
+interface I {
+    private void helper() { return; }
+}
+"#,
+        );
+        let s = sym(&fg, "helper");
+        assert_eq!(
+            s.kind,
+            SymbolKind::Function,
+            "private interface method with body must extract as Function (not Method)"
+        );
+        assert!(
+            s.parent.is_empty(),
+            "private interface method with body must have empty parent"
+        );
+    }
+
+    #[test]
     fn abstract_interface_method_produces_no_symbol() {
         // `void Bar();` inside an interface (no body) — forward
         // declaration; produces no Symbol record (mirroring

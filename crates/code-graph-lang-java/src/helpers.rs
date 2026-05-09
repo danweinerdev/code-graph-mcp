@@ -1,10 +1,16 @@
 //! Helper routines for the Java parser.
 //!
-//! Phase status: Phase 3.1 ships this module empty. Tasks 3.2-3.5 fill
-//! in the small structural helpers (e.g. enclosing-class lookup for
-//! method-vs-function disambiguation, anonymous-class skipping for
-//! Decision 4) used by the upcoming extractors.
-//!
-//! Cross-language helpers (e.g. `truncate_signature`) are re-exported
-//! from `code_graph_lang::helpers` rather than duplicated here, mirroring
-//! the post-consolidation shape of the C++/Rust/Go/Python plugins.
+//! Currently empty. The cross-language helpers
+//! ([`code_graph_lang::helpers::truncate_signature`],
+//! [`code_graph_lang::helpers::find_enclosing_kind`]) are imported
+//! directly from `code-graph-lang` at their use sites in `lib.rs` rather
+//! than re-exported through this module. The Java-specific helpers that
+//! Phase 3.2 needed (`enclosing_named_type_kind`,
+//! `enclosing_named_type_name`, `enclosing_type_name`) live as private
+//! functions in `lib.rs` rather than here, because they are tightly
+//! coupled to the extractor's tree-walking strategy. This module exists
+//! as a per-plugin landing spot for any Java-specific helpers later
+//! phases introduce (e.g. package-path joining, qualified-name
+//! flattening for inheritance edges); keeping the file present preserves
+//! the same module shape as the C++/Rust/Go/Python/C# plugins so future
+//! helpers slot in without churn.
