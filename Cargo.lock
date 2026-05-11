@@ -293,6 +293,7 @@ dependencies = [
  "code-graph-lang-cpp",
  "code-graph-lang-csharp",
  "code-graph-lang-go",
+ "code-graph-lang-java",
  "code-graph-lang-python",
  "code-graph-lang-rust",
  "crossbeam-channel",

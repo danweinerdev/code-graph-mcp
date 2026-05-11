@@ -19,3 +19,6 @@
 [submodule "external/efcore"]
 	path = external/efcore
 	url = https://github.com/dotnet/efcore.git
+[submodule "external/commons-lang"]
+	path = external/commons-lang
+	url = https://github.com/apache/commons-lang.git
