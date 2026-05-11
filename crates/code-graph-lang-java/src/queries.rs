@@ -143,10 +143,128 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
   name: (identifier) @ctor.name) @ctor.def
 "#;
 
-/// Call queries: `method_invocation` (direct, member-access, chained),
-/// `object_creation_expression`, invocations inside lambdas, anonymous
-/// classes, and enum-constant bodies. Filled in 3.3.
-pub(crate) const CALL_QUERIES: &str = "";
+/// Call query: every form of `method_invocation` (direct, member-access,
+/// chained, generic), plus `object_creation_expression` for `new T()`
+/// constructor calls, `explicit_constructor_invocation` for `this(...)`
+/// / `super(...)` chaining inside constructor bodies, and `method_reference`
+/// for identifier-on-RHS form (`String::length`, `obj::method`, `this::doIt`,
+/// `super::doIt`). All forms share the single capture name `call.name`
+/// so the extractor dispatches uniformly (mirroring the C# plugin's
+/// `call.name` convention).
+///
+/// Per-pattern shape (verified against tree-sitter-java 0.23.5 via
+/// scratch-crate probe):
+///
+/// - `(method_invocation name: (identifier))` — covers direct (`foo()`),
+///   member-access (`obj.foo()`), and generic (`obj.<T>foo()`) call forms
+///   in a single pattern. The `name:` field on `method_invocation` always
+///   points at the rightmost bare identifier; the `object:` (receiver)
+///   and `type_arguments:` fields are part of the node but not captured.
+///   Chained calls (`a.b().c()`) parse as nested `method_invocation`s —
+///   the outer query matches both levels independently, producing one
+///   edge per chain link (`b` and `c`).
+/// - `(object_creation_expression type: (type_identifier))` — bare
+///   constructor (`new Foo()`). Records `to = "Foo"`.
+/// - `(object_creation_expression type: (generic_type (type_identifier)))` —
+///   generic constructor (`new ArrayList<Integer>()`). Captures only the
+///   bare type_identifier inside the `generic_type`, dropping
+///   `type_arguments`.
+/// - `(object_creation_expression type: (scoped_type_identifier (type_identifier) @x .))` —
+///   qualified constructor (`new java.util.ArrayList()`). The anchor `.`
+///   pins the capture to the rightmost `type_identifier` of the
+///   `scoped_type_identifier` chain (e.g., `ArrayList`, not `java` or
+///   `util`).
+/// - `(object_creation_expression type: (generic_type (scoped_type_identifier (type_identifier) @x .)))` —
+///   qualified-and-generic constructor (`new java.util.ArrayList<Integer>()`).
+///   Captures the rightmost bare name (`ArrayList`), dropping both the
+///   namespace chain and the type arguments.
+/// - `(explicit_constructor_invocation constructor: _ @call.name)` —
+///   constructor chaining (`this(...)` / `super(...)` inside a
+///   constructor body). The `constructor:` field is the bare `this` or
+///   `super` keyword node — its `kind()` is the literal string `"this"`
+///   or `"super"`, and its text is the same. Recorded with
+///   `to = "this"` or `to = "super"` per the design brief: these ARE
+///   genuine constructor invocations and SHOULD produce call edges.
+/// - `(method_reference "::" (identifier) @call.name)` — method reference
+///   with an identifier on the RHS. The `"::"` anchor matches the
+///   `::` token; the captured `identifier` is the right-hand-side name
+///   (`String::length` → `length`, `obj::method` → `method`,
+///   `this::doIt` → `doIt`, `super::doIt` → `doIt`).
+///
+/// Patterns NOT matched (intentional or documented limitations):
+/// - `method_reference` with a `new` keyword on the RHS (constructor
+///   references, e.g. `ArrayList::new`, `Foo::new`). The grammar lays out
+///   `method_reference` as `(method_reference <lhs> :: <rhs>)`, where
+///   `<rhs>` is the `new` keyword token for constructor references — its
+///   node kind is `"new"`, not `"identifier"`. The pattern
+///   `(method_reference "::" (identifier) @call.name)` cleanly skips
+///   these. Documented as a known limitation rather than over-engineering
+///   a second capture pattern: an agent asking "what does this code
+///   construct via a method reference?" gets no edge; the same agent
+///   asking "what `new T()` calls exist?" gets the `object_creation`
+///   edges. The asymmetry mirrors the brief's "discover-and-document is
+///   acceptable; over-engineering an unusable query is not."
+/// - Cast expressions (`(String) o`) parse as `cast_expression`, NOT
+///   `method_invocation` or `object_creation_expression`. No filter
+///   needed (unlike C++ where casts appear as call_expression and require
+///   `is_cpp_cast` filtering).
+/// - `instanceof`, `synchronized`, `switch_expression`, and the rest of
+///   Java's keyword-led syntax each parse as dedicated nodes
+///   (`instanceof_expression`, `synchronized_statement`,
+///   `switch_expression`, etc.) and do NOT trigger spurious call edges.
+/// - `array_creation_expression` (`new int[10]`) is a distinct node from
+///   `object_creation_expression` — it does NOT match. Array allocations
+///   correctly produce zero call edges.
+/// - **No Java analog to C#'s `nameof` filter is required.** Java's
+///   `String::class` (`.class` literal) parses as `class_literal`, not as
+///   a method invocation. There is no syntactic-look-alike-but-not-a-call
+///   construct in Java analogous to `nameof(X)`. Annotations
+///   (`@Override`, `@Deprecated`, `@HttpGet(...)`) parse as
+///   `marker_annotation` / `annotation` nodes and are not
+///   `method_invocation`. The probe confirmed no spurious-call sources;
+///   no callee-name filter is wired in `extract_calls`.
+pub(crate) const CALL_QUERIES: &str = r#"
+; Direct, member-access, chained, and generic call: foo() / obj.foo() / a.b().c() / obj.<T>foo()
+; Chained calls produce two matches because the grammar nests
+; method_invocation on the `object:` field; each link runs through this
+; pattern independently.
+(method_invocation
+  name: (identifier) @call.name)
+
+; Constructor with bare type: new Foo()
+(object_creation_expression
+  type: (type_identifier) @call.name)
+
+; Constructor with generic type: new ArrayList<Integer>()
+(object_creation_expression
+  type: (generic_type
+    (type_identifier) @call.name))
+
+; Constructor with qualified type: new java.util.ArrayList()
+; The anchor `.` pins the capture to the rightmost type_identifier of
+; the scoped_type_identifier chain.
+(object_creation_expression
+  type: (scoped_type_identifier
+    (type_identifier) @call.name .))
+
+; Constructor with qualified-and-generic type: new java.util.ArrayList<Integer>()
+(object_creation_expression
+  type: (generic_type
+    (scoped_type_identifier
+      (type_identifier) @call.name .)))
+
+; this(...) / super(...) inside constructor bodies. The `constructor:`
+; field is the `this` or `super` keyword node; its text equals its kind.
+(explicit_constructor_invocation
+  constructor: _ @call.name)
+
+; Method reference with identifier on RHS: String::length / obj::method /
+; this::doIt / super::doIt. Constructor references (Type::new) deliberately
+; skipped — see Patterns NOT matched in the module doc.
+(method_reference
+  "::"
+  (identifier) @call.name)
+"#;
 
 /// Import queries: `import_declaration` in plain, wildcard, and static
 /// forms. Filled in 3.4.

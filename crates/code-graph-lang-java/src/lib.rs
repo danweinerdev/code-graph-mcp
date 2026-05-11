@@ -18,9 +18,14 @@
 //! interface methods (Decision 11), and enum-with-method-bodies
 //! (Decision 12) are covered with inline tests.
 //!
-//! Phase 3.3 will wire `extract_calls` (`method_invocation`,
-//! `object_creation_expression`, lambda body, anonymous-class body,
-//! enum-constant body, method references).
+//! Phase 3.3 wires `extract_calls` covering `method_invocation` (direct,
+//! member-access, chained, generic), `object_creation_expression`
+//! (constructor calls in bare / generic / qualified / qualified-generic
+//! forms), `explicit_constructor_invocation` (`this(...)` and `super(...)`
+//! constructor chaining), and `method_reference` (identifier-on-RHS form:
+//! `String::length`, `obj::method`, `this::doIt`, `super::doIt`).
+//! Constructor references (`Type::new`) are deliberately not matched —
+//! see `queries::CALL_QUERIES` for rationale.
 //!
 //! Phase 3.4 will wire `extract_imports` (`import_declaration` plain,
 //! wildcard, static).
@@ -94,7 +99,7 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use code_graph_core::{FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
@@ -124,8 +129,7 @@ pub struct JavaParser {
     /// Compiled definition query (live in 3.2 — drives
     /// [`Self::extract_definitions`]).
     def_query: Query,
-    /// Compiled call query (wired in 3.3).
-    #[allow(dead_code)] // wired in Phase 3.3 (extract_calls)
+    /// Compiled call query (live in 3.3 — drives [`Self::extract_calls`]).
     call_query: Query,
     /// Compiled import query (wired in 3.4).
     #[allow(dead_code)] // wired in Phase 3.4 (extract_imports)
@@ -143,8 +147,9 @@ impl JavaParser {
     ///
     /// Successful return is the gate that proves every query string in
     /// [`queries`] parses against tree-sitter-java 0.23.5. Phase 3.2
-    /// fills [`DEFINITION_QUERIES`]; the other three remain empty until
-    /// 3.3/3.4/3.5 land their respective extractors.
+    /// filled [`DEFINITION_QUERIES`]; Phase 3.3 filled [`CALL_QUERIES`].
+    /// [`IMPORT_QUERIES`] and [`INHERITANCE_QUERIES`] remain empty until
+    /// 3.4/3.5 land their respective extractors.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_java::LANGUAGE.into();
 
@@ -180,10 +185,11 @@ impl JavaParser {
     /// extractors) can be tested via `parse_file` without exposing them.
     /// Mirrors the Python/C# plugins' `parse_to_filegraph` indirection.
     ///
-    /// Phase 3.2 wires `extract_definitions` into the pipeline; the call,
-    /// import, and inheritance extractors are added in 3.3, 3.4, and 3.5
-    /// respectively. Until those land, `parse_file` produces only Symbol
-    /// records — zero edges.
+    /// Phase 3.2 wires `extract_definitions` into the pipeline; Phase 3.3
+    /// wires `extract_calls`. The import (3.4) and inheritance (3.5)
+    /// extractors are added in subsequent phases. Until those land,
+    /// `parse_file` produces Symbol records and `Calls` edges, but no
+    /// `Includes` or `Inherits` edges.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -197,6 +203,7 @@ impl JavaParser {
         };
 
         self.extract_definitions(root, content, &path_str, &mut fg);
+        self.extract_calls(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -444,6 +451,132 @@ impl JavaParser {
             }
         }
     }
+
+    /// Run the call query and produce [`EdgeKind::Calls`] edges. Mirrors
+    /// the C++/Rust/Go/Python/C# plugins' `extract_calls`: each capture
+    /// is a callee identifier, the line is anchored at the enclosing
+    /// `method_invocation` / `object_creation_expression` /
+    /// `explicit_constructor_invocation` / `method_reference` so the
+    /// reported line tracks the call-site (not an inner identifier on a
+    /// chain-continuation line), and the `from` field is built by
+    /// [`enclosing_function_id`] so it lines up exactly with the
+    /// `symbol_id()` shape produced by [`Self::extract_definitions`].
+    ///
+    /// Per-capture-name behavior (single capture name `call.name` shared
+    /// across all seven query patterns):
+    ///
+    /// - Direct, member-access, chained, and generic calls — `foo()`,
+    ///   `obj.foo()`, `a.b().c()`, `obj.<T>foo()` — captured by the
+    ///   single `method_invocation name: (identifier)` pattern. Chained
+    ///   calls produce one edge per link (the grammar nests
+    ///   `method_invocation`s on the `object:` field).
+    /// - Constructor calls (`new Foo()`, `new ArrayList<Integer>()`,
+    ///   `new java.util.ArrayList<>()`) → `to = "Foo"` / `to = "ArrayList"`.
+    ///   The query captures only the bare rightmost type_identifier;
+    ///   generics and qualifier chains are stripped.
+    /// - `this(...)` / `super(...)` constructor chaining → `to = "this"`
+    ///   / `to = "super"`. These ARE genuine constructor invocations
+    ///   (Java syntactically requires them in the first statement of a
+    ///   constructor body when used) and produce call edges per the
+    ///   design brief — no filter is applied. Agents disambiguate from
+    ///   ordinary method calls via the literal `"this"` / `"super"`
+    ///   callee name, which is not a valid Java identifier in a normal
+    ///   call position.
+    /// - Method references with identifier on RHS (`String::length`,
+    ///   `obj::method`, `this::doIt`, `super::doIt`) → `to = <RHS name>`.
+    ///   Constructor references (`Type::new`) are NOT matched by the
+    ///   query — see `queries::CALL_QUERIES` for the documented
+    ///   limitation.
+    ///
+    /// **Lambda transparency** is implemented in [`enclosing_function_id`]
+    /// — the enclosing-function walk does not stop at `lambda_expression`
+    /// nodes, so calls inside `() -> foo()` report the enclosing
+    /// method/constructor as the `from` field, not the lambda. Mirrors
+    /// Python `lambda`, Go `func_literal`, and C# `lambda_expression`
+    /// transparency.
+    ///
+    /// **Decision 4 transparency** (anonymous classes) is also
+    /// implemented in [`enclosing_function_id`] — the walk passes through
+    /// `object_creation_expression` boundaries, so a call inside a
+    /// `new Runnable() { void run() { foo(); } }` body reports the
+    /// enclosing NAMED method (the `m()` containing the `new Runnable()`),
+    /// matching the parent-resolution rule established for anonymous-class
+    /// method symbols in Phase 3.2's `extract_definitions`. The
+    /// anonymous-class's `run` method itself, if it exists, owns the
+    /// `from` field of any call directly inside it — but `run` is itself
+    /// a `method_declaration` and stops the walk under the same rules
+    /// that govern any named method.
+    ///
+    /// **Decision 12 transparency** (enum-constant method bodies) is also
+    /// implemented in [`enclosing_function_id`] — the walk passes through
+    /// `enum_constant` boundaries when no `method_declaration` ancestor
+    /// is found beneath the enum_constant, so a call inside a per-constant
+    /// method body resolves to the enum-type parent. (In well-formed Java,
+    /// the per-constant method body is itself a `method_declaration`, so
+    /// the walk stops there normally; the enum_constant transparency is
+    /// load-bearing only for calls directly inside an enum_constant's
+    /// `class_body` outside any method — a degenerate case but pinned by
+    /// the same walk-past rule the 3.2 helpers established.)
+    ///
+    /// **Callee filtering.** Java has no syntactic-look-alike-but-not-a-
+    /// call construct analogous to C#'s `nameof(X)`: casts parse as
+    /// `cast_expression`, `instanceof` as `instanceof_expression`,
+    /// `synchronized` as `synchronized_statement`, `switch` as
+    /// `switch_expression`, `class` literals as `class_literal`,
+    /// annotations as `marker_annotation`/`annotation`, and array
+    /// allocations as `array_creation_expression` (NOT
+    /// `object_creation_expression`). The probe found no Java callee-
+    /// name filter worth wiring; the extractor records every match.
+    fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.call_query, root, content);
+        let cap_names = self.call_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "call.name" {
+                    continue;
+                }
+
+                // For most captures the text is the callee identifier.
+                // For `explicit_constructor_invocation` the captured node
+                // is a keyword (`this` or `super`); its text equals its
+                // kind. The unified text extraction works in both cases.
+                let callee = cap_node.utf8_text(content).unwrap_or("");
+                if callee.is_empty() {
+                    continue;
+                }
+
+                // Anchor the line at the enclosing call/object-creation/
+                // ctor-chain/method-ref expression so the reported line
+                // tracks the call site. For chained or multi-line calls
+                // the inner identifier can land on a continuation line;
+                // the outer call node's start_position is the
+                // semantically-correct anchor. Falls back to the capture
+                // node when no enclosing call ancestor is found
+                // (defensive — the query patterns guarantee one).
+                let call_node = find_enclosing_kind(cap_node, "method_invocation")
+                    .or_else(|| find_enclosing_kind(cap_node, "object_creation_expression"))
+                    .or_else(|| find_enclosing_kind(cap_node, "explicit_constructor_invocation"))
+                    .or_else(|| find_enclosing_kind(cap_node, "method_reference"))
+                    .unwrap_or(cap_node);
+                let from = enclosing_function_id(cap_node, content, path);
+
+                fg.edges.push(Edge {
+                    from,
+                    to: callee.to_owned(),
+                    kind: EdgeKind::Calls,
+                    file: path.to_owned(),
+                    line: call_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for JavaParser {
@@ -582,6 +715,127 @@ fn enclosing_named_type_name(def_node: Node<'_>, content: &[u8]) -> String {
         current = n.parent();
     }
     String::new()
+}
+
+/// Build a `path:fn_name` or `path:Parent::fn_name` symbol-ID anchor for
+/// the function/method/constructor enclosing `node`. Mirrors the
+/// C++/Rust/Go/Python/C# plugins' `enclosing_function_id` and matches
+/// the [`code_graph_core::symbol_id`] shape produced by Phase 3.2's
+/// definition extractor so call edges' `from` fields line up exactly
+/// with definition IDs.
+///
+/// Lives in `lib.rs` rather than `helpers.rs` because the walk is
+/// tightly coupled to the same Decision 4 / Decision 12 transparency
+/// rules implemented by [`enclosing_named_type_kind`] and
+/// [`enclosing_named_type_name`]. Keeping all three together makes the
+/// "anonymous classes and enum_constant boundaries are transparent"
+/// contract obvious at a single read.
+///
+/// Behavior:
+/// - **`method_declaration`** with an enclosing named-type
+///   (`class_declaration` / `enum_declaration` / `record_declaration`)
+///   → returns `<path>:<TypeName>::<method>`. Uses
+///   [`enclosing_named_type_name`] so anonymous-class
+///   (`object_creation_expression`) and enum-constant (`enum_constant`)
+///   boundaries are transparent — matches the 3.2 parent-resolution
+///   rule.
+/// - **`method_declaration`** inside an `interface_declaration` (default,
+///   `static`, or Java-9+ `private` interface method, all detected by
+///   `body:` presence) → returns `<path>:<method>` (no parent). Matches
+///   Decision 11: the symbol kind is `Function`, and the symbol ID has
+///   no parent prefix. Methods without bodies in an interface yield no
+///   Symbol record (3.2's forward-declaration rule), so any call
+///   lexically inside such a node is unreachable in practice — the walk
+///   still reports the `<path>:<method>` form for robustness.
+/// - **`constructor_declaration`** → returns `<path>:<TypeName>::<ctor>`.
+///   The constructor's name matches its enclosing type's name (Java
+///   constructor syntax). Uses the same
+///   [`enclosing_named_type_name`] walk for consistency with how
+///   `extract_definitions` resolves the constructor's `parent` field.
+/// - **No enclosing function-shaped declaration** (call at file scope,
+///   in a field initializer, in an annotation argument, etc.) → returns
+///   `path` (the bare file path). Matches the C++/Rust/Go/Python/C#
+///   top-level-call rule.
+///
+/// **Lambda transparency:** `lambda_expression` is NOT a function-shaped
+/// declaration in this walk — calls inside `() -> foo()` walk past the
+/// lambda and report the enclosing method/constructor as the `from`.
+/// Mirrors the Python `lambda` and Go `func_literal` rules.
+///
+/// **Anonymous-class transparency (Decision 4):**
+/// `object_creation_expression` is NOT a function-shaped declaration in
+/// this walk. A call inside `new Runnable() { void run() { foo(); } }`
+/// has `run` (an inner `method_declaration`) as the immediate enclosing
+/// function — but the `run` symbol's PARENT, resolved via
+/// [`enclosing_named_type_name`], walks past the
+/// `object_creation_expression` to the outer named type. So the `from`
+/// field for the `foo()` call is `<path>:<OuterClass>::run` (matching
+/// the symbol ID produced by 3.2's `extract_definitions`). Two
+/// anonymous classes in the same method that both define `run` produce
+/// two collisions by design (documented limitation in 3.2's
+/// `two_anonymous_classes_in_same_method_both_define_run_collide_by_design`
+/// test).
+///
+/// **Enum-constant transparency (Decision 12):** `enum_constant` is NOT
+/// a function-shaped declaration in this walk. The transparency is
+/// load-bearing only when the enclosing named-type lookup would
+/// otherwise stop at an `enum_constant` boundary — see
+/// [`enclosing_named_type_name`] for the details.
+fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        match n.kind() {
+            "method_declaration" => {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(content).ok())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return path.to_owned();
+                }
+                // A method directly inside an interface with a body is a
+                // default/static/private interface method — 3.2's
+                // extract_definitions records it as Function with no
+                // parent (Decision 11), so the call's `from` must omit
+                // the parent too. Body-less abstract methods produce no
+                // symbol at all but the walk reports the `<path>:<name>`
+                // form for robustness (matches the C# precedent).
+                if find_enclosing_kind(n, "interface_declaration").is_some() {
+                    return format!("{path}:{name}");
+                }
+                // Otherwise, prefer the nearest enclosing named type as
+                // the parent. The walk uses
+                // [`enclosing_named_type_name`] so anonymous-class and
+                // enum-constant boundaries are transparent (Decisions 4
+                // and 12 — the parent must match the symbol ID 3.2
+                // produced for this method). Falls back to the bare
+                // `<path>:<name>` form if no enclosing type is found
+                // (defensive — shouldn't happen in well-formed Java).
+                let parent = enclosing_named_type_name(n, content);
+                if parent.is_empty() {
+                    return format!("{path}:{name}");
+                }
+                return format!("{path}:{parent}::{name}");
+            }
+            "constructor_declaration" => {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(content).ok())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return path.to_owned();
+                }
+                let parent = enclosing_named_type_name(n, content);
+                if parent.is_empty() {
+                    return format!("{path}:{name}");
+                }
+                return format!("{path}:{parent}::{name}");
+            }
+            _ => {}
+        }
+        current = n.parent();
+    }
+    path.to_owned()
 }
 
 /// Build a [`Symbol`] from a definition node. Centralises the row/column/
@@ -1275,5 +1529,514 @@ class Foo {
         assert!(foo.namespace.is_empty(), "expected empty namespace");
         let bar = sym(&fg, "bar");
         assert!(bar.namespace.is_empty(), "expected empty namespace");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.3 — call extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Calls` edges of `fg` (drops Inherits/Includes
+    /// when those land in 3.4/3.5). Mirrors the C# plugin's test helper.
+    fn calls(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect()
+    }
+
+    /// Assert that exactly one Calls edge with `from = expected_from`
+    /// and `to = expected_to` exists. Panics with a helpful message
+    /// listing every Calls edge if not. Mirrors the C# plugin's
+    /// `assert_one_call`.
+    fn assert_one_call(fg: &FileGraph, expected_from: &str, expected_to: &str) {
+        let edges = calls(fg);
+        let matched: Vec<&&Edge> = edges
+            .iter()
+            .filter(|e| e.from == expected_from && e.to == expected_to)
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "expected exactly one Calls edge from={:?} to={:?}; got: {:?}",
+            expected_from,
+            expected_to,
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_call_inside_method_records_calls_edge() {
+        let fg = parse_at("class C { void m() { foo(); } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "foo");
+    }
+
+    #[test]
+    fn member_access_call_records_rightmost_name_only() {
+        // `obj.foo()` → `to = "foo"`. The receiver `obj` is part of the
+        // syntactic chain but is not the callee identifier.
+        let fg = parse_at("class C { void m() { obj.foo(); } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "foo");
+    }
+
+    #[test]
+    fn chained_call_produces_one_edge_per_chain_link() {
+        // `a.b().c()` — tree-sitter parses two nested method_invocation
+        // nodes (the inner `a.b()` is the `object:` of the outer
+        // `_.c()`); the query matches both. Expect 2 edges (to `b` and
+        // to `c`), each from `<path>:C::m`.
+        let fg = parse_at("class C { void m() { a.b().c(); } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "b");
+        assert_one_call(&fg, "/p/Test.java:C::m", "c");
+    }
+
+    #[test]
+    fn constructor_call_records_type_as_callee() {
+        // `new Foo()` → `to = "Foo"`. Matches the C#/Python convention
+        // for constructor calls: the agent interprets the edge as
+        // construction; the recorded callee is the bare type name.
+        let fg = parse_at(
+            "class C { void m() { var x = new Foo(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "Foo");
+    }
+
+    #[test]
+    fn generic_call_records_bare_name_not_typed_form() {
+        // `obj.<Integer>foo()` → `to = "foo"`, NOT `foo<Integer>`. The
+        // `name:` field on method_invocation is the bare identifier; the
+        // `type_arguments:` field is a sibling that the query does not
+        // capture.
+        let fg = parse_at(
+            "class C { <T> void m() { this.<Integer>foo(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "foo");
+        // Pin the bare-name invariant — if a future refactor regresses
+        // to capturing the typed form, the substring check catches it.
+        assert!(
+            !edges[0].to.contains('<'),
+            "to must be bare name; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn generic_constructor_records_bare_type_name() {
+        // `new ArrayList<Integer>()` → `to = "ArrayList"`. The query
+        // captures only the type_identifier inside generic_type.
+        let fg = parse_at(
+            "class C { void m() { var x = new ArrayList<Integer>(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "ArrayList");
+        assert!(
+            !edges[0].to.contains('<'),
+            "to must be bare name; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn qualified_constructor_records_rightmost_type_name() {
+        // `new java.util.ArrayList()` → `to = "ArrayList"`. The
+        // scoped_type_identifier query anchors on the rightmost
+        // type_identifier.
+        let fg = parse_at(
+            "class C { void m() { var x = new java.util.ArrayList(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "ArrayList");
+        assert!(
+            !edges[0].to.contains('.'),
+            "to must be bare name; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn qualified_generic_constructor_records_rightmost_bare_type_name() {
+        // `new java.util.ArrayList<Integer>()` → `to = "ArrayList"`.
+        // The pattern walks generic_type → scoped_type_identifier and
+        // anchors on the rightmost type_identifier.
+        let fg = parse_at(
+            "class C { void m() { var x = new java.util.ArrayList<Integer>(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "ArrayList");
+        assert!(
+            !edges[0].to.contains('.') && !edges[0].to.contains('<'),
+            "to must be bare name; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn this_constructor_call_records_to_this() {
+        // `this(...)` inside a constructor body produces an
+        // explicit_constructor_invocation node. Per the design brief,
+        // these ARE genuine constructor invocations and SHOULD record
+        // edges with `to = "this"`. Agents disambiguate from ordinary
+        // method calls via the literal `"this"` callee name, which
+        // cannot appear as an identifier in a normal call position.
+        let fg = parse_at("class C { C(int x) { this(); } C() {} }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::C", "this");
+    }
+
+    #[test]
+    fn super_constructor_call_records_to_super() {
+        // `super(42)` inside a constructor body — same rule as
+        // `this(...)`. The `superclass` clause does NOT produce a Calls
+        // edge (3.5 will produce an Inherits edge for it instead); only
+        // the `super(...)` invocation itself counts as a call.
+        let fg = parse_at("class C extends B { C() { super(42); } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::C", "super");
+    }
+
+    #[test]
+    fn call_inside_lambda_body_records_enclosing_method() {
+        // Lambdas are transparent: a call inside `() -> foo()` reports
+        // the enclosing method as the `from`, not the lambda. Matches
+        // the C#/Python/Go convention.
+        let fg = parse_at(
+            "class C { void m() { Runnable r = () -> foo(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "foo");
+    }
+
+    #[test]
+    fn call_inside_anonymous_class_method_records_outer_class_parent() {
+        // Decision 4 transparency: the anonymous `new Runnable() { void
+        // run() { foo(); } }` does NOT produce a Class symbol. The
+        // `run` method DOES produce a Symbol — its parent is the
+        // enclosing NAMED type (the outer `C`), NOT the (non-existent)
+        // anonymous Class. The 3.2 test
+        // `method_inside_anonymous_class_records_outer_named_entity_as_parent`
+        // pins the symbol shape.
+        //
+        // For the call edge: `foo()` lives inside `run`, which is itself
+        // a method_declaration. So `enclosing_function_id` stops at
+        // `run` and reports `<path>:C::run` as the `from` — matching
+        // the symbol ID 3.2 produced for the anonymous `run` method.
+        // The anonymous-class boundary is transparent for parent
+        // resolution, not for function-shape resolution.
+        //
+        // The `new Runnable()` itself is also a constructor call edge
+        // (`from = C::m`, `to = "Runnable"`) — anonymous-class creation
+        // syntax IS a `new T()` from the agent's perspective. This test
+        // pins both edges to make the dual behavior explicit.
+        let fg = parse_at(
+            r#"class C { void m() { new Runnable() { public void run() { foo(); } }; } }"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", edges);
+        // (a) Anonymous-class creation records a constructor-style call
+        //     edge to the base type. The base-type symbol is in JRE
+        //     and won't resolve at query time, but the edge IS
+        //     recorded — matching the `object_creation_expression`
+        //     contract.
+        assert_one_call(&fg, "/p/Test.java:C::m", "Runnable");
+        // (b) The call inside `run` resolves to `<path>:C::run` via
+        //     Decision 4 parent transparency.
+        assert_one_call(&fg, "/p/Test.java:C::run", "foo");
+    }
+
+    #[test]
+    fn call_inside_enum_constant_method_body_records_enum_type_parent() {
+        // Decision 12 transparency: per-constant method bodies extract
+        // as `Method` with parent = enum type name (e.g., `Planet`,
+        // NOT a synthesised `Planet$EARTH`). The call edge's `from`
+        // follows the same rule: a call inside `EARTH { void f() {
+        // foo(); } }` reports `<path>:Planet::f`, NOT a synthesised
+        // parent. The 3.2 test
+        // `per_constant_enum_method_records_enum_type_as_parent` pins
+        // the symbol shape.
+        let fg = parse_at("enum P { E { void f() { foo(); } } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        // The call's enclosing function is `f`; `f`'s parent is the
+        // enum type `P` via the Decision 12 transparency walk.
+        assert_one_call(&fg, "/p/Test.java:P::f", "foo");
+    }
+
+    #[test]
+    fn method_reference_with_identifier_rhs_records_rhs_as_callee() {
+        // `String::length` → `to = "length"`. The grammar parses this
+        // as `method_reference (identifier "String") :: (identifier
+        // "length")`; the query captures only the RHS identifier.
+        let fg = parse_at(
+            "class C { void m() { java.util.function.Function<String, Integer> f = String::length; } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "length");
+    }
+
+    #[test]
+    fn this_method_reference_records_rhs_as_callee() {
+        // `this::doIt` → `to = "doIt"`. The LHS is a `this` keyword
+        // node, not an identifier; the query anchors past `"::"` and
+        // captures the identifier RHS, so this works.
+        let fg = parse_at(
+            r#"
+class C {
+    void doIt(String s) {}
+    void m() {
+        java.util.function.Consumer<String> c = this::doIt;
+    }
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::m", "doIt");
+    }
+
+    #[test]
+    fn constructor_method_reference_records_no_call_edge() {
+        // `Type::new` constructor references — the RHS is the `new`
+        // keyword token (kind = "new"), NOT an identifier. The query
+        // pattern `(method_reference "::" (identifier) @x)` cleanly
+        // skips them. This is a documented limitation: an agent asking
+        // "what does this code construct via a method reference?" gets
+        // no edge from this pattern; the same agent asking "what
+        // `new T()` direct calls exist?" gets `object_creation_expression`
+        // edges. Pin the no-edge behavior so a future refactor that
+        // unintentionally captures these would fail.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        java.util.function.Supplier<java.util.ArrayList> s = java.util.ArrayList::new;
+    }
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "constructor method reference (Type::new) must NOT produce a Calls edge; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cast_expression_produces_no_call_edge() {
+        // `(String) o` parses as `cast_expression`, not as a method
+        // invocation. No filter is needed; the query never matches it.
+        // Mirrors the C# `cast_expression_does_not_produce_call_edge`
+        // pin.
+        let fg = parse_at(
+            "class C { void m(Object o) { String s = (String) o; } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "cast expression must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn instanceof_and_synchronized_produce_no_call_edges() {
+        // `o instanceof String` parses as `instanceof_expression`;
+        // `synchronized (x) { ... }` parses as `synchronized_statement`.
+        // Neither is a method_invocation; the query never matches them.
+        let fg = parse_at(
+            r#"
+class C {
+    void m(Object o) {
+        boolean b = o instanceof String;
+        synchronized (this) {}
+    }
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "instanceof/synchronized must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn array_creation_produces_no_call_edge() {
+        // `new int[10]` parses as `array_creation_expression`, which is
+        // a distinct node from `object_creation_expression`. The
+        // constructor-call patterns in CALL_QUERIES never match it.
+        let fg = parse_at(
+            "class C { void m() { int[] a = new int[10]; } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "array creation must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn annotations_produce_no_call_edges() {
+        // `@Override`, `@Deprecated`, etc. parse as `marker_annotation`
+        // / `annotation` nodes — not method_invocation. They are
+        // transparent for call extraction (per Decision 8 — annotations
+        // are metadata, not behavior).
+        let fg = parse_at(
+            r#"
+@Deprecated
+class C {
+    @Override
+    void m() {}
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "annotations must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_inside_constructor_records_constructor_symbol_as_from() {
+        // The from-field for a call inside a constructor is
+        // `<path>:Class::Class` (the constructor's name matches its
+        // class — Java constructor syntax). Pins that constructor calls
+        // (3.2's `ctor` capture) and ordinary method calls (3.2's
+        // `method` capture) route through the same enclosing-function
+        // rule.
+        let fg = parse_at("class C { public C() { Init(); } }", "/p/Test.java");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:C::C", "Init");
+    }
+
+    #[test]
+    fn call_in_default_interface_method_omits_parent() {
+        // Decision 11: default interface methods extract as Function
+        // (no parent). The call's `from` follows: `<path>:doFoo`, NOT
+        // `<path>:I::doFoo`. Mirrors the C# pin in
+        // `call_in_default_interface_method_omits_parent`.
+        let fg = parse_at(
+            "interface I { default void doFoo() { helper(); } }",
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_one_call(&fg, "/p/Test.java:doFoo", "helper");
+    }
+
+    #[test]
+    fn call_edge_carries_file_and_line() {
+        // Sanity: edge.file and edge.line populate as expected (file =
+        // the path, line >= 1 for the 1-indexed call-site row). Don't
+        // pin a precise row (whitespace fragility); just assert the
+        // math is populated.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        foo();
+    }
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].file, "/p/Test.java");
+        assert!(edges[0].line >= 1);
+    }
+
+    #[test]
+    fn empty_file_produces_no_call_edges() {
+        let fg = parse("");
+        let edges = calls(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    #[test]
+    fn call_from_field_lines_up_with_symbol_id() {
+        // Concrete invariant: for every call edge whose `from` matches
+        // a definition symbol's `symbol_id`, the relationship is
+        // recoverable end-to-end. This is the contract that lets
+        // `get_callers`/`get_callees` work without name guessing.
+        let fg = parse_at(
+            r#"
+class C {
+    void caller() { callee(); }
+    void callee() {}
+}
+"#,
+            "/p/Test.java",
+        );
+        let caller = sym(&fg, "caller");
+        let edges = calls(&fg);
+        let from = symbol_id(caller);
+        let matched: Vec<&&Edge> = edges
+            .iter()
+            .filter(|e| e.from == from && e.to == "callee")
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "expected the call edge's `from` to equal symbol_id(caller); got: from={:?}; edges={:?}",
+            from,
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
     }
 }
