@@ -68,9 +68,9 @@ snapshot-audit:
 # count.
 #
 # Dogfood tests auto-skip when their submodule is not initialized, so
-# this target is opt-in: clone what you want to dogfood against. Use
-# `--depth 1` to keep clones small (~55MB total at full depth, mostly
-# curl + abseil).
+# this target is opt-in: clone what you want to dogfood against. The
+# `--depth 1` flag below keeps clones small — full-depth would be
+# multiple hundreds of MB (dominated by curl, abseil-cpp, and efcore).
 #
 # Single submodule: `git submodule update --init external/<name>`.
 submodules:
