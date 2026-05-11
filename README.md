@@ -1,6 +1,6 @@
 # code-graph-mcp
 
-An MCP server that builds an in-memory semantic code graph from C++, Rust, Go, and Python source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
+An MCP server that builds an in-memory semantic code graph from C++, Rust, Go, Python, C#, and Java source files using [tree-sitter](https://tree-sitter.github.io/), exposing 15 query tools to AI agents over stdio. Instead of an agent burning tokens grepping files to understand how code is connected, it calls `analyze_codebase` once and then issues targeted queries like `get_callers`, `get_class_hierarchy`, or `generate_diagram` to navigate the codebase instantly.
 
 ## Supported languages
 
@@ -10,6 +10,8 @@ An MCP server that builds an in-memory semantic code graph from C++, Rust, Go, a
 | Rust     | `.rs`      | `code-graph-lang-rust` |
 | Go       | `.go`      | `code-graph-lang-go` |
 | Python   | `.py`, `.pyi` | `code-graph-lang-python` |
+| C#       | `.cs`      | `code-graph-lang-csharp` |
+| Java     | `.java`    | `code-graph-lang-java` |
 
 ## Installation
 

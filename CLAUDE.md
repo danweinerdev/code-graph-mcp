@@ -32,7 +32,7 @@ Run `make install-hooks` once after cloning. This sets `git config core.hooksPat
 Each language plugin has a dogfood-baseline test that parses a real upstream repo and asserts the symbol count stays within ±10% of a recorded baseline. The repos are git submodules under `external/`, pinned by tag. Tests **auto-skip** with an `eprintln!` setup hint when the submodule is not initialized — they do NOT panic and do NOT need `--ignored` to opt in. Run them by initializing the submodule(s) you care about:
 
 ```bash
-make submodules                                       # init all six (shallow clones)
+make submodules                                       # init all eight (shallow clones)
 git submodule update --init external/ripgrep          # or just one
 ```
 
@@ -79,8 +79,10 @@ The workspace is split into language-agnostic core crates plus per-language plug
 | `crates/code-graph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
 | `crates/code-graph-lang-go` | Go language plugin — tree-sitter-go queries; method-receiver extraction, all import forms (single/grouped/aliased/dot/blank), direct + selector_expression calls |
 | `crates/code-graph-lang-python` | Python language plugin — tree-sitter-python queries; class/method/decorator handling, both import forms (`import` + `from … import`), multi-base inheritance, `.py` and `.pyi` |
+| `crates/code-graph-lang-csharp` | C# language plugin — tree-sitter-c-sharp queries; partial classes, default interface methods, extension methods, records as Class, generics verbatim |
+| `crates/code-graph-lang-java` | Java language plugin — tree-sitter-java queries; records as Class, anonymous classes invisible, default/static/private interface methods as Function, enum methods, this/super calls, method references |
 
-As of the Phase 7 cutover, **all four languages — C++, Rust, Go, and Python — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, and Python) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/code-graph-lang/src/lib.rs:116`.
+As of the CSharpJavaSupport cutover, **all six languages — C++, Rust, Go, Python, C#, and Java — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, Python, C#, and Java) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/code-graph-lang/src/lib.rs:116`.
 
 ```
 AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
@@ -93,10 +95,12 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
               [LanguageRegistry] [In-memory graph + JSON cache]
               (code-graph-lang)
                      |
-              [C++ Plugin] [Rust Plugin] [Go Plugin] [Python Plugin]
-              (code-graph-lang-cpp, code-graph-lang-rust, code-graph-lang-go, code-graph-lang-python)
+              [C++ Plugin] [Rust Plugin] [Go Plugin] [Python Plugin] [C# Plugin] [Java Plugin]
+              (code-graph-lang-cpp, code-graph-lang-rust, code-graph-lang-go,
+               code-graph-lang-python, code-graph-lang-csharp, code-graph-lang-java)
                      |
-              [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go + tree-sitter-python]
+              [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go
+               + tree-sitter-python + tree-sitter-c-sharp + tree-sitter-java]
 ```
 
 ## Configuration
@@ -354,3 +358,59 @@ Validated against tree-sitter-python v0.25.0.
 6. **Forward declarations don't apply.** Python doesn't have C/Go-style forward declarations. `.pyi` stubs are indexed identically to `.py` files (the grammar is the same; `...` body still parses as a function body).
 
 7. **Method dispatch is heuristic.** Same as the C++/Rust/Go plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different classes that share a name may resolve to the wrong candidate, especially given Python's duck-typing tradition.
+
+## C# Parser Limitations
+
+Validated against tree-sitter-c-sharp v0.23.5.
+
+### Supported C# Patterns
+
+- Partial classes — one `Class` symbol per `partial class Foo` declaration (Decision 3); merging across declarations is deferred to hierarchy-walk via the bare-name `from` rule on `Inherits` edges, NOT to extraction time
+- Default interface methods (C# 8+) — body-presence is the discriminator. The body can be `(block ...)` or `(arrow_expression_clause ...)` — both forms count. Abstract interface methods (no body) produce no Symbol
+- Extension methods — syntactic parent (the static class), NOT semantic remap. `static class Ext { static int Count(this string s) {...} }` extracts `Count` as a Method with parent `Ext`; the `this string` modifier does NOT remap to `string`
+- Records as `Class` (no `SymbolKind::Record`). Methods inside `record Foo { void M() {...} }` correctly parent to the record name; record components in the declaration syntax (`record Foo(string Name)`) parse as `formal_parameters` and are correctly invisible
+- Generic types preserved verbatim in `Inherits.from`. `class Foo<T> : Base<T>` records an Inherits edge with `from = "Foo<T>"` and `to = "Base<T>"` — the generic args ride along
+- All call patterns: direct (`foo()`), member-access (`obj.M()`), chained (`a.B().C()`), null-conditional (`obj?.M()`), generic (`Foo<T>()`), constructor (`new Foo()`)
+- All `using` forms: plain (`using System;`), dotted (`using System.IO;`), `using static` (`using static System.Math;`), alias (`using F = System.IO.File;`), `global using`, and `using` inside namespace blocks
+
+### Known Limitations
+
+1. **`nameof(X)` is filtered.** `nameof` parses as `invocation_expression function: (identifier "nameof")` in tree-sitter-c-sharp 0.23.5, but it is semantically a compile-time name operator, not a method call. Same precedent as C++ filtering `static_cast`/`dynamic_cast`/etc. Without the filter, every method using `nameof` for logging or reflection would record a `Calls` edge to `"nameof"`, polluting `get_callees` results.
+
+2. **Generic-class hierarchy lookup gap.** `Symbol.name` is the bare identifier (`"Foo"` for `class Foo<T>`) but `Inherits.from` includes the generic args (`"Foo<T>"`). `Graph::class_hierarchy` looks up symbols by `Symbol.name` and walks the adjacency map keyed by the `from` string, so the two halves miss each other and hierarchy walks for generic classes return the class as a leaf. **Same accepted limitation as the Rust plugin.**
+
+3. **Call resolution is heuristic** — same as C++/Rust/Go/Python. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). Method overloading and extension-method dispatch may resolve to the wrong candidate; this is syntactic, not semantic.
+
+4. **Partial-class search returns multiple symbols.** Because each `partial class Foo` declaration emits its own Class symbol (per Decision 3), `search_symbols("Foo")` returns N results — one per declaration file. The file path on each result is the disambiguator. Agents that expect a single hit per type name need to dedupe by name and group by file.
+
+5. **Forward declarations excluded.** Abstract interface methods (no body) produce no Symbol record. Same rule as the C++/Rust/Go/Java plugins — only definitions with bodies become symbols.
+
+6. **`record_declaration` extracts as Class; record components are invisible.** `record Foo(string Name)` produces a single `Class` symbol named `Foo`. The `(string Name)` positional component syntax parses as `formal_parameters` (not as field declarations) and is correctly NOT promoted to Field symbols.
+
+## Java Parser Limitations
+
+Validated against tree-sitter-java v0.23.5.
+
+### Supported Java Patterns
+
+- Records as `Class` (Decision 6). Record components in the declaration syntax (`record Foo(String name)`) parse as `formal_parameters` and are correctly invisible — no Field symbols leak
+- Anonymous classes are invisible to the symbol index (Decision 4) — `new Runnable() { void run() {...} }` produces NO Class symbol for the anonymous body. Methods declared inside an anonymous class inherit the *enclosing named entity's* parent (the enclosing method, class, or file), NOT a synthetic `Anonymous$1` name
+- Default, static, and Java-9+ private interface methods all extract as `Function` via the body-presence discriminator (Decision 11). Abstract interface methods (no body) produce no Symbol — same as C#
+- Enum methods (Decision 12) — both enum-level methods (`enum E { ; void m() {...} }`) AND per-constant method bodies (`enum E { A { void m() {...} } }`) attribute to the enum type as parent; per-constant boundaries are transparent for the parent walk
+- All call patterns: direct (`foo()`), member-access (`obj.m()`), chained (`a.b().c()`), generic (`Foo.<T>bar()`), constructor (`new Foo()`), `this(...)` and `super(...)` constructor chains, calls inside lambdas / anonymous-class bodies / enum-constant bodies (all transparent for enclosing-function walk), identifier-form method references (`String::length`, `obj::method`)
+- All `import` forms: plain (`import java.util.List;`), dotted (`import java.util.*;` — wildcard preserved verbatim in the `Includes.to`), `import static`, `import static <pkg>.*`
+- Sealed types' `permits` clause is ignored per Decision 6 — sealed interfaces and classes extract as ordinary `Interface`/`Class` symbols; the `permits:` field is not represented in the graph
+
+### Known Limitations
+
+1. **`Type::new` method references (constructor references) are NOT extracted as `Calls` edges.** The grammar produces a `new` keyword token as the RHS of `::` rather than an identifier, which is awkward to handle for the syntactic call extractor. Pinned by a dedicated no-edge test in the Java plugin. Identifier-form method references (`String::length`, `obj::method`) DO extract correctly.
+
+2. **Generic-class hierarchy lookup gap (same shape as C#).** `Symbol.name` is the bare identifier (`"Foo"` for `class Foo<T>`) but `Inherits.from` includes the generic args. Java's generic constraints (`<T extends Comparable<T>>`) ride along inside the `type_parameters` node, so the `from` field includes the *constraint verbatim* — `Foo<T extends Comparable<T>>`. This is a divergence from C#, where the `where T : Comparable<T>` clause sits in a sibling node and the `from` is the cleaner `"Foo<T>"`. Both honor Decision 9 ("preserved verbatim"); Java's verbatim is just verbose. `Graph::class_hierarchy` cannot bridge `Symbol.name` and `Inherits.from` in either case — same accepted limitation as Rust and C#.
+
+3. **Records cannot extend classes** (Java grammar treats this as a syntax error). `extract_inheritance` handles the resulting ERROR nodes gracefully via `has_error()` checks — mirrors the C# plugin's defensive shape. Records CAN implement interfaces; that path extracts normally.
+
+4. **Call resolution is heuristic** — same as C++/Rust/Go/Python/C#. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). Method overloading and structurally-equivalent methods may resolve to the wrong candidate; this is syntactic, not semantic.
+
+5. **Anonymous-class method-name collisions.** Two anonymous classes inside the same enclosing method that both define a method named `run` produce two Symbol records with the *same Symbol ID* (because the anonymous class is invisible to the ID-building walk per Decision 4). `Symbol.line` disambiguates at query time; agents that group by ID will see one collapsed entry while `search_symbols` will return both.
+
+6. **Forward declarations excluded.** Abstract interface methods (no body) and enum-level abstract methods produce no Symbol. Body-presence is the discriminator — same rule as the C++/Rust/Go/C# plugins.
