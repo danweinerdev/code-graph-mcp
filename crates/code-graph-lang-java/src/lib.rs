@@ -2701,15 +2701,18 @@ import com.baz.C;
         // `Bar<T>`); the constraint type is not double-counted. Mirrors
         // C# 2.5's `generic_class_with_where_constraints_does_not_pollute_to_field`.
         //
-        // The `from` field is `"Foo<T>"` (NOT `"Foo<T extends Comparable<T>>"`)
-        // because [`enclosing_type_name_with_generics`] preserves the
-        // verbatim `type_parameters` text — which IS
-        // `"<T extends Comparable<T>>"` — so this assertion documents
-        // the inherent trade-off: the bound text rides along inside
-        // `type_parameters`. The contract Decision 9 makes is
-        // "preserve verbatim", which the helper honors faithfully.
-        // Pin the actual observed text so any future grammar change
-        // surfaces here rather than silently shifting the contract.
+        // The `from` field is `"Foo<T extends Comparable<T>>"` —
+        // [`enclosing_type_name_with_generics`] captures the verbatim
+        // `type_parameters` text, and Java's constraint syntax lives
+        // INSIDE that node, so the bound rides along. **This diverges
+        // from C# 2.5**, where where-clauses sit in a SIBLING node and
+        // the from-field is the cleaner `"Foo<T>"`. Decision 9 says
+        // "preserve verbatim", which both plugins honor — Java's
+        // grammar just produces a verbose verbatim. The to-field is
+        // still clean `"Bar<T>"` because the constraint never enters
+        // the superclass clause. Pin the actual observed text so any
+        // future grammar change surfaces here rather than silently
+        // shifting the contract.
         let fg = parse_at(
             "class Foo<T extends Comparable<T>> extends Bar<T> { }\n",
             "/p/Test.java",
