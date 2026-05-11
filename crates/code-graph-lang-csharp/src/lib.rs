@@ -726,11 +726,12 @@ impl CSharpParser {
     /// **`from`-field composition.** The `from` field is the bare
     /// enclosing type name + the type-parameter list text (if any). For
     /// `class Foo` → `from = "Foo"`; for `class Foo<T>` →
-    /// `from = "Foo<T>"`. This is the contract documented in
-    /// `crates/code-graph-graph/src/algorithms.rs` (the
-    /// `Graph::class_hierarchy` walker looks up classes by
-    /// `Symbol.name`, which matches the same bare-name + generic-text
-    /// shape produced by [`Self::extract_definitions`]). The
+    /// `from = "Foo<T>"`. See [`enclosing_type_name_with_generics`]
+    /// for the full rule and a documented known asymmetry: `Symbol.name`
+    /// in `extract_definitions`'s output is bare (`"Foo"` for
+    /// `class Foo<T>`), so `Graph::class_hierarchy` cannot walk
+    /// inheritance edges for generic classes. Same limitation as the
+    /// Rust plugin. The
     /// `type_parameter_list` node kind is the canonical place tree-
     /// sitter records the angle-bracket parameter list; it appears as
     /// an unnamed-field child of `class_declaration` /
@@ -890,13 +891,25 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// `interface_declaration`, or `record_declaration`. Other node kinds
 /// return the empty string defensively.
 ///
-/// The result matches the shape [`Symbol.name`] takes in
-/// [`Self::extract_definitions`]'s output, satisfying the contract
-/// consumed by `Graph::class_hierarchy` in
-/// `crates/code-graph-graph/src/algorithms.rs` (the walker looks up
-/// classes by `Symbol.name`, NOT by `symbol_id`). Decision 9 — generic
-/// parameter text preserved verbatim — and the Phase 1 / Phase 5
-/// bare-name `from`-field rule are both enforced here.
+/// Decision 9 (generic parameter text preserved verbatim) — and the
+/// Phase 1 / Phase 5 bare-name `from`-field rule — are both enforced
+/// here. The result is the bare type name, EXCEPT for generic types
+/// where the `type_parameter_list` text is appended verbatim.
+///
+/// **Known asymmetry with `Symbol.name`** (matches the Rust plugin's
+/// pre-existing behavior — accepted as a documented limitation):
+/// `extract_definitions` stores `Symbol.name` as the bare identifier
+/// (`"Foo"` for `class Foo<T>`), but the `from` field of an `Inherits`
+/// edge produced here is the generics-preserving form (`"Foo<T>"`).
+/// `Graph::class_hierarchy` at `crates/code-graph-graph/src/algorithms.rs`
+/// looks up symbols by `Symbol.name` then walks `adj.get(name)` — for a
+/// generic class queried as `class_hierarchy("Foo")` the symbol is found
+/// but the adjacency lookup misses (edges are keyed under `"Foo<T>"`).
+/// Generic-class hierarchy walks are effectively unsupported by the
+/// graph layer in its current form. Same limitation exists in the Rust
+/// plugin and is the trade-off Decision 9 inherits from the Rust
+/// precedent. Phase 4.4's CLAUDE.md "C# Parser Limitations" section
+/// documents this for agent-facing visibility.
 ///
 /// `type_parameter_list` is an unnamed-field child on
 /// `class_declaration` / `struct_declaration` / `record_declaration`,
@@ -2446,10 +2459,18 @@ namespace Foo {
         // `class Foo<T> : Bar<T> { }` → 1 edge from="Foo<T>" to="Bar<T>".
         // Generic params survive in BOTH from and to per Decision 9
         // (preserved verbatim, matching Rust's rule — NOT Go's strip
-        // rule). The contract is consumed by
-        // `crates/code-graph-graph/src/algorithms.rs`'s
-        // `Graph::class_hierarchy`, which matches `Symbol.name` against
-        // edge target text.
+        // rule).
+        //
+        // **Known asymmetry pinned here**: while edge.from is
+        // "Foo<T>" (generics preserved), Symbol.name for the same class
+        // is the bare "Foo" (extract_definitions captures only the
+        // identifier child). This means Graph::class_hierarchy at
+        // crates/code-graph-graph/src/algorithms.rs cannot walk
+        // inheritance for generic classes — it looks up symbols by
+        // Symbol.name then walks adj.get(name), but the adjacency map
+        // is keyed under "Foo<T>". Same limitation exists in the Rust
+        // plugin and is the accepted Decision 9 trade-off. Phase 4.4's
+        // CLAUDE.md documents this for agent-facing visibility.
         let fg = parse_at("class Foo<T> : Bar<T> { }\n", "/p/x.cs");
         let edges = inherits(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);
@@ -2461,6 +2482,19 @@ namespace Foo {
         assert_eq!(
             e.to, "Bar<T>",
             "to must include generic argument list verbatim"
+        );
+
+        // Side-by-side assertion making the asymmetry self-documenting:
+        // Symbol.name is bare "Foo" (not "Foo<T>"); a future refactor
+        // that changes extract_definitions to include generics in
+        // Symbol.name would close the class_hierarchy gap but would
+        // need to update this assertion at the same time.
+        let s = sym(&fg, "Foo");
+        assert_eq!(
+            s.kind,
+            SymbolKind::Class,
+            "Symbol.name for class Foo<T> is bare 'Foo' — \
+             the from/Symbol.name asymmetry is the documented limitation"
         );
     }
 
