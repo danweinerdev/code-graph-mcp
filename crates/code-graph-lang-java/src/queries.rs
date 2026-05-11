@@ -4,10 +4,10 @@
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
 //! Phase status: Phase 3.2 filled [`DEFINITION_QUERIES`]; Phase 3.3
-//! filled [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and
-//! [`INHERITANCE_QUERIES`] remain empty until 3.4/3.5. Empty query
-//! strings compile to a no-op `Query` against any grammar, so the
-//! structural smoke test in `lib.rs` passes against the empty set.
+//! filled [`CALL_QUERIES`]; Phase 3.4 fills [`IMPORT_QUERIES`].
+//! [`INHERITANCE_QUERIES`] stays empty until 3.5. Empty query strings
+//! compile to a no-op `Query` against any grammar, so the structural
+//! smoke test in `lib.rs` passes against the still-empty set.
 //!
 //! Naming follows the established `*_QUERIES` convention shared with
 //! the C++/Rust/Go/Python/C# plugins (plural form, `pub(crate)`).
@@ -65,6 +65,22 @@
 //! - **Enum constants themselves** (`enum_constant` nodes — `EARTH`,
 //!   `MARS`, etc.) are NOT extracted as symbols (Decision 12). Only the
 //!   enum type and any methods declared inside it surface.
+//! - **`import_declaration`** has NO fields (`fields: {}` in
+//!   tree-sitter-java 0.23.5's `node-types.json`) and exactly three
+//!   possible named-child kinds: `identifier` (single-segment imports
+//!   like `import Foo;`), `scoped_identifier` (dotted-path imports —
+//!   the most common form), and `asterisk` (wildcard — appears as a
+//!   sibling of the path, separated by an anonymous `.` token, in
+//!   `import com.foo.*;` and `import static com.foo.Bar.*;`). The
+//!   `static` modifier is an anonymous keyword child (kind `"static"`,
+//!   `is_named() == false`) and is automatically excluded by any
+//!   named-children walk — no special filter is needed in the extractor.
+//!   For static-field imports (`import static com.foo.Bar.X;`) the
+//!   field name (`X`) folds INTO the `scoped_identifier`'s text, so the
+//!   captured path is `com.foo.Bar.X` directly — no reconstruction
+//!   required for the non-wildcard static form. Wildcard forms
+//!   reconstruct as `<path>.*` at extraction time by appending `.*` to
+//!   the named path child's text when a sibling `asterisk` is present.
 
 /// Definition query: classes, interfaces, enums, records, methods, and
 /// constructors. Each top-level pattern uses a dedicated capture name so
@@ -267,9 +283,71 @@ pub(crate) const CALL_QUERIES: &str = r#"
   (identifier) @call.name)
 "#;
 
-/// Import queries: `import_declaration` in plain, wildcard, and static
-/// forms. Filled in 3.4.
-pub(crate) const IMPORT_QUERIES: &str = "";
+/// Query for `import_declaration` in all forms (plain, single-segment,
+/// wildcard, static, and static wildcard).
+///
+/// All five Java import forms parse to a single `import_declaration` node
+/// in tree-sitter-java 0.23.5 — there is NO separate
+/// `static_import_declaration` node. The `static` keyword is an anonymous
+/// (non-named) child of kind `"static"`; only the path nodes
+/// (`identifier` / `scoped_identifier`) and the `asterisk` are named
+/// children. The grammar's `node-types.json` confirms the three named
+/// child kinds: `asterisk`, `identifier`, `scoped_identifier`.
+///
+/// Per-form shape (verified against tree-sitter-java 0.23.5 via the
+/// scratch-crate probe at `/tmp/java-probe`):
+///
+/// - `import com.foo.Bar;` → `(import_declaration (scoped_identifier ...))`.
+///   Single `scoped_identifier` named child whose text is the dotted
+///   path `com.foo.Bar`.
+/// - `import Foo;` → `(import_declaration (identifier))`. Single-segment
+///   imports use a bare `identifier` node (no `scoped_identifier`).
+/// - `import com.foo.*;` → `(import_declaration (scoped_identifier ...)
+///   (asterisk))`. The `scoped_identifier` text is `com.foo` (NOT
+///   `com.foo.*`); the `asterisk` is a separate named sibling. The `.`
+///   between them is an anonymous keyword child. The extractor
+///   reconstructs `com.foo.*` by appending `.*` to the path text when an
+///   `asterisk` sibling is present.
+/// - `import static com.foo.Bar.STATIC_FIELD;` →
+///   `(import_declaration (scoped_identifier ...))`. The `static`
+///   keyword is anonymous; the `scoped_identifier`'s text already
+///   contains the FULL path including the field name
+///   (`com.foo.Bar.STATIC_FIELD`). No reconstruction needed beyond
+///   accepting the path text verbatim.
+/// - `import static com.foo.Bar.*;` →
+///   `(import_declaration (scoped_identifier ...) (asterisk))`.
+///   Combination of the static and wildcard forms: `static` is dropped,
+///   `scoped_identifier` text is `com.foo.Bar`, and the `asterisk`
+///   triggers the `.*` reconstruction → `com.foo.Bar.*`.
+///
+/// **Single-capture strategy.** We capture the `import_declaration` node
+/// itself and recover the path text at extraction time. Encoding the
+/// path-with-or-without-asterisk reconstruction in the query would
+/// require two patterns plus predicate logic; one capture name + a
+/// small Rust-side walk over the directive's named children covers all
+/// five forms cleanly. Mirrors the C# plugin's `using_directive`
+/// single-capture approach.
+///
+/// Per Decision 7: the path is recorded verbatim — no resolution
+/// against build metadata (`pom.xml`, `build.gradle`). Wildcards are
+/// preserved verbatim (`import com.foo.*;` records `to = "com.foo.*"`,
+/// matching the Rust plugin's `use foo::*` rule). Static-import targets
+/// record the full path including the field name (`import static
+/// com.foo.Bar.X;` records `to = "com.foo.Bar.X"`); the `static`
+/// modifier is dropped. The default `resolve_include` returns `None`
+/// for these dotted strings — they are not filesystem paths — so the
+/// wire format records the package path verbatim and the engine never
+/// accidentally resolves it.
+pub(crate) const IMPORT_QUERIES: &str = r#"
+; import com.foo.Bar; / import Foo; / import com.foo.*; /
+; import static com.foo.Bar.STATIC_FIELD; / import static com.foo.Bar.*;
+; tree-sitter-java 0.23.5 produces a single `import_declaration` node
+; for every form; the `static` keyword and the `.` between the path
+; and the asterisk are anonymous children. The extractor recovers the
+; dotted path from the named identifier / scoped_identifier child and
+; appends `.*` when an `asterisk` sibling is present.
+(import_declaration) @import.dir
+"#;
 
 /// Inheritance queries: `superclass` (extends) and `super_interfaces`
 /// (implements) on classes; `extends_interfaces` on interfaces. Sealed

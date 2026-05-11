@@ -27,8 +27,15 @@
 //! Constructor references (`Type::new`) are deliberately not matched —
 //! see `queries::CALL_QUERIES` for rationale.
 //!
-//! Phase 3.4 will wire `extract_imports` (`import_declaration` plain,
-//! wildcard, static).
+//! Phase 3.4 wires `extract_imports`, producing [`EdgeKind::Includes`]
+//! edges for `import_declaration` in all five forms — plain
+//! (`import com.foo.Bar;`), single-segment (`import Foo;`), wildcard
+//! (`import com.foo.*;` → `to = "com.foo.*"`), static
+//! (`import static com.foo.Bar.X;` → `to = "com.foo.Bar.X"`, `static`
+//! modifier dropped), and the combination static-wildcard
+//! (`import static com.foo.Bar.*;` → `to = "com.foo.Bar.*"`). All forms
+//! record the dotted path verbatim per Decision 7; no resolution
+//! against build metadata (`pom.xml`, `build.gradle`).
 //!
 //! Phase 3.5 will wire `extract_inheritance` (`superclass`,
 //! `super_interfaces`, `extends_interfaces`). `permits` clauses on
@@ -131,8 +138,8 @@ pub struct JavaParser {
     def_query: Query,
     /// Compiled call query (live in 3.3 — drives [`Self::extract_calls`]).
     call_query: Query,
-    /// Compiled import query (wired in 3.4).
-    #[allow(dead_code)] // wired in Phase 3.4 (extract_imports)
+    /// Compiled import query (live in 3.4 — drives
+    /// [`Self::extract_imports`]).
     import_query: Query,
     /// Compiled inheritance query (wired in 3.5).
     #[allow(dead_code)] // wired in Phase 3.5 (extract_inheritance)
@@ -147,9 +154,9 @@ impl JavaParser {
     ///
     /// Successful return is the gate that proves every query string in
     /// [`queries`] parses against tree-sitter-java 0.23.5. Phase 3.2
-    /// filled [`DEFINITION_QUERIES`]; Phase 3.3 filled [`CALL_QUERIES`].
-    /// [`IMPORT_QUERIES`] and [`INHERITANCE_QUERIES`] remain empty until
-    /// 3.4/3.5 land their respective extractors.
+    /// filled [`DEFINITION_QUERIES`]; Phase 3.3 filled [`CALL_QUERIES`];
+    /// Phase 3.4 filled [`IMPORT_QUERIES`]. [`INHERITANCE_QUERIES`]
+    /// stays empty until 3.5 lands its extractor.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_java::LANGUAGE.into();
 
@@ -185,11 +192,11 @@ impl JavaParser {
     /// extractors) can be tested via `parse_file` without exposing them.
     /// Mirrors the Python/C# plugins' `parse_to_filegraph` indirection.
     ///
-    /// Phase 3.2 wires `extract_definitions` into the pipeline; Phase 3.3
-    /// wires `extract_calls`. The import (3.4) and inheritance (3.5)
-    /// extractors are added in subsequent phases. Until those land,
-    /// `parse_file` produces Symbol records and `Calls` edges, but no
-    /// `Includes` or `Inherits` edges.
+    /// Phase 3.2 wired `extract_definitions` into the pipeline; Phase 3.3
+    /// wired `extract_calls`; Phase 3.4 wires `extract_imports`. The
+    /// inheritance extractor (3.5) is added in the next phase. Until it
+    /// lands, `parse_file` produces Symbol records, `Calls` edges, and
+    /// `Includes` edges, but no `Inherits` edges.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -204,6 +211,7 @@ impl JavaParser {
 
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
+        self.extract_imports(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -579,6 +587,60 @@ impl JavaParser {
             }
         }
     }
+
+    /// Run the import query and produce [`EdgeKind::Includes`] edges.
+    /// Mirrors the C++/Rust/Go/Python/C# plugins' `extract_imports`: the
+    /// query's single capture (`import.dir`) yields each `import_declaration`
+    /// node; the [`import_declaration_path`] helper recovers the dotted
+    /// path text (reconstructing wildcards as `<path>.*`); the resulting
+    /// edge records the path verbatim per Decision 7.
+    ///
+    /// The `static` modifier on static imports is automatically dropped
+    /// because tree-sitter-java parses it as an anonymous keyword child
+    /// (`kind() == "static"`, `is_named() == false`); the
+    /// [`import_declaration_path`] walk visits only named children.
+    /// Wildcards reconstruct as `<path>.*` by appending `.*` to the
+    /// path text when an `asterisk` sibling is present — matching the
+    /// Rust plugin's `use foo::*` rule for path-with-glob imports.
+    ///
+    /// The edge's `from` is the file path (NOT a symbol ID), `kind` is
+    /// `Includes`, and `line` is anchored at the `import_declaration`
+    /// node's row (1-indexed). The `to` is the recovered path. Skips
+    /// captures whose node has a parse error so partial extraction
+    /// stays consistent with the other extractors' contracts.
+    fn extract_imports(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.import_query, root, content);
+        let cap_names = self.import_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "import.dir" {
+                    continue;
+                }
+
+                let Some(path_text) = import_declaration_path(cap_node, content) else {
+                    continue;
+                };
+                if path_text.is_empty() {
+                    continue;
+                }
+
+                fg.edges.push(Edge {
+                    from: path.to_owned(),
+                    to: path_text,
+                    kind: EdgeKind::Includes,
+                    file: path.to_owned(),
+                    line: cap_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for JavaParser {
@@ -593,8 +655,8 @@ impl LanguagePlugin for JavaParser {
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
     ///
     /// Phase 3.2 wired the definition extractor; Phase 3.3 wired the
-    /// call extractor. Phases 3.4/3.5 will wire the import and
-    /// inheritance extractors.
+    /// call extractor; Phase 3.4 wires the import extractor. Phase 3.5
+    /// will wire the inheritance extractor.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -841,6 +903,77 @@ fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
     path.to_owned()
 }
 
+/// Return the dotted package path written in an `import_declaration`
+/// node, or `None` if the directive has no recoverable path (defensive
+/// — well-formed Java always has at least one named path child).
+///
+/// Rules (per the tree-sitter-java 0.23.5 probe at Phase 3.4):
+/// - **Plain** (`import com.foo.Bar;`): the path is the single named
+///   `scoped_identifier` child; its text is the verbatim dotted path
+///   (`com.foo.Bar`).
+/// - **Single-segment** (`import Foo;`): the path is a bare `identifier`
+///   named child; its text is the single segment (`Foo`).
+/// - **Wildcard** (`import com.foo.*;`): the named children are
+///   `scoped_identifier` (text `com.foo`) AND `asterisk` (text `*`),
+///   with an anonymous `.` keyword between them. Reconstruct the path
+///   as `<scoped_identifier_text>.*`.
+/// - **Static** (`import static com.foo.Bar.STATIC_FIELD;`): the
+///   `static` keyword is an anonymous child and is automatically
+///   skipped by the named-children walk. The `scoped_identifier`'s
+///   text already includes the field name (`com.foo.Bar.STATIC_FIELD`)
+///   — no reconstruction beyond accepting the verbatim text.
+/// - **Static wildcard** (`import static com.foo.Bar.*;`): combination
+///   of the static and wildcard cases — `static` is dropped (anonymous),
+///   the `scoped_identifier` text is `com.foo.Bar`, and the `asterisk`
+///   sibling triggers `.*` reconstruction → `com.foo.Bar.*`.
+///
+/// The returned text is the verbatim dotted path (with the trailing
+/// `.*` for wildcards). Per Decision 7 the `static` modifier never
+/// appears in the returned text; wildcards are preserved verbatim.
+fn import_declaration_path(directive: Node<'_>, content: &[u8]) -> Option<String> {
+    let mut path_text: Option<String> = None;
+    let mut has_asterisk = false;
+
+    let mut cursor = directive.walk();
+    for child in directive.children(&mut cursor) {
+        if !child.is_named() {
+            // The `static` keyword (kind `"static"`) and the `.` between
+            // path and asterisk (kind `"."`) are anonymous children and
+            // are correctly skipped here. The opening `import` keyword
+            // and trailing `;` are likewise anonymous.
+            continue;
+        }
+        match child.kind() {
+            // First (and, per the grammar, only) path-shaped child
+            // wins. `node-types.json` guarantees at most one
+            // `identifier` / `scoped_identifier` named child.
+            "identifier" | "scoped_identifier" if path_text.is_none() => {
+                path_text = Some(child.utf8_text(content).unwrap_or("").to_owned());
+            }
+            "asterisk" => {
+                has_asterisk = true;
+            }
+            _ => {
+                // Defensive: any future grammar-evolution children fall
+                // through here without panicking. The probe confirmed
+                // exactly three possible named child kinds in
+                // tree-sitter-java 0.23.5 (identifier, scoped_identifier,
+                // asterisk); this arm exists so a grammar bump doesn't
+                // silently bypass the named-children contract.
+            }
+        }
+    }
+
+    let mut path = path_text?;
+    if path.is_empty() {
+        return None;
+    }
+    if has_asterisk {
+        path.push_str(".*");
+    }
+    Some(path)
+}
+
 /// Build a [`Symbol`] from a definition node. Centralises the row/column/
 /// signature math so each branch in `extract_definitions` stays small.
 /// Mirrors the C++/Rust/Go/Python/C# plugins' `make_symbol`.
@@ -878,8 +1011,9 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 3.1 structural smoke tests + Phase 3.2 definition-extraction
-    //! coverage + Phase 3.3 call-extraction coverage. Behavioral coverage
-    //! of import / inheritance extraction lands in 3.4-3.5.
+    //! coverage + Phase 3.3 call-extraction coverage + Phase 3.4
+    //! import-extraction coverage. Behavioral coverage of inheritance
+    //! extraction lands in 3.5.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
@@ -2041,5 +2175,198 @@ class C {
                 .map(|e| (e.from.as_str(), e.to.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.4 — import extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Includes` edges of `fg`. Mirrors the C#
+    /// plugin's `includes` test helper.
+    fn includes(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    #[test]
+    fn plain_import_records_includes_edge() {
+        // The shipped contract: a plain `import com.foo.Bar;` records
+        // one Includes edge with `to = "com.foo.Bar"` and
+        // `kind = EdgeKind::Includes`. Mirrors C# 2.4's
+        // `plain_using_records_includes_edge`.
+        let fg = parse_at("import com.foo.Bar;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "com.foo.Bar");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn dotted_import_preserves_full_path() {
+        // A longer dotted chain survives verbatim — no segments dropped,
+        // no segments swapped. The `scoped_identifier` text IS the
+        // verbatim dotted path.
+        let fg = parse_at("import com.foo.bar.baz.Qux;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "com.foo.bar.baz.Qux",
+            "dotted path must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn wildcard_import_preserves_asterisk() {
+        // `import com.foo.*;` → `to = "com.foo.*"`. The trailing `.*` is
+        // reconstructed at extraction time (tree-sitter parses the path
+        // and the asterisk as separate named children); the wire-format
+        // contract is that wildcards survive verbatim, matching the Rust
+        // plugin's `use foo::*` rule.
+        let fg = parse_at("import com.foo.*;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "com.foo.*",
+            "wildcard imports must preserve the trailing .* verbatim"
+        );
+    }
+
+    #[test]
+    fn static_import_drops_static_modifier() {
+        // `import static com.foo.Bar.STATIC_FIELD;` → `to =
+        // "com.foo.Bar.STATIC_FIELD"`. The `static` keyword is an
+        // anonymous child of `import_declaration` and is dropped by the
+        // named-children walk; the field name (`STATIC_FIELD`) folds
+        // into the scoped_identifier's text so no reconstruction is
+        // needed beyond accepting the verbatim text.
+        let fg = parse_at("import static com.foo.Bar.STATIC_FIELD;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "com.foo.Bar.STATIC_FIELD",
+            "static-import target must include the field name; static modifier must be dropped"
+        );
+        assert!(
+            !edges[0].to.contains("static"),
+            "to field must not contain 'static'; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn static_wildcard_import_drops_static_and_keeps_wildcard() {
+        // `import static com.foo.Bar.*;` → `to = "com.foo.Bar.*"`.
+        // Combination form: the `static` keyword is anonymous (dropped),
+        // the path is `com.foo.Bar`, and the trailing `.*` is
+        // reconstructed from the sibling `asterisk` named child.
+        let fg = parse_at("import static com.foo.Bar.*;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "com.foo.Bar.*",
+            "static-wildcard import must drop `static` and preserve the trailing .*"
+        );
+        assert!(
+            !edges[0].to.contains("static"),
+            "to field must not contain 'static'; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn single_segment_import_is_supported() {
+        // `import Foo;` — defensive cover. The grammar parses this as
+        // `(import_declaration (identifier))` (NOT `scoped_identifier`)
+        // and the `identifier` arm in `import_declaration_path` handles
+        // it. Single-segment imports are rare in real Java code (the
+        // language has no top-level package convention that produces
+        // them) but the grammar accepts them and the parser must too.
+        let fg = parse_at("import Foo;\n", "/p/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "Foo");
+    }
+
+    #[test]
+    fn multiple_imports_each_produce_edges() {
+        let fg = parse_at(
+            r#"
+import com.foo.A;
+import com.bar.B;
+import com.baz.C;
+"#,
+            "/p/Test.java",
+        );
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", edges);
+
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(
+            tos.contains(&"com.foo.A"),
+            "missing com.foo.A; got {:?}",
+            tos
+        );
+        assert!(
+            tos.contains(&"com.bar.B"),
+            "missing com.bar.B; got {:?}",
+            tos
+        );
+        assert!(
+            tos.contains(&"com.baz.C"),
+            "missing com.baz.C; got {:?}",
+            tos
+        );
+    }
+
+    #[test]
+    fn from_field_is_the_file_path() {
+        // The `Includes` edge's `from` is the file path (NOT a symbol
+        // ID, NOT empty). Mirrors the Python/Go/Rust/C# convention; the
+        // `Graph` engine routes Includes edges by file path.
+        let fg = parse_at("import com.foo.Bar;\n", "/abs/Test.java");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].from, "/abs/Test.java",
+            "from must be the file path"
+        );
+        assert_eq!(
+            edges[0].file, "/abs/Test.java",
+            "file must match the path arg"
+        );
+    }
+
+    #[test]
+    fn import_edge_carries_correct_line() {
+        // Line is 1-indexed and anchored at the `import_declaration`
+        // node. Three imports on lines 2, 3, 4 (leading newline pushes
+        // the first import past line 1). Mirrors the C# 2.4 line-anchor
+        // pin.
+        let fg = parse_at(
+            "\nimport com.foo.A;\nimport com.bar.B;\nimport com.baz.C;\n",
+            "/p/Test.java",
+        );
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", edges);
+
+        let line_for = |to: &str| -> u32 {
+            edges
+                .iter()
+                .find(|e| e.to == to)
+                .unwrap_or_else(|| panic!("missing edge to={:?}", to))
+                .line
+        };
+        assert_eq!(line_for("com.foo.A"), 2);
+        assert_eq!(line_for("com.bar.B"), 3);
+        assert_eq!(line_for("com.baz.C"), 4);
+    }
+
+    #[test]
+    fn empty_file_produces_no_includes_edges() {
+        let fg = parse("");
+        let edges = includes(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
     }
 }
