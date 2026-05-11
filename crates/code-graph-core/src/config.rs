@@ -192,9 +192,7 @@ impl ExtensionsConfig {
     /// each list uniformly. The label is the field name as it appears in
     /// `.code-graph.toml` (`"disabled"`, `"cpp"`, `"rust"`, `"go"`,
     /// `"python"`, `"csharp"`, `"java"`).
-    fn lists_mut(
-        &mut self,
-    ) -> [(&'static str, &mut Vec<String>); 7] {
+    fn lists_mut(&mut self) -> [(&'static str, &mut Vec<String>); 7] {
         [
             ("disabled", &mut self.disabled),
             ("cpp", &mut self.cpp),
@@ -663,7 +661,10 @@ python = [".pyx"]
         .unwrap();
         let cfg = RootConfig::load(dir.path()).expect("load valid additive lists");
         assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
-        assert_eq!(cfg.extensions.lookup_additional(".inl"), Some(Language::Cpp));
+        assert_eq!(
+            cfg.extensions.lookup_additional(".inl"),
+            Some(Language::Cpp)
+        );
         assert_eq!(
             cfg.extensions.lookup_additional(".pyx"),
             Some(Language::Python)

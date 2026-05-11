@@ -166,8 +166,8 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &RootConfig) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use code_graph_core::{FileGraph, Language};
     use code_graph_core::DiscoveryConfig;
+    use code_graph_core::{FileGraph, Language};
     use code_graph_lang::{LanguagePlugin, ParseError};
     use std::fs;
     use std::path::Path;

@@ -1085,9 +1085,8 @@ mod tests {
             cpp: vec![".cu".to_string()],
             ..Default::default()
         };
-        assert!(
-            reg.language_for_path_with_config(Path::new("/Makefile"), &cfg)
-                .is_none()
-        );
+        assert!(reg
+            .language_for_path_with_config(Path::new("/Makefile"), &cfg)
+            .is_none());
     }
 }

@@ -640,8 +640,8 @@ fn walk_collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn read_baseline_count(name: &str) -> usize {
     let path = baselines_dir().join(format!("{name}.txt"));
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read baseline {path:?}: {e}"));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read baseline {path:?}: {e}"));
     text.lines()
         .find_map(|line| line.strip_prefix("symbols: "))
         .and_then(|s| s.trim().parse::<usize>().ok())

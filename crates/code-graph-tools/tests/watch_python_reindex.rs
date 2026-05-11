@@ -30,7 +30,9 @@ use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::query::{callers_or_callees, Direction};
 use code_graph_tools::handlers::structure::get_class_hierarchy;
 use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_detail};
-use code_graph_tools::handlers::watch::{try_reindex_file, watch_start, watch_stop, ReindexOutcome};
+use code_graph_tools::handlers::watch::{
+    try_reindex_file, watch_start, watch_stop, ReindexOutcome,
+};
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
