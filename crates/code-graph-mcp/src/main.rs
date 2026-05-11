@@ -1,14 +1,16 @@
 //! `code-graph-mcp` binary entry point.
 //!
-//! Builds a [`LanguageRegistry`] with all four shipped language plugins —
-//! C++, Rust, Go, and Python — constructs a [`CodeGraphServer`], and
-//! serves stdio MCP via rmcp's [`ServiceExt::serve`] /
+//! Builds a [`LanguageRegistry`] with all six shipped language plugins —
+//! C++, Rust, Go, Python, C#, and Java — constructs a [`CodeGraphServer`],
+//! and serves stdio MCP via rmcp's [`ServiceExt::serve`] /
 //! [`RunningService::waiting`].
 
 use anyhow::Context;
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
+use code_graph_lang_csharp::CSharpParser;
 use code_graph_lang_go::GoParser;
+use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::CodeGraphServer;
@@ -38,6 +40,16 @@ async fn main() -> anyhow::Result<()> {
             PythonParser::new().context("initialize Python language plugin")?,
         ))
         .context("register Python language plugin")?;
+    registry
+        .register(Box::new(
+            CSharpParser::new().context("initialize C# language plugin")?,
+        ))
+        .context("register C# language plugin")?;
+    registry
+        .register(Box::new(
+            JavaParser::new().context("initialize Java language plugin")?,
+        ))
+        .context("register Java language plugin")?;
 
     let server = CodeGraphServer::new(registry);
 

@@ -20,7 +20,9 @@ use std::process::ExitCode;
 use code_graph_core::{Edge, EdgeKind, RootConfig, Symbol, SymbolKind};
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
+use code_graph_lang_csharp::CSharpParser;
 use code_graph_lang_go::GoParser;
+use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::discovery::discover;
@@ -92,6 +94,35 @@ fn main() -> ExitCode {
     };
     if let Err(e) = registry.register(Box::new(python_parser)) {
         eprintln!("Error registering Python parser: {e}");
+        return ExitCode::from(1);
+    }
+    // Register the C# parser so `parse-test testdata/csharp` and the
+    // efcore dogfood test against `external/efcore` extract symbols from
+    // `.cs` files. Mirrors the C++/Rust/Go/Python blocks above.
+    let csharp_parser = match CSharpParser::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error initializing C# parser: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry.register(Box::new(csharp_parser)) {
+        eprintln!("Error registering C# parser: {e}");
+        return ExitCode::from(1);
+    }
+    // Register the Java parser so `parse-test testdata/java` and the
+    // commons-lang dogfood test against `external/commons-lang` extract
+    // symbols from `.java` files. Mirrors the C++/Rust/Go/Python/C#
+    // blocks above.
+    let java_parser = match JavaParser::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error initializing Java parser: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry.register(Box::new(java_parser)) {
+        eprintln!("Error registering Java parser: {e}");
         return ExitCode::from(1);
     }
 
