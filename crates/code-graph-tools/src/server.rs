@@ -14,8 +14,8 @@
 //! the multi-language Rust port:
 //!
 //! - `analyze_codebase`: widened from "Index a C/C++ codebase…" to "Index a
-//!   codebase (C/C++, Rust, Go, Python) and build the code graph. Must be
-//!   called before any query tools."
+//!   codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph.
+//!   Must be called before any query tools."
 //! - `search_symbols`: keeps the existing description but gains a `language`
 //!   parameter ("Filter by source language: cpp, rust, go, python, csharp, or
 //!   java").
@@ -409,7 +409,7 @@ impl CodeGraphServer {
     // -- P0 (Phase 3.4) ----------------------------------------------------
 
     #[tool(
-        description = "Index a codebase (C/C++, Rust, Go, Python) and build the code graph. Must be called before any query tools."
+        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools."
     )]
     async fn analyze_codebase(
         &self,
