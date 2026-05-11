@@ -4,11 +4,9 @@
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
 //! Phase status: Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
-//! filled [`CALL_QUERIES`]; Phase 2.4 fills [`IMPORT_QUERIES`].
-//! [`INHERITANCE_QUERIES`] stays empty until 2.5. Empty query strings
-//! compile to a no-op `Query` against any grammar, so the structural
-//! smoke test in `lib.rs` passes against the empty set for the
-//! still-empty queries.
+//! filled [`CALL_QUERIES`]; Phase 2.4 filled [`IMPORT_QUERIES`]; Phase
+//! 2.5 filled [`INHERITANCE_QUERIES`]. All four query constants are
+//! live — the C# plugin's query surface is complete.
 //!
 //! ## C#-specific node-kind notes (tree-sitter-c-sharp 0.23.5)
 //!
@@ -312,8 +310,88 @@ pub(crate) const IMPORT_QUERIES: &str = r#"
 (using_directive) @using.dir
 "#;
 
-/// Query for `base_list` on classes, structs, and interfaces. C# does not
-/// syntactically distinguish class extension from interface implementation
-/// in the base list — both produce `Inherits` edges per Decision 2. Filled
-/// in Phase 2.5.
-pub(crate) const INHERITANCE_QUERIES: &str = "";
+/// Query for `base_list` on classes, structs, interfaces, and records.
+/// C# does not syntactically distinguish class extension from interface
+/// implementation in the base list — both produce `Inherits` edges per
+/// Decision 2 (no separate `Implements` edge kind).
+///
+/// Per-form shape (verified against tree-sitter-c-sharp 0.23.5 via
+/// scratch-crate probe):
+///
+/// - `class Foo : Bar { }` → `(class_declaration name: (identifier)
+///   (base_list (identifier)) body: ...)` — single named child of
+///   `base_list`, kind `identifier`.
+/// - `class Foo : Bar, IBaz, IQux { }` → three named children of
+///   `base_list`, each `identifier`. The `:` and `,` tokens are
+///   anonymous (non-named) children and never match the wildcard.
+/// - `class Foo<T> : Bar<T> { }` → base is `generic_name`; its
+///   `utf8_text` is `"Bar<T>"` (generic argument list preserved
+///   verbatim per Decision 9).
+/// - `class Foo : Ns.Bar { }` → base is `qualified_name`; text =
+///   `"Ns.Bar"`.
+/// - `class Foo : Ns.Generic<int, string> { }` → base is a single
+///   `qualified_name` whose rightmost name field is a `generic_name`;
+///   `utf8_text` preserves the dotted+generic form: `"Ns.Generic<int, string>"`.
+/// - `class Foo : global::Ns.Bar { }` → base is `qualified_name` with
+///   an `alias_qualified_name` qualifier; `utf8_text` = `"global::Ns.Bar"`.
+/// - `interface I : J, K { }` → identical shape under
+///   `interface_declaration` (interfaces extend interfaces; the same
+///   `Inherits` edge kind applies per Decision 2).
+/// - `record User(string name) : BaseRecord { }`,
+///   `record class User : BaseRecord { }`,
+///   `record struct Pt : IComparable<Pt> { }` → all three forms produce
+///   `record_declaration` with a `base_list` of the same shape.
+/// - `class Foo<T> : Bar<T> where T : IComparable { }` → the
+///   `type_parameter_constraints_clause` is a SIBLING of `base_list`
+///   inside the class declaration, NOT a child of `base_list`. The
+///   `where` text never participates in this query.
+/// - `class Foo { }` → no `base_list` child; the query produces zero
+///   matches for this declaration.
+///
+/// **Single-capture-per-base strategy.** The wildcard `(_)` matches any
+/// named child of `base_list` — `identifier`, `qualified_name`,
+/// `generic_name`, or any future grammar variant. We capture each base
+/// with `@inherit.base` and the enclosing declaration with
+/// `@inherit.def` so the extractor can recover the enclosing type's
+/// name + type-parameter list (for the `from` field) and the
+/// declaration's start line (for the edge's `line` field).
+///
+/// The four parallel patterns (class / struct / interface / record)
+/// are kept as separate top-level patterns rather than collapsed to
+/// `(_) @inherit.def (base_list (_) @inherit.base)`, because the
+/// uniform-decl-kind wildcard would also match the `base_list` itself
+/// recursively or other inner nodes that happen to contain a child
+/// node — explicit declaration-kind anchoring keeps the matches scoped
+/// to the four type declarations that can have base lists.
+///
+/// Per Decision 2: no edge-kind distinction between class extension
+/// and interface implementation. The agent disambiguates from the
+/// target Symbol's kind (`Class` vs `Interface`) at query time.
+///
+/// Per Decision 9: the `from` field in the emitted `Inherits` edge is
+/// the bare class name including generic parameter text verbatim
+/// (`Foo` for `class Foo`, `Foo<T>` for `class Foo<T>`). The contract
+/// is consumed by `Graph::class_hierarchy` in
+/// `crates/code-graph-graph/src/algorithms.rs` — the walker looks up
+/// classes by `Symbol.name` (bare name), not by `symbol_id`. The
+/// extractor in `lib.rs::extract_inheritance` composes the enclosing
+/// type's name + adjacent `type_parameter_list` text to satisfy this
+/// contract.
+pub(crate) const INHERITANCE_QUERIES: &str = r#"
+; class Foo : Bar, IBaz, IQux { }
+(class_declaration
+  (base_list (_) @inherit.base)) @inherit.def
+
+; struct Pt : IComparable<Pt> { }
+(struct_declaration
+  (base_list (_) @inherit.base)) @inherit.def
+
+; interface I : J, K { }
+(interface_declaration
+  (base_list (_) @inherit.base)) @inherit.def
+
+; record User(...) : Base { } / record class User : Base { } /
+; record struct Pt : IComparable<Pt> { }
+(record_declaration
+  (base_list (_) @inherit.base)) @inherit.def
+"#;

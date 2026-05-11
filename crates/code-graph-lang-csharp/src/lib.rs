@@ -41,9 +41,24 @@
 //! queries walk the entire tree by default. Per Decision 7 the path is
 //! recorded verbatim — no resolution against build metadata.
 //!
-//! Phase 2.5 will wire `extract_inheritance` (`base_list` for classes,
-//! structs, and interfaces — both class extension and interface
-//! implementation produce the same [`EdgeKind::Inherits`] per Decision 2).
+//! Phase 2.5 wires `extract_inheritance`, producing
+//! [`EdgeKind::Inherits`] edges for every `base_list` child under
+//! `class_declaration`, `struct_declaration`, `interface_declaration`,
+//! and `record_declaration`. Both class extension and interface
+//! implementation produce the same edge kind per Decision 2 (no
+//! separate `Implements` edge). Generic parameter text is preserved
+//! verbatim per Decision 9: `class Foo<T> : Bar<T>` emits one edge with
+//! `from = "Foo<T>", to = "Bar<T>"`. The `from` field is the bare class
+//! name (including any generic parameter list), NOT a `symbol_id` — the
+//! contract is consumed by `Graph::class_hierarchy` in
+//! `crates/code-graph-graph/src/algorithms.rs`, which looks up classes
+//! by `Symbol.name`.
+//!
+//! As of Phase 2.5, all four extractors are live; the C# plugin's
+//! per-file parse surface is complete. Phase 2.6 will add the
+//! `testdata/csharp/` corpus and the efcore dogfood baseline; the
+//! plugin is NOT YET registered in the binary — Phase 4 wires
+//! registration.
 //!
 //! # Default trait methods
 //!
@@ -132,8 +147,8 @@ use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITAN
 pub const EXTENSIONS: &[&str] = &[".cs"];
 
 /// C# source-file parser. Holds the tree-sitter `Language` and the four
-/// pre-compiled queries used to drive symbol/edge extraction in Phases
-/// 2.2-2.5.
+/// pre-compiled queries used to drive symbol/edge extraction. All four
+/// extractors are live as of Phase 2.5.
 ///
 /// Construct with [`CSharpParser::new`]; share across threads (queries
 /// are `Send + Sync`).
@@ -142,17 +157,13 @@ pub struct CSharpParser {
     /// instances built inside `parse_file` can attach to it without
     /// rebuilding the `LanguageFn`.
     language: TsLanguage,
-    /// Compiled definition query (live in 2.2 — drives
-    /// [`Self::extract_definitions`]).
+    /// Compiled definition query (drives [`Self::extract_definitions`]).
     def_query: Query,
-    /// Compiled call query (live in 2.3 — drives
-    /// [`Self::extract_calls`]).
+    /// Compiled call query (drives [`Self::extract_calls`]).
     call_query: Query,
-    /// Compiled import query (live in 2.4 — drives
-    /// [`Self::extract_imports`]).
+    /// Compiled import query (drives [`Self::extract_imports`]).
     import_query: Query,
-    /// Compiled inheritance query (wired in 2.5).
-    #[allow(dead_code)] // wired in Phase 2.5 (extract_inheritance)
+    /// Compiled inheritance query (drives [`Self::extract_inheritance`]).
     inheritance_query: Query,
 }
 
@@ -164,10 +175,10 @@ impl CSharpParser {
     ///
     /// Successful return is the Phase 2.1 acceptance gate that proves
     /// every query string in [`queries`] parses against tree-sitter-c-
-    /// sharp 0.23.5. Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
-    /// filled [`CALL_QUERIES`]; Phase 2.4 filled [`IMPORT_QUERIES`].
-    /// [`INHERITANCE_QUERIES`] remains empty until 2.5 lands its
-    /// extractor.
+    /// sharp 0.23.5. As of Phase 2.5 all four query constants
+    /// ([`DEFINITION_QUERIES`], [`CALL_QUERIES`], [`IMPORT_QUERIES`],
+    /// [`INHERITANCE_QUERIES`]) are live and drive their corresponding
+    /// extractors.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_c_sharp::LANGUAGE.into();
 
@@ -199,15 +210,14 @@ impl CSharpParser {
     /// Parse `content` (UTF-8 bytes) as C# and produce a [`FileGraph`].
     /// Internal entry point for [`Self::parse_file`] (the trait method);
     /// kept crate-private so the public surface stays the trait method
-    /// while each per-extractor method (the upcoming 2.3/2.4/2.5
-    /// extractors) can be tested via `parse_file` without exposing them.
-    /// Mirrors the Python plugin's `parse_to_filegraph` indirection.
+    /// while each per-extractor method can be tested via `parse_file`
+    /// without exposing them. Mirrors the Python plugin's
+    /// `parse_to_filegraph` indirection.
     ///
-    /// Phase 2.2 wired `extract_definitions`; Phase 2.3 wired
-    /// `extract_calls`; Phase 2.4 wires `extract_imports`. Phase 2.5
-    /// will add the inheritance extractor. Until 2.5 lands, `parse_file`
-    /// produces Symbol records, `Calls` edges, and `Includes` edges —
-    /// zero `Inherits` edges.
+    /// All four extractors are live (Phases 2.2-2.5): `parse_file`
+    /// produces Symbol records, `Calls` edges, `Includes` edges, and
+    /// `Inherits` edges from a single tree-sitter parse. Order matters
+    /// only for readability — the four passes are independent.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -223,6 +233,7 @@ impl CSharpParser {
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_imports(root, content, &path_str, &mut fg);
+        self.extract_inheritance(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -688,6 +699,109 @@ impl CSharpParser {
             }
         }
     }
+
+    /// Run the inheritance query and produce [`EdgeKind::Inherits`]
+    /// edges, one per base in each `base_list`. Mirrors the C++/Rust
+    /// plugins' `extract_inheritance` for the bare-name `from`-field
+    /// contract (see Phase 1 / Phase 5 of RustRewrite).
+    ///
+    /// **Per-match shape.** The query returns one match *per base* — a
+    /// declaration with three bases (`class Foo : Bar, IBaz, IQux`)
+    /// produces three matches, each carrying the same `@inherit.def`
+    /// (the enclosing declaration node) and a distinct `@inherit.base`
+    /// (one of `Bar` / `IBaz` / `IQux`). The `inherit.base` capture is
+    /// a single named child of `base_list`, which can be any of:
+    ///
+    /// - `identifier` — bare type name (`Bar`)
+    /// - `qualified_name` — dotted type name (`Ns.Bar`,
+    ///   `Ns.Generic<int,string>`, `global::Ns.Bar`)
+    /// - `generic_name` — generic type (`Bar<T>`,
+    ///   `IComparable<Pt>`)
+    ///
+    /// For every form the captured node's `utf8_text` is the verbatim
+    /// source text — generic argument lists, dotted qualifications, and
+    /// `global::` prefixes survive into the `to` field as written
+    /// (Decision 9 — generic params preserved verbatim).
+    ///
+    /// **`from`-field composition.** The `from` field is the bare
+    /// enclosing type name + the type-parameter list text (if any). For
+    /// `class Foo` → `from = "Foo"`; for `class Foo<T>` →
+    /// `from = "Foo<T>"`. This is the contract documented in
+    /// `crates/code-graph-graph/src/algorithms.rs` (the
+    /// `Graph::class_hierarchy` walker looks up classes by
+    /// `Symbol.name`, which matches the same bare-name + generic-text
+    /// shape produced by [`Self::extract_definitions`]). The
+    /// `type_parameter_list` node kind is the canonical place tree-
+    /// sitter records the angle-bracket parameter list; it appears as
+    /// an unnamed-field child of `class_declaration` /
+    /// `struct_declaration` / `record_declaration` and as a
+    /// `type_parameters:`-field child of `interface_declaration` (the
+    /// grammar is asymmetric across declaration kinds in 0.23.5; the
+    /// kind-based scan in [`enclosing_type_name_with_generics`] handles
+    /// both).
+    ///
+    /// **Decision 2 — no edge-kind distinction.** All bases — whether
+    /// they reference a class, an interface, or a struct — produce the
+    /// same [`EdgeKind::Inherits`]. The agent disambiguates from the
+    /// target Symbol's `kind` at query time.
+    ///
+    /// **Edge shape per match:**
+    /// - `from = bare_name + type_parameter_list` (e.g. `Foo<T>`)
+    /// - `to = base_node.utf8_text` (verbatim — `Bar<T>`, `Ns.Bar`, etc.)
+    /// - `kind = EdgeKind::Inherits`
+    /// - `file = path`
+    /// - `line = enclosing declaration's start_position().row + 1`
+    ///   (i.e., the class/struct/interface/record declaration line, not
+    ///   the base node's line — keeps the edge anchored at where the
+    ///   inheritance relationship is *declared*).
+    fn extract_inheritance(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.inheritance_query, root, content);
+        let cap_names = self.inheritance_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            let mut def_node: Option<Node<'_>> = None;
+            let mut base_node: Option<Node<'_>> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                match cap_name {
+                    "inherit.def" => def_node = Some(cap_node),
+                    "inherit.base" => base_node = Some(cap_node),
+                    // Defensive catch-all — guards against future
+                    // grammar revisions that might introduce additional
+                    // capture names under the same query patterns.
+                    _ => {}
+                }
+            }
+
+            let (Some(def), Some(base)) = (def_node, base_node) else {
+                continue;
+            };
+
+            let from = enclosing_type_name_with_generics(def, content);
+            if from.is_empty() {
+                continue;
+            }
+
+            let to = base.utf8_text(content).unwrap_or("").to_owned();
+            if to.is_empty() {
+                continue;
+            }
+
+            fg.edges.push(Edge {
+                from,
+                to,
+                kind: EdgeKind::Inherits,
+                file: path.to_owned(),
+                line: def.start_position().row as u32 + 1,
+            });
+        }
+    }
 }
 
 impl LanguagePlugin for CSharpParser {
@@ -700,10 +814,8 @@ impl LanguagePlugin for CSharpParser {
     }
 
     /// Parse `content` (UTF-8 bytes) as C# and produce a [`FileGraph`].
-    ///
-    /// Phase 2.2 wires the definition extractor; Phase 2.3 wires the
-    /// call extractor; Phase 2.4 wires the import extractor. Phase 2.5
-    /// adds the inheritance extractor.
+    /// All four extractors (definitions, calls, imports, inheritance)
+    /// are live as of Phase 2.5.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -766,6 +878,53 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
         current = n.parent();
     }
     String::new()
+}
+
+/// Return the bare enclosing-type name *with* the generic parameter
+/// list text appended (when present), suitable for the `from` field of
+/// an `Inherits` edge. For `class Foo` returns `"Foo"`; for
+/// `class Foo<T>` returns `"Foo<T>"`; for `interface I<T, U>` returns
+/// `"I<T, U>"`.
+///
+/// `def_node` must be one of `class_declaration`, `struct_declaration`,
+/// `interface_declaration`, or `record_declaration`. Other node kinds
+/// return the empty string defensively.
+///
+/// The result matches the shape [`Symbol.name`] takes in
+/// [`Self::extract_definitions`]'s output, satisfying the contract
+/// consumed by `Graph::class_hierarchy` in
+/// `crates/code-graph-graph/src/algorithms.rs` (the walker looks up
+/// classes by `Symbol.name`, NOT by `symbol_id`). Decision 9 — generic
+/// parameter text preserved verbatim — and the Phase 1 / Phase 5
+/// bare-name `from`-field rule are both enforced here.
+///
+/// `type_parameter_list` is an unnamed-field child on
+/// `class_declaration` / `struct_declaration` / `record_declaration`,
+/// but a `type_parameters:`-field child on `interface_declaration` in
+/// tree-sitter-c-sharp 0.23.5. The asymmetry across declaration kinds
+/// is real; we scan named children by *kind* to handle both cases
+/// without per-declaration branching.
+fn enclosing_type_name_with_generics(def_node: Node<'_>, content: &[u8]) -> String {
+    let name_node = match def_node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    let bare = name_node.utf8_text(content).unwrap_or("").to_owned();
+    if bare.is_empty() {
+        return bare;
+    }
+
+    let mut cursor = def_node.walk();
+    for child in def_node.children(&mut cursor) {
+        if child.kind() == "type_parameter_list" {
+            let tpl = child.utf8_text(content).unwrap_or("");
+            if !tpl.is_empty() {
+                return format!("{bare}{tpl}");
+            }
+        }
+    }
+
+    bare
 }
 
 /// Return the dotted namespace path for a declaration node by walking
@@ -905,8 +1064,8 @@ fn make_symbol(
 mod tests {
     //! Phase 2.1 structural smoke tests + Phase 2.2 definition-extraction
     //! coverage + Phase 2.3 call-extraction coverage + Phase 2.4
-    //! import-extraction coverage. Behavioral coverage of inheritance
-    //! extraction lands in 2.5.
+    //! import-extraction coverage + Phase 2.5 inheritance-extraction
+    //! coverage. All four extractors are exercised here.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
@@ -1523,8 +1682,8 @@ class Foo {
     // Phase 2.3 — call extraction
     // ----------------------------------------------------------------
 
-    /// Filter to just the `Calls` edges of `fg` (drops Inherits/Includes
-    /// when those land in 2.4/2.5).
+    /// Filter to just the `Calls` edges of `fg` (drops Inherits and
+    /// Includes edges, which are now also produced by `parse_file`).
     fn calls(fg: &FileGraph) -> Vec<&Edge> {
         fg.edges
             .iter()
@@ -2220,6 +2379,266 @@ namespace Foo {
     fn empty_file_produces_no_includes_edges() {
         let fg = parse("");
         let edges = includes(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2.5 — inheritance extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Inherits` edges of `fg`. Mirrors the `calls`
+    /// and `includes` helpers above so each phase's assertions exercise
+    /// only its own edge category.
+    fn inherits(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect()
+    }
+
+    #[test]
+    fn single_base_class_produces_one_inherits_edge() {
+        // `class Foo : Bar { }` → 1 Inherits edge with from="Foo",
+        // to="Bar". The bare-name `from`-field rule (Phase 1 / Phase 5
+        // of RustRewrite, reaffirmed by Decision 9 in this design) is
+        // load-bearing — see `crates/code-graph-graph/src/algorithms.rs`,
+        // which looks up classes by `Symbol.name`.
+        let fg = parse_at("class Foo : Bar { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(e.from, "Foo");
+        assert_eq!(e.to, "Bar");
+        assert_eq!(e.kind, EdgeKind::Inherits);
+    }
+
+    #[test]
+    fn multiple_bases_produce_one_edge_per_base() {
+        // `class Foo : Bar, IBaz, IQux { }` → 3 Inherits edges, all
+        // from="Foo". The query produces one match per base via the
+        // `(base_list (_) @inherit.base)` wildcard.
+        let fg = parse_at("class Foo : Bar, IBaz, IQux { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            3,
+            "expected 3 Inherits edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        for e in &edges {
+            assert_eq!(
+                e.from, "Foo",
+                "every base's `from` must be the enclosing type"
+            );
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"Bar"), "missing Bar; got {:?}", tos);
+        assert!(tos.contains(&"IBaz"), "missing IBaz; got {:?}", tos);
+        assert!(tos.contains(&"IQux"), "missing IQux; got {:?}", tos);
+    }
+
+    #[test]
+    fn generic_class_and_base_preserve_type_params() {
+        // `class Foo<T> : Bar<T> { }` → 1 edge from="Foo<T>" to="Bar<T>".
+        // Generic params survive in BOTH from and to per Decision 9
+        // (preserved verbatim, matching Rust's rule — NOT Go's strip
+        // rule). The contract is consumed by
+        // `crates/code-graph-graph/src/algorithms.rs`'s
+        // `Graph::class_hierarchy`, which matches `Symbol.name` against
+        // edge target text.
+        let fg = parse_at("class Foo<T> : Bar<T> { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(
+            e.from, "Foo<T>",
+            "from must include generic param list verbatim"
+        );
+        assert_eq!(
+            e.to, "Bar<T>",
+            "to must include generic argument list verbatim"
+        );
+    }
+
+    #[test]
+    fn qualified_base_preserves_dotted_path() {
+        // `class Foo : Ns.Bar { }` → 1 edge to="Ns.Bar" (verbatim
+        // qualified_name text; no resolution).
+        let fg = parse_at("class Foo : Ns.Bar { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Foo");
+        assert_eq!(edges[0].to, "Ns.Bar");
+    }
+
+    #[test]
+    fn qualified_generic_base_preserves_full_path_with_args() {
+        // `class Foo : Ns.Generic<int, string> { }` → the base is a
+        // single qualified_name whose rightmost name field is a
+        // generic_name; `utf8_text` preserves the dotted+generic form.
+        let fg = parse_at("class Foo : Ns.Generic<int, string> { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "Ns.Generic<int, string>");
+    }
+
+    #[test]
+    fn alias_qualified_base_preserves_global_prefix() {
+        // `class Foo : global::Ns.Bar { }` → the base's verbatim text
+        // includes the `global::` prefix. Matches the `using
+        // global::System;` rule from 2.4 — alias-qualified text is
+        // captured as written.
+        let fg = parse_at("class Foo : global::Ns.Bar { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "global::Ns.Bar");
+    }
+
+    #[test]
+    fn interface_extending_interfaces_produces_inherits_edges() {
+        // `interface I : J, K { }` → 2 Inherits edges from="I". Mirrors
+        // the multi-base class case but on an `interface_declaration`.
+        // Decision 2: interface inheritance uses the same `Inherits`
+        // edge kind.
+        let fg = parse_at("interface I : J, K { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", edges);
+        for e in &edges {
+            assert_eq!(e.from, "I");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"J"));
+        assert!(tos.contains(&"K"));
+    }
+
+    #[test]
+    fn record_with_base_produces_inherits_edge() {
+        // `record User(string n) : Base { }` → 1 edge from="User"
+        // to="Base". Records reach the inheritance extractor through
+        // the `record_declaration` arm in INHERITANCE_QUERIES — same
+        // shape as classes.
+        let fg = parse_at("record User(string n) : Base { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "User");
+        assert_eq!(edges[0].to, "Base");
+    }
+
+    #[test]
+    fn struct_implementing_interface_produces_inherits_edge() {
+        // `struct Pt : IComparable<Pt> { }` → 1 edge from="Pt"
+        // to="IComparable<Pt>". Decision 2: structs implementing
+        // interfaces produce `Inherits` edges, no distinction from
+        // class-implements-interface.
+        let fg = parse_at("struct Pt : IComparable<Pt> { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Pt");
+        assert_eq!(edges[0].to, "IComparable<Pt>");
+    }
+
+    #[test]
+    fn class_without_base_list_produces_no_inherits_edges() {
+        // `class Foo { }` → 0 Inherits edges. No `base_list` child
+        // means zero matches under any declaration-kind arm.
+        let fg = parse_at("class Foo { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    #[test]
+    fn inherits_edge_carries_file_and_line() {
+        // The edge.line is anchored at the *enclosing declaration*
+        // (where the inheritance is declared), NOT at the base node
+        // (which could span multiple lines for a long base list).
+        // Pin: with a leading newline the `class` keyword lands on
+        // line 2; the edge's line must equal 2.
+        let fg = parse_at("\nclass Foo : Bar { }\n", "/abs/foo.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(e.file, "/abs/foo.cs", "file must equal the path");
+        assert_eq!(
+            e.line, 2,
+            "line must be the enclosing declaration's line (2), not the base's line"
+        );
+    }
+
+    #[test]
+    fn decision_2_no_edge_kind_distinction_between_class_and_interface_bases() {
+        // Load-bearing Decision-2 pin: `class Foo : Bar, IBaz, IQux`
+        // produces 3 edges, ALL with `EdgeKind::Inherits`. Even though
+        // syntactic intuition might assign `Bar` (class extension)
+        // differently from `IBaz` / `IQux` (interface implementation),
+        // the C# grammar does NOT make that distinction in `base_list`
+        // and the plugin deliberately preserves that uniformity. The
+        // agent disambiguates from the target Symbol's `kind` at query
+        // time, not from a separate `Implements` edge.
+        let fg = parse_at("class Foo : Bar, IBaz, IQux { }\n", "/p/x.cs");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 3);
+        for e in &edges {
+            assert_eq!(
+                e.kind,
+                EdgeKind::Inherits,
+                "every base, whether a class or an interface, produces the same EdgeKind"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_class_with_base_records_inner_class_as_from() {
+        // A nested class with a base list records the *inner* class's
+        // name as `from`, not the outer. The query anchors on the
+        // immediate `class_declaration` ancestor of the `base_list`.
+        let fg = parse_at(
+            r#"
+class Outer {
+    class Inner : Base { }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Inner");
+        assert_eq!(edges[0].to, "Base");
+    }
+
+    #[test]
+    fn generic_class_with_where_constraints_does_not_pollute_to_field() {
+        // `class Foo<T> : Bar<T> where T : IComparable { }` — the
+        // `type_parameter_constraints_clause` is a SIBLING of
+        // `base_list`, not a child. The query never sees `IComparable`
+        // through the where-clause path. Exactly one Inherits edge
+        // (to Bar<T>); the constraint type is not double-counted.
+        let fg = parse_at(
+            "class Foo<T> : Bar<T> where T : IComparable { }\n",
+            "/p/x.cs",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "where-clause types must not leak into Inherits edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(edges[0].from, "Foo<T>");
+        assert_eq!(edges[0].to, "Bar<T>");
+    }
+
+    #[test]
+    fn empty_file_produces_no_inherits_edges() {
+        let fg = parse("");
+        let edges = inherits(&fg);
         assert!(edges.is_empty(), "got: {:?}", edges);
     }
 }
