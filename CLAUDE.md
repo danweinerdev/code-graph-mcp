@@ -44,6 +44,7 @@ git submodule update --init external/ripgrep          # or just one
 | C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/code-graph-lang-cpp/tests/baselines/fmt.txt` |
 | C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/code-graph-lang-cpp/tests/baselines/curl.txt` |
 | C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/code-graph-lang-cpp/tests/baselines/abseil-cpp.txt` |
+| C# | `external/efcore` (dotnet/efcore) | `v8.0.25` | `testdata/csharp/efcore-baseline.txt` |
 
 **Drift expectation when bumping a submodule SHA:** the symbol count almost always shifts. Re-measure with the bumped SHA and update the baseline file's `symbols: N` line + the `tag:` / `commit:` headers in the same commit as the SHA bump. The baseline assertion uses ±10% tolerance, so small drift may pass without an update — but the headers should still match the pinned commit so future readers can tell what was measured. The fmt/curl/abseil baselines deliberately live next to their tests under `crates/code-graph-lang-cpp/tests/baselines/` rather than `testdata/cpp/` because they're tied to the `external/` submodule version, not the in-tree synthetic fixtures the rest of `testdata/cpp/` covers.
 

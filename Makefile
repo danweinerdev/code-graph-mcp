@@ -62,8 +62,8 @@ snapshot-audit:
 
 # Initialize the optional `external/<repo>` git submodules used by the
 # per-language dogfood baseline tests (logrus, requests, ripgrep, fmt,
-# curl, abseil-cpp). Each submodule is pinned to a specific upstream
-# tag — see `.gitmodules` and `tests/baselines/*.txt` /
+# curl, abseil-cpp, efcore). Each submodule is pinned to a specific
+# upstream tag — see `.gitmodules` and `tests/baselines/*.txt` /
 # `testdata/<lang>/<name>-baseline.txt` for the recorded pin + symbol
 # count.
 #

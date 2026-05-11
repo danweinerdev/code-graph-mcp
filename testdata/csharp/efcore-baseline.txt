@@ -1,0 +1,4 @@
+repo: dotnet/efcore
+tag: v8.0.25
+commit: ccddb58
+symbols: 9184

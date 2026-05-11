@@ -29,6 +29,7 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
+code-graph-lang-csharp = { path = "../code-graph-lang-csharp" }
 code-graph-lang-go = { path = "../code-graph-lang-go" }
 code-graph-lang-python = { path = "../code-graph-lang-python" }
 code-graph-lang-rust = { path = "../code-graph-lang-rust" }

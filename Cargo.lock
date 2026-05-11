@@ -291,6 +291,7 @@ dependencies = [
  "code-graph-graph",
  "code-graph-lang",
  "code-graph-lang-cpp",
+ "code-graph-lang-csharp",
  "code-graph-lang-go",
  "code-graph-lang-python",
  "code-graph-lang-rust",
