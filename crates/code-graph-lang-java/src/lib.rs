@@ -188,8 +188,8 @@ impl JavaParser {
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
     /// Internal entry point for [`Self::parse_file`] (the trait method);
     /// kept crate-private so the public surface stays the trait method
-    /// while each per-extractor method (the upcoming 3.3/3.4/3.5
-    /// extractors) can be tested via `parse_file` without exposing them.
+    /// while each per-extractor method (the upcoming 3.5 inheritance
+    /// extractor) can be tested via `parse_file` without exposing it.
     /// Mirrors the Python/C# plugins' `parse_to_filegraph` indirection.
     ///
     /// Phase 3.2 wired `extract_definitions` into the pipeline; Phase 3.3
@@ -1672,8 +1672,9 @@ class Foo {
     // Phase 3.3 — call extraction
     // ----------------------------------------------------------------
 
-    /// Filter to just the `Calls` edges of `fg` (drops Inherits/Includes
-    /// when those land in 3.4/3.5). Mirrors the C# plugin's test helper.
+    /// Filter to just the `Calls` edges of `fg` (drops Includes edges
+    /// from 3.4 and the Inherits edges 3.5 will add). Mirrors the C#
+    /// plugin's test helper.
     fn calls(fg: &FileGraph) -> Vec<&Edge> {
         fg.edges
             .iter()
