@@ -26,8 +26,10 @@
 //! call patterns. The enclosing-function walk is transparent through
 //! lambda and query expressions (a call inside `() => Foo()` or
 //! `select Foo(x)` reports the enclosing method as `from`). Cast
-//! expressions, `typeof`, `sizeof`, `default`, and `checked` parse as
-//! dedicated node kinds and do NOT produce spurious call edges.
+//! expressions, `typeof`, `sizeof`, `default`, `checked`, and `unchecked`
+//! parse as dedicated node kinds and do NOT produce spurious call edges.
+//! `nameof(X)` parses as an `invocation_expression` in this grammar but
+//! is filtered as a compile-time name operator, not a call.
 //!
 //! Phase 2.4 will wire `extract_imports` (`using`, `using static`,
 //! `using A = X.Y`, `global using`, `using` inside namespace blocks).
@@ -155,9 +157,10 @@ impl CSharpParser {
     ///
     /// Successful return is the Phase 2.1 acceptance gate that proves
     /// every query string in [`queries`] parses against tree-sitter-c-
-    /// sharp 0.23.5. Phase 2.2 fills [`DEFINITION_QUERIES`]; the other
-    /// three remain empty until 2.3/2.4/2.5 land their respective
-    /// extractors.
+    /// sharp 0.23.5. Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
+    /// filled [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and
+    /// [`INHERITANCE_QUERIES`] remain empty until 2.4/2.5 land their
+    /// respective extractors.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_c_sharp::LANGUAGE.into();
 
@@ -529,13 +532,19 @@ impl CSharpParser {
     /// `() => Foo()` or `select Foo(x)` report the enclosing
     /// method/constructor as the `from` field, not the lambda or query.
     ///
-    /// **No callee filtering.** C# casts (`(Foo)x`) parse as a distinct
+    /// **Callee filtering.** C# casts (`(Foo)x`) parse as a distinct
     /// `cast_expression` node, NOT `invocation_expression`, so no
     /// `is_cpp_cast`-style filter is needed. `typeof`, `sizeof`,
-    /// `default`, and `checked` similarly have dedicated expression
-    /// kinds. `nameof(X)` IS an `invocation_expression` in this grammar
-    /// and produces a call edge to `nameof` — the syntactic-not-semantic
-    /// rule applies (the agent can post-filter if desired).
+    /// `default`, `checked`, and `unchecked` similarly have dedicated
+    /// expression kinds and never reach this query. The one exception
+    /// is `nameof(X)`: it IS an `invocation_expression` in tree-sitter-
+    /// c-sharp 0.23.5 (the grammar treats `nameof` as an ordinary call),
+    /// but `nameof` is a compile-time name operator, not a method call.
+    /// We filter it out of the call graph — same precedent as the C++
+    /// plugin's `is_cpp_cast` filter for `static_cast` and friends.
+    /// Without this filter, every method that uses `nameof` for logging
+    /// or reflection would record a call to `nameof`, polluting
+    /// `get_callees` results.
     fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.call_query, root, content);
@@ -554,6 +563,13 @@ impl CSharpParser {
 
                 let callee = cap_node.utf8_text(content).unwrap_or("");
                 if callee.is_empty() {
+                    continue;
+                }
+
+                // Filter `nameof(X)` — semantically a compile-time name
+                // operator, not a call. Mirrors the C++ `is_cpp_cast`
+                // precedent for `static_cast` and friends.
+                if callee == "nameof" {
                     continue;
                 }
 
@@ -1611,6 +1627,67 @@ class C {
         assert!(
             edges.is_empty(),
             "typeof/sizeof/default must not produce Calls edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nameof_is_filtered_and_produces_no_call_edge() {
+        // `nameof(X)` parses as an ordinary `invocation_expression` in
+        // tree-sitter-c-sharp 0.23.5 (the grammar does not have a
+        // dedicated nameof node). Without filtering, every method that
+        // uses `nameof` for logging/reflection would record a call to
+        // `nameof`, polluting `get_callees` results. We filter it in
+        // `extract_calls` — same precedent as the C++ plugin's
+        // `is_cpp_cast` filter for `static_cast`. This test locks the
+        // filter in: a future refactor that drops the filter will fail.
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var name = nameof(C);
+        var memberName = nameof(C.m);
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "nameof(X) must NOT produce a Calls edge; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unchecked_does_not_produce_call_edge() {
+        // Like `checked(expr)`, `unchecked(expr)` parses as a dedicated
+        // `unchecked_expression` node, not `invocation_expression`. The
+        // query never matches it. Pins the symmetric behavior alongside
+        // typeof/sizeof/default/checked. (No `checked` test exists for
+        // the same reason — both fall out of the grammar's node shape.)
+        let fg = parse_at(
+            r#"
+class C {
+    void m() {
+        var u = unchecked(42 + 1);
+        var c = checked(42 + 1);
+    }
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = calls(&fg);
+        assert!(
+            edges.is_empty(),
+            "unchecked/checked must not produce Calls edges; got: {:?}",
             edges
                 .iter()
                 .map(|e| (e.from.as_str(), e.to.as_str()))

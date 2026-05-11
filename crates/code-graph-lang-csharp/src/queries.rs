@@ -189,9 +189,13 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 ///   needed.
 /// - `nameof(X)` IS an `invocation_expression function: (identifier)`
 ///   in tree-sitter-c-sharp 0.23.5 (the grammar treats `nameof` as an
-///   ordinary call). It produces a `Calls` edge to `nameof`. This
-///   matches the syntactic-not-semantic contract; the agent can choose
-///   to filter `nameof` post-hoc.
+///   ordinary call), so the query DOES match it. The extractor in
+///   `lib.rs::extract_calls` filters these matches (a one-line callee-
+///   name check) — `nameof` is a compile-time name operator, not a
+///   method call, so producing a `Calls` edge to `nameof` would
+///   pollute the call graph for every method that uses `nameof` for
+///   logging/reflection. Same precedent as the C++ plugin filtering
+///   `static_cast` etc.
 pub(crate) const CALL_QUERIES: &str = r#"
 ; Direct call: Foo()
 (invocation_expression
