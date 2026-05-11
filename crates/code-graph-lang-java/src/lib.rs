@@ -496,16 +496,18 @@ impl JavaParser {
     /// transparency.
     ///
     /// **Decision 4 transparency** (anonymous classes) is also
-    /// implemented in [`enclosing_function_id`] — the walk passes through
-    /// `object_creation_expression` boundaries, so a call inside a
-    /// `new Runnable() { void run() { foo(); } }` body reports the
-    /// enclosing NAMED method (the `m()` containing the `new Runnable()`),
-    /// matching the parent-resolution rule established for anonymous-class
-    /// method symbols in Phase 3.2's `extract_definitions`. The
-    /// anonymous-class's `run` method itself, if it exists, owns the
-    /// `from` field of any call directly inside it — but `run` is itself
-    /// a `method_declaration` and stops the walk under the same rules
-    /// that govern any named method.
+    /// implemented in [`enclosing_function_id`] — `object_creation_expression`
+    /// boundaries are transparent when computing a method's **parent**
+    /// prefix, not when finding which method-shaped ancestor owns a
+    /// call. For `new Runnable() { void run() { foo(); } }`, the call
+    /// to `foo()` is directly inside `run` — `run` is a
+    /// `method_declaration` and stops the walk normally, so the call's
+    /// `from` is `<path>:C::run` (where `C` is the outer named class).
+    /// The transparency is what makes `run`'s parent be `C` rather
+    /// than a synthesized `Anonymous$1` — that's what 3.2's
+    /// `extract_definitions` established and 3.3 inherits. The result:
+    /// `run`'s call edges naturally carry `C::run` as `from`, threading
+    /// the anonymous boundary cleanly without a synthetic parent.
     ///
     /// **Decision 12 transparency** (enum-constant method bodies) is also
     /// implemented in [`enclosing_function_id`] — the walk passes through
@@ -590,8 +592,9 @@ impl LanguagePlugin for JavaParser {
 
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
     ///
-    /// Phase 3.2 wires the definition extractor; Phases 3.3/3.4/3.5 wire
-    /// the call, import, and inheritance extractors.
+    /// Phase 3.2 wired the definition extractor; Phase 3.3 wired the
+    /// call extractor. Phases 3.4/3.5 will wire the import and
+    /// inheritance extractors.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -875,8 +878,8 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 3.1 structural smoke tests + Phase 3.2 definition-extraction
-    //! coverage. Behavioral coverage of call / import / inheritance
-    //! extraction lands in 3.3-3.5.
+    //! coverage + Phase 3.3 call-extraction coverage. Behavioral coverage
+    //! of import / inheritance extraction lands in 3.4-3.5.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;

@@ -3,10 +3,11 @@
 //! Validated against tree-sitter-java v0.23.5 — `JavaParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 3.2 fills [`DEFINITION_QUERIES`]; the remaining
-//! three constants stay empty until 3.3/3.4/3.5. Empty query strings
-//! compile to a no-op `Query` against any grammar, so the structural
-//! smoke test in `lib.rs` passes against the empty set.
+//! Phase status: Phase 3.2 filled [`DEFINITION_QUERIES`]; Phase 3.3
+//! filled [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and
+//! [`INHERITANCE_QUERIES`] remain empty until 3.4/3.5. Empty query
+//! strings compile to a no-op `Query` against any grammar, so the
+//! structural smoke test in `lib.rs` passes against the empty set.
 //!
 //! Naming follows the established `*_QUERIES` convention shared with
 //! the C++/Rust/Go/Python/C# plugins (plural form, `pub(crate)`).
