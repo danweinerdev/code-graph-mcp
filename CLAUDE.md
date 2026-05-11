@@ -1,164 +1,113 @@
-# CLAUDE.md
+# CLAUDE.md — code-graph-mcp
 
-## Project: code-graph-mcp
+**Audience:** AI agents working in this repo. Optimized for fact lookup, not narrative.
+**Project:** Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs via tree-sitter; exposes graph-query tools to AI agents. Languages live: C++, Rust, Go, Python, C#, Java.
 
-Rust MCP server that builds an in-memory semantic code graph from source files using tree-sitter, exposing graph query tools for AI agents over stdio.
+## Commands
 
-## Build
+| Action | Make | Cargo |
+|---|---|---|
+| Build release | `make build` | `cargo build --release -p code-graph-mcp` |
+| Test all | `make test` | `cargo test --workspace` |
+| Test one crate | — | `cargo test -p <crate>` |
+| Lint (deny warnings) | `make lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Format check | `make fmt-check` | `cargo fmt --all --check` |
+| Snapshots clean | `make snapshot-clean` | — (fails if `*.snap.new` present) |
+| Snapshot audit | `make snapshot-audit ARGS="<fragments>"` | — |
+| Parse-test harness | — | `cargo run -p code-graph-parse-test -- <dir>` |
+| Install pre-commit hooks | `make install-hooks` | — (sets `core.hooksPath=scripts/hooks`) |
+| Init dogfood submodules | `make submodules` | `git submodule update --init external/<name>` |
 
-```bash
-make build                                            # cargo build --release -p code-graph-mcp
-make test                                             # cargo test --workspace
-make lint                                             # cargo clippy --workspace --all-targets -- -D warnings
-make fmt-check                                        # cargo fmt --all --check
-make snapshot-clean                                   # fail if any *.snap.new files exist (stale insta snapshots)
-make snapshot-audit ARGS="<fragments>"                # fail if changed snapshots don't match expected name fragments
+- No CGo/C toolchain needed; tree-sitter grammars build via pure-Rust `cc`. No cross-compile pipeline — build natively per target.
+- Pre-commit hook runs `make snapshot-clean`. `--no-verify` only if you understand a stale `*.snap.new` will break CI.
 
-# Or invoke cargo directly:
-cargo build --release -p code-graph-mcp               # host-target release binary
-cargo test --workspace                                # full workspace test suite
-cargo clippy --workspace --all-targets -- -D warnings # lint
-cargo fmt --check                                     # format check
-```
+## Workspace map
 
-No CGo or C toolchain required — `tree-sitter-cpp` (and the other tree-sitter grammars) link via their pure-Rust `cc`-built crates. Build natively on each platform you need the binary for; there is no cross-compile pipeline.
+| Crate | Path | Responsibility |
+|---|---|---|
+| `code-graph-mcp` | `crates/code-graph-mcp` | Binary; rmcp stdio server entry |
+| `code-graph-core` | `crates/code-graph-core` | `Symbol`, `Edge`, `SymbolKind`, `EdgeKind`, `RootConfig` (TOML) |
+| `code-graph-lang` | `crates/code-graph-lang` | `LanguagePlugin` trait, `LanguageRegistry`, `SymbolIndex` |
+| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, file index), JSON cache |
+| `code-graph-tools` | `crates/code-graph-tools` | Tool handlers; parallel discovery+indexer; watcher (notify-debouncer-full) |
+| `code-graph-lang-cpp` | `crates/code-graph-lang-cpp` | tree-sitter-cpp; scope-aware call resolution |
+| `code-graph-lang-rust` | `crates/code-graph-lang-rust` | tree-sitter-rust; impl/trait, use-tree, macro invocations |
+| `code-graph-lang-go` | `crates/code-graph-lang-go` | tree-sitter-go; receivers, import forms, selectors |
+| `code-graph-lang-python` | `crates/code-graph-lang-python` | tree-sitter-python; classes/decorators, both import forms, `.py`+`.pyi` |
+| `code-graph-lang-csharp` | `crates/code-graph-lang-csharp` | tree-sitter-c-sharp; partial classes, default interface methods, extension methods, records |
+| `code-graph-lang-java` | `crates/code-graph-lang-java` | tree-sitter-java; records, anon classes invisible, default/static/private interface methods, enum methods |
 
-### One-time setup: install pre-commit hooks
+Cross-language collisions (e.g. `init` in 5 languages) isolated via `(Language, name)`-keyed index at `crates/code-graph-lang/src/lib.rs:116`.
 
-Run `make install-hooks` once after cloning. This sets `git config core.hooksPath scripts/hooks`, pointing git at the tracked hook scripts under `scripts/hooks/` so commits run pre-commit checks automatically. Currently the only check is `make snapshot-clean` — a `git commit` is refused if any `*.snap.new` files remain in the working tree (run `cargo insta review` to accept or reject pending snapshots first). Bypass with `git commit --no-verify` only when you understand the consequences (committing with pending snapshots means the recorded snapshot is stale and CI will fail on a clean checkout).
+## Core invariants
 
-### Optional: dogfood-baseline submodules
+- **Tool handler return type:** `Result<CallToolResult, McpError>`. User-visible errors travel as `CallToolResult` with error flag, NOT as `Err`.
+- **State guard:** query handlers must call `ServerInner::require_indexed()` first.
+- **Paths:** all stored file paths are absolute.
+- **Symbol ID format:** `file:name` (free function) or `file:Parent::name` (method).
+- **Enums:** `SymbolKind`, `EdgeKind` derive Serde, serialize as readable JSON strings (`"function"`, `"calls"`).
+- **`LanguagePlugin` trait:** `extensions()`, `parse_file(path, content)`, `preprocess(content, cfg)`, `resolve_edges(symbols, file_graph, registry)`. `preprocess` defaults to `Cow::Borrowed(content)`; override only for byte-level rewrites (e.g. C++ `[cpp].macro_strip`).
+- **Logging:** workspace deliberately has NO `tracing` dep. `eprintln!` is the channel for out-of-handler warnings (canonical example: `crates/code-graph-tools/src/handlers/watch.rs`). If a task says "use `tracing::warn!`", check `Cargo.toml`; flag the deviation, do NOT silently add the dep.
+- **Snapshot tests:** `insta`. Snapshots at `crates/code-graph-tools/tests/snapshots/`.
 
-Each language plugin has a dogfood-baseline test that parses a real upstream repo and asserts the symbol count stays within ±10% of a recorded baseline. The repos are git submodules under `external/`, pinned by tag. Tests **auto-skip** with an `eprintln!` setup hint when the submodule is not initialized — they do NOT panic and do NOT need `--ignored` to opt in. Run them by initializing the submodule(s) you care about:
+## MCP tools (15)
 
-```bash
-make submodules                                       # init all eight (shallow clones)
-git submodule update --init external/ripgrep          # or just one
-```
+Tool descriptions in `#[tool(description=…)]` strings (server.rs) are **production behavior**, not docs — agents pattern-match on them. Edits to these strings are evaluated under the "Agent-facing tool descriptions" lens (see Quality lenses below).
 
-| Language | Submodule | Pin | Baseline file |
-|----------|-----------|-----|---------------|
-| Rust | `external/ripgrep` (BurntSushi/ripgrep) | `15.1.0` | `testdata/rust/ripgrep-baseline.txt` |
-| Go | `external/logrus` (sirupsen/logrus) | `v1.9.4` | `testdata/go/logrus-baseline.txt` |
-| Python | `external/requests` (psf/requests) | `v2.33.1` | `testdata/python/requests-baseline.txt` |
-| C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/code-graph-lang-cpp/tests/baselines/fmt.txt` |
-| C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/code-graph-lang-cpp/tests/baselines/curl.txt` |
-| C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/code-graph-lang-cpp/tests/baselines/abseil-cpp.txt` |
-| C# | `external/efcore` (dotnet/efcore) | `v8.0.25` | `testdata/csharp/efcore-baseline.txt` |
-| Java | `external/commons-lang` (apache/commons-lang) | `rel/commons-lang-3.20.0` | `testdata/java/commons-lang-baseline.txt` |
+| Group | Tools | Notes |
+|---|---|---|
+| Indexing | `analyze_codebase` | JSON cache + mtime-based incremental re-index. Re-run with `force=true` to bypass cache (see Cache invalidation). |
+| Symbol query | `get_file_symbols`, `search_symbols`, `get_symbol_detail`, `get_symbol_summary` | `get_file_symbols`: `top_level_only`/`brief` + `limit`/`offset` (default 100, max 1000). `search_symbols`: `namespace` + `limit`/`offset` + `brief` (default true). `get_symbol_summary`: counts by namespace/kind. |
+| Call graph | `get_callers`, `get_callees` | `limit`/`offset` (default 100, max 1000). |
+| Deps | `get_dependencies` | |
+| Structural | `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling` | `get_orphans`: `kind` + `limit`/`offset`/`brief` (default 20, max 1000). `get_class_hierarchy`: `depth` + `max_nodes` (default 250, max 1000). `get_coupling`: outgoing/incoming/both. |
+| Viz | `generate_mermaid` | call graph / file deps / inheritance tree. |
+| Watch | `watch_start`, `watch_stop` | auto-reindex via notify-debouncer-full. |
 
-**Drift expectation when bumping a submodule SHA:** the symbol count almost always shifts. Re-measure with the bumped SHA and update the baseline file's `symbols: N` line + the `tag:` / `commit:` headers in the same commit as the SHA bump. The baseline assertion uses ±10% tolerance, so small drift may pass without an update — but the headers should still match the pinned commit so future readers can tell what was measured. The fmt/curl/abseil baselines deliberately live next to their tests under `crates/code-graph-lang-cpp/tests/baselines/` rather than `testdata/cpp/` because they're tied to the `external/` submodule version, not the in-tree synthetic fixtures the rest of `testdata/cpp/` covers.
+### Response shapes
 
-curl is primarily C; tree-sitter-cpp parses C as a (mostly compatible) superset and the C++ plugin filters out ERROR nodes, so the per-file parse always succeeds even when the file uses idiomatic C constructs. The aggregate symbol count is the regression contract — whatever tree-sitter-cpp could extract is what the baseline locks in.
+- **`Page<T>` envelope** (`get_orphans`, `get_file_symbols`, `get_callers`, `get_callees`, `search_symbols`):
+  ```
+  { results: T[], total: u32, offset: u32, limit: u32 }
+  ```
+  - `total` = pre-pagination match count.
+  - `offset`/`limit` echo the *resolved* values (so silent clamp-to-1000 is visible).
+  - `limit = 0` → use default.
+  - Sort: `symbol_id` asc (symbol lists); `(depth, symbol_id)` asc for callers/callees (closest results page 1).
+- **`get_class_hierarchy`** (tree):
+  ```
+  { hierarchy: HierarchyNode, truncated: bool, max_nodes: u32, total_nodes_seen: u32 }
+  ```
+  - `total_nodes_seen` = unique class names walked (diamond ancestor = 1 slot, not 1-per-arm).
+  - `truncated: true` → partial tree is well-formed; retry with larger `max_nodes` (≤ 1000).
 
-## Test
+## Configuration (`.code-graph.toml`)
 
-```bash
-# Full workspace test suite (unit + integration tests)
-cargo test --workspace
-
-# Run a single crate's tests
-cargo test -p code-graph-tools
-
-# Parse-test harness (manual inspection: parse one file/dir and dump symbols+edges)
-cargo run -p code-graph-parse-test -- <directory>
-```
-
-## Architecture
-
-The workspace is split into language-agnostic core crates plus per-language plugin crates:
-
-| Crate | Responsibility |
-|-------|----------------|
-| `crates/code-graph-mcp` | Binary — `rmcp`-based stdio MCP server entry point |
-| `crates/code-graph-core` | Shared types (`Symbol`, `Edge`, `SymbolKind`, `EdgeKind`), `RootConfig` for `.code-graph.toml` |
-| `crates/code-graph-lang` | `LanguagePlugin` trait + `LanguageRegistry` (extension → plugin dispatch) |
-| `crates/code-graph-graph` | In-memory `Graph` (nodes, forward + reverse adjacency, file index), JSON cache persistence |
-| `crates/code-graph-tools` | Tool handlers, parallel `analyze_codebase` discovery + indexer, watcher (notify-debouncer-full) |
-| `crates/code-graph-lang-cpp` | C++ language plugin — tree-sitter-cpp queries + scope-aware call resolution |
-| `crates/code-graph-lang-rust` | Rust language plugin — tree-sitter-rust queries; impl/trait extraction, use-tree expansion, macro invocation calls |
-| `crates/code-graph-lang-go` | Go language plugin — tree-sitter-go queries; method-receiver extraction, all import forms (single/grouped/aliased/dot/blank), direct + selector_expression calls |
-| `crates/code-graph-lang-python` | Python language plugin — tree-sitter-python queries; class/method/decorator handling, both import forms (`import` + `from … import`), multi-base inheritance, `.py` and `.pyi` |
-| `crates/code-graph-lang-csharp` | C# language plugin — tree-sitter-c-sharp queries; partial classes, default interface methods, extension methods, records as Class, generics verbatim |
-| `crates/code-graph-lang-java` | Java language plugin — tree-sitter-java queries; records as Class, anonymous classes invisible, default/static/private interface methods as Function, enum methods, this/super calls, method references |
-
-As of the CSharpJavaSupport cutover, **all six languages — C++, Rust, Go, Python, C#, and Java — are live in the binary**. Cross-language collisions (e.g. an `init` symbol that exists in C++, Go, Python, C#, and Java) stay isolated via the `(Language, name)`-keyed `SymbolIndex` at `crates/code-graph-lang/src/lib.rs:116`.
-
-```
-AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
-                              |
-                     +--------+--------+
-                     |                 |
-              [Tool Handlers]    [Graph]
-              (code-graph-tools)  (code-graph-graph)
-                     |                 |
-              [LanguageRegistry] [In-memory graph + JSON cache]
-              (code-graph-lang)
-                     |
-              [C++ Plugin] [Rust Plugin] [Go Plugin] [Python Plugin] [C# Plugin] [Java Plugin]
-              (code-graph-lang-cpp, code-graph-lang-rust, code-graph-lang-go,
-               code-graph-lang-python, code-graph-lang-csharp, code-graph-lang-java)
-                     |
-              [tree-sitter + tree-sitter-cpp + tree-sitter-rust + tree-sitter-go
-               + tree-sitter-python + tree-sitter-c-sharp + tree-sitter-java]
-```
-
-## Configuration
-
-Each indexed root may contain a `.code-graph.toml` controlling discovery and parsing knobs. The file is read once per `analyze_codebase` call from `<root>/.code-graph.toml` and cached on the server for subsequent watch events.
-
-Schema (all keys optional; defaults shown):
+Lives at `<root>/.code-graph.toml`. Read once per `analyze_codebase` and cached for watch events. Sample at `.code-graph.toml.example` (repo root). All keys optional.
 
 ```toml
 [discovery]
-# Glob patterns added to the default ignore set (.git, target, node_modules, etc.).
-# Patterns follow the `ignore` crate's gitignore syntax.
-extra_ignores = []
-
-# Maximum parallel discovery threads (0 = num_cpus).
-max_threads = 0
+extra_ignores = []        # gitignore-syntax globs added to defaults (.git, target, node_modules, …)
+max_threads = 0           # 0 = num_cpus
 
 [parsing]
-# Maximum parallel parse threads (0 = num_cpus). The two thread pools share
-# the host concurrency budget — the indexer caps the sum at num_cpus.
-max_threads = 0
+max_threads = 0           # 0 = num_cpus; indexer caps discovery+parse sum at num_cpus
 
 [cpp]
-# Identifier tokens to remove from C++ source bytes before tree-sitter parses
-# them. Each occurrence is whole-word matched (bordered by non-identifier
-# bytes on both sides) and overwritten with spaces of the same length, so
-# byte offsets, line numbers, and column numbers reported in extracted
-# symbols match the original source. Default: `[]` (no rewriting).
-#
-# Use this for API-export macros that confuse the tree-sitter-cpp grammar
-# by occupying the position between `class` and the class name. UE example:
-#
-#   [cpp]
-#   macro_strip = ["CORE_API", "ENGINE_API", "UMG_API", "MYGAME_API"]
-#
-# With the list above, `class CORE_API AActor : public UObject {};` extracts
-# correctly as a Class symbol with a UObject `Inherits` edge.
-macro_strip = []
+macro_strip = []          # whole-word identifier tokens overwritten with same-length spaces
+                          # before tree-sitter parses. Preserves byte offsets / line / column.
+                          # Example: ["CORE_API", "ENGINE_API"] makes
+                          # `class CORE_API AActor : public UObject {}` extract correctly.
 
 [extensions]
-# Per-language file-extension overrides, layered on top of each plugin's
-# built-in extension list. Three semantics:
-#
-#   1. <lang> lists ADD extensions to that language's claim. A file matching
-#      `[extensions].cpp` dispatches to the C++ plugin even when no
-#      plugin's defaults claim it.
-#   2. A user addition WINS over a default-claim collision. If
-#      `[extensions].python = [".h"]`, `.h` files dispatch to Python even
-#      though C++ defaults claim `.h`. Two `[extensions].<lang>` lists
-#      claiming the same extension is a load-time error (no tiebreak).
-#   3. `disabled` SUPPRESSES extensions entirely, regardless of which
-#      plugin or override would claim them. `disabled` wins over both
-#      defaults and additions.
-#
-# Each entry must start with `.` and is lowercased at load. Empty strings
-# are dropped with an `eprintln!` notice. Built-in defaults per language:
-# cpp = [.cpp .cc .cxx .c .h .hpp .hxx], rust = [.rs], go = [.go],
-# python = [.py .pyi], csharp = [.cs], java = [.java].
+# Three semantics:
+#   1. <lang> lists ADD extensions to that language.
+#   2. User addition WINS over default-claim collision. Two `<lang>` lists
+#      claiming the same ext is a load-time error (no tiebreak).
+#   3. `disabled` SUPPRESSES, beating defaults AND additions.
+# Entries must start with `.`; lowercased at load; empty strings dropped with eprintln!.
+# Defaults: cpp=[.cpp .cc .cxx .c .h .hpp .hxx], rust=[.rs], go=[.go],
+#           python=[.py .pyi], csharp=[.cs], java=[.java].
 disabled = []
 cpp = []
 rust = []
@@ -168,249 +117,210 @@ csharp = []
 java = []
 ```
 
-A sample `.code-graph.toml.example` ships at the repo root; copy it to `.code-graph.toml` in any indexed root and customize as needed.
-
 ### Cache invalidation
 
-Changes to `[cpp].macro_strip` between `analyze_codebase` calls do NOT retroactively re-parse files whose mtime is unchanged (the cache uses mtime-based stale checking). To apply a new `macro_strip` list to already-indexed files, re-run `analyze_codebase` with `force=true`.
+- mtime-based stale checking. Changes to `[cpp].macro_strip` or `[extensions]` do NOT retroactively re-parse files with unchanged mtime.
+- To apply new `macro_strip` or to evict entries moved to `[extensions].disabled`: re-run `analyze_codebase` with `force=true`.
+- Adding extensions: new files brought in by `[extensions].<lang>` parse normally on next run.
+- Watch path consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
 
-Same caveat applies to `[extensions]` changes. Adding a new extension to `[extensions].<lang>` brings new files into discovery and they're parsed normally. But moving an extension *into* `[extensions].disabled` does NOT remove already-cached entries for those files — the cache file retains them until re-run with `force=true`. The watch path picks up `[extensions]` changes immediately for new events (it consults the cached `RootConfig`'s extensions slice on every reindex), so files that move into `disabled` simply stop reindexing on subsequent edits, but their pre-existing graph entries persist until the next forced rebuild.
+## Per-language parser facts
 
-## MCP Tools (15 total)
+Each section: grammar pin, supported patterns, **known limitations** (decision-critical for agents recommending behavior).
 
-The tool surface mirrors the Go implementation; the PaginationOverhaul plan retrofitted defensive caps and pagination envelopes for UE-scale codebases. Tools are grouped by purpose:
+### C++ — tree-sitter-cpp v0.23.4
 
-**Indexing:** `analyze_codebase` (with JSON cache + mtime-based incremental re-index)
-**Symbol queries:** `get_file_symbols` (with `top_level_only`/`brief` + `limit`/`offset`, default limit 100, max 1000), `search_symbols` (with `namespace`, `limit`/`offset`, `brief` default true), `get_symbol_detail`, `get_symbol_summary` (counts by namespace/kind)
-**Call graph:** `get_callers`, `get_callees` (both with `limit`/`offset`, default limit 100, max 1000)
-**Dependencies:** `get_dependencies`
-**Structural analysis:** `detect_cycles`, `get_orphans` (with `kind` + `limit`/`offset`/`brief`, default limit 20, max 1000), `get_class_hierarchy` (with `depth` for transitive walk + `max_nodes` budget, default 250, max 1000), `get_coupling` (outgoing/incoming/both)
-**Visualization:** `generate_mermaid` (call graph, file deps, or inheritance tree)
-**Watch mode:** `watch_start`, `watch_stop` (auto-reindex on file changes via notify-debouncer-full)
+Supported:
+- Free functions, qualified methods (`Class::method`), inline methods.
+- Classes, structs, enums (incl. `enum class`), typedefs, `using` aliases, function-pointer typedefs.
+- Operator overloads (in-class and free); auto return types (trailing `-> T` and deduced); nested classes/structs (parent set).
+- Lambda call edges.
+- All call patterns: free, method, arrow, qualified, template.
+- Macro-prefixed classes (`class CORE_API MyClass : public Base {}`) iff listed in `[cpp].macro_strip`. Default (no `[cpp]` section) leaves these broken — zero behavior change for non-UE users.
 
-### Response shapes
+Limitations:
+1. **Macro-generated definitions invisible.** `DEFINE_HANDLER(name)` expansions aren't seen by tree-sitter. Macro invocations that look like calls ARE captured as call edges.
+2. **Complex template metaprogramming** → ERROR nodes; parser skips gracefully.
+3. **Call resolution heuristic** — same-file > same-class > same-namespace > global. Syntactic, not semantic. Overloads may misresolve.
+4. **Cast expressions filtered:** `static_cast`/`dynamic_cast`/`const_cast`/`reinterpret_cast` (tree-sitter parses as calls).
+5. **Forward declarations excluded.** Only `function_definition` (with body) emits symbols.
+6. **`template_method` node not matched** in v0.23.4 — `obj.foo<T>()` falls through to `field_expression` when possible.
+7. **`macro_strip` raw-string-delimiter collision.** Raw string with tag identical to a stripped macro (e.g. `R"CORE_API(…)CORE_API"`) → both delimiters overwritten → tree-sitter fails to close → rest of file becomes ERROR, zero symbols. Silent file-level failure. Workaround: drop the macro from `macro_strip` for affected file, or rename the raw-string tag.
 
-List-shaped paginated tools (`get_orphans`, `get_file_symbols`, `get_callers`, `get_callees`, `search_symbols`) return the shared `Page<T>` envelope: `{ results: T[], total: u32, offset: u32, limit: u32 }`. `total` is the pre-pagination match count; `offset`/`limit` are echoed as the resolved values actually used (so silent clamp-to-1000 is visible to clients). Sort order is `symbol_id` ascending for symbol lists; `(depth, symbol_id)` ascending for `get_callers`/`get_callees` so the closest results appear on page 1. `limit = 0` is treated as "use default".
+### Rust — tree-sitter-rust v0.24.0
 
-Tree-shaped `get_class_hierarchy` returns `{ hierarchy: HierarchyNode, truncated: bool, max_nodes: u32, total_nodes_seen: u32 }`. `total_nodes_seen` counts unique class names actually walked — diamond inheritance costs one budget slot per shared ancestor, not one per arm reaching it. When `truncated: true`, the partial tree is well-formed (already-recursed children stay; new children are skipped after the budget is hit) and the agent can retry with a larger `max_nodes`. Hard ceiling: `max_nodes ≤ 1000`.
+Supported:
+- Free functions; methods in `impl` blocks (`Type::method`); default methods in `trait` blocks (extracted as `Function`, NOT `Method` — only `impl` ancestry promotes to `Method`).
+- Structs, enums (all variant kinds), traits, type aliases.
+- Generics (type-bound and where-clause); lifetime parameters.
+- `async fn`, `const fn`, `unsafe fn` → `Function` (or `Method` in `impl`).
+- Nested modules → `Symbol.namespace = "a::b"`; `mod_item`s themselves do NOT produce Symbol records (namespace anchors only).
+- All `use`-tree forms (simple, scoped, grouped, nested grouped, wildcard, aliased records the path, `self`-in-list, `extern crate`).
+- All call patterns: direct, method via `field_expression`, scoped, turbofish, macro invocation, chained.
+- Trait impls (`impl Trait for Type`) → `Inherits` edge Type → Trait (incl. generic impls and `where` clauses).
+- **Trait-impl method parent rule:** in `impl Trait for Type { fn m() }`, parent is `Type`, never `Trait`. Trait identity lives ONLY on the `Inherits` edge.
 
-## Code Conventions
+Limitations:
+1. **`macro_rules!` definitions NOT symbols.** Only macro *invocations* produce `Calls` edges. Anti-regression test: `macro_rules_definition_produces_zero_symbols` in `code-graph-lang-rust`.
+2. **`#[derive(...)]` and proc-macro attributes NOT call edges.** They parse as `attribute_item`, not `macro_invocation`.
+3. **Forward declarations excluded.** `function_signature_item` (no body) → no Symbol. Only `function_item` matches.
+4. **Call resolution heuristic** — same scope rule as C++.
+5. **Generic parents recorded verbatim.** Methods in `impl<T> Trait for Vec<T>` carry parent `Vec<T>` (not bare `Vec`). `Inherits.from` follows the same rule. → **Hierarchy lookup gap** (see C# limitation 2; same shape).
 
-- All tool handlers return `Result<CallToolResult, McpError>`; user-visible errors travel as `CallToolResult` with the error flag set, not `Err`
-- State guards check indexed state via `ServerInner::require_indexed()` before executing query handlers
-- `LanguagePlugin` trait: `extensions()`, `parse_file(path, content)`, `preprocess(content, cfg)`, `resolve_edges(symbols, file_graph, registry)` — `preprocess` is a default-impl hook for byte-level transformations (e.g. C++ `[cpp].macro_strip`); plugins inherit `Cow::Borrowed(content)` unless they need to rewrite
-- All stored file paths are absolute
-- Symbol ID format: `file:name` for free functions, `file:Parent::name` for methods
-- `SymbolKind` and `EdgeKind` derive `Serialize`/`Deserialize` and serialize as readable JSON strings (e.g. `"function"`, `"calls"`)
-- Snapshot tests for tool wire format use `insta` (snapshots in `crates/code-graph-tools/tests/snapshots/`)
+### Go — tree-sitter-go v0.25.0
 
-### Test conventions
+Supported:
+- Free functions; methods (receiver type as parent — pointer `(s *T)` and value `(s T)`, incl. generic receivers `(s *T[U])` → bare `T` recorded).
+- Structs, interfaces, type aliases (`type ID = string`), defined types (`type Count int`, `type Handler func(...)` → `Typedef`).
+- Generic functions (Go 1.18+) — type-param list in captured signature; bare name as `Symbol.name`.
+- `init()` and `main()` extracted as ordinary functions; no special-casing.
+- `package_clause` → `Symbol.namespace` (Go packages are flat; no nested module path).
+- All call patterns: direct, selector (`obj.M()`), package-qualified (`fmt.Println()`), chained (one edge per chain link), `go fn()`, `defer fn()`, calls inside `func_literal`.
+- All import forms via `import_spec`: single, grouped, aliased (alias dropped, path captured), dot, blank.
+- Package-level closure fallback: call inside `var H = func() { foo() }` → `from` = file path (mirrors C++ lambda-at-global-scope).
 
-- **Shared test helpers live in `super::test_helpers::*`.** When adding a paginated handler test module, `use super::test_helpers::{body_text, page_parts}` rather than defining local copies. The `test_helpers` module is `pub(super)` under `crates/code-graph-tools/src/handlers/mod.rs` and is the canonical home for assertion utilities every paginated tool's tests need. Re-creating these locally is a duplication the codebase already cleaned up once.
-- **Diagnostic sentinels before discriminator assertions in timing-dependent tests.** When a test depends on async timing or file IO (watch-mode reindex tests are the canonical case), assert a low-stakes baseline first ("a no-macro class extracts") before asserting the discriminator ("a macro-prefixed class extracts"). The baseline assertion's failure message names the most likely root cause (timing, IO, file-write race) so the failure mode is self-diagnosing. The pattern in `tests/watch_cpp_macro_strip.rs` (`UObject` sentinel before `AActor` check) is the example.
-- **Test fixtures with names matching the project's `.gitignore` rules need `git add -f`.** `.code-graph.toml` is gitignored because it's a per-user-root config users shouldn't commit, but test fixtures sometimes need that exact filename for `RootConfig::load` to find them (e.g. `testdata/ue/.code-graph.toml`). When adding such a fixture, `git add -f <path>` is required, and `git status` must show the file as staged before commit. The `cargo test` command does NOT catch a silently-excluded fixture — the test runs against the local-filesystem copy and passes locally; only a fresh-checkout CI run reveals the missing file. If you're unsure whether a test fixture is in this trap, run `git check-ignore <path>` — a hit means you need `-f`.
+Limitations:
+1. **Structural interface implementation → zero edges.** No `Inherits` edges for Go. `get_class_hierarchy` on Go interface returns leaf. Anti-regression: `crates/code-graph-tools/tests/mixed_language.rs::get_class_hierarchy_for_go_interface`.
+2. **Embedded struct fields → no `Inherits`.** `type T struct { Bar }` is composition, not inheritance. Anti-regression: `embedded_struct_field_produces_no_inherits_edge` in `code-graph-lang-go`.
+3. **Call resolution heuristic.**
+4. **`go.mod`/vendor NOT consulted.** Import paths recorded verbatim in `Includes.to`. Default basename match against FileIndex is correctly a no-op for module paths.
+5. **Generic type parameters not in structured fields.** `(s *Server[T])` → parent `Server` (bare). `[T]`/`[T any]`/`[T comparable]` survive only in captured signature text.
+6. **Backtick-string imports NOT matched.** Valid grammar but non-idiomatic; query only matches `interpreted_string_literal`. Anti-regression: `backtick_import_produces_no_includes_edge`.
+7. **Forward declarations excluded.** `method_elem` (no body, interface method element) NOT matched; only `method_declaration`.
 
-### Implementer conventions
+### Python — tree-sitter-python v0.25.0
 
-- **Verify a workspace dependency exists before adopting it.** When a task instruction names a dep (e.g. "use `tracing::warn!`"), check `Cargo.toml` first. If the dep isn't present, that's a signal: the instruction may be derived from a convention assumption that doesn't apply to this workspace. Flag the deviation in your report and ask for confirmation rather than silently adding the dep (which is scope expansion) or shipping broken code (which doesn't compile). The workspace's deliberate "no `tracing` dep" convention (per `crates/code-graph-tools/src/handlers/watch.rs`) is the canonical example: `eprintln!` is the established channel for out-of-handler warnings.
+Supported:
+- Free functions; methods (parent = enclosing class); nested classes (inner class's parent = *immediate* enclosing outer, NOT dotted path).
+- `async def` → `Function`/`Method`. v0.25 wraps both as `function_definition` (no separate `async_function_definition`); single query path.
+- `class` with single, multiple (`class D(A, B, C)` → 3 `Inherits` edges), qualified (`class D(module.Base)` → `to = "module.Base"`) inheritance. Keyword args in superclasses (`metaclass=Meta`, `total=False`) filtered as non-bases.
+- Decorators transparent for definition extraction. `@property`/`@staticmethod`/`@classmethod`/`@abstractmethod`/custom wrap `decorated_definition > function_definition`; queries match inner directly.
+- All call patterns: direct, attribute, chained (one edge per chain link), constructor (`MyClass()` → call to `MyClass`), `super()`, calls in comprehensions, calls in `lambda` (transparent for enclosing-function walk), calls in default arg expressions.
+- All import forms: `import foo` → `"foo"`; `import foo.bar` → `"foo.bar"`; `import foo as f` → `"foo"`; `from foo import bar` → `"foo"` (**module is the dep, NOT the imported name**); `from foo.bar import baz` → `"foo.bar"`; `from . import utils` → `".utils"` (relative preserved verbatim); `from typing import List, Dict` → 1 edge `"typing"`; `from __future__ import annotations` → `"__future__"`.
+- `.pyi` stubs indexed identically to `.py`. `def f(x: int) -> str: ...` parses as `function_definition` → Function symbol.
 
-### Quality-scanner: project-specific lenses
+Limitations:
+1. **Call resolution especially noisy due to dynamic typing.** `PythonParser` does NOT override `resolve_call`; default heuristic stands as the documented contract (rationale: type inference is out of scope).
+2. **Decorators transparent.** No separate kind for `@property`/`@staticmethod`/`@classmethod`/`@abstractmethod`; decoration metadata not in symbol record.
+3. **Type hints NOT extracted as edges.** Only call sites + explicit imports drive deps.
+4. **Conditional imports NOT extracted.** `if TYPE_CHECKING: import x` and `try: import x except ImportError: ...` filtered by module-top-level guard. Anti-regression tests cover both forms.
+5. **`from __future__` handled via dedicated `future_import_statement` node kind**, NOT `import_from_statement`.
+6. **No forward declarations in Python.** `.pyi` indexed identically.
+7. **Method dispatch heuristic.**
 
-When dispatching `planner:quality-scanner` for changes in this repo, the standard 5 lenses (Correctness, Safety, Maintainability, Testing, Over-Engineering) apply per the global agent definition. Additionally evaluate against these two repo-local lenses when the diff scope includes them:
+### C# — tree-sitter-c-sharp v0.23.5
 
-**Agent-facing tool descriptions** — applies when the diff touches `#[tool(description=…)]` strings in `crates/code-graph-tools/src/server.rs` (or analogous agent-readable description fields). Description text in these positions is *production behavior*, not documentation — agents pattern-match on it to decide whether to call the tool and with what arguments. A misleading description (e.g. "raise `offset` for more results" when `offset` is a skip-count) is functionally a bug. Writers rarely test their own copy by following the suggested action.
+Supported:
+- **Partial classes**: one Class symbol per `partial class Foo` declaration (Decision 3). Cross-declaration merging deferred to hierarchy-walk via bare-name `from` rule on `Inherits` edges, NOT extraction time.
+- **Default interface methods (C# 8+)**: body-presence discriminator. Body can be `(block ...)` or `(arrow_expression_clause ...)`. Abstract interface methods (no body) → no Symbol.
+- **Extension methods**: syntactic parent = static class. `static class Ext { static int Count(this string s) {...} }` → `Count` Method, parent `Ext`. `this string` does NOT remap to `string`.
+- **Records → `Class`** (no `SymbolKind::Record`). Methods in `record Foo { void M() {...} }` parent to record name. `record Foo(string Name)` components parse as `formal_parameters`, correctly invisible.
+- **Generics verbatim in `Inherits.from`.** `class Foo<T> : Base<T>` → `from = "Foo<T>"`, `to = "Base<T>"`.
+- All call patterns: direct, member-access, chained, null-conditional (`obj?.M()`), generic (`Foo<T>()`), constructor (`new Foo()`).
+- All `using` forms: plain, dotted, `using static`, alias (`using F = System.IO.File;`), `global using`, `using` inside namespace blocks.
+
+Limitations:
+1. **`nameof(X)` filtered.** Parses as `invocation_expression` but semantically a compile-time operator. Same precedent as C++ cast filtering.
+2. **Generic-class hierarchy lookup gap.** `Symbol.name` is bare (`"Foo"`); `Inherits.from` has generics (`"Foo<T>"`). `Graph::class_hierarchy` keys by `Symbol.name` but walks adjacency by `from` string → halves miss → generic-class walks return leaf. Same accepted limitation as Rust/Java.
+3. **Call resolution heuristic.** Method overloading + extension-method dispatch may misresolve.
+4. **Partial-class search returns N results** (one per declaration file). File path is the disambiguator. Agents expecting one hit per type name must dedupe by name + group by file.
+5. **Forward declarations excluded.** Abstract interface methods → no Symbol.
+6. **Records: components invisible.** `record Foo(string Name)` → 1 Class symbol; positional components parse as `formal_parameters`, NOT promoted to Field.
+
+### Java — tree-sitter-java v0.23.5
+
+Supported:
+- **Records → `Class`** (Decision 6). Components in `record Foo(String name)` parse as `formal_parameters`, invisible.
+- **Anonymous classes invisible to symbol index** (Decision 4). `new Runnable() { void run() {...} }` → NO Class symbol. Methods inside anon classes inherit the *enclosing named entity's* parent (enclosing method, class, or file), NOT a synthetic `Anonymous$1`.
+- **Default, static, private (Java 9+) interface methods**: all extract as `Function` via body-presence (Decision 11). Abstract interface methods → no Symbol.
+- **Enum methods** (Decision 12): both enum-level (`enum E { ; void m() {} }`) AND per-constant bodies (`enum E { A { void m() {} } }`) attribute to enum type as parent. Per-constant boundaries transparent for parent walk.
+- All call patterns: direct, member-access, chained, generic (`Foo.<T>bar()`), constructor (`new Foo()`), `this(...)`/`super(...)` chains, calls in lambdas/anon-class bodies/enum-constant bodies (all transparent for enclosing-function walk), identifier-form method refs (`String::length`, `obj::method`).
+- All `import` forms: plain, dotted (`*` wildcard preserved verbatim in `Includes.to`), `import static`, `import static <pkg>.*`.
+- Sealed types' `permits` clause ignored (Decision 6). Sealed interfaces/classes extract as ordinary `Interface`/`Class`.
+
+Limitations:
+1. **`Type::new` constructor references NOT extracted as `Calls`.** Grammar produces `new` keyword on RHS of `::`. Pinned by no-edge test. Identifier-form method refs DO extract.
+2. **Generic-class hierarchy lookup gap** (same shape as C#). Java's constraints (`<T extends Comparable<T>>`) ride along inside `type_parameters`, so `Inherits.from` is verbatim verbose (`Foo<T extends Comparable<T>>`). Both honor Decision 9 ("preserved verbatim"); Java is just noisier.
+3. **Records cannot extend classes** (Java syntax error). `extract_inheritance` handles ERROR nodes via `has_error()`. Records CAN implement interfaces; that path extracts.
+4. **Call resolution heuristic.**
+5. **Anonymous-class method-name collisions.** Two anon classes in the same enclosing method both defining `run` → two Symbols with the SAME Symbol ID (anon class invisible to ID-building walk). `Symbol.line` disambiguates at query time. Grouping by ID collapses; `search_symbols` returns both.
+6. **Forward declarations excluded.** Abstract interface methods + enum-level abstract methods → no Symbol.
+
+### Cross-language summary
+
+| Capability | C++ | Rust | Go | Python | C# | Java |
+|---|---|---|---|---|---|---|
+| Inheritance edges | ✓ | trait impl | ✗ (structural) | ✓ multi-base | ✓ | ✓ |
+| Generic verbatim in `Inherits.from` | n/a | ✓ → lookup gap | n/a | n/a | ✓ → lookup gap | ✓ → lookup gap |
+| Forward decls excluded | ✓ | ✓ | ✓ | n/a | ✓ | ✓ |
+| Call resolution | heuristic | heuristic | heuristic | heuristic | heuristic | heuristic |
+
+## Test conventions
+
+- **Shared helpers in `super::test_helpers::*`.** Use `body_text`, `page_parts` from there (canonical: `pub(super)` under `crates/code-graph-tools/src/handlers/mod.rs`). Do NOT recreate locally; codebase already cleaned this up.
+- **Diagnostic sentinels before discriminator assertions** in timing/IO-dependent tests (watch-mode reindex is canonical). Assert low-stakes baseline first ("a no-macro class extracts") before the discriminator ("a macro-prefixed class extracts"). Sentinel failure message names the likely root cause (timing, IO, race). Example: `tests/watch_cpp_macro_strip.rs` (`UObject` sentinel before `AActor` check).
+- **Gitignored test fixtures need `git add -f`.** `.code-graph.toml` is gitignored, but `RootConfig::load` requires that exact filename (e.g. `testdata/ue/.code-graph.toml`). Run `git check-ignore <path>` — a hit means `-f` is required. `cargo test` runs against local FS and passes locally even when the fixture is silently excluded; only a fresh-checkout CI reveals it.
+
+## Dogfood-baseline submodules (optional)
+
+Per-language baseline tests parse a real upstream repo and assert symbol count is within ±10% of recorded baseline. Submodules under `external/`, pinned by tag. **Tests auto-skip** with an `eprintln!` setup hint if uninitialized — no panic, no `--ignored` opt-in needed.
+
+| Lang | Submodule | Pin | Baseline |
+|---|---|---|---|
+| Rust | `external/ripgrep` (BurntSushi/ripgrep) | `15.1.0` | `testdata/rust/ripgrep-baseline.txt` |
+| Go | `external/logrus` (sirupsen/logrus) | `v1.9.4` | `testdata/go/logrus-baseline.txt` |
+| Python | `external/requests` (psf/requests) | `v2.33.1` | `testdata/python/requests-baseline.txt` |
+| C++ | `external/fmt` (fmtlib/fmt) | `12.1.0` | `crates/code-graph-lang-cpp/tests/baselines/fmt.txt` |
+| C++ | `external/curl` (curl/curl) | `curl-8_20_0` | `crates/code-graph-lang-cpp/tests/baselines/curl.txt` |
+| C++ | `external/abseil-cpp` (abseil/abseil-cpp) | `20260107.1` | `crates/code-graph-lang-cpp/tests/baselines/abseil-cpp.txt` |
+| C# | `external/efcore` (dotnet/efcore) | `v8.0.25` | `testdata/csharp/efcore-baseline.txt` |
+| Java | `external/commons-lang` (apache/commons-lang) | `rel/commons-lang-3.20.0` | `testdata/java/commons-lang-baseline.txt` |
+
+**SHA bump protocol:** symbol count almost always shifts. Re-measure with the new SHA and update `symbols: N` line + `tag:`/`commit:` headers in the same commit. ±10% tolerance may pass without an update, but headers should still match the pinned commit. fmt/curl/abseil baselines live next to their tests (`crates/code-graph-lang-cpp/tests/baselines/`), NOT under `testdata/cpp/`, because they're tied to submodule versions, not in-tree synthetic fixtures.
+
+curl is primarily C; tree-sitter-cpp parses C as a (mostly compatible) superset; C++ plugin filters ERROR nodes so per-file parse always succeeds. Aggregate symbol count is the regression contract.
+
+## Quality lenses (repo-local additions to planner:quality-scanner)
+
+Standard 5 lenses (Correctness, Safety, Maintainability, Testing, Over-Engineering) plus:
+
+### Agent-facing tool descriptions
+
+Applies when diff touches `#[tool(description=…)]` strings in `crates/code-graph-tools/src/server.rs` (or analogous fields). These are **production behavior** — agents pattern-match on them. A misleading description (e.g. "raise `offset` for more results" when `offset` is a skip-count) is functionally a bug.
 
 Checklist:
-- Every named arg in the description is documented with its default and ceiling.
-- The verb in any suggested action operationally produces the claimed result. "Raise `limit` to get more results" is correct; "raise `offset` to get more results" is wrong (offset skips, doesn't expand).
-- The response envelope shape is named, not implied. If the tool returns a paginated `{results, total, offset, limit}` wrapper, say so; don't let agents guess they need to index into `["results"]`.
-- When an agent should pick non-default values is at least hinted — "default 100; raise for symbols with high fan-in" beats "default 100, max 1000" alone.
-- Plurality and units match the field type.
+- Every named arg documented with default + ceiling.
+- Verb in suggested action operationally produces the claimed result. ✓ "raise `limit` for more results"; ✗ "raise `offset` for more results".
+- Response envelope shape named, not implied. Say `{results, total, offset, limit}`; don't make agents guess.
+- Hint when non-default values are appropriate ("default 100; raise for symbols with high fan-in" beats "default 100, max 1000" alone).
+- Plurality + units match field type.
 
-This lens caught two real agent-misleading bugs in CppMacroStrip Phase 4 (the "raise via offset" wording on `get_callers`/`get_callees` and the over-confident "typical depth=1/2 walks" claim on `get_class_hierarchy`).
+History: caught two real agent-misleading bugs in CppMacroStrip Phase 4 (`get_callers`/`get_callees` "raise via offset" and over-confident "typical depth=1/2 walks" on `get_class_hierarchy`).
 
-**Documentation read cold** — applies when the diff touches `*.md`, `.code-graph.toml.example`, or other agent-readable docs. Read the modified sections AND the surrounding sections cold — without context from the implementer's commit message or task description — exactly as a future contributor or AI agent would encounter them.
+### Documentation read cold
+
+Applies when diff touches `*.md`, `.code-graph.toml.example`, or other agent-readable docs. Read modified AND surrounding sections *cold* — without context from commit message / task — as a future agent would.
 
 Checklist:
-- **Framing contradictions across sibling sections.** A feature documented in two places (e.g. once under "Supported Patterns" and once under "Known Limitations") should convey consistent signals. A feature that's "supported with caveat X" belongs in one location, not two with conflicting headlines. Caught a real instance in CppMacroStrip Phase 3.
-- **Stale references that became more visible.** A reference like "the sample `.code-graph.toml` ships at the repo root" is wrong if the file is `.code-graph.toml.example`. When new content sits adjacent to a stale reference, fix the stale line — its visibility just doubled.
-- **"Must contain phrase X" load-bearing strings.** Some doc requirements are explicitly that a phrase appears (e.g. `force=true` in both CLAUDE.md and the sample TOML for cache invalidation). When the diff touches either file, grep for the phrase to confirm it survives the edit. Use `make snapshot-audit ARGS=...`-style assertions for this class of check; or just `grep -l <phrase> CLAUDE.md .code-graph.toml.example`.
-- **Documentation that promises behavior must match implementation.** "Default is 250" must match what the code resolves; "supports X" must match what's wired through.
-
-## C++ Parser Limitations
-
-Validated against tree-sitter-cpp v0.23.4.
-
-### Supported C++ Patterns
-
-- Free functions, qualified methods (`Class::method`), inline methods in class bodies
-- Classes, structs, enums (including `enum class`), typedefs, `using` aliases
-- Function pointer typedefs (`typedef void (*Callback)(int)`)
-- Operator overloads (`operator+`, `operator==`, etc.) — both in-class and free
-- Auto return types (trailing `-> T` and deduced)
-- Nested classes/structs (Parent field set correctly)
-- Lambda call edges (calls inside and to lambdas)
-- All call patterns: free, method, arrow, qualified, template
-- Macro-prefixed class declarations (`class CORE_API MyClass : public Base {};`) when listed in `[cpp].macro_strip` (see the Configuration section). Default behavior with no `[cpp]` section leaves these declarations broken, preserving zero behavior change for non-UE users — see Known Limitation 7 below for the raw-string-delimiter caveat that comes with this opt-in.
-
-### Known Limitations
-
-1. **Macro-generated definitions** — Macros like `DEFINE_HANDLER(name)` that expand to function definitions are not visible to tree-sitter (it sees the macro call, not the expansion). Macro invocations that look like function calls ARE captured as call edges.
-
-2. **Complex template metaprogramming** — Deeply nested template specializations may produce incomplete or error-containing AST nodes. The parser skips error nodes gracefully.
-
-3. **Call resolution is heuristic** — Call edges are resolved via scope-aware heuristic matching (same file > same class > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
-
-4. **C++ cast expressions** — `static_cast`, `dynamic_cast`, `const_cast`, `reinterpret_cast` are filtered out (tree-sitter parses them as call expressions).
-
-5. **Forward declarations excluded** — Only `function_definition` (with body) produces symbols. Forward declarations (`void foo();`) are intentionally excluded to avoid duplicates.
-
-6. **Template method calls** — `obj.foo<T>()` via `template_method` node type is not matched in tree-sitter-cpp v0.23.4. These calls fall through to the regular `field_expression` pattern when possible.
-
-7. **`macro_strip` raw-string-delimiter collision** — when `[cpp].macro_strip` is configured, the C++ plugin's `preprocess` hook whole-word-replaces each listed macro with same-length spaces before tree-sitter parses. A raw string literal whose delimiter tag is also a stripped macro (e.g. `R"CORE_API(content)CORE_API"` with `CORE_API` in `macro_strip`) has both delimiters overwritten and tree-sitter fails to close the raw string — the rest of the file becomes an `ERROR` node and zero symbols extract from it. The pattern does not occur in any known codebase (a raw-string tag that is also an API-export macro is contrived) but is documented because the failure mode is silent at the file level. Workaround: drop the offending macro from `macro_strip` for the affected file or rename the raw-string tag in the source.
-
-## Rust Parser Limitations
-
-Validated against tree-sitter-rust v0.24.0.
-
-### Supported Rust Patterns
-
-- Free functions, methods inside `impl` blocks (`Type::method`), default methods inside `trait` blocks (extracted as `Function`, not `Method` — only `impl` ancestry promotes to `Method`)
-- Structs, enums (all variant kinds), traits, type aliases (`type` items)
-- Generics — both type-bound (`fn foo<T: Display>`) and where-clause (`fn foo<T> where T: Display`) forms
-- Lifetime parameters (`fn longest<'a>(x: &'a str)`)
-- `async fn`, `const fn`, `unsafe fn` — extracted as `Function` (or `Method` inside an `impl`)
-- Nested modules — `mod a { mod b { fn x() {} } }` populates `Symbol.namespace = "a::b"`; `mod_item`s themselves are namespace anchors and do NOT produce Symbol records
-- All `use`-tree forms expanded to dotted paths: simple, scoped, grouped, nested grouped (`use std::{io::{self, Read}, collections::HashMap}` → 3 edges), wildcard (`use foo::*`), aliased (`use foo as bar` records the path `foo`), `self`-in-list, and `extern crate alloc`
-- All call patterns: direct, method via `field_expression`, scoped, turbofish, macro invocation, chained calls
-- Trait impls (`impl Trait for Type`) produce `Inherits` edges from the implementing type to the trait — including generic impls (`impl<T> Trait for Vec<T>`) and impls with `where` clauses
-- Trait-impl method parent disambiguation: in `impl Trait for Type { fn m() }` the method's parent is `Type`, never `Trait`. The trait identity lives only on the `Inherits` edge.
-
-### Known Limitations
-
-1. **`macro_rules!` definitions are not extracted as symbols.** Only macro *invocations* produce `Calls` edges. The definition queries deliberately do not match `macro_definition` nodes (the tree-sitter-rust 0.24 wrapping node for `macro_rules!` blocks). An anti-regression test in `code-graph-lang-rust` (`macro_rules_definition_produces_zero_symbols`) asserts that `macro_rules! foo { ... }` yields zero Symbol records.
-
-2. **`#[derive(...)]` and proc-macro attributes are NOT captured as call edges.** They parse as `attribute_item` nodes, not `macro_invocation`, and the call queries only target `macro_invocation`. Multiple `#[derive(Debug, Clone, ...)]` attributes on a struct contribute zero `Calls` edges.
-
-3. **Forward declarations excluded.** Trait method declarations without bodies (`fn bar();`) parse as `function_signature_item` and do NOT produce Symbol records — only `function_item` (which requires a body) is matched. Default methods inside trait bodies (with bodies) and methods inside `impl` blocks DO produce symbols.
-
-4. **Call resolution is heuristic** — same as C++. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic — overloaded functions may resolve to the wrong candidate.
-
-5. **Complex use trees expanded but lifetime/generic constraints not represented.** Each terminal path in a `use` tree becomes one edge; lifetime parameters and generic bounds in the surrounding code are not part of the graph. Generic impls record the type-field text verbatim — methods inside `impl<T> Trait for Vec<T>` carry parent `Vec<T>` (with the generic in the parent string), not bare `Vec`. The `Inherits` edge's `from` field follows the same rule.
-
-## Go Parser Limitations
-
-Validated against tree-sitter-go v0.25.0.
-
-### Supported Go Patterns
-
-- Free functions, methods (with receiver type as parent — both pointer `(s *T)` and value `(s T)` forms, including generic receivers `(s *T[U])` where the bare `T` is recorded as parent)
-- Structs (`type T struct { ... }`), interfaces (`type T interface { ... }`), type aliases (`type ID = string`), defined types (`type Count int`, `type Handler func(...)` → `Typedef`)
-- Generic functions (Go 1.18+, `func Map[T any](...)`) — type-parameter list survives in the captured signature; the bare name is recorded as the symbol name
-- `init()` and `main()` are extracted as ordinary functions — no special-casing
-- Package name from `package_clause` populates `Symbol.namespace` (Go packages are flat — single-level, no nested module path)
-- All call patterns: direct (`foo()`), method/field selector (`obj.M()`), package-qualified (`fmt.Println()`), chained (`a.B().C()` → 2 edges, one per chain link), `go fn()`, `defer fn()`, calls inside closure literals (`func_literal`)
-- All import forms via `import_spec`: single (`import "fmt"`), grouped (`import (...)`), aliased (`import f "fmt"` — alias dropped, path captured), dot (`import . "testing"`), blank (`import _ "image/png"`)
-- Package-level closure fallback: a call inside a `var H = func() { foo() }` reports the file path as `from` (no enclosing function declaration), mirroring the C++ lambda-at-global-scope behavior
-
-### Known Limitations
-
-1. **Structural interface implementation produces no edges.** Go interfaces are satisfied structurally — a concrete type implements an interface by having the right method set, with no syntactic declaration. The parser emits zero `Inherits` edges for Go. `get_class_hierarchy` on a Go interface returns the interface as a leaf node with empty `bases` and `derived` (anti-regression test in `crates/code-graph-tools/tests/mixed_language.rs::get_class_hierarchy_for_go_interface`).
-
-2. **Embedded struct fields produce no `Inherits` edge.** `type T struct { Bar }` is structural composition (method-set promotion at runtime), not inheritance — no edge is emitted. An anti-regression test in `code-graph-lang-go` (`embedded_struct_field_produces_no_inherits_edge`) asserts a fixture with an embedded field yields zero `Inherits` edges.
-
-3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different receiver types that share a name may resolve to the wrong candidate.
-
-4. **`go.mod` and vendor directories are NOT consulted.** Discovery walks files and respects `.gitignore`; module-path resolution is out of scope. Import paths (e.g. `"github.com/sirupsen/logrus"`) are recorded verbatim in the `Includes` edge's `to` field — the default `resolve_include` basename match against the FileIndex is correctly a no-op for module paths.
-
-5. **Generic type parameters and constraints not represented in symbol records.** Generic types are recognized in receiver positions (`func (s *Server[T]) M()` → parent recorded as `Server`, not `Server[T]`) so methods on a generic struct group with the bare type name. The type-parameter list `[T]` and any constraints (`[T any]`, `[T comparable]`) survive in the captured signature text only — they are not part of the symbol record's structured fields.
-
-6. **`raw_string_literal` (backtick) imports are intentionally NOT matched.** Backtick-delimited import paths are valid Go grammar but not idiomatic and not produced by `gofmt`; the import query only matches `interpreted_string_literal`. An anti-regression test in `code-graph-lang-go` (`backtick_import_produces_no_includes_edge`) asserts backtick imports produce zero `Includes` edges.
-
-7. **Forward declarations excluded.** Interface method elements (`type R interface { Read() }`) parse as `method_elem` nodes (no body) and are NOT matched by the definition query — only `method_declaration` (with a body and receiver) produces method symbols. The interface method set is implicit; only the interface type itself becomes a `Symbol`.
-
-## Python Parser Limitations
-
-Validated against tree-sitter-python v0.25.0.
-
-### Supported Python Patterns
-
-- Free functions, methods inside classes (parent = enclosing class name), nested classes (inner class records the *immediate* enclosing outer class as parent — not a dotted path)
-- `async def` — extracted as `Function` (or `Method` inside a class) with no separate kind. tree-sitter-python 0.25 wraps `async def` as a `function_definition`, not a separate `async_function_definition` node, so a single query path covers both sync and async forms.
-- `class` definitions with single (`class D(B)`), multiple (`class D(A, B, C)` → 3 `Inherits` edges), and qualified (`class D(module.Base)` → 1 edge with `to = "module.Base"`) inheritance. Keyword arguments in superclasses (`class C(metaclass=Meta)`, `class C(total=False)`) are filtered as non-bases.
-- Decorators are transparent for definition extraction. `@property` / `@staticmethod` / `@classmethod` / `@abstractmethod` / custom decorators all wrap `decorated_definition > function_definition`; queries match the inner `function_definition` directly.
-- All call patterns: direct (`foo()`), attribute (`obj.method()`), chained (`a.b().c()` → 2 edges, one per chain link), constructor calls (`MyClass()` — recorded as a call to `MyClass`, agent interprets as construction), `super()`, calls inside list/dict/set comprehensions, calls inside `lambda` (lambda is transparent for the enclosing-function walk), calls inside default argument expressions
-- All import forms: `import foo` → `to = "foo"`; `import foo.bar` → `to = "foo.bar"`; `import foo as f` → `to = "foo"` (alias dropped); `from foo import bar` → `to = "foo"` (the *module* is the dependency, NOT the imported name); `from foo.bar import baz` → `to = "foo.bar"`; `from . import utils` → `to = ".utils"` (relative imports preserved verbatim); `from typing import List, Dict` → 1 edge with `to = "typing"`; `from __future__ import annotations` → `to = "__future__"`
-- `.pyi` stub files indexed identically to `.py`. `def f(x: int) -> str: ...` (a stub with `...` body) still parses as `function_definition` and produces a Function symbol.
-
-### Known Limitations
-
-1. **Call resolution is especially noisy due to dynamic typing.** `PythonParser` does NOT override `resolve_call` — the default scope-aware heuristic (same file > same class > same namespace > global) is the documented contract. Python's runtime polymorphism means most call resolutions are best-effort: `obj.foo()` cannot be resolved to a concrete `foo` without type inference, which is out of scope for a tree-sitter-based static analyzer. (Rationale documented in the Phase 7.1 verification: `PythonParser` accepts the default `resolve_call` for this reason.)
-
-2. **Decorators are transparent for definition extraction.** `@property` / `@staticmethod` / `@classmethod` produce ordinary `Method` symbols with no separate flag. `@abstractmethod` is NOT flagged as a separate kind — it parses as a method like any other. The decoration metadata is not preserved as a structured field in the symbol record.
-
-3. **Type hints not extracted as edges.** `def f(x: SomeType) -> OtherType` does not produce edges to `SomeType` or `OtherType`. Only call sites and explicit imports drive the dependency graph.
-
-4. **Conditional imports NOT extracted.** Patterns like `if TYPE_CHECKING: import expensive_module` are wrapped in `if_statement > block` and the import queries do not enter conditional bodies — `extract_imports`'s module-top-level guard filters them out. `try: import x except ImportError: ...` is filtered for the same reason. Anti-regression tests in the Python plugin's import tests cover both the `if`-block and `try`-block forms.
-
-5. **`from __future__` records `__future__` as the module path.** `from __future__ import annotations` produces an `Includes` edge with `to = "__future__"`. Handled via the dedicated `future_import_statement` node kind, NOT `import_from_statement` — tree-sitter-python 0.25 tags the future-import line with its own node type.
-
-6. **Forward declarations don't apply.** Python doesn't have C/Go-style forward declarations. `.pyi` stubs are indexed identically to `.py` files (the grammar is the same; `...` body still parses as a function body).
-
-7. **Method dispatch is heuristic.** Same as the C++/Rust/Go plugins — call edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). This is syntactic, not semantic; methods on different classes that share a name may resolve to the wrong candidate, especially given Python's duck-typing tradition.
-
-## C# Parser Limitations
-
-Validated against tree-sitter-c-sharp v0.23.5.
-
-### Supported C# Patterns
-
-- Partial classes — one `Class` symbol per `partial class Foo` declaration (Decision 3); merging across declarations is deferred to hierarchy-walk via the bare-name `from` rule on `Inherits` edges, NOT to extraction time
-- Default interface methods (C# 8+) — body-presence is the discriminator. The body can be `(block ...)` or `(arrow_expression_clause ...)` — both forms count. Abstract interface methods (no body) produce no Symbol
-- Extension methods — syntactic parent (the static class), NOT semantic remap. `static class Ext { static int Count(this string s) {...} }` extracts `Count` as a Method with parent `Ext`; the `this string` modifier does NOT remap to `string`
-- Records as `Class` (no `SymbolKind::Record`). Methods inside `record Foo { void M() {...} }` correctly parent to the record name; record components in the declaration syntax (`record Foo(string Name)`) parse as `formal_parameters` and are correctly invisible
-- Generic types preserved verbatim in `Inherits.from`. `class Foo<T> : Base<T>` records an Inherits edge with `from = "Foo<T>"` and `to = "Base<T>"` — the generic args ride along
-- All call patterns: direct (`foo()`), member-access (`obj.M()`), chained (`a.B().C()`), null-conditional (`obj?.M()`), generic (`Foo<T>()`), constructor (`new Foo()`)
-- All `using` forms: plain (`using System;`), dotted (`using System.IO;`), `using static` (`using static System.Math;`), alias (`using F = System.IO.File;`), `global using`, and `using` inside namespace blocks
-
-### Known Limitations
-
-1. **`nameof(X)` is filtered.** `nameof` parses as `invocation_expression function: (identifier "nameof")` in tree-sitter-c-sharp 0.23.5, but it is semantically a compile-time name operator, not a method call. Same precedent as C++ filtering `static_cast`/`dynamic_cast`/etc. Without the filter, every method using `nameof` for logging or reflection would record a `Calls` edge to `"nameof"`, polluting `get_callees` results.
-
-2. **Generic-class hierarchy lookup gap.** `Symbol.name` is the bare identifier (`"Foo"` for `class Foo<T>`) but `Inherits.from` includes the generic args (`"Foo<T>"`). `Graph::class_hierarchy` looks up symbols by `Symbol.name` and walks the adjacency map keyed by the `from` string, so the two halves miss each other and hierarchy walks for generic classes return the class as a leaf. **Same accepted limitation as the Rust plugin.**
-
-3. **Call resolution is heuristic** — same as C++/Rust/Go/Python. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). Method overloading and extension-method dispatch may resolve to the wrong candidate; this is syntactic, not semantic.
-
-4. **Partial-class search returns multiple symbols.** Because each `partial class Foo` declaration emits its own Class symbol (per Decision 3), `search_symbols("Foo")` returns N results — one per declaration file. The file path on each result is the disambiguator. Agents that expect a single hit per type name need to dedupe by name and group by file.
-
-5. **Forward declarations excluded.** Abstract interface methods (no body) produce no Symbol record. Same rule as the C++/Rust/Go/Java plugins — only definitions with bodies become symbols.
-
-6. **`record_declaration` extracts as Class; record components are invisible.** `record Foo(string Name)` produces a single `Class` symbol named `Foo`. The `(string Name)` positional component syntax parses as `formal_parameters` (not as field declarations) and is correctly NOT promoted to Field symbols.
-
-## Java Parser Limitations
-
-Validated against tree-sitter-java v0.23.5.
-
-### Supported Java Patterns
-
-- Records as `Class` (Decision 6). Record components in the declaration syntax (`record Foo(String name)`) parse as `formal_parameters` and are correctly invisible — no Field symbols leak
-- Anonymous classes are invisible to the symbol index (Decision 4) — `new Runnable() { void run() {...} }` produces NO Class symbol for the anonymous body. Methods declared inside an anonymous class inherit the *enclosing named entity's* parent (the enclosing method, class, or file), NOT a synthetic `Anonymous$1` name
-- Default, static, and Java-9+ private interface methods all extract as `Function` via the body-presence discriminator (Decision 11). Abstract interface methods (no body) produce no Symbol — same as C#
-- Enum methods (Decision 12) — both enum-level methods (`enum E { ; void m() {...} }`) AND per-constant method bodies (`enum E { A { void m() {...} } }`) attribute to the enum type as parent; per-constant boundaries are transparent for the parent walk
-- All call patterns: direct (`foo()`), member-access (`obj.m()`), chained (`a.b().c()`), generic (`Foo.<T>bar()`), constructor (`new Foo()`), `this(...)` and `super(...)` constructor chains, calls inside lambdas / anonymous-class bodies / enum-constant bodies (all transparent for enclosing-function walk), identifier-form method references (`String::length`, `obj::method`)
-- All `import` forms: plain (`import java.util.List;`), dotted (`import java.util.*;` — wildcard preserved verbatim in the `Includes.to`), `import static`, `import static <pkg>.*`
-- Sealed types' `permits` clause is ignored per Decision 6 — sealed interfaces and classes extract as ordinary `Interface`/`Class` symbols; the `permits:` field is not represented in the graph
-
-### Known Limitations
-
-1. **`Type::new` method references (constructor references) are NOT extracted as `Calls` edges.** The grammar produces a `new` keyword token as the RHS of `::` rather than an identifier, which is awkward to handle for the syntactic call extractor. Pinned by a dedicated no-edge test in the Java plugin. Identifier-form method references (`String::length`, `obj::method`) DO extract correctly.
-
-2. **Generic-class hierarchy lookup gap (same shape as C#).** `Symbol.name` is the bare identifier (`"Foo"` for `class Foo<T>`) but `Inherits.from` includes the generic args. Java's generic constraints (`<T extends Comparable<T>>`) ride along inside the `type_parameters` node, so the `from` field includes the *constraint verbatim* — `Foo<T extends Comparable<T>>`. This is a divergence from C#, where the `where T : Comparable<T>` clause sits in a sibling node and the `from` is the cleaner `"Foo<T>"`. Both honor Decision 9 ("preserved verbatim"); Java's verbatim is just verbose. `Graph::class_hierarchy` cannot bridge `Symbol.name` and `Inherits.from` in either case — same accepted limitation as Rust and C#.
-
-3. **Records cannot extend classes** (Java grammar treats this as a syntax error). `extract_inheritance` handles the resulting ERROR nodes gracefully via `has_error()` checks — mirrors the C# plugin's defensive shape. Records CAN implement interfaces; that path extracts normally.
-
-4. **Call resolution is heuristic** — same as C++/Rust/Go/Python/C#. Edges resolve via scope-aware heuristic matching (same file > same parent > same namespace > global). Method overloading and structurally-equivalent methods may resolve to the wrong candidate; this is syntactic, not semantic.
-
-5. **Anonymous-class method-name collisions.** Two anonymous classes inside the same enclosing method that both define a method named `run` produce two Symbol records with the *same Symbol ID* (because the anonymous class is invisible to the ID-building walk per Decision 4). `Symbol.line` disambiguates at query time; agents that group by ID will see one collapsed entry while `search_symbols` will return both.
-
-6. **Forward declarations excluded.** Abstract interface methods (no body) and enum-level abstract methods produce no Symbol. Body-presence is the discriminator — same rule as the C++/Rust/Go/C# plugins.
+- **Framing contradictions across sibling sections.** A feature documented in two places (e.g. "Supported Patterns" + "Known Limitations") should convey consistent signals. Caught in CppMacroStrip Phase 3.
+- **Stale references newly visible.** "The sample `.code-graph.toml` ships at the repo root" is wrong — file is `.code-graph.toml.example`. New adjacent content doubles visibility of stale lines; fix them.
+- **Load-bearing "must contain phrase X" strings.** Example: `force=true` must appear in both CLAUDE.md and `.code-graph.toml.example` for cache invalidation. When diff touches either, `grep -l <phrase> CLAUDE.md .code-graph.toml.example` to confirm survival.
+- **Doc promises must match implementation.** "Default is 250" must match what code resolves; "supports X" must match what's wired through.
+
+## Architecture diagram
+
+```
+AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
+                              |
+                     +--------+--------+
+                     |                 |
+              [Tool Handlers]     [Graph]
+              (code-graph-tools)  (code-graph-graph)
+                     |                 |
+              [LanguageRegistry]  [In-memory graph + JSON cache]
+              (code-graph-lang)
+                     |
+   [C++] [Rust] [Go] [Python] [C#] [Java]
+                     |
+   tree-sitter + tree-sitter-{cpp,rust,go,python,c-sharp,java}
+```
