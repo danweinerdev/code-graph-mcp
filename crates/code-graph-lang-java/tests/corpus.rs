@@ -356,7 +356,12 @@ fn broken_file_recovers_around_error_nodes_without_panic() {
     let corpus = parse_corpus(&parser);
     let broken = corpus.get("Broken.java").expect("Broken.java in corpus");
     let names: Vec<&str> = broken.symbols.iter().map(|s| s.name.as_str()).collect();
-    for want in ["Broken", "good", "AlsoGood", "run"] {
+    // `bar` is the load-bearing recovery — the malformed method that
+    // tree-sitter-java 0.23.5 recovers more aggressively than tree-sitter-
+    // c-sharp does (the C# analog drops `Bar` entirely). Pinning it by
+    // name ensures a future grammar regression that recovers a DIFFERENT
+    // 5th symbol fails this test, not silently passes the count.
+    for want in ["Broken", "bar", "good", "AlsoGood", "run"] {
         assert!(
             names.contains(&want),
             "{want} must still extract from Broken.java; got: {names:?}"
