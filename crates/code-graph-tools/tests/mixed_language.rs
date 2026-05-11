@@ -1,7 +1,8 @@
-//! Phase 5.6 + 6.6 + 7.7 integration tests — exercise the full MCP-server
-//! path with the C++, Rust, Go, and Python language plugins registered.
+//! Phase 5.6 + 6.6 + 7.7 + 4.2 integration tests — exercise the full
+//! MCP-server path with the C++, Rust, Go, Python, C#, and Java language
+//! plugins registered.
 //!
-//! All four plugins share the [`LanguageRegistry`]; this file confirms
+//! All six plugins share the [`LanguageRegistry`]; this file confirms
 //! they coexist correctly and that the symbol/edge surface continues to
 //! work for language-specific shapes (Rust traits and trait impls drive
 //! the widened `{Class, Struct, Interface, Trait}` root filter on
@@ -9,7 +10,7 @@
 //! while producing zero `Inherits` edges; Python's dynamic typing means
 //! call resolution is best-effort but cross-language isolation still
 //! holds; mixed indexing and the `(Language, name)`-keyed SymbolIndex
-//! isolate cross-language collisions across all four languages).
+//! isolate cross-language collisions across all six languages).
 //!
 //! The mixed-language pieces use `testdata/mixed/` (with `foo.cpp`,
 //! `foo.rs`, `foo.go`, and `foo.py` — all defining `helper`) so the
@@ -26,7 +27,9 @@ use std::sync::Arc;
 use code_graph_core::Language;
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
+use code_graph_lang_csharp::CSharpParser;
 use code_graph_lang_go::GoParser;
+use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
@@ -44,8 +47,8 @@ use common::{
     copy_testdata_from, first_text, testdata_mixed_path, testdata_rust_path, GO_INTERFACE_FIXTURE,
 };
 
-/// Fresh server with the C++, Rust, Go, and Python language plugins
-/// registered — mirrors the registration block in
+/// Fresh server with the C++, Rust, Go, Python, C#, and Java language
+/// plugins registered — mirrors the registration block in
 /// `crates/code-graph-mcp/src/main.rs`. Used by every test in this file
 /// so each test exercises the same registry shape the binary ships.
 fn server_with_all_parsers() -> CodeGraphServer {
@@ -62,6 +65,12 @@ fn server_with_all_parsers() -> CodeGraphServer {
     registry
         .register(Box::new(PythonParser::new().expect("PythonParser::new")))
         .expect("register PythonParser");
+    registry
+        .register(Box::new(CSharpParser::new().expect("CSharpParser::new")))
+        .expect("register CSharpParser");
+    registry
+        .register(Box::new(JavaParser::new().expect("JavaParser::new")))
+        .expect("register JavaParser");
     CodeGraphServer::new(registry)
 }
 
@@ -162,8 +171,8 @@ async fn mixed_cpp_rust_go_python_indexes_all_four() {
 /// the Go reference, which never serialized it. The file extension is
 /// the next-cheapest discriminant and is unambiguous for the mixed
 /// fixture (`.cpp` ↔ Cpp, `.rs` ↔ Rust, `.go` ↔ Go, `.py`/`.pyi` ↔
-/// Python). Returns `"?"` for any other extension to surface unexpected
-/// results loudly rather than silently.
+/// Python, `.cs` ↔ C#, `.java` ↔ Java). Returns `"?"` for any other
+/// extension to surface unexpected results loudly rather than silently.
 fn language_from_file(file: &str) -> &'static str {
     if file.ends_with(".cpp") || file.ends_with(".cc") || file.ends_with(".cxx") {
         "cpp"
@@ -173,6 +182,10 @@ fn language_from_file(file: &str) -> &'static str {
         "go"
     } else if file.ends_with(".py") || file.ends_with(".pyi") {
         "python"
+    } else if file.ends_with(".cs") {
+        "csharp"
+    } else if file.ends_with(".java") {
+        "java"
     } else {
         "?"
     }
@@ -403,28 +416,41 @@ async fn generate_diagram_for_rust_trait_inheritance() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6.6 / 7.7 — 3-way collision fixture across the 4-language
-// registry — Rust excluded by design.
+// Phase 6.6 / 7.7 / 4.2 — 5-way collision fixture across the 6-language
+// registry. Rust is excluded by design (see history below).
 //
-// A function named `init` exists in C++, Go, AND Python; the
+// A function named `init` exists in C++, Go, Python, C#, AND Java; the
 // `(Language, name)`-keyed `SymbolIndex` from Phase 3 must keep them
 // isolated during call resolution. Each language's caller resolves to
 // its own-language `init`; nothing leaks across language boundaries.
 // Inline fixture so it stays close to the assertions and doesn't
 // pollute the shared `testdata/mixed/` corpus.
 //
-// Phase 6.6 shipped this as a 2-way (C++ + Go) regression; Phase 7.7
-// widens it to 3-way (C++ + Go + Python) to confirm the SymbolIndex
-// keying scales with the fourth plugin. Rust is excluded by design:
-// Rust's `init` would parse as an ordinary function and would add no
-// new structural pressure (the load-bearing assertion is asymmetric
-// isolation across distinct *languages*, not the pair count).
+// History: Phase 6.6 shipped this as a 2-way (C++ + Go) regression;
+// Phase 7.7 widened to 3-way (C++ + Go + Python); Phase 4.2 of the
+// CSharpJavaSupport plan widens to 5-way (adds C# and Java) to confirm
+// the SymbolIndex keying scales with the fifth and sixth plugins. Rust
+// is excluded by design: Rust's `init` would parse as an ordinary
+// function and would add no new structural pressure (the load-bearing
+// assertion is asymmetric isolation across distinct *languages*, not
+// the pair count).
+//
+// **Cardinal rule (load-bearing per design):** all five fixtures use
+// the bare lowercase name `init` — NOT PascalCase `Init` for C# or any
+// other casing. The `(Language, name)` index key is the literal name
+// string; using `Init` would make the symbol a different name key
+// entirely and the test would no longer pin cross-language *name-key*
+// isolation — only language-tagging. For C#/Java this means the source
+// reads `class Module { public static void init() { ... } }`. The
+// extractors emit `Symbol.name == "init"` because the captured node is
+// the bare identifier child of `method_declaration`; the enclosing
+// class name lives in `Symbol.parent` (e.g., `"Module"`), not the name.
 // ---------------------------------------------------------------------
 
-/// Synthesize a TempDir with a C++ file, a Go file, AND a Python file,
-/// each declaring a function named `init` plus an in-language caller of
-/// that `init`. Returns the indexed fixture so callers can issue tool
-/// requests.
+/// Synthesize a TempDir with one source file per language (C++, Go,
+/// Python, C#, Java), each declaring a function/method named `init`
+/// (lowercase — load-bearing) plus an in-language caller of that `init`.
+/// Returns the indexed fixture so callers can issue tool requests.
 async fn build_init_collision_fixture() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for init-collision fixture");
     // C++ side: `init()` plus an in-file caller `caller_cpp` that calls
@@ -454,11 +480,36 @@ async fn build_init_collision_fixture() -> IndexedFixture {
         "def init():\n    pass\n\ndef caller_py():\n    init()\n",
     )
     .expect("write init_py.py");
+    // C# side: C# requires a type declaration to host a method, so
+    // `init` and `caller_csharp` live inside `class Module`. Both extract
+    // as `Method` with parent `Module`; their `Symbol.name` fields are
+    // bare (`"init"` / `"caller_csharp"`). The `init()` call from
+    // `caller_csharp` resolves same-file > same-parent and lands on the
+    // C#-language `init` via (Language=CSharp, name="init"). Lowercase
+    // `init` is load-bearing — PascalCase `Init` would shift the index
+    // key and no longer pin name-key isolation across languages.
+    std::fs::write(
+        dir.path().join("init_cs.cs"),
+        "class Module {\n    public static void init() {}\n    \
+         public static void caller_csharp() { init(); }\n}\n",
+    )
+    .expect("write init_cs.cs");
+    // Java side: same shape as C# — `class Module { static void init()
+    // {}; static void caller_java() { init(); } }`. Lowercase `init` is
+    // idiomatic in Java (camelCase) AND load-bearing here for the same
+    // reason as C#. The Java extractor produces `Symbol.name == "init"`
+    // with parent `Module`.
+    std::fs::write(
+        dir.path().join("init_java.java"),
+        "public class Module {\n    public static void init() {}\n    \
+         public static void caller_java() { init(); }\n}\n",
+    )
+    .expect("write init_java.java");
     build_indexed_from_dir(dir).await
 }
 
 #[tokio::test]
-async fn search_init_returns_all_three_languages() {
+async fn search_init_returns_all_five_languages() {
     let fx = build_init_collision_fixture().await;
     let r = search_symbols(
         &fx.inner.graph,
@@ -470,13 +521,15 @@ async fn search_init_returns_all_three_languages() {
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
-    // Exactly three `init` entries — one per language. Each language's
+    // Exactly five `init` entries — one per language. Each language's
     // symbol_id sits in a distinct (Language, name) bucket of the
     // SymbolIndex. Without per-language keying, the resolver would
     // collapse them into one entry on call lookup.
     let cpp_count = languages.iter().filter(|l| **l == "cpp").count();
     let go_count = languages.iter().filter(|l| **l == "go").count();
     let python_count = languages.iter().filter(|l| **l == "python").count();
+    let csharp_count = languages.iter().filter(|l| **l == "csharp").count();
+    let java_count = languages.iter().filter(|l| **l == "java").count();
     assert_eq!(
         cpp_count, 1,
         "expected exactly 1 C++ init, got languages: {languages:?}"
@@ -489,21 +542,32 @@ async fn search_init_returns_all_three_languages() {
         python_count, 1,
         "expected exactly 1 Python init, got languages: {languages:?}"
     );
+    assert_eq!(
+        csharp_count, 1,
+        "expected exactly 1 C# init, got languages: {languages:?}"
+    );
+    assert_eq!(
+        java_count, 1,
+        "expected exactly 1 Java init, got languages: {languages:?}"
+    );
 }
 
-/// CRITICAL regression: with `init` defined in C++, Go, AND Python, the
-/// in-language caller's `Calls` edge must resolve to the same-language
-/// `init`. The (Language, name) keying of `SymbolIndex` (Phase 3
-/// invariant at `crates/code-graph-lang/src/lib.rs:116`) is what prevents
-/// any caller from showing up in another language's init's caller list.
-/// If that keying ever degrades to bare `name`, callers from one
-/// language would be candidates for another language's init's resolution
-/// and these asymmetric assertions would fail.
+/// CRITICAL regression: with `init` defined in C++, Go, Python, C#, AND
+/// Java, the in-language caller's `Calls` edge must resolve to the
+/// same-language `init`. The (Language, name) keying of `SymbolIndex`
+/// (Phase 3 invariant at `crates/code-graph-lang/src/lib.rs:116`) is
+/// what prevents any caller from showing up in another language's
+/// init's caller list. If that keying ever degrades to bare `name`,
+/// callers from one language would be candidates for another language's
+/// init's resolution and these asymmetric assertions would fail.
 ///
 /// The shape is: for each pair (A, B) of languages, A's caller IS in
-/// A-init's callers AND IS NOT in B-init's callers. For three languages
-/// that's 3 positive assertions plus 6 negative assertions (each pair
-/// in both directions), all of which must hold simultaneously.
+/// A-init's callers AND IS NOT in B-init's callers. For five languages
+/// that's **5 positive assertions plus 5 × 4 = 20 negative assertions**
+/// (each ordered pair), all of which must hold simultaneously. The
+/// asymmetric (positive AND negative) shape is the load-bearing pattern
+/// — Phase 6 debrief of RustRewrite established this, Phase 7 confirmed,
+/// and Phase 4.2 of CSharpJavaSupport widens to five.
 #[tokio::test]
 async fn cross_language_init_callers_stay_isolated() {
     let fx = build_init_collision_fixture().await;
@@ -512,24 +576,18 @@ async fn cross_language_init_callers_stay_isolated() {
     // Locate the per-language symbol IDs from the indexed graph rather
     // than reconstructing them by string formatting — TempDir paths are
     // opaque and canonicalized.
-    let cpp_init_id = g
-        .search_symbols("init", None)
-        .into_iter()
-        .find(|s| s.language == Language::Cpp && s.name == "init")
-        .map(|s| code_graph_core::symbol_id(&s))
-        .expect("C++ init symbol must exist");
-    let go_init_id = g
-        .search_symbols("init", None)
-        .into_iter()
-        .find(|s| s.language == Language::Go && s.name == "init")
-        .map(|s| code_graph_core::symbol_id(&s))
-        .expect("Go init symbol must exist");
-    let python_init_id = g
-        .search_symbols("init", None)
-        .into_iter()
-        .find(|s| s.language == Language::Python && s.name == "init")
-        .map(|s| code_graph_core::symbol_id(&s))
-        .expect("Python init symbol must exist");
+    fn init_id_for(g: &code_graph_graph::Graph, lang: Language) -> String {
+        g.search_symbols("init", None)
+            .into_iter()
+            .find(|s| s.language == lang && s.name == "init")
+            .map(|s| code_graph_core::symbol_id(&s))
+            .unwrap_or_else(|| panic!("{lang:?} init symbol must exist"))
+    }
+    let cpp_init_id = init_id_for(&g, Language::Cpp);
+    let go_init_id = init_id_for(&g, Language::Go);
+    let python_init_id = init_id_for(&g, Language::Python);
+    let csharp_init_id = init_id_for(&g, Language::CSharp);
+    let java_init_id = init_id_for(&g, Language::Java);
     drop(g);
 
     /// Pull the `symbol_id` field from each entry in a `get_callers`
@@ -545,95 +603,81 @@ async fn cross_language_init_callers_stay_isolated() {
             .collect()
     }
 
-    // C++ init's callers — must include caller_cpp and must NOT include
-    // either caller_go or caller_py.
-    let cpp_callers = callers_or_callees(
+    /// Assert one language's isolation: (1 positive) `init`'s callers
+    /// includes the same-language `caller_<lang>`; (N-1 negative)
+    /// `init`'s callers excludes every other language's
+    /// `caller_<other>`. The per-language slug must match the source
+    /// fixture's caller name (`caller_cpp`, `caller_go`, `caller_py`,
+    /// `caller_csharp`, `caller_java`). `lang_label` is the
+    /// human-readable name used in assertion messages.
+    ///
+    /// Factored out to collapse five near-identical 20-line blocks into
+    /// five 1-line calls and to make the asymmetric (positive AND
+    /// negative) contract obvious by structure rather than by reading
+    /// 25 inline assertions.
+    fn assert_isolation(
+        graph: &parking_lot::RwLock<code_graph_graph::Graph>,
+        init_id: &str,
+        lang_label: &str,
+        own_caller_slug: &str,
+        other_caller_slugs: &[&str],
+    ) {
+        let resp = callers_or_callees(graph, init_id, Some(1), Direction::Callers, None, None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&first_text(&resp)).expect("get_callers response is JSON");
+        let callers = caller_ids(&parsed);
+        let own_suffix = format!(":{own_caller_slug}");
+        assert!(
+            callers.iter().any(|s| s.ends_with(&own_suffix)),
+            "{lang_label} init must have {own_caller_slug} in its callers, got: {callers:?}"
+        );
+        for other in other_caller_slugs {
+            let other_suffix = format!(":{other}");
+            assert!(
+                !callers.iter().any(|s| s.ends_with(&other_suffix)),
+                "{lang_label} init must NOT have {other} (cross-language leak) in its \
+                 callers — (Language, name) SymbolIndex keying broke; got: {callers:?}"
+            );
+        }
+    }
+
+    // Five (positive + negative) blocks. Each block asserts 1 positive
+    // and 4 negatives → 5 × (1 + 4) = 25 total assertions, matching the
+    // 5 + 20 contract documented above.
+    assert_isolation(
         &fx.inner.graph,
         &cpp_init_id,
-        Some(1),
-        Direction::Callers,
-        None,
-        None,
+        "C++",
+        "caller_cpp",
+        &["caller_go", "caller_py", "caller_csharp", "caller_java"],
     );
-    let cpp_arr: serde_json::Value =
-        serde_json::from_str(&first_text(&cpp_callers)).expect("get_callers response is JSON");
-    let cpp_caller_names = caller_ids(&cpp_arr);
-    assert!(
-        cpp_caller_names.iter().any(|s| s.ends_with(":caller_cpp")),
-        "C++ init must have caller_cpp in its callers, got: {cpp_caller_names:?}"
-    );
-    assert!(
-        !cpp_caller_names.iter().any(|s| s.ends_with(":caller_go")),
-        "C++ init must NOT have the Go caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {cpp_caller_names:?}"
-    );
-    assert!(
-        !cpp_caller_names.iter().any(|s| s.ends_with(":caller_py")),
-        "C++ init must NOT have the Python caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {cpp_caller_names:?}"
-    );
-
-    // Go init's callers — must include caller_go and must NOT include
-    // caller_cpp or caller_py.
-    let go_callers = callers_or_callees(
+    assert_isolation(
         &fx.inner.graph,
         &go_init_id,
-        Some(1),
-        Direction::Callers,
-        None,
-        None,
+        "Go",
+        "caller_go",
+        &["caller_cpp", "caller_py", "caller_csharp", "caller_java"],
     );
-    let go_arr: serde_json::Value =
-        serde_json::from_str(&first_text(&go_callers)).expect("get_callers response is JSON");
-    let go_caller_names = caller_ids(&go_arr);
-    assert!(
-        go_caller_names.iter().any(|s| s.ends_with(":caller_go")),
-        "Go init must have caller_go in its callers, got: {go_caller_names:?}"
-    );
-    assert!(
-        !go_caller_names.iter().any(|s| s.ends_with(":caller_cpp")),
-        "Go init must NOT have the C++ caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {go_caller_names:?}"
-    );
-    assert!(
-        !go_caller_names.iter().any(|s| s.ends_with(":caller_py")),
-        "Go init must NOT have the Python caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {go_caller_names:?}"
-    );
-
-    // Python init's callers — must include caller_py and must NOT
-    // include caller_cpp or caller_go. Closes the third leg of the
-    // 3-way isolation assertion.
-    let python_callers = callers_or_callees(
+    assert_isolation(
         &fx.inner.graph,
         &python_init_id,
-        Some(1),
-        Direction::Callers,
-        None,
-        None,
+        "Python",
+        "caller_py",
+        &["caller_cpp", "caller_go", "caller_csharp", "caller_java"],
     );
-    let python_arr: serde_json::Value =
-        serde_json::from_str(&first_text(&python_callers)).expect("get_callers response is JSON");
-    let python_caller_names = caller_ids(&python_arr);
-    assert!(
-        python_caller_names
-            .iter()
-            .any(|s| s.ends_with(":caller_py")),
-        "Python init must have caller_py in its callers, got: {python_caller_names:?}"
+    assert_isolation(
+        &fx.inner.graph,
+        &csharp_init_id,
+        "C#",
+        "caller_csharp",
+        &["caller_cpp", "caller_go", "caller_py", "caller_java"],
     );
-    assert!(
-        !python_caller_names
-            .iter()
-            .any(|s| s.ends_with(":caller_cpp")),
-        "Python init must NOT have the C++ caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {python_caller_names:?}"
-    );
-    assert!(
-        !python_caller_names
-            .iter()
-            .any(|s| s.ends_with(":caller_go")),
-        "Python init must NOT have the Go caller in its callers — \
-         (Language, name) SymbolIndex keying broke; got: {python_caller_names:?}"
+    assert_isolation(
+        &fx.inner.graph,
+        &java_init_id,
+        "Java",
+        "caller_java",
+        &["caller_cpp", "caller_go", "caller_py", "caller_csharp"],
     );
 }
 
