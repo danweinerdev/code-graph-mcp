@@ -37,9 +37,17 @@
 //! record the dotted path verbatim per Decision 7; no resolution
 //! against build metadata (`pom.xml`, `build.gradle`).
 //!
-//! Phase 3.5 will wire `extract_inheritance` (`superclass`,
-//! `super_interfaces`, `extends_interfaces`). `permits` clauses on
-//! sealed types are ignored per Decision 6.
+//! Phase 3.5 wires `extract_inheritance`, producing
+//! [`EdgeKind::Inherits`] edges for `superclass` (extends) and
+//! `super_interfaces` (implements) on `class_declaration` /
+//! `record_declaration` / `enum_declaration`, plus
+//! `extends_interfaces` on `interface_declaration`. Per Decision 2,
+//! `extends` and `implements` produce the same edge kind — agents
+//! disambiguate via the target Symbol's kind. Per Decision 9, generic
+//! parameter text is preserved verbatim in both the `from` field
+//! (`Foo<T>` for `class Foo<T>`) and the `to` field (`Bar<T>` for
+//! `extends Bar<T>`). Sealed types' `permits` clauses are intentionally
+//! ignored per Decision 6.
 //!
 //! # Default trait methods
 //!
@@ -141,8 +149,8 @@ pub struct JavaParser {
     /// Compiled import query (live in 3.4 — drives
     /// [`Self::extract_imports`]).
     import_query: Query,
-    /// Compiled inheritance query (wired in 3.5).
-    #[allow(dead_code)] // wired in Phase 3.5 (extract_inheritance)
+    /// Compiled inheritance query (live in 3.5 — drives
+    /// [`Self::extract_inheritance`]).
     inheritance_query: Query,
 }
 
@@ -155,8 +163,9 @@ impl JavaParser {
     /// Successful return is the gate that proves every query string in
     /// [`queries`] parses against tree-sitter-java 0.23.5. Phase 3.2
     /// filled [`DEFINITION_QUERIES`]; Phase 3.3 filled [`CALL_QUERIES`];
-    /// Phase 3.4 filled [`IMPORT_QUERIES`]. [`INHERITANCE_QUERIES`]
-    /// stays empty until 3.5 lands its extractor.
+    /// Phase 3.4 filled [`IMPORT_QUERIES`]; Phase 3.5 filled
+    /// [`INHERITANCE_QUERIES`]. All four query strings are live as of
+    /// 3.5.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_java::LANGUAGE.into();
 
@@ -188,15 +197,15 @@ impl JavaParser {
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
     /// Internal entry point for [`Self::parse_file`] (the trait method);
     /// kept crate-private so the public surface stays the trait method
-    /// while each per-extractor method (the upcoming 3.5 inheritance
-    /// extractor) can be tested via `parse_file` without exposing it.
-    /// Mirrors the Python/C# plugins' `parse_to_filegraph` indirection.
+    /// while each per-extractor method can be tested via `parse_file`
+    /// without exposing it. Mirrors the Python/C# plugins'
+    /// `parse_to_filegraph` indirection.
     ///
     /// Phase 3.2 wired `extract_definitions` into the pipeline; Phase 3.3
-    /// wired `extract_calls`; Phase 3.4 wires `extract_imports`. The
-    /// inheritance extractor (3.5) is added in the next phase. Until it
-    /// lands, `parse_file` produces Symbol records, `Calls` edges, and
-    /// `Includes` edges, but no `Inherits` edges.
+    /// wired `extract_calls`; Phase 3.4 wired `extract_imports`; Phase
+    /// 3.5 wires `extract_inheritance`. All four extractors are live —
+    /// `parse_file` produces Symbol records, `Calls` edges, `Includes`
+    /// edges, and `Inherits` edges from a single tree-sitter parse.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -212,6 +221,7 @@ impl JavaParser {
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_imports(root, content, &path_str, &mut fg);
+        self.extract_inheritance(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -641,6 +651,124 @@ impl JavaParser {
             }
         }
     }
+
+    /// Run the inheritance query and produce [`EdgeKind::Inherits`]
+    /// edges, one per base in each extends/implements clause. Mirrors
+    /// the C++/Rust/Go/Python/C# plugins' `extract_inheritance` for the
+    /// bare-name `from`-field contract (cite Phase 1 / Phase 5 of
+    /// RustRewrite and the C# 2.5 precedent at
+    /// `crates/code-graph-lang-csharp/src/lib.rs::extract_inheritance`).
+    ///
+    /// **Per-match shape.** The query returns one match *per base*:
+    ///
+    /// - `superclass: (superclass (_) @inherit.base)` on
+    ///   `class_declaration` — exactly one match per class (Java allows
+    ///   exactly one superclass).
+    /// - `interfaces: (super_interfaces (type_list (_) @inherit.base))` on
+    ///   `class_declaration` / `record_declaration` / `enum_declaration` —
+    ///   one match per implemented interface in the list.
+    /// - `(extends_interfaces (type_list (_) @inherit.base))` on
+    ///   `interface_declaration` — one match per extended interface.
+    ///
+    /// `class Foo extends Bar implements IBaz, IQux { }` produces three
+    /// matches (one for `Bar` via `superclass`, two for `IBaz` / `IQux`
+    /// via `super_interfaces`). Each carries the same `@inherit.def`
+    /// (the enclosing declaration) and a distinct `@inherit.base`. The
+    /// `inherit.base` capture is a single named child of the `superclass`
+    /// or `type_list` wrapper and can be any of:
+    ///
+    /// - `type_identifier` — bare type name (`Bar`, `IBaz`)
+    /// - `generic_type` — generic type (`Bar<T>`,
+    ///   `Comparable<Color>`)
+    /// - `scoped_type_identifier` — dotted type name (`Ns.Bar`,
+    ///   `java.util.List`)
+    ///
+    /// For every form the captured node's `utf8_text` is the verbatim
+    /// source text — generic argument lists and dotted qualifications
+    /// survive into the `to` field as written (Decision 9 — generic
+    /// params preserved verbatim).
+    ///
+    /// **`from`-field composition.** The `from` field is the bare
+    /// enclosing type name + the type-parameter list text (if any). For
+    /// `class Foo` → `from = "Foo"`; for `class Foo<T>` →
+    /// `from = "Foo<T>"`. See [`enclosing_type_name_with_generics`] for
+    /// the full rule and a documented known asymmetry with `Symbol.name`
+    /// (mirrors C# 2.5 and Rust).
+    ///
+    /// **Decision 2 — no edge-kind distinction.** All bases — whether
+    /// reached through `superclass` (`extends`), `super_interfaces`
+    /// (`implements`), or `extends_interfaces` (interface-extends-
+    /// interface) — produce the same [`EdgeKind::Inherits`]. The agent
+    /// disambiguates from the target Symbol's `kind` at query time.
+    ///
+    /// **Decision 6 — `permits` ignored.** Sealed types'
+    /// `permits: (permits (type_list ...))` field is NOT matched by any
+    /// query pattern. No `Inherits` edges are produced for it.
+    ///
+    /// **Constraint isolation.** Generic constraints inside the
+    /// `type_parameters:` clause (e.g. `class Foo<T extends Comparable<T>>`)
+    /// live inside `(type_parameter ... (type_bound ...))` — a sibling
+    /// of `superclass`, NOT a child. The query never sees constraint
+    /// types through the inheritance path. Pinned by
+    /// `generic_class_with_extends_constraint_does_not_pollute_to_field`.
+    ///
+    /// **Edge shape per match:**
+    /// - `from = bare_name + type_parameters` (e.g. `Foo<T>`)
+    /// - `to = base_node.utf8_text` (verbatim — `Bar<T>`, `Ns.Bar`, etc.)
+    /// - `kind = EdgeKind::Inherits`
+    /// - `file = path`
+    /// - `line = enclosing declaration's start_position().row + 1`
+    ///   (i.e., the class/interface/enum/record declaration line, not
+    ///   the base node's line — keeps the edge anchored at where the
+    ///   inheritance relationship is *declared*).
+    fn extract_inheritance(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.inheritance_query, root, content);
+        let cap_names = self.inheritance_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            let mut def_node: Option<Node<'_>> = None;
+            let mut base_node: Option<Node<'_>> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                match cap_name {
+                    "inherit.def" => def_node = Some(cap_node),
+                    "inherit.base" => base_node = Some(cap_node),
+                    // Defensive catch-all — guards against future grammar
+                    // revisions that might introduce additional capture
+                    // names under the same query patterns.
+                    _ => {}
+                }
+            }
+
+            let (Some(def), Some(base)) = (def_node, base_node) else {
+                continue;
+            };
+
+            let from = enclosing_type_name_with_generics(def, content);
+            if from.is_empty() {
+                continue;
+            }
+
+            let to = base.utf8_text(content).unwrap_or("").to_owned();
+            if to.is_empty() {
+                continue;
+            }
+
+            fg.edges.push(Edge {
+                from,
+                to,
+                kind: EdgeKind::Inherits,
+                file: path.to_owned(),
+                line: def.start_position().row as u32 + 1,
+            });
+        }
+    }
 }
 
 impl LanguagePlugin for JavaParser {
@@ -653,10 +781,8 @@ impl LanguagePlugin for JavaParser {
     }
 
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
-    ///
-    /// Phase 3.2 wired the definition extractor; Phase 3.3 wired the
-    /// call extractor; Phase 3.4 wires the import extractor. Phase 3.5
-    /// will wire the inheritance extractor.
+    /// All four extractors (definitions, calls, imports, inheritance)
+    /// are live as of Phase 3.5.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -721,6 +847,66 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
         current = n.parent();
     }
     String::new()
+}
+
+/// Return the bare enclosing-type name *with* the generic parameter
+/// list text appended (when present), suitable for the `from` field of
+/// an `Inherits` edge. For `class Foo` returns `"Foo"`; for
+/// `class Foo<T>` returns `"Foo<T>"`; for
+/// `interface I<T, U>` returns `"I<T, U>"`.
+///
+/// `def_node` must be one of `class_declaration`, `interface_declaration`,
+/// `enum_declaration`, or `record_declaration`. Other node kinds return
+/// the empty string defensively.
+///
+/// Decision 9 (generic parameter text preserved verbatim) — and the
+/// Phase 1 / Phase 5 bare-name `from`-field rule — are both enforced
+/// here. The result is the bare type name, EXCEPT for generic types
+/// where the `type_parameters` text is appended verbatim.
+///
+/// **Known asymmetry with `Symbol.name`** (matches the Rust plugin's
+/// pre-existing behavior and the C# 2.5 precedent at
+/// `crates/code-graph-lang-csharp/src/lib.rs::enclosing_type_name_with_generics` —
+/// accepted as a documented limitation): `extract_definitions` stores
+/// `Symbol.name` as the bare identifier (`"Foo"` for `class Foo<T>`),
+/// but the `from` field of an `Inherits` edge produced here is the
+/// generics-preserving form (`"Foo<T>"`). `Graph::class_hierarchy` at
+/// `crates/code-graph-graph/src/algorithms.rs` looks up symbols by
+/// `Symbol.name` then walks `adj.get(name)` — for a generic class
+/// queried as `class_hierarchy("Foo")` the symbol is found but the
+/// adjacency lookup misses (edges are keyed under `"Foo<T>"`).
+/// Generic-class hierarchy walks are effectively unsupported by the
+/// graph layer in its current form. Same limitation exists in the
+/// Rust and C# plugins; the trade-off is documented in Phase 4.4's
+/// CLAUDE.md "Java Parser Limitations" section.
+///
+/// In tree-sitter-java 0.23.5 the generic parameter list is the named
+/// child of kind `type_parameters` (reached via the `type_parameters:`
+/// field on every declaration kind that admits generics —
+/// `class_declaration`, `interface_declaration`, `record_declaration`).
+/// `enum_declaration` does not accept generics in Java; the field is
+/// simply absent and the function returns the bare name.
+fn enclosing_type_name_with_generics(def_node: Node<'_>, content: &[u8]) -> String {
+    let name_node = match def_node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    let bare = name_node.utf8_text(content).unwrap_or("").to_owned();
+    if bare.is_empty() {
+        return bare;
+    }
+
+    let mut cursor = def_node.walk();
+    for child in def_node.children(&mut cursor) {
+        if child.kind() == "type_parameters" {
+            let tp = child.utf8_text(content).unwrap_or("");
+            if !tp.is_empty() {
+                return format!("{bare}{tp}");
+            }
+        }
+    }
+
+    bare
 }
 
 /// Return the kind of the **first enclosing named-type ancestor** of
@@ -1012,8 +1198,8 @@ fn make_symbol(
 mod tests {
     //! Phase 3.1 structural smoke tests + Phase 3.2 definition-extraction
     //! coverage + Phase 3.3 call-extraction coverage + Phase 3.4
-    //! import-extraction coverage. Behavioral coverage of inheritance
-    //! extraction lands in 3.5.
+    //! import-extraction coverage + Phase 3.5 inheritance-extraction
+    //! coverage. All four extractors are live.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
@@ -2368,6 +2554,374 @@ import com.baz.C;
     fn empty_file_produces_no_includes_edges() {
         let fg = parse("");
         let edges = includes(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.5 — inheritance extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Inherits` edges of `fg`. Mirrors the `calls`
+    /// and `includes` helpers above so each phase's assertions exercise
+    /// only its own edge category. (Same pattern as the C# 2.5 test
+    /// module.)
+    fn inherits(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect()
+    }
+
+    #[test]
+    fn single_extends_produces_one_inherits_edge() {
+        // `class Foo extends Bar { }` → 1 Inherits edge with from="Foo",
+        // to="Bar". The bare-name `from`-field rule (Phase 1 / Phase 5
+        // of RustRewrite, reaffirmed by Decision 9 in this design) is
+        // load-bearing — see `crates/code-graph-graph/src/algorithms.rs`,
+        // which looks up classes by `Symbol.name`.
+        let fg = parse_at("class Foo extends Bar { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(e.from, "Foo");
+        assert_eq!(e.to, "Bar");
+        assert_eq!(e.kind, EdgeKind::Inherits);
+    }
+
+    #[test]
+    fn multiple_implements_produces_one_edge_per_interface() {
+        // `class Foo implements IBaz, IQux { }` → 2 Inherits edges from
+        // the `super_interfaces > type_list > (_)` wildcard. The
+        // ordering inside the type_list is preserved by tree-sitter but
+        // not contractually asserted here — set membership is what
+        // matters.
+        let fg = parse_at("class Foo implements IBaz, IQux { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected 2 Inherits edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        for e in &edges {
+            assert_eq!(e.from, "Foo");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"IBaz"), "missing IBaz; got {:?}", tos);
+        assert!(tos.contains(&"IQux"), "missing IQux; got {:?}", tos);
+    }
+
+    #[test]
+    fn extends_and_implements_combined_produce_three_edges() {
+        // `class Foo extends Bar implements IBaz, IQux { }` → 3 Inherits
+        // edges, all from="Foo". One comes from `superclass` (`Bar`),
+        // two from `super_interfaces` (`IBaz`, `IQux`). The plan brief's
+        // headline example.
+        let fg = parse_at(
+            "class Foo extends Bar implements IBaz, IQux { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            3,
+            "expected 3 Inherits edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        for e in &edges {
+            assert_eq!(e.from, "Foo");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"Bar"), "missing Bar; got {:?}", tos);
+        assert!(tos.contains(&"IBaz"), "missing IBaz; got {:?}", tos);
+        assert!(tos.contains(&"IQux"), "missing IQux; got {:?}", tos);
+    }
+
+    #[test]
+    fn generic_class_and_base_preserve_type_params() {
+        // `class Foo<T> extends Bar<T> { }` → 1 edge from="Foo<T>"
+        // to="Bar<T>". Generic params survive in BOTH from and to per
+        // Decision 9 (preserved verbatim, matching Rust's rule and the
+        // C# 2.5 precedent — NOT Go's strip rule).
+        //
+        // **Known asymmetry pinned here**: while edge.from is "Foo<T>"
+        // (generics preserved), Symbol.name for the same class is the
+        // bare "Foo" (extract_definitions captures only the identifier
+        // child). This means Graph::class_hierarchy at
+        // crates/code-graph-graph/src/algorithms.rs cannot walk
+        // inheritance for generic classes — it looks up symbols by
+        // Symbol.name then walks adj.get(name), but the adjacency map
+        // is keyed under "Foo<T>". Same limitation exists in the Rust
+        // and C# plugins; the accepted Decision 9 trade-off is
+        // documented in Phase 4.4's CLAUDE.md "Java Parser Limitations"
+        // section.
+        let fg = parse_at("class Foo<T> extends Bar<T> { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(
+            e.from, "Foo<T>",
+            "from must include generic param list verbatim"
+        );
+        assert_eq!(
+            e.to, "Bar<T>",
+            "to must include generic argument list verbatim"
+        );
+
+        // Side-by-side assertion making the asymmetry self-documenting
+        // (mirrors C# 2.5's `generic_class_and_base_preserve_type_params`
+        // test): Symbol.name is bare "Foo" (not "Foo<T>"). A future
+        // refactor that changes extract_definitions to include generics
+        // in Symbol.name would close the class_hierarchy gap but would
+        // need to update this assertion at the same time.
+        let s = sym(&fg, "Foo");
+        assert_eq!(
+            s.kind,
+            SymbolKind::Class,
+            "Symbol.name for class Foo<T> is bare 'Foo' — \
+             the from/Symbol.name asymmetry is the documented limitation"
+        );
+    }
+
+    #[test]
+    fn generic_class_with_extends_constraint_does_not_pollute_to_field() {
+        // `class Foo<T extends Comparable<T>> extends Bar<T> { }` — the
+        // `extends Comparable<T>` is a CONSTRAINT inside the
+        // `type_parameters > type_parameter > type_bound` sub-tree, NOT
+        // a sibling of `superclass`. The query never sees `Comparable<T>`
+        // through the inheritance path. Exactly one Inherits edge (to
+        // `Bar<T>`); the constraint type is not double-counted. Mirrors
+        // C# 2.5's `generic_class_with_where_constraints_does_not_pollute_to_field`.
+        //
+        // The `from` field is `"Foo<T>"` (NOT `"Foo<T extends Comparable<T>>"`)
+        // because [`enclosing_type_name_with_generics`] preserves the
+        // verbatim `type_parameters` text — which IS
+        // `"<T extends Comparable<T>>"` — so this assertion documents
+        // the inherent trade-off: the bound text rides along inside
+        // `type_parameters`. The contract Decision 9 makes is
+        // "preserve verbatim", which the helper honors faithfully.
+        // Pin the actual observed text so any future grammar change
+        // surfaces here rather than silently shifting the contract.
+        let fg = parse_at(
+            "class Foo<T extends Comparable<T>> extends Bar<T> { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "constraint types must not leak into Inherits edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            edges[0].from, "Foo<T extends Comparable<T>>",
+            "from preserves type_parameters verbatim (Decision 9) — the bound \
+             text rides along because it lives inside the same syntactic node"
+        );
+        assert_eq!(
+            edges[0].to, "Bar<T>",
+            "to must reflect only the superclass clause — the constraint \
+             type must NOT appear here"
+        );
+    }
+
+    #[test]
+    fn qualified_base_preserves_dotted_path() {
+        // `class Foo extends Ns.Bar { }` → 1 edge to="Ns.Bar" (verbatim
+        // scoped_type_identifier text; no resolution).
+        let fg = parse_at("class Foo extends Ns.Bar { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Foo");
+        assert_eq!(edges[0].to, "Ns.Bar");
+    }
+
+    #[test]
+    fn interface_extending_interfaces_produces_inherits_edges() {
+        // `interface I extends J, K { }` → 2 Inherits edges from="I".
+        // Interfaces use the `extends_interfaces` node (unnamed-field
+        // child of `interface_declaration`) — a different node kind
+        // from `super_interfaces` on classes. Decision 2: interface
+        // inheritance uses the same `Inherits` edge kind.
+        let fg = parse_at("interface I extends J, K { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", edges);
+        for e in &edges {
+            assert_eq!(e.from, "I");
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"J"));
+        assert!(tos.contains(&"K"));
+    }
+
+    #[test]
+    fn record_implementing_interface_produces_inherits_edge() {
+        // `record User(String name) implements Foo { }` → 1 edge
+        // from="User" to="Foo". Records reach the inheritance extractor
+        // through the `record_declaration` arm in INHERITANCE_QUERIES.
+        // Records can ONLY implement interfaces — never extend a class —
+        // so the only base-bearing clause is `interfaces:`.
+        let fg = parse_at(
+            "record User(String name) implements Foo { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "User");
+        assert_eq!(edges[0].to, "Foo");
+    }
+
+    #[test]
+    fn enum_implementing_interface_produces_inherits_edge() {
+        // `enum Color implements Comparable<Color> { }` → 1 edge
+        // from="Color" to="Comparable<Color>". Enums can ONLY implement
+        // interfaces — never extend a class — so the only base-bearing
+        // clause is `interfaces:`. The base is a `generic_type` node;
+        // its verbatim text preserves the type argument.
+        let fg = parse_at(
+            "enum Color implements Comparable<Color> { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Color");
+        assert_eq!(edges[0].to, "Comparable<Color>");
+    }
+
+    #[test]
+    fn sealed_interface_permits_clause_produces_no_inherits_edges() {
+        // `sealed interface Shape permits Circle, Square { }` — the
+        // `permits:` field is a SIBLING of `extends_interfaces`, not a
+        // child. Decision 6: the `permits` clause produces NO edges.
+        // No `extends_interfaces` clause is present here, so the total
+        // count is zero.
+        let fg = parse_at(
+            "sealed interface Shape permits Circle, Square { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert!(
+            edges.is_empty(),
+            "permits clause must produce zero inheritance edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sealed_class_extends_plus_permits_only_records_extends_edge() {
+        // `sealed class Animal extends LivingThing permits Dog, Cat { }`
+        // — the `superclass:` field produces 1 edge (`LivingThing`); the
+        // `permits:` field produces 0 edges (Decision 6). Net: exactly
+        // one Inherits edge.
+        let fg = parse_at(
+            "sealed class Animal extends LivingThing permits Dog, Cat { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "permits clause must not contribute edges; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(edges[0].from, "Animal");
+        assert_eq!(edges[0].to, "LivingThing");
+    }
+
+    #[test]
+    fn class_without_extends_or_implements_produces_no_inherits_edges() {
+        // `class Foo { }` → 0 Inherits edges. No `superclass`, no
+        // `super_interfaces`; the query produces zero matches.
+        let fg = parse_at("class Foo { }\n", "/p/Test.java");
+        let edges = inherits(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    #[test]
+    fn inherits_edge_carries_file_and_line() {
+        // The edge.line is anchored at the *enclosing declaration*
+        // (where the inheritance is declared), NOT at the base node.
+        // Pin: with a leading newline the `class` keyword lands on
+        // line 2; the edge's line must equal 2. Mirrors C# 2.5's
+        // `inherits_edge_carries_file_and_line`.
+        let fg = parse_at("\nclass Foo extends Bar { }\n", "/abs/Foo.java");
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        let e = edges[0];
+        assert_eq!(e.file, "/abs/Foo.java", "file must equal the path");
+        assert_eq!(
+            e.line, 2,
+            "line must be the enclosing declaration's line (2), not the base's line"
+        );
+    }
+
+    #[test]
+    fn decision_2_no_edge_kind_distinction_between_extends_and_implements() {
+        // Load-bearing Decision-2 pin: `class Foo extends Bar implements
+        // IBaz, IQux { }` produces 3 edges, ALL with `EdgeKind::Inherits`.
+        // Even though Java's grammar syntactically distinguishes `extends`
+        // (the `superclass` field) from `implements` (the
+        // `super_interfaces` field), the plugin deliberately collapses
+        // both into one edge kind. Agents disambiguate from the target
+        // Symbol's `kind` at query time, not from a separate
+        // `Implements` edge.
+        let fg = parse_at(
+            "class Foo extends Bar implements IBaz, IQux { }\n",
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 3);
+        for e in &edges {
+            assert_eq!(
+                e.kind,
+                EdgeKind::Inherits,
+                "extends and implements must produce the same EdgeKind"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_class_with_base_records_inner_class_as_from() {
+        // A nested class with a base list records the *inner* class's
+        // name as `from`, not the outer. The query anchors on the
+        // immediate `class_declaration` ancestor of the inheritance
+        // clause. Mirrors C# 2.5's nested-class test.
+        let fg = parse_at(
+            r#"
+class Outer {
+    class Inner extends Base { }
+}
+"#,
+            "/p/Test.java",
+        );
+        let edges = inherits(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].from, "Inner");
+        assert_eq!(edges[0].to, "Base");
+    }
+
+    #[test]
+    fn empty_file_produces_no_inherits_edges() {
+        let fg = parse("");
+        let edges = inherits(&fg);
         assert!(edges.is_empty(), "got: {:?}", edges);
     }
 }

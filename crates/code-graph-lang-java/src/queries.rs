@@ -4,10 +4,9 @@
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
 //! Phase status: Phase 3.2 filled [`DEFINITION_QUERIES`]; Phase 3.3
-//! filled [`CALL_QUERIES`]; Phase 3.4 fills [`IMPORT_QUERIES`].
-//! [`INHERITANCE_QUERIES`] stays empty until 3.5. Empty query strings
-//! compile to a no-op `Query` against any grammar, so the structural
-//! smoke test in `lib.rs` passes against the still-empty set.
+//! filled [`CALL_QUERIES`]; Phase 3.4 filled [`IMPORT_QUERIES`]; Phase
+//! 3.5 filled [`INHERITANCE_QUERIES`]. All four query constants are
+//! live — the Java plugin's query surface is complete.
 //!
 //! Naming follows the established `*_QUERIES` convention shared with
 //! the C++/Rust/Go/Python/C# plugins (plural form, `pub(crate)`).
@@ -349,7 +348,107 @@ pub(crate) const IMPORT_QUERIES: &str = r#"
 (import_declaration) @import.dir
 "#;
 
-/// Inheritance queries: `superclass` (extends) and `super_interfaces`
-/// (implements) on classes; `extends_interfaces` on interfaces. Sealed
-/// types' `permits` clauses intentionally NOT matched. Filled in 3.5.
-pub(crate) const INHERITANCE_QUERIES: &str = "";
+/// Query for `extends` (`superclass`) and `implements` (`super_interfaces`)
+/// clauses on classes/records/enums, plus `extends` (`extends_interfaces`)
+/// clauses on interfaces. Java syntactically distinguishes `extends`
+/// (single-superclass) from `implements` (multi-interface), but Decision 2
+/// folds both into the same [`EdgeKind::Inherits`] — there is no separate
+/// `Implements` edge kind. Sealed types' `permits` clauses are intentionally
+/// NOT matched (Decision 6).
+///
+/// Per-form shape (verified against tree-sitter-java 0.23.5 via the
+/// scratch-crate probe at `/tmp/java-inherit-probe`):
+///
+/// - `class Foo extends Bar { }` → `(class_declaration ... superclass:
+///   (superclass (type_identifier)) ...)`. The `superclass:` field's
+///   ONLY named child is the base (no `type_list` wrapper); Java allows
+///   exactly one superclass.
+/// - `class Foo extends Bar implements IBaz, IQux { }` → adds a sibling
+///   `interfaces: (super_interfaces (type_list (type_identifier)
+///   (type_identifier)))`. The `interfaces:` field's named child is a
+///   `super_interfaces` NODE; the multi-base list lives inside a
+///   `type_list` named child.
+/// - `class Foo<T> extends Bar<T> { }` → the base is a `generic_type`
+///   under `superclass`; `utf8_text` is `"Bar<T>"` (generic argument list
+///   preserved verbatim per Decision 9).
+/// - `class Foo<T extends Comparable<T>> extends Bar<T> { }` — the
+///   `extends Comparable<T>` is a CONSTRAINT inside the
+///   `type_parameters:` field's `(type_parameter ... (type_bound ...))`
+///   sub-tree, NOT a sibling of `superclass`. The query never sees
+///   `Comparable<T>` through that path. Pinned by
+///   `generic_class_with_extends_constraint_does_not_pollute_to_field`.
+/// - `class Foo extends Ns.Bar { }` → base is a `scoped_type_identifier`;
+///   `utf8_text` is `"Ns.Bar"`.
+/// - `interface I extends J, K { }` → `(interface_declaration ...
+///   (extends_interfaces (type_list (type_identifier) (type_identifier)))
+///   ...)`. The `extends_interfaces` node is an UNNAMED-FIELD child of
+///   `interface_declaration` (no `interfaces:` field, no `superclass:`
+///   field — interfaces use a different node kind for their extends
+///   clause).
+/// - `record User(String name) implements Foo { }` → same shape as
+///   classes: `(record_declaration ... interfaces: (super_interfaces
+///   (type_list (type_identifier))) ...)`. Records can ONLY implement
+///   interfaces — `record User(...) extends Base { }` is a syntax error
+///   that tree-sitter recovers from as an ERROR node, producing zero
+///   inheritance matches for the malformed clause.
+/// - `enum Color implements Comparable<Color> { }` → same shape:
+///   `(enum_declaration ... interfaces: (super_interfaces (type_list
+///   (generic_type ...))) ...)`. Enums can ONLY implement interfaces
+///   (they cannot extend a superclass — they implicitly extend `Enum`
+///   and tree-sitter rejects an explicit `extends`).
+/// - `sealed interface Shape permits Circle, Square { }` → the
+///   `permits:` field is a SIBLING of `extends_interfaces`, NOT a child
+///   of it. Decision 6 mandates that `permits` produces no edges; the
+///   query simply doesn't reach `permits` nodes (no matching pattern).
+/// - `class Foo { }` → no `superclass`, no `super_interfaces`, no
+///   `extends_interfaces`; the query produces zero matches.
+///
+/// **Capture strategy.** Each base produces one `@inherit.base` capture
+/// paired with the enclosing declaration's `@inherit.def`. We use the
+/// single-child shape for `superclass` (no `type_list` wrapper) and the
+/// wildcard `(type_list (_) @inherit.base)` for the multi-base
+/// `super_interfaces` / `extends_interfaces` shapes — mirroring the
+/// C# plugin's `(base_list (_) @inherit.base)` pattern, where `(_)`
+/// matches `type_identifier`, `generic_type`, `scoped_type_identifier`,
+/// or any future grammar variant uniformly.
+///
+/// Per Decision 2: no edge-kind distinction between `extends` and
+/// `implements`. The agent disambiguates from the target Symbol's kind
+/// (`Class` vs `Interface`) at query time.
+///
+/// Per Decision 9: the `from` field in the emitted `Inherits` edge is
+/// the bare type name including generic parameter text verbatim
+/// (`Foo` for `class Foo`, `Foo<T>` for `class Foo<T>`). The contract
+/// is consumed by `Graph::class_hierarchy` in
+/// `crates/code-graph-graph/src/algorithms.rs` — the walker looks up
+/// classes by `Symbol.name` (bare name), not by `symbol_id`. The
+/// extractor in `lib.rs::extract_inheritance` composes the enclosing
+/// type's name + adjacent `type_parameters` text to satisfy this
+/// contract; cite the C# 2.5 precedent in
+/// `crates/code-graph-lang-csharp/src/lib.rs::enclosing_type_name_with_generics`.
+pub(crate) const INHERITANCE_QUERIES: &str = r#"
+; class Foo extends Bar { }  /  record User(...) extends ? — n/a (records can't extend)
+; The `superclass` field holds a single named child (no type_list wrapper);
+; Java allows at most one superclass.
+(class_declaration
+  superclass: (superclass (_) @inherit.base)) @inherit.def
+
+; class Foo implements IBaz, IQux { } / record User(...) implements Foo { } /
+; enum Color implements Comparable<Color> { }
+; All three declaration kinds use the same `interfaces: (super_interfaces
+; (type_list ...))` shape per the 3.5 probe.
+(class_declaration
+  interfaces: (super_interfaces (type_list (_) @inherit.base))) @inherit.def
+
+(record_declaration
+  interfaces: (super_interfaces (type_list (_) @inherit.base))) @inherit.def
+
+(enum_declaration
+  interfaces: (super_interfaces (type_list (_) @inherit.base))) @inherit.def
+
+; interface I extends J, K { }
+; `extends_interfaces` is an unnamed-field child of interface_declaration
+; (no field name); its `type_list` child holds the bases.
+(interface_declaration
+  (extends_interfaces (type_list (_) @inherit.base))) @inherit.def
+"#;
