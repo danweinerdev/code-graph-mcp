@@ -3,11 +3,12 @@
 //! Validated against tree-sitter-c-sharp v0.23.5 — `CSharpParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3 fills
-//! [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and [`INHERITANCE_QUERIES`] stay
-//! empty until 2.4/2.5. Empty query strings compile to a no-op `Query`
-//! against any grammar, so the structural smoke test in `lib.rs` passes
-//! against the empty set for the still-empty queries.
+//! Phase status: Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
+//! filled [`CALL_QUERIES`]; Phase 2.4 fills [`IMPORT_QUERIES`].
+//! [`INHERITANCE_QUERIES`] stays empty until 2.5. Empty query strings
+//! compile to a no-op `Query` against any grammar, so the structural
+//! smoke test in `lib.rs` passes against the empty set for the
+//! still-empty queries.
 //!
 //! ## C#-specific node-kind notes (tree-sitter-c-sharp 0.23.5)
 //!
@@ -245,8 +246,71 @@ pub(crate) const CALL_QUERIES: &str = r#"
 "#;
 
 /// Query for `using_directive` in all forms (plain, `using static`,
-/// alias, `global using`). Filled in Phase 2.4.
-pub(crate) const IMPORT_QUERIES: &str = "";
+/// alias, `global using`, and any combination of those modifiers).
+///
+/// All five C# `using` forms parse to a single `using_directive` node in
+/// tree-sitter-c-sharp 0.23.5 — there is NO separate
+/// `global_using_directive` / `static_using_directive` node. The
+/// modifier keywords (`global`, `static`) and the alias `=` token are
+/// anonymous (non-named) children; only the path nodes and the alias
+/// name are named, named children.
+///
+/// Per-form shape (verified against tree-sitter-c-sharp 0.23.5 via
+/// scratch-crate probe):
+///
+/// - `using System;` → `(using_directive (identifier))` — single
+///   `identifier` named child holding the path.
+/// - `using System.Collections.Generic;` → `(using_directive
+///   (qualified_name ...))` — single `qualified_name` named child
+///   holding the dotted path verbatim.
+/// - `using static System.Console;` → `(using_directive
+///   (qualified_name ...))` — anonymous `static` keyword child precedes
+///   the path. Same named-child shape as the dotted form.
+/// - `using FooAlias = Some.Long.Type.Name;` → `(using_directive
+///   name: (identifier) (qualified_name ...))` — has a `name:` field
+///   holding the alias identifier AND a separate unnamed-field named
+///   child holding the target path. The `=` token is anonymous.
+/// - `global using System.Linq;` → `(using_directive
+///   (qualified_name ...))` — anonymous `global` keyword child
+///   precedes `using`. Same named-child shape as plain dotted form.
+///
+/// Combination forms (`global using static X.Y;`, `global using A =
+/// X.Y;`) parse to the same `using_directive` node and follow the same
+/// rules. The `using` keyword inside a namespace block (`namespace Foo
+/// { using Bar; ... }`) ALSO parses as `using_directive` — the query
+/// matches it because tree-sitter queries walk the entire tree by
+/// default.
+///
+/// **Single-capture strategy.** We capture the `using_directive` node
+/// itself and recover the path text at extraction time. Encoding the
+/// path-vs-alias logic in the query would require two patterns with a
+/// `!name` negation predicate to distinguish the alias-present from the
+/// alias-absent case; tree-sitter-c-sharp 0.23.5 does not assign a
+/// stable field name to the path in either form (the path is an
+/// anonymous named child in both), so the extractor's identifier /
+/// qualified_name traversal is the load-bearing path extraction
+/// regardless. One capture name + Rust-side extraction is the simplest
+/// design that covers all five forms without query duplication.
+///
+/// Per Decision 7: the path is recorded verbatim — no resolution
+/// against build metadata. `using static System.Console;` records
+/// `to = "System.Console"`, NOT `to = "static System.Console"`;
+/// `using FooAlias = Some.Long.Type.Name;` records
+/// `to = "Some.Long.Type.Name"`, NOT `to = "FooAlias"`. The default
+/// `resolve_include` returns `None` for these dotted strings — they are
+/// not filesystem paths — so the wire format records the namespace
+/// path verbatim and the engine never accidentally resolves it.
+pub(crate) const IMPORT_QUERIES: &str = r#"
+; using System; / using System.X.Y; / using static System.Console; /
+; using FooAlias = Some.Long.Type.Name; / global using System.Linq; /
+; global using static System.Math; / global using A = X.Y; /
+; and any combination of those modifiers. tree-sitter-c-sharp 0.23.5
+; produces a single `using_directive` node for every form; modifier
+; keywords (`global`, `static`) and the alias `=` are anonymous
+; children. The extractor recovers the dotted path from the named
+; identifier / qualified_name children at extraction time.
+(using_directive) @using.dir
+"#;
 
 /// Query for `base_list` on classes, structs, and interfaces. C# does not
 /// syntactically distinguish class extension from interface implementation

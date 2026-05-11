@@ -31,8 +31,15 @@
 //! `nameof(X)` parses as an `invocation_expression` in this grammar but
 //! is filtered as a compile-time name operator, not a call.
 //!
-//! Phase 2.4 will wire `extract_imports` (`using`, `using static`,
-//! `using A = X.Y`, `global using`, `using` inside namespace blocks).
+//! Phase 2.4 wires `extract_imports`, producing [`EdgeKind::Includes`]
+//! edges for plain (`using System;`), dotted (`using
+//! System.Collections.Generic;`), `using static` (the `static` modifier
+//! is dropped from `to`), `using A = X.Y` (the alias is dropped; the
+//! target path is preserved), and `global using` (the `global` modifier
+//! is dropped) forms. The `using` directive inside a namespace block
+//! (`namespace Foo { using Bar; ... }`) is captured because tree-sitter
+//! queries walk the entire tree by default. Per Decision 7 the path is
+//! recorded verbatim — no resolution against build metadata.
 //!
 //! Phase 2.5 will wire `extract_inheritance` (`base_list` for classes,
 //! structs, and interfaces — both class extension and interface
@@ -141,8 +148,8 @@ pub struct CSharpParser {
     /// Compiled call query (live in 2.3 — drives
     /// [`Self::extract_calls`]).
     call_query: Query,
-    /// Compiled import query (wired in 2.4).
-    #[allow(dead_code)] // wired in Phase 2.4 (extract_imports)
+    /// Compiled import query (live in 2.4 — drives
+    /// [`Self::extract_imports`]).
     import_query: Query,
     /// Compiled inheritance query (wired in 2.5).
     #[allow(dead_code)] // wired in Phase 2.5 (extract_inheritance)
@@ -158,9 +165,9 @@ impl CSharpParser {
     /// Successful return is the Phase 2.1 acceptance gate that proves
     /// every query string in [`queries`] parses against tree-sitter-c-
     /// sharp 0.23.5. Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
-    /// filled [`CALL_QUERIES`]. [`IMPORT_QUERIES`] and
-    /// [`INHERITANCE_QUERIES`] remain empty until 2.4/2.5 land their
-    /// respective extractors.
+    /// filled [`CALL_QUERIES`]; Phase 2.4 filled [`IMPORT_QUERIES`].
+    /// [`INHERITANCE_QUERIES`] remains empty until 2.5 lands its
+    /// extractor.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_c_sharp::LANGUAGE.into();
 
@@ -196,11 +203,11 @@ impl CSharpParser {
     /// extractors) can be tested via `parse_file` without exposing them.
     /// Mirrors the Python plugin's `parse_to_filegraph` indirection.
     ///
-    /// Phase 2.2 wired `extract_definitions`; Phase 2.3 wires
-    /// `extract_calls`. Phases 2.4 and 2.5 will add the import and
-    /// inheritance extractors. Until those land, `parse_file` produces
-    /// Symbol records and `Calls` edges only — zero `Includes` /
-    /// `Inherits` edges.
+    /// Phase 2.2 wired `extract_definitions`; Phase 2.3 wired
+    /// `extract_calls`; Phase 2.4 wires `extract_imports`. Phase 2.5
+    /// will add the inheritance extractor. Until 2.5 lands, `parse_file`
+    /// produces Symbol records, `Calls` edges, and `Includes` edges —
+    /// zero `Inherits` edges.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
         let root = tree.root_node();
@@ -215,6 +222,7 @@ impl CSharpParser {
 
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
+        self.extract_imports(root, content, &path_str, &mut fg);
 
         Ok(fg)
     }
@@ -596,6 +604,90 @@ impl CSharpParser {
             }
         }
     }
+
+    /// Run the import query and produce [`EdgeKind::Includes`] edges,
+    /// one per `using_directive`. Mirrors the C++/Rust/Go/Python plugins'
+    /// import extraction conventions: the edge `from` is the source-file
+    /// path (NOT a symbol ID); the edge `to` is the dotted namespace
+    /// path *as written* in the source, per Decision 7.
+    ///
+    /// **Modifier handling** (verified against tree-sitter-c-sharp
+    /// 0.23.5 via scratch-crate probe):
+    /// - `using System;` → `to = "System"`.
+    /// - `using System.Collections.Generic;` → `to =
+    ///   "System.Collections.Generic"` (the `qualified_name` text is
+    ///   preserved verbatim).
+    /// - `using static System.Console;` → `to = "System.Console"`. The
+    ///   `static` keyword is an anonymous child of `using_directive` and
+    ///   is excluded from the path; the path is the named identifier /
+    ///   qualified_name child.
+    /// - `using FooAlias = Some.Long.Type.Name;` → `to =
+    ///   "Some.Long.Type.Name"`. The alias name is held in the `name:`
+    ///   field of `using_directive`; the target path is the named child
+    ///   that is NOT the `name:` field (after the anonymous `=`
+    ///   keyword). We capture the latter — same rule as Python `import
+    ///   foo as f` (path captured; alias dropped) and Go aliased
+    ///   imports.
+    /// - `global using System.Linq;` → `to = "System.Linq"`. The
+    ///   `global` keyword is an anonymous child preceding `using` and
+    ///   is excluded.
+    /// - Combination forms (`global using static X.Y;`, `global using A
+    ///   = X.Y;`) parse to the same `using_directive` node and follow
+    ///   the same rules — modifiers are anonymous, path is the named
+    ///   non-`name:` child.
+    ///
+    /// **Namespace-scoped usings.** `namespace Foo { using Bar; ... }`
+    /// parses with the `using_directive` as a child of the namespace's
+    /// `declaration_list`. Tree-sitter queries walk the entire tree, so
+    /// the `(using_directive) @using.dir` pattern matches both top-level
+    /// and namespace-scoped usings. There is intentionally no
+    /// module-top-level filter (in contrast to Python's
+    /// `is_module_top_level` filter for conditional imports) — both
+    /// kinds of C# `using` produce identical dependency information.
+    ///
+    /// **Line anchoring.** The line is anchored at the
+    /// `using_directive` node itself (`start_position().row + 1`),
+    /// matching the convention every other plugin uses for import-style
+    /// statements.
+    ///
+    /// **Resolution.** `CSharpParser` does NOT override
+    /// `resolve_include`. The default basename-match resolver returns
+    /// `None` for these dotted namespace paths (they are not filesystem
+    /// paths), mirroring Python — see the crate-level docstring for the
+    /// rationale.
+    fn extract_imports(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.import_query, root, content);
+        let cap_names = self.import_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                let cap_name = capture_name_for_index(cap_names, capture.index);
+                if cap_name != "using.dir" {
+                    continue;
+                }
+
+                let Some(path_text) = using_directive_path(cap_node, content) else {
+                    continue;
+                };
+                if path_text.is_empty() {
+                    continue;
+                }
+
+                fg.edges.push(Edge {
+                    from: path.to_owned(),
+                    to: path_text,
+                    kind: EdgeKind::Includes,
+                    file: path.to_owned(),
+                    line: cap_node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
 }
 
 impl LanguagePlugin for CSharpParser {
@@ -610,8 +702,8 @@ impl LanguagePlugin for CSharpParser {
     /// Parse `content` (UTF-8 bytes) as C# and produce a [`FileGraph`].
     ///
     /// Phase 2.2 wires the definition extractor; Phase 2.3 wires the
-    /// call extractor. Phases 2.4 and 2.5 add the import and inheritance
-    /// extractors.
+    /// call extractor; Phase 2.4 wires the import extractor. Phase 2.5
+    /// adds the inheritance extractor.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -726,6 +818,49 @@ fn enclosing_namespace(def_node: Node<'_>, content: &[u8]) -> String {
     }
 
     String::new()
+}
+
+/// Return the dotted namespace path written in a `using_directive`
+/// node, or `None` if the directive has no recoverable path (defensive
+/// — well-formed C# always has one named path child).
+///
+/// Rules (per the tree-sitter-c-sharp 0.23.5 probe at Phase 2.4):
+/// - **Plain / static / global / static+global** (no `name:` field):
+///   the path is the single named child whose kind is either
+///   `identifier` (single-segment path) or `qualified_name` (dotted).
+///   Modifier keywords (`global`, `static`) are anonymous children and
+///   are skipped.
+/// - **Alias** (with `name:` field — `using A = X.Y;` or `global using A
+///   = X.Y;`): the path is the first named child whose kind is
+///   `identifier` or `qualified_name` AND that is NOT the
+///   `name:`-field child. The alias name is held in the `name:` field
+///   and is intentionally dropped, mirroring Python `import foo as f` →
+///   `to = "foo"`.
+///
+/// The returned text is the verbatim source text of the path node, so
+/// `using System.Collections.Generic;` returns `Some("System.Collections.Generic")`
+/// (the whole `qualified_name`'s text) and the dotted structure is
+/// preserved without re-walking the qualified_name children.
+fn using_directive_path(directive: Node<'_>, content: &[u8]) -> Option<String> {
+    // If `name:` is set, this is an alias form. The path is the first
+    // named identifier/qualified_name child that is NOT the alias node.
+    let alias_node = directive.child_by_field_name("name");
+
+    let mut cursor = directive.walk();
+    for child in directive.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if let Some(alias) = alias_node {
+            if child.id() == alias.id() {
+                continue;
+            }
+        }
+        if matches!(child.kind(), "identifier" | "qualified_name") {
+            return Some(child.utf8_text(content).unwrap_or("").to_owned());
+        }
+    }
+    None
 }
 
 /// Build a [`Symbol`] from a definition node. Centralises the row/column/
@@ -1827,6 +1962,240 @@ class C {
     fn empty_file_produces_no_call_edges() {
         let fg = parse("");
         let edges = calls(&fg);
+        assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2.4 — import extraction
+    // ----------------------------------------------------------------
+
+    /// Filter to just the `Includes` edges of `fg`.
+    fn includes(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    #[test]
+    fn plain_using_records_includes_edge() {
+        let fg = parse_at("using System;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "System");
+        assert_eq!(edges[0].kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn dotted_using_preserves_full_path() {
+        let fg = parse_at("using System.Collections.Generic;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "System.Collections.Generic",
+            "dotted path must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn static_using_drops_static_modifier() {
+        // `using static System.Console;` — the `static` keyword is an
+        // anonymous child of `using_directive`; only the named path
+        // child is captured.
+        let fg = parse_at("using static System.Console;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "System.Console",
+            "static modifier must be dropped from `to`"
+        );
+        assert!(
+            !edges[0].to.contains("static"),
+            "to field must not contain 'static'; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn aliased_using_preserves_target_path() {
+        // `using FooAlias = Some.Long.Type.Name;` — the alias is the
+        // `name:` field; the path is the other named child. The
+        // extractor records the *path*, dropping the alias (same rule
+        // as Python `import foo as f`).
+        let fg = parse_at("using FooAlias = Some.Long.Type.Name;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "Some.Long.Type.Name",
+            "alias form must record target path, not alias name"
+        );
+        assert!(
+            !edges[0].to.contains("FooAlias"),
+            "to field must not contain alias name; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn simple_aliased_using_preserves_target_path() {
+        // `using A = Foo;` — both the alias and the target path parse
+        // as bare `identifier` nodes. The `name:` field disambiguates
+        // them; the extractor picks the non-`name:` identifier.
+        let fg = parse_at("using A = Foo;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "Foo",
+            "alias-with-single-identifier-target must record target, not alias"
+        );
+    }
+
+    #[test]
+    fn global_using_drops_global_modifier() {
+        let fg = parse_at("global using System.Linq;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(
+            edges[0].to, "System.Linq",
+            "global modifier must be dropped from `to`"
+        );
+        assert!(
+            !edges[0].to.contains("global"),
+            "to field must not contain 'global'; got {:?}",
+            edges[0].to
+        );
+    }
+
+    #[test]
+    fn global_using_static_drops_both_modifiers() {
+        // Combination: `global using static System.Math;` — both
+        // modifiers are anonymous children and are dropped; the path
+        // survives verbatim.
+        let fg = parse_at("global using static System.Math;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "System.Math");
+    }
+
+    #[test]
+    fn using_inside_namespace_block_is_captured() {
+        // Anti-regression per the 2.4 verification field: a `using`
+        // inside a `namespace { ... }` block must be captured (the
+        // tree-sitter query walks the whole tree by default, so the
+        // `using_directive` inside the namespace's `declaration_list`
+        // surfaces alongside any top-level usings).
+        let fg = parse_at(
+            r#"
+namespace Foo {
+    using Bar;
+    class C {}
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = includes(&fg);
+        assert_eq!(
+            edges.len(),
+            1,
+            "namespace-scoped using must produce one Includes edge; got: {:?}",
+            edges
+                .iter()
+                .map(|e| (e.from.as_str(), e.to.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(edges[0].to, "Bar");
+    }
+
+    #[test]
+    fn multiple_usings_at_file_scope_each_produce_edges() {
+        let fg = parse_at(
+            r#"
+using System;
+using System.IO;
+using System.Collections.Generic;
+"#,
+            "/p/x.cs",
+        );
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", edges);
+
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"System"), "missing System; got {:?}", tos);
+        assert!(
+            tos.contains(&"System.IO"),
+            "missing System.IO; got {:?}",
+            tos
+        );
+        assert!(
+            tos.contains(&"System.Collections.Generic"),
+            "missing System.Collections.Generic; got {:?}",
+            tos
+        );
+    }
+
+    #[test]
+    fn using_inside_namespace_and_top_level_produces_two_edges() {
+        // Combination of file-scope and namespace-scope usings — both
+        // surface, neither is dropped.
+        let fg = parse_at(
+            r#"
+using System;
+namespace Foo {
+    using Bar;
+    class C {}
+}
+"#,
+            "/p/x.cs",
+        );
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 2, "got: {:?}", edges);
+
+        let tos: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(tos.contains(&"System"));
+        assert!(tos.contains(&"Bar"));
+    }
+
+    #[test]
+    fn from_field_is_the_file_path() {
+        // The `Includes` edge's `from` is the file path (NOT a symbol
+        // ID, NOT empty). Mirrors the Python/Go/Rust convention; the
+        // `Graph` engine routes Includes edges by file path.
+        let fg = parse_at("using System;\n", "/abs/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "/abs/x.cs", "from must be the file path");
+        assert_eq!(edges[0].file, "/abs/x.cs", "file must match the path arg");
+    }
+
+    #[test]
+    fn import_edge_carries_correct_line() {
+        // Line is 1-indexed and anchored at the `using_directive` node.
+        // Three usings on lines 2, 3, 4 (leading newline pushes the
+        // first using past line 1).
+        let fg = parse_at(
+            "\nusing System;\nusing System.IO;\nusing System.Collections.Generic;\n",
+            "/p/x.cs",
+        );
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 3, "got: {:?}", edges);
+
+        // Find each edge by its target and assert its line.
+        let line_for = |to: &str| -> u32 {
+            edges
+                .iter()
+                .find(|e| e.to == to)
+                .unwrap_or_else(|| panic!("missing edge to={:?}", to))
+                .line
+        };
+        assert_eq!(line_for("System"), 2);
+        assert_eq!(line_for("System.IO"), 3);
+        assert_eq!(line_for("System.Collections.Generic"), 4);
+    }
+
+    #[test]
+    fn empty_file_produces_no_includes_edges() {
+        let fg = parse("");
+        let edges = includes(&fg);
         assert!(edges.is_empty(), "got: {:?}", edges);
     }
 }
