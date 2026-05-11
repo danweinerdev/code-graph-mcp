@@ -856,7 +856,16 @@ fn using_directive_path(directive: Node<'_>, content: &[u8]) -> Option<String> {
                 continue;
             }
         }
-        if matches!(child.kind(), "identifier" | "qualified_name") {
+        // `alias_qualified_name` covers the bare `using global::System;`
+        // form — tree-sitter-c-sharp 0.23.5 produces an
+        // `alias_qualified_name` node directly under `using_directive`
+        // when the path starts with `global::` and has no further
+        // qualification. The verbatim text (`"global::System"`) is what
+        // Decision 7 wants in the `to` field.
+        if matches!(
+            child.kind(),
+            "identifier" | "qualified_name" | "alias_qualified_name"
+        ) {
             return Some(child.utf8_text(content).unwrap_or("").to_owned());
         }
     }
@@ -895,8 +904,9 @@ fn make_symbol(
 #[cfg(test)]
 mod tests {
     //! Phase 2.1 structural smoke tests + Phase 2.2 definition-extraction
-    //! coverage + Phase 2.3 call-extraction coverage. Behavioral coverage
-    //! of import / inheritance extraction lands in 2.4-2.5.
+    //! coverage + Phase 2.3 call-extraction coverage + Phase 2.4
+    //! import-extraction coverage. Behavioral coverage of inheritance
+    //! extraction lands in 2.5.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
@@ -2075,6 +2085,20 @@ class C {
         let edges = includes(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);
         assert_eq!(edges[0].to, "System.Math");
+    }
+
+    #[test]
+    fn bare_alias_qualified_using_preserves_global_prefix() {
+        // tree-sitter-c-sharp 0.23.5 produces a direct `alias_qualified_name`
+        // child under `using_directive` for `using global::System;` (no
+        // dotted suffix). Without an `alias_qualified_name` arm in
+        // using_directive_path, this case silently produced no edge. The
+        // verbatim text `"global::System"` is what Decision 7 wants —
+        // record it as the path.
+        let fg = parse_at("using global::System;\n", "/p/x.cs");
+        let edges = includes(&fg);
+        assert_eq!(edges.len(), 1, "got: {:?}", edges);
+        assert_eq!(edges[0].to, "global::System");
     }
 
     #[test]
