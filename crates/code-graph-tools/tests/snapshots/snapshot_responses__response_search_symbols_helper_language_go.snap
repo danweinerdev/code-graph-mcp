@@ -1,10 +1,10 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
-assertion_line: 875
 expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -16,5 +16,6 @@ expression: parsed
       "namespace": "mixed"
     }
   ],
-  "total": 1
+  "total": 1,
+  "truncated": false
 }

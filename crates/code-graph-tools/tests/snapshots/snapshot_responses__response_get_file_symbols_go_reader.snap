@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 100,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -32,5 +33,6 @@ expression: parsed
       "namespace": "main"
     }
   ],
-  "total": 3
+  "total": 3,
+  "truncated": false
 }

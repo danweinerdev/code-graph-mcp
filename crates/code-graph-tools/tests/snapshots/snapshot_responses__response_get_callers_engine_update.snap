@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 100,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -13,5 +14,6 @@ expression: parsed
       "symbol_id": "[testdata]/main.cpp:main"
     }
   ],
-  "total": 1
+  "total": 1,
+  "truncated": false
 }

@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 0,
   "results": [
     [
@@ -11,5 +12,6 @@ expression: parsed
       "[testdata]/circular_b.h"
     ]
   ],
-  "total": 1
+  "total": 1,
+  "truncated": false
 }

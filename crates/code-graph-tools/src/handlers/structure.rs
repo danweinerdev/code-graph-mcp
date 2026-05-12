@@ -82,6 +82,8 @@ pub fn detect_cycles(
         total,
         offset: resolved_offset,
         limit: resolved_limit,
+        truncated: false,
+        next_offset: None,
     };
     tool_success_json(&response)
 }
@@ -148,6 +150,8 @@ pub fn get_orphans(
         total,
         offset: resolved_offset,
         limit: resolved_limit,
+        truncated: false,
+        next_offset: None,
     };
     tool_success_json(&response)
 }

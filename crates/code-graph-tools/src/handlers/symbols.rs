@@ -92,6 +92,8 @@ pub fn get_file_symbols(
         total,
         offset: resolved_offset,
         limit: resolved_limit,
+        truncated: false,
+        next_offset: None,
     };
     tool_success_json(&response)
 }
@@ -172,6 +174,8 @@ pub fn search_symbols(graph: &RwLock<Graph>, input: SearchSymbolsInput<'_>) -> C
         total: sr.total,
         offset: resolved_offset,
         limit: resolved_limit,
+        truncated: false,
+        next_offset: None,
     };
     tool_success_json(&response)
 }

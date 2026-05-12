@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 50,
+  "next_offset": null,
   "offset": 50,
   "results": [
     {
@@ -67,5 +68,6 @@ expression: parsed
       "symbol_id": "[testdata]/hub.cpp:callee_059"
     }
   ],
-  "total": 60
+  "total": 60,
+  "truncated": false
 }

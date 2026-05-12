@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 100,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -19,5 +20,6 @@ expression: parsed
       "symbol_id": "[testdata]/utils.cpp:lerp"
     }
   ],
-  "total": 2
+  "total": 2,
+  "truncated": false
 }

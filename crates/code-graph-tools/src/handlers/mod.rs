@@ -65,19 +65,32 @@ fn is_zero_u32(n: &u32) -> bool {
 
 /// Shared pagination envelope for list-shaped tool responses.
 ///
-/// Field-declaration order — `results`, `total`, `offset`, `limit` — is the
-/// wire-format contract: `serde` serializes derived structs in declaration
-/// order, so reordering these fields is a breaking JSON change. The insta
+/// Field-declaration order — `results`, `total`, `offset`, `limit`,
+/// `truncated`, `next_offset` — is the wire-format contract: `serde`
+/// serializes derived structs in declaration order, so reordering these
+/// fields is a breaking JSON change. New fields may be appended at the end
+/// (additive-only); the existing field positions are frozen. The insta
 /// snapshot harness alphabetizes keys via `parsed_sorted` before recording,
 /// so snapshot files do not preserve declaration order — the struct itself
 /// is the source of truth, not the snapshots. Integer fields stay `u32`
 /// (not `usize`) so JSON output is byte-identical across platforms.
+///
+/// `truncated` is `true` when the handler stopped emitting results before
+/// reaching `limit` due to a byte-budget cap (see Phase 2 of the
+/// `PaginatedResponseSizeSafety` plan). `next_offset` is `Some(n)` when a
+/// client should re-request with `offset = n` to continue paging — `None`
+/// when there is no further page. The fields always serialize (no
+/// `skip_serializing_if`) so MCP clients can rely on a stable envelope
+/// shape: `truncated: false` and `next_offset: null` are emitted explicitly
+/// when no truncation occurred.
 #[derive(Debug, Serialize)]
 pub struct Page<T: Serialize> {
     pub results: Vec<T>,
     pub total: u32,
     pub offset: u32,
     pub limit: u32,
+    pub truncated: bool,
+    pub next_offset: Option<u32>,
 }
 
 /// Convert a [`Symbol`] to a [`SymbolResult`]. In `brief` mode, `column`,

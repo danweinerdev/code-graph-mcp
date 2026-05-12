@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 20,
   "results": [
     {
@@ -42,5 +43,6 @@ expression: parsed
       "name": "func_024"
     }
   ],
-  "total": 25
+  "total": 25,
+  "truncated": false
 }

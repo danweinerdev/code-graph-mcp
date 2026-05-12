@@ -113,6 +113,8 @@ pub fn callers_or_callees(
         total,
         offset: resolved_offset,
         limit: resolved_limit,
+        truncated: false,
+        next_offset: None,
     };
     tool_success_json(&response)
 }

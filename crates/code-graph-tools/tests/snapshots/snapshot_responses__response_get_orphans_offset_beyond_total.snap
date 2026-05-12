@@ -4,7 +4,9 @@ expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 999,
   "results": [],
-  "total": 5
+  "total": 5,
+  "truncated": false
 }

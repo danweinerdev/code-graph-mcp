@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -61,5 +62,6 @@ expression: parsed
       "name": "Engine"
     }
   ],
-  "total": 7
+  "total": 7,
+  "truncated": false
 }

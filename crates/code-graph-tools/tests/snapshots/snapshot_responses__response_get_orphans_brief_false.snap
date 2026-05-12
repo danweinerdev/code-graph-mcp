@@ -4,6 +4,7 @@ expression: parsed
 ---
 {
   "limit": 20,
+  "next_offset": null,
   "offset": 0,
   "results": [
     {
@@ -54,5 +55,6 @@ expression: parsed
       "signature": "void neverCalled()"
     }
   ],
-  "total": 5
+  "total": 5,
+  "truncated": false
 }
