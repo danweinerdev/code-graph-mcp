@@ -1,0 +1,31 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 50,
+  "next_offset": 3,
+  "offset": 0,
+  "results": [
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 3,
+      "symbol_id": "[testdata]/hub.cpp:callee_000"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 4,
+      "symbol_id": "[testdata]/hub.cpp:callee_001"
+    },
+    {
+      "depth": 1,
+      "file": "[testdata]/hub.cpp",
+      "line": 5,
+      "symbol_id": "[testdata]/hub.cpp:callee_002"
+    }
+  ],
+  "total": 60,
+  "truncated": true
+}

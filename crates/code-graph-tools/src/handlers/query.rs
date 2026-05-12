@@ -969,6 +969,215 @@ mod tests {
         assert_eq!(limit, 100);
     }
 
+    // --- Phase 2 byte-budget invariants (callees direction) -------------
+    //
+    // Task 2.4 of PaginatedResponseSizeSafety. Mirrors the callers-side
+    // tests above (2.3). The wiring is identical — both directions flow
+    // through the same `callers_or_callees` handler — so these tests cover
+    // the callee-side BFS edge construction and lock the documented
+    // sort-determinism contract for `Direction::Callees`.
+
+    /// Mirror of `graph_with_layered_callers` for the callees direction:
+    /// a single hub `entry` calls `per_depth` distinct depth-1 callees,
+    /// each of which calls a depth-2 callee, each of which calls a
+    /// depth-3 callee. Names are zero-padded and per-depth-prefixed so
+    /// the `(depth, symbol_id)` sort order is predictable:
+    /// `d1_callee_NNN` < `d2_callee_NNN` < `d3_callee_NNN` within each
+    /// depth bucket. At BFS depth=3, the handler returns
+    /// `3 * per_depth` chains.
+    ///
+    /// Layout (per_depth=3 example):
+    ///   entry -> d1_callee_000 -> d2_callee_000 -> d3_callee_000
+    ///   entry -> d1_callee_001 -> d2_callee_001 -> d3_callee_001
+    ///   entry -> d1_callee_002 -> d2_callee_002 -> d3_callee_002
+    fn graph_with_layered_callees(per_depth: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut callee_symbols: Vec<Symbol> = Vec::with_capacity(per_depth * 3);
+        // entry's body holds the call sites for entry -> d1 (lives in /hub.cpp).
+        let mut hub_edges: Vec<Edge> = Vec::with_capacity(per_depth);
+        // d1's body holds d1 -> d2 call sites; d2's body holds d2 -> d3.
+        // Both lots live in /big.cpp.
+        let mut big_edges: Vec<Edge> = Vec::with_capacity(per_depth * 2);
+        for i in 0..per_depth {
+            let d1 = format!("d1_callee_{i:03}");
+            let d2 = format!("d2_callee_{i:03}");
+            let d3 = format!("d3_callee_{i:03}");
+            callee_symbols.push(sym(&d1, "/big.cpp"));
+            callee_symbols.push(sym(&d2, "/big.cpp"));
+            callee_symbols.push(sym(&d3, "/big.cpp"));
+            // entry -> d1 (depth=1 in callees BFS from entry).
+            hub_edges.push(call_edge(
+                "/hub.cpp:entry",
+                &format!("/big.cpp:{d1}"),
+                "/hub.cpp",
+                (i * 2 + 1) as u32,
+            ));
+            // d1 -> d2 (depth=2).
+            big_edges.push(call_edge(
+                &format!("/big.cpp:{d1}"),
+                &format!("/big.cpp:{d2}"),
+                "/big.cpp",
+                (i * 2 + 1) as u32,
+            ));
+            // d2 -> d3 (depth=3).
+            big_edges.push(call_edge(
+                &format!("/big.cpp:{d2}"),
+                &format!("/big.cpp:{d3}"),
+                "/big.cpp",
+                (i * 2 + 2) as u32,
+            ));
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/big.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: callee_symbols,
+            edges: big_edges,
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/hub.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("entry", "/hub.cpp")],
+            edges: hub_edges,
+        });
+        g
+    }
+
+    #[test]
+    fn callees_byte_budget_preserves_depth_sort_order() {
+        // Phase 2 of PaginatedResponseSizeSafety, task 2.4: byte-budget
+        // truncation must not reorder the (depth, symbol_id)-sorted chain
+        // set in the callees direction. The helper preserves iteration
+        // order, so kept records are a strict prefix of the sorted chain
+        // — i.e. `max(kept depth) <= min(would-be-next-page depth)` and
+        // within-depth ties are tiebroken by symbol_id ascending.
+        //
+        // Fixture: 30 callees spread across depths 1/2/3 (10 each). With a
+        // tight `max_bytes` that fits only ~8 records, truncation must
+        // happen within the depth-1 bucket (the sorted prefix). The first
+        // dropped record is also at depth=1, so kept depths are
+        // non-decreasing and bounded above by the dropped page's first
+        // depth.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_layered_callees(10));
+        // Each CallChain serializes to roughly 90-110 bytes:
+        //   {"symbol_id":"/big.cpp:d1_callee_NNN","file":"/big.cpp","line":N,"depth":1}
+        // Budget = 800 bytes after envelope reservation → ~8 records before
+        // the 9th's projected total exceeds the budget.
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 800;
+        let r = callers_or_callees(
+            &g,
+            "/hub.cpp:entry",
+            Some(3), // walk all 3 BFS depths so 30 chains are produced
+            Direction::Callees,
+            Some(100),
+            Some(0),
+            max_bytes,
+        );
+
+        let (arr, total, offset, _limit) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+
+        assert!(truncated, "tight max_bytes must produce truncated=true");
+        let n = next_offset.expect("truncated=true must set next_offset=Some(n)");
+        assert!(
+            n > offset,
+            "next_offset must point past the current page: next_offset={n} <= offset={offset}",
+        );
+        assert_eq!(total, 30, "total is the pre-pagination match count");
+        assert!(
+            !arr.is_empty(),
+            "budget should still admit at least one record",
+        );
+        assert!(
+            (arr.len() as u32) < 100,
+            "byte budget (not count cap) must trim the page: arr.len()={}",
+            arr.len(),
+        );
+
+        // Sort-determinism core assertion: kept records' depths are
+        // non-decreasing (the helper preserved the handler's (depth,
+        // symbol_id) sort order).
+        let depths: Vec<u64> = arr
+            .iter()
+            .map(|h| h["depth"].as_u64().expect("depth is u64"))
+            .collect();
+        for win in depths.windows(2) {
+            assert!(
+                win[0] <= win[1],
+                "kept depths must be non-decreasing: {depths:?}",
+            );
+        }
+        // And within-depth ties are tiebroken by symbol_id ascending. Run
+        // the same monotonic check on the (depth, symbol_id) tuple to
+        // confirm the handler's pre-truncation sort survived the helper.
+        let keys: Vec<(u64, String)> = arr
+            .iter()
+            .map(|h| {
+                (
+                    h["depth"].as_u64().unwrap(),
+                    h["symbol_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        for win in keys.windows(2) {
+            assert!(
+                win[0] <= win[1],
+                "kept records must remain (depth, symbol_id)-sorted: {keys:?}",
+            );
+        }
+
+        // max(kept depth) <= depth of the first dropped record. With the
+        // fixture's 30 chains and an 8-ish-record budget, the prefix lives
+        // entirely within depth=1, so the first dropped depth is also 1.
+        let max_kept_depth = depths.iter().copied().max().unwrap();
+        // Re-fetch the full sorted chain set deterministically and read
+        // the dropped page's first depth from the position `next_offset`.
+        // The handler's (depth, symbol_id) ordering is reproduced here by
+        // calling with `offset = n, limit = 1` (NO_BYTE_BUDGET so nothing
+        // truncates).
+        let r_next = callers_or_callees(
+            &g,
+            "/hub.cpp:entry",
+            Some(3),
+            Direction::Callees,
+            Some(1),
+            Some(n),
+            NO_BYTE_BUDGET,
+        );
+        let (arr_next, _, _, _) = page_parts(&r_next);
+        assert_eq!(arr_next.len(), 1, "fixture guarantees a next record exists");
+        let first_dropped_depth = arr_next[0]["depth"].as_u64().unwrap();
+        assert!(
+            max_kept_depth <= first_dropped_depth,
+            "max(kept depth)={max_kept_depth} must be <= first_dropped_depth={first_dropped_depth}",
+        );
+    }
+
+    #[test]
+    fn callees_byte_budget_no_truncation_with_no_budget() {
+        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the
+        // handler's existing behavior is preserved exactly — no
+        // truncation, no next_offset. Locks the contract that the
+        // byte-budget wiring does not affect callers that opt out, for
+        // the callees direction.
+        let g = locked(graph_with_n_callees(30));
+        let r = callers_or_callees(
+            &g,
+            "/hub.cpp:entry",
+            Some(1),
+            Direction::Callees,
+            Some(100),
+            Some(0),
+            NO_BYTE_BUDGET,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert_eq!(arr.len(), 30);
+        assert_eq!(total, 30);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
+    }
+
     #[test]
     fn callees_pagination_orders_by_depth_then_symbol_id() {
         // Mirror of the callers test:
