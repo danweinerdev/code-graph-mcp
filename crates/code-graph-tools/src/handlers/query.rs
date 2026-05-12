@@ -1010,9 +1010,10 @@ mod tests {
                 "/hub.cpp:entry",
                 &format!("/big.cpp:{d1}"),
                 "/hub.cpp",
-                (i * 2 + 1) as u32,
+                (i + 1) as u32,
             ));
-            // d1 -> d2 (depth=2).
+            // d1 -> d2 (depth=2). big.cpp interleaves d1->d2 (odd) and
+            // d2->d3 (even), giving each edge a unique line within the file.
             big_edges.push(call_edge(
                 &format!("/big.cpp:{d1}"),
                 &format!("/big.cpp:{d2}"),
