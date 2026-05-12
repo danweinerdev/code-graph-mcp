@@ -4,7 +4,7 @@ expression: "tool_entry(\"get_callees\")"
 ---
 {
   "name": "get_callees",
-  "description": "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for symbols with wide fan-out, use `offset` to page through the remainder, or narrow via lower `depth` to scope a specific subtree.",
+  "description": "Find functions called by the given symbol (downstream call chain). `symbol` is a Symbol ID in the `file:name` or `file:Parent::name` format returned by get_file_symbols/search_symbols. Returns the {results, total, offset, limit, truncated, next_offset} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. `depth` defaults to 1 (direct callees only); raise it to walk further downstream. `limit` defaults to 100 (max 1000, clamped silently — the echoed `limit` reflects the resolved value); raise `limit` for symbols with wide fan-out, use `offset` to page through the remainder, or narrow by lowering `depth` to scope a specific subtree. Responses are also capped by `[response].max_bytes` (default 100KB); when the byte budget bites, `truncated` is true and `next_offset` points at the first un-emitted record — re-call with `offset = next_offset` to resume. `truncated=false` plus `next_offset=null` means the page is complete. `results.length` may be less than `limit` when the byte cap fires, so consult `truncated`, not length, to detect partial pages.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

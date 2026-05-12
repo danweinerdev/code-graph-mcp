@@ -444,7 +444,25 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "List all symbols (functions, classes, etc.) defined in a file. Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 100 (max 1000); pass limit/offset to page through large files (UE generated headers can exceed 100). `brief` defaults to true and omits column/end_line/signature for token efficiency — set false for full detail when investigating a specific symbol."
+        description = "List all symbols (functions, classes, etc.) defined in a file. \
+                       Returns the {results, total, offset, limit, truncated, next_offset} \
+                       envelope, sorted by symbol_id ascending. `limit` defaults to 100 \
+                       (max 1000, clamped silently — the echoed `limit` reflects the \
+                       resolved value); raise `limit` for wider pages on large files (UE \
+                       generated headers can exceed 100), and use `offset` to advance \
+                       through results. `top_level_only` (default false) drops nested \
+                       methods/types. `brief` (default true) omits signature, column, \
+                       and end_line; set false for full detail when investigating a \
+                       specific symbol. `count_only=true` returns the match total with \
+                       an empty `results` array in a < 1KB bounded response — use it for \
+                       sizing queries before paging. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget bites, \
+                       `truncated` is true and `next_offset` points at the first \
+                       un-emitted record — re-call with `offset = next_offset` to resume. \
+                       `truncated=false` plus `next_offset=null` means the page is \
+                       complete. `results.length` may be less than `limit` when the byte \
+                       cap fires, so consult `truncated`, not length, to detect partial \
+                       pages."
     )]
     async fn get_file_symbols(
         &self,
@@ -467,7 +485,28 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Search for symbols by name pattern across the indexed codebase. Returns paginated results. Default brief mode omits signatures for token efficiency."
+        description = "Search for symbols by name pattern across the indexed codebase. \
+                       Returns the {results, total, offset, limit, truncated, next_offset} \
+                       envelope, sorted by symbol_id ascending. At least one filter is \
+                       expected: `query` (substring or regex on the symbol name), `kind` \
+                       (function, method, class, struct, enum, typedef, interface, \
+                       trait), `namespace` (substring match against the symbol's \
+                       namespace path, e.g. 'Nfs' matches 'Ark::Nfs::V4'), and/or \
+                       `language` (cpp, rust, go, python, csharp, java). `limit` defaults \
+                       to 20 (max 1000, clamped silently — the echoed `limit` reflects \
+                       the resolved value); raise `limit` for broad searches expected to \
+                       return many hits, and use `offset` to advance through the \
+                       remainder. `brief` (default true) omits signature, column, and \
+                       end_line; set false for full detail. `count_only=true` returns \
+                       the match total with an empty `results` array in a < 1KB bounded \
+                       response — use it to size a search before committing to paging. \
+                       Responses are also capped by `[response].max_bytes` (default \
+                       100KB); when the byte budget bites, `truncated` is true and \
+                       `next_offset` points at the first un-emitted record — re-call \
+                       with `offset = next_offset` to resume. `truncated=false` plus \
+                       `next_offset=null` means the page is complete. `results.length` \
+                       may be less than `limit` when the byte cap fires, so consult \
+                       `truncated`, not length, to detect partial pages."
     )]
     async fn search_symbols(
         &self,
@@ -525,7 +564,24 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Find functions that call the given symbol (upstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callers appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for hot symbols with high fan-in (e.g. UObject::Serialize), use `offset` to page through the remainder, or narrow the search by lowering `depth`."
+        description = "Find functions that call the given symbol (upstream call chain). \
+                       `symbol` is a Symbol ID in the `file:name` or `file:Parent::name` \
+                       format returned by get_file_symbols/search_symbols. Returns the \
+                       {results, total, offset, limit, truncated, next_offset} envelope, \
+                       sorted by (depth, symbol_id) ascending so the closest callers \
+                       appear first. `depth` defaults to 1 (direct callers only); raise \
+                       it to walk further upstream. `limit` defaults to 100 (max 1000, \
+                       clamped silently — the echoed `limit` reflects the resolved \
+                       value); raise `limit` for hot symbols with high fan-in (e.g. \
+                       UObject::Serialize), use `offset` to page through the remainder, \
+                       or narrow by lowering `depth`. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
+                       un-emitted record — re-call with `offset = next_offset` to \
+                       resume. `truncated=false` plus `next_offset=null` means the page \
+                       is complete. `results.length` may be less than `limit` when the \
+                       byte cap fires, so consult `truncated`, not length, to detect \
+                       partial pages."
     )]
     async fn get_callers(
         &self,
@@ -547,7 +603,25 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Find functions called by the given symbol (downstream call chain). Returns paginated results in the {results, total, offset, limit} envelope, sorted by (depth, symbol_id) ascending so the closest callees appear first. Default limit 100 (max 1000); raise `limit` (toward the 1000 cap) for symbols with wide fan-out, use `offset` to page through the remainder, or narrow via lower `depth` to scope a specific subtree."
+        description = "Find functions called by the given symbol (downstream call \
+                       chain). `symbol` is a Symbol ID in the `file:name` or \
+                       `file:Parent::name` format returned by \
+                       get_file_symbols/search_symbols. Returns the {results, total, \
+                       offset, limit, truncated, next_offset} envelope, sorted by \
+                       (depth, symbol_id) ascending so the closest callees appear \
+                       first. `depth` defaults to 1 (direct callees only); raise it to \
+                       walk further downstream. `limit` defaults to 100 (max 1000, \
+                       clamped silently — the echoed `limit` reflects the resolved \
+                       value); raise `limit` for symbols with wide fan-out, use \
+                       `offset` to page through the remainder, or narrow by lowering \
+                       `depth` to scope a specific subtree. Responses are also capped \
+                       by `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the \
+                       first un-emitted record — re-call with `offset = next_offset` \
+                       to resume. `truncated=false` plus `next_offset=null` means the \
+                       page is complete. `results.length` may be less than `limit` \
+                       when the byte cap fires, so consult `truncated`, not length, \
+                       to detect partial pages."
     )]
     async fn get_callees(
         &self,
@@ -601,9 +675,27 @@ impl CodeGraphServer {
         ))
     }
 
-    #[tool(
-        description = "Find symbols with no incoming call edges (uncalled functions/methods). Returns paginated results in the {results, total, offset, limit} envelope, sorted by symbol_id ascending. Default limit 20 (max 1000) — small because orphan lists are explored interactively; use `offset` to page through, raise `limit` for a wider page, or filter by `kind` (function, method, class, struct, enum, typedef, interface, trait) to narrow the scope. `brief` defaults to true and omits signatures for token efficiency."
-    )]
+    #[tool(description = "Find symbols with no incoming call edges (uncalled \
+                       functions/methods). Returns the {results, total, offset, limit, \
+                       truncated, next_offset} envelope, sorted by symbol_id \
+                       ascending. `limit` defaults to 20 (max 1000, clamped silently — \
+                       the echoed `limit` reflects the resolved value); the default is \
+                       small because orphan lists are typically explored \
+                       interactively. Raise `limit` for wider scans, use `offset` to \
+                       advance through pages, or filter by `kind` (function, method, \
+                       class, struct, enum, typedef, interface, trait) to narrow the \
+                       scope. `brief` (default true) omits signature, column, and \
+                       end_line for token efficiency; set false for full detail. \
+                       `count_only=true` returns the orphan total with an empty \
+                       `results` array in a < 1KB bounded response — use it to size \
+                       the orphan set before paging. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the \
+                       first un-emitted record — re-call with `offset = next_offset` \
+                       to resume. `truncated=false` plus `next_offset=null` means the \
+                       page is complete. `results.length` may be less than `limit` \
+                       when the byte cap fires, so consult `truncated`, not length, \
+                       to detect partial pages.")]
     async fn get_orphans(
         &self,
         Parameters(args): Parameters<GetOrphansArgs>,
