@@ -169,11 +169,18 @@ async fn mixed_cpp_rust_go_python_indexes_all_four() {
 /// Infer the language of a `search_symbols` result from its `file`
 /// extension. The wire format (`SymbolResult`) deliberately omits the
 /// `language` field — Phase 1 keeps the JSON shape byte-identical with
-/// the Go reference, which never serialized it. The file extension is
-/// the next-cheapest discriminant and is unambiguous for the mixed
-/// fixture (`.cpp` ↔ Cpp, `.rs` ↔ Rust, `.go` ↔ Go, `.py`/`.pyi` ↔
-/// Python, `.cs` ↔ C#, `.java` ↔ Java). Returns `"?"` for any other
-/// extension to surface unexpected results loudly rather than silently.
+/// the Go reference, which never serialized it. Phase 3.4 of
+/// `PaginatedResponseSizeSafety` then dropped the `file` field as well
+/// (the `id` already encodes it via `file:name` /
+/// `file:Parent::name`), so this helper now recovers the file path via
+/// [`code_graph_core::id_to_file`] on the `id` field — the documented
+/// inverse contract from Phase 1.4.
+///
+/// The file extension is the next-cheapest discriminant and is
+/// unambiguous for the mixed fixture (`.cpp` ↔ Cpp, `.rs` ↔ Rust, `.go`
+/// ↔ Go, `.py`/`.pyi` ↔ Python, `.cs` ↔ C#, `.java` ↔ Java). Returns
+/// `"?"` for any other extension to surface unexpected results loudly
+/// rather than silently.
 fn language_from_file(file: &str) -> &'static str {
     if file.ends_with(".cpp") || file.ends_with(".cc") || file.ends_with(".cxx") {
         "cpp"
@@ -194,6 +201,11 @@ fn language_from_file(file: &str) -> &'static str {
 
 /// Pull a per-result language tag out of a `search_symbols` response,
 /// using the file extension as the discriminant (see `language_from_file`).
+/// Recovers the file portion from each record's `id` via
+/// [`code_graph_core::id_to_file`] — Phase 3.4 of
+/// `PaginatedResponseSizeSafety` removed the dedicated `file` field from
+/// `SymbolResult` records because it duplicated information already in
+/// the `id`.
 fn result_languages(body: &str) -> Vec<&'static str> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).expect("search_symbols returns JSON");
@@ -201,7 +213,12 @@ fn result_languages(body: &str) -> Vec<&'static str> {
         .as_array()
         .expect("results is an array")
         .iter()
-        .map(|r| language_from_file(r["file"].as_str().expect("each result has a file field")))
+        .map(|r| {
+            let id = r["id"]
+                .as_str()
+                .expect("each result has an id field that encodes the file path");
+            language_from_file(code_graph_core::id_to_file(id))
+        })
         .collect()
 }
 

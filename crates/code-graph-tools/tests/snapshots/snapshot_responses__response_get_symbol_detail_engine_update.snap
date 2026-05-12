@@ -4,7 +4,6 @@ expression: parsed
 ---
 {
   "end_line": 10,
-  "file": "[testdata]/engine.cpp",
   "id": "[testdata]/engine.cpp:Engine::update",
   "kind": "method",
   "line": 6,

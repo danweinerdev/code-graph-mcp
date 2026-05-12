@@ -964,10 +964,11 @@ mod tests {
         // surface `truncated=true`, and report a usable `next_offset`.
         //
         // Fixture: 30 orphan functions named `func_000`..`func_029` in
-        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~90-100
+        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~60-70
         // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
-        // "function","file":"/big.cpp","line":1}` plus the helper's +1
-        // inter-record comma).
+        // "function","line":1}` plus the helper's +1 inter-record comma).
+        // Phase 3.4 of PaginatedResponseSizeSafety dropped the `file`
+        // field from SymbolResult — the `id` already encodes it.
         //
         // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
         // overhead reservation is 300 bytes, which fits ~3 records before

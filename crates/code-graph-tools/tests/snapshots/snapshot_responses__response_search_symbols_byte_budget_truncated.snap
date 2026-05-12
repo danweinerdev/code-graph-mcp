@@ -4,29 +4,32 @@ expression: parsed
 ---
 {
   "limit": 1000,
-  "next_offset": 3,
+  "next_offset": 4,
   "offset": 0,
   "results": [
     {
-      "file": "[testdata]/big.cpp",
       "id": "[testdata]/big.cpp:func_000",
       "kind": "function",
       "line": 1,
       "name": "func_000"
     },
     {
-      "file": "[testdata]/big.cpp",
       "id": "[testdata]/big.cpp:func_001",
       "kind": "function",
       "line": 2,
       "name": "func_001"
     },
     {
-      "file": "[testdata]/big.cpp",
       "id": "[testdata]/big.cpp:func_002",
       "kind": "function",
       "line": 3,
       "name": "func_002"
+    },
+    {
+      "id": "[testdata]/big.cpp:func_003",
+      "kind": "function",
+      "line": 4,
+      "name": "func_003"
     }
   ],
   "total": 30,

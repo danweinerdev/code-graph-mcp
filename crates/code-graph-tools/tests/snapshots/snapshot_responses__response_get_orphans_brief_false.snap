@@ -9,7 +9,6 @@ expression: parsed
   "results": [
     {
       "end_line": 22,
-      "file": "[testdata]/engine.cpp",
       "id": "[testdata]/engine.cpp:DebugEngine::dumpState",
       "kind": "method",
       "line": 20,
@@ -19,7 +18,6 @@ expression: parsed
     },
     {
       "end_line": 4,
-      "file": "[testdata]/engine.cpp",
       "id": "[testdata]/engine.cpp:Engine::Engine",
       "kind": "method",
       "line": 4,
@@ -29,7 +27,6 @@ expression: parsed
     },
     {
       "end_line": 18,
-      "file": "[testdata]/main.cpp",
       "id": "[testdata]/main.cpp:main",
       "kind": "function",
       "line": 9,
@@ -38,7 +35,6 @@ expression: parsed
     },
     {
       "end_line": 9,
-      "file": "[testdata]/orphan.cpp",
       "id": "[testdata]/orphan.cpp:alsoOrphaned",
       "kind": "function",
       "line": 7,
@@ -47,7 +43,6 @@ expression: parsed
     },
     {
       "end_line": 5,
-      "file": "[testdata]/orphan.cpp",
       "id": "[testdata]/orphan.cpp:neverCalled",
       "kind": "function",
       "line": 3,

@@ -8,7 +8,6 @@ expression: parsed
   "offset": 0,
   "results": [
     {
-      "file": "[testdata]/foo.py",
       "id": "[testdata]/foo.py:helper",
       "kind": "function",
       "line": 11,

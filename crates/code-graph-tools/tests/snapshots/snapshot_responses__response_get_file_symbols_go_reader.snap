@@ -8,7 +8,6 @@ expression: parsed
   "offset": 0,
   "results": [
     {
-      "file": "[testdata]/reader.go",
       "id": "[testdata]/reader.go:MyReader",
       "kind": "struct",
       "line": 7,
@@ -16,7 +15,6 @@ expression: parsed
       "namespace": "main"
     },
     {
-      "file": "[testdata]/reader.go",
       "id": "[testdata]/reader.go:MyReader::Read",
       "kind": "method",
       "line": 9,
@@ -25,7 +23,6 @@ expression: parsed
       "parent": "MyReader"
     },
     {
-      "file": "[testdata]/reader.go",
       "id": "[testdata]/reader.go:Reader",
       "kind": "interface",
       "line": 3,

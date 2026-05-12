@@ -533,12 +533,18 @@ mod tests {
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
         assert_eq!(total, 3);
-        // All three include id/name/kind/file/line/namespace? namespace is "" so omitted.
+        // All three include id/name/kind/line; namespace is "" so omitted.
+        // Phase 3.4 of PaginatedResponseSizeSafety dropped `file` from
+        // SymbolResult — the id already encodes it via
+        // `code_graph_core::symbol_id` (`file:name` /
+        // `file:Parent::name`). Clients recover via
+        // `code_graph_core::id_to_file`.
         for entry in arr {
             assert!(entry.get("id").is_some());
             assert!(entry.get("name").is_some());
             assert!(entry.get("kind").is_some());
-            assert!(entry.get("file").is_some());
+            // `file` must NOT be in the record (dropped in Phase 3.4).
+            assert!(entry.get("file").is_none());
             // brief: signature must be absent.
             assert!(entry.get("signature").is_none());
         }
@@ -779,10 +785,11 @@ mod tests {
         // `limit`, surface `truncated=true`, and report a usable `next_offset`.
         //
         // Fixture: 30 free functions named `func_000`..`func_029` in
-        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~80-90
+        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~60-70
         // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
-        // "function","file":"/big.cpp","line":1}` plus the helper's +1
-        // inter-record comma).
+        // "function","line":1}` plus the helper's +1 inter-record comma).
+        // Phase 3.4 of PaginatedResponseSizeSafety dropped the `file`
+        // field from SymbolResult — the `id` already encodes it.
         //
         // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
         // overhead reservation is 300 bytes, fits a handful of records

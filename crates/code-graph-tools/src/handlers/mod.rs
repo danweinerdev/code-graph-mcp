@@ -32,20 +32,26 @@ use code_graph_core::{symbol_id, Language, Symbol, SymbolKind};
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
-/// JSON-shape mirror of Go's `symbolResult` in
-/// `internal/tools/symbols.go`. Field order, names, and `omitempty` semantics
-/// match exactly so wire-format snapshots stay byte-identical.
+/// JSON-shape record for symbol-list responses across `get_orphans`,
+/// `get_file_symbols`, `search_symbols`, and `get_symbol_detail`.
 ///
 /// The brief-mode behavior is encoded in the field defaults: `column`,
 /// `end_line`, and `signature` get zero/empty values when `brief = true`,
 /// which the `skip_serializing_if` annotations then drop from the JSON
-/// output. This mirrors Go's `omitempty` serialization exactly.
+/// output.
+///
+/// **No `file` field.** Phase 3.4 of `PaginatedResponseSizeSafety` dropped
+/// it as a wire-format optimization: the `id` already encodes the file
+/// path (per [`code_graph_core::symbol_id`] — `file:name` or
+/// `file:Parent::name`), so the dedicated `file` key was a 100% redundant
+/// payload tax. Clients recover the absolute path via
+/// [`code_graph_core::id_to_file`], the documented inverse contract.
+/// Wire-format breaking, pre-1.0 acceptable.
 #[derive(Debug, Serialize)]
 pub struct SymbolResult {
     pub id: String,
     pub name: String,
     pub kind: String,
-    pub file: String,
     pub line: u32,
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub column: u32,
@@ -101,7 +107,6 @@ pub fn symbol_to_result(s: &Symbol, brief: bool) -> SymbolResult {
         id: symbol_id(s),
         name: s.name.clone(),
         kind: kind_str(s.kind).to_string(),
-        file: s.file.clone(),
         line: s.line,
         column: if brief { 0 } else { s.column },
         end_line: if brief { 0 } else { s.end_line },
@@ -425,6 +430,56 @@ mod tests {
             obj["signature"],
             serde_json::json!("void Widget::do_thing()")
         );
+    }
+
+    #[test]
+    fn id_to_file_recovers_dropped_file_field() {
+        // Phase 3.4 of PaginatedResponseSizeSafety: `SymbolResult.file`
+        // was dropped from the wire format because the `id` already
+        // encodes the file path. This test is the round-trip contract:
+        // for any record emitted by `symbol_to_result`, feeding
+        // `record.id` through `code_graph_core::id_to_file` MUST yield
+        // the source `Symbol.file` byte-for-byte. If `id_to_file` ever
+        // diverges from how `symbol_id(s)` is constructed, this test
+        // fails before any client notices.
+        //
+        // Covers both id shapes: free function (`file:name`) and method
+        // (`file:Parent::name`). Both are produced by `symbol_id` (see
+        // `code_graph_core::symbol_id`); both must survive round-trip.
+        use code_graph_core::id_to_file;
+
+        // Method shape — sample sym() has parent="Widget".
+        let s_method = sym();
+        let r_method = symbol_to_result(&s_method, false);
+        let v_method = serde_json::to_value(&r_method).unwrap();
+        let id_method = v_method["id"].as_str().expect("id present");
+        assert_eq!(
+            id_to_file(id_method),
+            s_method.file,
+            "method-shape id_to_file must recover the original file"
+        );
+        // Spot-check the id shape: it MUST contain `Parent::name`.
+        assert_eq!(id_method, "/a.cpp:Widget::do_thing");
+        // And the record MUST NOT carry a `file` key (Phase 3.4 drop).
+        assert!(
+            v_method.as_object().unwrap().get("file").is_none(),
+            "SymbolResult must not serialize a `file` key post-Phase 3.4"
+        );
+
+        // Free-function shape — clear parent to flip the id branch.
+        let mut s_free = sym();
+        s_free.parent.clear();
+        s_free.namespace.clear();
+        s_free.name = "free_fn".to_string();
+        let r_free = symbol_to_result(&s_free, false);
+        let v_free = serde_json::to_value(&r_free).unwrap();
+        let id_free = v_free["id"].as_str().expect("id present");
+        assert_eq!(
+            id_to_file(id_free),
+            s_free.file,
+            "free-function-shape id_to_file must recover the original file"
+        );
+        assert_eq!(id_free, "/a.cpp:free_fn");
     }
 
     #[test]
