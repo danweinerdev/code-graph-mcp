@@ -17,8 +17,8 @@ use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
 use super::{
-    parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json, Page,
-    SymbolResult,
+    byte_budget_take, parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json,
+    Page, SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -113,9 +113,6 @@ pub fn get_orphans(
     brief: Option<bool>,
     max_bytes: usize,
 ) -> CallToolResult {
-    // Plumbed in task 2.0; consumed in task 2.1+ (PaginatedResponseSizeSafety).
-    let _ = max_bytes;
-
     let parsed_kind: Option<SymbolKind> =
         match kind.and_then(|s| if s.is_empty() { None } else { Some(s) }) {
             None => None,
@@ -140,22 +137,28 @@ pub fn get_orphans(
     // tie-break rules.
     matches.sort_by_key(symbol_id);
 
-    // Bounds-safe slice: skip+take never panics on out-of-range offsets,
-    // unlike direct indexing.
-    let results: Vec<SymbolResult> = matches
-        .iter()
-        .skip(resolved_offset as usize)
-        .take(resolved_limit as usize)
-        .map(|s| symbol_to_result(s, resolved_brief))
-        .collect();
+    // Materialize to SymbolResult first, then route through byte_budget_take
+    // (Phase 2 of PaginatedResponseSizeSafety): the helper internally applies
+    // offset+limit skip/take and stops early if the running serialized byte
+    // count would exceed `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept`
+    // from the helper is `results.len() as u32`, NOT the pre-pagination match
+    // count — that's `total` captured above and held unchanged.
+    let (results, _total_kept, truncated, next_offset) = byte_budget_take(
+        matches
+            .into_iter()
+            .map(|s| symbol_to_result(&s, resolved_brief)),
+        resolved_offset,
+        resolved_limit,
+        max_bytes,
+    );
 
     let response = Page::<SymbolResult> {
         results,
         total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated: false,
-        next_offset: None,
+        truncated,
+        next_offset,
     };
     tool_success_json(&response)
 }
@@ -909,6 +912,78 @@ mod tests {
                 "brief=false must include signature: {entry:?}",
             );
         }
+    }
+
+    // --- Phase 2 byte-budget invariants -----------------------------------
+
+    #[test]
+    fn orphans_byte_budget_truncates_oversized_page() {
+        // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` must
+        // make `get_orphans` stop emitting records before reaching `limit`,
+        // surface `truncated=true`, and report a usable `next_offset`.
+        //
+        // Fixture: 30 orphan functions named `func_000`..`func_029` in
+        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~90-100
+        // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
+        // "function","file":"/big.cpp","line":1}` plus the helper's +1
+        // inter-record comma).
+        //
+        // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
+        // overhead reservation is 300 bytes, which fits ~3 records before
+        // the 4th would push past. Asks for `limit=20` so the byte budget
+        // (not the count cap) is what bites. Asserts the documented
+        // truncation semantics: `truncated=true`, `next_offset=Some(n)`
+        // with `n > offset=0`, `results.len() < limit=20`, and
+        // `total >= results.len() + offset`.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_orphan_functions(30));
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
+        let r = get_orphans(&g, None, Some(20), Some(0), None, max_bytes);
+
+        let (arr, total, offset, limit) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+
+        assert!(truncated, "tight max_bytes must produce truncated=true");
+        assert!(
+            (arr.len() as u32) < limit,
+            "truncation must stop before hitting the count cap: results.len()={} >= limit={}",
+            arr.len(),
+            limit,
+        );
+        assert!(
+            !arr.is_empty(),
+            "budget should still admit at least one record",
+        );
+        match next_offset {
+            Some(n) => assert!(
+                n > offset,
+                "next_offset must point past the current page: next_offset={n} <= offset={offset}",
+            ),
+            None => panic!("truncated=true must set next_offset=Some(n)"),
+        }
+        assert!(
+            total >= arr.len() as u32 + offset,
+            "total must be at least the records seen so far: total={total} < results.len()+offset={}",
+            arr.len() as u32 + offset,
+        );
+        // Sanity: total still reflects the full pre-pagination match count.
+        assert_eq!(total, 30, "total is the pre-pagination match count");
+    }
+
+    #[test]
+    fn orphans_byte_budget_no_truncation_with_no_budget() {
+        // Mirror anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the
+        // handler's existing behavior is preserved exactly — no truncation,
+        // no next_offset. Locks the contract that the byte-budget wiring
+        // does not affect callers that opt out.
+        let g = locked(graph_with_n_orphan_functions(30));
+        let r = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
+        let (arr, total, _, _) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert_eq!(arr.len(), 20);
+        assert_eq!(total, 30);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
     }
 
     // --- get_class_hierarchy ---

@@ -214,14 +214,6 @@ pub fn suggest_symbols(graph: &code_graph_graph::Graph, name: &str, limit: usize
 /// ≈ 100 bytes) plus a 5× safety margin. The slack absorbs inter-record
 /// commas, large `total`/`offset`/`limit` integer widths, and any future
 /// envelope-shape additions without forcing a constant bump.
-///
-/// `#[allow(dead_code)]` is intentional for Phase 1 of the
-/// `PaginatedResponseSizeSafety` plan: the constant and its sole consumer
-/// [`byte_budget_take`] ship in Phase 1, but handlers do not wire them up
-/// until Phase 2. Without the allow, `cargo clippy --workspace
-/// --all-targets -- -D warnings` would fail. The allow is removed in Phase 2
-/// once the first handler consumes the helper.
-#[allow(dead_code)]
 pub(super) const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 
 /// Sentinel byte-budget value meaning "no enforcement."
@@ -262,10 +254,6 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// NOT the pre-pagination match count. The handler is responsible for
 /// computing the latter separately (typically via `.count()` on the source
 /// iterator before this helper is called).
-///
-/// `#[allow(dead_code)]` is intentional for Phase 1 of the
-/// `PaginatedResponseSizeSafety` plan — see [`ENVELOPE_OVERHEAD_BYTES`].
-#[allow(dead_code)]
 pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
     iter: I,
     offset: u32,
