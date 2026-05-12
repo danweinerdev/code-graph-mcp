@@ -448,6 +448,7 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{body_text, page_parts};
+    use super::super::NO_BYTE_BUDGET;
     use super::*;
     use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
@@ -680,7 +681,7 @@ mod tests {
     #[test]
     fn orphans_default_returns_callables() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, usize::MAX);
+        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         // foo and baz have no callers; bar is called by foo. cls is a Class
         // and is excluded by the default callable-only filter.
@@ -698,7 +699,7 @@ mod tests {
     #[test]
     fn orphans_kind_class_returns_only_classes() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some("class"), None, None, None, usize::MAX);
+        let r = get_orphans(&g, Some("class"), None, None, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], serde_json::json!("cls"));
@@ -709,7 +710,7 @@ mod tests {
     #[test]
     fn orphans_invalid_kind_errors() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, Some("widget"), None, None, None, usize::MAX);
+        let r = get_orphans(&g, Some("widget"), None, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
     }
@@ -717,7 +718,7 @@ mod tests {
     #[test]
     fn orphans_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, None, None, None, None, usize::MAX);
+        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -731,7 +732,7 @@ mod tests {
         // kind — Go's `req.GetArguments()["kind"].(string)` ignores empty
         // strings via the `&& k != ""` check.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some(""), None, None, None, usize::MAX);
+        let r = get_orphans(&g, Some(""), None, None, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2, "empty kind => default callables-only");
     }
@@ -742,7 +743,7 @@ mod tests {
         // the serialized form even though our test fixture has a non-empty
         // signature on each symbol.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, usize::MAX);
+        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
@@ -782,7 +783,7 @@ mod tests {
     fn orphans_default_limit_is_20() {
         // 25 orphans: default limit (20) returns the first 20; total = 25.
         let g = locked(graph_with_n_orphan_functions(25));
-        let r = get_orphans(&g, None, None, None, None, usize::MAX);
+        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -796,9 +797,9 @@ mod tests {
         // covers all 30 with no overlap.
         let g = locked(graph_with_n_orphan_functions(30));
 
-        let p1 = get_orphans(&g, None, Some(20), Some(0), None, usize::MAX);
+        let p1 = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
         let (a1, t1, _, _) = page_parts(&p1);
-        let p2 = get_orphans(&g, None, Some(20), Some(20), None, usize::MAX);
+        let p2 = get_orphans(&g, None, Some(20), Some(20), None, NO_BYTE_BUDGET);
         let (a2, t2, _, _) = page_parts(&p2);
 
         assert_eq!(a1.len(), 20);
@@ -821,9 +822,9 @@ mod tests {
     fn orphans_total_is_pre_pagination_count() {
         // Same fixture, three different pages — total is identical across all.
         let g = locked(graph_with_n_orphan_functions(30));
-        let r1 = get_orphans(&g, None, Some(20), Some(0), None, usize::MAX);
-        let r2 = get_orphans(&g, None, Some(20), Some(20), None, usize::MAX);
-        let r3 = get_orphans(&g, None, Some(5), Some(10), None, usize::MAX);
+        let r1 = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
+        let r2 = get_orphans(&g, None, Some(20), Some(20), None, NO_BYTE_BUDGET);
+        let r3 = get_orphans(&g, None, Some(5), Some(10), None, NO_BYTE_BUDGET);
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
         let (_, t3, _, _) = page_parts(&r3);
@@ -839,7 +840,7 @@ mod tests {
         // 5-item fixture also verifies all 5 results return — confirming
         // take(1000) doesn't accidentally drop entries on a small set.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(999_999), None, None, usize::MAX);
+        let r = get_orphans(&g, None, Some(999_999), None, None, NO_BYTE_BUDGET);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
         assert_eq!(arr.len(), 5);
@@ -849,7 +850,7 @@ mod tests {
     fn orphans_zero_limit_uses_default() {
         // limit = 0 is treated as "unset"; resolves to default 20.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(0), None, None, usize::MAX);
+        let r = get_orphans(&g, None, Some(0), None, None, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -858,7 +859,7 @@ mod tests {
     fn orphans_offset_beyond_total_returns_empty() {
         // offset >= total returns empty results with the correct total.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, Some(999), None, usize::MAX);
+        let r = get_orphans(&g, None, None, Some(999), None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 2);
@@ -886,7 +887,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = get_orphans(&g, Some("class"), Some(10), None, None, usize::MAX);
+        let r = get_orphans(&g, Some("class"), Some(10), None, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 10);
         assert_eq!(total, 12);
@@ -899,7 +900,7 @@ mod tests {
     fn orphans_brief_false_includes_signature() {
         // brief=false surfaces signature/column/end_line on each row.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, Some(false), usize::MAX);
+        let r = get_orphans(&g, None, None, None, Some(false), NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert!(!arr.is_empty());
         for entry in &arr {

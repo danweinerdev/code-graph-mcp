@@ -513,6 +513,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::handlers::analyze::analyze_codebase;
+    use crate::handlers::NO_BYTE_BUDGET;
     use crate::server::CodeGraphServer;
 
     fn first_text(r: &CallToolResult) -> String {
@@ -771,7 +772,7 @@ mod tests {
             true,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
         // Phase 3: response is now a Page<SymbolResult> envelope.
@@ -858,7 +859,7 @@ mod tests {
             true,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
         // Phase 3: response is now a Page<SymbolResult> envelope.
@@ -902,7 +903,15 @@ mod tests {
 
         // get_file_symbols now produces the canonical not-found wording.
         let path_str = a_cpp.to_string_lossy().into_owned();
-        let r = get_file_symbols(&inner.graph, &path_str, false, true, None, None, usize::MAX);
+        let r = get_file_symbols(
+            &inner.graph,
+            &path_str,
+            false,
+            true,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             first_text(&r),

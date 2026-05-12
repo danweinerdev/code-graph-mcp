@@ -22,6 +22,7 @@ use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::query::get_dependencies;
 use code_graph_tools::handlers::structure::detect_cycles;
 use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_summary};
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
@@ -74,7 +75,7 @@ async fn analyze_then_query_pipeline() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(sr.is_error.is_none() || sr.is_error == Some(false));
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&sr)).unwrap();

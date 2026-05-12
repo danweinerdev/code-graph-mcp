@@ -50,6 +50,7 @@ use code_graph_tools::handlers::structure::{
 use code_graph_tools::handlers::symbols::{
     get_file_symbols, get_symbol_detail, get_symbol_summary, search_symbols, SearchSymbolsInput,
 };
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
 use rmcp::model::CallToolResult;
@@ -192,7 +193,15 @@ async fn response_get_file_symbols_engine_cpp() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -211,7 +220,7 @@ async fn response_search_symbols_query_engine() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -263,7 +272,7 @@ async fn response_get_callers_engine_update() {
         Direction::Callers,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     // No further normalization needed; the envelope itself is deterministic.
@@ -287,7 +296,7 @@ async fn response_get_callees_engine_update() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     let parsed = parsed_sorted(&r);
@@ -343,7 +352,7 @@ async fn response_detect_cycles() {
 #[tokio::test]
 async fn response_get_orphans_default_callables() {
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, None, None, usize::MAX);
+    let r = get_orphans(&fx.inner.graph, None, None, None, None, NO_BYTE_BUDGET);
     // The handler now sorts by `symbol_id` ascending and wraps in the
     // `Page<SymbolResult>` envelope. The envelope itself is deterministic;
     // `parsed_sorted` only normalizes object key order (not array order).
@@ -365,7 +374,7 @@ async fn response_get_orphans_paginated_offset() {
         Some(20),
         Some(20),
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -378,7 +387,14 @@ async fn response_get_orphans_brief_false() {
     // brief=false surfaces signature/column/end_line on each row. Reuse
     // the small testdata/cpp fixture so the snapshot stays readable.
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, None, Some(false), usize::MAX);
+    let r = get_orphans(
+        &fx.inner.graph,
+        None,
+        None,
+        None,
+        Some(false),
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -389,7 +405,7 @@ async fn response_get_orphans_brief_false() {
 async fn response_get_orphans_offset_beyond_total() {
     // offset=999 against a small fixture: results=[], total=<full count>.
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None, usize::MAX);
+    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -529,7 +545,7 @@ async fn response_get_file_symbols_paginated_offset() {
         true,
         Some(50),
         Some(100),
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -552,7 +568,7 @@ async fn response_get_callers_paginated_offset() {
         Direction::Callers,
         Some(50),
         Some(50),
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -575,7 +591,7 @@ async fn response_get_callees_paginated_offset() {
         Direction::Callees,
         Some(50),
         Some(50),
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1044,7 +1060,7 @@ async fn response_search_symbols_helper_language_rust() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1116,7 +1132,7 @@ async fn response_search_symbols_helper_language_go() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1192,7 +1208,15 @@ async fn response_get_file_symbols_go_reader() {
         .join("reader.go")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1330,7 +1354,7 @@ async fn response_search_symbols_helper_language_python() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1346,7 +1370,15 @@ async fn response_get_file_symbols_python_models() {
         .join("models.py")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

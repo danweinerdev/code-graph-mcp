@@ -224,6 +224,11 @@ pub fn suggest_symbols(graph: &code_graph_graph::Graph, name: &str, limit: usize
 #[allow(dead_code)]
 pub(super) const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 
+/// Sentinel byte-budget value meaning "no enforcement."
+/// Used by tests that exercise pagination but not the response-size cap.
+/// Production call sites read [response].max_bytes from RootConfig.
+pub const NO_BYTE_BUDGET: usize = usize::MAX;
+
 /// Apply `offset` + `limit` pagination to `iter` while enforcing a
 /// JSON-serialized byte budget on the returned page. This is the drop-in
 /// replacement for the `.skip(offset).take(limit).collect()` pattern used by

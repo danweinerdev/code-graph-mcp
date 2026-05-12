@@ -141,6 +141,7 @@ pub fn get_dependencies(graph: &RwLock<Graph>, file: &str) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{body_text, page_parts};
+    use super::super::NO_BYTE_BUDGET;
     use super::*;
     use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
@@ -202,7 +203,7 @@ mod tests {
     #[test]
     fn callers_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callers, None, None, usize::MAX);
+        let r = callers_or_callees(&g, "", None, Direction::Callers, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn callees_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callees, None, None, usize::MAX);
+        let r = callers_or_callees(&g, "", None, Direction::Callees, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -225,7 +226,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
@@ -242,7 +243,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
@@ -258,7 +259,7 @@ mod tests {
             Direction::Callees,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2);
@@ -282,7 +283,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
@@ -303,7 +304,7 @@ mod tests {
             Direction::Callees,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
@@ -316,7 +317,15 @@ mod tests {
         let g = locked(graph_with_calls());
         // "a" matches the substring of `/x.cpp:a`. The graph has `a`/`b`/`c`
         // — `a` should be suggested via search_symbols substring matching.
-        let r = callers_or_callees(&g, "a", None, Direction::Callers, None, None, usize::MAX);
+        let r = callers_or_callees(
+            &g,
+            "a",
+            None,
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.starts_with("symbol not found: \"a\""), "got: {text}");
@@ -326,7 +335,15 @@ mod tests {
     #[test]
     fn callers_unknown_symbol_no_suggestions() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "nope", None, Direction::Callers, None, None, usize::MAX);
+        let r = callers_or_callees(
+            &g,
+            "nope",
+            None,
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
     }
@@ -410,7 +427,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -431,7 +448,7 @@ mod tests {
             Direction::Callers,
             Some(100),
             Some(0),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let p2 = callers_or_callees(
             &g,
@@ -440,7 +457,7 @@ mod tests {
             Direction::Callers,
             Some(100),
             Some(100),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -473,7 +490,7 @@ mod tests {
             Direction::Callers,
             Some(50),
             Some(0),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let r2 = callers_or_callees(
             &g,
@@ -482,7 +499,7 @@ mod tests {
             Direction::Callers,
             Some(50),
             Some(50),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let r3 = callers_or_callees(
             &g,
@@ -491,7 +508,7 @@ mod tests {
             Direction::Callers,
             Some(10),
             Some(140),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -511,7 +528,7 @@ mod tests {
             Direction::Callers,
             Some(999_999),
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -528,7 +545,7 @@ mod tests {
             Direction::Callers,
             Some(0),
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -544,7 +561,7 @@ mod tests {
             Direction::Callers,
             None,
             Some(999),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -590,7 +607,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
@@ -615,7 +632,7 @@ mod tests {
             Direction::Callees,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -634,7 +651,7 @@ mod tests {
             Direction::Callees,
             Some(100),
             Some(0),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let p2 = callers_or_callees(
             &g,
@@ -643,7 +660,7 @@ mod tests {
             Direction::Callees,
             Some(100),
             Some(100),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -672,7 +689,7 @@ mod tests {
             Direction::Callees,
             Some(50),
             Some(0),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let r2 = callers_or_callees(
             &g,
@@ -681,7 +698,7 @@ mod tests {
             Direction::Callees,
             Some(50),
             Some(50),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let r3 = callers_or_callees(
             &g,
@@ -690,7 +707,7 @@ mod tests {
             Direction::Callees,
             Some(10),
             Some(140),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -710,7 +727,7 @@ mod tests {
             Direction::Callees,
             Some(999_999),
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -727,7 +744,7 @@ mod tests {
             Direction::Callees,
             Some(0),
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -743,7 +760,7 @@ mod tests {
             Direction::Callees,
             None,
             Some(999),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -783,7 +800,7 @@ mod tests {
             Direction::Callees,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);

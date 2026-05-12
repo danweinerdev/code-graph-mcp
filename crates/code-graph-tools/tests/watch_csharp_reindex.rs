@@ -43,6 +43,7 @@ use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_detail};
 use code_graph_tools::handlers::watch::{
     try_reindex_file, watch_start, watch_stop, ReindexOutcome,
 };
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
@@ -204,7 +205,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -256,7 +257,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -308,7 +309,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -378,7 +379,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     if r.is_error == Some(true) {
         let body = first_text(&r);
@@ -486,7 +487,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -516,7 +517,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let names_a = symbol_names_from(&first_text(&r));
     assert!(
@@ -531,7 +532,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let names_b = symbol_names_from(&first_text(&r));
     assert!(
@@ -565,7 +566,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let names_c = symbol_names_from(&first_text(&r));
     assert!(
@@ -602,7 +603,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert_eq!(
         r.is_error,

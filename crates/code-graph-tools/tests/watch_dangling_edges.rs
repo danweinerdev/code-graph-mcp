@@ -31,6 +31,7 @@ use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::query::{callers_or_callees, Direction};
 use code_graph_tools::handlers::symbols::get_symbol_detail;
 use code_graph_tools::handlers::watch::{try_reindex_file, ReindexOutcome};
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
@@ -94,7 +95,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -133,7 +134,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

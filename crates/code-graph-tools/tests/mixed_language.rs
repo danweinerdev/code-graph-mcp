@@ -38,6 +38,7 @@ use code_graph_tools::handlers::structure::{
     generate_diagram, get_class_hierarchy, GenerateDiagramInput,
 };
 use code_graph_tools::handlers::symbols::{search_symbols, SearchSymbolsInput};
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
@@ -214,7 +215,7 @@ async fn search_helper_no_filter_returns_all_four_languages() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -252,7 +253,7 @@ async fn search_helper_language_cpp_returns_only_cpp() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -274,7 +275,7 @@ async fn search_helper_language_rust_returns_only_rust() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -296,7 +297,7 @@ async fn search_helper_language_go_returns_only_go() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -318,7 +319,7 @@ async fn search_helper_language_python_returns_only_python() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -523,7 +524,7 @@ async fn search_init_returns_all_five_languages() {
             brief: true,
             ..Default::default()
         },
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -635,7 +636,7 @@ async fn cross_language_init_callers_stay_isolated() {
             Direction::Callers,
             None,
             None,
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&first_text(&resp)).expect("get_callers response is JSON");

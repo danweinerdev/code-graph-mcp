@@ -240,6 +240,7 @@ pub fn get_symbol_summary(graph: &RwLock<Graph>, file: Option<&str>) -> CallTool
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{body_text, page_parts};
+    use super::super::NO_BYTE_BUDGET;
     use super::*;
     use code_graph_core::{FileGraph, Language, Symbol, SymbolKind};
 
@@ -282,7 +283,7 @@ mod tests {
     #[test]
     fn file_symbols_missing_file_param_errors() {
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "", false, true, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "", false, true, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn file_symbols_unknown_file_errors() {
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
     }
@@ -310,7 +311,7 @@ mod tests {
             true,
             Some(50),
             Some(10),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
@@ -338,7 +339,15 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_file_symbols(&g, "/methods_only.cpp", true, true, None, None, usize::MAX);
+        let r = get_file_symbols(
+            &g,
+            "/methods_only.cpp",
+            true,
+            true,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         // Not a tool error.
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
@@ -351,7 +360,7 @@ mod tests {
     #[test]
     fn file_symbols_returns_full_list_in_brief_mode() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
@@ -370,7 +379,7 @@ mod tests {
     #[test]
     fn file_symbols_top_level_only_filters_out_methods() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         // 3 symbols total, but `do_thing` has parent="Bar" so it's filtered.
         assert_eq!(arr.len(), 2);
@@ -386,7 +395,7 @@ mod tests {
     #[test]
     fn file_symbols_brief_false_includes_signature() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", false, false, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "/a.cpp", false, false, None, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
@@ -424,7 +433,7 @@ mod tests {
     #[test]
     fn file_symbols_default_limit_is_100() {
         let g = locked(graph_with_n_file_symbols(120));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, None, None, usize::MAX);
+        let r = get_file_symbols(&g, "/big.cpp", false, true, None, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
         assert_eq!(total, 120);
@@ -435,7 +444,15 @@ mod tests {
     #[test]
     fn file_symbols_page_1_and_page_2_cover_full_set() {
         let g = locked(graph_with_n_file_symbols(150));
-        let p1 = get_file_symbols(&g, "/big.cpp", false, true, Some(100), Some(0), usize::MAX);
+        let p1 = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(100),
+            Some(0),
+            NO_BYTE_BUDGET,
+        );
         let p2 = get_file_symbols(
             &g,
             "/big.cpp",
@@ -443,7 +460,7 @@ mod tests {
             true,
             Some(100),
             Some(100),
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -469,9 +486,33 @@ mod tests {
     #[test]
     fn file_symbols_total_is_pre_pagination_count() {
         let g = locked(graph_with_n_file_symbols(150));
-        let r1 = get_file_symbols(&g, "/big.cpp", false, true, Some(50), Some(0), usize::MAX);
-        let r2 = get_file_symbols(&g, "/big.cpp", false, true, Some(50), Some(50), usize::MAX);
-        let r3 = get_file_symbols(&g, "/big.cpp", false, true, Some(10), Some(140), usize::MAX);
+        let r1 = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(50),
+            Some(0),
+            NO_BYTE_BUDGET,
+        );
+        let r2 = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(50),
+            Some(50),
+            NO_BYTE_BUDGET,
+        );
+        let r3 = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(10),
+            Some(140),
+            NO_BYTE_BUDGET,
+        );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
         let (_, t3, _, _) = page_parts(&r3);
@@ -486,7 +527,15 @@ mod tests {
         // the response echoes the clamped value. The 5-row count also
         // verifies take(1000) doesn't drop entries on a small set.
         let g = locked(graph_with_n_file_symbols(5));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(999_999), None, usize::MAX);
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(999_999),
+            None,
+            NO_BYTE_BUDGET,
+        );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
         assert_eq!(arr.len(), 5);
@@ -495,7 +544,7 @@ mod tests {
     #[test]
     fn file_symbols_zero_limit_uses_default() {
         let g = locked(graph_with_n_file_symbols(5));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(0), None, usize::MAX);
+        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(0), None, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
     }
@@ -503,7 +552,7 @@ mod tests {
     #[test]
     fn file_symbols_offset_beyond_total_returns_empty() {
         let g = locked(graph_with_n_file_symbols(5));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, None, Some(999), usize::MAX);
+        let r = get_file_symbols(&g, "/big.cpp", false, true, None, Some(999), NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 5);
@@ -523,7 +572,7 @@ mod tests {
     #[test]
     fn search_symbols_no_filter_errors() {
         let g = locked(small_graph());
-        let r = search_symbols(&g, search_input(), usize::MAX);
+        let r = search_symbols(&g, search_input(), NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             body_text(&r),
@@ -537,7 +586,7 @@ mod tests {
         // language filter too). Locked in here so future edits to the message
         // are caught.
         let g = locked(small_graph());
-        let r = search_symbols(&g, search_input(), usize::MAX);
+        let r = search_symbols(&g, search_input(), NO_BYTE_BUDGET);
         assert_eq!(
             body_text(&r),
             "'query', 'kind', 'namespace', or 'language' is required"
@@ -556,7 +605,7 @@ mod tests {
                 language: Some(""),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));
     }
@@ -570,7 +619,7 @@ mod tests {
                 kind: Some("widget"),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
@@ -585,7 +634,7 @@ mod tests {
                 language: Some("ruby"),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid language: ruby");
@@ -602,7 +651,7 @@ mod tests {
                 offset: Some(0),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
@@ -622,7 +671,7 @@ mod tests {
                 limit: Some(0),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // limit=0 normalized to 20.
@@ -638,7 +687,7 @@ mod tests {
                 kind: Some("function"),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // 1 Function symbol in the small graph (foo).
@@ -654,7 +703,7 @@ mod tests {
                 language: Some("cpp"),
                 ..search_input()
             },
-            usize::MAX,
+            NO_BYTE_BUDGET,
         );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // All three sample symbols are Cpp.

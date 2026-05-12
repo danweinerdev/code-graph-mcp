@@ -24,6 +24,7 @@ use code_graph_lang_cpp::CppParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::symbols::get_file_symbols;
 use code_graph_tools::handlers::watch::{watch_start, watch_stop};
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
@@ -145,7 +146,7 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                         true,
                         None,
                         None,
-                        usize::MAX,
+                        NO_BYTE_BUDGET,
                     );
                     // Either:
                     //  - success: body is a Page<SymbolResult> envelope, or
@@ -221,7 +222,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
     assert!(
@@ -261,7 +262,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         pre.is_error.is_none() || pre.is_error == Some(false),
@@ -286,7 +287,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert_eq!(
         r.is_error,

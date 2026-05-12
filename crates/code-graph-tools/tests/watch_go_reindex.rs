@@ -31,6 +31,7 @@ use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_detail};
 use code_graph_tools::handlers::watch::{
     try_reindex_file, watch_start, watch_stop, ReindexOutcome,
 };
+use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
@@ -131,7 +132,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -152,7 +153,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -201,7 +202,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         true,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -229,7 +230,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
-        usize::MAX,
+        NO_BYTE_BUDGET,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {
