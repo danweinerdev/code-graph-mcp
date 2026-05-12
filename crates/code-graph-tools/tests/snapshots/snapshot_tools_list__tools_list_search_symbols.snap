@@ -26,7 +26,7 @@ expression: "tool_entry(\"search_symbols\")"
       },
       "kind": {
         "default": null,
-        "description": "Filter by symbol kind: function, method, class, struct, enum, typedef",
+        "description": "Filter by symbol kind: function, method, class, struct, enum, typedef, interface, trait",
         "type": [
           "string",
           "null"
