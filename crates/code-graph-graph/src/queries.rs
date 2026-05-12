@@ -190,10 +190,6 @@ impl Graph {
     /// less memory and ~5× fewer comparisons than the previous algorithm
     /// — and `total` is still exact, unlike an early-exit approach.
     pub fn search(&self, mut params: SearchParams) -> SearchResult {
-        if params.limit == 0 {
-            params.limit = 20;
-        }
-
         // Pre-compute lowercase forms once outside the hot loop. The regex
         // is only built when pattern is non-empty; substring fallback uses
         // `lower_pattern` whether or not the regex compiled (cheap to keep
@@ -257,6 +253,15 @@ impl Graph {
                 symbols: Vec::new(),
                 total,
             };
+        }
+
+        // Resolve `limit = 0` to the default 20 on the materializing path.
+        // The count_only branch above returns before this line, so it never
+        // sees the default — count_only callers pass `limit = 0` as a
+        // "don't care" sentinel and `params.limit` stays 0 if they inspect
+        // it after the call.
+        if params.limit == 0 {
+            params.limit = 20;
         }
 
         // Bounded max-heap: holds at most (offset + limit) entries, the N
