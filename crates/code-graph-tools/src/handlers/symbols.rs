@@ -173,7 +173,8 @@ pub struct SearchSymbolsInput<'a> {
     /// `truncated: false`, `next_offset: None`) without materializing
     /// `SymbolResult`s. Wired into the early-return path in Phase 3.2
     /// of `PaginatedResponseSizeSafety`; the Graph-layer heap short-
-    /// circuit lands in task 3.3.
+    /// circuit (`SearchParams.count_only`) lands in task 3.3 so the
+    /// BinaryHeap<TopEntry> is never constructed on this path.
     pub count_only: bool,
 }
 
@@ -239,30 +240,20 @@ pub fn search_symbols(
     let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
 
-    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
-    // delegate to `Graph::search` and emit the sentinel envelope using
-    // `sr.total` (the pre-pagination match count is reported regardless of
-    // limit/offset, so the count is correct even without a Graph-layer
-    // short-circuit). Phase 3.3 will thread `count_only` into `SearchParams`
-    // so the `BinaryHeap<TopEntry>` is never constructed; for 3.2 the heap
-    // is still built but the resulting page is discarded. Acceptable interim
-    // per the plan's task 3.2 spec.
+    // Count-only short-circuit (Phase 3.3 of PaginatedResponseSizeSafety):
+    // delegate to `Graph::search` with `count_only=true` so the
+    // BinaryHeap<TopEntry> is never constructed. `sr.symbols` is guaranteed
+    // empty on this path; only `sr.total` (the pre-pagination match count)
+    // is meaningful. Emit the documented sentinel envelope.
     if input.count_only {
-        // Pass `limit = 1` to minimize the heap's memory footprint during
-        // this interim path — `sr.total` is independent of the limit, so
-        // a small limit yields the correct count without paying the cost
-        // of a full-page allocation. Cannot use `limit = 0`: `Graph::search`
-        // normalizes 0 to the default 20 at queries.rs (the contract is
-        // "0 means use the default"), so the heap would still allocate
-        // 20 slots. `limit = 1` is the smallest value that bypasses that
-        // normalization.
         let sr = graph.read().search(SearchParams {
             pattern: query_str.to_string(),
             kind: parsed_kind,
             namespace: namespace_str.to_string(),
             language: parsed_language,
-            limit: 1,
+            limit: 0,
             offset: 0,
+            count_only: true,
         });
         // `limit: 0` is a deliberate exception to the
         // "envelope echoes resolved limit" contract — see plan Decision 9.
@@ -288,6 +279,7 @@ pub fn search_symbols(
         language: parsed_language,
         limit: resolved_limit,
         offset: resolved_offset,
+        count_only: false,
     });
 
     // `sr.symbols` is the already-sliced page (length <= resolved_limit).
@@ -1470,7 +1462,7 @@ mod tests {
 
     #[test]
     fn search_symbols_count_only_returns_sentinel_envelope_under_1kb() {
-        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
+        // Phase 3 of PaginatedResponseSizeSafety: when count_only=true, the
         // handler emits Page { results: [], total: <real count>, offset: 0,
         // limit: 0, truncated: false, next_offset: None } regardless of how
         // many records WOULD have been returned. Serialized envelope must
@@ -1483,9 +1475,9 @@ mod tests {
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         //
-        // Note: this task (3.2) accepts the interim cost of building the
-        // BinaryHeap inside Graph::search; task 3.3 will thread count_only
-        // into SearchParams so the heap is never constructed.
+        // Task 3.3 threads `count_only` into `SearchParams`, so the
+        // BinaryHeap<TopEntry> is never constructed on this path — the
+        // wire-format contract above is unchanged.
         let g = locked(graph_with_n_broad_matches(1000));
         let r = search_symbols(
             &g,

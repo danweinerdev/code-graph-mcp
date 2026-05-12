@@ -20,6 +20,48 @@ use regex::Regex;
 
 use crate::Graph;
 
+// Test-only counter incremented on every `BinaryHeap::push` call inside
+// `Graph::search`. Used by the heap-not-touched test in Phase 3.3 of
+// `PaginatedResponseSizeSafety` to pin the cost win of `count_only=true` to
+// observable behavior: a future refactor that accidentally re-introduces
+// heap construction on the count-only path would make
+// `search_count_only_does_not_push_heap` fail immediately. Reset between
+// measurements via `reset_heap_pushes`; read via `heap_pushes`. Hidden
+// behind `#[cfg(test)]` so production builds carry no overhead.
+//
+// **Thread-local on purpose:** cargo test runs `#[test]`s on a thread pool
+// by default, and many other tests in this module also exercise
+// `Graph::search`. A process-global atomic would race across parallel
+// tests, contaminating the count. A `thread_local!` counter is observed
+// only by the test on the current thread, so the heap-not-touched test
+// can run in parallel with the rest of the suite without serialization.
+//
+// Plain `//` rather than `///` because `thread_local!` is a macro
+// invocation and rustdoc emits `unused_doc_comments` on the inner item.
+#[cfg(test)]
+thread_local! {
+    static HEAP_PUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the heap-push counter to zero before a measurement. Test-only.
+#[cfg(test)]
+pub(crate) fn reset_heap_pushes() {
+    HEAP_PUSHES.with(|c| c.set(0));
+}
+
+/// Read the current value of the heap-push counter. Test-only.
+#[cfg(test)]
+pub(crate) fn heap_pushes() -> usize {
+    HEAP_PUSHES.with(|c| c.get())
+}
+
+/// Increment the counter by 1. Test-only.
+#[cfg(test)]
+#[inline]
+fn bump_heap_pushes() {
+    HEAP_PUSHES.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Heap entry for the bounded-top-N search algorithm. Keyed by `id`
 /// (the precomputed `symbol_id`), with a borrowed `Symbol` reference so
 /// the heap doesn't clone every match. The Ord impl makes
@@ -75,6 +117,18 @@ pub struct SearchParams {
     /// Skip the first N matches. Bounded to `total` so out-of-range offsets
     /// return an empty page rather than panicking.
     pub offset: u32,
+    /// When `true`, [`Graph::search`] short-circuits before the
+    /// `BinaryHeap<TopEntry>` push/pop loop: it walks the match predicate to
+    /// compute the exact `total` count, then returns
+    /// `SearchResult { symbols: vec![], total }` without ever allocating the
+    /// heap or cloning a Symbol. The wire-format envelope is unchanged; the
+    /// optimization is internal. `Default` is `false`, so existing call sites
+    /// that construct via `..SearchParams::default()` keep their behavior.
+    /// Threaded into the search-symbols count-only path in Phase 3.3 of
+    /// `PaginatedResponseSizeSafety` (the architectural exception path for
+    /// search-symbols-specific count-only — orphans / file_symbols compute
+    /// `total` directly from their filtered Vec, no heap involved).
+    pub count_only: bool,
 }
 
 /// Paginated search response.
@@ -152,6 +206,59 @@ impl Graph {
         };
         let lower_ns = params.namespace.to_lowercase();
 
+        // count_only short-circuit (Phase 3.3 of PaginatedResponseSizeSafety):
+        // walk the match predicate exactly as the materializing path does,
+        // but skip the BinaryHeap allocation, the per-match `symbol_id`
+        // formatting, and the Vec<Symbol> clone at the end. The returned
+        // `total` is byte-identical to the materializing path's total because
+        // both branches share the same matchers; only the per-match work
+        // diverges. `params.offset` is intentionally ignored — count_only
+        // callers opted out of paging, and `total` is the pre-pagination
+        // match count by definition.
+        if params.count_only {
+            let mut total: u32 = 0;
+            for node in self.nodes.values() {
+                let s = &node.symbol;
+
+                if let Some(k) = params.kind {
+                    if s.kind != k {
+                        continue;
+                    }
+                }
+
+                if let Some(l) = params.language {
+                    if s.language != l {
+                        continue;
+                    }
+                }
+
+                if !lower_ns.is_empty() && !s.namespace.to_lowercase().contains(&lower_ns) {
+                    continue;
+                }
+
+                if !params.pattern.is_empty() {
+                    let full_name = if s.parent.is_empty() {
+                        s.name.clone()
+                    } else {
+                        format!("{}::{}", s.parent, s.name)
+                    };
+                    let matched = match &re {
+                        Some(r) => r.is_match(&full_name),
+                        None => full_name.to_lowercase().contains(&lower_pattern),
+                    };
+                    if !matched {
+                        continue;
+                    }
+                }
+
+                total = total.saturating_add(1);
+            }
+            return SearchResult {
+                symbols: Vec::new(),
+                total,
+            };
+        }
+
         // Bounded max-heap: holds at most (offset + limit) entries, the N
         // lexicographically-smallest symbol IDs seen so far. Eviction
         // happens when a new match's ID is smaller than the current max
@@ -205,10 +312,14 @@ impl Graph {
             let id = symbol_id(s);
             if top.len() < cap {
                 top.push(TopEntry { id, sym: s });
+                #[cfg(test)]
+                bump_heap_pushes();
             } else if let Some(top_max) = top.peek() {
                 if id < top_max.id {
                     top.pop();
                     top.push(TopEntry { id, sym: s });
+                    #[cfg(test)]
+                    bump_heap_pushes();
                 }
             }
         }
@@ -732,6 +843,115 @@ mod tests {
         assert_eq!(ids[1], "/a.cpp:mu");
         assert_eq!(ids[2], "/z.cpp:alpha");
         assert_eq!(ids[3], "/z.cpp:zeta");
+    }
+
+    // --- search: count_only -------------------------------------------------
+
+    /// Build a graph with `n` free functions named `match_NNN` in `/big.cpp`.
+    /// Zero-padded so ids sort lexically. All symbols pass a
+    /// `pattern = "match"` filter, so the test exercises a path where every
+    /// node hits the heap (or the count-only short-circuit's counter).
+    fn graph_with_n_matching(n: usize) -> Graph {
+        let mut g = Graph::new();
+        let symbols: Vec<Symbol> = (0..n)
+            .map(|i| sym(&format!("match_{i:03}"), SymbolKind::Function, "/big.cpp"))
+            .collect();
+        g.merge_file_graph(make_fg("/big.cpp", Language::Cpp, symbols, vec![]));
+        g
+    }
+
+    #[test]
+    fn search_count_only_returns_zero_symbols_and_real_total() {
+        // count_only=true: results MUST be empty; total MUST be the
+        // pre-pagination match count (NOT zero, NOT capped by limit).
+        let g = graph_with_n_matching(50);
+        let result = g.search(SearchParams {
+            pattern: "match".to_string(),
+            count_only: true,
+            ..SearchParams::default()
+        });
+        assert!(
+            result.symbols.is_empty(),
+            "count_only must emit empty symbols"
+        );
+        assert_eq!(result.total, 50, "total must reflect true match count");
+    }
+
+    #[test]
+    fn search_count_only_total_matches_regular_search_total() {
+        // Behavioral test (plan task 3.3): a count_only=true call MUST report
+        // the same `total` as a regular call (limit=1, count_only=false)
+        // against the same fixture. `total` is the pre-pagination match count
+        // and must be independent of the count_only flag.
+        let g = graph_with_n_matching(50);
+        let count_only = g.search(SearchParams {
+            pattern: "match".to_string(),
+            count_only: true,
+            limit: 0,
+            offset: 0,
+            ..SearchParams::default()
+        });
+        let regular = g.search(SearchParams {
+            pattern: "match".to_string(),
+            count_only: false,
+            limit: 1,
+            offset: 0,
+            ..SearchParams::default()
+        });
+        assert_eq!(
+            count_only.total, regular.total,
+            "count_only and regular search must report the same total"
+        );
+        assert_eq!(count_only.total, 50);
+        assert!(count_only.symbols.is_empty());
+        assert_eq!(regular.symbols.len(), 1);
+    }
+
+    #[test]
+    fn search_count_only_does_not_push_heap() {
+        // Pins the cost win of count_only=true to observable behavior:
+        // `Graph::search` MUST NOT push anything onto the BinaryHeap when
+        // count_only is true. Without this guard, a future refactor could
+        // re-introduce heap construction on the count-only path and the wire
+        // format would still pass — but the perf optimization would be silently
+        // lost. HEAP_PUSHES is a thread-local counter (gated `#[cfg(test)]`),
+        // so this test runs unmolested in parallel with the rest of the suite
+        // — the increment on the test thread is observed only here.
+        let g = graph_with_n_matching(100);
+
+        // Phase 1: count_only=true MUST push zero entries.
+        reset_heap_pushes();
+        let count_only = g.search(SearchParams {
+            pattern: "match".to_string(),
+            count_only: true,
+            ..SearchParams::default()
+        });
+        let pushes_count_only = heap_pushes();
+        assert_eq!(count_only.total, 100);
+        assert!(count_only.symbols.is_empty());
+        assert_eq!(
+            pushes_count_only, 0,
+            "count_only=true must skip the heap entirely; got {pushes_count_only} pushes"
+        );
+
+        // Phase 2: count_only=false MUST push at least once. This sentinel
+        // catches the inverse failure mode — a refactor that accidentally
+        // disables the counter (e.g. removes the `#[cfg(test)]` increment
+        // sites) — which would make Phase 1's assertion trivially pass.
+        reset_heap_pushes();
+        let regular = g.search(SearchParams {
+            pattern: "match".to_string(),
+            count_only: false,
+            limit: 10,
+            ..SearchParams::default()
+        });
+        let pushes_regular = heap_pushes();
+        assert_eq!(regular.total, 100);
+        assert_eq!(regular.symbols.len(), 10);
+        assert!(
+            pushes_regular > 0,
+            "count_only=false must push the heap (sentinel against a no-op counter); got {pushes_regular} pushes"
+        );
     }
 
     // --- search_symbols (legacy wrapper) ---
