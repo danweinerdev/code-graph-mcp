@@ -50,7 +50,7 @@ use code_graph_tools::handlers::structure::{
 use code_graph_tools::handlers::symbols::{
     get_file_symbols, get_symbol_detail, get_symbol_summary, search_symbols, SearchSymbolsInput,
 };
-use code_graph_tools::handlers::NO_BYTE_BUDGET;
+use code_graph_tools::handlers::{ENVELOPE_OVERHEAD_BYTES, NO_BYTE_BUDGET};
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
 use rmcp::model::CallToolResult;
@@ -427,7 +427,7 @@ async fn response_get_orphans_byte_budget_truncated() {
     // `N < limit`, and `total:25` (pre-pagination match count is
     // unchanged regardless of truncation).
     let fx = build_indexed_fixture_with_many_orphans(25).await;
-    let max_bytes = 512 + 400; // ENVELOPE_OVERHEAD_BYTES + budget
+    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
     let r = get_orphans(
         &fx.inner.graph,
         Some("function"),
@@ -603,7 +603,7 @@ async fn response_get_file_symbols_byte_budget_truncated() {
         .join("big.cpp")
         .to_string_lossy()
         .into_owned();
-    let max_bytes = 512 + 400; // ENVELOPE_OVERHEAD_BYTES + budget
+    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
     let r = get_file_symbols(
         &fx.inner.graph,
         &file,
@@ -661,7 +661,7 @@ async fn response_get_callers_byte_budget_truncated() {
     // handler's pre-truncation sort.
     let fx = build_indexed_fixture_with_high_fan().await;
     let id = format!("{}:target", fx.indexed_root.join("hub.cpp").display());
-    let max_bytes = 512 + 400; // ENVELOPE_OVERHEAD_BYTES + budget
+    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
     let r = callers_or_callees(
         &fx.inner.graph,
         &id,

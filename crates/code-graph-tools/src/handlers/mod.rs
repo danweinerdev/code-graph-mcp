@@ -214,7 +214,7 @@ pub fn suggest_symbols(graph: &code_graph_graph::Graph, name: &str, limit: usize
 /// ≈ 100 bytes) plus a 5× safety margin. The slack absorbs inter-record
 /// commas, large `total`/`offset`/`limit` integer widths, and any future
 /// envelope-shape additions without forcing a constant bump.
-pub(super) const ENVELOPE_OVERHEAD_BYTES: usize = 512;
+pub const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 
 /// Sentinel byte-budget value meaning "no enforcement."
 /// Used by tests that exercise pagination but not the response-size cap.
