@@ -643,6 +643,41 @@ async fn response_get_callers_paginated_offset() {
 }
 
 #[tokio::test]
+async fn response_get_callers_byte_budget_truncated() {
+    // Phase 2 of PaginatedResponseSizeSafety (task 2.3): a tight `max_bytes`
+    // forces the handler to stop emitting CallChain records before reaching
+    // `limit`, returns `truncated=true` and a `next_offset` pointing past
+    // the partial page.
+    //
+    // Reuses the 60-caller high-fan fixture so the per-record serialized
+    // shape is small and predictable. With a budget of ~400 bytes after
+    // envelope overhead, only a handful of records fit before the budget
+    // bites. `limit=50` is well above what fits, so the byte budget (not
+    // the count cap) is what trims the page. The snapshot locks the
+    // truncated-page shape: `truncated:true`, `next_offset:N` where
+    // `N < limit`, `total:60` (pre-pagination match count is unchanged
+    // regardless of truncation), and the kept records are in
+    // (depth, symbol_id) ascending order — the helper preserves the
+    // handler's pre-truncation sort.
+    let fx = build_indexed_fixture_with_high_fan().await;
+    let id = format!("{}:target", fx.indexed_root.join("hub.cpp").display());
+    let max_bytes = 512 + 400; // ENVELOPE_OVERHEAD_BYTES + budget
+    let r = callers_or_callees(
+        &fx.inner.graph,
+        &id,
+        Some(1),
+        Direction::Callers,
+        Some(50),
+        Some(0),
+        max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
 async fn response_get_callees_paginated_offset() {
     // Page-2 snapshot: hub symbol with 60 callees. Request
     // offset=50 limit=50 — slice taken from the sorted (depth, symbol_id)

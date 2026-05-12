@@ -13,7 +13,7 @@ use code_graph_graph::{CallChain, Graph};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 
-use super::{suggest_symbols, tool_error, tool_success_json, Page};
+use super::{byte_budget_take, suggest_symbols, tool_error, tool_success_json, Page};
 
 /// Direction for [`callers_or_callees`]. Reverse → [`Graph::callers`];
 /// Forward → [`Graph::callees`].
@@ -53,9 +53,6 @@ pub fn callers_or_callees(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    // Plumbed in task 2.0; consumed in task 2.3 / 2.4 (PaginatedResponseSizeSafety).
-    let _ = max_bytes;
-
     if symbol.is_empty() {
         return tool_error("'symbol' is required");
     }
@@ -105,20 +102,23 @@ pub fn callers_or_callees(
             .then_with(|| a.symbol_id.cmp(&b.symbol_id))
     });
 
-    // Bounds-safe slice via skip+take.
-    let page: Vec<CallChain> = chains
-        .into_iter()
-        .skip(resolved_offset as usize)
-        .take(resolved_limit as usize)
-        .collect();
+    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety).
+    // The helper internally applies offset+limit skip/take and stops early if
+    // the running serialized byte count would exceed `max_bytes -
+    // ENVELOPE_OVERHEAD_BYTES`. The helper preserves iteration order, so the
+    // (depth, symbol_id) sort above is preserved across truncation: kept
+    // records are a strict prefix of the sorted chain set. `total` (captured
+    // above) remains the pre-pagination match count regardless of truncation.
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(chains, resolved_offset, resolved_limit, max_bytes);
 
     let response = Page::<CallChain> {
-        results: page,
+        results,
         total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated: false,
-        next_offset: None,
+        truncated,
+        next_offset,
     };
     tool_success_json(&response)
 }
@@ -618,6 +618,206 @@ mod tests {
         assert_eq!(arr[1]["symbol_id"], serde_json::json!("/x.cpp:d_near_b"));
         assert_eq!(arr[2]["depth"], serde_json::json!(2));
         assert_eq!(arr[2]["symbol_id"], serde_json::json!("/x.cpp:d_far"));
+    }
+
+    // --- Phase 2 byte-budget invariants (callers direction) --------------
+    //
+    // Task 2.3 of PaginatedResponseSizeSafety. The companion callees-side
+    // test lives in task 2.4 (same handler, same wiring — distinct
+    // fixture/assertions).
+
+    /// Build a graph with `per_depth` distinct callers at each of three
+    /// depths (1, 2, 3) feeding a single hub `target`. Names are
+    /// zero-padded and per-depth-prefixed so the (depth, symbol_id) sort
+    /// order is predictable: `d1_caller_NNN` < `d2_caller_NNN` < `d3_caller_NNN`
+    /// within each depth bucket. At BFS depth=3, the handler returns
+    /// `3 * per_depth` chains.
+    ///
+    /// Layout (per_depth=3 example):
+    ///   d3_caller_002 -> d2_caller_002 -> d1_caller_002 -> target
+    ///   d3_caller_001 -> d2_caller_001 -> d1_caller_001 -> target
+    ///   d3_caller_000 -> d2_caller_000 -> d1_caller_000 -> target
+    fn graph_with_layered_callers(per_depth: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(per_depth * 3);
+        let mut edges: Vec<Edge> = Vec::with_capacity(per_depth * 3);
+        for i in 0..per_depth {
+            let d1 = format!("d1_caller_{i:03}");
+            let d2 = format!("d2_caller_{i:03}");
+            let d3 = format!("d3_caller_{i:03}");
+            symbols.push(sym(&d1, "/big.cpp"));
+            symbols.push(sym(&d2, "/big.cpp"));
+            symbols.push(sym(&d3, "/big.cpp"));
+            // d1 -> target (depth=1)
+            edges.push(call_edge(
+                &format!("/big.cpp:{d1}"),
+                "/hub.cpp:target",
+                "/big.cpp",
+                (i * 3 + 1) as u32,
+            ));
+            // d2 -> d1 (depth=2 in callers BFS from target)
+            edges.push(call_edge(
+                &format!("/big.cpp:{d2}"),
+                &format!("/big.cpp:{d1}"),
+                "/big.cpp",
+                (i * 3 + 2) as u32,
+            ));
+            // d3 -> d2 (depth=3)
+            edges.push(call_edge(
+                &format!("/big.cpp:{d3}"),
+                &format!("/big.cpp:{d2}"),
+                "/big.cpp",
+                (i * 3 + 3) as u32,
+            ));
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/big.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges,
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/hub.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("target", "/hub.cpp")],
+            edges: vec![],
+        });
+        g
+    }
+
+    #[test]
+    fn callers_byte_budget_preserves_depth_sort_order() {
+        // Phase 2 of PaginatedResponseSizeSafety, task 2.3: byte-budget
+        // truncation must not reorder the (depth, symbol_id)-sorted chain
+        // set. The helper preserves iteration order, so kept records are a
+        // strict prefix of the sorted chain — i.e. `max(kept depth) <=
+        // min(would-be-next-page depth)` and within-depth ties are
+        // tiebroken by symbol_id ascending.
+        //
+        // Fixture: 30 callers spread across depths 1/2/3 (10 each). With a
+        // tight `max_bytes` that fits only ~8 records, truncation must
+        // happen within the depth-1 bucket (the sorted prefix). The first
+        // dropped record is also at depth=1, so kept depths are
+        // non-decreasing and bounded above by the dropped page's first
+        // depth.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_layered_callers(10));
+        // Each CallChain serializes to roughly 90-110 bytes:
+        //   {"symbol_id":"/big.cpp:d1_caller_NNN","file":"/big.cpp","line":N,"depth":1}
+        // Budget = 800 bytes after envelope reservation → ~8 records before
+        // the 9th's projected total exceeds the budget.
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 800;
+        let r = callers_or_callees(
+            &g,
+            "/hub.cpp:target",
+            Some(3), // walk all 3 BFS depths so 30 chains are produced
+            Direction::Callers,
+            Some(100),
+            Some(0),
+            max_bytes,
+        );
+
+        let (arr, total, offset, _limit) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+
+        assert!(truncated, "tight max_bytes must produce truncated=true");
+        let n = next_offset.expect("truncated=true must set next_offset=Some(n)");
+        assert!(
+            n > offset,
+            "next_offset must point past the current page: next_offset={n} <= offset={offset}",
+        );
+        assert_eq!(total, 30, "total is the pre-pagination match count");
+        assert!(
+            !arr.is_empty(),
+            "budget should still admit at least one record",
+        );
+        assert!(
+            (arr.len() as u32) < 100,
+            "byte budget (not count cap) must trim the page: arr.len()={}",
+            arr.len(),
+        );
+
+        // Sort-determinism core assertion: kept records' depths are
+        // non-decreasing (the helper preserved the handler's (depth,
+        // symbol_id) sort order).
+        let depths: Vec<u64> = arr
+            .iter()
+            .map(|h| h["depth"].as_u64().expect("depth is u64"))
+            .collect();
+        for win in depths.windows(2) {
+            assert!(
+                win[0] <= win[1],
+                "kept depths must be non-decreasing: {depths:?}",
+            );
+        }
+        // And within-depth ties are tiebroken by symbol_id ascending. Run
+        // the same monotonic check on the (depth, symbol_id) tuple to
+        // confirm the handler's pre-truncation sort survived the helper.
+        let keys: Vec<(u64, String)> = arr
+            .iter()
+            .map(|h| {
+                (
+                    h["depth"].as_u64().unwrap(),
+                    h["symbol_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        for win in keys.windows(2) {
+            assert!(
+                win[0] <= win[1],
+                "kept records must remain (depth, symbol_id)-sorted: {keys:?}",
+            );
+        }
+
+        // max(kept depth) <= depth of the first dropped record. With the
+        // fixture's 30 chains and an 8-ish-record budget, the prefix lives
+        // entirely within depth=1, so the first dropped depth is also 1.
+        let max_kept_depth = depths.iter().copied().max().unwrap();
+        // Re-fetch the full sorted chain set deterministically and read the
+        // dropped page's first depth from the position `next_offset`. The
+        // handler's (depth, symbol_id) ordering is reproduced here by
+        // calling with `offset = n, limit = 1` (NO_BYTE_BUDGET so nothing
+        // truncates).
+        let r_next = callers_or_callees(
+            &g,
+            "/hub.cpp:target",
+            Some(3),
+            Direction::Callers,
+            Some(1),
+            Some(n),
+            NO_BYTE_BUDGET,
+        );
+        let (arr_next, _, _, _) = page_parts(&r_next);
+        assert_eq!(arr_next.len(), 1, "fixture guarantees a next record exists");
+        let first_dropped_depth = arr_next[0]["depth"].as_u64().unwrap();
+        assert!(
+            max_kept_depth <= first_dropped_depth,
+            "max(kept depth)={max_kept_depth} must be <= first_dropped_depth={first_dropped_depth}",
+        );
+    }
+
+    #[test]
+    fn callers_byte_budget_no_truncation_with_no_budget() {
+        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the
+        // handler's existing behavior is preserved exactly — no truncation,
+        // no next_offset. Locks the contract that the byte-budget wiring
+        // does not affect callers that opt out.
+        let g = locked(graph_with_n_callers(30));
+        let r = callers_or_callees(
+            &g,
+            "/hub.cpp:target",
+            Some(1),
+            Direction::Callers,
+            Some(100),
+            Some(0),
+            NO_BYTE_BUDGET,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert_eq!(arr.len(), 30);
+        assert_eq!(total, 30);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
     }
 
     // --- get_callees pagination invariants --------------------------------
