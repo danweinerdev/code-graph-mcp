@@ -101,6 +101,11 @@ max_threads = 0           # 0 = num_cpus
 [parsing]
 max_threads = 0           # 0 = num_cpus; indexer caps discovery+parse sum at num_cpus
 
+[response]
+max_bytes = 102400        # byte cap on paginated MCP responses; mid-page truncation
+                          # surfaces `truncated: true` + `next_offset` for paging resume.
+                          # Default fits Claude Code's harness; raise for larger budgets.
+
 [cpp]
 macro_strip = []          # whole-word identifier tokens overwritten with same-length spaces
                           # before tree-sitter parses. Preserves byte offsets / line / column.
@@ -125,12 +130,15 @@ csharp = []
 java = []
 ```
 
+- **`[response].max_bytes`**: byte cap on paginated tool responses. Default 102400. **Consulted from the cached `RootConfig` on each tool call** (the TOML file is NOT re-read per query).
+
 ### Cache invalidation
 
 - mtime-based stale checking. Changes to `[cpp].macro_strip` or `[extensions]` do NOT retroactively re-parse files with unchanged mtime.
 - To apply new `macro_strip` or to evict entries moved to `[extensions].disabled`: re-run `analyze_codebase` with `force=true`.
 - Adding extensions: new files brought in by `[extensions].<lang>` parse normally on next run.
 - Watch path consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
+- `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call. The cache is refreshed by `analyze_codebase`; the value affects response shaping only, so **no `force=true` is required** to apply a changed value at the next reload.
 
 ## Per-language parser facts
 

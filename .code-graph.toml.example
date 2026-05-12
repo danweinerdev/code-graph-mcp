@@ -33,6 +33,13 @@ extra_ignore = ["build/", "node_modules/", "vendor/"]
 # count.
 max_threads = 0
 
+[response]
+# Byte cap on paginated MCP responses. When a page would exceed this
+# size, the server truncates mid-page and surfaces `truncated: true`
+# plus a `next_offset` to resume paging. Default chosen to fit Claude
+# Code's harness; raise for clients with larger token budgets.
+# max_bytes = 102400
+
 # C++-specific knobs. The `macro_strip` list contains identifier tokens to
 # whole-word-replace with spaces in C++ source bytes before tree-sitter
 # parses. Use this for API-export macros that confuse the tree-sitter-cpp
