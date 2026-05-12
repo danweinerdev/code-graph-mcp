@@ -214,6 +214,7 @@ async fn search_helper_no_filter_returns_all_four_languages() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -251,6 +252,7 @@ async fn search_helper_language_cpp_returns_only_cpp() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -272,6 +274,7 @@ async fn search_helper_language_rust_returns_only_rust() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -293,6 +296,7 @@ async fn search_helper_language_go_returns_only_go() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -314,6 +318,7 @@ async fn search_helper_language_python_returns_only_python() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -518,6 +523,7 @@ async fn search_init_returns_all_five_languages() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let body = first_text(&r);
     let languages = result_languages(&body);
@@ -622,7 +628,15 @@ async fn cross_language_init_callers_stay_isolated() {
         own_caller_slug: &str,
         other_caller_slugs: &[&str],
     ) {
-        let resp = callers_or_callees(graph, init_id, Some(1), Direction::Callers, None, None);
+        let resp = callers_or_callees(
+            graph,
+            init_id,
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            usize::MAX,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&first_text(&resp)).expect("get_callers response is JSON");
         let callers = caller_ids(&parsed);

@@ -197,7 +197,15 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // class `Alpha` must extract at all. If this fails, the rest of
     // the test cannot meaningfully diagnose anything — the most
     // likely root causes are listed in the assertion message.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -248,6 +256,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -292,7 +301,15 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Post-edit: file symbols must contain Alpha + Gamma (and their
     // M methods), and must NOT contain Beta, Delta, or UseBeta.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -361,6 +378,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     if r.is_error == Some(true) {
         let body = first_text(&r);
@@ -461,7 +479,15 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // fails, the partial-class assertions cannot meaningfully
     // diagnose anything.
     let sentinel_str = sentinel_path.to_string_lossy().into_owned();
-    let r = get_file_symbols(&server.inner.graph, &sentinel_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &sentinel_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols(Sentinel.cs) must succeed: {r:?}"
@@ -483,14 +509,30 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     let foo_a_str = foo_a_path.to_string_lossy().into_owned();
     let foo_b_str = foo_b_path.to_string_lossy().into_owned();
 
-    let r = get_file_symbols(&server.inner.graph, &foo_a_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &foo_a_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     let names_a = symbol_names_from(&first_text(&r));
     assert!(
         names_a.iter().any(|n| n == "Foo") && names_a.iter().any(|n| n == "A"),
         "Foo_a.cs must contain Foo and method A; got {names_a:?}"
     );
 
-    let r = get_file_symbols(&server.inner.graph, &foo_b_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &foo_b_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     let names_b = symbol_names_from(&first_text(&r));
     assert!(
         names_b.iter().any(|n| n == "Foo") && names_b.iter().any(|n| n == "B"),
@@ -516,7 +558,15 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     }
     let foo_c_str = foo_c_path.to_string_lossy().into_owned();
 
-    let r = get_file_symbols(&server.inner.graph, &foo_c_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &foo_c_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     let names_c = symbol_names_from(&first_text(&r));
     assert!(
         names_c.iter().any(|n| n == "Foo") && names_c.iter().any(|n| n == "C"),
@@ -545,7 +595,15 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // Foo_b.cs is gone — get_file_symbols must surface the canonical
     // "no symbols found in file" not-found envelope. Any other shape
     // means the prune did not fully remove the file's symbols.
-    let r = get_file_symbols(&server.inner.graph, &foo_b_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &foo_b_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert_eq!(
         r.is_error,
         Some(true),

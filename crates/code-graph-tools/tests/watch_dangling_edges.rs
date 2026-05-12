@@ -94,6 +94,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -132,6 +133,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

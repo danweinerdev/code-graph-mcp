@@ -67,7 +67,15 @@ async fn analyze_then_query_pipeline() {
 
     // get_file_symbols on engine.cpp returns symbols.
     let engine_cpp = path.join("engine.cpp").to_string_lossy().into_owned();
-    let sr = get_file_symbols(&server.inner.graph, &engine_cpp, false, true, None, None);
+    let sr = get_file_symbols(
+        &server.inner.graph,
+        &engine_cpp,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(sr.is_error.is_none() || sr.is_error == Some(false));
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&sr)).unwrap();
     // Phase 3: response is now a Page<SymbolResult> envelope.

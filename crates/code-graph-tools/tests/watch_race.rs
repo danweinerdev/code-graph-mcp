@@ -145,6 +145,7 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                         true,
                         None,
                         None,
+                        usize::MAX,
                     );
                     // Either:
                     //  - success: body is a Page<SymbolResult> envelope, or
@@ -220,6 +221,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         true,
         None,
         None,
+        usize::MAX,
     );
     let body = first_text(&r);
     assert!(
@@ -259,6 +261,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         true,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         pre.is_error.is_none() || pre.is_error == Some(false),
@@ -276,7 +279,15 @@ async fn watch_loop_handles_file_removal_end_to_end() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let path_str = target.to_string_lossy().into_owned();
-    let r = get_file_symbols(&server.inner.graph, &path_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &path_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert_eq!(
         r.is_error,
         Some(true),

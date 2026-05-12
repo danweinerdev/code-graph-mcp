@@ -124,7 +124,15 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
 
     // Pre-edit sanity: file symbols list contains all three methods (plus
     // the Server struct); Caller's callees include Beta.
-    let r = get_file_symbols(&server.inner.graph, &srv_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &srv_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -144,6 +152,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -185,7 +194,15 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
 
     // Post-edit: file symbols must contain Alpha + Caller + Gamma + Server,
     // and must NOT contain Beta.
-    let r = get_file_symbols(&server.inner.graph, &srv_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &srv_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -212,6 +229,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

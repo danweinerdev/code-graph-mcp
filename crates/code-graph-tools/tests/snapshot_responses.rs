@@ -192,7 +192,7 @@ async fn response_get_file_symbols_engine_cpp() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -211,6 +211,7 @@ async fn response_search_symbols_query_engine() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -262,6 +263,7 @@ async fn response_get_callers_engine_update() {
         Direction::Callers,
         None,
         None,
+        usize::MAX,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     // No further normalization needed; the envelope itself is deterministic.
@@ -285,6 +287,7 @@ async fn response_get_callees_engine_update() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     let parsed = parsed_sorted(&r);
@@ -340,7 +343,7 @@ async fn response_detect_cycles() {
 #[tokio::test]
 async fn response_get_orphans_default_callables() {
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, None, None);
+    let r = get_orphans(&fx.inner.graph, None, None, None, None, usize::MAX);
     // The handler now sorts by `symbol_id` ascending and wraps in the
     // `Page<SymbolResult>` envelope. The envelope itself is deterministic;
     // `parsed_sorted` only normalizes object key order (not array order).
@@ -356,7 +359,14 @@ async fn response_get_orphans_paginated_offset() {
     // offset=20 limit=20, snapshot the response. Confirms the slice is
     // taken from the *sorted* full match set, not the BFS-visit order.
     let fx = build_indexed_fixture_with_many_orphans(25).await;
-    let r = get_orphans(&fx.inner.graph, Some("function"), Some(20), Some(20), None);
+    let r = get_orphans(
+        &fx.inner.graph,
+        Some("function"),
+        Some(20),
+        Some(20),
+        None,
+        usize::MAX,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -368,7 +378,7 @@ async fn response_get_orphans_brief_false() {
     // brief=false surfaces signature/column/end_line on each row. Reuse
     // the small testdata/cpp fixture so the snapshot stays readable.
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, None, Some(false));
+    let r = get_orphans(&fx.inner.graph, None, None, None, Some(false), usize::MAX);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -379,7 +389,7 @@ async fn response_get_orphans_brief_false() {
 async fn response_get_orphans_offset_beyond_total() {
     // offset=999 against a small fixture: results=[], total=<full count>.
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None);
+    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None, usize::MAX);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -512,7 +522,15 @@ async fn response_get_file_symbols_paginated_offset() {
         .join("big.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, Some(50), Some(100));
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        Some(50),
+        Some(100),
+        usize::MAX,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -534,6 +552,7 @@ async fn response_get_callers_paginated_offset() {
         Direction::Callers,
         Some(50),
         Some(50),
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -556,6 +575,7 @@ async fn response_get_callees_paginated_offset() {
         Direction::Callees,
         Some(50),
         Some(50),
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1024,6 +1044,7 @@ async fn response_search_symbols_helper_language_rust() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1095,6 +1116,7 @@ async fn response_search_symbols_helper_language_go() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1170,7 +1192,7 @@ async fn response_get_file_symbols_go_reader() {
         .join("reader.go")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1308,6 +1330,7 @@ async fn response_search_symbols_helper_language_python() {
             brief: true,
             ..Default::default()
         },
+        usize::MAX,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1323,7 +1346,7 @@ async fn response_get_file_symbols_python_models() {
         .join("models.py")
         .to_string_lossy()
         .into_owned();
-    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None);
+    let r = get_file_symbols(&fx.inner.graph, &file, false, true, None, None, usize::MAX);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

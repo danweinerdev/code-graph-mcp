@@ -216,7 +216,15 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
     // class `Alpha` must extract at all. If this fails, the rest of
     // the test cannot meaningfully diagnose anything — the most
     // likely root causes are listed in the assertion message.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -267,6 +275,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -311,7 +320,15 @@ class Gamma extends Alpha { public void m() { } }\n",
 
     // Post-edit: file symbols must contain Alpha + Gamma (and their
     // m methods), and must NOT contain Beta, Delta, or useBeta.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -380,6 +397,7 @@ class Gamma extends Alpha { public void m() { } }\n",
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     if r.is_error == Some(true) {
         let body = first_text(&r);
@@ -481,7 +499,15 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     // fails, the anonymous-class assertions cannot meaningfully
     // diagnose anything.
     let sentinel_str = sentinel_path.to_string_lossy().into_owned();
-    let r = get_file_symbols(&server.inner.graph, &sentinel_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &sentinel_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols(Sentinel.java) must succeed: {r:?}"
@@ -506,7 +532,15 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     let anon_str = anon_path.to_string_lossy().into_owned();
     let anon_run_id = format!("{anon_str}:AnonHost::run");
 
-    let r = get_file_symbols(&server.inner.graph, &anon_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &anon_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols(AnonHost.java) must succeed: {r:?}"
@@ -528,6 +562,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -566,7 +601,15 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     // Post-remove get_file_symbols must report not-found for the deleted
     // file — anything else means the prune did not fully remove the
     // file's symbols.
-    let r = get_file_symbols(&server.inner.graph, &anon_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &anon_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert_eq!(
         r.is_error,
         Some(true),
@@ -609,6 +652,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert_eq!(
         r.is_error,

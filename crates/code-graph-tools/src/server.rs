@@ -438,6 +438,7 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::symbols::get_file_symbols(
             &self.inner.graph,
             &args.file,
@@ -445,6 +446,7 @@ impl CodeGraphServer {
             args.brief.unwrap_or(true),
             args.limit,
             args.offset,
+            max_bytes,
         ))
     }
 
@@ -467,7 +469,12 @@ impl CodeGraphServer {
             offset: args.offset,
             brief: args.brief.unwrap_or(true),
         };
-        Ok(handlers::symbols::search_symbols(&self.inner.graph, input))
+        let max_bytes = self.inner.config.read().response.max_bytes;
+        Ok(handlers::symbols::search_symbols(
+            &self.inner.graph,
+            input,
+            max_bytes,
+        ))
     }
 
     #[tool(description = "Get full details for a symbol by its ID")]
@@ -510,6 +517,7 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::query::callers_or_callees(
             &self.inner.graph,
             &args.symbol,
@@ -517,6 +525,7 @@ impl CodeGraphServer {
             handlers::query::Direction::Callers,
             args.limit,
             args.offset,
+            max_bytes,
         ))
     }
 
@@ -530,6 +539,7 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::query::callers_or_callees(
             &self.inner.graph,
             &args.symbol,
@@ -537,6 +547,7 @@ impl CodeGraphServer {
             handlers::query::Direction::Callees,
             args.limit,
             args.offset,
+            max_bytes,
         ))
     }
 
@@ -583,12 +594,14 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::structure::get_orphans(
             &self.inner.graph,
             args.kind.as_deref(),
             args.limit,
             args.offset,
             args.brief,
+            max_bytes,
         ))
     }
 

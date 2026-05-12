@@ -146,7 +146,15 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // Pre-edit sanity: file symbols list contains all three classes
     // plus their methods; class_hierarchy on Alpha includes Beta as
     // derived.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -185,6 +193,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -229,7 +238,15 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Post-edit: file symbols must contain Alpha + Gamma (and their m
     // methods), and must NOT contain Beta, Delta, or Delta::use_beta.
-    let r = get_file_symbols(&server.inner.graph, &models_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &models_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -305,6 +322,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     if r.is_error == Some(true) {
         // Canonical post-fix shape: Delta::use_beta itself was deleted

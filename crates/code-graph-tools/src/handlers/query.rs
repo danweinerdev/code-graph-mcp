@@ -51,7 +51,11 @@ pub fn callers_or_callees(
     direction: Direction,
     limit: Option<u32>,
     offset: Option<u32>,
+    max_bytes: usize,
 ) -> CallToolResult {
+    // Plumbed in task 2.0; consumed in task 2.3 / 2.4 (PaginatedResponseSizeSafety).
+    let _ = max_bytes;
+
     if symbol.is_empty() {
         return tool_error("'symbol' is required");
     }
@@ -198,7 +202,7 @@ mod tests {
     #[test]
     fn callers_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callers, None, None);
+        let r = callers_or_callees(&g, "", None, Direction::Callers, None, None, usize::MAX);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -206,7 +210,7 @@ mod tests {
     #[test]
     fn callees_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callees, None, None);
+        let r = callers_or_callees(&g, "", None, Direction::Callees, None, None, usize::MAX);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -214,7 +218,15 @@ mod tests {
     #[test]
     fn callers_returns_chain_for_known_symbol() {
         let g = locked(graph_with_calls());
-        let r = callers_or_callees(&g, "/x.cpp:c", Some(1), Direction::Callers, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:c",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            usize::MAX,
+        );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["symbol_id"], serde_json::json!("/x.cpp:b"));
@@ -223,7 +235,15 @@ mod tests {
     #[test]
     fn callers_depth_default_one() {
         let g = locked(graph_with_calls());
-        let r = callers_or_callees(&g, "/x.cpp:c", None, Direction::Callers, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:c",
+            None,
+            Direction::Callers,
+            None,
+            None,
+            usize::MAX,
+        );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
     }
@@ -231,7 +251,15 @@ mod tests {
     #[test]
     fn callees_returns_chain_for_known_symbol() {
         let g = locked(graph_with_calls());
-        let r = callers_or_callees(&g, "/x.cpp:a", Some(2), Direction::Callees, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:a",
+            Some(2),
+            Direction::Callees,
+            None,
+            None,
+            usize::MAX,
+        );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2);
         let names: Vec<String> = arr
@@ -247,7 +275,15 @@ mod tests {
         // `/x.cpp:a` has no callers. Symbol exists in graph → return an
         // envelope with results=[] and total=0 (NOT a tool error).
         let g = locked(graph_with_calls());
-        let r = callers_or_callees(&g, "/x.cpp:a", Some(1), Direction::Callers, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:a",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            usize::MAX,
+        );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -260,7 +296,15 @@ mod tests {
     fn callees_known_symbol_with_no_callees_returns_empty_envelope() {
         // `/x.cpp:c` has no callees. Symbol exists → return empty envelope.
         let g = locked(graph_with_calls());
-        let r = callers_or_callees(&g, "/x.cpp:c", Some(1), Direction::Callees, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:c",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            usize::MAX,
+        );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
@@ -272,7 +316,7 @@ mod tests {
         let g = locked(graph_with_calls());
         // "a" matches the substring of `/x.cpp:a`. The graph has `a`/`b`/`c`
         // — `a` should be suggested via search_symbols substring matching.
-        let r = callers_or_callees(&g, "a", None, Direction::Callers, None, None);
+        let r = callers_or_callees(&g, "a", None, Direction::Callers, None, None, usize::MAX);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.starts_with("symbol not found: \"a\""), "got: {text}");
@@ -282,7 +326,7 @@ mod tests {
     #[test]
     fn callers_unknown_symbol_no_suggestions() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "nope", None, Direction::Callers, None, None);
+        let r = callers_or_callees(&g, "nope", None, Direction::Callers, None, None, usize::MAX);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
     }
@@ -366,6 +410,7 @@ mod tests {
             Direction::Callers,
             None,
             None,
+            usize::MAX,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -386,6 +431,7 @@ mod tests {
             Direction::Callers,
             Some(100),
             Some(0),
+            usize::MAX,
         );
         let p2 = callers_or_callees(
             &g,
@@ -394,6 +440,7 @@ mod tests {
             Direction::Callers,
             Some(100),
             Some(100),
+            usize::MAX,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -426,6 +473,7 @@ mod tests {
             Direction::Callers,
             Some(50),
             Some(0),
+            usize::MAX,
         );
         let r2 = callers_or_callees(
             &g,
@@ -434,6 +482,7 @@ mod tests {
             Direction::Callers,
             Some(50),
             Some(50),
+            usize::MAX,
         );
         let r3 = callers_or_callees(
             &g,
@@ -442,6 +491,7 @@ mod tests {
             Direction::Callers,
             Some(10),
             Some(140),
+            usize::MAX,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -461,6 +511,7 @@ mod tests {
             Direction::Callers,
             Some(999_999),
             None,
+            usize::MAX,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -477,6 +528,7 @@ mod tests {
             Direction::Callers,
             Some(0),
             None,
+            usize::MAX,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -492,6 +544,7 @@ mod tests {
             Direction::Callers,
             None,
             Some(999),
+            usize::MAX,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -530,7 +583,15 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = callers_or_callees(&g, "/x.cpp:target", Some(2), Direction::Callers, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:target",
+            Some(2),
+            Direction::Callers,
+            None,
+            None,
+            usize::MAX,
+        );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
         // Expected order: (1, c_near_a), (1, d_near_b), (2, d_far).
@@ -554,6 +615,7 @@ mod tests {
             Direction::Callees,
             None,
             None,
+            usize::MAX,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -572,6 +634,7 @@ mod tests {
             Direction::Callees,
             Some(100),
             Some(0),
+            usize::MAX,
         );
         let p2 = callers_or_callees(
             &g,
@@ -580,6 +643,7 @@ mod tests {
             Direction::Callees,
             Some(100),
             Some(100),
+            usize::MAX,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -608,6 +672,7 @@ mod tests {
             Direction::Callees,
             Some(50),
             Some(0),
+            usize::MAX,
         );
         let r2 = callers_or_callees(
             &g,
@@ -616,6 +681,7 @@ mod tests {
             Direction::Callees,
             Some(50),
             Some(50),
+            usize::MAX,
         );
         let r3 = callers_or_callees(
             &g,
@@ -624,6 +690,7 @@ mod tests {
             Direction::Callees,
             Some(10),
             Some(140),
+            usize::MAX,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -643,6 +710,7 @@ mod tests {
             Direction::Callees,
             Some(999_999),
             None,
+            usize::MAX,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -659,6 +727,7 @@ mod tests {
             Direction::Callees,
             Some(0),
             None,
+            usize::MAX,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -674,6 +743,7 @@ mod tests {
             Direction::Callees,
             None,
             Some(999),
+            usize::MAX,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -706,7 +776,15 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = callers_or_callees(&g, "/x.cpp:entry", Some(2), Direction::Callees, None, None);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:entry",
+            Some(2),
+            Direction::Callees,
+            None,
+            None,
+            usize::MAX,
+        );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["depth"], serde_json::json!(1));

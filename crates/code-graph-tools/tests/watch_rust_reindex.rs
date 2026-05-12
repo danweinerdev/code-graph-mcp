@@ -123,7 +123,15 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
 
     // Pre-edit sanity: file symbols list contains all three; caller's
     // callees include beta.
-    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &lib_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit get_file_symbols must succeed: {r:?}"
@@ -143,6 +151,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -180,7 +189,15 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
 
     // Post-edit: file symbols must contain alpha + caller + gamma, and
     // must NOT contain beta.
-    let r = get_file_symbols(&server.inner.graph, &lib_str, false, true, None, None);
+    let r = get_file_symbols(
+        &server.inner.graph,
+        &lib_str,
+        false,
+        true,
+        None,
+        None,
+        usize::MAX,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit get_file_symbols must succeed: {r:?}"
@@ -207,6 +224,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         Direction::Callees,
         None,
         None,
+        usize::MAX,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

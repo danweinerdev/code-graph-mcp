@@ -771,6 +771,7 @@ mod tests {
             true,
             None,
             None,
+            usize::MAX,
         );
         let body = body_json(&r);
         // Phase 3: response is now a Page<SymbolResult> envelope.
@@ -857,6 +858,7 @@ mod tests {
             true,
             None,
             None,
+            usize::MAX,
         );
         let body = body_json(&r);
         // Phase 3: response is now a Page<SymbolResult> envelope.
@@ -900,7 +902,7 @@ mod tests {
 
         // get_file_symbols now produces the canonical not-found wording.
         let path_str = a_cpp.to_string_lossy().into_owned();
-        let r = get_file_symbols(&inner.graph, &path_str, false, true, None, None);
+        let r = get_file_symbols(&inner.graph, &path_str, false, true, None, None, usize::MAX);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             first_text(&r),
