@@ -15,7 +15,7 @@
 mod config;
 
 pub use config::{
-    ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, ResponseConfig, RootConfig,
+    ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, RootConfig,
     DEFAULT_RESPONSE_MAX_BYTES,
 };
 

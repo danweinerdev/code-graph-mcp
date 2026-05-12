@@ -255,8 +255,9 @@ async fn get_orphans_under_budget_at_limit_1000() {
         let body_len = body.len();
         let (page_len, page_total, page_truncated, page_next_offset) = page_summary(&r);
 
-        // Each intermediate response stays under budget. Same assertion
-        // as the first page — pinning the contract across every iteration.
+        // Every continuation page, including the final one, stays under
+        // the same budget ceiling as the first page — pinning the
+        // contract across every iteration of the paging loop.
         assert!(
             body_len <= DEFAULT_RESPONSE_MAX_BYTES + ENVELOPE_HEADROOM_BYTES,
             "get_orphans page (offset={offset}) body {body_len} bytes \
