@@ -363,8 +363,24 @@ pub(super) mod test_helpers {
     /// in the wire JSON returns `None`; a number returns `Some(n as u32)`.
     pub fn page_extras(r: &CallToolResult) -> (bool, Option<u32>) {
         let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
-        let truncated = parsed["truncated"].as_bool().unwrap_or(false);
-        let next_offset = parsed["next_offset"].as_u64().map(|n| n as u32);
+        // Page<T> always emits both fields (no skip_serializing_if); a missing
+        // key means a malformed envelope, so fail loud rather than mask it.
+        let truncated = parsed["truncated"]
+            .as_bool()
+            .expect("Page<T> envelope missing `truncated` field");
+        let next_offset = match &parsed["next_offset"] {
+            serde_json::Value::Null => None,
+            v => {
+                let n = v
+                    .as_u64()
+                    .expect("Page<T> envelope `next_offset` must be null or integer");
+                debug_assert!(
+                    n <= u32::MAX as u64,
+                    "Page<T> envelope `next_offset` exceeds u32::MAX"
+                );
+                Some(n as u32)
+            }
+        };
         (truncated, next_offset)
     }
 }
