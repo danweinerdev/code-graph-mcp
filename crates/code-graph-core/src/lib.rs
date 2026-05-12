@@ -14,7 +14,10 @@
 
 mod config;
 
-pub use config::{ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, RootConfig};
+pub use config::{
+    ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, ResponseConfig, RootConfig,
+    DEFAULT_RESPONSE_MAX_BYTES,
+};
 
 use serde::{Deserialize, Serialize};
 

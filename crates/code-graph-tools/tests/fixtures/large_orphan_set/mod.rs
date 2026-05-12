@@ -176,10 +176,14 @@ mod tests {
         // module-level docs MUST move together — otherwise the next
         // engineer reading the docs sees a number that doesn't match the
         // code. This guard makes a silent edit of one without the other
-        // a test failure.
-        assert!(
-            ORPHAN_COUNT >= 1500,
-            "ORPHAN_COUNT must stay >= 1500 to guarantee byte-budget truncation at limit=1000"
-        );
+        // a compile error.
+        //
+        // `const { assert!(..) }` lifts the check to compile-time. A
+        // plain runtime `assert!` on a const value trips
+        // `clippy::assertions_on_constants` under `-D warnings`; the
+        // const-block form is what clippy recommends, and it's also
+        // strictly stronger: a future engineer who edits `ORPHAN_COUNT`
+        // below 1500 gets the failure at `cargo build`, not on test run.
+        const { assert!(ORPHAN_COUNT >= 1500) };
     }
 }
