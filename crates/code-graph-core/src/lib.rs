@@ -126,8 +126,12 @@ pub fn symbol_id(s: &Symbol) -> SymbolId {
 ///
 /// Walks `id` from right to left and returns the slice before the **rightmost
 /// `:` that is not part of a `::` token**. Concretely, a colon at byte index
-/// `i` qualifies iff `bytes[i - 1] != b':'` AND `bytes[i + 1] != b':'`. This is
-/// exact-inverse of the two id formats:
+/// `i` qualifies if neither its left neighbor (when present, i.e. `i > 0`) nor
+/// its right neighbor (when present, i.e. `i < bytes.len() - 1`) is also `:`.
+/// At the string boundaries the absent neighbor is treated as non-colon, so a
+/// leading `:` qualifies if its right neighbor is not `:`, and a trailing `:`
+/// qualifies if its left neighbor is not `:`. This is the exact inverse of
+/// the two id formats:
 ///
 /// - Free symbol: `format!("{file}:{name}")` — the single separator colon.
 /// - Method: `format!("{file}:{parent}::{name}")` — the separator colon sits
@@ -150,6 +154,11 @@ pub fn symbol_id(s: &Symbol) -> SymbolId {
 /// - **Malformed id with no separator colon**: returns `""` rather than
 ///   panicking. Callers that need to detect this case should check
 ///   `id_to_file(id).is_empty()`.
+/// - **Leading `:` (no preceding file path)**: `id_to_file(":foo")` returns
+///   `""` — the leading colon qualifies as a separator (no left neighbor, and
+///   the right neighbor `f` is non-colon), so the slice before it is empty.
+///   Callers can detect this malformed-or-prefixless shape via `.is_empty()`
+///   on the result, same as the no-separator case above.
 pub fn id_to_file(id: &str) -> &str {
     let bytes = id.as_bytes();
     let mut i = bytes.len();
@@ -529,5 +538,33 @@ mod tests {
             id_to_file("/project/foo:bar.rs:func"),
             "/project/foo:bar.rs"
         );
+    }
+
+    #[test]
+    fn id_to_file_empty_string() {
+        // Boundary: empty input. The loop's `while i > 0` guard never enters
+        // (i starts at 0), so the function falls through to the `""` return.
+        // Pins the empty-input behavior against accidental regressions
+        // (e.g. switching the loop to `do-while` or `for i in 0..len`).
+        assert_eq!(id_to_file(""), "");
+    }
+
+    #[test]
+    fn id_to_file_only_double_colons() {
+        // Boundary: bare `::` input. The colon at index 1 has a left neighbor
+        // `:` → does not qualify. The colon at index 0 has a right neighbor
+        // `:` → does not qualify. No colon qualifies, so the function returns
+        // `""`. Pins the all-`::`-no-other-bytes behavior.
+        assert_eq!(id_to_file("::"), "");
+    }
+
+    #[test]
+    fn id_to_file_leading_colon_returns_empty() {
+        // Boundary: leading `:` with no preceding file path. The colon at
+        // index 0 has no left neighbor (i == 0 fails the `i > 0` guard) and
+        // a non-colon right neighbor (`f`), so it qualifies as a separator.
+        // The slice before index 0 is empty → returns `""`. This is the
+        // documented signal for "malformed or prefixless id".
+        assert_eq!(id_to_file(":foo"), "");
     }
 }

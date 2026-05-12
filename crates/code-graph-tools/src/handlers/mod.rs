@@ -208,11 +208,12 @@ pub fn suggest_symbols(graph: &code_graph_graph::Graph, name: &str, limit: usize
 }
 
 /// Reserved bytes for the [`Page<T>`] envelope wrapper itself when sizing a
-/// response against `max_bytes`. Accounts for:
-/// `{"results":[...],"total":NNNN,"offset":NNNN,"limit":NNNN,"truncated":false,"next_offset":null}`
-/// plus inter-record commas. 512 bytes is comfortably larger than the worst
-/// realistic envelope (~100 bytes) and gives headroom for handler-specific
-/// fields that wrap `Page<T>` in a slightly larger response.
+/// response against `max_bytes`. Reserves headroom for the JSON envelope
+/// wrapper
+/// (`{"results":[...],"total":N,"offset":M,"limit":L,"truncated":false,"next_offset":null}`
+/// ≈ 100 bytes) plus a 5× safety margin. The slack absorbs inter-record
+/// commas, large `total`/`offset`/`limit` integer widths, and any future
+/// envelope-shape additions without forcing a constant bump.
 ///
 /// `#[allow(dead_code)]` is intentional for Phase 1 of the
 /// `PaginatedResponseSizeSafety` plan: the constant and its sole consumer
@@ -266,6 +267,18 @@ pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
     limit: u32,
     max_bytes: usize,
 ) -> (Vec<T>, u32, bool, Option<u32>) {
+    // `limit == 0` is always a caller bug here: every handler resolves
+    // limit defaults (typically via `resolve_pagination(limit, DEFAULT, MAX)`)
+    // before invoking this helper. A 0 limit would cause the first
+    // `kept.len() >= limit` check to return immediately with an empty page
+    // and `truncated=false`, silently swallowing all records. Surface that
+    // mistake loudly in debug builds; release builds still behave (empty
+    // page, no continuation) but the panic catches the bug in CI.
+    debug_assert!(
+        limit > 0,
+        "byte_budget_take called with limit=0; callers must resolve limit defaults before invocation"
+    );
+
     // Reserve envelope overhead so `{"results": [...], ...}` always fits.
     // saturating_sub guards against a pathological `max_bytes <
     // ENVELOPE_OVERHEAD_BYTES` (including the boundary `max_bytes == 0`
@@ -284,10 +297,18 @@ pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
             // not by the helper.
             return (kept, limit, false, None);
         }
+        // Production `T` types (SymbolResult, CallChain) are infallible
+        // serializers — they hold only plain owned data with no cycles or
+        // custom Serialize impls that can error. The `unwrap_or(0)` fallback
+        // exists solely to satisfy the generic `T: Serialize` bound. On a
+        // hypothetical failure the record is admitted as zero-cost (the
+        // running total does not move) and the budget will still bite on
+        // the next iteration, so we never silently emit unbounded bytes.
         let serialized_len = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
         // +1 covers the inter-record comma between this candidate and the
-        // previous one. The first candidate has no leading comma, but we
-        // still add 1 here for simplicity — over-estimation favors safety.
+        // previous one. The first candidate has no leading comma, so this
+        // over-counts by 1 byte on the first record; intentional headroom
+        // over ENVELOPE_OVERHEAD_BYTES — over-estimation favors safety.
         let projected = running_bytes
             .saturating_add(serialized_len)
             .saturating_add(1);
@@ -548,5 +569,40 @@ mod tests {
         assert_eq!(total_kept, 2);
         assert!(!truncated);
         assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_exact_fit_includes_record() {
+        // Boundary: when the projected serialized total EXACTLY equals the
+        // post-envelope budget, the helper uses `>` (strict) for rejection,
+        // so the record must be INCLUDED, not dropped.
+        //
+        // Each `Rec { id: N }` for single-digit N serializes as `{"id":N}`
+        // (8 bytes); the helper adds +1 for the comma → 9 bytes per record.
+        // To make exactly 1 record land on the boundary, set the budget to
+        // 9 bytes (max_bytes = ENVELOPE_OVERHEAD_BYTES + 9). Projected
+        // running total after admitting record 0 = 0 + 8 + 1 = 9 == budget;
+        // `9 > 9` is false → record kept. The next record's projected total
+        // would be 9 + 8 + 1 = 18 > 9 → truncated.
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) =
+            byte_budget_take(items, 0, 100, ENVELOPE_OVERHEAD_BYTES + 9);
+        assert_eq!(kept.len(), 1, "exact-fit record must be admitted");
+        assert_eq!(total_kept, 1);
+        assert!(truncated, "second record's projected total exceeds budget");
+        assert_eq!(next_offset, Some(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "limit=0")]
+    fn byte_budget_take_panics_on_zero_limit_in_debug() {
+        // Caller bug: passing `limit=0` bypasses pagination defaulting
+        // (handlers always resolve via `resolve_pagination` first) and would
+        // silently return an empty page. The `debug_assert!` makes that
+        // mistake visible in test builds. In release builds the assertion
+        // is compiled out and the helper still returns cleanly (empty page,
+        // no continuation), so this contract is debug-only by design.
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let _ = byte_budget_take(items, 0, 0, 10_000);
     }
 }

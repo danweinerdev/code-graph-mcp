@@ -258,12 +258,12 @@ impl ExtensionsConfig {
 /// Response-shaping tunables. Controls the byte budget that paginated tool
 /// handlers honor when materializing a page of results.
 ///
-/// `max_bytes` is a soft per-response ceiling enforced by the
-/// `byte_budget_take` helper in `code-graph-tools`. When a candidate record
-/// would push the running serialized size over the budget, the page is cut
-/// short with `truncated=true` and `next_offset` set so the caller can
-/// resume. See `Plans/PaginatedResponseSizeSafety/README.md` for the full
-/// rationale.
+/// `max_bytes` is a soft per-response ceiling that will be enforced by the
+/// `byte_budget_take` helper in `code-graph-tools` (wired in Phase 2 of the
+/// `PaginatedResponseSizeSafety` plan). When a candidate record would push
+/// the running serialized size over the budget, the page is cut short with
+/// `truncated=true` and `next_offset` set so the caller can resume. See
+/// `Plans/PaginatedResponseSizeSafety/README.md` for the full rationale.
 ///
 /// The default (`102_400` bytes = 100 KB) is sized to fit a page of
 /// typical-size records under a single MCP tool response that an AI agent
@@ -281,6 +281,7 @@ pub struct ResponseConfig {
     pub max_bytes: usize,
 }
 
+// Cannot derive: max_bytes default is DEFAULT_RESPONSE_MAX_BYTES, not 0.
 impl Default for ResponseConfig {
     fn default() -> Self {
         Self {
@@ -946,8 +947,9 @@ disabled = [""]
         // The chosen default is 102_400 bytes (100 KB). Documented in
         // PaginatedResponseSizeSafety/README.md, Decision 8. Encoded as a
         // public constant so downstream wiring can reference the same
-        // value without duplicating the magic number.
-        assert_eq!(DEFAULT_RESPONSE_MAX_BYTES, 102_400);
+        // value without duplicating the magic number. The literal value
+        // (102_400) is invariant — if you need to change it, update the
+        // README's Decision 8 first.
         let cfg = RootConfig::default();
         assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
     }
