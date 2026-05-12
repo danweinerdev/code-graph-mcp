@@ -1,0 +1,12 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 0,
+  "next_offset": null,
+  "offset": 0,
+  "results": [],
+  "total": 1000,
+  "truncated": false
+}

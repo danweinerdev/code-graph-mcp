@@ -461,6 +461,7 @@ impl CodeGraphServer {
             args.brief.unwrap_or(true),
             args.limit,
             args.offset,
+            args.count_only.unwrap_or(false),
             max_bytes,
         ))
     }
@@ -483,6 +484,7 @@ impl CodeGraphServer {
             limit: args.limit,
             offset: args.offset,
             brief: args.brief.unwrap_or(true),
+            count_only: args.count_only.unwrap_or(false),
         };
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::symbols::search_symbols(
@@ -616,6 +618,7 @@ impl CodeGraphServer {
             args.limit,
             args.offset,
             args.brief,
+            args.count_only.unwrap_or(false),
             max_bytes,
         ))
     }

@@ -772,6 +772,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
@@ -859,6 +860,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
@@ -910,6 +912,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));

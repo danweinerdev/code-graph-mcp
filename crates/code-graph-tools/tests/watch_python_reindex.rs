@@ -154,6 +154,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -246,6 +247,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(

@@ -205,6 +205,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -309,6 +310,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -487,6 +489,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -517,6 +520,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let names_a = symbol_names_from(&first_text(&r));
@@ -532,6 +536,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let names_b = symbol_names_from(&first_text(&r));
@@ -566,6 +571,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let names_c = symbol_names_from(&first_text(&r));
@@ -603,6 +609,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert_eq!(

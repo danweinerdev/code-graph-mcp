@@ -105,12 +105,21 @@ pub fn detect_cycles(
 /// means "use the default" (mirrors `search_symbols`); `limit` is
 /// silently clamped at 1000. `offset >= total` returns an empty `results`
 /// page with the correct `total`.
+///
+/// When `count_only = true` (Phase 3 of `PaginatedResponseSizeSafety`),
+/// the handler returns the sentinel response shape `Page { results: [],
+/// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
+/// without ever materializing `SymbolResult`s or invoking the byte-budget
+/// helper. `total` reflects the true pre-pagination match count after the
+/// kind filter. See plan Decision 9 for why `limit: 0` is a deliberate
+/// exception to the "envelope echoes resolved limit" contract.
 pub fn get_orphans(
     graph: &RwLock<Graph>,
     kind: Option<&str>,
     limit: Option<u32>,
     offset: Option<u32>,
     brief: Option<bool>,
+    count_only: bool,
     max_bytes: usize,
 ) -> CallToolResult {
     let parsed_kind: Option<SymbolKind> =
@@ -121,6 +130,30 @@ pub fn get_orphans(
                 None => return tool_error(format!("invalid kind: {s}")),
             },
         };
+
+    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
+    // compute `total` via the cheap path (filter + count) and emit the
+    // sentinel envelope WITHOUT materializing SymbolResults or invoking
+    // `byte_budget_take`. Order is load-bearing — must precede the
+    // materialization step below so the byte-budget cost is never paid.
+    if count_only {
+        let total = graph.read().orphans(parsed_kind).len() as u32;
+        // `limit: 0` is a deliberate exception to the
+        // "envelope echoes resolved limit" contract — see plan Decision 9.
+        // count_only callers opted out of paging; echoing a would-have-been
+        // limit would mislead them into thinking there's a record page to
+        // fetch. The exception is documented in CLAUDE.md alongside the
+        // count_only sub-block (Phase 4.2).
+        let response = Page::<SymbolResult> {
+            results: vec![],
+            total,
+            offset: 0,
+            limit: 0,
+            truncated: false,
+            next_offset: None,
+        };
+        return tool_success_json(&response);
+    }
 
     // Resolve defaults: zero-or-missing limit -> 20; clamp at 1000.
     let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
@@ -684,7 +717,7 @@ mod tests {
     #[test]
     fn orphans_default_returns_callables() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         // foo and baz have no callers; bar is called by foo. cls is a Class
         // and is excluded by the default callable-only filter.
@@ -702,7 +735,7 @@ mod tests {
     #[test]
     fn orphans_kind_class_returns_only_classes() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some("class"), None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("class"), None, None, None, false, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], serde_json::json!("cls"));
@@ -713,7 +746,7 @@ mod tests {
     #[test]
     fn orphans_invalid_kind_errors() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, Some("widget"), None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("widget"), None, None, None, false, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
     }
@@ -721,7 +754,7 @@ mod tests {
     #[test]
     fn orphans_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -735,7 +768,7 @@ mod tests {
         // kind — Go's `req.GetArguments()["kind"].(string)` ignores empty
         // strings via the `&& k != ""` check.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some(""), None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some(""), None, None, None, false, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2, "empty kind => default callables-only");
     }
@@ -746,7 +779,7 @@ mod tests {
         // the serialized form even though our test fixture has a non-empty
         // signature on each symbol.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
@@ -786,7 +819,7 @@ mod tests {
     fn orphans_default_limit_is_20() {
         // 25 orphans: default limit (20) returns the first 20; total = 25.
         let g = locked(graph_with_n_orphan_functions(25));
-        let r = get_orphans(&g, None, None, None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -800,9 +833,9 @@ mod tests {
         // covers all 30 with no overlap.
         let g = locked(graph_with_n_orphan_functions(30));
 
-        let p1 = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
+        let p1 = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
         let (a1, t1, _, _) = page_parts(&p1);
-        let p2 = get_orphans(&g, None, Some(20), Some(20), None, NO_BYTE_BUDGET);
+        let p2 = get_orphans(&g, None, Some(20), Some(20), None, false, NO_BYTE_BUDGET);
         let (a2, t2, _, _) = page_parts(&p2);
 
         assert_eq!(a1.len(), 20);
@@ -825,9 +858,9 @@ mod tests {
     fn orphans_total_is_pre_pagination_count() {
         // Same fixture, three different pages — total is identical across all.
         let g = locked(graph_with_n_orphan_functions(30));
-        let r1 = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
-        let r2 = get_orphans(&g, None, Some(20), Some(20), None, NO_BYTE_BUDGET);
-        let r3 = get_orphans(&g, None, Some(5), Some(10), None, NO_BYTE_BUDGET);
+        let r1 = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
+        let r2 = get_orphans(&g, None, Some(20), Some(20), None, false, NO_BYTE_BUDGET);
+        let r3 = get_orphans(&g, None, Some(5), Some(10), None, false, NO_BYTE_BUDGET);
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
         let (_, t3, _, _) = page_parts(&r3);
@@ -843,7 +876,7 @@ mod tests {
         // 5-item fixture also verifies all 5 results return — confirming
         // take(1000) doesn't accidentally drop entries on a small set.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(999_999), None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(999_999), None, None, false, NO_BYTE_BUDGET);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
         assert_eq!(arr.len(), 5);
@@ -853,7 +886,7 @@ mod tests {
     fn orphans_zero_limit_uses_default() {
         // limit = 0 is treated as "unset"; resolves to default 20.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(0), None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(0), None, None, false, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -862,7 +895,7 @@ mod tests {
     fn orphans_offset_beyond_total_returns_empty() {
         // offset >= total returns empty results with the correct total.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, Some(999), None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, Some(999), None, false, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 2);
@@ -890,7 +923,15 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = get_orphans(&g, Some("class"), Some(10), None, None, NO_BYTE_BUDGET);
+        let r = get_orphans(
+            &g,
+            Some("class"),
+            Some(10),
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 10);
         assert_eq!(total, 12);
@@ -903,7 +944,7 @@ mod tests {
     fn orphans_brief_false_includes_signature() {
         // brief=false surfaces signature/column/end_line on each row.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, Some(false), NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, Some(false), false, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert!(!arr.is_empty());
         for entry in &arr {
@@ -938,7 +979,7 @@ mod tests {
         use super::super::ENVELOPE_OVERHEAD_BYTES;
         let g = locked(graph_with_n_orphan_functions(30));
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
-        let r = get_orphans(&g, None, Some(20), Some(0), None, max_bytes);
+        let r = get_orphans(&g, None, Some(20), Some(0), None, false, max_bytes);
 
         let (arr, total, offset, limit) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
@@ -977,13 +1018,92 @@ mod tests {
         // no next_offset. Locks the contract that the byte-budget wiring
         // does not affect callers that opt out.
         let g = locked(graph_with_n_orphan_functions(30));
-        let r = get_orphans(&g, None, Some(20), Some(0), None, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 30);
         assert!(!truncated);
         assert_eq!(next_offset, None);
+    }
+
+    // --- Phase 3 count_only invariants ------------------------------------
+
+    #[test]
+    fn orphans_count_only_returns_sentinel_envelope_under_1kb() {
+        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
+        // handler returns Page { results: [], total: <real count>, offset: 0,
+        // limit: 0, truncated: false, next_offset: None } regardless of how
+        // many records WOULD have been returned. Serialized envelope size
+        // must be < 1KB even at the 1000-orphan scale.
+        //
+        // Asserts: (a) results is empty, (b) total reflects the true match
+        // count (not zero), (c) limit=0 (deliberate exception to the
+        // "envelope echoes resolved limit" contract per plan Decision 9),
+        // (d) truncated=false and next_offset is None, (e) serialized body
+        // is well under 1024 bytes regardless of input scale.
+        let g = locked(graph_with_n_orphan_functions(1000));
+        let r = get_orphans(&g, None, None, None, None, true, NO_BYTE_BUDGET);
+
+        let body = body_text(&r);
+        assert!(
+            body.len() < 1024,
+            "count_only response must be < 1KB; got {} bytes",
+            body.len(),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+        let offset = parsed["offset"].as_u64().unwrap();
+        let limit = parsed["limit"].as_u64().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+
+        assert!(results.is_empty(), "count_only must emit empty results");
+        assert_eq!(total, 1000, "total must reflect true match count");
+        assert_eq!(offset, 0, "count_only emits offset=0");
+        assert_eq!(
+            limit, 0,
+            "count_only emits limit=0 (Decision 9 exception to envelope echo rule)"
+        );
+        assert!(!truncated, "count_only must never set truncated=true");
+        assert_eq!(
+            next_offset,
+            serde_json::Value::Null,
+            "count_only must emit next_offset=null"
+        );
+    }
+
+    #[test]
+    fn orphans_count_only_respects_kind_filter() {
+        // The count_only short-circuit must apply the same kind filter as
+        // the materializing path, so total reflects the post-filter count.
+        // Fixture: 2 orphan functions + 1 orphan class. kind=function -> 2;
+        // kind=class -> 1.
+        let g = locked(graph_with_orphans());
+
+        // kind=function => 2 orphans (foo, baz).
+        let r = get_orphans(&g, Some("function"), None, None, None, true, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"].as_u64().unwrap(), 2);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+
+        // kind=class => 1 orphan (cls).
+        let r = get_orphans(&g, Some("class"), None, None, None, true, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"].as_u64().unwrap(), 1);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn orphans_count_only_invalid_kind_still_errors() {
+        // The count_only check runs AFTER kind validation; bad kinds still
+        // surface the canonical "invalid kind: <s>" tool error.
+        let g = locked(Graph::new());
+        let r = get_orphans(&g, Some("widget"), None, None, None, true, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "invalid kind: widget");
     }
 
     // --- get_class_hierarchy ---

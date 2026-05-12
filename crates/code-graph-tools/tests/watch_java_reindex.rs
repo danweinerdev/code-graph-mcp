@@ -224,6 +224,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -328,6 +329,7 @@ class Gamma extends Alpha { public void m() { } }\n",
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -507,6 +509,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -540,6 +543,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -609,6 +613,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert_eq!(

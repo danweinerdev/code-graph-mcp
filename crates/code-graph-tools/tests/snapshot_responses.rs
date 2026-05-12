@@ -200,6 +200,7 @@ async fn response_get_file_symbols_engine_cpp() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -261,6 +262,57 @@ async fn response_search_symbols_byte_budget_truncated() {
             ..Default::default()
         },
         max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_count_only_search_symbols() {
+    // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
+    // `search_symbols` returns the sentinel envelope shape `Page { results: [],
+    // total: <real count>, offset: 0, limit: 0, truncated: false,
+    // next_offset: None }`. `total` reflects the pre-pagination match count
+    // from Graph::search (independent of any limit/offset). The `limit: 0`
+    // is a deliberate exception to the "envelope echoes resolved limit"
+    // contract per plan Decision 9.
+    //
+    // For this task (3.2), the handler still calls Graph::search with a
+    // tiny limit (heap is built but discarded). Task 3.3 will thread
+    // count_only into SearchParams so the heap is never constructed.
+    //
+    // The snapshot locks the wire-format shape and the per-record size
+    // contract: serialized body MUST stay under 1KB even at the 1000-match
+    // scale.
+    let fx = build_indexed_fixture_with_many_file_symbols(1000).await;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("func"),
+            count_only: true,
+            ..Default::default()
+        },
+        NO_BYTE_BUDGET,
+    );
+    // Size contract: serialized response < 1KB regardless of input scale.
+    let body = first_text(&r);
+    assert!(
+        body.len() < 1024,
+        "count_only response must be < 1KB; got {} bytes",
+        body.len(),
+    );
+    // Total contract: true pre-pagination match count.
+    let parsed_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed_json["total"].as_u64().unwrap(),
+        1000,
+        "total must reflect the true match count",
+    );
+    assert!(
+        parsed_json["results"].as_array().unwrap().is_empty(),
+        "count_only must emit empty results",
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -392,7 +444,15 @@ async fn response_detect_cycles() {
 #[tokio::test]
 async fn response_get_orphans_default_callables() {
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, None, None, NO_BYTE_BUDGET);
+    let r = get_orphans(
+        &fx.inner.graph,
+        None,
+        None,
+        None,
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
     // The handler now sorts by `symbol_id` ascending and wraps in the
     // `Page<SymbolResult>` envelope. The envelope itself is deterministic;
     // `parsed_sorted` only normalizes object key order (not array order).
@@ -414,6 +474,7 @@ async fn response_get_orphans_paginated_offset() {
         Some(20),
         Some(20),
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -433,6 +494,7 @@ async fn response_get_orphans_brief_false() {
         None,
         None,
         Some(false),
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -445,7 +507,15 @@ async fn response_get_orphans_brief_false() {
 async fn response_get_orphans_offset_beyond_total() {
     // offset=999 against a small fixture: results=[], total=<full count>.
     let fx = build_indexed_fixture().await;
-    let r = get_orphans(&fx.inner.graph, None, None, Some(999), None, NO_BYTE_BUDGET);
+    let r = get_orphans(
+        &fx.inner.graph,
+        None,
+        None,
+        Some(999),
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -474,7 +544,54 @@ async fn response_get_orphans_byte_budget_truncated() {
         Some(20),
         Some(0),
         None,
+        false,
         max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_count_only_orphans() {
+    // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
+    // `get_orphans` returns the sentinel envelope shape `Page { results: [],
+    // total: <real count>, offset: 0, limit: 0, truncated: false,
+    // next_offset: None }`. The `limit: 0` is a deliberate exception to
+    // the "envelope echoes resolved limit" contract per plan Decision 9.
+    //
+    // The snapshot locks the wire-format shape and the per-record size
+    // contract: serialized body MUST stay under 1KB even at the 1000-orphan
+    // scale (the regression scenario from the plan's motivation). `total`
+    // reflects the true pre-pagination match count (not zero).
+    let fx = build_indexed_fixture_with_many_orphans(1000).await;
+    let r = get_orphans(
+        &fx.inner.graph,
+        Some("function"),
+        None,
+        None,
+        None,
+        true,
+        NO_BYTE_BUDGET,
+    );
+    // Size contract: serialized response < 1KB regardless of input scale.
+    let body = first_text(&r);
+    assert!(
+        body.len() < 1024,
+        "count_only response must be < 1KB; got {} bytes",
+        body.len(),
+    );
+    // Total contract: true pre-pagination match count.
+    let parsed_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed_json["total"].as_u64().unwrap(),
+        1000,
+        "total must reflect the true match count",
+    );
+    assert!(
+        parsed_json["results"].as_array().unwrap().is_empty(),
+        "count_only must emit empty results",
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -615,6 +732,7 @@ async fn response_get_file_symbols_paginated_offset() {
         true,
         Some(50),
         Some(100),
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -651,7 +769,62 @@ async fn response_get_file_symbols_byte_budget_truncated() {
         true,
         Some(20),
         Some(0),
+        false,
         max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_count_only_file_symbols() {
+    // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
+    // `get_file_symbols` returns the sentinel envelope shape `Page {
+    // results: [], total: <real count>, offset: 0, limit: 0,
+    // truncated: false, next_offset: None }` after counting matches via
+    // the cheap path (no SymbolResult materialization, no byte budget).
+    // `total` reflects the true post-filter, pre-pagination match count.
+    // The `limit: 0` is a deliberate exception to the "envelope echoes
+    // resolved limit" contract per plan Decision 9.
+    //
+    // The snapshot locks the wire-format shape and the per-record size
+    // contract: serialized body MUST stay under 1KB even at the 1000-symbol
+    // scale.
+    let fx = build_indexed_fixture_with_many_file_symbols(1000).await;
+    let file = fx
+        .indexed_root
+        .join("big.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        None,
+        None,
+        true,
+        NO_BYTE_BUDGET,
+    );
+    // Size contract: serialized response < 1KB regardless of input scale.
+    let body = first_text(&r);
+    assert!(
+        body.len() < 1024,
+        "count_only response must be < 1KB; got {} bytes",
+        body.len(),
+    );
+    // Total contract: true pre-pagination match count.
+    let parsed_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed_json["total"].as_u64().unwrap(),
+        1000,
+        "total must reflect the true match count",
+    );
+    assert!(
+        parsed_json["results"].as_array().unwrap().is_empty(),
+        "count_only must emit empty results",
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -1392,6 +1565,7 @@ async fn response_get_file_symbols_go_reader() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -1554,6 +1728,7 @@ async fn response_get_file_symbols_python_models() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);

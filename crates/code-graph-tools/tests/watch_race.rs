@@ -146,6 +146,7 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                         true,
                         None,
                         None,
+                        false,
                         NO_BYTE_BUDGET,
                     );
                     // Either:
@@ -222,6 +223,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     let body = first_text(&r);
@@ -262,6 +264,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -287,6 +290,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert_eq!(

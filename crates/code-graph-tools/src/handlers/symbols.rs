@@ -39,6 +39,27 @@ use super::{
 /// default" (mirrors `search_symbols` and `get_orphans`); `limit` is
 /// silently clamped at 1000. `offset >= total` returns an empty `results`
 /// page with the correct `total`.
+///
+/// When `count_only = true` (Phase 3 of `PaginatedResponseSizeSafety`),
+/// the handler returns the sentinel response shape `Page { results: [],
+/// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
+/// after computing `total` via the cheap path (filter + count), without
+/// ever materializing `SymbolResult`s or invoking the byte-budget helper.
+/// The empty-raw-set check still runs first, so a misspelled file path
+/// surfaces the diagnostic error wording even on a count_only call. See
+/// plan Decision 9 for why `limit: 0` is a deliberate exception to the
+/// "envelope echoes resolved limit" contract.
+///
+/// `#[allow(clippy::too_many_arguments)]`: the existing call-site
+/// convention for `get_file_symbols` (and `get_orphans`) is positional
+/// args. Phase 3.2 of `PaginatedResponseSizeSafety` adds `count_only` as
+/// the 8th positional parameter to preserve that convention for the ~25
+/// existing call sites (tests, watch handlers, integration). The
+/// `GenerateDiagramInput` / `SearchSymbolsInput` struct pattern is used
+/// elsewhere in this module where the arg count crossed the threshold
+/// before any consumers existed; here, we accept the lint to avoid a
+/// breaking refactor across every caller.
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_symbols(
     graph: &RwLock<Graph>,
     file: &str,
@@ -46,6 +67,7 @@ pub fn get_file_symbols(
     brief: bool,
     limit: Option<u32>,
     offset: Option<u32>,
+    count_only: bool,
     max_bytes: usize,
 ) -> CallToolResult {
     if file.is_empty() {
@@ -60,6 +82,34 @@ pub fn get_file_symbols(
     // error wording rather than an empty Page<T>.
     if symbols.is_empty() {
         return tool_error(format!("no symbols found in file: {file}"));
+    }
+
+    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
+    // count the post-filter match set WITHOUT materializing SymbolResults or
+    // invoking `byte_budget_take`. Order is load-bearing — must run AFTER
+    // the empty-raw-set check (so misspelled files keep the diagnostic
+    // error wording) but BEFORE the materialization step below.
+    if count_only {
+        let total = if top_level_only {
+            symbols.iter().filter(|s| s.parent.is_empty()).count() as u32
+        } else {
+            symbols.len() as u32
+        };
+        // `limit: 0` is a deliberate exception to the
+        // "envelope echoes resolved limit" contract — see plan Decision 9.
+        // count_only callers opted out of paging; echoing a would-have-been
+        // limit would mislead them into thinking there's a record page to
+        // fetch. The exception is documented in CLAUDE.md alongside the
+        // count_only sub-block (Phase 4.2).
+        let response = Page::<SymbolResult> {
+            results: vec![],
+            total,
+            offset: 0,
+            limit: 0,
+            truncated: false,
+            next_offset: None,
+        };
+        return tool_success_json(&response);
     }
 
     // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
@@ -118,6 +168,13 @@ pub struct SearchSymbolsInput<'a> {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub brief: bool,
+    /// When `true`, the handler returns the sentinel envelope
+    /// (`results: []`, `total: <real count>`, `offset: 0`, `limit: 0`,
+    /// `truncated: false`, `next_offset: None`) without materializing
+    /// `SymbolResult`s. Wired into the early-return path in Phase 3.2
+    /// of `PaginatedResponseSizeSafety`; the Graph-layer heap short-
+    /// circuit lands in task 3.3.
+    pub count_only: bool,
 }
 
 /// `search_symbols` body. Validates that at least one filter was supplied,
@@ -181,6 +238,46 @@ pub fn search_symbols(
 
     let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
+
+    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
+    // delegate to `Graph::search` and emit the sentinel envelope using
+    // `sr.total` (the pre-pagination match count is reported regardless of
+    // limit/offset, so the count is correct even without a Graph-layer
+    // short-circuit). Phase 3.3 will thread `count_only` into `SearchParams`
+    // so the `BinaryHeap<TopEntry>` is never constructed; for 3.2 the heap
+    // is still built but the resulting page is discarded. Acceptable interim
+    // per the plan's task 3.2 spec.
+    if input.count_only {
+        // Pass `limit = 1` to minimize the heap's memory footprint during
+        // this interim path — `sr.total` is independent of the limit, so
+        // a small limit yields the correct count without paying the cost
+        // of a full-page allocation. Cannot use `limit = 0` because the
+        // handler resolves zero to the default 20 above (see also the
+        // `byte_budget_take` debug_assert on limit > 0).
+        let sr = graph.read().search(SearchParams {
+            pattern: query_str.to_string(),
+            kind: parsed_kind,
+            namespace: namespace_str.to_string(),
+            language: parsed_language,
+            limit: 1,
+            offset: 0,
+        });
+        // `limit: 0` is a deliberate exception to the
+        // "envelope echoes resolved limit" contract — see plan Decision 9.
+        // count_only callers opted out of paging; echoing a would-have-been
+        // limit would mislead them into thinking there's a record page to
+        // fetch. The exception is documented in CLAUDE.md alongside the
+        // count_only sub-block (Phase 4.2).
+        let response = Page::<SymbolResult> {
+            results: vec![],
+            total: sr.total,
+            offset: 0,
+            limit: 0,
+            truncated: false,
+            next_offset: None,
+        };
+        return tool_success_json(&response);
+    }
 
     let sr = graph.read().search(SearchParams {
         pattern: query_str.to_string(),
@@ -349,7 +446,7 @@ mod tests {
     #[test]
     fn file_symbols_missing_file_param_errors() {
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "", false, true, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(&g, "", false, true, None, None, false, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -357,7 +454,16 @@ mod tests {
     #[test]
     fn file_symbols_unknown_file_errors() {
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            "/missing.cpp",
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
     }
@@ -377,6 +483,7 @@ mod tests {
             true,
             Some(50),
             Some(10),
+            false,
             NO_BYTE_BUDGET,
         );
         assert_eq!(r.is_error, Some(true));
@@ -412,6 +519,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             NO_BYTE_BUDGET,
         );
         // Not a tool error.
@@ -426,7 +534,7 @@ mod tests {
     #[test]
     fn file_symbols_returns_full_list_in_brief_mode() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, false, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
@@ -445,7 +553,7 @@ mod tests {
     #[test]
     fn file_symbols_top_level_only_filters_out_methods() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, false, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         // 3 symbols total, but `do_thing` has parent="Bar" so it's filtered.
         assert_eq!(arr.len(), 2);
@@ -461,7 +569,16 @@ mod tests {
     #[test]
     fn file_symbols_brief_false_includes_signature() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", false, false, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            "/a.cpp",
+            false,
+            false,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
@@ -499,7 +616,16 @@ mod tests {
     #[test]
     fn file_symbols_default_limit_is_100() {
         let g = locked(graph_with_n_file_symbols(120));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, None, None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
         assert_eq!(total, 120);
@@ -517,6 +643,7 @@ mod tests {
             true,
             Some(100),
             Some(0),
+            false,
             NO_BYTE_BUDGET,
         );
         let p2 = get_file_symbols(
@@ -526,6 +653,7 @@ mod tests {
             true,
             Some(100),
             Some(100),
+            false,
             NO_BYTE_BUDGET,
         );
         let (a1, t1, _, _) = page_parts(&p1);
@@ -559,6 +687,7 @@ mod tests {
             true,
             Some(50),
             Some(0),
+            false,
             NO_BYTE_BUDGET,
         );
         let r2 = get_file_symbols(
@@ -568,6 +697,7 @@ mod tests {
             true,
             Some(50),
             Some(50),
+            false,
             NO_BYTE_BUDGET,
         );
         let r3 = get_file_symbols(
@@ -577,6 +707,7 @@ mod tests {
             true,
             Some(10),
             Some(140),
+            false,
             NO_BYTE_BUDGET,
         );
         let (_, t1, _, _) = page_parts(&r1);
@@ -600,6 +731,7 @@ mod tests {
             true,
             Some(999_999),
             None,
+            false,
             NO_BYTE_BUDGET,
         );
         let (arr, _, _, limit) = page_parts(&r);
@@ -610,7 +742,16 @@ mod tests {
     #[test]
     fn file_symbols_zero_limit_uses_default() {
         let g = locked(graph_with_n_file_symbols(5));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(0), None, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(0),
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
     }
@@ -618,7 +759,16 @@ mod tests {
     #[test]
     fn file_symbols_offset_beyond_total_returns_empty() {
         let g = locked(graph_with_n_file_symbols(5));
-        let r = get_file_symbols(&g, "/big.cpp", false, true, None, Some(999), NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            None,
+            Some(999),
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 5);
@@ -650,7 +800,16 @@ mod tests {
         use super::super::ENVELOPE_OVERHEAD_BYTES;
         let g = locked(graph_with_n_file_symbols(30));
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
-        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(20), Some(0), max_bytes);
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(20),
+            Some(0),
+            false,
+            max_bytes,
+        );
 
         let (arr, total, offset, limit) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
@@ -696,6 +855,7 @@ mod tests {
             true,
             Some(20),
             Some(0),
+            false,
             NO_BYTE_BUDGET,
         );
         let (arr, total, _, _) = page_parts(&r);
@@ -715,9 +875,119 @@ mod tests {
         let g = locked(Graph::new());
         // Even with a pathologically tight budget that would normally
         // truncate everything, the empty-raw-set branch is preserved.
-        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, 0);
+        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, false, 0);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
+    }
+
+    // --- Phase 3 count_only invariants ------------------------------------
+
+    #[test]
+    fn file_symbols_count_only_returns_sentinel_envelope_under_1kb() {
+        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
+        // handler emits Page { results: [], total: <real count>, offset: 0,
+        // limit: 0, truncated: false, next_offset: None } regardless of how
+        // many records WOULD have been returned. Serialized envelope size
+        // must stay < 1KB even at the 1000-symbol scale.
+        //
+        // Asserts: (a) results is empty, (b) total reflects the true match
+        // count (not zero), (c) limit=0 (deliberate exception to the
+        // "envelope echoes resolved limit" contract per plan Decision 9),
+        // (d) truncated=false and next_offset is None, (e) serialized body
+        // is well under 1024 bytes regardless of input scale.
+        let g = locked(graph_with_n_file_symbols(1000));
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            None,
+            None,
+            true,
+            NO_BYTE_BUDGET,
+        );
+
+        let body = body_text(&r);
+        assert!(
+            body.len() < 1024,
+            "count_only response must be < 1KB; got {} bytes",
+            body.len(),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+        let offset = parsed["offset"].as_u64().unwrap();
+        let limit = parsed["limit"].as_u64().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+
+        assert!(results.is_empty(), "count_only must emit empty results");
+        assert_eq!(total, 1000, "total must reflect true match count");
+        assert_eq!(offset, 0, "count_only emits offset=0");
+        assert_eq!(
+            limit, 0,
+            "count_only emits limit=0 (Decision 9 exception to envelope echo rule)"
+        );
+        assert!(!truncated, "count_only must never set truncated=true");
+        assert_eq!(
+            next_offset,
+            serde_json::Value::Null,
+            "count_only must emit next_offset=null"
+        );
+    }
+
+    #[test]
+    fn file_symbols_count_only_respects_top_level_only_filter() {
+        // The count_only short-circuit must apply the same top_level_only
+        // filter as the materializing path. small_graph() has 3 symbols
+        // (foo, Bar, Bar::do_thing); top_level_only=true filters out the
+        // method, so total drops from 3 to 2.
+        let g = locked(small_graph());
+
+        // top_level_only=false => 3 symbols.
+        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, true, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"].as_u64().unwrap(), 3);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+
+        // top_level_only=true => 2 symbols (foo, Bar; Bar::do_thing has parent=Bar).
+        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, true, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"].as_u64().unwrap(), 2);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_symbols_count_only_empty_raw_set_still_errors() {
+        // The count_only check runs AFTER the empty-raw-set diagnostic, so
+        // a misspelled file path STILL surfaces the canonical
+        // "no symbols found in file: <file>" tool error rather than a
+        // Page<T> with total=0. This preserves the diagnostic-UX guard.
+        let g = locked(Graph::new());
+        let r = get_file_symbols(
+            &g,
+            "/missing.cpp",
+            false,
+            true,
+            None,
+            None,
+            true,
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
+    }
+
+    #[test]
+    fn file_symbols_count_only_empty_file_param_still_errors() {
+        // The count_only check runs AFTER required-arg validation; empty
+        // file param still surfaces the canonical "'file' is required"
+        // tool error.
+        let g = locked(Graph::new());
+        let r = get_file_symbols(&g, "", false, true, None, None, true, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "'file' is required");
     }
 
     // --- search_symbols ---
@@ -1192,6 +1462,141 @@ mod tests {
             "short page under sufficient budget must NOT be marked truncated",
         );
         assert_eq!(next_offset, serde_json::Value::Null);
+    }
+
+    // --- Phase 3 search_symbols count_only invariants ---------------------
+
+    #[test]
+    fn search_symbols_count_only_returns_sentinel_envelope_under_1kb() {
+        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
+        // handler emits Page { results: [], total: <real count>, offset: 0,
+        // limit: 0, truncated: false, next_offset: None } regardless of how
+        // many records WOULD have been returned. Serialized envelope must
+        // stay < 1KB even at the 1000-match scale.
+        //
+        // Asserts: (a) results is empty, (b) total reflects the true
+        // pre-pagination match count from Graph::search (not zero),
+        // (c) limit=0 (deliberate exception to the "envelope echoes
+        // resolved limit" contract per plan Decision 9),
+        // (d) truncated=false and next_offset is None, (e) serialized body
+        // is well under 1024 bytes regardless of input scale.
+        //
+        // Note: this task (3.2) accepts the interim cost of building the
+        // BinaryHeap inside Graph::search; task 3.3 will thread count_only
+        // into SearchParams so the heap is never constructed.
+        let g = locked(graph_with_n_broad_matches(1000));
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                count_only: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+
+        let body = body_text(&r);
+        assert!(
+            body.len() < 1024,
+            "count_only response must be < 1KB; got {} bytes",
+            body.len(),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+        let offset = parsed["offset"].as_u64().unwrap();
+        let limit = parsed["limit"].as_u64().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+
+        assert!(results.is_empty(), "count_only must emit empty results");
+        assert_eq!(total, 1000, "total must reflect true match count");
+        assert_eq!(offset, 0, "count_only emits offset=0");
+        assert_eq!(
+            limit, 0,
+            "count_only emits limit=0 (Decision 9 exception to envelope echo rule)"
+        );
+        assert!(!truncated, "count_only must never set truncated=true");
+        assert_eq!(
+            next_offset,
+            serde_json::Value::Null,
+            "count_only must emit next_offset=null"
+        );
+    }
+
+    #[test]
+    fn search_symbols_count_only_total_matches_full_search_total() {
+        // count_only must report the same `total` as a regular call —
+        // i.e., the pre-pagination match count from Graph::search is
+        // independent of count_only. Companion to the 3.3 behavioral test
+        // (same query with count_only=false vs true returns equal total).
+        let g = locked(graph_with_n_broad_matches(50));
+
+        let r_count = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                count_only: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r_count)).unwrap();
+        let total_count_only = parsed["total"].as_u64().unwrap();
+
+        let r_full = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(1),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r_full)).unwrap();
+        let total_full = parsed["total"].as_u64().unwrap();
+
+        assert_eq!(
+            total_count_only, total_full,
+            "count_only must report the same total as a regular search",
+        );
+        assert_eq!(total_count_only, 50);
+    }
+
+    #[test]
+    fn search_symbols_count_only_still_validates_filters() {
+        // The count_only check runs AFTER filter validation; "at least one
+        // filter required" and "invalid kind" errors still surface.
+        let g = locked(small_graph());
+
+        // No filter supplied -> validation error even with count_only=true.
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                count_only: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(
+            body_text(&r),
+            "'query', 'kind', 'namespace', or 'language' is required"
+        );
+
+        // Bad kind -> "invalid kind: widget" even with count_only=true.
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                kind: Some("widget"),
+                count_only: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "invalid kind: widget");
     }
 
     // --- get_symbol_detail ---

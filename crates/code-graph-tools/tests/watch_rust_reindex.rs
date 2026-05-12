@@ -131,6 +131,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(
@@ -197,6 +198,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(

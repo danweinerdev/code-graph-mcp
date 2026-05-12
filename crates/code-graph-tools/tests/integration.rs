@@ -75,6 +75,7 @@ async fn analyze_then_query_pipeline() {
         true,
         None,
         None,
+        false,
         NO_BYTE_BUDGET,
     );
     assert!(sr.is_error.is_none() || sr.is_error == Some(false));
