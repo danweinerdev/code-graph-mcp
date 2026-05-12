@@ -207,6 +207,104 @@ pub fn suggest_symbols(graph: &code_graph_graph::Graph, name: &str, limit: usize
     out
 }
 
+/// Reserved bytes for the [`Page<T>`] envelope wrapper itself when sizing a
+/// response against `max_bytes`. Accounts for:
+/// `{"results":[...],"total":NNNN,"offset":NNNN,"limit":NNNN,"truncated":false,"next_offset":null}`
+/// plus inter-record commas. 512 bytes is comfortably larger than the worst
+/// realistic envelope (~100 bytes) and gives headroom for handler-specific
+/// fields that wrap `Page<T>` in a slightly larger response.
+///
+/// `#[allow(dead_code)]` is intentional for Phase 1 of the
+/// `PaginatedResponseSizeSafety` plan: the constant and its sole consumer
+/// [`byte_budget_take`] ship in Phase 1, but handlers do not wire them up
+/// until Phase 2. Without the allow, `cargo clippy --workspace
+/// --all-targets -- -D warnings` would fail. The allow is removed in Phase 2
+/// once the first handler consumes the helper.
+#[allow(dead_code)]
+pub(super) const ENVELOPE_OVERHEAD_BYTES: usize = 512;
+
+/// Apply `offset` + `limit` pagination to `iter` while enforcing a
+/// JSON-serialized byte budget on the returned page. This is the drop-in
+/// replacement for the `.skip(offset).take(limit).collect()` pattern used by
+/// the four materializing handlers (orphans, file_symbols, callers, callees)
+/// today; Phase 2 of the `PaginatedResponseSizeSafety` plan wires it through.
+///
+/// Behavior:
+/// - Skips the first `offset` items from `iter`, then accumulates up to
+///   `limit` items while the running JSON byte count stays under
+///   `max_bytes - ENVELOPE_OVERHEAD_BYTES`.
+/// - Each candidate is pre-serialized with `serde_json::to_string`; its
+///   serialized length (plus one byte for the inter-record comma) is added
+///   to the running total.
+/// - If a candidate would push the total over budget, it is NOT included,
+///   the function returns early with `truncated = true` and
+///   `next_offset = Some(offset + kept_count)`.
+/// - If `limit` is reached, or `iter` is exhausted, before the budget
+///   bites, the function returns `truncated = false` and `next_offset = None`.
+/// - Pathological case: if the very first candidate alone exceeds the
+///   budget, the helper returns 0 records, `truncated = true`, and
+///   `next_offset = Some(offset)` — never panics, never makes forward
+///   progress impossible. Callers should treat `next_offset == Some(offset)`
+///   with an empty `results` as "budget too tight for any record at this
+///   position" and surface a meaningful error if needed.
+///
+/// Return tuple is `(kept_records, total_kept, truncated, next_offset)`
+/// where `total_kept == kept_records.len() as u32`.
+///
+/// Note on `total_kept` vs `Page<T>.total`: the second tuple element is the
+/// count of records actually emitted on THIS page (`results.len() as u32`),
+/// NOT the pre-pagination match count. The handler is responsible for
+/// computing the latter separately (typically via `.count()` on the source
+/// iterator before this helper is called).
+///
+/// `#[allow(dead_code)]` is intentional for Phase 1 of the
+/// `PaginatedResponseSizeSafety` plan — see [`ENVELOPE_OVERHEAD_BYTES`].
+#[allow(dead_code)]
+pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
+    iter: I,
+    offset: u32,
+    limit: u32,
+    max_bytes: usize,
+) -> (Vec<T>, u32, bool, Option<u32>) {
+    // Reserve envelope overhead so `{"results": [...], ...}` always fits.
+    // saturating_sub guards against a pathological `max_bytes <
+    // ENVELOPE_OVERHEAD_BYTES` (including the boundary `max_bytes == 0`
+    // case) — budget becomes 0, the loop's first comparison rejects every
+    // candidate, and the helper returns 0 records with truncated=true.
+    let budget = max_bytes.saturating_sub(ENVELOPE_OVERHEAD_BYTES);
+
+    let mut kept: Vec<T> = Vec::new();
+    let mut running_bytes: usize = 0;
+
+    for item in iter.into_iter().skip(offset as usize) {
+        if (kept.len() as u32) >= limit {
+            // Hit the count cap before the byte budget — clean page, no
+            // continuation token. Anything beyond `limit` is the next call's
+            // responsibility, signalled by the caller-supplied `offset+limit`,
+            // not by the helper.
+            return (kept, limit, false, None);
+        }
+        let serialized_len = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
+        // +1 covers the inter-record comma between this candidate and the
+        // previous one. The first candidate has no leading comma, but we
+        // still add 1 here for simplicity — over-estimation favors safety.
+        let projected = running_bytes
+            .saturating_add(serialized_len)
+            .saturating_add(1);
+        if projected > budget {
+            // Budget bites: drop this candidate, stop here.
+            let kept_len = kept.len() as u32;
+            return (kept, kept_len, true, Some(offset.saturating_add(kept_len)));
+        }
+        running_bytes = projected;
+        kept.push(item);
+    }
+
+    // Iterator exhausted before either trigger fired. No continuation.
+    let kept_len = kept.len() as u32;
+    (kept, kept_len, false, None)
+}
+
 /// Test-only helpers shared across handler submodules. Lifted out of each
 /// submodule's `mod tests` to avoid identical copy-paste in every paginated
 /// handler test file. Submodules opt in via `use super::test_helpers::*`.
@@ -335,5 +433,120 @@ mod tests {
         assert_eq!(parse_language("java"), Some(Language::Java));
         assert!(parse_language("ruby").is_none());
         assert!(parse_language("").is_none());
+    }
+
+    /// Tiny serializable record with predictable JSON size, used to make the
+    /// byte-budget thresholds in the tests below easy to reason about.
+    ///
+    /// `Rec { id: N }` serializes as `{"id":N}`:
+    /// - id `0..=9`   → 8 bytes
+    /// - id `10..=99` → 9 bytes
+    ///
+    /// With the helper's +1 inter-record comma overhead, each single-digit
+    /// record costs 9 bytes against the budget; the byte budget itself is
+    /// `max_bytes - ENVELOPE_OVERHEAD_BYTES` (512).
+    #[derive(Serialize)]
+    struct Rec {
+        id: u32,
+    }
+
+    #[test]
+    fn byte_budget_take_fits_under_budget() {
+        // 5 records, generous budget — all kept, no truncation.
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 100, 10_000);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(total_kept, 5);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_truncates_on_overflow() {
+        // Records sized so exactly 2 fit before the 3rd blows the budget.
+        // Each `{"id":N}` for single-digit N is 8 bytes; helper adds +1
+        // comma per record. Two records cost 9+9 = 18 bytes against budget.
+        // Set budget = 20 → 3rd record's projected total is 18+9 = 27 > 20.
+        // max_bytes = ENVELOPE_OVERHEAD_BYTES (512) + 20 = 532.
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) =
+            byte_budget_take(items, 0, 100, ENVELOPE_OVERHEAD_BYTES + 20);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(total_kept, 2);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(2));
+    }
+
+    #[test]
+    fn byte_budget_take_max_bytes_zero() {
+        // Pathological: max_bytes = 0 cannot even hold the envelope. Helper
+        // returns empty results, truncated=true, next_offset preserves the
+        // caller's offset so re-paging from that position is still possible
+        // once `max_bytes` is raised. offset is within iter range so the
+        // first post-skip candidate is actually evaluated (and rejected).
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 100, 0);
+        assert!(kept.is_empty());
+        assert_eq!(total_kept, 0);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(0));
+    }
+
+    #[test]
+    fn byte_budget_take_iter_shorter_than_limit() {
+        // 3 records, limit=100, budget never tested. Iterator exhaustion
+        // wins: truncated=false, next_offset=None.
+        let items: Vec<Rec> = (0..3).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 100, 10_000);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(total_kept, 3);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_first_record_exceeds_budget() {
+        // Single record whose serialized form alone blows past the
+        // envelope-overhead-adjusted budget. With budget = 5 bytes (after
+        // subtracting overhead), an 8-byte record cannot fit. Expected:
+        // 0 records kept, truncated=true, next_offset=Some(offset).
+        //
+        // Uses offset=3 with enough records that skip(3) lands on a real
+        // candidate — proves the "first post-skip candidate too big" path,
+        // not the "iter exhausted" path.
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) =
+            byte_budget_take(items, 3, 100, ENVELOPE_OVERHEAD_BYTES + 5);
+        assert!(kept.is_empty());
+        assert_eq!(total_kept, 0);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(3));
+    }
+
+    #[test]
+    fn byte_budget_take_respects_offset_when_skipping() {
+        // Sanity: offset=2 skips the first 2 items before applying budget.
+        // 5 records, offset=2, generous budget → 3 records kept (ids 2,3,4).
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 2, 100, 10_000);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].id, 2);
+        assert_eq!(kept[2].id, 4);
+        assert_eq!(total_kept, 3);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_limit_cap_before_budget() {
+        // limit caps before budget bites. 5 records, limit=2, generous
+        // budget → exactly 2 kept, truncated=false (caller decides whether
+        // to re-page via offset+limit).
+        let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 2, 10_000);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(total_kept, 2);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
     }
 }
