@@ -3,12 +3,13 @@ title: "Pagination & Output-Size Caps for UE-Scale Codebases"
 type: design
 status: review
 created: 2026-05-07
-updated: 2026-05-07
+updated: 2026-05-12
 tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 related:
   - Designs/RustRewrite
   - Designs/LLMOptimization
   - Plans/Complete/RustRewrite
+  - Plans/Active/PaginatedResponseSizeSafety
   - Retro/2026-05-07-rust-rewrite-complete
 ---
 
@@ -327,6 +328,42 @@ Mitigation: the design ships in a single PR with a clearly named "wire-format ch
 **Decision:** Option 2. Clamp silently; echoed `limit` reveals the actual cap to the agent.
 
 **Rationale:** Errors for large `limit` would force agents to retry with a smaller value. Silent clamping just gives them a smaller page; the echoed `limit` field (already part of the contract) reveals the actual size used. The agent can adapt without a round-trip.
+
+### Decision 8: Byte cap default 100 KB, configurable via `[response].max_bytes`
+
+**Decision:** Byte cap default 100 KB, configurable via `[response].max_bytes`. Picked over tokenizer-based budgeting for determinism and zero added dependencies. `.code-graph.toml` exposure means teams running on Unreal-scale indexes can raise it without a rebuild; default is conservative enough that Claude Code's harness accepts every response. Truncation surfaces via `truncated: bool` + `next_offset: Option<u32>` on the envelope.
+
+**Rationale:** This decision was driven by direct user feedback from `Plans/Active/PaginatedResponseSizeSafety` — a `get_orphans(limit=1000)` call against a real 71-file / 1,759-symbol Rust repo on `rust-main` returned 1,031 records as a 297,266-character single-line JSON payload (~74K tokens), which Claude Code's harness rejected and spilled to disk. The original Decision 7 ceiling (1000 records) was tuned to a record count that no longer correlates with the actual failure mode (bytes / tokens). A byte budget is the natural backstop because it directly measures the dimension that broke. Tokenizer-aware budgeting was considered and rejected — it would couple the server to a particular model's tokenizer and add a dependency, while a static byte cap reliably underestimates token cost for any reasonable JSON payload. Surfacing truncation explicitly via `truncated` + `next_offset` (rather than silently dropping records) is the same trade-off as Decision 7's echoed `limit`: tell the agent what happened so it can resume paging without round-trips.
+
+### Decision 9: `count_only: bool` on the three `SymbolResult`-emitting tools
+
+**Decision:** `count_only: bool` on the three `SymbolResult`-emitting tools. Applies to `get_orphans`, `search_symbols`, `get_file_symbols`. `get_callers`/`get_callees` are excluded; their depth/limit combination already makes "how many?" cheap. `count_only` is threaded into `SearchParams` for `search_symbols` so `Graph::search` skips materialization, not faked at the handler with `limit: 0`.
+
+**Rationale:** The same 1,031-orphan repro that drove Decision 8 also exposed a "how many orphans does this repo have?" use case where the records themselves are noise — the agent wants `total` and nothing else. Faking this with `limit: 0` would still materialize the full match set inside `Graph::search` (which sorts before slicing), defeating the purpose. Wiring `count_only` into `SearchParams` lets `Graph::search` short-circuit before its `BinaryHeap<TopEntry>` materialization, producing a sub-kilobyte response on inputs that would otherwise exceed the byte budget. `get_callers`/`get_callees` are deliberately excluded — their depth parameter already caps the BFS, so the count-only escape hatch buys nothing.
+
+### Decision 10: `SymbolResult.file` dropped universally
+
+**Decision:** `SymbolResult.file` dropped universally. The id format `file:name` or `file:Parent::name` makes the separate `file` field strictly redundant on `SymbolResult`. Agents recover it via a documented `id_to_file` helper. Uniform record shape across all three tools, no hoist-when-uniform special case. Halves brief-mode record byte count on real-world inputs.
+
+**Rationale:** Bytes-per-record is the lever the byte budget multiplies against, so slimming the per-record payload directly enlarges the effective page size. The `file` field duplicates the prefix of every `Symbol.id`, and `id` is already part of the canonical contract (Core invariants: `Symbol ID format: file:name or file:Parent::name`). On the 1,031-orphan repro, the duplicated file path was responsible for roughly half of brief-mode record bytes. A "hoist-when-uniform" special case (one shared `file` at the envelope level when every record matches) was considered and rejected — the conditional shape would force agents to branch on envelope structure, and the savings vanish on cross-file queries like `get_orphans`. Universal drop with a published `id_to_file` recovery helper keeps the wire format uniform and the parsing rule trivial.
+
+### Decision 11: `CallChain.file` retained
+
+**Decision:** `CallChain.file` retained. `CallChain.file` is the call-site file, NOT the definition file encoded in `symbol_id`. Dropping it would lose information. Not a candidate for slimming.
+
+**Rationale:** During the slimming review prompted by the same byte-budget work, `CallChain.file` looked superficially like a candidate for the same treatment as `SymbolResult.file`. It is not — the `symbol_id` on a `CallChain` row encodes where the called symbol is *defined*, while `file` records where the *call site* lives. Those diverge whenever a symbol is invoked from outside its defining file, which is the common case in graph queries (a function in `mod_a.rs` calling another function in `mod_b.rs`). Dropping `CallChain.file` would force agents to walk back to the file via a separate query, trading one round-trip for a handful of bytes saved per row. The slimming heuristic is "drop fields that are derivable from other fields on the same record"; `CallChain.file` is not derivable from `symbol_id`.
+
+### Decision 12: `search_symbols` byte-budget at handler layer, not in `Graph::search`
+
+**Decision:** `search_symbols` byte-budget at handler layer, not in `Graph::search`. Keeps `Graph::search` byte-blind. Already-sliced page returns from Graph; if it serializes past budget, handler trims and sets `next_offset = original_offset + truncation_index`. `total` from `Graph::search` (pre-pagination match count) is preserved.
+
+**Rationale:** `search_symbols` is architecturally different from the other four paginated tools — it pushes pagination into `Graph::search` via `SearchParams { limit, offset }` (per Architecture: "Materialization layer is not uniform across paginated tools"). Threading byte awareness into `Graph::search` would couple the Graph layer to wire-format concerns and complicate the `count_only` short-circuit. Doing the byte trim at the handler layer matches what the other four tools already do (they slice at the handler too) and keeps the Graph layer focused on graph semantics. `next_offset` is computed from the *original* `offset` plus the index where the byte budget bit, so resume-paging is correct even when the underlying Graph-layer slice was already smaller than the requested `limit`. `total` survives unchanged because it is computed pre-pagination inside `Graph::search`; the handler never sees an undercount. This decision was forced by the same 1,031-orphan / ~74K-token user report that drove Decision 8 — once byte truncation is mandatory on `get_orphans` et al., `search_symbols` must follow the same contract or agents have to learn two paging-resume protocols.
+
+### Decision 13: Limit ceiling (1000) NOT lowered
+
+**Decision:** Limit ceiling (1000) NOT lowered. Byte budget self-enforces the actual cap. Agents discover the cap via `truncated=true` + `next_offset` rather than via a documented `limit` ceiling. Avoids re-litigating Decision 7. Tool descriptions document `limit` as "≤ this many records" rather than an exact guarantee.
+
+**Rationale:** With Decision 8's byte budget in place, the hard 1000-record ceiling from Decision 7 is no longer the binding constraint — the byte cap bites first on every realistic payload. Lowering the record ceiling (e.g. to 200) was considered but rejected: it would re-litigate Decision 7 without changing the failure mode (the 1,031-orphan repro was rejected because of its byte size, not because 1,031 > 1000), and it would force agents that DO want many small records to issue more round-trips than necessary. Keeping the ceiling at 1000 and letting the byte budget self-enforce means the contract degrades gracefully: small records pack densely into a page, large records produce a shorter page with `truncated=true`, and the agent reads the same `next_offset` signal in both cases. The tool-description language shifts from "returns up to 1000 records" (exact guarantee) to "returns ≤ this many records" (upper bound) to match the new reality.
 
 ---
 
