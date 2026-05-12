@@ -16,6 +16,14 @@ expression: "tool_entry(\"get_orphans\")"
           "null"
         ]
       },
+      "count_only": {
+        "default": null,
+        "description": "Return only the match count, no records (default false). Bounded response < 1KB regardless of match scale.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "kind": {
         "default": null,
         "description": "Filter by symbol kind: function, method (default: all callables)",

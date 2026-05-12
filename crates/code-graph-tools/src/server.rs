@@ -234,6 +234,11 @@ pub struct GetFileSymbolsArgs {
     #[schemars(description = "Skip first N matches for pagination (default 0)")]
     #[serde(default)]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "Return only the match count, no records (default false). Bounded response < 1KB regardless of match scale."
+    )]
+    #[serde(default)]
+    pub count_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -263,6 +268,11 @@ pub struct SearchSymbolsArgs {
     #[schemars(description = "Omit signature, column, end_line (default true)")]
     #[serde(default)]
     pub brief: Option<bool>,
+    #[schemars(
+        description = "Return only the match count, no records (default false). Bounded response < 1KB regardless of match scale."
+    )]
+    #[serde(default)]
+    pub count_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -340,6 +350,11 @@ pub struct GetOrphansArgs {
     #[schemars(description = "Omit signature, column, end_line (default true)")]
     #[serde(default)]
     pub brief: Option<bool>,
+    #[schemars(
+        description = "Return only the match count, no records (default false). Bounded response < 1KB regardless of match scale."
+    )]
+    #[serde(default)]
+    pub count_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -812,6 +827,7 @@ mod tests {
                 brief: None,
                 limit: None,
                 offset: None,
+                count_only: None,
             }))
             .await
             .expect("tool-level errors return Ok(CallToolResult)");
@@ -837,6 +853,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 brief: None,
+                count_only: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -949,6 +966,7 @@ mod tests {
                 brief: None,
                 limit: None,
                 offset: None,
+                count_only: None,
             }))
             .await
             .unwrap();
@@ -1017,6 +1035,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 brief: None,
+                count_only: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -1165,5 +1184,124 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["total"].as_u64().unwrap(), 0);
+    }
+
+    // -- Phase 3.1 count_only Args deserialization -------------------------
+    //
+    // The `count_only: Option<bool>` field on GetOrphansArgs,
+    // SearchSymbolsArgs, and GetFileSymbolsArgs must deserialize via the
+    // same contract as the existing `Option<bool>` fields (`brief`, `force`,
+    // …): absent → None, present-and-bool → Some(value), wrong-type →
+    // deserialization error. The None default is what lets handlers resolve
+    // it to `false` via `unwrap_or(false)` in task 3.2; the test guards the
+    // pre-condition that flow depends on.
+    //
+    // We exercise the contract once per struct (across the four cases) so
+    // that a future schema-level regression on any of the three is caught
+    // independently.
+
+    #[test]
+    fn get_orphans_args_count_only_absent_is_none() {
+        let args: GetOrphansArgs = serde_json::from_str("{}").expect("empty object deserializes");
+        assert!(
+            args.count_only.is_none(),
+            "absent count_only must deserialize to None (handler resolves None to false via unwrap_or(false)); got {:?}",
+            args.count_only,
+        );
+    }
+
+    #[test]
+    fn get_orphans_args_count_only_true_is_some_true() {
+        let args: GetOrphansArgs =
+            serde_json::from_str(r#"{"count_only": true}"#).expect("count_only=true deserializes");
+        assert_eq!(args.count_only, Some(true));
+    }
+
+    #[test]
+    fn get_orphans_args_count_only_false_is_some_false() {
+        let args: GetOrphansArgs = serde_json::from_str(r#"{"count_only": false}"#)
+            .expect("count_only=false deserializes");
+        assert_eq!(args.count_only, Some(false));
+    }
+
+    #[test]
+    fn get_orphans_args_count_only_malformed_string_rejected() {
+        let result: Result<GetOrphansArgs, _> = serde_json::from_str(r#"{"count_only": "yes"}"#);
+        assert!(
+            result.is_err(),
+            "string instead of bool must produce a deserialization error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn search_symbols_args_count_only_absent_is_none() {
+        let args: SearchSymbolsArgs =
+            serde_json::from_str("{}").expect("empty object deserializes");
+        assert!(
+            args.count_only.is_none(),
+            "absent count_only must deserialize to None; got {:?}",
+            args.count_only,
+        );
+    }
+
+    #[test]
+    fn search_symbols_args_count_only_true_is_some_true() {
+        let args: SearchSymbolsArgs =
+            serde_json::from_str(r#"{"count_only": true}"#).expect("count_only=true deserializes");
+        assert_eq!(args.count_only, Some(true));
+    }
+
+    #[test]
+    fn search_symbols_args_count_only_false_is_some_false() {
+        let args: SearchSymbolsArgs = serde_json::from_str(r#"{"count_only": false}"#)
+            .expect("count_only=false deserializes");
+        assert_eq!(args.count_only, Some(false));
+    }
+
+    #[test]
+    fn search_symbols_args_count_only_malformed_string_rejected() {
+        let result: Result<SearchSymbolsArgs, _> = serde_json::from_str(r#"{"count_only": "yes"}"#);
+        assert!(
+            result.is_err(),
+            "string instead of bool must produce a deserialization error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn get_file_symbols_args_count_only_absent_is_none() {
+        // `file` is required on GetFileSymbolsArgs; supply a stub.
+        let args: GetFileSymbolsArgs =
+            serde_json::from_str(r#"{"file": "/x.cpp"}"#).expect("minimum-required deserializes");
+        assert!(
+            args.count_only.is_none(),
+            "absent count_only must deserialize to None; got {:?}",
+            args.count_only,
+        );
+    }
+
+    #[test]
+    fn get_file_symbols_args_count_only_true_is_some_true() {
+        let args: GetFileSymbolsArgs =
+            serde_json::from_str(r#"{"file": "/x.cpp", "count_only": true}"#)
+                .expect("count_only=true deserializes");
+        assert_eq!(args.count_only, Some(true));
+    }
+
+    #[test]
+    fn get_file_symbols_args_count_only_false_is_some_false() {
+        let args: GetFileSymbolsArgs =
+            serde_json::from_str(r#"{"file": "/x.cpp", "count_only": false}"#)
+                .expect("count_only=false deserializes");
+        assert_eq!(args.count_only, Some(false));
+    }
+
+    #[test]
+    fn get_file_symbols_args_count_only_malformed_string_rejected() {
+        let result: Result<GetFileSymbolsArgs, _> =
+            serde_json::from_str(r#"{"file": "/x.cpp", "count_only": "yes"}"#);
+        assert!(
+            result.is_err(),
+            "string instead of bool must produce a deserialization error; got {result:?}",
+        );
     }
 }

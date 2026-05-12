@@ -16,6 +16,14 @@ expression: "tool_entry(\"get_file_symbols\")"
           "null"
         ]
       },
+      "count_only": {
+        "default": null,
+        "description": "Return only the match count, no records (default false). Bounded response < 1KB regardless of match scale.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "file": {
         "description": "Absolute path to the source file",
         "type": "string"
