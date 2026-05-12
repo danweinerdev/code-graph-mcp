@@ -199,7 +199,6 @@ pub fn search_symbols(
         .iter()
         .map(|s| symbol_to_result(s, input.brief))
         .collect();
-    let page_len = page.len();
 
     // Handler-layer trim: iterate the mapped page, accumulating
     // serialized-JSON byte counts (plus a +1 inter-record comma, mirroring
@@ -217,7 +216,7 @@ pub fn search_symbols(
     // `Graph::search` returned a short page (end of match set). Only the
     // budget-driven trim sets `truncated=true`.
     let budget = max_bytes.saturating_sub(ENVELOPE_OVERHEAD_BYTES);
-    let mut results: Vec<SymbolResult> = Vec::with_capacity(page_len);
+    let mut results: Vec<SymbolResult> = Vec::with_capacity(page.len());
     let mut running_bytes: usize = 0;
     let mut truncated = false;
     let mut next_offset: Option<u32> = None;
@@ -1159,6 +1158,38 @@ mod tests {
         assert!(
             !truncated,
             "short page (end of match set) must NOT be marked truncated",
+        );
+        assert_eq!(next_offset, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn search_symbols_short_page_under_tight_but_sufficient_budget() {
+        // Companion to `search_symbols_short_page_not_marked_truncated`:
+        // exercises the interesting case — a short page (5 matches, limit=20)
+        // with a finite-but-sufficient budget. The trim loop must exhaust
+        // the page without biting; truncated stays false. Pins that the
+        // short-page detection isn't accidentally inverted under a real
+        // (non-infinite) budget.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_broad_matches(5));
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(20),
+                offset: Some(0),
+                ..search_input()
+            },
+            ENVELOPE_OVERHEAD_BYTES + 2000,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+        assert_eq!(results.len(), 5);
+        assert!(
+            !truncated,
+            "short page under sufficient budget must NOT be marked truncated",
         );
         assert_eq!(next_offset, serde_json::Value::Null);
     }
