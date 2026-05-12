@@ -355,6 +355,18 @@ pub(super) mod test_helpers {
         let limit = parsed["limit"].as_u64().unwrap_or(0) as u32;
         (results, total, offset, limit)
     }
+
+    /// Sibling accessor (not a wider tuple) so existing call sites continue to
+    /// compile unchanged. Reads the two `Page<T>` envelope fields added in
+    /// Phase 1 of the `PaginatedResponseSizeSafety` plan — `truncated` and
+    /// `next_offset` — from the same parsed JSON body. `next_offset == null`
+    /// in the wire JSON returns `None`; a number returns `Some(n as u32)`.
+    pub fn page_extras(r: &CallToolResult) -> (bool, Option<u32>) {
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap_or(false);
+        let next_offset = parsed["next_offset"].as_u64().map(|n| n as u32);
+        (truncated, next_offset)
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +603,59 @@ mod tests {
         assert_eq!(total_kept, 1);
         assert!(truncated, "second record's projected total exceeds budget");
         assert_eq!(next_offset, Some(1));
+    }
+
+    #[test]
+    fn page_parts_and_page_extras_agree_on_envelope_fields() {
+        // Pin both helpers' contracts together: construct a Page<T> with both
+        // Phase-1 envelope fields populated, round-trip through
+        // tool_success_json, then assert (a) page_parts still returns the
+        // legacy 4-tuple unchanged and (b) page_extras returns the new
+        // (truncated, next_offset) pair.
+        use super::test_helpers::{page_extras, page_parts};
+
+        let page: Page<Rec> = Page {
+            results: vec![Rec { id: 1 }, Rec { id: 2 }],
+            total: 7,
+            offset: 4,
+            limit: 2,
+            truncated: true,
+            next_offset: Some(42),
+        };
+        let r = tool_success_json(&page);
+
+        let (results, total, offset, limit) = page_parts(&r);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["id"], serde_json::json!(1));
+        assert_eq!(results[1]["id"], serde_json::json!(2));
+        assert_eq!(total, 7);
+        assert_eq!(offset, 4);
+        assert_eq!(limit, 2);
+
+        let (truncated, next_offset) = page_extras(&r);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(42));
+    }
+
+    #[test]
+    fn page_extras_reads_default_envelope_as_false_none() {
+        // Default-shaped Page<T> (truncated=false, next_offset=None) must
+        // surface as (false, None) — proves the JSON `null` -> Option::None
+        // mapping documented on page_extras.
+        use super::test_helpers::page_extras;
+
+        let page: Page<Rec> = Page {
+            results: vec![],
+            total: 0,
+            offset: 0,
+            limit: 100,
+            truncated: false,
+            next_offset: None,
+        };
+        let r = tool_success_json(&page);
+        let (truncated, next_offset) = page_extras(&r);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
     }
 
     #[test]
