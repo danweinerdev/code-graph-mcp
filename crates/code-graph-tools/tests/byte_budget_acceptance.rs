@@ -64,7 +64,7 @@ use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::structure::get_orphans;
-use code_graph_tools::handlers::symbols::{search_symbols, SearchSymbolsInput};
+use code_graph_tools::handlers::symbols::{get_file_symbols, search_symbols, SearchSymbolsInput};
 use code_graph_tools::handlers::ENVELOPE_OVERHEAD_BYTES;
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
@@ -420,22 +420,147 @@ async fn search_symbols_under_budget_at_limit_1000() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 5.3: count_only smoke tests — to be filled in by 5.3.
+// Task 5.3: count_only smoke tests
 // ---------------------------------------------------------------------------
 //
-// Three tests live here once 5.3 lands:
-//   - count_only_under_1kb_orphans
-//   - count_only_under_1kb_search_symbols
-//   - count_only_under_1kb_file_symbols
+// Each test calls one of `get_orphans` / `search_symbols` /
+// `get_file_symbols` with `count_only=true` against the same
+// 1500-orphan fixture and pins the documented count-only contract:
 //
-// Each calls the target tool with `count_only=true` against the same
-// `IndexedFixture`, asserts:
-//   - serde_json::to_string(&response_body).len() < 1024
-//   - response.total > 0
-//   - response.results.is_empty()
-//   - response.truncated == false
-//   - response.next_offset.is_none()
+//   - serialized body < 1024 bytes
+//   - total > 0 (sanity: fixture has matches)
+//   - results.is_empty()
+//   - truncated == false
+//   - next_offset.is_none()
 //
 // Trivial line count, but they pin the 1KB contract against an
 // accidental future bloat of the count-only envelope (e.g. a new
-// always-present metadata field).
+// always-present metadata field). The handler unit tests in
+// `structure.rs` / `symbols.rs` cover the per-tool sentinel-shape
+// invariants on tiny in-memory graphs; these integration smoke tests
+// confirm the same contract holds end-to-end on the real-scale fixture
+// that drove the originally-reported failure mode.
+
+#[tokio::test]
+async fn count_only_under_1kb_orphans() {
+    let fx = build_indexed_fixture().await;
+
+    let r = get_orphans(
+        &fx.inner.graph,
+        None,
+        None,
+        None,
+        None,
+        true,
+        DEFAULT_RESPONSE_MAX_BYTES,
+    );
+    let body = first_text(&r);
+    let body_len = body.len();
+    let (results_len, total, truncated, next_offset) = page_summary(&r);
+
+    // The 1KB contract. Phase 3.2's count-only sentinel envelope is
+    // engineered to fit well under this ceiling regardless of fixture
+    // size — `total` is the only variable-width field and it's a single
+    // u32. If this fails, someone has added a per-call metadata field
+    // to the envelope.
+    assert!(
+        body_len < 1024,
+        "get_orphans(count_only=true) body {body_len} bytes must be < 1024",
+    );
+    assert!(
+        total > 0,
+        "fixture must yield > 0 orphans (sanity); got total={total}",
+    );
+    assert_eq!(
+        results_len, 0,
+        "count_only must emit empty results; got results.len()={results_len}",
+    );
+    assert!(!truncated, "count_only must never set truncated=true");
+    assert!(
+        next_offset.is_none(),
+        "count_only must emit next_offset=null; got {next_offset:?}",
+    );
+}
+
+#[tokio::test]
+async fn count_only_under_1kb_search_symbols() {
+    let fx = build_indexed_fixture().await;
+
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("orphan"),
+            count_only: true,
+            ..SearchSymbolsInput::default()
+        },
+        DEFAULT_RESPONSE_MAX_BYTES,
+    );
+    let body = first_text(&r);
+    let body_len = body.len();
+    let (results_len, total, truncated, next_offset) = page_summary(&r);
+
+    assert!(
+        body_len < 1024,
+        "search_symbols(count_only=true) body {body_len} bytes must be < 1024",
+    );
+    assert!(
+        total > 0,
+        "fixture must yield > 0 matches for query=\"orphan\" (sanity); got total={total}",
+    );
+    assert_eq!(
+        results_len, 0,
+        "count_only must emit empty results; got results.len()={results_len}",
+    );
+    assert!(!truncated, "count_only must never set truncated=true");
+    assert!(
+        next_offset.is_none(),
+        "count_only must emit next_offset=null; got {next_offset:?}",
+    );
+}
+
+#[tokio::test]
+async fn count_only_under_1kb_file_symbols() {
+    let fx = build_indexed_fixture().await;
+
+    // The fixture writes `large_orphans.cpp` into the canonicalized
+    // TempDir. `get_file_symbols` keys off the absolute path that was
+    // recorded at index time, so reconstruct it the same way
+    // `build_indexed_fixture` did.
+    let file_path = std::fs::canonicalize(fx._dir.path())
+        .expect("canonicalize fixture dir")
+        .join(large_orphan_set::FIXTURE_FILENAME)
+        .to_string_lossy()
+        .into_owned();
+
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file_path,
+        false,
+        true,
+        None,
+        None,
+        true,
+        DEFAULT_RESPONSE_MAX_BYTES,
+    );
+    let body = first_text(&r);
+    let body_len = body.len();
+    let (results_len, total, truncated, next_offset) = page_summary(&r);
+
+    assert!(
+        body_len < 1024,
+        "get_file_symbols(count_only=true) body {body_len} bytes must be < 1024",
+    );
+    assert!(
+        total > 0,
+        "fixture must yield > 0 symbols for large_orphans.cpp (sanity); got total={total}",
+    );
+    assert_eq!(
+        results_len, 0,
+        "count_only must emit empty results; got results.len()={results_len}",
+    );
+    assert!(!truncated, "count_only must never set truncated=true");
+    assert!(
+        next_offset.is_none(),
+        "count_only must emit next_offset=null; got {next_offset:?}",
+    );
+}
