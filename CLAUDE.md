@@ -68,12 +68,20 @@ Tool descriptions in `#[tool(description=…)]` strings (server.rs) are **produc
 
 - **`Page<T>` envelope** (`get_orphans`, `get_file_symbols`, `get_callers`, `get_callees`, `search_symbols`):
   ```
-  { results: T[], total: u32, offset: u32, limit: u32 }
+  { results: T[], total: u32, offset: u32, limit: u32, truncated: bool, next_offset: u32 | null }
   ```
   - `total` = pre-pagination match count.
   - `offset`/`limit` echo the *resolved* values (so silent clamp-to-1000 is visible).
   - `limit = 0` → use default.
+  - `truncated` / `next_offset` are always present (no `skip_serializing_if`); a non-truncated page emits `truncated: false` and `next_offset: null` explicitly.
+  - **Paging-resume contract.** When `truncated=true`, the page was cut short by the byte budget (`[response].max_bytes`, default 100KB) before reaching `limit`. Re-call with `offset = next_offset` to continue. `next_offset` always points strictly past the current page's last emitted record. `truncated=false` plus `next_offset=null` means the page is the natural end of the result set.
+  - **`limit` is an upper bound, not an exact count.** The returned page may have fewer records than `limit` when the byte budget bites. Check `truncated` rather than `results.length == limit` to detect partial pages — a full byte-capped page can still satisfy `results.length < limit`, and a natural last page satisfies the same inequality without truncation.
   - Sort: `symbol_id` asc (symbol lists); `(depth, symbol_id)` asc for callers/callees (closest results page 1).
+  - **`count_only` response shape** (subset of `Page<T>`, used by `get_orphans`, `search_symbols`, `get_file_symbols` when `count_only=true`):
+    ```
+    { results: [], total, offset: 0, limit: 0, truncated: false, next_offset: null }
+    ```
+    `limit: 0` here is a **deliberate exception** to the "envelope echoes resolved limit" contract above — `count_only` callers opted out of paging entirely, so echoing a would-have-been limit would mislead them into thinking there's a record page to fetch. `total` still reflects the true pre-pagination match count after all filters. The envelope stays shape-compatible with `Page<T>` so a single client deserializer covers both modes.
 - **`get_class_hierarchy`** (tree):
   ```
   { hierarchy: HierarchyNode, truncated: bool, max_nodes: u32, total_nodes_seen: u32 }
