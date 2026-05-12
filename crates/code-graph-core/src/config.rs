@@ -11,13 +11,48 @@
 //! to the host's logical CPU count.
 
 use crate::Language;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 
 /// Helper for `#[serde(default = "...")]` on `bool` fields whose documented
 /// default is `true`. Plain `#[serde(default)]` would give `false`.
 fn default_true() -> bool {
     true
+}
+
+/// Default value for `[response].max_bytes` — 100 KB. Sized to keep
+/// individual MCP tool responses within a budget that the agent context
+/// window can absorb without forcing aggressive summarization, while still
+/// fitting a page of typical-size records (see `PaginatedResponseSizeSafety`
+/// plan README, Decision 8).
+pub const DEFAULT_RESPONSE_MAX_BYTES: usize = 102_400;
+
+/// Helper for `#[serde(default = "...")]` on `ResponseConfig::max_bytes` so
+/// that omitting the key (with the section present) still yields the
+/// documented default.
+fn default_response_max_bytes() -> usize {
+    DEFAULT_RESPONSE_MAX_BYTES
+}
+
+/// Custom deserializer for `[response].max_bytes`. Rejects zero with a
+/// clear error message — a budget of zero would make every paginated
+/// handler return an empty page with `truncated=true`, which is
+/// silently-broken behavior nobody would intend.
+///
+/// Negative integers and non-integer values are rejected by `toml`/`serde`
+/// at the type-coercion layer (the field is `usize`), so this validator
+/// only has to guard against the one in-range value that's still nonsense.
+fn deserialize_response_max_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "`[response].max_bytes` must be > 0",
+        ));
+    }
+    Ok(value)
 }
 
 /// Top-level project configuration loaded from `<root>/.code-graph.toml`.
@@ -35,6 +70,8 @@ pub struct RootConfig {
     pub cpp: CppConfig,
     #[serde(default)]
     pub extensions: ExtensionsConfig,
+    #[serde(default)]
+    pub response: ResponseConfig,
 }
 
 /// Discovery walker tunables. Controls how source files are found and which
@@ -215,6 +252,40 @@ impl ExtensionsConfig {
             ("csharp", &self.csharp),
             ("java", &self.java),
         ]
+    }
+}
+
+/// Response-shaping tunables. Controls the byte budget that paginated tool
+/// handlers honor when materializing a page of results.
+///
+/// `max_bytes` is a soft per-response ceiling enforced by the
+/// `byte_budget_take` helper in `code-graph-tools`. When a candidate record
+/// would push the running serialized size over the budget, the page is cut
+/// short with `truncated=true` and `next_offset` set so the caller can
+/// resume. See `Plans/PaginatedResponseSizeSafety/README.md` for the full
+/// rationale.
+///
+/// The default (`102_400` bytes = 100 KB) is sized to fit a page of
+/// typical-size records under a single MCP tool response that an AI agent
+/// can absorb without forcing summarization.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResponseConfig {
+    /// Per-response byte budget consulted by paginated handlers. Default
+    /// `102_400` (100 KB). Must be `> 0`; zero is rejected at load time
+    /// with a clear error (a zero budget would silently return an empty
+    /// page on every call).
+    #[serde(
+        default = "default_response_max_bytes",
+        deserialize_with = "deserialize_response_max_bytes"
+    )]
+    pub max_bytes: usize,
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_RESPONSE_MAX_BYTES,
+        }
     }
 }
 
@@ -866,6 +937,163 @@ disabled = [""]
         let cfg = RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
         assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
         assert!(cfg.extensions.disabled.is_empty());
+    }
+
+    // --- ResponseConfig tests (PaginatedResponseSizeSafety Phase 1.2) ------
+
+    #[test]
+    fn response_config_default_is_100kb() {
+        // The chosen default is 102_400 bytes (100 KB). Documented in
+        // PaginatedResponseSizeSafety/README.md, Decision 8. Encoded as a
+        // public constant so downstream wiring can reference the same
+        // value without duplicating the magic number.
+        assert_eq!(DEFAULT_RESPONSE_MAX_BYTES, 102_400);
+        let cfg = RootConfig::default();
+        assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn response_section_absent_uses_default() {
+        // Backward compatibility: every existing `.code-graph.toml` in the
+        // wild has no `[response]` section. Loading must produce the
+        // default `max_bytes` with no error.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[discovery]\nmax_threads = 0\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path())
+            .expect("config without [response] section must load cleanly");
+        assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn response_section_empty_uses_default() {
+        // `[response]` header present but no `max_bytes` key must still
+        // yield the default via the `#[serde(default = ...)]` on the field.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".code-graph.toml"), "[response]\n").unwrap();
+        let cfg = RootConfig::load(dir.path())
+            .expect("empty [response] section must yield default max_bytes");
+        assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn response_explicit_override_is_honored() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[response]\nmax_bytes = 51200\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("explicit override must load");
+        assert_eq!(cfg.response.max_bytes, 51_200);
+    }
+
+    #[test]
+    fn response_max_bytes_zero_is_rejected() {
+        // A zero budget would make every paginated handler return an empty
+        // page with `truncated=true` — silently-broken. The custom
+        // deserializer rejects it at load time with a clear error message.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[response]\nmax_bytes = 0\n",
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path())
+            .expect_err("max_bytes = 0 must be rejected, not silently accepted");
+        match err {
+            ConfigError::Toml(ref e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("max_bytes") && msg.contains("> 0"),
+                    "error must clearly name the field and the constraint, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Toml, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_max_bytes_negative_is_rejected() {
+        // `usize` cannot represent a negative value; `toml`/`serde` reject
+        // at the type-coercion layer with its own diagnostic. We verify
+        // here that load returns `Err`, not silently coerces or defaults.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[response]\nmax_bytes = -1\n",
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path())
+            .expect_err("negative max_bytes must be rejected, not coerced");
+        match err {
+            ConfigError::Toml(_) => {}
+            other => panic!("expected ConfigError::Toml for negative max_bytes, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_max_bytes_non_integer_is_rejected() {
+        // A floating-point or string value must error at the type-coercion
+        // layer rather than silently converting.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[response]\nmax_bytes = 1.5\n",
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path())
+            .expect_err("non-integer max_bytes must be rejected, not coerced");
+        match err {
+            ConfigError::Toml(_) => {}
+            other => panic!("expected ConfigError::Toml for non-integer max_bytes, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_section_round_trip_serialize_deserialize() {
+        // Confirms the section participates in serde round-tripping
+        // alongside the other sections. The Serialize derive (no custom
+        // ser) emits the field directly; deserialization runs through the
+        // custom validator on the way back.
+        let mut cfg = RootConfig::default();
+        cfg.response.max_bytes = 65_536;
+        let serialized = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.response.max_bytes, 65_536);
+    }
+
+    #[test]
+    fn response_section_coexists_with_other_sections() {
+        // Smoke test: every section appearing together still parses and
+        // each retains its own values. Confirms the new field doesn't
+        // disturb existing section ordering.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            r#"
+[discovery]
+max_threads = 2
+[parsing]
+max_threads = 4
+[cpp]
+macro_strip = ["CORE_API"]
+[extensions]
+cpp = [".cu"]
+[response]
+max_bytes = 200000
+"#,
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("multi-section config must load");
+        assert_eq!(cfg.discovery.max_threads, 2);
+        assert_eq!(cfg.parsing.max_threads, 4);
+        assert_eq!(cfg.cpp.macro_strip, vec!["CORE_API".to_string()]);
+        assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
+        assert_eq!(cfg.response.max_bytes, 200_000);
     }
 
     #[test]
