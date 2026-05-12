@@ -228,6 +228,46 @@ async fn response_search_symbols_query_engine() {
     });
 }
 
+#[tokio::test]
+async fn response_search_symbols_byte_budget_truncated() {
+    // Phase 2.5 of PaginatedResponseSizeSafety: a tight `max_bytes` makes
+    // the handler trim the already-sliced page that `Graph::search`
+    // returned. Architectural exception from the other four paginated
+    // tools — search_symbols delegates pagination to `Graph::search`, so
+    // the trim happens at the handler layer (NOT via `byte_budget_take`).
+    //
+    // Fixture: 30 free functions named `func_NNN` in a single C++ file.
+    // `query="func"` matches all 30, so `sr.total = 30` regardless of
+    // page size. Asks for `limit=1000` so `Graph::search` returns the
+    // full 30-record page; the budget is what trims it. With a budget of
+    // ~400 bytes after envelope overhead, only a handful of records fit.
+    //
+    // The snapshot locks the truncated-page shape: `truncated: true`,
+    // `next_offset: N` where `N < limit` (and `N < 30` — the trim never
+    // points past the underlying match set), and `total: 30`
+    // (pre-pagination match count from `Graph::search`, unchanged
+    // regardless of trim outcome). Kept records are in `symbol_id`
+    // ascending order — `Graph::search`'s deterministic bounded-heap
+    // sort, preserved by the handler-layer trim.
+    let fx = build_indexed_fixture_with_many_file_symbols(30).await;
+    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
+    let r = search_symbols(
+        &fx.inner.graph,
+        SearchSymbolsInput {
+            query: Some("func"),
+            limit: Some(1000),
+            offset: Some(0),
+            brief: true,
+            ..Default::default()
+        },
+        max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
 // --- get_symbol_detail ---------------------------------------------------
 
 #[tokio::test]

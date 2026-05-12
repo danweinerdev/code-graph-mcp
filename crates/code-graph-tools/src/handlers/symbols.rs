@@ -14,7 +14,7 @@ use rmcp::model::CallToolResult;
 
 use super::{
     byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    tool_error, tool_success_json, Page, SymbolResult,
+    tool_error, tool_success_json, Page, SymbolResult, ENVELOPE_OVERHEAD_BYTES,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
@@ -124,14 +124,27 @@ pub struct SearchSymbolsInput<'a> {
 /// parses string-typed filters into their typed forms, then delegates to
 /// `Graph::search`. The pagination envelope is always present — `total`
 /// is reported pre-pagination so callers can render "page X of Y" UIs.
+///
+/// **Architectural exception (Phase 2 of `PaginatedResponseSizeSafety`):**
+/// unlike the four materializing handlers (orphans, file_symbols, callers,
+/// callees) that operate on a full match set before pagination, this handler
+/// receives an already-sliced page from `Graph::search` (the heap inside
+/// `search` keeps only `offset + limit` records). The byte-budget trim is
+/// applied at the handler layer here as a post-process on `sr.symbols`,
+/// NOT via `byte_budget_take` (whose `offset`/`limit` semantics don't apply
+/// to an already-paginated page).
+///
+/// Truncation distinction matters: `sr.symbols.len() < resolved_limit` is
+/// normal end-of-match-set (Graph::search exhausted the underlying match
+/// set at this offset); we report `truncated=false` in that case. Only set
+/// `truncated=true` when the byte-budget trim DROPS records from the page
+/// returned by `Graph::search`. `total` always carries `sr.total` (the
+/// pre-pagination match count from `Graph::search`).
 pub fn search_symbols(
     graph: &RwLock<Graph>,
     input: SearchSymbolsInput<'_>,
     max_bytes: usize,
 ) -> CallToolResult {
-    // Plumbed in task 2.0; consumed in task 2.1+ (PaginatedResponseSizeSafety).
-    let _ = max_bytes;
-
     let query_str = input.query.unwrap_or("");
     let kind_str_ref = input.kind.unwrap_or("");
     let namespace_str = input.namespace.unwrap_or("");
@@ -178,19 +191,69 @@ pub fn search_symbols(
         offset: resolved_offset,
     });
 
-    let results: Vec<SymbolResult> = sr
+    // `sr.symbols` is the already-sliced page (length <= resolved_limit).
+    // Map to SymbolResult eagerly so we can size each record against the
+    // byte budget.
+    let page: Vec<SymbolResult> = sr
         .symbols
         .iter()
         .map(|s| symbol_to_result(s, input.brief))
         .collect();
+    let page_len = page.len();
+
+    // Handler-layer trim: iterate the mapped page, accumulating
+    // serialized-JSON byte counts (plus a +1 inter-record comma, mirroring
+    // `byte_budget_take`'s accounting). Stop at the first record whose
+    // admission would push the running total past
+    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. The dropped record's index `k`
+    // (within `page`) becomes the offset delta for `next_offset`.
+    //
+    // saturating_sub guards against pathological `max_bytes` smaller than
+    // `ENVELOPE_OVERHEAD_BYTES` (including `max_bytes == 0`): budget
+    // becomes 0 and the first record's projected total trips the cutoff.
+    //
+    // If we exhaust the page without the budget biting, `truncated` stays
+    // `false` and `next_offset` stays `None` — including the case where
+    // `Graph::search` returned a short page (end of match set). Only the
+    // budget-driven trim sets `truncated=true`.
+    let budget = max_bytes.saturating_sub(ENVELOPE_OVERHEAD_BYTES);
+    let mut results: Vec<SymbolResult> = Vec::with_capacity(page_len);
+    let mut running_bytes: usize = 0;
+    let mut truncated = false;
+    let mut next_offset: Option<u32> = None;
+
+    for record in page {
+        // Production records (SymbolResult) hold only plain owned data and
+        // never fail to serialize; the unwrap_or(0) fallback mirrors
+        // `byte_budget_take` and only exists to satisfy the Serialize bound.
+        let serialized_len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
+        // +1 covers the inter-record comma. Over-counts by 1 on the first
+        // record — intentional headroom, same as `byte_budget_take`.
+        let projected = running_bytes
+            .saturating_add(serialized_len)
+            .saturating_add(1);
+        if projected > budget {
+            // Budget bites: this record is the first one DROPPED. `k` is the
+            // count of records ALREADY kept; `resolved_offset + k` is where
+            // the next call should re-page from to pick up this dropped
+            // record as its first entry — no overlap, no gap at the trim
+            // boundary.
+            let k = results.len() as u32;
+            truncated = true;
+            next_offset = Some(resolved_offset.saturating_add(k));
+            break;
+        }
+        running_bytes = projected;
+        results.push(record);
+    }
 
     let response = Page::<SymbolResult> {
         results,
         total: sr.total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated: false,
-        next_offset: None,
+        truncated,
+        next_offset,
     };
     tool_success_json(&response)
 }
@@ -806,6 +869,298 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // All three sample symbols are Cpp.
         assert_eq!(parsed["total"], serde_json::json!(3));
+    }
+
+    // --- search_symbols byte-budget invariants ----------------------------
+
+    /// Build a single-file graph with `n` free functions named
+    /// `match_NNN` for `n < 1000`. Zero-padding keeps the natural
+    /// `symbol_id` sort order predictable: ids are
+    /// `"/broad.cpp:match_000".."/broad.cpp:match_NNN"`. All symbols pass a
+    /// `query="match"` filter, so `Graph::search` returns up to
+    /// `offset+limit` of them — perfect for exercising the handler-layer
+    /// trim against an already-sliced page.
+    fn graph_with_n_broad_matches(n: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(n);
+        for i in 0..n {
+            symbols.push(sym(
+                &format!("match_{i:03}"),
+                SymbolKind::Function,
+                "/broad.cpp",
+                "",
+            ));
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/broad.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    #[test]
+    fn search_symbols_byte_budget_truncates_oversized_page() {
+        // Phase 2.5 of PaginatedResponseSizeSafety: a tight `max_bytes`
+        // must make the handler trim its already-sliced page from
+        // `Graph::search` and surface `truncated=true` with a usable
+        // `next_offset`. Architectural distinction from the other four
+        // paginated handlers: search_symbols receives a page that's
+        // already <= resolved_limit records long, so the trim happens at
+        // the handler layer (NOT via `byte_budget_take`).
+        //
+        // 100 symbols total in the graph — `query="match"` matches all of
+        // them, so `sr.total` is 100 (pre-pagination match count from
+        // `Graph::search`). Ask for limit=50; with a tight budget only a
+        // handful of records fit before the budget bites.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_broad_matches(100));
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(50),
+                offset: Some(0),
+                ..search_input()
+            },
+            max_bytes,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let truncated = parsed["truncated"].as_bool().expect("truncated field");
+        let next_offset = parsed["next_offset"].as_u64();
+        let total = parsed["total"].as_u64().unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let limit = parsed["limit"].as_u64().unwrap();
+
+        assert!(truncated, "tight max_bytes must produce truncated=true");
+        let k = next_offset.expect("truncated=true must set next_offset=Some(n)");
+        assert!(
+            k < limit,
+            "next_offset must point before the count cap: next_offset={k} >= limit={limit}",
+        );
+        assert!(
+            (results.len() as u64) < limit,
+            "trim must stop before hitting the count cap: results.len()={} >= limit={limit}",
+            results.len(),
+        );
+        assert!(
+            !results.is_empty(),
+            "budget should still admit at least one record",
+        );
+        // `total` is the pre-pagination match count from `Graph::search`,
+        // NOT the page size. 100 symbols all match `query="match"`.
+        assert_eq!(
+            total, 100,
+            "total is the pre-pagination match count, not results.len()",
+        );
+    }
+
+    #[test]
+    fn search_symbols_byte_budget_records_not_corrupted_by_trim() {
+        // Pin: the handler-layer trim drops complete records, never half-
+        // serialized ones. Take the last KEPT record's `id` and verify it
+        // round-trips through `id_to_file` to a non-empty file path —
+        // proves the id field is intact and the JSON envelope didn't slice
+        // a record mid-string.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_broad_matches(100));
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(50),
+                offset: Some(0),
+                ..search_input()
+            },
+            max_bytes,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "fixture sized so at least one record fits the budget",
+        );
+        let last = results.last().unwrap();
+        let id = last["id"].as_str().expect("last record has a string id");
+        let file = code_graph_core::id_to_file(id);
+        assert!(
+            !file.is_empty(),
+            "id_to_file must resolve to a non-empty path; id={id} truncated mid-serialization?",
+        );
+        assert_eq!(
+            file, "/broad.cpp",
+            "id must round-trip back to the fixture's file path",
+        );
+    }
+
+    #[test]
+    fn search_symbols_byte_budget_re_paging_correctness() {
+        // CRITICAL: re-paging from `next_offset` must produce exactly the
+        // (k+1)-th record from the first call's underlying sorted match
+        // set (the record AT index `k` that the trim DROPPED). No overlap,
+        // no gap at the trim boundary.
+        //
+        // Strategy: call once with a tight budget that truncates at index
+        // k; record `next_offset = Some(resolved_offset + k)`. Call again
+        // with `offset = next_offset` and NO_BYTE_BUDGET (so the full page
+        // returns). The second call's first record's `id` must equal the
+        // id at sorted-position `k` in the full match set — easy to
+        // compute independently because `match_NNN` ids sort lexically.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_broad_matches(100));
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
+
+        // First call: tight budget, expect truncation.
+        let r1 = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(50),
+                offset: Some(0),
+                ..search_input()
+            },
+            max_bytes,
+        );
+        let p1: serde_json::Value = serde_json::from_str(&body_text(&r1)).unwrap();
+        let truncated1 = p1["truncated"].as_bool().unwrap();
+        let next_offset1 = p1["next_offset"]
+            .as_u64()
+            .expect("first call must truncate") as u32;
+        let results1 = p1["results"].as_array().unwrap();
+        assert!(truncated1, "first call must trip the budget");
+
+        // Independent oracle: ids sort lexically. The (k+1)-th record's id
+        // is `/broad.cpp:match_<next_offset1>` (zero-padded to 3 digits).
+        let expected_first_id_of_page_2 = format!("/broad.cpp:match_{next_offset1:03}");
+
+        // Second call: re-page from `next_offset` with no budget cap. The
+        // first record of the returned page is the one the trim DROPPED.
+        let r2 = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(50),
+                offset: Some(next_offset1),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let p2: serde_json::Value = serde_json::from_str(&body_text(&r2)).unwrap();
+        let results2 = p2["results"].as_array().unwrap();
+        assert!(
+            !results2.is_empty(),
+            "second call must return at least the dropped record",
+        );
+        let first_id_of_page_2 = results2[0]["id"].as_str().unwrap();
+        assert_eq!(
+            first_id_of_page_2, expected_first_id_of_page_2,
+            "re-paging boundary mismatch: first record of page 2 must equal the (k+1)-th record from page 1's underlying sorted set",
+        );
+
+        // Anti-overlap: the last id of page 1 must NOT equal the first id
+        // of page 2 (no duplicate record at the trim boundary).
+        let last_id_of_page_1 = results1.last().expect("page 1 has at least one record")["id"]
+            .as_str()
+            .unwrap();
+        assert_ne!(
+            last_id_of_page_1, first_id_of_page_2,
+            "trim must not leave overlap at the boundary",
+        );
+
+        // Anti-gap: ids are lexically dense (`match_000`..`match_099`), so
+        // the first record of page 2 must be the immediate successor of
+        // page 1's last record.
+        let last_seq: u32 = last_id_of_page_1
+            .strip_prefix("/broad.cpp:match_")
+            .and_then(|s| s.parse().ok())
+            .expect("page 1 last id must end with a 3-digit suffix");
+        let first_seq: u32 = first_id_of_page_2
+            .strip_prefix("/broad.cpp:match_")
+            .and_then(|s| s.parse().ok())
+            .expect("page 2 first id must end with a 3-digit suffix");
+        assert_eq!(
+            first_seq,
+            last_seq + 1,
+            "trim must leave no gap at the boundary: page 1 ends at seq {last_seq}, page 2 starts at seq {first_seq}",
+        );
+    }
+
+    #[test]
+    fn search_symbols_byte_budget_no_truncation_with_no_budget() {
+        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX) the handler
+        // returns the full page from `Graph::search` unchanged —
+        // `truncated=false`, `next_offset=None`. Locks the contract that
+        // byte-budget wiring doesn't affect callers that opt out.
+        let g = locked(graph_with_n_broad_matches(100));
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(50),
+                offset: Some(0),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+        let total = parsed["total"].as_u64().unwrap();
+
+        assert_eq!(
+            results.len(),
+            50,
+            "NO_BYTE_BUDGET must return the full page from Graph::search",
+        );
+        assert!(!truncated, "NO_BYTE_BUDGET must never set truncated=true");
+        assert_eq!(
+            next_offset,
+            serde_json::Value::Null,
+            "NO_BYTE_BUDGET must set next_offset=null",
+        );
+        assert_eq!(total, 100, "total is the pre-pagination match count");
+    }
+
+    #[test]
+    fn search_symbols_short_page_not_marked_truncated() {
+        // Architectural pin: when `Graph::search` returns a short page
+        // (the underlying match set is exhausted at this offset),
+        // `truncated` MUST stay `false` even with a small budget — as
+        // long as the budget is large enough to fit every record on the
+        // returned page. A short page is end-of-match-set, NOT a
+        // budget-driven trim.
+        //
+        // Fixture: 5 matches total. Ask for limit=20. Graph::search
+        // returns all 5 (page shorter than limit). With generous budget,
+        // the trim loop exhausts the page without biting — truncated must
+        // stay false, next_offset must stay None.
+        let g = locked(graph_with_n_broad_matches(5));
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("match"),
+                limit: Some(20),
+                offset: Some(0),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+        assert_eq!(results.len(), 5);
+        assert!(
+            !truncated,
+            "short page (end of match set) must NOT be marked truncated",
+        );
+        assert_eq!(next_offset, serde_json::Value::Null);
     }
 
     // --- get_symbol_detail ---
