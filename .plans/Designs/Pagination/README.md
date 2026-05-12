@@ -71,7 +71,7 @@ Today `SearchResponse` is private to `crates/codegraph-tools/src/handlers/symbol
 ```mermaid
 graph TD
     Handlers[crates/codegraph-tools/src/handlers/mod.rs]
-    Page["pub struct Page&lt;T&gt; { results, total, offset, limit }"]
+    Page["pub struct Page&lt;T&gt; { results, total, offset, limit,<br/>truncated, next_offset }"]
     Symbols[symbols.rs<br/>get_file_symbols<br/>search_symbols]
     Structure[structure.rs<br/>get_orphans]
     Query[query.rs<br/>get_callers / get_callees]
@@ -82,7 +82,9 @@ graph TD
     Query --uses--> Page
 ```
 
-Same field names, same semantics, same JSON shape as the current `SearchResponse`. `total` = pre-pagination match count; `offset`/`limit` = the resolved values used (echoed). All three integer fields are `u32`, matching the existing `SearchResponse` types — preserves the wire format byte-for-byte. No `next_offset`, no `has_more`, no `truncated` on the envelope — clients compute `total > offset + len(results)` themselves, exactly as they do today for `search_symbols`.
+Same field names, same semantics, same JSON shape as the current `SearchResponse`. `total` = pre-pagination match count; `offset`/`limit` = the resolved values used (echoed). All three integer fields are `u32`, matching the existing `SearchResponse` types — preserves the wire format byte-for-byte.
+
+> **Superseded by D8 (see Decisions below).** The byte-budget addendum added `truncated: bool` and `next_offset: Option<u32>` to the envelope. Clients should now check `truncated` rather than computing `total > offset + len(results)` themselves — the byte budget can cut a page short before the count cap, and `next_offset` provides the resume position. The Mermaid and sequence diagrams in this section reflect the original 4-field design; the canonical wire shape is now the 6-field envelope documented in D8.
 
 **Materialization layer is not uniform across paginated tools.** `search_symbols` pushes pagination into the Graph layer via `SearchParams` — `Graph::search` does the sort and slice and returns a `SearchResult { matches, total }`. The new paginated tools (`get_orphans`, `get_file_symbols`, `get_callers`, `get_callees`) take a different path: the Graph layer returns the full unsorted result, and the handler does the sort + slice. This is intentional. Push-down would require touching four Graph-layer entry points; pagination is a wire-format concern, and matching the wire format is what matters for the user-visible contract. Pushing pagination into the Graph layer is a separate performance project that can ship independently. The two patterns coexist with no behavioral difference visible to callers.
 
@@ -105,7 +107,7 @@ sequenceDiagram
     Handler->>Handler: total = vec.len()
     Handler->>Handler: stable sort (symbol_id ascending)
     Handler->>Handler: slice [offset .. offset+limit]
-    Handler-->>Server: Page { results, total, offset, limit }
+    Handler-->>Server: Page { results, total, offset, limit, truncated, next_offset }
     Server-->>Agent: JSON envelope
 ```
 

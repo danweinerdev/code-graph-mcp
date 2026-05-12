@@ -138,7 +138,7 @@ java = []
 - To apply new `macro_strip` or to evict entries moved to `[extensions].disabled`: re-run `analyze_codebase` with `force=true`.
 - Adding extensions: new files brought in by `[extensions].<lang>` parse normally on next run.
 - Watch path consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
-- `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call. The cache is refreshed by `analyze_codebase`; the value affects response shaping only, so **no `force=true` is required** to apply a changed value at the next reload.
+- `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (the TOML file is NOT re-read per query). To apply a changed value, re-run `analyze_codebase` — **no `force=true` required**, because no mtime-based cache entries are affected; the value only shapes response output.
 
 ## Per-language parser facts
 
@@ -307,7 +307,7 @@ Applies when diff touches `#[tool(description=…)]` strings in `crates/code-gra
 Checklist:
 - Every named arg documented with default + ceiling.
 - Verb in suggested action operationally produces the claimed result. ✓ "raise `limit` for more results"; ✗ "raise `offset` for more results".
-- Response envelope shape named, not implied. Say `{results, total, offset, limit}`; don't make agents guess.
+- Response envelope shape named, not implied. Say `{results, total, offset, limit, truncated, next_offset}`; don't make agents guess.
 - Hint when non-default values are appropriate ("default 100; raise for symbols with high fan-in" beats "default 100, max 1000" alone).
 - Plurality + units match field type.
 
