@@ -114,6 +114,58 @@ pub fn symbol_id(s: &Symbol) -> SymbolId {
     }
 }
 
+/// Recover the file path prefix of a [`SymbolId`] produced by [`symbol_id`].
+///
+/// This is the **public id-recovery contract** for MCP consumers: any consumer
+/// that needs to map a `SymbolId` back to the originating file path MUST use
+/// this function rather than rolling its own split. Phase 4 of the
+/// `PaginatedResponseSizeSafety` plan references this as the canonical inverse
+/// of [`symbol_id`].
+///
+/// # Algorithm
+///
+/// Walks `id` from right to left and returns the slice before the **rightmost
+/// `:` that is not part of a `::` token**. Concretely, a colon at byte index
+/// `i` qualifies iff `bytes[i - 1] != b':'` AND `bytes[i + 1] != b':'`. This is
+/// exact-inverse of the two id formats:
+///
+/// - Free symbol: `format!("{file}:{name}")` — the single separator colon.
+/// - Method: `format!("{file}:{parent}::{name}")` — the separator colon sits
+///   to the LEFT of `Parent::name`, so the rightmost-not-part-of-`::` colon is
+///   the separator, never one of the colons in `::`.
+///
+/// Symbol names in the six supported languages (C++, Rust, Go, Python, C#,
+/// Java) cannot contain a `:`, so there is no ambiguity inside the name
+/// portion.
+///
+/// # Edge cases
+///
+/// - **Windows drive letters** (`C:\Users\foo\bar.cs:Baz::qux`): the drive
+///   colon at index `1` is followed by `\`, not `:`, so it qualifies as a
+///   separator colon. But the rightmost-not-part-of-`::` colon is the one
+///   between `bar.cs` and `Baz`, so the drive colon is not reached.
+/// - **Filename containing `:`** (`/project/foo:bar.rs:func`): same reasoning;
+///   the rightmost qualifying colon is between `bar.rs` and `func`, so
+///   `foo:bar.rs` is preserved in the file portion.
+/// - **Malformed id with no separator colon**: returns `""` rather than
+///   panicking. Callers that need to detect this case should check
+///   `id_to_file(id).is_empty()`.
+pub fn id_to_file(id: &str) -> &str {
+    let bytes = id.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b':' {
+            let prev_is_colon = i > 0 && bytes[i - 1] == b':';
+            let next_is_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+            if !prev_is_colon && !next_is_colon {
+                return &id[..i];
+            }
+        }
+    }
+    ""
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +447,87 @@ mod tests {
             language: Language::Cpp,
         };
         assert_eq!(symbol_id(&s), "src/util.cpp:free_in_ns");
+    }
+
+    // -------------------------------------------------------------------
+    // id_to_file recovery tests
+    //
+    // These tests pin the rightmost-not-part-of-`::` contract documented on
+    // `id_to_file`. Phase 4 of PaginatedResponseSizeSafety references this
+    // function as the canonical inverse of `symbol_id`; consumers must use it
+    // rather than rolling their own split.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn id_to_file_unix_free_function() {
+        // Free function id format: "file:name" → file is everything before
+        // the single separator colon.
+        assert_eq!(id_to_file("/a/b.rs:foo"), "/a/b.rs");
+    }
+
+    #[test]
+    fn id_to_file_unix_method() {
+        // Method id format: "file:Parent::name" → the separator colon is the
+        // rightmost colon NOT part of `::`. The `::` between Parent and name
+        // must be skipped.
+        assert_eq!(id_to_file("/a/b.rs:Foo::bar"), "/a/b.rs");
+    }
+
+    #[test]
+    fn id_to_file_windows_path() {
+        // Windows drive-letter colon (`C:\...`) must NOT be confused with the
+        // separator. The drive colon's right neighbor is `\`, not `:`, so the
+        // colon qualifies as a separator candidate — but it's never reached
+        // because a rightmost qualifying colon exists between `b.cs` and `Baz`.
+        assert_eq!(id_to_file(r"C:\a\b.cs:Baz::qux"), r"C:\a\b.cs");
+    }
+
+    #[test]
+    fn id_to_file_malformed_no_separator() {
+        // Defensive: id with no `:` at all → empty &str, NOT a panic.
+        assert_eq!(id_to_file("noseparator"), "");
+    }
+
+    #[test]
+    fn id_to_file_round_trip() {
+        // Construct ids the same way symbol_id does and assert id_to_file
+        // recovers the file path. Covers a representative spread of path
+        // shapes (Unix abs, Unix rel, Windows abs, deeply nested).
+        let cases = [
+            ("/a/b.rs", "foo"),
+            ("src/util.cpp", "do_thing"),
+            (r"C:\Users\dev\widget.cs", "Render"),
+            ("crates/code-graph-core/src/lib.rs", "id_to_file"),
+        ];
+        for (file, name) in cases {
+            let id = format!("{file}:{name}");
+            assert_eq!(id_to_file(&id), file, "round-trip failed for id={id}");
+        }
+
+        // Method form: "{file}:{parent}::{name}" must also round-trip.
+        let method_cases = [
+            ("/a/b.rs", "Foo", "bar"),
+            ("src/widget.cpp", "Widget", "do_it"),
+        ];
+        for (file, parent, name) in method_cases {
+            let id = format!("{file}:{parent}::{name}");
+            assert_eq!(
+                id_to_file(&id),
+                file,
+                "method-form round-trip failed for id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn id_to_file_unix_filename_with_colon() {
+        // Documents that the rightmost-single-colon rule is the contract,
+        // not an accident. A filename containing `:` (legal on Unix) is
+        // preserved in the file portion because the separator colon is to
+        // its right.
+        assert_eq!(
+            id_to_file("/project/foo:bar.rs:func"),
+            "/project/foo:bar.rs"
+        );
     }
 }
