@@ -584,6 +584,42 @@ async fn response_get_file_symbols_paginated_offset() {
 }
 
 #[tokio::test]
+async fn response_get_file_symbols_byte_budget_truncated() {
+    // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` forces
+    // the handler to stop emitting records before reaching `limit`, returns
+    // `truncated=true` and a `next_offset` pointing past the partial page.
+    //
+    // Reuses the 30-symbol synthetic file fixture so the per-record
+    // serialized shape is small and predictable. With a budget of ~400
+    // bytes after envelope overhead, only a handful of records fit before
+    // the budget bites. `limit=20` is well above what fits, so the byte
+    // budget (not the count cap) is what trims the page. The snapshot
+    // locks the truncated-page shape: `truncated:true`, `next_offset:N`
+    // where `N < limit`, and `total:30` (pre-pagination match count is
+    // unchanged regardless of truncation).
+    let fx = build_indexed_fixture_with_many_file_symbols(30).await;
+    let file = fx
+        .indexed_root
+        .join("big.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let max_bytes = 512 + 400; // ENVELOPE_OVERHEAD_BYTES + budget
+    let r = get_file_symbols(
+        &fx.inner.graph,
+        &file,
+        false,
+        true,
+        Some(20),
+        Some(0),
+        max_bytes,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
 async fn response_get_callers_paginated_offset() {
     // Page-2 snapshot: hub symbol with 60 callers. Request
     // offset=50 limit=50 — slice taken from the sorted (depth, symbol_id)

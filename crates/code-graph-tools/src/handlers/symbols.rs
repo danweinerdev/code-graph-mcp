@@ -13,8 +13,8 @@ use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 
 use super::{
-    kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result, tool_error,
-    tool_success_json, Page, SymbolResult,
+    byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
+    tool_error, tool_success_json, Page, SymbolResult,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
@@ -48,16 +48,16 @@ pub fn get_file_symbols(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    // Plumbed in task 2.0; consumed in task 2.1+ (PaginatedResponseSizeSafety).
-    let _ = max_bytes;
-
     if file.is_empty() {
         return tool_error("'file' is required");
     }
 
     let symbols = graph.read().file_symbols(Path::new(file));
     // Raw-set-empty -> existing tool error. Wording preserved byte-for-byte
-    // so agents that match against this string keep working.
+    // so agents that match against this string keep working. This branch
+    // executes BEFORE the byte-budget step (PaginationOverhaul Phase 3
+    // decision) so a misspelled file path always surfaces the diagnostic
+    // error wording rather than an empty Page<T>.
     if symbols.is_empty() {
         return tool_error(format!("no symbols found in file: {file}"));
     }
@@ -68,6 +68,8 @@ pub fn get_file_symbols(
 
     // Apply `top_level_only` filter into a Vec<SymbolResult>. Build the
     // Vec eagerly so we can sort + slice + count it in subsequent steps.
+    // The filter runs BEFORE `total` is captured so `total` reflects the
+    // post-filter, pre-pagination match count.
     let mut results: Vec<SymbolResult> = Vec::with_capacity(symbols.len());
     for s in &symbols {
         if top_level_only && !s.parent.is_empty() {
@@ -84,20 +86,22 @@ pub fn get_file_symbols(
     // canonicalizes the sequence.
     results.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Bounds-safe slice via skip+take.
-    let page: Vec<SymbolResult> = results
-        .into_iter()
-        .skip(resolved_offset as usize)
-        .take(resolved_limit as usize)
-        .collect();
+    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety):
+    // the helper internally applies offset+limit skip/take and stops early
+    // if the running serialized byte count would exceed
+    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
+    // `results.len() as u32`, NOT the pre-pagination match count — that's
+    // `total` captured above and held unchanged.
+    let (records, _total_kept, truncated, next_offset) =
+        byte_budget_take(results, resolved_offset, resolved_limit, max_bytes);
 
     let response = Page::<SymbolResult> {
-        results: page,
+        results: records,
         total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated: false,
-        next_offset: None,
+        truncated,
+        next_offset,
     };
     tool_success_json(&response)
 }
@@ -558,6 +562,100 @@ mod tests {
         assert_eq!(total, 5);
         assert_eq!(offset, 999);
         assert_eq!(limit, 100);
+    }
+
+    // --- Phase 2 byte-budget invariants -----------------------------------
+
+    #[test]
+    fn file_symbols_byte_budget_truncates_oversized_page() {
+        // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` must
+        // make `get_file_symbols` stop emitting records before reaching
+        // `limit`, surface `truncated=true`, and report a usable `next_offset`.
+        //
+        // Fixture: 30 free functions named `func_000`..`func_029` in
+        // `/big.cpp`. Each serialized SymbolResult in brief mode is ~80-90
+        // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
+        // "function","file":"/big.cpp","line":1}` plus the helper's +1
+        // inter-record comma).
+        //
+        // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
+        // overhead reservation is 300 bytes, fits a handful of records
+        // before the next would push past. Asks for `limit=20` so the byte
+        // budget (not the count cap) is what bites. Asserts documented
+        // truncation semantics: `truncated=true`, `next_offset=Some(n)`
+        // with `n > offset=0`, `results.len() < limit=20`, and
+        // `total >= results.len() + offset`.
+        use super::super::ENVELOPE_OVERHEAD_BYTES;
+        let g = locked(graph_with_n_file_symbols(30));
+        let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
+        let r = get_file_symbols(&g, "/big.cpp", false, true, Some(20), Some(0), max_bytes);
+
+        let (arr, total, offset, limit) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+
+        assert!(truncated, "tight max_bytes must produce truncated=true");
+        assert!(
+            (arr.len() as u32) < limit,
+            "truncation must stop before hitting the count cap: results.len()={} >= limit={}",
+            arr.len(),
+            limit,
+        );
+        assert!(
+            !arr.is_empty(),
+            "budget should still admit at least one record",
+        );
+        match next_offset {
+            Some(n) => assert!(
+                n > offset,
+                "next_offset must point past the current page: next_offset={n} <= offset={offset}",
+            ),
+            None => panic!("truncated=true must set next_offset=Some(n)"),
+        }
+        assert!(
+            total >= arr.len() as u32 + offset,
+            "total must be at least the records seen so far: total={total} < results.len()+offset={}",
+            arr.len() as u32 + offset,
+        );
+        // Sanity: total still reflects the full pre-pagination match count.
+        assert_eq!(total, 30, "total is the pre-pagination match count");
+    }
+
+    #[test]
+    fn file_symbols_byte_budget_no_truncation_with_no_budget() {
+        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the handler's
+        // existing behavior is preserved exactly — no truncation, no
+        // next_offset. Locks the contract that byte-budget wiring doesn't
+        // affect callers that opt out.
+        let g = locked(graph_with_n_file_symbols(30));
+        let r = get_file_symbols(
+            &g,
+            "/big.cpp",
+            false,
+            true,
+            Some(20),
+            Some(0),
+            NO_BYTE_BUDGET,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert_eq!(arr.len(), 20);
+        assert_eq!(total, 30);
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn file_symbols_byte_budget_does_not_change_empty_raw_set_error() {
+        // CRITICAL invariant per PaginationOverhaul Phase 3: empty raw set
+        // returns the documented error envelope (NOT a Page<T>) regardless
+        // of `max_bytes`. The byte-budget step runs after the empty-raw-set
+        // check, so a tight budget cannot mask the diagnostic error.
+        let g = locked(Graph::new());
+        // Even with a pathologically tight budget that would normally
+        // truncate everything, the empty-raw-set branch is preserved.
+        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, 0);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
     }
 
     // --- search_symbols ---
