@@ -251,9 +251,11 @@ pub fn search_symbols(
         // Pass `limit = 1` to minimize the heap's memory footprint during
         // this interim path — `sr.total` is independent of the limit, so
         // a small limit yields the correct count without paying the cost
-        // of a full-page allocation. Cannot use `limit = 0` because the
-        // handler resolves zero to the default 20 above (see also the
-        // `byte_budget_take` debug_assert on limit > 0).
+        // of a full-page allocation. Cannot use `limit = 0`: `Graph::search`
+        // normalizes 0 to the default 20 at queries.rs (the contract is
+        // "0 means use the default"), so the heap would still allocate
+        // 20 slots. `limit = 1` is the smallest value that bypasses that
+        // normalization.
         let sr = graph.read().search(SearchParams {
             pattern: query_str.to_string(),
             kind: parsed_kind,
