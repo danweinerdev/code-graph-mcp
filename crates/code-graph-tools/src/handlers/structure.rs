@@ -971,8 +971,8 @@ mod tests {
         // field from SymbolResult — the `id` already encodes it.
         //
         // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
-        // overhead reservation is 300 bytes, which fits ~3 records before
-        // the 4th would push past. Asks for `limit=20` so the byte budget
+        // overhead reservation is 300 bytes, which fits ~4 records before
+        // the 5th would push past. Asks for `limit=20` so the byte budget
         // (not the count cap) is what bites. Asserts the documented
         // truncation semantics: `truncated=true`, `next_offset=Some(n)`
         // with `n > offset=0`, `results.len() < limit=20`, and
