@@ -44,7 +44,7 @@ Cross-language collisions (e.g. `init` in 5 languages) isolated via `(Language, 
 - **Tool handler return type:** `Result<CallToolResult, McpError>`. User-visible errors travel as `CallToolResult` with error flag, NOT as `Err`.
 - **State guard:** query handlers must call `ServerInner::require_indexed()` first.
 - **Paths:** all stored file paths are absolute.
-- **Symbol ID format:** `file:name` (free function) or `file:Parent::name` (method).
+- **Symbol ID format:** `file:name` (free function) or `file:Parent::name` (method). Records returned by paginated tools no longer include a separate `file` field; clients recover it via the documented id-to-file split (rsplit on the rightmost `:` not part of `::`).
 - **Enums:** `SymbolKind`, `EdgeKind` derive Serde, serialize as readable JSON strings (`"function"`, `"calls"`).
 - **`LanguagePlugin` trait:** `extensions()`, `parse_file(path, content)`, `preprocess(content, cfg)`, `resolve_edges(symbols, file_graph, registry)`. `preprocess` defaults to `Cow::Borrowed(content)`; override only for byte-level rewrites (e.g. C++ `[cpp].macro_strip`).
 - **Logging:** workspace deliberately has NO `tracing` dep. `eprintln!` is the channel for out-of-handler warnings (canonical example: `crates/code-graph-tools/src/handlers/watch.rs`). If a task says "use `tracing::warn!`", check `Cargo.toml`; flag the deviation, do NOT silently add the dep.
@@ -57,10 +57,10 @@ Tool descriptions in `#[tool(description=…)]` strings (server.rs) are **produc
 | Group | Tools | Notes |
 |---|---|---|
 | Indexing | `analyze_codebase` | JSON cache + mtime-based incremental re-index. Re-run with `force=true` to bypass cache (see Cache invalidation). |
-| Symbol query | `get_file_symbols`, `search_symbols`, `get_symbol_detail`, `get_symbol_summary` | `get_file_symbols`: `top_level_only`/`brief` + `limit`/`offset` (default 100, max 1000). `search_symbols`: `namespace` + `limit`/`offset` + `brief` (default true). `get_symbol_summary`: counts by namespace/kind. |
-| Call graph | `get_callers`, `get_callees` | `limit`/`offset` (default 100, max 1000). |
+| Symbol query | `get_file_symbols`, `search_symbols`, `get_symbol_detail`, `get_symbol_summary` | `get_file_symbols`: `top_level_only`/`brief` + `limit`/`offset` (default 100, max 1000); `count_only=true` returns total without records (< 1KB response); response capped at `[response].max_bytes` (default 100KB) — see Response shapes. `search_symbols`: `namespace` + `limit`/`offset` + `brief` (default true); `count_only=true` returns total without records (< 1KB response); response capped at `[response].max_bytes` (default 100KB) — see Response shapes. `get_symbol_summary`: counts by namespace/kind. |
+| Call graph | `get_callers`, `get_callees` | `limit`/`offset` (default 100, max 1000); response capped at `[response].max_bytes` (default 100KB) — see Response shapes. |
 | Deps | `get_dependencies` | |
-| Structural | `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling` | `get_orphans`: `kind` + `limit`/`offset`/`brief` (default 20, max 1000). `get_class_hierarchy`: `depth` + `max_nodes` (default 250, max 1000). `get_coupling`: outgoing/incoming/both. |
+| Structural | `detect_cycles`, `get_orphans`, `get_class_hierarchy`, `get_coupling` | `get_orphans`: `kind` + `limit`/`offset`/`brief` (default 20, max 1000); `count_only=true` returns total without records (< 1KB response); response capped at `[response].max_bytes` (default 100KB) — see Response shapes. `get_class_hierarchy`: `depth` + `max_nodes` (default 250, max 1000). `get_coupling`: outgoing/incoming/both. |
 | Viz | `generate_mermaid` | call graph / file deps / inheritance tree. |
 | Watch | `watch_start`, `watch_stop` | auto-reindex via notify-debouncer-full. |
 
