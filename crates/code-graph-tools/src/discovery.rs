@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use code_graph_core::{Language, RootConfig};
 use code_graph_lang::LanguageRegistry;
 
+use crate::indexer::ProgressSink;
+
 /// One source file located by the walker.
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
@@ -60,7 +62,22 @@ pub struct Discovered {
 /// Results are sorted by path before returning so the binary output is
 /// reproducible across runs and matches the Go binary's
 /// `sort.Strings(files)` ordering byte-for-byte.
-pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &RootConfig) -> Discovered {
+///
+/// `progress` receives two events: a `(0, 0, "Discovering files…")` marker
+/// before the parallel walk begins (`total=0` per the indeterminate-phase
+/// convention), and a `(N, N, "Discovered N files")` event after the walk
+/// completes. Per-file events during the walk are intentionally omitted to
+/// avoid the closure-capture and `Send + Sync` plumbing inside
+/// `ignore::WalkBuilder::build_parallel().run()`; the parse phase that
+/// follows reports per-file at `total=N` granularity.
+pub fn discover(
+    root: &Path,
+    registry: &LanguageRegistry,
+    cfg: &RootConfig,
+    progress: &dyn ProgressSink,
+) -> Discovered {
+    progress.report(0, 0, "Discovering files...");
+
     let (file_tx, file_rx) = crossbeam_channel::unbounded::<DiscoveredFile>();
     let (warn_tx, warn_rx) = crossbeam_channel::unbounded::<String>();
 
@@ -160,6 +177,9 @@ pub fn discover(root: &Path, registry: &LanguageRegistry, cfg: &RootConfig) -> D
     // worker order.
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
+    let n = files.len() as u32;
+    progress.report(n, n, &format!("Discovered {n} files"));
+
     Discovered { files, warnings }
 }
 
@@ -236,7 +256,12 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         let names: Vec<String> = result
             .files
@@ -261,7 +286,12 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         let paths: Vec<String> = result
             .files
@@ -290,7 +320,12 @@ mod tests {
             respect_gitignore: false,
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         let paths: Vec<String> = result
             .files
@@ -318,7 +353,12 @@ mod tests {
             extra_ignore: vec!["build/**".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         let paths: Vec<String> = result
             .files
@@ -346,7 +386,12 @@ mod tests {
             extra_ignore: vec!["!build/**".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         let paths: Vec<String> = result
             .files
@@ -371,7 +416,12 @@ mod tests {
             extra_ignore: vec!["[".to_string()],
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         // The walk still produced files.
         assert!(
@@ -406,7 +456,12 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         // Exactly one a.cpp; no infinite recursion through the symlink.
         let count = result
@@ -435,7 +490,12 @@ mod tests {
             max_threads: 0,
             ..Default::default()
         };
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
         assert_eq!(
             result.files.len(),
             2,
@@ -465,7 +525,12 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         // Restore permissions before any assertion can fail and leave the
         // tempdir un-cleanable.
@@ -512,7 +577,12 @@ mod tests {
 
         let reg = cpp_only_registry();
         let cfg = DiscoveryConfig::default();
-        let result = discover(dir.path(), &reg, &root(cfg));
+        let result = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
 
         assert_eq!(
             result.files.len(),
@@ -558,7 +628,12 @@ mod tests {
         let cfg = DiscoveryConfig::default();
 
         let t0 = Instant::now();
-        let parallel = discover(dir.path(), &reg, &root(cfg));
+        let parallel = discover(
+            dir.path(),
+            &reg,
+            &root(cfg),
+            &crate::indexer::NoopProgressSink,
+        );
         let parallel_dt = t0.elapsed();
 
         let t1 = Instant::now();

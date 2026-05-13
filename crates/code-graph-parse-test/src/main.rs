@@ -26,6 +26,7 @@ use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::discovery::discover;
+use code_graph_tools::indexer::NoopProgressSink;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -136,7 +137,7 @@ fn main() -> ExitCode {
     // the Go binary's `sort.Strings(files)` ordering so the output diff
     // stays byte-clean.
     let cfg = RootConfig::default();
-    let discovered = discover(&dir, &registry, &cfg);
+    let discovered = discover(&dir, &registry, &cfg, &NoopProgressSink);
     warnings.extend(discovered.warnings);
 
     // Canonicalize paths after discovery so symbol IDs and the printed file

@@ -157,7 +157,7 @@ pub async fn analyze_codebase(
                 Ok(v) => v,
                 Err(e) => return Err(e.to_string()),
             };
-        resolve_all_edges(&mut graphs, &registry.registry);
+        resolve_all_edges(&mut graphs, &registry.registry, &sink);
         // Drop the sink (sender) so the forwarder task exits cleanly.
         drop(sink);
         Ok::<_, String>((graphs, blocking_warnings))

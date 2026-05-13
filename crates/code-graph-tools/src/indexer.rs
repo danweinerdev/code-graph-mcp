@@ -131,7 +131,7 @@ pub fn index_directory(
     cfg: &RootConfig,
     progress: &dyn ProgressSink,
 ) -> Result<(Vec<FileGraph>, Vec<String>), IndexError> {
-    let discovered = discovery::discover(root, registry, cfg);
+    let discovered = discovery::discover(root, registry, cfg, progress);
     let mut warnings = discovered.warnings.clone();
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -263,11 +263,25 @@ fn push(index: &mut SymbolIndex, lang: code_graph_core::Language, key: &str, ent
 /// `Inherits` edges are left alone (the bare derived class name is the
 /// canonical form). Unknown edge kinds and edges from files whose plugin
 /// is no longer in the registry are silently skipped.
-pub fn resolve_all_edges(graphs: &mut [FileGraph], registry: &LanguageRegistry) {
+///
+/// `progress` receives one event per file in the form
+/// `(n, total, "Resolving edges: <path>")`, mirroring the per-file
+/// granularity of the parse loop. Files whose plugin is missing from
+/// the registry still count toward the progress counter so the total
+/// stays consistent with `graphs.len()`.
+pub fn resolve_all_edges(
+    graphs: &mut [FileGraph],
+    registry: &LanguageRegistry,
+    progress: &dyn ProgressSink,
+) {
     let symbol_index = build_symbol_index(graphs);
     let file_index = build_file_index(graphs);
 
-    for fg in graphs.iter_mut() {
+    let total = graphs.len() as u32;
+    for (i, fg) in graphs.iter_mut().enumerate() {
+        let n = (i + 1) as u32;
+        progress.report(n, total, &format!("Resolving edges: {}", fg.path));
+
         let plugin = match registry.plugin_for(fg.language) {
             Some(p) => p,
             None => continue,
@@ -490,15 +504,35 @@ mod tests {
         assert!(warnings.is_empty());
 
         let events = sink.0.lock().unwrap();
-        assert_eq!(events.len(), n as usize, "one event per parsed file");
-        // The last reported progress must equal the total. Order of
-        // intermediate events is rayon-dependent; only the high-water mark
-        // is guaranteed.
-        let max_progress = events.iter().map(|e| e.progress).max().unwrap();
+        // Phase markers from discovery (2 events) + per-file parse events
+        // (n events). Discovery emits a "Discovering files..." start event
+        // and a "Discovered N files" end event before parsing begins.
+        let discover_start = events
+            .iter()
+            .filter(|e| e.message == "Discovering files...")
+            .count();
+        let discover_end = events
+            .iter()
+            .filter(|e| e.message.starts_with("Discovered "))
+            .count();
+        let parse_events: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(|e| e.message.starts_with("Parsing: "))
+            .collect();
+        assert_eq!(discover_start, 1, "one 'Discovering files...' event");
+        assert_eq!(discover_end, 1, "one 'Discovered N files' event");
+        assert_eq!(
+            parse_events.len(),
+            n as usize,
+            "one parse event per parsed file"
+        );
+        // The last reported parse progress must equal the total. Order of
+        // intermediate parse events is rayon-dependent; only the high-water
+        // mark is guaranteed.
+        let max_progress = parse_events.iter().map(|e| e.progress).max().unwrap();
         assert_eq!(max_progress, n);
-        for e in events.iter() {
+        for e in parse_events.iter() {
             assert_eq!(e.total, n);
-            assert!(e.message.starts_with("Parsing: "));
         }
     }
 
@@ -591,7 +625,7 @@ mod tests {
 
         let mut graphs = vec![header, main];
         let reg = cpp_only_registry();
-        resolve_all_edges(&mut graphs, &reg);
+        resolve_all_edges(&mut graphs, &reg, &NoopProgressSink);
 
         // Locate the rewritten edges on the main graph.
         let main_after = graphs.iter().find(|g| g.path == main_path).unwrap();
