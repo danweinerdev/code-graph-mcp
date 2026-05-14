@@ -37,6 +37,30 @@ use crate::Graph;
 /// `Inherits` edges into the queried name). Both fields are skipped from
 /// JSON output when empty so leaf nodes serialize as just `{ "name": ... }`,
 /// matching the Go shape's `omitempty` tags.
+///
+/// `ref` distinguishes three node shapes that all carry empty `bases`
+/// and `derived` lists, so JSON consumers can tell them apart:
+/// - `ref: None` (field omitted from JSON) on a *full* node = canonical
+///   first-visit occurrence; its `bases`/`derived` (when present) are
+///   the real subtree. A leaf with `ref: None` is the natural end of an
+///   inheritance chain — nothing more to walk.
+/// - `ref: Some(true)` (emitted as `"ref": true`) = stub indicating
+///   "this name was already visited and fully expanded elsewhere in the
+///   tree; consult the canonical occurrence". Stubs collapse diamond-
+///   inheritance subtree duplications so the same ancestor isn't
+///   re-serialized inline on every arm that reaches it.
+/// - A bare leaf with empty `bases`/`derived` and `ref: None` reached
+///   via the cycle base case (the queried name was already on the
+///   current DFS path) is the cycle-guard halt — semantically distinct
+///   from a ref stub, even though the JSON looks similar to a natural
+///   leaf. Task 2.2 wires the canonical-vs-stub distinction in
+///   `build_hierarchy`; for Task 2.1 every constructed node carries
+///   `ref: None`.
+///
+/// The raw-identifier `r#ref` is required because `ref` is a Rust
+/// keyword. Serde strips the `r#` prefix automatically when serializing,
+/// so the JSON field name is the unprefixed `"ref"` without needing
+/// `#[serde(rename = "ref")]`.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchyNode {
     pub name: String,
@@ -44,6 +68,8 @@ pub struct HierarchyNode {
     pub bases: Vec<HierarchyNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived: Vec<HierarchyNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<bool>,
 }
 
 /// One frame on the iterative-Tarjan worklist.
@@ -208,6 +234,7 @@ impl Graph {
                 name: name.to_string(),
                 bases: Vec::new(),
                 derived: Vec::new(),
+                r#ref: None,
             };
         }
 
@@ -215,6 +242,7 @@ impl Graph {
             name: name.to_string(),
             bases: Vec::new(),
             derived: Vec::new(),
+            r#ref: None,
         };
 
         if depth == 0 {
@@ -617,6 +645,35 @@ mod tests {
         assert_eq!(
             scc_contents(&cycles[0]),
             vec!["/a".to_string(), "/b".to_string()],
+        );
+    }
+
+    // --- HierarchyNode serialization ---
+
+    /// Byte-identical-JSON regression: a leaf `HierarchyNode` with
+    /// `r#ref: None` and empty `bases`/`derived` must serialize to
+    /// EXACTLY `{"name":"X"}` — the same wire shape it had before the
+    /// `ref` field was added in Task 2.1. This pins down two contracts
+    /// simultaneously:
+    /// 1. `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    ///    drops the field from the JSON output when `ref` is `None`, so
+    ///    existing JSON consumers / stored snapshots see no shape change.
+    /// 2. Serde strips the `r#` raw-identifier prefix automatically when
+    ///    emitting JSON field names — no `#[serde(rename = "ref")]` is
+    ///    needed. If a future serde change broke this assumption, the
+    ///    test would surface as `{"name":"X","r#ref":...}` or similar.
+    #[test]
+    fn hierarchy_node_ref_none_serializes_without_ref_field() {
+        let node = HierarchyNode {
+            name: "X".to_string(),
+            bases: Vec::new(),
+            derived: Vec::new(),
+            r#ref: None,
+        };
+        let json = serde_json::to_string(&node).expect("serialize HierarchyNode");
+        assert_eq!(
+            json, r#"{"name":"X"}"#,
+            "leaf node with ref: None must serialize byte-identically to pre-Task-2.1 shape",
         );
     }
 
