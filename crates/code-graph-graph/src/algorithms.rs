@@ -10,12 +10,15 @@
 //! a few dozen levels deep at most, so the stack-safety concern is specific
 //! to file-include cycles rather than inheritance trees.
 //!
-//! The key correctness property carried forward from the Go regression test
-//! (`Designs/LLMOptimization/notes/01-Implementation.md`) is that the class
-//! hierarchy uses a **per-DFS-path** visited set — not a global one — so
-//! diamond inheritance fully expands a shared ancestor under both arms.
-//! See [`Graph::class_hierarchy`] and the `class_hierarchy_diamond_4_level_fixture`
-//! test below.
+//! The class hierarchy walk uses two visited sets in tandem: a
+//! per-DFS-path `on_path` set distinguishes cycles (bare-leaf halt) from
+//! diamonds, and a global `visited_unique` set drives both the
+//! `max_nodes` budget and the diamond-dedupe ref-stub branch. The
+//! check order is `on_path` first, `visited_unique` second — a name
+//! reached on the current DFS path collapses to a cycle leaf even if
+//! it has also been fully expanded elsewhere. See
+//! [`Graph::class_hierarchy`] and the
+//! `class_hierarchy_diamond_4_level_fixture` test below.
 //!
 //! Locking is not handled in this module. Task 2.6 wraps [`Graph`] in
 //! `parking_lot::RwLock`; until then these methods take `&self` and rely
@@ -38,8 +41,8 @@ use crate::Graph;
 /// JSON output when empty so leaf nodes serialize as just `{ "name": ... }`,
 /// matching the Go shape's `omitempty` tags.
 ///
-/// `ref` distinguishes three node shapes that all carry empty `bases`
-/// and `derived` lists, so JSON consumers can tell them apart:
+/// `ref` distinguishes diamond-shared stubs from canonical nodes;
+/// cycle-guard halts remain JSON-identical to natural leaves.
 /// - `ref: None` (field omitted from JSON) on a *full* node = canonical
 ///   first-visit occurrence; its `bases`/`derived` (when present) are
 ///   the real subtree. A leaf with `ref: None` is the natural end of an
@@ -51,11 +54,10 @@ use crate::Graph;
 ///   re-serialized inline on every arm that reaches it.
 /// - A bare leaf with empty `bases`/`derived` and `ref: None` reached
 ///   via the cycle base case (the queried name was already on the
-///   current DFS path) is the cycle-guard halt — semantically distinct
-///   from a ref stub, even though the JSON looks similar to a natural
-///   leaf. Task 2.2 wires the canonical-vs-stub distinction in
-///   `build_hierarchy`; for Task 2.1 every constructed node carries
-///   `ref: None`.
+///   current DFS path) is the cycle-guard halt. It is JSON-
+///   indistinguishable from a natural-end leaf; the distinction lives
+///   only in the walk's internal state. Clients walking the tree treat
+///   both cases identically.
 ///
 /// The raw-identifier `r#ref` is required because `ref` is a Rust
 /// keyword. Serde strips the `r#` prefix automatically when serializing,
@@ -143,14 +145,23 @@ impl Graph {
     ///   off the tree.
     ///
     /// **Diamond inheritance**: the DFS uses a *per-path* `on_path` set
-    /// rather than a global visited set. This is essential — when a
-    /// shared ancestor is reached via two different paths (e.g.
-    /// `Derived → MixinA → Base` and `Derived → MixinB → Base`), each
-    /// arm must fully expand `Base` independently. A global visited set
-    /// would short-circuit the second visit and silently truncate the
-    /// hierarchy. The `max_nodes` budget is layered on top via a
-    /// separate `visited_unique` set that tracks names globally for the
-    /// budget check; it does NOT replace `on_path`. See the
+    /// for cycle detection and a *global* `visited_unique` set for
+    /// diamond deduplication. When a shared ancestor is reached via two
+    /// different paths (e.g. `Derived → MixinA → Base` and
+    /// `Derived → MixinB → Base`), the first arm fully expands `Base`
+    /// and inserts the name into `visited_unique`; the second arm sees
+    /// the name in `visited_unique` (but not in `on_path`) and emits a
+    /// `{name, ref: true}` stub instead of re-expanding. Clients walking
+    /// the tree maintain a `name -> node` map keyed on the first
+    /// non-ref occurrence and treat `ref: true` as a pointer back to
+    /// that canonical node. Cycles still emit bare leaves (`on_path`
+    /// hit wins over `visited_unique` hit); the cycle leaf is JSON-
+    /// indistinguishable from a natural-end leaf.
+    ///
+    /// The `max_nodes` budget consults `visited_unique` exclusively —
+    /// each unique name costs one slot regardless of how many arms
+    /// reach it. Ref-stubs do not charge additional slots (the slot
+    /// was charged on first visit). See the
     /// `class_hierarchy_diamond_4_level_fixture` and
     /// `class_hierarchy_diamond_counts_unique_names` tests.
     pub fn class_hierarchy(
@@ -179,12 +190,14 @@ impl Graph {
         let mut on_path: HashSet<String> = HashSet::new();
         let mut visited_unique: HashSet<String> = HashSet::new();
         let mut truncated = false;
-        // Seed the global unique-name set with the root before recursing —
-        // the root counts as one unique node in the budget, exactly like
-        // every other class name. If `max_nodes == 0` the recursive helper
-        // will refuse to add any children to the root and the truncated
-        // flag fires on the first attempt.
-        visited_unique.insert(name.to_string());
+        // The root is treated identically to any other first-visit node:
+        // `build_hierarchy` inserts it into both `on_path` and
+        // `visited_unique` at the top of the call. The root therefore
+        // costs one budget slot exactly like every other class name; if
+        // `max_nodes == 0`, the recursive helper still inserts the root
+        // but refuses to descend into any children (the per-child budget
+        // gate sees `visited_unique.len() == 1 >= 0` and trips
+        // `truncated`).
         let root = self.build_hierarchy(
             name,
             depth,
@@ -205,18 +218,43 @@ impl Graph {
     /// applies to file-include cycles which can chain across thousands
     /// of headers. The plan only requires Tarjan to be iterative.
     ///
+    /// The function opens with a three-way branch at the visit point.
+    /// The order is load-bearing: `on_path` is checked BEFORE
+    /// `visited_unique` so a self-cycle that is also on a different DFS
+    /// path collapses to a cycle leaf (not a ref-stub). The three cases:
+    ///
+    /// 1. **Cycle** — `on_path.contains(name)` is true. Return a bare
+    ///    leaf `{name}` with `r#ref: None`. This is the existing cycle
+    ///    guard, JSON-indistinguishable from a natural-end leaf, and
+    ///    matches the Go reference's `if onPath[name] { return &node }`.
+    /// 2. **Diamond** — `visited_unique.contains(name)` is true and the
+    ///    name is NOT on the current path. Return a ref-stub
+    ///    `{name, ref: true}` and do NOT recurse. The canonical
+    ///    occurrence (with full `bases`/`derived`) lives at the first
+    ///    place this name was reached in pre-order; clients reconstruct
+    ///    the full tree by keying a `name -> node` map on first
+    ///    non-ref occurrences and treating ref-stubs as pointers.
+    /// 3. **First visit** — neither set contains the name. Insert into
+    ///    BOTH `on_path` and `visited_unique`, recurse to build the
+    ///    subtree, and remove from `on_path` on the way back up.
+    ///    `visited_unique` is never removed — it carries diamond-
+    ///    dedupe state across sibling branches.
+    ///
     /// Two visited sets are threaded through:
     /// - `on_path` (per-DFS-path) is mutated in lockstep with the
     ///   recursion: the name is inserted before recursing into children
     ///   and removed after both the bases and derived loops complete.
-    ///   This is the diamond fix — siblings can each fully expand the
-    ///   same ancestor because the set only carries the *current path*,
-    ///   not every previously seen node.
     /// - `visited_unique` (global) tracks every unique name walked
-    ///   anywhere in the tree, for the `max_nodes` budget. It is *only*
-    ///   inserted into, never removed — diamond inheritance still gets
-    ///   the per-path expansion behavior; only the budget counter
-    ///   collapses identical names.
+    ///   anywhere in the tree. It serves two purposes: gating the
+    ///   `max_nodes` budget (one slot per unique name regardless of
+    ///   visit count) and triggering the diamond ref-stub branch on
+    ///   re-visits.
+    ///
+    /// The caller's per-child budget gate consults `visited_unique`
+    /// before recursing: only first-visit children consume a slot;
+    /// diamond re-visits are free. Ref-stub emission therefore preserves
+    /// the existing `total_nodes_seen` contract — unique class names
+    /// walked, diamond ancestor = 1 slot.
     fn build_hierarchy(
         &self,
         name: &str,
@@ -226,9 +264,10 @@ impl Graph {
         max_nodes: u32,
         truncated: &mut bool,
     ) -> HierarchyNode {
-        // Cycle base case: this name is on the current DFS path. Emit a
-        // bare leaf so the caller sees the name without recursing
-        // forever. Matches Go's `if onPath[name] { return &HierarchyNode{Name: name} }`.
+        // (1) Cycle guard. Checked FIRST so a self-cycle on a different
+        // DFS path collapses to a cycle leaf, not a ref-stub. Bare leaf
+        // with `r#ref: None` matches Go's
+        // `if onPath[name] { return &HierarchyNode{Name: name} }`.
         if on_path.contains(name) {
             return HierarchyNode {
                 name: name.to_string(),
@@ -237,6 +276,27 @@ impl Graph {
                 r#ref: None,
             };
         }
+
+        // (2) Diamond dedupe. The name has already been fully expanded
+        // somewhere else in the tree (its canonical occurrence). Emit a
+        // ref-stub so clients can rejoin the canonical subtree without
+        // re-serializing it inline. No recursion — `visited_unique`
+        // already counted this name's slot at first visit.
+        if visited_unique.contains(name) {
+            return HierarchyNode {
+                name: name.to_string(),
+                bases: Vec::new(),
+                derived: Vec::new(),
+                r#ref: Some(true),
+            };
+        }
+
+        // (3) First visit. Charge the unique-name slot and enter the
+        // DFS path. Both inserts happen here, in lockstep, so future
+        // re-visits along the same path see `on_path` first (cycle
+        // leaf) and re-visits across sibling paths see `visited_unique`
+        // (ref-stub).
+        visited_unique.insert(name.to_string());
 
         let mut node = HierarchyNode {
             name: name.to_string(),
@@ -257,7 +317,10 @@ impl Graph {
         // `name`, so a sibling DFS path on the unwound stack doesn't
         // see a stale entry. The workspace uses `panic = unwind`
         // (default), so this RAII guard is the way to guarantee
-        // unconditional cleanup without `unsafe`.
+        // unconditional cleanup without `unsafe`. Note: only `on_path`
+        // is rewound; `visited_unique` is intentionally global, so its
+        // first-visit insert above persists across the unwind for the
+        // diamond-dedupe invariant.
         struct PopGuard<'a> {
             set: &'a mut HashSet<String>,
             name: String,
@@ -279,12 +342,15 @@ impl Graph {
         // reborrowed as `&mut HashSet<String>`) through the call.
         //
         // The budget check happens *before* we recurse into a child:
-        // - if the child's name is already in `visited_unique`, recursion
-        //   is free (no budget cost — the diamond's shared ancestor)
+        // - if the child's name is already in `visited_unique`, the
+        //   recursion will emit a ref-stub (case 2 above) and is free
+        //   — no budget cost for the diamond's shared ancestor.
         // - otherwise, refuse to descend when the budget is at the cap;
         //   set `truncated` and skip this child entirely so the budget
         //   check is monotone (once exceeded, it never tries to grow
-        //   again on this branch).
+        //   again on this branch). The actual `visited_unique` insert
+        //   for the child happens inside the recursive call's first-
+        //   visit branch.
         if let Some(entries) = self.adj.get(name) {
             let bases: Vec<String> = entries
                 .iter()
@@ -292,12 +358,9 @@ impl Graph {
                 .map(|e| e.target.clone())
                 .collect();
             for target in bases {
-                if !visited_unique.contains(&target) {
-                    if (visited_unique.len() as u32) >= max_nodes {
-                        *truncated = true;
-                        continue;
-                    }
-                    visited_unique.insert(target.clone());
+                if !visited_unique.contains(&target) && (visited_unique.len() as u32) >= max_nodes {
+                    *truncated = true;
+                    continue;
                 }
                 node.bases.push(self.build_hierarchy(
                     &target,
@@ -317,12 +380,9 @@ impl Graph {
                 .map(|e| e.target.clone())
                 .collect();
             for target in derived {
-                if !visited_unique.contains(&target) {
-                    if (visited_unique.len() as u32) >= max_nodes {
-                        *truncated = true;
-                        continue;
-                    }
-                    visited_unique.insert(target.clone());
+                if !visited_unique.contains(&target) && (visited_unique.len() as u32) >= max_nodes {
+                    *truncated = true;
+                    continue;
                 }
                 node.derived.push(self.build_hierarchy(
                     &target,
@@ -675,6 +735,14 @@ mod tests {
             json, r#"{"name":"X"}"#,
             "leaf node with ref: None must serialize byte-identically to pre-Task-2.1 shape",
         );
+
+        // Round-trip: JSON missing every optional field must deserialize
+        // back to the same node. Pins the `#[serde(default)]` on `r#ref`
+        // — without it, missing `"ref"` would refuse to deserialize and
+        // any historical hierarchy JSON would break on load.
+        let round_trip: HierarchyNode =
+            serde_json::from_str(r#"{"name":"X"}"#).expect("deserialize HierarchyNode");
+        assert_eq!(round_trip, node);
     }
 
     // --- class_hierarchy: lookup and kind filter ---
@@ -814,13 +882,13 @@ mod tests {
 
     // --- class_hierarchy: 4-level diamond regression ---
 
-    /// THE regression test for the diamond-inheritance bug fixed in the
-    /// LLMOptimization phase. With a global-visited DFS, the second
-    /// arm's visit to `Base` would short-circuit to an empty leaf,
-    /// silently truncating the hierarchy. The 3-class diamond at
-    /// depth=2 is too shallow to expose the bug because the shared node
-    /// bottoms out as a leaf either way; a 4-level chain at depth=3 is
-    /// the minimal fixture that makes the truncation visible.
+    /// Regression pin for the diamond-shape walk. The historical bug
+    /// (fixed in the LLMOptimization phase) was a global-visited DFS
+    /// that silently truncated the second arm's `Base` to an empty
+    /// leaf. The ref-stub walk introduced for diamond dedupe (this
+    /// phase) replaces *re-expansion* with explicit `ref: true` stubs:
+    /// the canonical expansion still happens once, but its name is
+    /// reachable everywhere else via ref-stubs rather than missing.
     ///
     /// Fixture (Inherits flows child -> parent):
     /// ```text
@@ -838,15 +906,22 @@ mod tests {
     /// Inherits edges: Base->Root, MixinA->Base, MixinB->Base,
     /// Derived->MixinA, Derived->MixinB, Leaf->Derived.
     ///
-    /// Query: `class_hierarchy("Derived", 3)`.
-    /// Expected:
-    /// - bases = [MixinA, MixinB]
-    /// - both MixinA and MixinB have bases = [Base]
-    /// - **both copies of Base have non-empty bases containing Root**
+    /// Pre-order DFS for `class_hierarchy("Derived", 3)`:
+    ///   - Visit Derived.
+    ///   - bases[0] = MixinA → bases[0] = Base → bases[0] = Root.
+    ///   - Walking Base's derived (down-DFS) reaches MixinA (cycle
+    ///     leaf — on_path) and MixinB (FIRST visit — full node, but at
+    ///     depth=0 so empty bases/derived).
+    ///   - Back at Derived, bases[1] = MixinB. MixinB is already in
+    ///     `visited_unique` from the down-DFS walk above, so it emits
+    ///     a `{name: "MixinB", ref: true}` ref-stub here.
     ///
-    /// If the per-DFS-path tracking is reverted to a global visited
-    /// set, the second arm's Base would have empty bases — the
-    /// assertions below would catch it.
+    /// The discriminator assertions: MixinB at `result.bases[1]` is a
+    /// ref-stub (empty bases, `ref: Some(true)`) AND the canonical
+    /// MixinB inside `Base.derived` does NOT recurse to Base (which
+    /// would be a cycle), so the diamond has exactly one fully-expanded
+    /// path Derived → MixinA → Base → Root rather than two duplicate
+    /// inline expansions.
     #[test]
     fn class_hierarchy_diamond_4_level_fixture() {
         let mut g = Graph::new();
@@ -885,29 +960,43 @@ mod tests {
         assert_eq!(mixin_a.name, "MixinA");
         assert_eq!(mixin_b.name, "MixinB");
 
-        // Both mixins must have bases = [Base].
+        // MixinA is the canonical (first-visit) occurrence and has a
+        // fully expanded Base subtree: Base → Root.
+        assert_eq!(mixin_a.r#ref, None, "MixinA must be the canonical node");
         assert_eq!(mixin_a.bases.len(), 1, "MixinA -> Base");
-        assert_eq!(mixin_a.bases[0].name, "Base");
-        assert_eq!(mixin_b.bases.len(), 1, "MixinB -> Base");
-        assert_eq!(mixin_b.bases[0].name, "Base");
+        let base = &mixin_a.bases[0];
+        assert_eq!(base.name, "Base");
+        assert_eq!(base.r#ref, None, "Base under MixinA is canonical");
+        assert_eq!(
+            base.bases.len(),
+            1,
+            "Base must expand to Root via its canonical occurrence",
+        );
+        assert_eq!(base.bases[0].name, "Root");
 
-        // **The regression assertion**: both Base copies must be fully
-        // expanded. With a global-visited bug the second copy would have
-        // empty bases.
-        assert!(
-            !mixin_a.bases[0].bases.is_empty(),
-            "diamond bug regression: Base under MixinA must expand to Root",
+        // MixinB at Derived.bases[1] is a ref-stub: MixinB was already
+        // walked as one of Base.derived during the canonical Base
+        // expansion above, so the second reach emits a stub rather than
+        // re-expanding the Mixin subtree inline.
+        assert_eq!(
+            mixin_b.r#ref,
+            Some(true),
+            "MixinB on the second arm must be a ref-stub, not a full node",
         );
         assert!(
-            !mixin_b.bases[0].bases.is_empty(),
-            "diamond bug regression: Base under MixinB must expand to Root",
+            mixin_b.bases.is_empty(),
+            "ref-stub carries empty bases by definition; got {:?}",
+            mixin_b.bases,
         );
-        assert_eq!(mixin_a.bases[0].bases[0].name, "Root");
-        assert_eq!(mixin_b.bases[0].bases[0].name, "Root");
+        assert!(
+            mixin_b.derived.is_empty(),
+            "ref-stub carries empty derived by definition",
+        );
 
-        // Sanity: the derived side reports Leaf.
+        // Sanity: the derived side reports Leaf as a full node.
         assert_eq!(result.derived.len(), 1);
         assert_eq!(result.derived[0].name, "Leaf");
+        assert_eq!(result.derived[0].r#ref, None);
     }
 
     // --- class_hierarchy: max_nodes budget ---
@@ -1052,9 +1141,11 @@ mod tests {
     }
 
     /// Backward-compat regression: with `max_nodes = u32::MAX` the
-    /// algorithm must produce the same tree shape as the existing
-    /// `class_hierarchy_diamond_4_level_fixture` test. Asserts the
-    /// new budget plumbing doesn't perturb unbounded queries.
+    /// algorithm must produce the same tree shape as the
+    /// `class_hierarchy_diamond_4_level_fixture` test (ref-stub walk).
+    /// Asserts the budget plumbing doesn't perturb unbounded queries —
+    /// `u32::MAX` should never truncate and never change the dedupe
+    /// pattern.
     #[test]
     fn class_hierarchy_max_nodes_unbounded_matches_legacy() {
         // Same fixture as `class_hierarchy_diamond_4_level_fixture`.
@@ -1085,29 +1176,35 @@ mod tests {
             .expect("Derived found");
         assert!(!truncated, "u32::MAX budget never truncates");
 
-        // Same shape assertions as the legacy diamond test — both `Base`
-        // copies must fully expand to `Root`. A regression in the new
-        // budget plumbing that accidentally cut off the second `Base`
-        // expansion would surface here.
+        // Same shape as the ref-stub diamond test: MixinA is the
+        // canonical arm with Base → Root fully expanded; MixinB at
+        // Derived.bases[1] is the ref-stub. A regression in the budget
+        // plumbing that perturbed the walk order or fired the budget
+        // gate inappropriately would change either the canonical
+        // expansion or the ref-stub placement.
         let mut bases = root.bases.clone();
         bases.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(bases.len(), 2);
         assert_eq!(bases[0].name, "MixinA");
         assert_eq!(bases[1].name, "MixinB");
+        assert_eq!(bases[0].r#ref, None, "MixinA is canonical under u32::MAX");
         assert_eq!(bases[0].bases.len(), 1);
         assert_eq!(bases[0].bases[0].name, "Base");
-        assert_eq!(bases[1].bases.len(), 1);
-        assert_eq!(bases[1].bases[0].name, "Base");
+        assert_eq!(bases[0].bases[0].r#ref, None);
         assert!(
             !bases[0].bases[0].bases.is_empty(),
-            "Base under MixinA must expand to Root (legacy diamond regression)"
-        );
-        assert!(
-            !bases[1].bases[0].bases.is_empty(),
-            "Base under MixinB must expand to Root (legacy diamond regression)"
+            "Base under MixinA must expand to Root (canonical arm)"
         );
         assert_eq!(bases[0].bases[0].bases[0].name, "Root");
-        assert_eq!(bases[1].bases[0].bases[0].name, "Root");
+
+        assert_eq!(
+            bases[1].r#ref,
+            Some(true),
+            "MixinB on the second arm must remain a ref-stub even under \
+             unbounded budget — `max_nodes = u32::MAX` must not change the \
+             walk's dedupe behavior."
+        );
+        assert!(bases[1].bases.is_empty());
 
         assert_eq!(root.derived.len(), 1);
         assert_eq!(root.derived[0].name, "Leaf");
