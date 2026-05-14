@@ -84,10 +84,12 @@ async fn analyze_then_query_pipeline() {
     let arr = parsed["results"].as_array().expect("results array");
     assert!(!arr.is_empty(), "engine.cpp has at least one symbol");
 
-    // Summary returns a non-empty namespace map.
-    let summary = get_symbol_summary(&server.inner.graph, None);
+    // Summary returns the `Page<SummaryRow>` envelope; assert the envelope
+    // shape is present and `results` is non-empty for the indexed fixture.
+    let summary = get_symbol_summary(&server.inner.graph, None, None, None, NO_BYTE_BUDGET);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&summary)).unwrap();
-    assert!(parsed.is_object());
+    let results = parsed["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "indexed fixture has at least one row");
 
     // Dependencies returns engine.h + utils.h for engine.cpp.
     let deps = get_dependencies(&server.inner.graph, &engine_cpp);

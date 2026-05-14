@@ -69,6 +69,32 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// One row of the `get_symbol_summary` response.
+///
+/// The handler emits a flat `Page<SummaryRow>` envelope rather than the
+/// nested `HashMap<String, HashMap<&'static str, u32>>` shape it used
+/// historically. The flat form shares the pagination + byte-budget
+/// machinery used by the other paginated tools and removes the
+/// response-size cliff on graphs with thousands of `(namespace, kind)`
+/// pairs.
+///
+/// `namespace` is owned (not `&'static str`) so the empty-namespace
+/// display rename (`""` → `"<global>"`) can construct strings at
+/// row-build time. `kind` reuses [`kind_str`]'s `&'static str` return so
+/// kind names stay byte-identical across every tool surface. `count` is
+/// `u32` for byte-identical JSON across platforms — same convention as
+/// [`Page`].
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; callers consume it
+/// as JSON via `CallToolResult`, never as a Rust type.
+#[derive(Debug, Serialize)]
+pub(super) struct SummaryRow {
+    pub namespace: String,
+    pub kind: &'static str,
+    pub count: u32,
+}
+
 /// Shared pagination envelope for list-shaped tool responses.
 ///
 /// Field-declaration order — `results`, `total`, `offset`, `limit`,

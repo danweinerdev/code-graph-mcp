@@ -342,7 +342,7 @@ async fn response_get_symbol_detail_engine_update() {
 #[tokio::test]
 async fn response_get_symbol_summary_whole_graph() {
     let fx = build_indexed_fixture().await;
-    let r = get_symbol_summary(&fx.inner.graph, None);
+    let r = get_symbol_summary(&fx.inner.graph, None, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

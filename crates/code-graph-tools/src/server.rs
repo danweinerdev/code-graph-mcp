@@ -288,6 +288,12 @@ pub struct GetSymbolSummaryArgs {
     #[schemars(description = "Optional absolute path: scope counts to a single file")]
     #[serde(default)]
     pub file: Option<String>,
+    #[schemars(description = "Maximum rows to return (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N rows for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -566,7 +572,18 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Get symbol counts grouped by namespace and kind — useful for codebase orientation"
+        description = "Get symbol counts grouped by namespace and kind — useful for codebase \
+                       orientation. Returns a {results, total, offset, limit, truncated, \
+                       next_offset} envelope where each row is `{namespace, kind, count}`, \
+                       sorted by `(namespace, kind)` ascending so paging is deterministic \
+                       across calls. `limit` defaults to 100 (max 1000, clamped silently — \
+                       the echoed `limit` reflects the resolved value); raise `limit` for \
+                       large codebases with many distinct namespaces, and use `offset` to \
+                       advance through results. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget bites, \
+                       `truncated` is true and `next_offset` points at the first un-emitted \
+                       row — re-call with `offset = next_offset` to resume. `truncated=false` \
+                       plus `next_offset=null` means the page is complete."
     )]
     async fn get_symbol_summary(
         &self,
@@ -575,9 +592,13 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::symbols::get_symbol_summary(
             &self.inner.graph,
             args.file.as_deref(),
+            args.limit,
+            args.offset,
+            max_bytes,
         ))
     }
 
@@ -1036,7 +1057,11 @@ mod tests {
     async fn get_symbol_summary_requires_indexed_before_running() {
         let server = empty_server();
         let r = server
-            .get_symbol_summary(Parameters(GetSymbolSummaryArgs { file: None }))
+            .get_symbol_summary(Parameters(GetSymbolSummaryArgs {
+                file: None,
+                limit: None,
+                offset: None,
+            }))
             .await
             .expect("Ok envelope on require_indexed failure");
         assert_eq!(r.is_error, Some(true));
@@ -1126,11 +1151,19 @@ mod tests {
         assert_eq!(text, "no symbols found in file: /never.cpp");
     }
 
-    /// One representative description must match the Go reference
-    /// byte-for-byte. `get_symbol_summary` is chosen because its
-    /// description carries an em-dash (U+2014) — a hyphen-minus regression
-    /// would slip past the count/name tests but would be caught here. The
-    /// full description-snapshot suite lands in Phase 3.7.
+    /// One representative description must preserve the em-dash (U+2014)
+    /// — a hyphen-minus regression would slip past the count/name tests
+    /// but would be caught here. `get_symbol_summary` is chosen because
+    /// its description has carried an em-dash since the original Go
+    /// reference. The full description-snapshot suite is the wire-
+    /// format-of-record (`tests/snapshot_tools_list.rs`); this test
+    /// guards just the em-dash byte sequence.
+    ///
+    /// ResponseShapePolish Phase 1 (Task 1.1) rewrote the description
+    /// to mention the new `Page<SummaryRow>` envelope shape; the
+    /// em-dash is preserved verbatim. Task 1.5 will rewrite the
+    /// description again with the full envelope/sort/count_only
+    /// wording — keep the em-dash check intact through that edit.
     #[test]
     fn tool_descriptions_match_go_reference_for_get_symbol_summary() {
         let tools = CodeGraphServer::tool_router().list_all();
@@ -1143,10 +1176,9 @@ mod tests {
             .as_ref()
             .map(|c| c.as_ref())
             .expect("get_symbol_summary must have a description");
-        assert_eq!(
-            description,
-            "Get symbol counts grouped by namespace and kind — useful for codebase orientation",
-            "get_symbol_summary description must match Go reference byte-for-byte (em-dash U+2014)",
+        assert!(
+            description.starts_with("Get symbol counts grouped by namespace and kind \u{2014} "),
+            "get_symbol_summary description must keep the em-dash (U+2014) prefix; got {description:?}",
         );
     }
 

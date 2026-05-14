@@ -5,7 +5,6 @@
 //! returns a `CallToolResult` ready to hand back to rmcp. Error wording
 //! matches the Go reference at `internal/tools/symbols.go` byte-for-byte.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use code_graph_core::paths;
@@ -15,7 +14,7 @@ use rmcp::model::CallToolResult;
 
 use super::{
     byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    tool_error, tool_success_json, Page, SymbolResult, ENVELOPE_OVERHEAD_BYTES,
+    tool_error, tool_success_json, Page, SummaryRow, SymbolResult, ENVELOPE_OVERHEAD_BYTES,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
@@ -382,24 +381,77 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
     }
 }
 
-/// `get_symbol_summary` body. Returns the namespace → kind-string → count
-/// map as JSON. Unlike Go (which serializes `map[string]map[parser.SymbolKind]int`
-/// directly), we re-key the inner map by the lowercase kind string so the
-/// JSON output uses the same kind names as every other surface.
-pub fn get_symbol_summary(graph: &RwLock<Graph>, file: Option<&str>) -> CallToolResult {
+/// `get_symbol_summary` body. Returns a [`Page`]`<`[`SummaryRow`]`>`
+/// envelope where each row is one `(namespace, kind, count)` triple.
+///
+/// ResponseShapePolish Phase 1 (Task 1.1) flattened the previous nested
+/// `HashMap<String, HashMap<&'static str, u32>>` shape into the shared
+/// `Page<T>` envelope so the summary handler can use the existing
+/// pagination + byte-budget machinery (eliminating the 196 KB UE-scale
+/// rejection the nested shape caused). Task 1.2 wires real pagination
+/// through: flatten → sort by `(namespace, kind)` → `byte_budget_take`.
+/// Task 1.3 will add the `<global>` display rename for empty namespaces;
+/// Task 1.4 will thread a `count_only` argument.
+///
+/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
+/// default" (mirrors `get_orphans` and `get_file_symbols`); `limit` is
+/// silently clamped at 1000. `offset >= total` returns an empty `results`
+/// page with the correct `total`. Rows are sorted by `(namespace, kind)`
+/// ascending so page 1 + page 2 partition the rows deterministically
+/// across calls.
+pub fn get_symbol_summary(
+    graph: &RwLock<Graph>,
+    file: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
     let path: Option<&Path> = file.filter(|s| !s.is_empty()).map(Path::new);
     let summary = graph.read().symbol_summary(path);
 
-    // Re-key SymbolKind -> &str for stable JSON output.
-    let mut response: HashMap<String, HashMap<&'static str, u32>> =
-        HashMap::with_capacity(summary.len());
+    // Flatten the nested map: one row per (namespace, kind) pair. No
+    // `<global>` rename yet — Task 1.3.
+    let mut rows: Vec<SummaryRow> = Vec::new();
     for (ns, kinds) in summary {
-        let mut inner = HashMap::with_capacity(kinds.len());
         for (k, count) in kinds {
-            inner.insert(kind_str(k), count);
+            rows.push(SummaryRow {
+                namespace: ns.clone(),
+                kind: kind_str(k),
+                count,
+            });
         }
-        response.insert(ns, inner);
     }
+
+    // Sort by `(namespace, kind)` ascending so pagination is deterministic
+    // across calls. `Graph::symbol_summary` walks a HashMap, so without
+    // this canonicalization the page boundaries would shift between runs.
+    // The sort key matches the contract documented on `SummaryRow`.
+    rows.sort_by(|a, b| (a.namespace.as_str(), a.kind).cmp(&(b.namespace.as_str(), b.kind)));
+
+    let total = rows.len() as u32;
+
+    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
+    // Mirrors `get_orphans` / `get_file_symbols` conventions.
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
+    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety):
+    // the helper internally applies offset+limit skip/take and stops early
+    // if the running serialized byte count would exceed
+    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
+    // `results.len() as u32`, NOT the pre-pagination row count — that's
+    // `total` captured above and held unchanged.
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
+
+    let response = Page::<SummaryRow> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
     tool_success_json(&response)
 }
 
@@ -1747,26 +1799,65 @@ mod tests {
     }
 
     // --- get_symbol_summary ---
+    //
+    // ResponseShapePolish Phase 1 (Task 1.1) flipped the response shape
+    // from the nested `HashMap<String, HashMap<&str, u32>>` to a
+    // `Page<SummaryRow>` envelope. The assertions below were rewritten
+    // to read the new flat-row shape; the underlying counts are
+    // unchanged. Tasks 1.2–1.4 will add pagination, sort, `<global>`
+    // rename, and `count_only` tests on top of this baseline.
+
+    /// Pick a single `SummaryRow` out of the response by `(namespace, kind)`.
+    /// Panics with a helpful message if no row matches — callers want a
+    /// loud failure, not a silent skip, when the shape regresses.
+    fn pick_count(results: &[serde_json::Value], namespace: &str, kind: &str) -> u32 {
+        for row in results {
+            if row["namespace"] == serde_json::json!(namespace)
+                && row["kind"] == serde_json::json!(kind)
+            {
+                return row["count"].as_u64().expect("count is integer") as u32;
+            }
+        }
+        panic!(
+            "no row matched (namespace={namespace:?}, kind={kind:?}) in {:?}",
+            results,
+        );
+    }
+
+    fn has_row(results: &[serde_json::Value], namespace: &str, kind: &str) -> bool {
+        results.iter().any(|row| {
+            row["namespace"] == serde_json::json!(namespace)
+                && row["kind"] == serde_json::json!(kind)
+        })
+    }
 
     #[test]
     fn symbol_summary_whole_graph() {
         let g = locked(small_graph());
-        let r = get_symbol_summary(&g, None);
+        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        // 3 symbols all in namespace "".
-        let inner = parsed[""].as_object().unwrap();
-        assert_eq!(inner["function"], serde_json::json!(1));
-        assert_eq!(inner["class"], serde_json::json!(1));
-        assert_eq!(inner["method"], serde_json::json!(1));
+        // Phase 1: response is now `Page<SummaryRow>`. All 3 sample
+        // symbols carry namespace="" (the `<global>` display rename
+        // lands in Task 1.3).
+        let results = parsed["results"].as_array().expect("results array");
+        assert_eq!(pick_count(results, "", "function"), 1);
+        assert_eq!(pick_count(results, "", "class"), 1);
+        assert_eq!(pick_count(results, "", "method"), 1);
+        // total reflects the row count (3 rows for 3 distinct
+        // (namespace, kind) pairs in the small graph fixture).
+        assert_eq!(parsed["total"].as_u64().unwrap(), 3);
     }
 
     #[test]
-    fn symbol_summary_empty_graph_returns_empty_object() {
+    fn symbol_summary_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_symbol_summary(&g, None);
+        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let obj = parsed.as_object().unwrap();
-        assert!(obj.is_empty());
+        // Phase 1: empty graph now yields an empty Page envelope, NOT a
+        // bare empty object. The shape change is intentional (see plan).
+        let results = parsed["results"].as_array().expect("results array");
+        assert!(results.is_empty());
+        assert_eq!(parsed["total"].as_u64().unwrap(), 0);
     }
 
     #[test]
@@ -1779,12 +1870,308 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_symbol_summary(&g, Some("/b.cpp"));
+        let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let inner = parsed[""].as_object().unwrap();
-        assert_eq!(inner["function"], serde_json::json!(1));
-        // No method or class — those are in /a.cpp only.
-        assert!(!inner.contains_key("method"));
-        assert!(!inner.contains_key("class"));
+        let results = parsed["results"].as_array().expect("results array");
+        assert_eq!(pick_count(results, "", "function"), 1);
+        // No method or class rows — those are in /a.cpp only.
+        assert!(!has_row(results, "", "method"));
+        assert!(!has_row(results, "", "class"));
+    }
+
+    // --- Task 1.2 pagination tests ------------------------------------------
+    //
+    // ResponseShapePolish Phase 1 Task 1.2 wires real pagination through
+    // `get_symbol_summary`. These tests pin:
+    //   * basic round-trip with multiple namespaces (deterministic ordering),
+    //   * sort stability across two pages,
+    //   * `limit=0` resolves to the default (mirrors `get_orphans`),
+    //   * `offset >= total` returns an empty page with correct `total`,
+    //   * a >100-row fixture triggers byte-budget truncation under the
+    //     production `[response].max_bytes` default.
+
+    use super::super::test_helpers::page_extras;
+
+    /// Build a graph with N distinct namespaces, each carrying one Function
+    /// symbol, so `symbol_summary` yields exactly N rows of
+    /// `(namespace_i, "function", 1)` once sorted. Used by the multi-page
+    /// + budget-bite tests below.
+    fn multi_namespace_graph(n: usize) -> Graph {
+        let mut g = Graph::new();
+        for i in 0..n {
+            let ns = format!("ns_{:04}", i);
+            let file = format!("/f_{:04}.cpp", i);
+            let s = Symbol {
+                name: format!("func_{:04}", i),
+                kind: SymbolKind::Function,
+                file: file.clone(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: String::new(),
+                namespace: ns,
+                parent: String::new(),
+                language: Language::Cpp,
+            };
+            g.merge_file_graph(FileGraph {
+                path: file,
+                language: Language::Cpp,
+                symbols: vec![s],
+                edges: Vec::new(),
+            });
+        }
+        g
+    }
+
+    #[test]
+    fn symbol_summary_basic_round_trip_multiple_namespaces() {
+        // Two namespaces ("alpha", "beta") plus the default ""-namespace
+        // rows from `small_graph` — three distinct namespaces, multiple
+        // kinds. Asserts `total`, `results.len()`, and that two back-to-back
+        // calls produce the same ordering (sort is deterministic).
+        let mut g = small_graph();
+        g.merge_file_graph(FileGraph {
+            path: "/alpha.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![Symbol {
+                name: "a_fn".to_string(),
+                kind: SymbolKind::Function,
+                file: "/alpha.cpp".to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: String::new(),
+                namespace: "alpha".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/beta.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![Symbol {
+                name: "b_fn".to_string(),
+                kind: SymbolKind::Function,
+                file: "/beta.cpp".to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: String::new(),
+                namespace: "beta".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+
+        let r1 = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let (results1, total1, offset1, limit1) = page_parts(&r1);
+        let (truncated1, next1) = page_extras(&r1);
+
+        // small_graph: 3 rows (function/class/method in ns="");
+        // alpha + beta add 2 more rows (function in ns="alpha", "beta").
+        // Total = 5.
+        assert_eq!(total1, 5);
+        assert_eq!(results1.len(), 5);
+        assert_eq!(offset1, 0);
+        assert_eq!(limit1, 100);
+        assert!(!truncated1);
+        assert_eq!(next1, None);
+
+        // Determinism: a second call yields identical row order.
+        let r2 = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let (results2, _, _, _) = page_parts(&r2);
+        assert_eq!(
+            results1, results2,
+            "row order must be deterministic across repeated calls",
+        );
+
+        // Sort order: namespace asc, then kind asc. Expected sequence:
+        //   ("",      "class"),
+        //   ("",      "function"),
+        //   ("",      "method"),
+        //   ("alpha", "function"),
+        //   ("beta",  "function").
+        let expected_ns_kind: Vec<(&str, &str)> = vec![
+            ("", "class"),
+            ("", "function"),
+            ("", "method"),
+            ("alpha", "function"),
+            ("beta", "function"),
+        ];
+        let got: Vec<(String, String)> = results1
+            .iter()
+            .map(|row| {
+                (
+                    row["namespace"].as_str().unwrap().to_string(),
+                    row["kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let want: Vec<(String, String)> = expected_ns_kind
+            .iter()
+            .map(|(ns, k)| (ns.to_string(), k.to_string()))
+            .collect();
+        assert_eq!(got, want, "sort must be (namespace, kind) ascending");
+    }
+
+    #[test]
+    fn symbol_summary_sort_stable_across_two_pages() {
+        // Build a graph with 8 distinct (namespace, kind) rows; fetch page
+        // 1 with limit=4, page 2 with offset=4 limit=4; concatenate and
+        // assert equality with the full sorted result.
+        let g = locked(multi_namespace_graph(8));
+
+        let full = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let (full_rows, full_total, _, _) = page_parts(&full);
+        assert_eq!(full_total, 8);
+        assert_eq!(full_rows.len(), 8);
+
+        let p1 = get_symbol_summary(&g, None, Some(4), Some(0), NO_BYTE_BUDGET);
+        let (p1_rows, p1_total, p1_offset, p1_limit) = page_parts(&p1);
+        let (p1_truncated, p1_next) = page_extras(&p1);
+        assert_eq!(p1_total, 8);
+        assert_eq!(p1_rows.len(), 4);
+        assert_eq!(p1_offset, 0);
+        assert_eq!(p1_limit, 4);
+        // Hit the limit cap before any byte cap fires; truncated stays false
+        // and next_offset stays None — caller pages via offset+limit.
+        assert!(!p1_truncated);
+        assert_eq!(p1_next, None);
+
+        let p2 = get_symbol_summary(&g, None, Some(4), Some(4), NO_BYTE_BUDGET);
+        let (p2_rows, p2_total, p2_offset, p2_limit) = page_parts(&p2);
+        assert_eq!(p2_total, 8);
+        assert_eq!(p2_rows.len(), 4);
+        assert_eq!(p2_offset, 4);
+        assert_eq!(p2_limit, 4);
+
+        // page 1 + page 2 must equal the full sorted result, row-for-row.
+        let mut concat = p1_rows.clone();
+        concat.extend(p2_rows.iter().cloned());
+        assert_eq!(
+            concat, full_rows,
+            "page1 + page2 must equal the full sorted result",
+        );
+    }
+
+    #[test]
+    fn symbol_summary_limit_zero_resolves_to_default() {
+        // limit=0 must behave identically to limit=None (default 100).
+        // Mirrors `get_orphans` (Decision documented on the handler).
+        let g = locked(multi_namespace_graph(50));
+
+        let r_zero = get_symbol_summary(&g, None, Some(0), None, NO_BYTE_BUDGET);
+        let (rows_zero, total_zero, offset_zero, limit_zero) = page_parts(&r_zero);
+        let r_none = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let (rows_none, total_none, offset_none, limit_none) = page_parts(&r_none);
+
+        // Both report 50 rows, default-resolved limit=100, no truncation.
+        assert_eq!(total_zero, 50);
+        assert_eq!(total_none, 50);
+        assert_eq!(limit_zero, 100, "limit=0 must resolve to default 100");
+        assert_eq!(limit_none, 100);
+        assert_eq!(offset_zero, 0);
+        assert_eq!(offset_none, 0);
+        // Same payload.
+        assert_eq!(rows_zero, rows_none);
+    }
+
+    #[test]
+    fn symbol_summary_offset_past_total_returns_empty_page() {
+        // offset >= total: empty `results`, total still echoes the
+        // pre-pagination row count, truncated=false, next_offset=None.
+        let g = locked(multi_namespace_graph(5));
+
+        let r = get_symbol_summary(&g, None, Some(10), Some(99), NO_BYTE_BUDGET);
+        let (rows, total, offset, limit) = page_parts(&r);
+        let (truncated, next) = page_extras(&r);
+        assert!(rows.is_empty(), "offset past total yields empty page");
+        assert_eq!(total, 5, "total reflects pre-pagination row count");
+        assert_eq!(offset, 99);
+        assert_eq!(limit, 10);
+        assert!(!truncated);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn symbol_summary_limit_clamped_to_thousand() {
+        // limit values above 1000 are silently clamped to 1000; the echoed
+        // `limit` in the envelope reflects the resolved value.
+        let g = locked(multi_namespace_graph(3));
+        let r = get_symbol_summary(&g, None, Some(5000), None, NO_BYTE_BUDGET);
+        let (_, _, _, limit) = page_parts(&r);
+        assert_eq!(limit, 1000, "limit must clamp at 1000");
+    }
+
+    #[test]
+    fn symbol_summary_over_one_hundred_rows_caps_at_default_limit() {
+        // >100-row fixture: build 1200 distinct namespaces (each yielding
+        // one row). Call with default limit; under the production 100KB
+        // `max_bytes` this MUST cap the page at exactly 100 rows (the
+        // count cap). Pins the regression the Task 1.1 stub was hiding:
+        // the stub ignored `limit` entirely and emitted all 1200 rows.
+        //
+        // Each SummaryRow serialized is roughly
+        //   {"namespace":"ns_0123","kind":"function","count":1}
+        // ≈ 55 bytes. 100KB budget minus ENVELOPE_OVERHEAD_BYTES (512)
+        // leaves room for ~1800 rows by byte budget alone — so the count
+        // cap (limit=100) bites first. `truncated` is false on this path
+        // (byte_budget_take only sets truncated when the BYTE budget
+        // bites, not when the count cap hits) and `next_offset` is null;
+        // the caller pages via `offset + limit` per the documented
+        // `Page<T>` envelope contract.
+        let g = locked(multi_namespace_graph(1200));
+
+        // Use the production default `max_bytes` to mirror real callers.
+        let default_max_bytes = code_graph_core::RootConfig::default().response.max_bytes;
+        let r = get_symbol_summary(&g, None, None, None, default_max_bytes);
+        let (rows, total, offset, limit) = page_parts(&r);
+        let (truncated, next) = page_extras(&r);
+
+        assert_eq!(total, 1200, "total reflects pre-pagination row count");
+        assert_eq!(rows.len(), 100, "default page must cap at limit=100");
+        assert_eq!(limit, 100);
+        assert_eq!(offset, 0);
+        // Count cap path: limit reached cleanly, byte budget not consulted.
+        assert!(!truncated, "count-cap path returns truncated=false");
+        assert_eq!(next, None, "count-cap path returns next_offset=null");
+    }
+
+    #[test]
+    fn symbol_summary_byte_budget_triggers_truncation_with_large_limit() {
+        // Same >100-row fixture, but raised `limit` past the count cap so
+        // the BYTE budget bites instead. With max_bytes shrunk to ~2KB
+        // (budget = 2048 - 512 = 1536) and ~55 bytes per row, only ~25
+        // rows fit before the budget rejects the next one. limit=1000
+        // ensures the count cap never bites first.
+        //
+        // This is the load-bearing complement to the previous test: it
+        // pins the truncation half of the Task 1.1 regression. Without
+        // pagination wired through, the stub would have emitted all
+        // 1200 rows and overflowed any client harness's response budget.
+        let g = locked(multi_namespace_graph(1200));
+
+        let r = get_symbol_summary(&g, None, Some(1000), None, 2048);
+        let (rows, total, offset, limit) = page_parts(&r);
+        let (truncated, next) = page_extras(&r);
+
+        assert_eq!(total, 1200);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 1000);
+        assert!(
+            rows.len() < 1000,
+            "byte budget must trim well below the count cap; got {}",
+            rows.len()
+        );
+        assert!(truncated, "byte budget must set truncated=true");
+        let next_offset = next.expect("truncated pages must carry next_offset");
+        assert_eq!(
+            next_offset as usize,
+            rows.len(),
+            "next_offset must equal the count of records emitted in this page",
+        );
     }
 }

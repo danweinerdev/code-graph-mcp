@@ -3,15 +3,46 @@ source: crates/code-graph-tools/tests/snapshot_responses.rs
 expression: parsed
 ---
 {
-  "": {
-    "class": 4,
-    "enum": 1,
-    "function": 3,
-    "method": 5,
-    "struct": 1,
-    "typedef": 1
-  },
-  "utils": {
-    "function": 3
-  }
+  "limit": 100,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "count": 4,
+      "kind": "class",
+      "namespace": ""
+    },
+    {
+      "count": 1,
+      "kind": "enum",
+      "namespace": ""
+    },
+    {
+      "count": 3,
+      "kind": "function",
+      "namespace": ""
+    },
+    {
+      "count": 5,
+      "kind": "method",
+      "namespace": ""
+    },
+    {
+      "count": 1,
+      "kind": "struct",
+      "namespace": ""
+    },
+    {
+      "count": 1,
+      "kind": "typedef",
+      "namespace": ""
+    },
+    {
+      "count": 3,
+      "kind": "function",
+      "namespace": "utils"
+    }
+  ],
+  "total": 7,
+  "truncated": false
 }
