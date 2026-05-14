@@ -393,7 +393,7 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// Task 1.3 added the `<global>` display rename for empty namespaces (a
 /// row-build-time substitution; the graph's `Symbol.namespace` field is
 /// never mutated, and `search_symbols(namespace="")` still filters by
-/// the empty string). Task 1.4 will thread a `count_only` argument.
+/// the empty string).
 ///
 /// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
 /// default" (mirrors `get_orphans` and `get_file_symbols`); `limit` is
@@ -402,15 +402,51 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// ascending so page 1 + page 2 partition the rows deterministically
 /// across calls. The `<global>` substitution happens BEFORE the sort, so
 /// `<global>` rows sort wherever `<` lands in ASCII (between `;` and `=`).
+///
+/// When `count_only = true` (Task 1.4), the handler returns the sentinel
+/// response shape `Page { results: [], total, offset: 0, limit: 0,
+/// truncated: false, next_offset: None }` without flattening, sorting, or
+/// invoking the byte-budget helper. `total` is the count of distinct
+/// `(namespace, kind)` pairs across the summary — i.e. the row count the
+/// paginated path would emit — NOT the sum of per-pair symbol counts.
+/// Mirrors `get_orphans` / `search_symbols` / `get_file_symbols` count_only
+/// semantics. See plan Decision 9 for why `limit: 0` is a deliberate
+/// exception to the "envelope echoes resolved limit" contract.
 pub fn get_symbol_summary(
     graph: &RwLock<Graph>,
     file: Option<&str>,
     limit: Option<u32>,
     offset: Option<u32>,
+    count_only: bool,
     max_bytes: usize,
 ) -> CallToolResult {
     let path: Option<&Path> = file.filter(|s| !s.is_empty()).map(Path::new);
     let summary = graph.read().symbol_summary(path);
+
+    // Count-only short-circuit (Task 1.4): emit the sentinel envelope
+    // WITHOUT flattening rows or invoking `byte_budget_take`. `total` is
+    // the number of distinct `(namespace, kind)` pairs — i.e. the row
+    // count the paginated path below would emit (one row per inner-map
+    // entry). Summing inner-map lengths matches the nested-loop count
+    // exactly, so `count_only=true` and `count_only=false` agree on `total`.
+    if count_only {
+        let total: u32 = summary.values().map(|m| m.len()).sum::<usize>() as u32;
+        // `limit: 0` is a deliberate exception to the
+        // "envelope echoes resolved limit" contract — see plan Decision 9.
+        // count_only callers opted out of paging; echoing a would-have-been
+        // limit would mislead them into thinking there's a record page to
+        // fetch. The exception is documented in CLAUDE.md alongside the
+        // count_only sub-block.
+        let response = Page::<SummaryRow> {
+            results: vec![],
+            total,
+            offset: 0,
+            limit: 0,
+            truncated: false,
+            next_offset: None,
+        };
+        return tool_success_json(&response);
+    }
 
     // Flatten the nested map: one row per (namespace, kind) pair. The
     // empty-namespace -> `<global>` rename (Task 1.3) is applied at row
@@ -1846,7 +1882,7 @@ mod tests {
     #[test]
     fn symbol_summary_whole_graph() {
         let g = locked(small_graph());
-        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // Phase 1: response is now `Page<SummaryRow>`. All 3 sample
         // symbols carry namespace="" in the graph; Task 1.3's display
@@ -1867,7 +1903,7 @@ mod tests {
     #[test]
     fn symbol_summary_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // Phase 1: empty graph now yields an empty Page envelope, NOT a
         // bare empty object. The shape change is intentional (see plan).
@@ -1886,7 +1922,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
         // Task 1.3: empty namespace renders as `<global>` in the response.
@@ -1984,7 +2020,7 @@ mod tests {
         });
         let g = locked(g);
 
-        let r1 = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r1 = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let (results1, total1, offset1, limit1) = page_parts(&r1);
         let (truncated1, next1) = page_extras(&r1);
 
@@ -1999,7 +2035,7 @@ mod tests {
         assert_eq!(next1, None);
 
         // Determinism: a second call yields identical row order.
-        let r2 = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r2 = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let (results2, _, _, _) = page_parts(&r2);
         assert_eq!(
             results1, results2,
@@ -2045,12 +2081,12 @@ mod tests {
         // assert equality with the full sorted result.
         let g = locked(multi_namespace_graph(8));
 
-        let full = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let full = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let (full_rows, full_total, _, _) = page_parts(&full);
         assert_eq!(full_total, 8);
         assert_eq!(full_rows.len(), 8);
 
-        let p1 = get_symbol_summary(&g, None, Some(4), Some(0), NO_BYTE_BUDGET);
+        let p1 = get_symbol_summary(&g, None, Some(4), Some(0), false, NO_BYTE_BUDGET);
         let (p1_rows, p1_total, p1_offset, p1_limit) = page_parts(&p1);
         let (p1_truncated, p1_next) = page_extras(&p1);
         assert_eq!(p1_total, 8);
@@ -2062,7 +2098,7 @@ mod tests {
         assert!(!p1_truncated);
         assert_eq!(p1_next, None);
 
-        let p2 = get_symbol_summary(&g, None, Some(4), Some(4), NO_BYTE_BUDGET);
+        let p2 = get_symbol_summary(&g, None, Some(4), Some(4), false, NO_BYTE_BUDGET);
         let (p2_rows, p2_total, p2_offset, p2_limit) = page_parts(&p2);
         assert_eq!(p2_total, 8);
         assert_eq!(p2_rows.len(), 4);
@@ -2084,9 +2120,9 @@ mod tests {
         // Mirrors `get_orphans` (Decision documented on the handler).
         let g = locked(multi_namespace_graph(50));
 
-        let r_zero = get_symbol_summary(&g, None, Some(0), None, NO_BYTE_BUDGET);
+        let r_zero = get_symbol_summary(&g, None, Some(0), None, false, NO_BYTE_BUDGET);
         let (rows_zero, total_zero, offset_zero, limit_zero) = page_parts(&r_zero);
-        let r_none = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r_none = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let (rows_none, total_none, offset_none, limit_none) = page_parts(&r_none);
 
         // Both report 50 rows, default-resolved limit=100, no truncation.
@@ -2106,7 +2142,7 @@ mod tests {
         // pre-pagination row count, truncated=false, next_offset=None.
         let g = locked(multi_namespace_graph(5));
 
-        let r = get_symbol_summary(&g, None, Some(10), Some(99), NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, None, Some(10), Some(99), false, NO_BYTE_BUDGET);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
         assert!(rows.is_empty(), "offset past total yields empty page");
@@ -2122,7 +2158,7 @@ mod tests {
         // limit values above 1000 are silently clamped to 1000; the echoed
         // `limit` in the envelope reflects the resolved value.
         let g = locked(multi_namespace_graph(3));
-        let r = get_symbol_summary(&g, None, Some(5000), None, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, None, Some(5000), None, false, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000, "limit must clamp at 1000");
     }
@@ -2148,7 +2184,7 @@ mod tests {
 
         // Use the production default `max_bytes` to mirror real callers.
         let default_max_bytes = code_graph_core::RootConfig::default().response.max_bytes;
-        let r = get_symbol_summary(&g, None, None, None, default_max_bytes);
+        let r = get_symbol_summary(&g, None, None, None, false, default_max_bytes);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
 
@@ -2175,7 +2211,7 @@ mod tests {
         // 1200 rows and overflowed any client harness's response budget.
         let g = locked(multi_namespace_graph(1200));
 
-        let r = get_symbol_summary(&g, None, Some(1000), None, 2048);
+        let r = get_symbol_summary(&g, None, Some(1000), None, false, 2048);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
 
@@ -2254,7 +2290,7 @@ mod tests {
         //   * no row carries the bare empty string (rename is complete).
         let g = locked(global_and_namespaced_graph());
 
-        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
 
@@ -2309,7 +2345,7 @@ mod tests {
         let g = locked(global_and_namespaced_graph());
 
         // Run the summary first; assert the `<global>` rename surfaces.
-        let r_summary = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let r_summary = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed_summary: serde_json::Value =
             serde_json::from_str(&body_text(&r_summary)).unwrap();
         let summary_results = parsed_summary["results"].as_array().expect("results array");
@@ -2361,5 +2397,249 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Task 1.4 count_only invariants -------------------------------------
+    //
+    // ResponseShapePolish Phase 1 Task 1.4 adds a `count_only: bool` argument
+    // to `get_symbol_summary`. When true, the handler returns the sentinel
+    // envelope (`results: []`, `limit: 0`, `offset: 0`, `truncated: false`,
+    // `next_offset: None`) and reports `total` as the count of distinct
+    // `(namespace, kind)` pairs — i.e. the number of rows the paginated
+    // path would emit, NOT the sum of per-pair symbol counts. The pair-vs-
+    // symbol distinction is load-bearing in the verification frontmatter;
+    // `symbol_summary_count_only_does_not_count_individual_symbols` pins
+    // it against the worst-case shape (many symbols, one pair).
+    //
+    // The sentinel shape mirrors `get_orphans` / `search_symbols` /
+    // `get_file_symbols` count_only paths (Phase 3 of
+    // `PaginatedResponseSizeSafety`), so a single client deserializer
+    // covers all four tools.
+
+    /// Build a graph with N Function symbols all in namespace `"foo"`. The
+    /// inner map under `summary["foo"]` therefore has exactly ONE entry
+    /// `(SymbolKind::Function -> N)`, so the row count is 1 regardless of
+    /// N. Used by the load-bearing
+    /// `count_only_does_not_count_individual_symbols` test below.
+    fn many_symbols_one_pair_graph(n: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut symbols = Vec::with_capacity(n);
+        for i in 0..n {
+            symbols.push(Symbol {
+                name: format!("func_{i:04}"),
+                kind: SymbolKind::Function,
+                file: "/foo.cpp".to_string(),
+                line: (i as u32) + 1,
+                column: 0,
+                end_line: (i as u32) + 1,
+                signature: String::new(),
+                namespace: "foo".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            });
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/foo.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    /// Build a graph with exactly 5 distinct `(namespace, kind)` pairs.
+    /// Used by the sentinel-shape test to pin `total = 5` against a
+    /// fixture whose row count is known by construction.
+    fn five_pair_graph() -> Graph {
+        let mut g = Graph::new();
+        // (ns="alpha", kind=Function)
+        // (ns="alpha", kind=Class)
+        // (ns="beta", kind=Function)
+        // (ns="beta", kind=Method) — `Method` requires a parent
+        // (ns="", kind=Function) — surfaces as `<global>` in row output
+        //   but still contributes one `(namespace, kind)` pair to total.
+        let symbols = vec![
+            Symbol {
+                name: "a_fn".to_string(),
+                kind: SymbolKind::Function,
+                file: "/p.cpp".to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: String::new(),
+                namespace: "alpha".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            },
+            Symbol {
+                name: "AClass".to_string(),
+                kind: SymbolKind::Class,
+                file: "/p.cpp".to_string(),
+                line: 2,
+                column: 0,
+                end_line: 2,
+                signature: String::new(),
+                namespace: "alpha".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            },
+            Symbol {
+                name: "b_fn".to_string(),
+                kind: SymbolKind::Function,
+                file: "/p.cpp".to_string(),
+                line: 3,
+                column: 0,
+                end_line: 3,
+                signature: String::new(),
+                namespace: "beta".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            },
+            Symbol {
+                name: "b_method".to_string(),
+                kind: SymbolKind::Method,
+                file: "/p.cpp".to_string(),
+                line: 4,
+                column: 0,
+                end_line: 4,
+                signature: String::new(),
+                namespace: "beta".to_string(),
+                parent: "AClass".to_string(),
+                language: Language::Cpp,
+            },
+            Symbol {
+                name: "g_fn".to_string(),
+                kind: SymbolKind::Function,
+                file: "/p.cpp".to_string(),
+                line: 5,
+                column: 0,
+                end_line: 5,
+                signature: String::new(),
+                namespace: String::new(),
+                parent: String::new(),
+                language: Language::Cpp,
+            },
+        ];
+        g.merge_file_graph(FileGraph {
+            path: "/p.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    #[test]
+    fn symbol_summary_count_only_returns_row_count() {
+        // When count_only=true the handler MUST emit the sentinel envelope
+        // exactly: `results: []`, `total = <distinct (ns, kind) pair count>`,
+        // `offset: 0`, `limit: 0`, `truncated: false`, `next_offset: null`.
+        // The fixture's 5 pairs are constructed by hand so this test fails
+        // loudly if either (a) the row-count math drifts, or (b) the
+        // sentinel shape regresses on any field.
+        let g = locked(five_pair_graph());
+
+        let r = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+
+        let body = body_text(&r);
+        // count_only must produce a sub-1KB response regardless of input
+        // scale — pins the same contract as get_orphans / search_symbols /
+        // get_file_symbols.
+        assert!(
+            body.len() < 1024,
+            "count_only response must be < 1KB; got {} bytes",
+            body.len(),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+        let offset = parsed["offset"].as_u64().unwrap();
+        let limit = parsed["limit"].as_u64().unwrap();
+        let truncated = parsed["truncated"].as_bool().unwrap();
+        let next_offset = parsed["next_offset"].clone();
+
+        assert!(results.is_empty(), "count_only must emit empty results");
+        assert_eq!(
+            total, 5,
+            "total must equal the (namespace, kind) pair count"
+        );
+        assert_eq!(offset, 0, "count_only emits offset=0");
+        assert_eq!(
+            limit, 0,
+            "count_only emits limit=0 (Decision 9 exception to envelope echo rule)"
+        );
+        assert!(!truncated, "count_only must never set truncated=true");
+        assert_eq!(
+            next_offset,
+            serde_json::Value::Null,
+            "count_only must emit next_offset=null"
+        );
+    }
+
+    #[test]
+    fn symbol_summary_count_only_total_matches_paginated_total() {
+        // The count_only short-circuit MUST agree with the paginated path
+        // on `total`. The paginated path's `total` is the post-flatten
+        // pre-pagination row count (`rows.len()` after the nested-loop
+        // build); the count_only path computes the same number via
+        // `summary.values().map(|m| m.len()).sum()`. This test pins that
+        // the two formulas remain in lockstep — if one ever drifts (e.g.
+        // someone adds a filter to the flatten loop but forgets to mirror
+        // it in count_only), the assertion fails.
+        let g = locked(five_pair_graph());
+
+        let r_count = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+        let parsed_count: serde_json::Value = serde_json::from_str(&body_text(&r_count)).unwrap();
+        let total_count = parsed_count["total"].as_u64().unwrap();
+
+        let r_page = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let (_results, total_page, _offset, _limit) = page_parts(&r_page);
+
+        assert_eq!(
+            total_count, total_page as u64,
+            "count_only total must equal paginated total for the same query",
+        );
+    }
+
+    #[test]
+    fn symbol_summary_count_only_does_not_count_individual_symbols() {
+        // Load-bearing semantic distinction from the verification field:
+        // `total` is the row count (count of distinct `(namespace, kind)`
+        // pairs), NOT the sum of symbol counts. A fixture with 50 symbols
+        // all `(namespace="foo", kind=Function)` collapses to ONE row of
+        // `{namespace: "foo", kind: "function", count: 50}`, so
+        // `count_only=true` must report `total = 1`.
+        //
+        // If a future refactor accidentally returns the symbol sum (50)
+        // instead of the pair count (1), this test fails loudly. That's
+        // the specific regression the verification field is asking us to
+        // pin — the formula and the wording (`m.len()`, NOT `m.values().sum()`)
+        // are easy to swap by mistake.
+        let g = locked(many_symbols_one_pair_graph(50));
+
+        let r = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+
+        assert_eq!(
+            total, 1,
+            "count_only total counts (namespace, kind) PAIRS, not individual symbols; \
+             50 symbols all in (foo, Function) collapse to 1 row -> total=1",
+        );
+
+        // Sanity: the paginated path agrees with the (count_only=false)
+        // semantics — one row, count=50. This isn't the assertion that
+        // protects against the symbol-sum bug (that's the count_only check
+        // above), but it pins the per-row `count` field stays correct.
+        let r_page = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let (results, total_page, _offset, _limit) = page_parts(&r_page);
+        assert_eq!(total_page, 1, "paginated total must also be 1 row");
+        assert_eq!(results.len(), 1, "exactly one row materialized");
+        assert_eq!(
+            results[0]["count"].as_u64().unwrap(),
+            50,
+            "the single row's `count` field is the per-pair symbol count (50)",
+        );
     }
 }

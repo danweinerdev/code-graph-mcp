@@ -8,6 +8,14 @@ expression: "tool_entry(\"get_symbol_summary\")"
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
+      "count_only": {
+        "default": null,
+        "description": "Return only the row count, no records (default false). Bounded response < 1KB regardless of row scale. `total` is the (namespace, kind) pair count, NOT the sum of symbol counts.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "file": {
         "default": null,
         "description": "Optional absolute path: scope counts to a single file",

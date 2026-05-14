@@ -86,7 +86,7 @@ async fn analyze_then_query_pipeline() {
 
     // Summary returns the `Page<SummaryRow>` envelope; assert the envelope
     // shape is present and `results` is non-empty for the indexed fixture.
-    let summary = get_symbol_summary(&server.inner.graph, None, None, None, NO_BYTE_BUDGET);
+    let summary = get_symbol_summary(&server.inner.graph, None, None, None, false, NO_BYTE_BUDGET);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&summary)).unwrap();
     let results = parsed["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "indexed fixture has at least one row");

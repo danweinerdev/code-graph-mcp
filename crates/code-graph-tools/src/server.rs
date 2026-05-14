@@ -294,6 +294,11 @@ pub struct GetSymbolSummaryArgs {
     #[schemars(description = "Skip first N rows for pagination (default 0)")]
     #[serde(default)]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "Return only the row count, no records (default false). Bounded response < 1KB regardless of row scale. `total` is the (namespace, kind) pair count, NOT the sum of symbol counts."
+    )]
+    #[serde(default)]
+    pub count_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -598,6 +603,7 @@ impl CodeGraphServer {
             args.file.as_deref(),
             args.limit,
             args.offset,
+            args.count_only.unwrap_or(false),
             max_bytes,
         ))
     }
@@ -1061,6 +1067,7 @@ mod tests {
                 file: None,
                 limit: None,
                 offset: None,
+                count_only: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
