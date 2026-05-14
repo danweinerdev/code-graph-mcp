@@ -28,7 +28,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use code_graph_core::{Symbol, SymbolId};
+use code_graph_core::{paths, Symbol, SymbolId};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{EdgeEntry, FileEntry, Graph, Node};
@@ -84,6 +84,149 @@ fn mtime_nanos(path: &Path) -> Option<u64> {
         .ok()
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
+}
+
+/// Simplify the file-path portion of a [`SymbolId`].
+///
+/// A `SymbolId` is `<file>:<name>` for free symbols and `<file>:<parent>::<name>`
+/// for methods (see `code_graph_core::symbol_id`). This helper splits on the
+/// **rightmost `:` that is not part of a `::` token** — the exact same rule
+/// `code_graph_core::id_to_file` uses — applies [`paths::simplify`] to the
+/// file portion, and rejoins with the original name portion.
+///
+/// On an id with no qualifying separator (no `:` at all, or only `::` tokens),
+/// the id is returned unchanged via the fallback branch.
+///
+/// A leading `:` (e.g. `":foo"`) is a special-but-degenerate case: the index-0
+/// colon IS found as a qualifying separator (no left neighbor, no right `:`),
+/// so the split-rejoin branch runs with an empty file portion. `paths::simplify`
+/// on an empty path round-trips to empty, and the rejoin produces the original
+/// id — identity via arithmetic, not via the fallback. Matches `id_to_file`'s
+/// behavior (which returns `""` as the file portion for `":foo"`).
+///
+/// **Contract dependency:** this helper mirrors `code_graph_core::id_to_file`'s
+/// splitting rule. If `symbol_id`/`id_to_file`'s format ever changes (e.g. a
+/// new separator), this helper must be updated in lockstep — the two split
+/// the same way for the same reason.
+fn simplify_symbol_id(id: &str) -> String {
+    let bytes = id.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b':' {
+            let prev_is_colon = i > 0 && bytes[i - 1] == b':';
+            let next_is_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+            if !prev_is_colon && !next_is_colon {
+                // Qualifying separator at byte index `i`. Slice `[..i]` is
+                // the file portion, `[i..]` is the leading `:` plus the
+                // name portion. Splitting at `i` (an ASCII colon) is safe
+                // for UTF-8 — `b':'` is single-byte.
+                let file_part = &id[..i];
+                let name_part = &id[i..];
+                let simplified_file = paths::simplify(Path::new(file_part));
+                let mut out =
+                    String::with_capacity(simplified_file.as_os_str().len() + name_part.len());
+                out.push_str(&simplified_file.to_string_lossy());
+                out.push_str(name_part);
+                return out;
+            }
+        }
+    }
+    // No qualifying separator → leave the id untouched. Mirrors
+    // `id_to_file`'s "returns empty" signal for prefixless/malformed ids;
+    // here we have no `<file>` to rewrite, so the rewrite is the identity.
+    id.to_string()
+}
+
+/// Walk every path-bearing field of `cache` and simplify in place.
+///
+/// Migration target for v2 caches whose path strings still carry the
+/// Windows verbatim-extended prefix (`\\?\`). Phase 1 of the
+/// `PathNormalization` plan switched the indexer to write short-form paths
+/// via `paths::canonicalize`; pre-Phase-1 caches need an in-place rewrite
+/// before they materialize into a [`Graph`], or the resulting graph is
+/// silently inconsistent (e.g. `files` keys stripped while `nodes`
+/// SymbolId keys still prefixed → every file lookup returns empty with no
+/// error).
+///
+/// The 12 path-bearing locations rewritten (see Decision 5 of
+/// `Designs/PathNormalization/README.md`):
+/// 1. `files` map keys
+/// 2. every `FileEntry.symbol_ids` entry (file-portion of the SymbolId)
+/// 3. `nodes` map keys (file-portion of the SymbolId)
+/// 4. every `Symbol.file` string inside a node value
+/// 5. `adj` map keys
+/// 6. every `EdgeEntry.target` inside `adj` (file-portion of the SymbolId)
+/// 7. every `EdgeEntry.file` inside `adj`
+///    8/9/10. the same three fields inside `radj`
+/// 11. `includes` map keys AND every inner `Vec<PathBuf>` entry
+/// 12. `mtimes` map keys
+///
+/// **Idempotency.** [`paths::simplify`] is identity on non-extended paths,
+/// so a second call on the same cache produces byte-identical output. The
+/// rebuild-by-drain pattern is also deterministic in the sense that field
+/// ordering inside `HashMap`s is irrelevant for equality.
+///
+/// Helper is private; the only caller is `Graph::load`.
+fn simplify_cache(cache: &mut GraphCache) {
+    // (1, 2) files map + each FileEntry's symbol_ids.
+    let old_files = std::mem::take(&mut cache.files);
+    cache.files.reserve(old_files.len());
+    for (path, mut entry) in old_files {
+        let new_path = paths::simplify(&path);
+        for sid in &mut entry.symbol_ids {
+            *sid = simplify_symbol_id(sid);
+        }
+        cache.files.insert(new_path, entry);
+    }
+
+    // (3, 4) nodes map keys + each Symbol.file value.
+    let old_nodes = std::mem::take(&mut cache.nodes);
+    cache.nodes.reserve(old_nodes.len());
+    for (id, mut symbol) in old_nodes {
+        let new_id = simplify_symbol_id(&id);
+        symbol.file = paths::simplify(Path::new(&symbol.file))
+            .to_string_lossy()
+            .into_owned();
+        cache.nodes.insert(new_id, symbol);
+    }
+
+    // (5, 6, 7) adj map keys + each EdgeEntry's target SymbolId + file PathBuf.
+    simplify_edge_map(&mut cache.adj);
+    // (8, 9, 10) same three for radj.
+    simplify_edge_map(&mut cache.radj);
+
+    // (11) includes map keys AND each inner Vec<PathBuf> entry.
+    let old_includes = std::mem::take(&mut cache.includes);
+    cache.includes.reserve(old_includes.len());
+    for (path, deps) in old_includes {
+        let new_path = paths::simplify(&path);
+        let new_deps: Vec<PathBuf> = deps.iter().map(|p| paths::simplify(p)).collect();
+        cache.includes.insert(new_path, new_deps);
+    }
+
+    // (12) mtimes map keys.
+    let old_mtimes = std::mem::take(&mut cache.mtimes);
+    cache.mtimes.reserve(old_mtimes.len());
+    for (path, nanos) in old_mtimes {
+        cache.mtimes.insert(paths::simplify(&path), nanos);
+    }
+}
+
+/// Drain-and-rebuild an adjacency map: simplify each SymbolId key, and for
+/// each `EdgeEntry` in the vec simplify both `target` (SymbolId) and `file`
+/// (PathBuf). Shared between `adj` and `radj`.
+fn simplify_edge_map(map: &mut HashMap<SymbolId, Vec<EdgeEntry>>) {
+    let old = std::mem::take(map);
+    map.reserve(old.len());
+    for (id, mut entries) in old {
+        let new_id = simplify_symbol_id(&id);
+        for entry in &mut entries {
+            entry.target = simplify_symbol_id(&entry.target);
+            entry.file = paths::simplify(&entry.file);
+        }
+        map.insert(new_id, entries);
+    }
 }
 
 impl Graph {
@@ -175,12 +318,19 @@ impl Graph {
             Err(e) => return Err(PersistError::Io(e)),
         };
 
-        let cache: GraphCache = serde_json::from_slice(&data)?;
+        let mut cache: GraphCache = serde_json::from_slice(&data)?;
         if cache.version != CACHE_VERSION {
             // v1 (Go-written) or future version: silent re-index. Graph
             // state is left untouched on this branch.
             return Ok(false);
         }
+
+        // Migrate path-bearing fields in place. On already-clean caches
+        // this is a no-op (per `paths::simplify`'s identity behavior on
+        // non-extended paths). Pre-Phase-1 caches written with Windows
+        // verbatim-extended (`\\?\`) prefixes get rewritten to short-form
+        // here, before the cache is consumed into the in-memory graph.
+        simplify_cache(&mut cache);
 
         self.nodes = cache
             .nodes
@@ -216,6 +366,24 @@ pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
     };
     let cache: GraphCache = serde_json::from_slice(&data)?;
 
+    // Intentionally does NOT call `simplify_cache` (see PathNormalization
+    // design Decision 5). `stale_paths` only consumes `cache.mtimes` for the
+    // `mtime_nanos` stat-and-compare loop below; rewriting the keys would
+    // both waste work (9 of 10 cache fields are dropped here) and risk
+    // reformatting paths that `mtime_nanos` needs in their on-disk form
+    // (paths > 260 chars on Windows may require the extended-path prefix).
+    //
+    // Windows pre-Phase-1 cache migration story: a cache written before
+    // `paths::canonicalize` (with `\\?\`-prefixed `mtimes` keys) flows
+    // through `stale_paths` unchanged. The `mtime_nanos` call either
+    // succeeds (because Windows accepts both forms for stat) and the cache
+    // fast-path proceeds normally — then `Graph::load` runs and applies
+    // `simplify_cache` so the in-memory graph is consistent. Or
+    // `mtime_nanos` returns `None` for every file, all are reported stale,
+    // and `analyze_codebase` falls through to a full re-index (which uses
+    // `paths::canonicalize` to write clean keys going forward). Either
+    // outcome is correct; the forced re-index is graceful degradation, not
+    // a regression.
     let mut stale = Vec::new();
     for (path, cached_nanos) in &cache.mtimes {
         match mtime_nanos(path) {
@@ -534,6 +702,394 @@ mod tests {
         assert_eq!(entry.symbol_ids, vec!["/a.py:snake_case_fn".to_string()]);
     }
 
+    // -------------------------------------------------------------------
+    // Phase 2.1: simplify_cache / simplify_symbol_id unit tests.
+    //
+    // Platform note: `paths::simplify` is identity on non-Windows targets
+    // (per `dunce::simplified`'s documented behavior). The "strips the
+    // `\\?\` prefix" assertion is therefore only verifiable on Windows —
+    // covered by the `#[cfg(windows)]` test in `code_graph_core::paths`.
+    //
+    // What the tests below verify on Linux (and Windows):
+    // - `simplify_symbol_id` splits on the rightmost `:` not part of `::`
+    //   (mirrors `id_to_file`'s contract), invokes `paths::simplify` on the
+    //   file portion, and rejoins. On Linux this is observable as a
+    //   round-trip identity on clean inputs; the structural correctness of
+    //   the split/rejoin is the load-bearing assertion.
+    // - `simplify_cache` performs a drain-and-rebuild over every map and
+    //   leaves a clean cache byte-equal (idempotency).
+    //
+    // The actual strip is verified end-to-end on Windows; here we test the
+    // **shape** of the rewrite, which is what regresses if a future change
+    // forgets a field.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn simplify_symbol_id_basic() {
+        // Free-function id: rightmost qualifying colon is the single
+        // separator between file portion and name. On Linux the file
+        // portion is identity through `paths::simplify`, so the input
+        // round-trips. The test pins the structural rule: split on `:`,
+        // simplify file portion, rejoin.
+        let id = "/a/b.rs:Foo";
+        assert_eq!(simplify_symbol_id(id), "/a/b.rs:Foo");
+    }
+
+    #[test]
+    fn simplify_symbol_id_with_method_separator() {
+        // Method id format: "file:Parent::name". The `::` between Parent
+        // and name must NOT be split — only the single colon to the LEFT
+        // of `Parent::name` qualifies. On Linux the file portion is
+        // identity, so the input round-trips; the assertion pins that the
+        // helper did not split at one of the `::` colons.
+        let id = "/a/b.rs:Foo::bar";
+        assert_eq!(simplify_symbol_id(id), "/a/b.rs:Foo::bar");
+    }
+
+    #[test]
+    fn simplify_symbol_id_relative_path_round_trips() {
+        // Relative Unix-style id (no leading `/`) — pins that the helper
+        // doesn't require an absolute path. `paths::simplify` is identity
+        // on relative inputs, so the input round-trips. Distinct coverage
+        // from `_basic` (absolute) and `_with_method_separator` (`::`).
+        let id = "sub/dir/file.rs:helper";
+        assert_eq!(simplify_symbol_id(id), id);
+    }
+
+    #[test]
+    fn simplify_symbol_id_malformed_no_separator_is_identity() {
+        // No `:` at all — `id_to_file` returns `""` for this shape and we
+        // have no file portion to rewrite; documented behavior is to leave
+        // the id untouched.
+        assert_eq!(simplify_symbol_id("noseparator"), "noseparator");
+    }
+
+    #[test]
+    fn simplify_symbol_id_leading_colon_is_identity() {
+        // Leading `:` qualifies as a separator per `id_to_file`'s contract
+        // (no left neighbor, non-colon right neighbor). The file portion is
+        // an empty string; `paths::simplify(Path::new(""))` yields `""` and
+        // the rejoin reproduces the original id. We assert the
+        // user-visible identity rather than the internal path-through.
+        assert_eq!(simplify_symbol_id(":foo"), ":foo");
+    }
+
+    #[test]
+    fn simplify_symbol_id_unix_filename_with_colon() {
+        // Filename containing `:` (legal on Unix). The rightmost
+        // qualifying colon is the separator between `bar.rs` and `func`;
+        // the `:` inside the filename must be preserved in the file
+        // portion.
+        assert_eq!(
+            simplify_symbol_id("/project/foo:bar.rs:func"),
+            "/project/foo:bar.rs:func"
+        );
+    }
+
+    #[test]
+    fn simplify_symbol_id_windows_drive_letter_path() {
+        // Windows-style id with a drive-letter colon at index 1. The
+        // rightmost qualifying colon (the one between `b.cs` and `Baz`) is
+        // found first by the right-to-left scan; the drive colon is never
+        // visited as a separator candidate. This pins the disambiguation
+        // contract — a future algorithm change that incorrectly identifies
+        // the drive colon as the separator would corrupt every Windows
+        // symbol's id during cache migration.
+        //
+        // On Linux `paths::simplify` is identity, so the assertion is
+        // structural (split + rejoin produces the input). On Windows the
+        // bare-drive-letter form `C:\...` is also short-form, so
+        // `paths::simplify` is also identity — the structural correctness
+        // is what matters; this is NOT a Windows-only test.
+        assert_eq!(
+            simplify_symbol_id(r"C:\a\b.cs:Baz::qux"),
+            r"C:\a\b.cs:Baz::qux"
+        );
+    }
+
+    #[test]
+    fn simplify_symbol_id_only_double_colons_is_identity() {
+        // Pathological input: every `:` is part of a `::` pair, so no
+        // qualifying separator is found and the fallback returns the input
+        // unchanged. Mirrors `id_to_file`'s `only_double_colons` boundary
+        // case (see `code_graph_core::id_to_file` tests).
+        assert_eq!(simplify_symbol_id("::"), "::");
+        assert_eq!(simplify_symbol_id("foo::bar"), "foo::bar");
+    }
+
+    /// Build a `GraphCache` exercising every path-bearing field, using the
+    /// supplied `file_path` string as the planted file path everywhere a
+    /// path appears. Returns the cache plus the SymbolId strings that
+    /// were planted (for use in cross-field consistency assertions).
+    ///
+    /// Two symbols are planted: a free function and a method on a class
+    /// (so the method's SymbolId carries `::`, exercising the
+    /// `simplify_symbol_id` split rule).
+    fn build_cache_with_path(file_path: &str) -> GraphCache {
+        let path_buf = PathBuf::from(file_path);
+        let dep_path_buf = PathBuf::from(format!("{file_path}.dep"));
+        let other_path_buf = PathBuf::from(format!("{file_path}.other"));
+
+        let free_id: SymbolId = format!("{file_path}:Foo");
+        let method_id: SymbolId = format!("{file_path}:Bar::baz");
+        let target_id: SymbolId = format!("{file_path}:Quux");
+
+        let free_symbol = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Function,
+            file: file_path.to_string(),
+            line: 1,
+            column: 0,
+            end_line: 3,
+            signature: "fn Foo()".to_string(),
+            namespace: String::new(),
+            parent: String::new(),
+            language: Language::Rust,
+        };
+        let method_symbol = Symbol {
+            name: "baz".to_string(),
+            kind: SymbolKind::Method,
+            file: file_path.to_string(),
+            line: 5,
+            column: 0,
+            end_line: 7,
+            signature: "fn baz()".to_string(),
+            namespace: String::new(),
+            parent: "Bar".to_string(),
+            language: Language::Rust,
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(free_id.clone(), free_symbol);
+        nodes.insert(method_id.clone(), method_symbol);
+
+        let edge_entry = EdgeEntry {
+            target: target_id.clone(),
+            kind: EdgeKind::Calls,
+            file: path_buf.clone(),
+            line: 2,
+        };
+        let mut adj = HashMap::new();
+        adj.insert(free_id.clone(), vec![edge_entry.clone()]);
+        let mut radj = HashMap::new();
+        radj.insert(method_id.clone(), vec![edge_entry]);
+
+        let mut files = HashMap::new();
+        files.insert(
+            path_buf.clone(),
+            FileEntry {
+                language: Language::Rust,
+                symbol_ids: vec![free_id, method_id],
+            },
+        );
+
+        let mut includes = HashMap::new();
+        includes.insert(
+            path_buf.clone(),
+            vec![dep_path_buf.clone(), other_path_buf.clone()],
+        );
+
+        let mut mtimes = HashMap::new();
+        mtimes.insert(path_buf, 42);
+        mtimes.insert(dep_path_buf, 7);
+
+        GraphCache {
+            version: CACHE_VERSION,
+            generator: GENERATOR.to_string(),
+            nodes,
+            adj,
+            radj,
+            files,
+            includes,
+            mtimes,
+        }
+    }
+
+    #[test]
+    fn simplify_cache_strips_all_fields() {
+        // On Linux, `paths::simplify` is identity, so this test verifies
+        // the **structural** drain-and-rebuild over every field: a clean
+        // input produces a byte-equal clean output (one assertion below
+        // covers this via idempotency), AND every individual location
+        // round-trips through the rewrite without dropping data or
+        // corrupting shape. On Windows the same drain-and-rebuild path
+        // would additionally strip `\\?\` prefixes; the Windows-specific
+        // strip is pinned by the `#[cfg(windows)]` tests in
+        // `code_graph_core::paths`.
+        //
+        // We use a path that, on Windows, `paths::simplify` would
+        // transform (the verbatim disk form), and check **structurally**
+        // that every field's contents are equal to `paths::simplify`
+        // applied to the original — so the test asserts the right thing
+        // regardless of platform identity-vs-strip behavior.
+        let planted = r"\\?\D:\proj\file.h";
+        let mut cache = build_cache_with_path(planted);
+
+        simplify_cache(&mut cache);
+
+        let expected_path = paths::simplify(Path::new(planted));
+        let expected_path_str = expected_path.to_string_lossy().into_owned();
+        let expected_free_id = format!("{expected_path_str}:Foo");
+        let expected_method_id = format!("{expected_path_str}:Bar::baz");
+        let expected_target_id = format!("{expected_path_str}:Quux");
+        let expected_dep = paths::simplify(Path::new(&format!("{planted}.dep")));
+        let expected_other = paths::simplify(Path::new(&format!("{planted}.other")));
+
+        // (1) files map keys.
+        assert!(
+            cache.files.contains_key(&expected_path),
+            "files key not simplified: keys={:?}",
+            cache.files.keys().collect::<Vec<_>>()
+        );
+        // (2) FileEntry.symbol_ids entries (both free and method form).
+        let entry = cache
+            .files
+            .get(&expected_path)
+            .expect("file entry present after simplify");
+        assert!(
+            entry.symbol_ids.contains(&expected_free_id),
+            "FileEntry.symbol_ids missing simplified free id: {:?}",
+            entry.symbol_ids
+        );
+        assert!(
+            entry.symbol_ids.contains(&expected_method_id),
+            "FileEntry.symbol_ids missing simplified method id: {:?}",
+            entry.symbol_ids
+        );
+
+        // (3) nodes map keys.
+        assert!(
+            cache.nodes.contains_key(&expected_free_id),
+            "nodes key (free) not simplified: keys={:?}",
+            cache.nodes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cache.nodes.contains_key(&expected_method_id),
+            "nodes key (method) not simplified: keys={:?}",
+            cache.nodes.keys().collect::<Vec<_>>()
+        );
+        // (4) Symbol.file values on each node.
+        let free_symbol = cache.nodes.get(&expected_free_id).unwrap();
+        assert_eq!(
+            free_symbol.file, expected_path_str,
+            "Symbol.file (free) not simplified"
+        );
+        let method_symbol = cache.nodes.get(&expected_method_id).unwrap();
+        assert_eq!(
+            method_symbol.file, expected_path_str,
+            "Symbol.file (method) not simplified"
+        );
+
+        // (5) adj map keys.
+        assert!(
+            cache.adj.contains_key(&expected_free_id),
+            "adj key not simplified: keys={:?}",
+            cache.adj.keys().collect::<Vec<_>>()
+        );
+        let adj_entries = cache.adj.get(&expected_free_id).unwrap();
+        assert_eq!(adj_entries.len(), 1, "adj vec length preserved");
+        // (6) EdgeEntry.target SymbolId.
+        assert_eq!(
+            adj_entries[0].target, expected_target_id,
+            "adj EdgeEntry.target not simplified"
+        );
+        // (7) EdgeEntry.file PathBuf.
+        assert_eq!(
+            adj_entries[0].file, expected_path,
+            "adj EdgeEntry.file not simplified"
+        );
+
+        // (8) radj map keys.
+        assert!(
+            cache.radj.contains_key(&expected_method_id),
+            "radj key not simplified: keys={:?}",
+            cache.radj.keys().collect::<Vec<_>>()
+        );
+        let radj_entries = cache.radj.get(&expected_method_id).unwrap();
+        // (9) EdgeEntry.target inside radj.
+        assert_eq!(
+            radj_entries[0].target, expected_target_id,
+            "radj EdgeEntry.target not simplified"
+        );
+        // (10) EdgeEntry.file inside radj.
+        assert_eq!(
+            radj_entries[0].file, expected_path,
+            "radj EdgeEntry.file not simplified"
+        );
+
+        // (11) includes map keys AND inner Vec<PathBuf> entries.
+        assert!(
+            cache.includes.contains_key(&expected_path),
+            "includes key not simplified: keys={:?}",
+            cache.includes.keys().collect::<Vec<_>>()
+        );
+        let inner = cache.includes.get(&expected_path).unwrap();
+        assert!(
+            inner.contains(&expected_dep),
+            "includes inner Vec missing simplified dep: {inner:?}"
+        );
+        assert!(
+            inner.contains(&expected_other),
+            "includes inner Vec missing simplified other: {inner:?}"
+        );
+
+        // (12) mtimes map keys.
+        assert!(
+            cache.mtimes.contains_key(&expected_path),
+            "mtimes key not simplified: keys={:?}",
+            cache.mtimes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cache.mtimes.contains_key(&expected_dep),
+            "mtimes second key not simplified: keys={:?}",
+            cache.mtimes.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn simplify_cache_idempotent_on_clean_input() {
+        // Build a cache whose paths are already "clean" (no extended
+        // prefix). `simplify_cache` must produce a by-value-equal cache:
+        // every map key and value identical, every Vec ordered the same.
+        //
+        // Reserialize-and-compare via JSON is the strongest byte-identity
+        // check available: HashMap iteration order is non-deterministic
+        // for serde_json's default object output, but `BTreeMap`-free
+        // serde of `HashMap` still produces a JSON object whose KEYS are
+        // unordered yet whose VALUES round-trip identically. We compare
+        // by value-equality on the cache fields directly — which catches
+        // any rewrite that drops or duplicates an entry — and separately
+        // assert the JSON deserializes back to the same in-memory shape.
+        let before = build_cache_with_path("/a/b.rs");
+
+        // Clone via JSON round-trip to get an independent before-state we
+        // can compare against (the cache fields don't implement Clone
+        // directly but the serde derive gives us this for free).
+        let before_json = serde_json::to_value(&before).unwrap();
+
+        let mut after = build_cache_with_path("/a/b.rs");
+        simplify_cache(&mut after);
+        let after_json = serde_json::to_value(&after).unwrap();
+
+        // Field-by-field value equality. `serde_json::Value` Eq compares
+        // object contents by key, not insertion order — ideal for HashMap
+        // round-trips.
+        assert_eq!(
+            before_json, after_json,
+            "simplify_cache on clean input must produce an equal cache"
+        );
+
+        // Running it a second time on the already-clean output must also
+        // be idempotent — defends against a rewrite that happens to be
+        // idempotent only on the first pass.
+        simplify_cache(&mut after);
+        let after_twice = serde_json::to_value(&after).unwrap();
+        assert_eq!(
+            before_json, after_twice,
+            "simplify_cache must be idempotent under repeated application"
+        );
+    }
+
     #[test]
     fn round_trip_preserves_inherits_edge_kind() {
         // Defends against a future edge-kind serialization regression: an
@@ -556,5 +1112,521 @@ mod tests {
         let edge = &loaded.adj["Derived"][0];
         assert_eq!(edge.target, "Base");
         assert_eq!(edge.kind, EdgeKind::Inherits);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2.3: end-to-end anti-regression test for `Graph::load` wiring.
+    //
+    // The 2.1 unit test `simplify_cache_strips_all_fields` exercises
+    // `simplify_cache` DIRECTLY — i.e., without the disk write or the
+    // `Graph::load` plumbing. This test covers the END-TO-END path:
+    //   (1) build a `GraphCache` with `\\?\D:\proj\…` in every path-bearing
+    //       location,
+    //   (2) write it to a tempdir as cache JSON (skipping `Graph::save`,
+    //       which would simplify-on-the-way-out via the in-memory graph's
+    //       already-clean state),
+    //   (3) call `Graph::load` and assert the loaded graph is well-formed.
+    //
+    // Platform behavior — and the load-bearing caveat for this test:
+    // - On non-Windows (Linux/macOS): `paths::simplify` is identity per
+    //   `dunce::simplified`'s contract. The planted `\\?\` strings flow
+    //   through `simplify_cache` UNCHANGED. **Limitation:** on Linux, this
+    //   test cannot distinguish "`simplify_cache` was called and was a
+    //   no-op" from "`simplify_cache` was never called" — both produce
+    //   identical output. The structural and per-location assertions catch
+    //   regressions that drop, corrupt, or duplicate fields (because those
+    //   change graph shape regardless of strip behavior), but a pure
+    //   deletion of the `simplify_cache(&mut cache)` call from
+    //   `Graph::load` would still pass on Linux. The 2.1 unit test
+    //   (`simplify_cache_strips_all_fields`) is the function-body contract;
+    //   this test is the Graph::load wiring contract — observable only on
+    //   Windows.
+    // - On Windows: `paths::simplify` strips `\\?\`. The test asserts each
+    //   of the 12 planted locations has been stripped, with one assertion
+    //   per location naming the offending field on failure (the explicit
+    //   regression target — partial migration must fail loudly). A
+    //   `#[cfg(windows)]` ground-truth check below also asserts that
+    //   `paths::simplify` actually performed observable work on the test
+    //   fixture; if `paths::simplify` itself regresses to identity, the
+    //   ground-truth check fires before any of the per-location assertions.
+    //
+    // The `mtimes` field is not exposed on `Graph` (it lives only on
+    // `GraphCache`); its rewrite is covered by the 2.1 in-memory unit test
+    // (`simplify_cache_strips_all_fields`). End-to-end coverage of `mtimes`
+    // through `Graph::load` is partial: a `simplify_cache` bug in the
+    // mtimes block that panics or corrupts deserialization would surface
+    // here (because `Graph::load` would fail). A silent correctness bug in
+    // the mtimes block (wrong key written, entry dropped without panic)
+    // would NOT be detected — `mtimes` is never read back from the
+    // resulting `Graph`. Future closing of this gap would require either a
+    // crate-internal `#[cfg(test)]` accessor for `mtimes` or routing
+    // `stale_paths` through the loaded graph state.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cache_migration_strips_all_path_locations_end_to_end() {
+        // Plant `\\?\D:\proj\file.h` in every path-bearing location of a
+        // synthetic `GraphCache`. The string is intentionally a Windows
+        // verbatim-extended path: on Windows `paths::simplify` strips it to
+        // `D:\proj\file.h`; on Linux `paths::simplify` is identity so the
+        // planted string survives. Both outcomes are valid migration output
+        // — the test asserts the platform-appropriate one.
+        let planted = r"\\?\D:\proj\file.h";
+        let cache = build_cache_with_path(planted);
+        // Sanity: the fixture below is what `build_cache_with_path` plants.
+        // Asserting the shape explicitly (rather than re-reading
+        // `cache.nodes.len()` etc.) documents what the test expects to find
+        // post-load and fails loudly if `build_cache_with_path` is later
+        // shrunk in a way that hides a regression.
+        assert_eq!(
+            cache.nodes.len(),
+            2,
+            "fixture invariant: 2 nodes (free fn + method)"
+        );
+        assert_eq!(cache.files.len(), 1, "fixture invariant: 1 file entry");
+        assert_eq!(
+            cache.adj.len(),
+            1,
+            "fixture invariant: 1 adj key (free fn source)"
+        );
+        assert_eq!(
+            cache.radj.len(),
+            1,
+            "fixture invariant: 1 radj key (method target)"
+        );
+        assert_eq!(cache.includes.len(), 1, "fixture invariant: 1 includes key");
+
+        // Write the synthetic cache directly via `serde_json::to_vec` +
+        // `fs::write` — bypassing `Graph::save`, which would serialize the
+        // current in-memory state (empty / already-clean) rather than our
+        // planted dirty cache.
+        let dir = TempDir::new().unwrap();
+        let bytes = serde_json::to_vec(&cache).unwrap();
+        fs::write(cache_path(dir.path()), &bytes).unwrap();
+
+        // Load via the production path. This is the wiring under test:
+        // `Graph::load` must call `simplify_cache` between deserialize and
+        // materialize.
+        let mut graph = Graph::new();
+        let loaded = graph.load(dir.path()).expect("load must not error");
+        assert!(
+            loaded,
+            "Graph::load must return Ok(true) for a v2 cache — \
+             a version-mismatch silent re-index would mean the migration \
+             never ran"
+        );
+
+        // Compute the expected post-migration strings. On Linux these are
+        // byte-identical to the planted strings (identity); on Windows the
+        // `\\?\` prefix has been stripped. We compute them through
+        // `paths::simplify` so the assertions remain correct on both
+        // platforms.
+        let expected_path = paths::simplify(Path::new(planted));
+        let expected_path_str = expected_path.to_string_lossy().into_owned();
+        let expected_free_id: SymbolId = format!("{expected_path_str}:Foo");
+        let expected_method_id: SymbolId = format!("{expected_path_str}:Bar::baz");
+        let expected_target_id: SymbolId = format!("{expected_path_str}:Quux");
+        let expected_dep = paths::simplify(Path::new(&format!("{planted}.dep")));
+        let expected_other = paths::simplify(Path::new(&format!("{planted}.other")));
+
+        // ---------- Structural assertions (cross-platform) ----------
+        //
+        // These prove `Graph::load`'s wiring did NOT drop or corrupt any
+        // field while running `simplify_cache`. They fire on every
+        // platform; a structural regression (e.g. `simplify_cache` dropping
+        // a HashMap entry) fails these regardless of identity-vs-strip
+        // behavior.
+
+        assert_eq!(
+            graph.nodes.len(),
+            2,
+            "loaded graph: 2 nodes (free fn + method)"
+        );
+        assert_eq!(graph.files.len(), 1, "loaded graph: 1 file entry");
+        assert_eq!(graph.adj.len(), 1, "loaded graph: 1 adj key");
+        assert_eq!(graph.radj.len(), 1, "loaded graph: 1 radj key");
+        assert_eq!(graph.includes.len(), 1, "loaded graph: 1 includes key");
+
+        // ---------- Per-location assertions ----------
+        //
+        // Each of the 12 granular path-bearing locations from Task 2.1 is
+        // asserted independently. On Linux these confirm the planted
+        // strings survived `simplify_cache` unchanged; on Windows they
+        // confirm each `\\?\` prefix was stripped. The expected strings
+        // are computed via `paths::simplify` so the same assertion holds
+        // on both platforms.
+        //
+        // Each assertion message names the offending location so a
+        // future partial-migration regression points directly at the field
+        // that was missed.
+
+        // (1) `files` map key.
+        assert!(
+            graph.files.contains_key(expected_path.as_path()),
+            "files map key not migrated: keys={:?}",
+            graph.files.keys().collect::<Vec<_>>()
+        );
+
+        // (2) `FileEntry.symbol_ids` — both free and method form.
+        let file_entry = graph
+            .files
+            .get(expected_path.as_path())
+            .expect("file entry present after load");
+        assert!(
+            file_entry.symbol_ids.contains(&expected_free_id),
+            "FileEntry.symbol_ids missing migrated free id ({expected_free_id:?}): \
+             actual={:?}",
+            file_entry.symbol_ids
+        );
+        assert!(
+            file_entry.symbol_ids.contains(&expected_method_id),
+            "FileEntry.symbol_ids missing migrated method id ({expected_method_id:?}): \
+             actual={:?}",
+            file_entry.symbol_ids
+        );
+
+        // (3) `nodes` map keys — both free and method form.
+        assert!(
+            graph.nodes.contains_key(&expected_free_id),
+            "nodes map missing migrated free key ({expected_free_id:?}): keys={:?}",
+            graph.nodes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            graph.nodes.contains_key(&expected_method_id),
+            "nodes map missing migrated method key ({expected_method_id:?}): keys={:?}",
+            graph.nodes.keys().collect::<Vec<_>>()
+        );
+
+        // (4) `Symbol.file` field on each Node's wrapped Symbol.
+        let free_node = graph.nodes.get(&expected_free_id).unwrap();
+        assert_eq!(
+            free_node.symbol.file, expected_path_str,
+            "Node.symbol.file (free) not migrated"
+        );
+        let method_node = graph.nodes.get(&expected_method_id).unwrap();
+        assert_eq!(
+            method_node.symbol.file, expected_path_str,
+            "Node.symbol.file (method) not migrated"
+        );
+
+        // (5) `adj` map key.
+        assert!(
+            graph.adj.contains_key(&expected_free_id),
+            "adj map missing migrated key ({expected_free_id:?}): keys={:?}",
+            graph.adj.keys().collect::<Vec<_>>()
+        );
+        let adj_entries = graph.adj.get(&expected_free_id).unwrap();
+        assert_eq!(
+            adj_entries.len(),
+            1,
+            "adj vec length preserved through load"
+        );
+
+        // (6) `EdgeEntry.target` in `adj`.
+        assert_eq!(
+            adj_entries[0].target, expected_target_id,
+            "adj EdgeEntry.target not migrated"
+        );
+
+        // (7) `EdgeEntry.file` in `adj`.
+        assert_eq!(
+            adj_entries[0].file, expected_path,
+            "adj EdgeEntry.file not migrated"
+        );
+
+        // (8) `radj` map key.
+        assert!(
+            graph.radj.contains_key(&expected_method_id),
+            "radj map missing migrated key ({expected_method_id:?}): keys={:?}",
+            graph.radj.keys().collect::<Vec<_>>()
+        );
+        let radj_entries = graph.radj.get(&expected_method_id).unwrap();
+        assert_eq!(
+            radj_entries.len(),
+            1,
+            "radj vec length preserved through load"
+        );
+
+        // (9) `EdgeEntry.target` in `radj`.
+        assert_eq!(
+            radj_entries[0].target, expected_target_id,
+            "radj EdgeEntry.target not migrated"
+        );
+
+        // (10) `EdgeEntry.file` in `radj`.
+        assert_eq!(
+            radj_entries[0].file, expected_path,
+            "radj EdgeEntry.file not migrated"
+        );
+
+        // (11a) `includes` map key.
+        assert!(
+            graph.includes.contains_key(expected_path.as_path()),
+            "includes map missing migrated key ({expected_path:?}): keys={:?}",
+            graph.includes.keys().collect::<Vec<_>>()
+        );
+        let includes_inner = graph.includes.get(expected_path.as_path()).unwrap();
+        assert_eq!(
+            includes_inner.len(),
+            2,
+            "includes inner Vec: 2 deps (.dep + .other)"
+        );
+
+        // (11b) inner `Vec<PathBuf>` entries in `includes`.
+        assert!(
+            includes_inner.contains(&expected_dep),
+            "includes inner Vec missing migrated dep ({expected_dep:?}): actual={includes_inner:?}"
+        );
+        assert!(
+            includes_inner.contains(&expected_other),
+            "includes inner Vec missing migrated other ({expected_other:?}): \
+             actual={includes_inner:?}"
+        );
+
+        // (12) `mtimes` rewrite is not directly observable here: `Graph`
+        // exposes no `mtimes` accessor, so this test cannot assert the
+        // migrated `mtimes` keys. A `simplify_cache` bug that panics or
+        // breaks deserialization in the mtimes block WOULD surface here
+        // (the `Graph::load` call above would fail), but a silent
+        // correctness bug (wrong key, dropped entry) would NOT. The 2.1
+        // unit test (`simplify_cache_strips_all_fields`) is the authoritative
+        // contract for the `mtimes` rewrite shape.
+
+        // ---------- Windows-only strip assertions ----------
+        //
+        // Ground-truth check FIRST: if `paths::simplify` itself regresses
+        // to identity on Windows, every per-location assertion above would
+        // still trivially pass (expected == planted on both sides). Pin
+        // the substantive behavior here so a `dunce` swap or signature
+        // change surfaces before the per-location checks.
+        //
+        // The sweep block after the ground-truth check is belt-and-
+        // suspenders for future fixture growth: with the current 1-entry
+        // map fixtures it is fully redundant with the per-location
+        // assertions above. If a future contributor adds more entries to
+        // `build_cache_with_path` without adding matching per-location
+        // assertions, the sweep catches a partial-migration regression
+        // that the per-location coverage would miss.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                expected_path_str, r"D:\proj\file.h",
+                "ground truth: paths::simplify must strip \\?\\ on Windows. \
+                 If this fails, the per-location assertions below are vacuous \
+                 (expected == planted) and the test no longer protects the \
+                 migration contract."
+            );
+            let prefix = r"\\?\";
+            for key in graph.files.keys() {
+                assert!(
+                    !key.to_string_lossy().contains(prefix),
+                    "files map key still contains verbatim prefix: {key:?}"
+                );
+            }
+            for entry in graph.files.values() {
+                for sid in &entry.symbol_ids {
+                    assert!(
+                        !sid.contains(prefix),
+                        "FileEntry.symbol_ids entry still contains verbatim prefix: {sid:?}"
+                    );
+                }
+            }
+            for key in graph.nodes.keys() {
+                assert!(
+                    !key.contains(prefix),
+                    "nodes map key still contains verbatim prefix: {key:?}"
+                );
+            }
+            for node in graph.nodes.values() {
+                assert!(
+                    !node.symbol.file.contains(prefix),
+                    "Symbol.file still contains verbatim prefix: {:?}",
+                    node.symbol.file
+                );
+            }
+            for (key, entries) in &graph.adj {
+                assert!(
+                    !key.contains(prefix),
+                    "adj map key still contains verbatim prefix: {key:?}"
+                );
+                for entry in entries {
+                    assert!(
+                        !entry.target.contains(prefix),
+                        "adj EdgeEntry.target still contains verbatim prefix: {:?}",
+                        entry.target
+                    );
+                    assert!(
+                        !entry.file.to_string_lossy().contains(prefix),
+                        "adj EdgeEntry.file still contains verbatim prefix: {:?}",
+                        entry.file
+                    );
+                }
+            }
+            for (key, entries) in &graph.radj {
+                assert!(
+                    !key.contains(prefix),
+                    "radj map key still contains verbatim prefix: {key:?}"
+                );
+                for entry in entries {
+                    assert!(
+                        !entry.target.contains(prefix),
+                        "radj EdgeEntry.target still contains verbatim prefix: {:?}",
+                        entry.target
+                    );
+                    assert!(
+                        !entry.file.to_string_lossy().contains(prefix),
+                        "radj EdgeEntry.file still contains verbatim prefix: {:?}",
+                        entry.file
+                    );
+                }
+            }
+            for (key, deps) in &graph.includes {
+                assert!(
+                    !key.to_string_lossy().contains(prefix),
+                    "includes map key still contains verbatim prefix: {key:?}"
+                );
+                for dep in deps {
+                    assert!(
+                        !dep.to_string_lossy().contains(prefix),
+                        "includes inner Vec entry still contains verbatim prefix: {dep:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2.4: end-to-end cross-field consistency test for `Graph::load`.
+    //
+    // The 2.3 test (`cache_migration_strips_all_path_locations_end_to_end`)
+    // verifies each path-bearing field is migrated in isolation. This test
+    // is the **user-experience** check: does a real lookup against a
+    // migrated cache return the expected symbols?
+    //
+    // The lookup path inside `Graph::file_symbols` (crates/code-graph-graph/
+    // src/queries.rs:150) is:
+    //
+    //   self.files[<path>].symbol_ids  →  self.nodes[<id>]  →  Symbol
+    //
+    // If 2.1 missed simplifying ANY of these — say, `nodes` map keys remain
+    // prefixed while `files` keys are stripped — then `file_symbols` returns
+    // an empty `Vec` for a short-form lookup, EVEN THOUGH 2.3's per-location
+    // assertions might still pass for each field viewed independently. That
+    // is the failure mode this test pins.
+    //
+    // Platform behavior:
+    // - On Linux: `paths::simplify` is identity. The planted `\\?\`-prefixed
+    //   strings flow through `Graph::load` unchanged, and the lookup must
+    //   use the same planted string (re-simplified to itself) as the key.
+    //   The test still validates cross-field alignment: if the migration
+    //   internally rewrote one field but not another, the lookup would
+    //   return empty even on Linux.
+    // - On Windows: `paths::simplify` strips `\\?\`. The lookup key is
+    //   `D:\proj\file.h`; the migrated cache's `files` key, `nodes` SymbolId
+    //   prefix, and `Symbol.file` value all equal `D:\proj\file.h`. The test
+    //   validates both strip correctness AND cross-field alignment.
+    //
+    // We use `paths::simplify(Path::new(planted))` to compute the lookup key
+    // — NOT a hardcoded `D:\proj\file.h` — so the test is meaningful on
+    // both platforms.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cache_migration_preserves_cross_field_consistency() {
+        // Plant `\\?\D:\proj\file.h` in every path-bearing location. After
+        // `Graph::load` (which runs `simplify_cache`), every reference to
+        // this path across all fields must agree on its post-migration form
+        // — otherwise the lookup chain through `file_symbols` breaks.
+        let planted = r"\\?\D:\proj\file.h";
+        let cache = build_cache_with_path(planted);
+
+        // Write the synthetic cache directly via `serde_json::to_vec` +
+        // `fs::write` (same idiom as 2.3) — bypassing `Graph::save`, which
+        // would serialize the current in-memory state rather than our
+        // planted dirty cache.
+        let dir = TempDir::new().unwrap();
+        let bytes = serde_json::to_vec(&cache).unwrap();
+        fs::write(cache_path(dir.path()), &bytes).unwrap();
+
+        let mut graph = Graph::new();
+        let loaded = graph.load(dir.path()).expect("load must not error");
+        assert!(
+            loaded,
+            "Graph::load must return Ok(true) for a v2 cache — \
+             a silent re-index would mean the migration never ran"
+        );
+
+        // Compute the expected post-migration path. On Linux this is
+        // identity (the planted `\\?\…` survives); on Windows the `\\?\`
+        // prefix is stripped to `D:\proj\file.h`. The test uses this
+        // platform-conditional expected path as the lookup key, NOT a
+        // hardcoded `D:\proj\file.h` (which would only work on Windows).
+        // This is the cross-FIELD consistency check — what matters is that
+        // the graph internally aligns its keys after migration, which is
+        // observable on both platforms via the lookup-then-assert chain.
+        let lookup_path = paths::simplify(Path::new(planted));
+        let expected_path_str = lookup_path.to_string_lossy().into_owned();
+
+        // Ground-truth check on Windows: if `paths::simplify` regresses to
+        // identity, the per-platform branch above silently makes this test
+        // vacuous (lookup_path == planted on both sides). The assert pins
+        // the substantive Windows behavior so a `dunce` swap or signature
+        // change surfaces before the cross-field assertions below.
+        #[cfg(windows)]
+        assert_eq!(
+            expected_path_str, r"D:\proj\file.h",
+            "ground truth: paths::simplify must strip \\?\\ on Windows. \
+             If this fails, the lookup below is checking that the GRAPH \
+             still contains the planted dirty path — a vacuous pass."
+        );
+
+        // The headline assertion: a `file_symbols` lookup against the
+        // migrated cache returns a non-empty result for the expected
+        // post-migration path. If any link in the
+        // `files → symbol_ids → nodes` chain was missed by `simplify_cache`,
+        // this returns an empty Vec.
+        let symbols = graph.file_symbols(lookup_path.as_path());
+        assert!(
+            !symbols.is_empty(),
+            "file_symbols({lookup_path:?}) returned empty — \
+             cross-field key alignment broken. files keys, FileEntry.symbol_ids, \
+             nodes keys, and Symbol.file must all agree on the migrated path. \
+             graph.files keys: {:?}; graph.nodes keys: {:?}",
+            graph.files.keys().collect::<Vec<_>>(),
+            graph.nodes.keys().collect::<Vec<_>>()
+        );
+
+        // Find the planted `Foo` symbol in the result. Both planted nodes
+        // (`Foo` free fn + `Bar::baz` method) live in the same file, so
+        // `file_symbols` returns both; we assert the headline `Foo` symbol
+        // is present and has a fully-migrated `file` field.
+        let foo = symbols.iter().find(|s| s.name == "Foo").unwrap_or_else(|| {
+            panic!(
+                "file_symbols returned a non-empty Vec but no Symbol named 'Foo'. \
+                     names={:?}",
+                symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            foo.file, expected_path_str,
+            "Symbol.file must equal the migrated path (no \\\\?\\ prefix on Windows); \
+             a mismatch here means `simplify_cache` rewrote a key but not the value, \
+             which would break any caller that compares `Symbol.file` against a \
+             short-form path elsewhere in the system"
+        );
+
+        // Belt-and-suspenders: also verify the method symbol survives the
+        // same lookup. If `simplify_symbol_id` mishandled the `::` rule, the
+        // method's SymbolId could have been rewritten differently than its
+        // `FileEntry.symbol_ids` entry, dropping it from `file_symbols`
+        // output even though the file-level lookup itself succeeded.
+        let baz = symbols
+            .iter()
+            .find(|s| s.name == "baz")
+            .expect("method symbol 'baz' must survive file_symbols lookup");
+        assert_eq!(
+            baz.file, expected_path_str,
+            "method Symbol.file must equal the migrated path"
+        );
     }
 }

@@ -18,7 +18,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use code_graph_core::{ConfigError, RootConfig};
+use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::{stale_paths, Graph};
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::RoleServer;
@@ -58,7 +58,7 @@ pub async fn analyze_codebase(
         return tool_error("'path' is required");
     }
 
-    let abs_path = match std::fs::canonicalize(&path_raw) {
+    let abs_path = match paths::canonicalize(std::path::Path::new(&path_raw)) {
         Ok(p) => p,
         Err(_) => {
             return tool_error(format!("directory does not exist: {path_raw}"));
@@ -67,7 +67,7 @@ pub async fn analyze_codebase(
     if !abs_path.is_dir() {
         // We deliberately distinguish "path doesn't resolve" from "path resolves
         // to a file, not a directory" — the Go binary collapses both into a single
-        // "directory does not exist" message, but Rust's `std::fs::canonicalize`
+        // "directory does not exist" message, but Rust's `paths::canonicalize`
         // already gave us the richer information and discarding it just for Go
         // byte-identity would make the error less helpful for no real benefit.
         // Phase 3.7 snapshots will lock in the Rust-specific wording.

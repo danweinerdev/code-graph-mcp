@@ -13,6 +13,7 @@
 //! a silent re-index rather than being parsed.
 
 mod config;
+pub mod paths;
 
 pub use config::{
     ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, RootConfig,

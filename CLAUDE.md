@@ -43,12 +43,20 @@ Cross-language collisions (e.g. `init` in 5 languages) isolated via `(Language, 
 
 - **Tool handler return type:** `Result<CallToolResult, McpError>`. User-visible errors travel as `CallToolResult` with error flag, NOT as `Err`.
 - **State guard:** query handlers must call `ServerInner::require_indexed()` first.
-- **Paths:** all stored file paths are absolute.
+- **Paths:** all stored file paths are absolute and `\\?\`-prefix-stripped via [`dunce`](https://crates.io/crates/dunce) at index time (`code_graph_core::paths::canonicalize`); incoming file-path args on `get_file_symbols`, `get_coupling`, `get_dependencies`, and `generate_diagram(file=…)` are normalized through `code_graph_core::paths::normalize_user_path` before lookup. `dunce::simplified` strips only `VerbatimDisk` prefixes — `VerbatimUNC` paths (`\\?\UNC\server\share\…`) pass through unchanged; this is dunce's documented behavior and is the form symbol IDs carry for network-share-hosted code.
 - **Symbol ID format:** `file:name` (free function) or `file:Parent::name` (method). Records returned by paginated tools no longer include a separate `file` field; clients recover it via the documented id-to-file split (rsplit on the rightmost `:` not part of `::`).
 - **Enums:** `SymbolKind`, `EdgeKind` derive Serde, serialize as readable JSON strings (`"function"`, `"calls"`).
 - **`LanguagePlugin` trait:** `extensions()`, `parse_file(path, content)`, `preprocess(content, cfg)`, `resolve_edges(symbols, file_graph, registry)`. `preprocess` defaults to `Cow::Borrowed(content)`; override only for byte-level rewrites (e.g. C++ `[cpp].macro_strip`).
 - **Logging:** workspace deliberately has NO `tracing` dep. `eprintln!` is the channel for out-of-handler warnings (canonical example: `crates/code-graph-tools/src/handlers/watch.rs`). If a task says "use `tracing::warn!`", check `Cargo.toml`; flag the deviation, do NOT silently add the dep.
 - **Snapshot tests:** `insta`. Snapshots at `crates/code-graph-tools/tests/snapshots/`.
+
+## Known cross-cutting limitations
+
+Per-language parser limitations live in the per-language sections below. The items here cut across crates and warrant top-level visibility.
+
+- **Watch-mode path re-contamination on Windows.** `notify-debouncer-full` may deliver `\\?\`-prefixed event paths during reindex (`crates/code-graph-tools/src/handlers/watch.rs`), re-contaminating a graph that was clean post-`PathNormalization`. Filed as a deferred follow-up plan; see `Designs/PathNormalization/README.md` Non-Goals. The fix would route watch event paths through `paths::simplify` (or, better, `paths::canonicalize`) before merging the reindexed `FileGraph`. Until that lands, a Windows user running watch mode against a UE-style codebase may see `\\?\` strings creep back into symbol IDs after the first watched file modification, defeating the index-time canonicalization done by `analyze_codebase`.
+- **Verbatim UNC paths pass through unchanged.** `dunce::simplified` only strips `VerbatimDisk` prefixes; `VerbatimUNC` paths (`\\?\UNC\server\share\…`) survive verbatim by design. For UE-style codebases on local `D:` drives (the primary dogfood scenario) this is invisible. For network-share-hosted code on Windows, symbol IDs and stored paths will carry the extended-UNC form. No fix is in scope; documented so future readers don't mistake the behavior for a regression.
+- **Linux CI cannot exercise the `\\?\` strip.** Path normalization is a Windows-only behavior; `dunce::simplified` is documented identity on non-Windows. The repo's load-bearing strip-correctness checks live in `#[cfg(windows)]`-gated unit tests in `crates/code-graph-core/src/paths.rs` and in `#[cfg(windows)]` ground-truth assertions inside `crates/code-graph-graph/src/persist.rs::tests`. The dotty-path test in `crates/code-graph-tools/tests/path_normalization.rs::four_file_taking_tools_resolve_dot_segment_paths` is the strongest cross-platform regression target — it would fail on Linux if any handler's `normalize_user_path` wrap were removed.
 
 ## MCP tools (15)
 
@@ -139,6 +147,7 @@ java = []
 - Adding extensions: new files brought in by `[extensions].<lang>` parse normally on next run.
 - Watch path consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
 - `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (the TOML file is NOT re-read per query). To apply a changed value, re-run `analyze_codebase` — **no `force=true` required**, because no mtime-based cache entries are affected; the value only shapes response output.
+- **Path-string migration on load.** JSON caches written before the `PathNormalization` plan (containing `\\?\D:\…` extended-path strings throughout `nodes`/`adj`/`radj`/`files`/`includes`/`mtimes`) auto-migrate during `Graph::load` via `paths::simplify` (see `crates/code-graph-graph/src/persist.rs::simplify_cache`). **No `force=true` required** — the migration runs unconditionally on every load and is a no-op on already-clean caches. `stale_paths` is deliberately exempt from the migration; see the inline comment at the `stale_paths` deserialization site for the rationale.
 
 ## Per-language parser facts
 

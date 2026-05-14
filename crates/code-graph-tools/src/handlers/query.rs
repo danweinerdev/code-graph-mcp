@@ -7,8 +7,7 @@
 //! return `[]` for a known symbol that just has no callers/callees, and
 //! to return a tool error only when the symbol itself isn't in the graph.
 
-use std::path::Path;
-
+use code_graph_core::paths;
 use code_graph_graph::{CallChain, Graph};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
@@ -130,7 +129,14 @@ pub fn get_dependencies(graph: &RwLock<Graph>, file: &str) -> CallToolResult {
         return tool_error("'file' is required");
     }
 
-    let deps = graph.read().file_dependencies(Path::new(file));
+    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
+    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
+    // form when the path exists on disk (resolving `.` / `..` and stripping
+    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
+    // On Linux with an already-canonical path this is effectively identity,
+    // so existing snapshots / tests stay byte-identical.
+    let path = paths::normalize_user_path(file);
+    let deps = graph.read().file_dependencies(&path);
     let strings: Vec<String> = deps
         .into_iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -1260,5 +1266,88 @@ mod tests {
         let strings: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(strings.contains(&"/utils.h"));
         assert!(strings.contains(&"/types.h"));
+    }
+
+    // --- PathNormalization Phase 3.2 --------------------------------------
+
+    #[test]
+    fn dependencies_resolves_dot_segments_to_canonical_lookup() {
+        // PathNormalization Phase 3.2: `get_dependencies` wraps the
+        // user-supplied `file` argument with `paths::normalize_user_path`
+        // before the graph lookup. Mirrors the Phase 3.1 test in `symbols.rs`.
+        // Plant include edges keyed by a real canonical filesystem path,
+        // then query the handler twice — once with the canonical form, once
+        // with a `./sub/../` injected form — and assert both return the same
+        // dependency list.
+        //
+        // The path must exist on disk so the canonicalize branch is exercised
+        // (the lexical-fallback branch on a non-existent path would NOT
+        // resolve dot segments, per `paths.rs` test `(d)`).
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        let file_path = tmp.path().join("a.cpp");
+        std::fs::write(&file_path, "// empty\n").expect("write file");
+
+        // Capture the canonical form the graph will be keyed by. On Linux
+        // this is identity for an already-canonical path; the explicit
+        // canonicalize step keeps the test correct under symlinked tempdirs
+        // (e.g. macOS `/var` -> `/private/var`).
+        let canonical = paths::canonicalize(&file_path).expect("canonicalize file");
+        let canonical_str = canonical
+            .to_str()
+            .expect("canonical path is valid UTF-8 on Linux");
+
+        // Build a graph with two include edges from the canonical path.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: canonical_str.to_string(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: vec![
+                include_edge(canonical_str, "/utils.h"),
+                include_edge(canonical_str, "/types.h"),
+            ],
+        });
+        let g = locked(g);
+
+        // (1) Canonical form — baseline.
+        let r_canonical = get_dependencies(&g, canonical_str);
+        assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
+        let parsed_canonical: serde_json::Value =
+            serde_json::from_str(&body_text(&r_canonical)).unwrap();
+        let arr_canonical = parsed_canonical.as_array().unwrap();
+        assert_eq!(arr_canonical.len(), 2);
+        let strings_canonical: Vec<&str> =
+            arr_canonical.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(strings_canonical.contains(&"/utils.h"));
+        assert!(strings_canonical.contains(&"/types.h"));
+
+        // (2) `./sub/../a.cpp` form — load-bearing.
+        let messy = tmp.path().join(".").join("sub").join("..").join("a.cpp");
+        let messy_str = messy.to_str().expect("messy path is valid UTF-8 on Linux");
+        assert_ne!(
+            messy_str, canonical_str,
+            "messy fixture must differ from canonical for the test to be meaningful"
+        );
+
+        let r_messy = get_dependencies(&g, messy_str);
+        assert!(
+            r_messy.is_error.is_none() || r_messy.is_error == Some(false),
+            "messy form must succeed after normalize: body={}",
+            body_text(&r_messy),
+        );
+        let parsed_messy: serde_json::Value = serde_json::from_str(&body_text(&r_messy)).unwrap();
+        let arr_messy = parsed_messy.as_array().unwrap();
+        assert_eq!(
+            arr_messy.len(),
+            2,
+            "messy form must return the same dep list as canonical",
+        );
+        let mut strings_messy: Vec<&str> = arr_messy.iter().map(|v| v.as_str().unwrap()).collect();
+        let mut strings_canonical_sorted = strings_canonical.clone();
+        strings_messy.sort();
+        strings_canonical_sorted.sort();
+        assert_eq!(strings_messy, strings_canonical_sorted);
     }
 }

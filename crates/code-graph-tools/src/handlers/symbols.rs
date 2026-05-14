@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use code_graph_core::paths;
 use code_graph_graph::{Graph, SearchParams};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
@@ -74,7 +75,15 @@ pub fn get_file_symbols(
         return tool_error("'file' is required");
     }
 
-    let symbols = graph.read().file_symbols(Path::new(file));
+    // PathNormalization Phase 3.1: normalize the user-supplied file argument
+    // before graph lookup. `normalize_user_path` returns the canonical form
+    // when the path exists on disk (resolving `.` / `..` and stripping the
+    // Windows `\\?\` extended-path prefix when the short form is valid) and
+    // falls back to a lexical strip otherwise. On Linux with an already-
+    // canonical path this is effectively identity, so existing call sites
+    // (and snapshot tests) are byte-identical.
+    let path = paths::normalize_user_path(file);
+    let symbols = graph.read().file_symbols(&path);
     // Raw-set-empty -> existing tool error. Wording preserved byte-for-byte
     // so agents that match against this string keep working. This branch
     // executes BEFORE the byte-budget step (PaginationOverhaul Phase 3
@@ -879,6 +888,102 @@ mod tests {
         let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, false, 0);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
+    }
+
+    // --- PathNormalization Phase 3.1 --------------------------------------
+
+    #[test]
+    fn file_symbols_resolves_dot_segments_to_canonical_lookup() {
+        // PathNormalization Phase 3.1: the handler wraps the user-supplied
+        // `file` argument with `paths::normalize_user_path` before the graph
+        // lookup. This test plants a symbol in the graph keyed by a real
+        // canonical filesystem path, then queries the handler twice — once
+        // with the canonical form, once with a `./` + `subdir/..` injected
+        // form that resolves to the same canonical via `dunce::canonicalize`.
+        // Both calls must succeed and return the same record set.
+        //
+        // The path must exist on disk so the canonicalize branch is exercised
+        // (the lexical-fallback branch on a non-existent path would NOT
+        // resolve dot segments, per `paths.rs` test `(d)`).
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        let file_path = tmp.path().join("file.cpp");
+        std::fs::write(&file_path, "// empty\n").expect("write file");
+
+        // Capture the canonical form the graph will be keyed by. On Linux
+        // this is identity for an already-canonical path; the explicit
+        // canonicalize step keeps the test correct under symlinked tempdirs
+        // (e.g. macOS `/var` -> `/private/var`).
+        let canonical = paths::canonicalize(&file_path).expect("canonicalize file");
+        let canonical_str = canonical
+            .to_str()
+            .expect("canonical path is valid UTF-8 on Linux");
+
+        // Build a graph whose Symbol is keyed by the canonical path.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: canonical_str.to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("the_func", SymbolKind::Function, canonical_str, "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+
+        // (1) Canonical form — the baseline. Asserts the fixture is sound
+        // before we exercise the normalize path.
+        let r_canonical = get_file_symbols(
+            &g,
+            canonical_str,
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
+        let (arr_canonical, total_canonical, _, _) = page_parts(&r_canonical);
+        assert_eq!(arr_canonical.len(), 1);
+        assert_eq!(total_canonical, 1);
+
+        // (2) `./sub/../file.cpp` form — the load-bearing assertion. Without
+        // `normalize_user_path`, this string would fail an exact-match graph
+        // lookup against the canonical key and trip the "no symbols found"
+        // error.
+        let messy = tmp.path().join(".").join("sub").join("..").join("file.cpp");
+        let messy_str = messy.to_str().expect("messy path is valid UTF-8 on Linux");
+        // Sanity: the messy form is NOT byte-equal to the canonical form,
+        // so a successful query proves the normalize step did real work.
+        assert_ne!(
+            messy_str, canonical_str,
+            "messy fixture must differ from canonical for the test to be meaningful"
+        );
+
+        let r_messy = get_file_symbols(
+            &g,
+            messy_str,
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
+        assert!(
+            r_messy.is_error.is_none() || r_messy.is_error == Some(false),
+            "messy form must succeed after normalize: body={}",
+            body_text(&r_messy),
+        );
+        let (arr_messy, total_messy, _, _) = page_parts(&r_messy);
+        assert_eq!(
+            arr_messy.len(),
+            1,
+            "messy form must return the same record set"
+        );
+        assert_eq!(total_messy, 1);
+        // Same id round-trips through both forms.
+        assert_eq!(arr_messy[0]["id"], arr_canonical[0]["id"]);
     }
 
     // --- Phase 3 count_only invariants ------------------------------------

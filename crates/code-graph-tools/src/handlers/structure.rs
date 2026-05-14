@@ -8,9 +8,9 @@
 //! readers understand which strings are deliberate.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use code_graph_core::{symbol_id, SymbolKind};
+use code_graph_core::{paths, symbol_id, SymbolKind};
 use code_graph_graph::{DiagramEdge, Graph, HierarchyNode};
 use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, Content};
@@ -317,14 +317,20 @@ pub fn get_coupling(graph: &RwLock<Graph>, file: &str, direction: Option<&str>) 
         direction
     };
 
-    let path = Path::new(file);
+    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
+    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
+    // form when the path exists on disk (resolving `.` / `..` and stripping
+    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
+    // On Linux with an already-canonical path this is effectively identity,
+    // so existing snapshots stay byte-identical.
+    let path = paths::normalize_user_path(file);
     let counts: HashMap<PathBuf, u32> = match direction {
-        "outgoing" => graph.read().coupling(path),
-        "incoming" => graph.read().incoming_coupling(path),
+        "outgoing" => graph.read().coupling(&path),
+        "incoming" => graph.read().incoming_coupling(&path),
         "both" => {
             let g = graph.read();
-            let outgoing = g.coupling(path);
-            let incoming = g.incoming_coupling(path);
+            let outgoing = g.coupling(&path);
+            let incoming = g.incoming_coupling(&path);
             drop(g);
             let mut merged: HashMap<PathBuf, u32> =
                 HashMap::with_capacity(outgoing.len() + incoming.len());
@@ -420,7 +426,11 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
     let dr_opt = if let Some(id) = symbol {
         g.diagram_call_graph(id, depth, max_nodes)
     } else if let Some(path) = file {
-        g.diagram_file_graph(Path::new(path), depth, max_nodes)
+        // PathNormalization Phase 3.2: same normalize wrap as `get_coupling`
+        // and `get_file_symbols`. Only the file-mode branch needs it — the
+        // `symbol` and `class` branches take symbol IDs, not file paths.
+        let normalized = paths::normalize_user_path(path);
+        g.diagram_file_graph(&normalized, depth, max_nodes)
     } else if let Some(name) = class {
         g.diagram_inheritance(name, depth, max_nodes)
     } else {
@@ -1631,5 +1641,162 @@ mod tests {
             },
         );
         assert_eq!(body_text(&r), "[]");
+    }
+
+    // --- PathNormalization Phase 3.2 --------------------------------------
+
+    #[test]
+    fn coupling_resolves_dot_segments_to_canonical_lookup() {
+        // PathNormalization Phase 3.2: `get_coupling` wraps the user-supplied
+        // `file` argument with `paths::normalize_user_path` before the graph
+        // lookup. Mirrors the Phase 3.1 test in `symbols.rs`. Plant a coupling
+        // edge keyed by a real canonical filesystem path, then query the
+        // handler twice — once with the canonical form, once with a
+        // `./sub/../` injected form that resolves to the same canonical via
+        // `dunce::canonicalize`. Both calls must return the same coupling map.
+        //
+        // The path must exist on disk so the canonicalize branch is exercised
+        // (the lexical-fallback branch on a non-existent path would NOT
+        // resolve dot segments, per `paths.rs` test `(d)`).
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        let file_path = tmp.path().join("a.cpp");
+        std::fs::write(&file_path, "// empty\n").expect("write file");
+
+        // Capture the canonical form the graph will be keyed by. On Linux
+        // this is identity for an already-canonical path; the explicit
+        // canonicalize step keeps the test correct under symlinked tempdirs
+        // (e.g. macOS `/var` -> `/private/var`).
+        let canonical = paths::canonicalize(&file_path).expect("canonicalize file");
+        let canonical_str = canonical
+            .to_str()
+            .expect("canonical path is valid UTF-8 on Linux");
+
+        // Build a graph with an include edge from the canonical path to
+        // `/b.cpp` so the outgoing-coupling lookup has a record to find.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: canonical_str.to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge(canonical_str, "/b.cpp")],
+        });
+        let g = locked(g);
+
+        // (1) Canonical form — the baseline. Asserts the fixture is sound
+        // before we exercise the normalize path.
+        let r_canonical = get_coupling(&g, canonical_str, None);
+        assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
+        let parsed_canonical: serde_json::Value =
+            serde_json::from_str(&body_text(&r_canonical)).unwrap();
+        let obj_canonical = parsed_canonical.as_object().unwrap();
+        assert_eq!(obj_canonical["/b.cpp"], serde_json::json!(1));
+
+        // (2) `./sub/../a.cpp` form — the load-bearing assertion. Without
+        // `normalize_user_path`, this string would fail an exact-match graph
+        // lookup against the canonical key and return an empty object.
+        let messy = tmp.path().join(".").join("sub").join("..").join("a.cpp");
+        let messy_str = messy.to_str().expect("messy path is valid UTF-8 on Linux");
+        assert_ne!(
+            messy_str, canonical_str,
+            "messy fixture must differ from canonical for the test to be meaningful"
+        );
+
+        let r_messy = get_coupling(&g, messy_str, None);
+        assert!(
+            r_messy.is_error.is_none() || r_messy.is_error == Some(false),
+            "messy form must succeed after normalize: body={}",
+            body_text(&r_messy),
+        );
+        let parsed_messy: serde_json::Value = serde_json::from_str(&body_text(&r_messy)).unwrap();
+        let obj_messy = parsed_messy.as_object().unwrap();
+        assert_eq!(
+            obj_messy["/b.cpp"],
+            serde_json::json!(1),
+            "messy form must return the same coupling map as canonical",
+        );
+    }
+
+    #[test]
+    fn diagram_file_mode_resolves_dot_segments_to_canonical_lookup() {
+        // PathNormalization Phase 3.2: `generate_diagram` (file mode) wraps
+        // the user-supplied `file` argument with `paths::normalize_user_path`
+        // before the graph lookup. Mirrors the Phase 3.1 test in `symbols.rs`.
+        // Plant an include edge keyed by a real canonical filesystem path,
+        // then query the handler twice — once with the canonical form, once
+        // with a `./sub/../` injected form — and assert both produce a
+        // non-empty edge set.
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        let file_path = tmp.path().join("x.cpp");
+        std::fs::write(&file_path, "// empty\n").expect("write file");
+
+        let canonical = paths::canonicalize(&file_path).expect("canonicalize file");
+        let canonical_str = canonical
+            .to_str()
+            .expect("canonical path is valid UTF-8 on Linux");
+
+        // Build a graph with /y.cpp -> canonical via include, so the file-mode
+        // diagram (reverse-include scan) returns one edge.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: canonical_str.to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/y.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/y.cpp", canonical_str)],
+        });
+        let g = locked(g);
+
+        // (1) Canonical form — baseline.
+        let r_canonical = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                file: Some(canonical_str),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
+        let parsed_canonical: serde_json::Value =
+            serde_json::from_str(&body_text(&r_canonical)).unwrap();
+        let arr_canonical = parsed_canonical.as_array().unwrap();
+        assert_eq!(arr_canonical.len(), 1);
+        assert_eq!(arr_canonical[0]["label"], serde_json::json!("includes"));
+
+        // (2) `./sub/../x.cpp` form — load-bearing.
+        let messy = tmp.path().join(".").join("sub").join("..").join("x.cpp");
+        let messy_str = messy.to_str().expect("messy path is valid UTF-8 on Linux");
+        assert_ne!(
+            messy_str, canonical_str,
+            "messy fixture must differ from canonical for the test to be meaningful"
+        );
+
+        let r_messy = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                file: Some(messy_str),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(
+            r_messy.is_error.is_none() || r_messy.is_error == Some(false),
+            "messy form must succeed after normalize: body={}",
+            body_text(&r_messy),
+        );
+        let parsed_messy: serde_json::Value = serde_json::from_str(&body_text(&r_messy)).unwrap();
+        let arr_messy = parsed_messy.as_array().unwrap();
+        assert_eq!(
+            arr_messy.len(),
+            1,
+            "messy form must return the same edge set as canonical",
+        );
+        assert_eq!(arr_messy[0]["label"], serde_json::json!("includes"));
     }
 }

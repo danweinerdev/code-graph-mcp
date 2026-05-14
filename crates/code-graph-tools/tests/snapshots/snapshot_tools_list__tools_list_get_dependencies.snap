@@ -4,7 +4,7 @@ expression: "tool_entry(\"get_dependencies\")"
 ---
 {
   "name": "get_dependencies",
-  "description": "List files included/imported by the given file",
+  "description": "List files included/imported by the given file. Path is resolved against the indexed graph; `\\\\?\\` extended-path prefix is handled automatically, and relative segments (`.` / `..`) resolve against the on-disk file when it exists (otherwise lexical-only).",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

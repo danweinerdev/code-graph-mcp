@@ -4,7 +4,7 @@ expression: "tool_entry(\"generate_diagram\")"
 ---
 {
   "name": "generate_diagram",
-  "description": "Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid.",
+  "description": "Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid. When `file=` is used, the path is resolved against the indexed graph; `\\\\?\\` extended-path prefix is handled automatically, and relative segments (`.` / `..`) resolve against the on-disk file when it exists (otherwise lexical-only). The `symbol=` and `class=` modes take identifiers, not paths, and are NOT normalized — pass them exactly as they appear in the index.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

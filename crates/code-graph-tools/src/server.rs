@@ -462,7 +462,10 @@ impl CodeGraphServer {
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
-                       pages."
+                       pages. Path is resolved against the indexed graph; `\\\\?\\` \
+                       extended-path prefix is handled automatically, and relative \
+                       segments (`.` / `..`) resolve against the on-disk file when it \
+                       exists (otherwise lexical-only)."
     )]
     async fn get_file_symbols(
         &self,
@@ -471,17 +474,32 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        let max_bytes = self.inner.config.read().response.max_bytes;
-        Ok(handlers::symbols::get_file_symbols(
-            &self.inner.graph,
-            &args.file,
-            args.top_level_only.unwrap_or(false),
-            args.brief.unwrap_or(true),
-            args.limit,
-            args.offset,
-            args.count_only.unwrap_or(false),
-            max_bytes,
-        ))
+        // The handler internally calls `paths::normalize_user_path`, which
+        // wraps `dunce::canonicalize` — a blocking filesystem stat. On a
+        // local-disk repo this is microseconds, but on NFS / sshfs / a
+        // stale Windows share it can park the Tokio worker for hundreds of
+        // ms to seconds. Offload the whole sync handler (which also
+        // acquires the graph RwLock and serializes JSON) to the blocking
+        // pool. Same idiom `analyze_codebase` uses for its indexing work.
+        let inner = self.inner.clone();
+        let max_bytes = inner.config.read().response.max_bytes;
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::symbols::get_file_symbols(
+                &inner.graph,
+                &args.file,
+                args.top_level_only.unwrap_or(false),
+                args.brief.unwrap_or(true),
+                args.limit,
+                args.offset,
+                args.count_only.unwrap_or(false),
+                max_bytes,
+            )
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("get_file_symbols task panicked: {e}")),
+        })
     }
 
     #[tool(
@@ -642,7 +660,12 @@ impl CodeGraphServer {
         ))
     }
 
-    #[tool(description = "List files included/imported by the given file")]
+    #[tool(
+        description = "List files included/imported by the given file. Path is resolved \
+                       against the indexed graph; `\\\\?\\` extended-path prefix is handled \
+                       automatically, and relative segments (`.` / `..`) resolve against \
+                       the on-disk file when it exists (otherwise lexical-only)."
+    )]
     async fn get_dependencies(
         &self,
         Parameters(args): Parameters<GetDependenciesArgs>,
@@ -650,10 +673,17 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        Ok(handlers::query::get_dependencies(
-            &self.inner.graph,
-            &args.file,
-        ))
+        // `paths::normalize_user_path` inside the handler may block on a
+        // filesystem stat (see `get_file_symbols` comment).
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::query::get_dependencies(&inner.graph, &args.file)
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("get_dependencies task panicked: {e}")),
+        })
     }
 
     // -- P1+P2 + watch (Phase 3.5) -----------------------------------------
@@ -743,7 +773,12 @@ impl CodeGraphServer {
         ))
     }
 
-    #[tool(description = "Get cross-file dependency counts for a file")]
+    #[tool(
+        description = "Get cross-file dependency counts for a file. Path is resolved \
+                       against the indexed graph; `\\\\?\\` extended-path prefix is handled \
+                       automatically, and relative segments (`.` / `..`) resolve against \
+                       the on-disk file when it exists (otherwise lexical-only)."
+    )]
     async fn get_coupling(
         &self,
         Parameters(args): Parameters<GetCouplingArgs>,
@@ -751,15 +786,21 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        Ok(handlers::structure::get_coupling(
-            &self.inner.graph,
-            &args.file,
-            args.direction.as_deref(),
-        ))
+        // `paths::normalize_user_path` inside the handler may block on a
+        // filesystem stat (see `get_file_symbols` comment).
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::structure::get_coupling(&inner.graph, &args.file, args.direction.as_deref())
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("get_coupling task panicked: {e}")),
+        })
     }
 
     #[tool(
-        description = "Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid."
+        description = "Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid. When `file=` is used, the path is resolved against the indexed graph; `\\\\?\\` extended-path prefix is handled automatically, and relative segments (`.` / `..`) resolve against the on-disk file when it exists (otherwise lexical-only). The `symbol=` and `class=` modes take identifiers, not paths, and are NOT normalized — pass them exactly as they appear in the index."
     )]
     async fn generate_diagram(
         &self,
@@ -768,19 +809,29 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        let input = handlers::structure::GenerateDiagramInput {
-            symbol: args.symbol.as_deref(),
-            file: args.file.as_deref(),
-            class: args.class.as_deref(),
-            depth: args.depth,
-            max_nodes: args.max_nodes,
-            format: args.format.as_deref(),
-            styled: args.styled.unwrap_or(false),
-        };
-        Ok(handlers::structure::generate_diagram(
-            &self.inner.graph,
-            input,
-        ))
+        // Only the `file=` branch calls `paths::normalize_user_path` (the
+        // blocking stat); `symbol=` and `class=` are in-memory. Wrap
+        // unconditionally for the simpler dispatcher — the spawn_blocking
+        // overhead for the non-file branches is ~5µs of scheduling, well
+        // below JSON-serialization cost.
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let input = handlers::structure::GenerateDiagramInput {
+                symbol: args.symbol.as_deref(),
+                file: args.file.as_deref(),
+                class: args.class.as_deref(),
+                depth: args.depth,
+                max_nodes: args.max_nodes,
+                format: args.format.as_deref(),
+                styled: args.styled.unwrap_or(false),
+            };
+            handlers::structure::generate_diagram(&inner.graph, input)
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("generate_diagram task panicked: {e}")),
+        })
     }
 
     #[tool(
