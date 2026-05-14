@@ -390,15 +390,18 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// pagination + byte-budget machinery (eliminating the 196 KB UE-scale
 /// rejection the nested shape caused). Task 1.2 wires real pagination
 /// through: flatten → sort by `(namespace, kind)` → `byte_budget_take`.
-/// Task 1.3 will add the `<global>` display rename for empty namespaces;
-/// Task 1.4 will thread a `count_only` argument.
+/// Task 1.3 added the `<global>` display rename for empty namespaces (a
+/// row-build-time substitution; the graph's `Symbol.namespace` field is
+/// never mutated, and `search_symbols(namespace="")` still filters by
+/// the empty string). Task 1.4 will thread a `count_only` argument.
 ///
 /// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
 /// default" (mirrors `get_orphans` and `get_file_symbols`); `limit` is
 /// silently clamped at 1000. `offset >= total` returns an empty `results`
 /// page with the correct `total`. Rows are sorted by `(namespace, kind)`
 /// ascending so page 1 + page 2 partition the rows deterministically
-/// across calls.
+/// across calls. The `<global>` substitution happens BEFORE the sort, so
+/// `<global>` rows sort wherever `<` lands in ASCII (between `;` and `=`).
 pub fn get_symbol_summary(
     graph: &RwLock<Graph>,
     file: Option<&str>,
@@ -409,13 +412,22 @@ pub fn get_symbol_summary(
     let path: Option<&Path> = file.filter(|s| !s.is_empty()).map(Path::new);
     let summary = graph.read().symbol_summary(path);
 
-    // Flatten the nested map: one row per (namespace, kind) pair. No
-    // `<global>` rename yet — Task 1.3.
+    // Flatten the nested map: one row per (namespace, kind) pair. The
+    // empty-namespace -> `<global>` rename (Task 1.3) is applied at row
+    // build time, BEFORE the sort, and only here — the graph's
+    // `Symbol.namespace` stays empty and `search_symbols(namespace="")`
+    // still filters by the empty string. The rename is intentionally
+    // asymmetric: display label vs query filter.
     let mut rows: Vec<SummaryRow> = Vec::new();
     for (ns, kinds) in summary {
+        let display_ns = if ns.is_empty() {
+            "<global>".to_string()
+        } else {
+            ns.clone()
+        };
         for (k, count) in kinds {
             rows.push(SummaryRow {
-                namespace: ns.clone(),
+                namespace: display_ns.clone(),
                 kind: kind_str(k),
                 count,
             });
@@ -1837,12 +1849,16 @@ mod tests {
         let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // Phase 1: response is now `Page<SummaryRow>`. All 3 sample
-        // symbols carry namespace="" (the `<global>` display rename
-        // lands in Task 1.3).
+        // symbols carry namespace="" in the graph; Task 1.3's display
+        // rename surfaces them under `<global>` in the response.
         let results = parsed["results"].as_array().expect("results array");
-        assert_eq!(pick_count(results, "", "function"), 1);
-        assert_eq!(pick_count(results, "", "class"), 1);
-        assert_eq!(pick_count(results, "", "method"), 1);
+        assert_eq!(pick_count(results, "<global>", "function"), 1);
+        assert_eq!(pick_count(results, "<global>", "class"), 1);
+        assert_eq!(pick_count(results, "<global>", "method"), 1);
+        // Display-rename invariant: no row carries the bare empty string.
+        assert!(!has_row(results, "", "function"));
+        assert!(!has_row(results, "", "class"));
+        assert!(!has_row(results, "", "method"));
         // total reflects the row count (3 rows for 3 distinct
         // (namespace, kind) pairs in the small graph fixture).
         assert_eq!(parsed["total"].as_u64().unwrap(), 3);
@@ -1873,10 +1889,11 @@ mod tests {
         let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
-        assert_eq!(pick_count(results, "", "function"), 1);
+        // Task 1.3: empty namespace renders as `<global>` in the response.
+        assert_eq!(pick_count(results, "<global>", "function"), 1);
         // No method or class rows — those are in /a.cpp only.
-        assert!(!has_row(results, "", "method"));
-        assert!(!has_row(results, "", "class"));
+        assert!(!has_row(results, "<global>", "method"));
+        assert!(!has_row(results, "<global>", "class"));
     }
 
     // --- Task 1.2 pagination tests ------------------------------------------
@@ -1926,9 +1943,10 @@ mod tests {
     #[test]
     fn symbol_summary_basic_round_trip_multiple_namespaces() {
         // Two namespaces ("alpha", "beta") plus the default ""-namespace
-        // rows from `small_graph` — three distinct namespaces, multiple
-        // kinds. Asserts `total`, `results.len()`, and that two back-to-back
-        // calls produce the same ordering (sort is deterministic).
+        // rows from `small_graph` (rendered as `<global>` after Task 1.3) —
+        // three distinct namespaces, multiple kinds. Asserts `total`,
+        // `results.len()`, and that two back-to-back calls produce the
+        // same ordering (sort is deterministic).
         let mut g = small_graph();
         g.merge_file_graph(FileGraph {
             path: "/alpha.cpp".to_string(),
@@ -1970,9 +1988,9 @@ mod tests {
         let (results1, total1, offset1, limit1) = page_parts(&r1);
         let (truncated1, next1) = page_extras(&r1);
 
-        // small_graph: 3 rows (function/class/method in ns="");
-        // alpha + beta add 2 more rows (function in ns="alpha", "beta").
-        // Total = 5.
+        // small_graph: 3 rows (function/class/method in ns="" → rendered
+        // as `<global>`); alpha + beta add 2 more rows (function in
+        // ns="alpha", "beta"). Total = 5.
         assert_eq!(total1, 5);
         assert_eq!(results1.len(), 5);
         assert_eq!(offset1, 0);
@@ -1988,16 +2006,19 @@ mod tests {
             "row order must be deterministic across repeated calls",
         );
 
-        // Sort order: namespace asc, then kind asc. Expected sequence:
-        //   ("",      "class"),
-        //   ("",      "function"),
-        //   ("",      "method"),
-        //   ("alpha", "function"),
-        //   ("beta",  "function").
+        // Sort order: namespace asc, then kind asc. After Task 1.3's
+        // `<global>` rename happens at row-build time (i.e. BEFORE the
+        // sort), `<` (ASCII 60) sorts before `a` (97) and `b` (98), so
+        // the `<global>` rows still come first. Expected sequence:
+        //   ("<global>", "class"),
+        //   ("<global>", "function"),
+        //   ("<global>", "method"),
+        //   ("alpha",    "function"),
+        //   ("beta",     "function").
         let expected_ns_kind: Vec<(&str, &str)> = vec![
-            ("", "class"),
-            ("", "function"),
-            ("", "method"),
+            ("<global>", "class"),
+            ("<global>", "function"),
+            ("<global>", "method"),
             ("alpha", "function"),
             ("beta", "function"),
         ];
@@ -2173,5 +2194,172 @@ mod tests {
             rows.len(),
             "next_offset must equal the count of records emitted in this page",
         );
+    }
+
+    // --- Task 1.3 <global> rename tests ------------------------------------
+    //
+    // ResponseShapePolish Phase 1 Task 1.3 renames the empty namespace to
+    // the literal string `<global>` when building each `SummaryRow` — a
+    // row-build-time substitution that does NOT mutate `Symbol.namespace`
+    // in the graph. The asymmetry is load-bearing: display label is
+    // `<global>`, but `search_symbols(namespace="")` still filters by the
+    // empty string. Two tests pin each side of that asymmetry.
+
+    /// Build a graph with both a global-scope symbol (namespace = `""`) and
+    /// a namespaced symbol (namespace = `"bar"`). The fixture is the
+    /// minimal shape that exercises the rename without dragging in the
+    /// other `small_graph` rows; the two tests below share it.
+    fn global_and_namespaced_graph() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/lib.rs".to_string(),
+            language: Language::Rust,
+            symbols: vec![
+                Symbol {
+                    name: "foo".to_string(),
+                    kind: SymbolKind::Function,
+                    file: "/lib.rs".to_string(),
+                    line: 1,
+                    column: 0,
+                    end_line: 1,
+                    signature: "fn foo()".to_string(),
+                    namespace: String::new(),
+                    parent: String::new(),
+                    language: Language::Rust,
+                },
+                Symbol {
+                    name: "inside_bar".to_string(),
+                    kind: SymbolKind::Function,
+                    file: "/lib.rs".to_string(),
+                    line: 5,
+                    column: 0,
+                    end_line: 5,
+                    signature: "fn inside_bar()".to_string(),
+                    namespace: "bar".to_string(),
+                    parent: String::new(),
+                    language: Language::Rust,
+                },
+            ],
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    #[test]
+    fn summary_renames_empty_namespace_to_global() {
+        // Indexes a fixture with both a global-scope symbol (namespace = "")
+        // and a namespaced symbol (namespace = "bar"). Asserts:
+        //   * a row exists with namespace="<global>" and the correct count,
+        //   * a row exists with namespace="bar" and the correct count,
+        //   * no row carries the bare empty string (rename is complete).
+        let g = locked(global_and_namespaced_graph());
+
+        let r = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = parsed["results"].as_array().expect("results array");
+
+        // Two distinct (namespace, kind) pairs: ("<global>", "function")
+        // for `foo`, and ("bar", "function") for `inside_bar`.
+        assert_eq!(parsed["total"].as_u64().unwrap(), 2);
+        assert_eq!(pick_count(results, "<global>", "function"), 1);
+        assert_eq!(pick_count(results, "bar", "function"), 1);
+
+        // No row carries the bare empty string — the rename is complete,
+        // not a "both versions emitted" half-rename.
+        assert!(
+            !has_row(results, "", "function"),
+            "empty-namespace rows must be renamed, not duplicated",
+        );
+
+        // Sort order: namespace asc, then kind asc. `<global>` (ASCII '<'
+        // = 60) sorts before `bar` (ASCII 'b' = 98), so the global row
+        // comes first. Pinning this order locks in the documented
+        // "rename happens BEFORE the sort" contract; if the sort moved
+        // ahead of the rename, the ordering would flip ("" sorts before
+        // "bar"  - same direction by accident — so check the actual
+        // strings, not just the relative order).
+        let got: Vec<(String, String)> = results
+            .iter()
+            .map(|row| {
+                (
+                    row["namespace"].as_str().unwrap().to_string(),
+                    row["kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("<global>".to_string(), "function".to_string()),
+                ("bar".to_string(), "function".to_string()),
+            ],
+            "rows must sort after the rename, with `<global>` carrying the literal display label",
+        );
+    }
+
+    #[test]
+    fn search_symbols_with_empty_namespace_filter_still_finds_globals_after_summary() {
+        // Pins the asymmetry: the `<global>` rename is DISPLAY-ONLY (it
+        // happens only in `get_symbol_summary`'s row build). The graph's
+        // `Symbol.namespace` stays empty, and `search_symbols` still
+        // filters global-scope symbols via `namespace=""` (or, equivalently,
+        // by leaving the filter empty — which in this handler means "no
+        // namespace filter"). Running the summary first demonstrates the
+        // call does not mutate the underlying graph state.
+        let g = locked(global_and_namespaced_graph());
+
+        // Run the summary first; assert the `<global>` rename surfaces.
+        let r_summary = get_symbol_summary(&g, None, None, None, NO_BYTE_BUDGET);
+        let parsed_summary: serde_json::Value =
+            serde_json::from_str(&body_text(&r_summary)).unwrap();
+        let summary_results = parsed_summary["results"].as_array().expect("results array");
+        assert!(
+            has_row(summary_results, "<global>", "function"),
+            "summary must render the global-scope symbol under `<global>`",
+        );
+
+        // Now query the graph for the global-scope symbol via search.
+        // `search_symbols` treats namespace="" as "no namespace filter"
+        // (see `Graph::search` — empty `lower_ns` short-circuits the
+        // contains check); the query must therefore return `foo`. The
+        // load-bearing assertion is that NO `<global>` literal appears in
+        // the search response's namespace field — confirming the rename
+        // never touched the graph state, only the summary's row builder.
+        let r_search = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("foo"),
+                namespace: Some(""),
+                brief: true,
+                ..SearchSymbolsInput::default()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert!(r_search.is_error.is_none() || r_search.is_error == Some(false));
+        let parsed_search: serde_json::Value = serde_json::from_str(&body_text(&r_search)).unwrap();
+        let search_results = parsed_search["results"].as_array().expect("results array");
+        let names: Vec<&str> = search_results
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"foo"),
+            "search_symbols must still find the global-scope symbol; got names={names:?}",
+        );
+
+        // The graph's Symbol.namespace is empty for `foo`; the search
+        // response either omits the namespace field (skip_serializing_if
+        // on empty String — see `SymbolResult`) or carries `""`. EITHER
+        // way, it must NOT carry the `<global>` display literal — the
+        // rename is scoped to `get_symbol_summary`.
+        for row in search_results {
+            if let Some(ns) = row.get("namespace").and_then(|v| v.as_str()) {
+                assert_ne!(
+                    ns, "<global>",
+                    "search_symbols must never surface the `<global>` display label; \
+                     that rename is scoped to get_symbol_summary",
+                );
+            }
+        }
     }
 }

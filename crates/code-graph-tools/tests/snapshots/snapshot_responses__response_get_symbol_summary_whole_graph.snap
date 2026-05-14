@@ -10,32 +10,32 @@ expression: parsed
     {
       "count": 4,
       "kind": "class",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 1,
       "kind": "enum",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 3,
       "kind": "function",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 5,
       "kind": "method",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 1,
       "kind": "struct",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 1,
       "kind": "typedef",
-      "namespace": ""
+      "namespace": "<global>"
     },
     {
       "count": 3,
