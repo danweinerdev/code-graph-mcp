@@ -82,8 +82,11 @@ pub async fn analyze_codebase(
         Err(ConfigError::Io(e)) => {
             return tool_error(format!("failed to read .code-graph.toml: {e}"));
         }
+        // Any new `ConfigError` variant must be mapped here — the catch-all
+        // path produces less-helpful errors.
         Err(e @ ConfigError::ExtensionMissingDot { .. })
-        | Err(e @ ConfigError::ExtensionConflict { .. }) => {
+        | Err(e @ ConfigError::ExtensionConflict { .. })
+        | Err(e @ ConfigError::MacroStripConflict { .. }) => {
             return tool_error(format!("invalid .code-graph.toml: {e}"));
         }
     };

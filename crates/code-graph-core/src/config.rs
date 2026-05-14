@@ -120,9 +120,9 @@ pub struct ParsingConfig {
     pub max_threads: usize,
 }
 
-/// C++-specific knobs. Currently the only field is `macro_strip` — a list of
-/// identifier tokens (typically API-export macros like `CORE_API`) that are
-/// blanked out of C++ source bytes before tree-sitter parses them.
+/// C++-specific knobs. `macro_strip` is whole-word identifier replacement;
+/// `macro_strip_with_args` is parameterized-macro replacement (identifier +
+/// balanced `(args)`). See `Designs/UeMacroSupport`.
 ///
 /// **Empty-string entries are filtered at load time.** An empty pattern would
 /// match every byte position with zero advancement and infinite-loop the
@@ -130,7 +130,7 @@ pub struct ParsingConfig {
 /// and warns once per drop. The substitution algorithm (Phase 1.2) is allowed
 /// to assume every pattern has length > 0.
 ///
-/// The field is `Vec<String>` (not `Vec<&'static str>`); patterns are checked
+/// The fields are `Vec<String>` (not `Vec<&'static str>`); patterns are checked
 /// for emptiness only — non-identifier-character patterns are not validated
 /// here because the substitution layer does literal byte-equality matching.
 /// See `Designs/CppMacroStrip/README.md` Decision 7 and Error Handling.
@@ -138,9 +138,23 @@ pub struct ParsingConfig {
 pub struct CppConfig {
     /// Identifier tokens to remove from C++ source bytes before tree-sitter
     /// parses them. Empty by default. Empty-string entries are filtered out
-    /// at load time (see [`RootConfig::load`]).
+    /// at load time (see [`RootConfig::load`]). Within-list duplicates are
+    /// NOT deduplicated — the substitution pass is idempotent, so duplicates
+    /// produce extra work without changing output. (`macro_strip_with_args`
+    /// dedups; the asymmetry is intentional but preserved because the
+    /// `macro_strip` field shipped before the dedup convention was
+    /// established.)
     #[serde(default)]
     pub macro_strip: Vec<String>,
+    /// Parameterized macro tokens to remove from C++ source bytes before
+    /// tree-sitter parses them; the identifier AND its trailing balanced
+    /// `(args)` group are both blanked. Empty by default. Empty-string
+    /// entries are filtered out at load time; within-list duplicates are
+    /// silently deduplicated; tokens that appear in BOTH `macro_strip` and
+    /// `macro_strip_with_args` are rejected with
+    /// [`ConfigError::MacroStripConflict`] (see [`RootConfig::load`]).
+    #[serde(default)]
+    pub macro_strip_with_args: Vec<String>,
 }
 
 /// Per-language file-extension overrides.
@@ -323,6 +337,13 @@ pub enum ConfigError {
         first: &'static str,
         second: &'static str,
     },
+    /// A token appears in BOTH `[cpp].macro_strip` and
+    /// `[cpp].macro_strip_with_args`. Each list applies a different
+    /// substitution rule (whole-word vs. identifier + balanced args), so
+    /// listing the same token in both is ambiguous about the user's intent;
+    /// there's no principled tiebreak.
+    #[error("[cpp] macro '{token}' may not appear in both `macro_strip` and `macro_strip_with_args` (ambiguous strip target — remove it from one list or the other)")]
+    MacroStripConflict { token: String },
 }
 
 impl RootConfig {
@@ -359,6 +380,53 @@ impl RootConfig {
             }
             keep
         });
+
+        // Parallel validation for `[cpp].macro_strip_with_args`. Two extra
+        // steps relative to `macro_strip`:
+        //   1. Drain empty-string entries (same per-drop `eprintln!` cadence
+        //      as `macro_strip` above; the substitution algorithm in Phase 3
+        //      requires every pattern to have length > 0).
+        //   2. Silently deduplicate within-list duplicates while preserving
+        //      first-occurrence order. A user repeating the same macro is
+        //      almost always a paste-mistake, not an intentional weighting,
+        //      and the downstream scan is idempotent — dedup is the principle
+        //      of least surprise.
+        //
+        // Drain → dedup → cross-check. Drain-then-cross-check is the
+        // canonical order: empty strings could superficially appear to be in
+        // both lists before they're dropped.
+        //
+        // Case-sensitive throughout. C++ macro names are case-sensitive;
+        // lowercasing would corrupt user config.
+        parsed.cpp.macro_strip_with_args.retain(|s| {
+            let keep = !s.is_empty();
+            if !keep {
+                eprintln!(
+                    "code-graph-mcp: dropping empty entry from .code-graph.toml [cpp].macro_strip_with_args"
+                );
+            }
+            keep
+        });
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        parsed
+            .cpp
+            .macro_strip_with_args
+            .retain(|s| seen.insert(s.clone()));
+
+        // Cross-list conflict: a token in BOTH `macro_strip` and
+        // `macro_strip_with_args` is ambiguous about the user's intent (each
+        // list applies a different substitution rule). One offending token is
+        // enough to block the load; we don't enumerate all hits.
+        if let Some(token) = parsed
+            .cpp
+            .macro_strip
+            .iter()
+            .find(|t| parsed.cpp.macro_strip_with_args.contains(t))
+        {
+            return Err(ConfigError::MacroStripConflict {
+                token: token.clone(),
+            });
+        }
 
         // Normalize and validate `[extensions]` lists: drain empties (warn),
         // require leading dot, lowercase, and reject cross-additive
@@ -1116,6 +1184,165 @@ max_bytes = 200000
             cfg.cpp.macro_strip,
             vec!["B".to_string(), "A".to_string(), "C".to_string()],
             "macro_strip must preserve user-listed order"
+        );
+    }
+
+    // --- CppConfig macro_strip_with_args tests (UeMacroSupport Phase 1.4) ---
+
+    #[test]
+    fn cpp_macro_strip_with_args_default_empty() {
+        // Zero-config users see an empty `macro_strip_with_args` list. Two
+        // paths: a TOML with no `[cpp]` section, and an explicit empty array.
+        // Both must yield an empty Vec.
+        let cfg = RootConfig::default();
+        assert!(
+            cfg.cpp.macro_strip_with_args.is_empty(),
+            "default macro_strip_with_args must be empty (opt-in)"
+        );
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[discovery]\nmax_threads = 0\n",
+        )
+        .unwrap();
+        let cfg =
+            RootConfig::load(dir.path()).expect("config without [cpp] section must load cleanly");
+        assert!(
+            cfg.cpp.macro_strip_with_args.is_empty(),
+            "absent [cpp] section must default to empty macro_strip_with_args"
+        );
+
+        // Explicit `[cpp]\nmacro_strip_with_args = []` is the same.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip_with_args = []\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path())
+            .expect("[cpp] with explicit empty macro_strip_with_args must load cleanly");
+        assert!(
+            cfg.cpp.macro_strip_with_args.is_empty(),
+            "explicit empty array must yield empty macro_strip_with_args"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_with_args_round_trips() {
+        // The canonical Unreal Engine reflection macros round-trip verbatim.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip_with_args = [\"UCLASS\", \"UFUNCTION\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load must succeed");
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            vec!["UCLASS".to_string(), "UFUNCTION".to_string()],
+            "macro_strip_with_args must round-trip verbatim"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_with_args_filters_empty_strings() {
+        // Mirror of `cpp_macro_strip_filters_empty_strings`: the empty-pattern
+        // infinite-loop risk applies equally to the args variant, so the
+        // load-time drain is the only safe enforcement point.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip_with_args = [\"\", \"UCLASS\", \"\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            vec!["UCLASS".to_string()],
+            "empty entries must be drained, leaving only valid patterns"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_with_args_dedups_within_list() {
+        // Within-list duplicates are silently deduplicated; first-occurrence
+        // order is preserved. This is the principle-of-least-surprise: paste
+        // mistakes shouldn't error, and the substitution scan is idempotent.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip_with_args = [\"UCLASS\", \"UCLASS\", \"UFUNCTION\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("load must succeed with duplicates");
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            vec!["UCLASS".to_string(), "UFUNCTION".to_string()],
+            "duplicates must be removed AND first-occurrence order preserved"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_conflict_rejected() {
+        // The same token in BOTH lists is ambiguous (each list applies a
+        // different substitution rule), so the load fails with the specific
+        // `MacroStripConflict` variant. Asserting the variant — not just
+        // `is_err()` — pins the handler-side error-mapping contract.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"X\"]\nmacro_strip_with_args = [\"X\"]\n",
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path())
+            .expect_err("token in both lists must produce MacroStripConflict");
+        assert!(
+            matches!(&err, ConfigError::MacroStripConflict { token } if token == "X"),
+            "expected ConfigError::MacroStripConflict {{ token: \"X\" }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_macro_strip_disjoint_lists_pass() {
+        // Distinct tokens in each list: the typical UE case (an API-export
+        // macro in `macro_strip` and a reflection macro in
+        // `macro_strip_with_args`). Both lists must survive verbatim.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"ENGINE_API\"]\nmacro_strip_with_args = [\"UCLASS\"]\n",
+        )
+        .unwrap();
+        let cfg = RootConfig::load(dir.path()).expect("disjoint lists must load cleanly");
+        assert_eq!(cfg.cpp.macro_strip, vec!["ENGINE_API".to_string()]);
+        assert_eq!(cfg.cpp.macro_strip_with_args, vec!["UCLASS".to_string()]);
+    }
+
+    #[test]
+    fn cpp_macro_strip_case_sensitivity_preserved() {
+        // `UCLASS` and `uclass` are DISTINCT tokens — C++ macros are
+        // case-sensitive. This test pins the invariant against any future
+        // "helpful" lowercasing that would silently merge the two and either
+        // (a) trigger a false-positive conflict, or (b) corrupt the user's
+        // config.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"UCLASS\"]\nmacro_strip_with_args = [\"uclass\"]\n",
+        )
+        .unwrap();
+        let cfg =
+            RootConfig::load(dir.path()).expect("case-mismatched tokens must NOT be a conflict");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["UCLASS".to_string()],
+            "macro_strip entry must survive case-unchanged"
+        );
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            vec!["uclass".to_string()],
+            "macro_strip_with_args entry must survive case-unchanged"
         );
     }
 }

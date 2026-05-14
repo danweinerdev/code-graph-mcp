@@ -62,6 +62,7 @@ pub(crate) mod queries;
 pub use preprocess::strip_macros;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::Path;
 
 use code_graph_core::{Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind};
@@ -477,7 +478,42 @@ impl LanguagePlugin for CppParser {
     }
 
     fn preprocess<'a>(&self, content: &'a [u8], cfg: &RootConfig) -> Cow<'a, [u8]> {
-        crate::preprocess::strip_macros(content, &cfg.cpp.macro_strip)
+        // Fast-path: both lists empty -> zero-cost identity. Most non-UE
+        // users will hit this branch.
+        if cfg.cpp.macro_strip.is_empty() && cfg.cpp.macro_strip_with_args.is_empty() {
+            return Cow::Borrowed(content);
+        }
+        // Pass 1: existing whole-word identifier replacement. Returns a
+        // fresh Cow; on `macro_strip = []` this is Borrowed-identity (no
+        // allocation), on non-empty it's Owned with the substitutions
+        // applied.
+        let cow = crate::preprocess::strip_macros(content, &cfg.cpp.macro_strip);
+        // Short-circuit when only `macro_strip` is populated. Without this
+        // guard we'd `into_owned()` the buffer (cheap if pass 1 already
+        // owns it; a fresh allocation if pass 1 returned Borrowed), then
+        // walk every byte calling `strip_macros_with_args` with an empty
+        // token set — a guaranteed-zero-replacement O(N) scan. The outer
+        // fast-path covers the "both empty" case; this covers "only
+        // pass-1 has work to do."
+        if cfg.cpp.macro_strip_with_args.is_empty() {
+            return cow;
+        }
+        // Pass 2 needs `&mut [u8]`; force ownership. If pass 1 returned
+        // Borrowed (macro_strip empty, macro_strip_with_args non-empty),
+        // `into_owned()` allocates the buffer pass 2 will mutate — that
+        // allocation has a purpose and clippy accepts it.
+        let mut buf: Vec<u8> = cow.into_owned();
+        // Build the owned-bytes token set per call. Tiny lists in practice
+        // (UE preset is ~25 tokens); HashSet construction is amortized
+        // well below tree-sitter parse cost.
+        let tokens: HashSet<Vec<u8>> = cfg
+            .cpp
+            .macro_strip_with_args
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        crate::preprocess::strip_macros_with_args(&mut buf, &tokens);
+        Cow::Owned(buf)
     }
 
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {

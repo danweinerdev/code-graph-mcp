@@ -56,13 +56,65 @@ max_threads = 0
 # the new strip list will appear to have no effect.
 #
 # Suggested list for Unreal Engine codebases (uncomment to opt in, then
-# add any project-local <PROJECTNAME>_API macros):
+# add any project-local <PROJECTNAME>_API macros). Pair `macro_strip`
+# (bare-token API macros) with `macro_strip_with_args` (parameterized
+# reflection macros — see below) to get full UE coverage.
 # [cpp]
 # macro_strip = [
 #   "CORE_API", "ENGINE_API", "UMG_API", "SLATE_API",
 #   "RENDERCORE_API", "NIAGARA_API", "ONLINESUBSYSTEM_API",
 #   "GAMEPLAYABILITIES_API",
 # ]
+#
+# `macro_strip_with_args` strips identifier-plus-parenthesized-arg-list
+# constructs — `UCLASS(BlueprintType, …)`, `UFUNCTION(...)`,
+# `UPROPERTY(...)`, `GENERATED_BODY()`, delegate-family macros. Without
+# this, tree-sitter-cpp sees the unstripped `UCLASS(...)` on a class
+# declaration line and produces an ERROR node that swallows the
+# surrounding class — every UE class disappears from the index. Same
+# byte-length-preserving substitution as `macro_strip`; `\n` bytes are
+# preserved during the fill so multi-line macros (e.g.
+# `DECLARE_DELEGATE_TwoParams(\n  FOnHit, …)`) keep line numbers aligned.
+#
+# Recommended UE preset:
+# macro_strip_with_args = [
+#   # Reflection / metadata macros
+#   "UCLASS", "USTRUCT", "UENUM", "UFUNCTION", "UPROPERTY",
+#   "UINTERFACE", "UDELEGATE", "UPARAM", "UMETA",
+#   # Generated-body markers
+#   "GENERATED_BODY", "GENERATED_UCLASS_BODY", "GENERATED_USTRUCT_BODY",
+#   "GENERATED_UINTERFACE_BODY", "GENERATED_IINTERFACE_BODY",
+#   # Delegate macro families (UE5; UE4 also uses these)
+#   "DECLARE_DYNAMIC_MULTICAST_DELEGATE",
+#   "DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam",
+#   "DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams",
+#   "DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams",
+#   "DECLARE_DELEGATE", "DECLARE_DELEGATE_OneParam",
+#   "DECLARE_DELEGATE_TwoParams", "DECLARE_DELEGATE_RetVal",
+#   "DECLARE_MULTICAST_DELEGATE", "DECLARE_EVENT",
+# ]
+#
+# Project-specific additions you may want manually (uncomment as needed):
+#   "DEPRECATED", "UE_DEPRECATED"  # deprecation annotation macros
+#
+# DO NOT add `WITH_EDITOR`, `WITH_EDITORONLY_DATA`,
+# `WITH_DEV_AUTOMATION_TESTS`, or other `#if`-guarded identifiers to
+# `macro_strip` — they appear inside `#if` expressions and the
+# whole-word substitution would blank them, breaking conditional
+# compilation silently. They are harmless to omit from
+# `macro_strip_with_args` too (they never appear with trailing parens,
+# so the parameterized scanner skips them either way; adding them there
+# has no effect).
+#
+# A token may appear in `macro_strip` OR `macro_strip_with_args` but
+# NOT both — the load fails with `MacroStripConflict` if you list a
+# name in both. The two scans are disjoint by definition: bare
+# identifiers vs identifier+parens.
+#
+# After changing this list, re-run analyze_codebase with force=true to
+# invalidate the mtime-based cache. Without `force=true`, files whose
+# mtime hasn't changed since the last index will skip preprocessing and
+# the new strip list will appear to have no effect.
 
 # Per-language file-extension overrides, layered on top of each plugin's
 # built-in extension list. Three semantics:

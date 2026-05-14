@@ -119,6 +119,12 @@ macro_strip = []          # whole-word identifier tokens overwritten with same-l
                           # before tree-sitter parses. Preserves byte offsets / line / column.
                           # Example: ["CORE_API", "ENGINE_API"] makes
                           # `class CORE_API AActor : public UObject {}` extract correctly.
+macro_strip_with_args = [] # identifier-plus-(args) tokens stripped the same way; covers
+                          # parameterized UE reflection macros UCLASS(...), UFUNCTION(...),
+                          # UPROPERTY(...), GENERATED_BODY(), DECLARE_*_DELEGATE(...).
+                          # `\n` bytes are preserved during the fill so multi-line arg lists
+                          # keep line offsets aligned. Token may not appear in both lists.
+                          # See `.code-graph.toml.example` for the recommended UE preset.
 
 [extensions]
 # Three semantics:
@@ -142,8 +148,8 @@ java = []
 
 ### Cache invalidation
 
-- mtime-based stale checking. Changes to `[cpp].macro_strip` or `[extensions]` do NOT retroactively re-parse files with unchanged mtime.
-- To apply new `macro_strip` or to evict entries moved to `[extensions].disabled`: re-run `analyze_codebase` with `force=true`.
+- mtime-based stale checking. Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime.
+- To apply new `macro_strip`, new `macro_strip_with_args`, or to evict entries moved to `[extensions].disabled`: re-run `analyze_codebase` with `force=true`.
 - Adding extensions: new files brought in by `[extensions].<lang>` parse normally on next run.
 - Watch path consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
 - `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (the TOML file is NOT re-read per query). To apply a changed value, re-run `analyze_codebase` — **no `force=true` required**, because no mtime-based cache entries are affected; the value only shapes response output.
@@ -162,6 +168,7 @@ Supported:
 - Lambda call edges.
 - All call patterns: free, method, arrow, qualified, template.
 - Macro-prefixed classes (`class CORE_API MyClass : public Base {}`) iff listed in `[cpp].macro_strip`. Default (no `[cpp]` section) leaves these broken — zero behavior change for non-UE users.
+- Parameterized API/reflection macros (`UCLASS(...)`, `UFUNCTION(...)`, `UPROPERTY(...)`, `GENERATED_BODY()`, `DECLARE_*_DELEGATE(...)`, etc.) iff listed in `[cpp].macro_strip_with_args`. The scanner uses `find_balanced_close` + `skip_lexical` to walk parens past strings/comments/raw-strings; `\n` bytes inside the matched span are preserved so multi-line arg lists keep line offsets aligned. Default (no `[cpp].macro_strip_with_args`) leaves these broken — zero behavior change for non-UE users. Pair with `macro_strip` for `<MODULE>_API` bare-token coverage; same token may not appear in both lists (`ConfigError::MacroStripConflict`). See `Designs/UeMacroSupport` for the full UE preset.
 
 Limitations:
 1. **Macro-generated definitions invisible.** `DEFINE_HANDLER(name)` expansions aren't seen by tree-sitter. Macro invocations that look like calls ARE captured as call edges.
@@ -170,7 +177,7 @@ Limitations:
 4. **Cast expressions filtered:** `static_cast`/`dynamic_cast`/`const_cast`/`reinterpret_cast` (tree-sitter parses as calls).
 5. **Forward declarations excluded.** Only `function_definition` (with body) emits symbols.
 6. **`template_method` node not matched** in v0.23.4 — `obj.foo<T>()` falls through to `field_expression` when possible.
-7. **`macro_strip` raw-string-delimiter collision.** Raw string with tag identical to a stripped macro (e.g. `R"CORE_API(…)CORE_API"`) → both delimiters overwritten → tree-sitter fails to close → rest of file becomes ERROR, zero symbols. Silent file-level failure. Workaround: drop the macro from `macro_strip` for affected file, or rename the raw-string tag.
+7. **`macro_strip` / `macro_strip_with_args` raw-string-delimiter collision.** Raw string with tag identical to a stripped macro (e.g. `R"CORE_API(…)CORE_API"` or `R"UCLASS(…)UCLASS"`) → both delimiters overwritten → tree-sitter fails to close → rest of file becomes ERROR, zero symbols. Silent file-level failure. The two-pass interaction makes this slightly worse: pass-1 (whole-word `strip_macros`) has no lexical awareness and rewrites raw-string tags it shouldn't; once the opening tag is blanked, pass-2's `skip_lexical` no longer recognizes the raw-string boundary and may scan into what was previously a raw-string body. Workaround: drop the colliding macro from `macro_strip` / `macro_strip_with_args` for the affected file, or rename the raw-string tag.
 
 ### Rust — tree-sitter-rust v0.24.0
 
