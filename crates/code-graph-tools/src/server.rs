@@ -580,32 +580,33 @@ impl CodeGraphServer {
         description = "Get symbol counts grouped by namespace and kind — useful for codebase \
                        orientation. Returns a `Page<SummaryRow>` envelope: {results, total, \
                        offset, limit, truncated, next_offset}, where each row is \
-                       `{namespace, kind, count}`. Rows are sorted by `(namespace, kind)` \
-                       ascending so paging is deterministic across calls. `limit` defaults \
-                       to 100 (max 1000, clamped silently — the echoed `limit` reflects the \
-                       resolved value); raise `limit` for more rows per page on large \
-                       codebases with many distinct namespaces. `offset` defaults to 0; \
-                       raise `offset` to skip past previous results. `count_only=true` \
-                       returns the sentinel page with `total` = the `(namespace, kind)` \
-                       pair count (NOT the sum of individual symbols) and an empty \
-                       `results` array in a < 1KB bounded response — use it to size the \
-                       row set before paging. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget bites, \
-                       `truncated` is true and `next_offset` points at the first \
+                       `{namespace, kind, count}`. NOTE on `<global>`: rows with \
+                       `namespace == \"<global>\"` are a display label for the empty \
+                       namespace (symbols defined at global scope). `search_symbols` \
+                       cannot currently filter to global-scope symbols only — its \
+                       `namespace` field is a case-insensitive substring filter where \
+                       the empty string means \"no filter\", so \
+                       `search_symbols(namespace=\"\")` returns all symbols rather than \
+                       only global-scope ones. To investigate global-scope symbols, use \
+                       this tool to confirm they exist, then inspect them via \
+                       `search_symbols` with other filters (e.g., by `kind` or `query`). \
+                       Rows are sorted by `(namespace, kind)` ascending so paging is \
+                       deterministic across calls. `limit` defaults to 100 (max 1000, \
+                       clamped silently — the echoed `limit` reflects the resolved \
+                       value); raise `limit` for more rows per page on large codebases \
+                       with many distinct namespaces. `offset` defaults to 0; raise \
+                       `offset` to skip past previous results. `count_only=true` returns \
+                       the sentinel page with `total` = the `(namespace, kind)` pair \
+                       count (NOT the sum of individual symbols) and an empty `results` \
+                       array in a < 1KB bounded response — use it to size the row set \
+                       before paging. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
                        un-emitted row — re-call with `offset = next_offset` to resume. \
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
-                       pages. NOTE on `<global>`: rows with `namespace == \"<global>\"` \
-                       are a display label for the empty namespace (symbols defined at \
-                       global scope). `search_symbols` cannot currently filter to \
-                       global-scope symbols only — its `namespace` field is a \
-                       case-insensitive substring filter where the empty string means \
-                       \"no filter\", so `search_symbols(namespace=\"\")` returns all \
-                       symbols rather than only global-scope ones. To investigate \
-                       global-scope symbols, use this tool to confirm they exist, then \
-                       inspect them via `search_symbols` with other filters (e.g., by \
-                       `kind` or `query`)."
+                       pages."
     )]
     async fn get_symbol_summary(
         &self,
@@ -1513,7 +1514,7 @@ mod tests {
             serde_json::from_str("{}").expect("empty object deserializes");
         assert!(
             args.count_only.is_none(),
-            "absent count_only must deserialize to None; got {:?}",
+            "absent count_only must deserialize to None (handler resolves None to false via unwrap_or(false)); got {:?}",
             args.count_only,
         );
     }
