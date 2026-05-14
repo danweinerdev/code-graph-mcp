@@ -578,17 +578,34 @@ impl CodeGraphServer {
 
     #[tool(
         description = "Get symbol counts grouped by namespace and kind — useful for codebase \
-                       orientation. Returns a {results, total, offset, limit, truncated, \
-                       next_offset} envelope where each row is `{namespace, kind, count}`, \
-                       sorted by `(namespace, kind)` ascending so paging is deterministic \
-                       across calls. `limit` defaults to 100 (max 1000, clamped silently — \
-                       the echoed `limit` reflects the resolved value); raise `limit` for \
-                       large codebases with many distinct namespaces, and use `offset` to \
-                       advance through results. Responses are also capped by \
+                       orientation. Returns a `Page<SummaryRow>` envelope: {results, total, \
+                       offset, limit, truncated, next_offset}, where each row is \
+                       `{namespace, kind, count}`. Rows are sorted by `(namespace, kind)` \
+                       ascending so paging is deterministic across calls. `limit` defaults \
+                       to 100 (max 1000, clamped silently — the echoed `limit` reflects the \
+                       resolved value); raise `limit` for more rows per page on large \
+                       codebases with many distinct namespaces. `offset` defaults to 0; \
+                       raise `offset` to skip past previous results. `count_only=true` \
+                       returns the sentinel page with `total` = the `(namespace, kind)` \
+                       pair count (NOT the sum of individual symbols) and an empty \
+                       `results` array in a < 1KB bounded response — use it to size the \
+                       row set before paging. Responses are also capped by \
                        `[response].max_bytes` (default 100KB); when the byte budget bites, \
-                       `truncated` is true and `next_offset` points at the first un-emitted \
-                       row — re-call with `offset = next_offset` to resume. `truncated=false` \
-                       plus `next_offset=null` means the page is complete."
+                       `truncated` is true and `next_offset` points at the first \
+                       un-emitted row — re-call with `offset = next_offset` to resume. \
+                       `truncated=false` plus `next_offset=null` means the page is \
+                       complete. `results.length` may be less than `limit` when the byte \
+                       cap fires, so consult `truncated`, not length, to detect partial \
+                       pages. NOTE on `<global>`: rows with `namespace == \"<global>\"` \
+                       are a display label for the empty namespace (symbols defined at \
+                       global scope). `search_symbols` cannot currently filter to \
+                       global-scope symbols only — its `namespace` field is a \
+                       case-insensitive substring filter where the empty string means \
+                       \"no filter\", so `search_symbols(namespace=\"\")` returns all \
+                       symbols rather than only global-scope ones. To investigate \
+                       global-scope symbols, use this tool to confirm they exist, then \
+                       inspect them via `search_symbols` with other filters (e.g., by \
+                       `kind` or `query`)."
     )]
     async fn get_symbol_summary(
         &self,
@@ -1374,15 +1391,15 @@ mod tests {
     // -- Phase 3.1 count_only Args deserialization -------------------------
     //
     // The `count_only: Option<bool>` field on GetOrphansArgs,
-    // SearchSymbolsArgs, and GetFileSymbolsArgs must deserialize via the
-    // same contract as the existing `Option<bool>` fields (`brief`, `force`,
-    // …): absent → None, present-and-bool → Some(value), wrong-type →
-    // deserialization error. The None default is what lets handlers resolve
-    // it to `false` via `unwrap_or(false)` in task 3.2; the test guards the
-    // pre-condition that flow depends on.
+    // SearchSymbolsArgs, GetFileSymbolsArgs, and GetSymbolSummaryArgs must
+    // deserialize via the same contract as the existing `Option<bool>`
+    // fields (`brief`, `force`, …): absent → None, present-and-bool →
+    // Some(value), wrong-type → deserialization error. The None default
+    // is what lets handlers resolve it to `false` via `unwrap_or(false)`;
+    // the test guards the pre-condition that flow depends on.
     //
     // We exercise the contract once per struct (across the four cases) so
-    // that a future schema-level regression on any of the three is caught
+    // that a future schema-level regression on any of the four is caught
     // independently.
 
     #[test]
@@ -1484,6 +1501,41 @@ mod tests {
     fn get_file_symbols_args_count_only_malformed_string_rejected() {
         let result: Result<GetFileSymbolsArgs, _> =
             serde_json::from_str(r#"{"file": "/x.cpp", "count_only": "yes"}"#);
+        assert!(
+            result.is_err(),
+            "string instead of bool must produce a deserialization error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn get_symbol_summary_args_count_only_absent_is_none() {
+        let args: GetSymbolSummaryArgs =
+            serde_json::from_str("{}").expect("empty object deserializes");
+        assert!(
+            args.count_only.is_none(),
+            "absent count_only must deserialize to None; got {:?}",
+            args.count_only,
+        );
+    }
+
+    #[test]
+    fn get_symbol_summary_args_count_only_true_is_some_true() {
+        let args: GetSymbolSummaryArgs =
+            serde_json::from_str(r#"{"count_only": true}"#).expect("count_only=true deserializes");
+        assert_eq!(args.count_only, Some(true));
+    }
+
+    #[test]
+    fn get_symbol_summary_args_count_only_false_is_some_false() {
+        let args: GetSymbolSummaryArgs = serde_json::from_str(r#"{"count_only": false}"#)
+            .expect("count_only=false deserializes");
+        assert_eq!(args.count_only, Some(false));
+    }
+
+    #[test]
+    fn get_symbol_summary_args_count_only_malformed_string_rejected() {
+        let result: Result<GetSymbolSummaryArgs, _> =
+            serde_json::from_str(r#"{"count_only": "yes"}"#);
         assert!(
             result.is_err(),
             "string instead of bool must produce a deserialization error; got {result:?}",
