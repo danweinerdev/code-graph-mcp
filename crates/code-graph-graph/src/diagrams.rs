@@ -81,11 +81,7 @@ pub enum DiagramDirection {
 /// serializes as `"callees"`/`"callers"`/`"both"`, whereas this per-edge
 /// tag serializes as `"calls"`/`"called_by"`. They are kept as separate
 /// Rust types so neither has to borrow the other's wire-format strings.
-///
-/// `Hash` is derived (unlike `DiagramDirection`) because this tag is part
-/// of the edge-dedupe key — two edges that render to the same endpoint
-/// labels but differ in direction are kept distinct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeDirection {
     #[serde(rename = "calls")]
     Calls,
@@ -334,20 +330,27 @@ impl Graph {
             center: mermaid_label(start_id, &self.nodes).unwrap_or_else(|| start_id.to_string()),
             edges: Vec::new(),
         };
-        // Dedupe is keyed on the *rendered* endpoint labels plus the
-        // edge orientation, NOT the raw SymbolIds. Two distinct symbols
-        // that reduce to the same `parent::name` (template
+        // Dedupe is keyed on the *rendered* endpoint labels only, NOT
+        // the raw SymbolIds and NOT the edge orientation. Two distinct
+        // symbols that reduce to the same `parent::name` (template
         // specializations, same-named methods in unrelated classes,
         // same-named free functions in different files) collapse into
         // one diagram edge by design. This is intentionally lossy:
         // visual coherence wins over ID-level fidelity in a diagram.
-        // Clients needing ID-level fidelity should call
-        // `get_callers`/`get_callees`. The direction tag is part of the
-        // key so an edge that renders to the same labels in both arms
-        // (a `Calls` and a `CalledBy` between the same display names)
-        // stays distinct. First occurrence of each triple wins, in BFS
-        // visitation order — no merging, no tiebreak.
-        let mut seen: HashSet<(String, String, EdgeDirection)> = HashSet::new();
+        //
+        // Orientation is deliberately NOT in the key. Under `Both` at
+        // depth >= 2 a single underlying call `A -> B` is reachable
+        // from both arms: the forward (adj) arm tags it `Calls`, the
+        // reverse (radj) arm tags the same call `CalledBy`. Keeping
+        // direction in the key would render that one call twice (a
+        // solid arrow AND a dashed one). Instead the edge is emitted
+        // exactly once, tagged by whichever arm reached it first in BFS
+        // visitation order. A genuinely bidirectional pair still
+        // survives as two edges, because `A -> B` and `B -> A` are
+        // distinct label pairs. Clients needing per-arm or ID-level
+        // fidelity should call `get_callers`/`get_callees`. First
+        // occurrence of each label pair wins — no merging, no tiebreak.
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         for (from, to, direction) in raw_edges {
             // Truncation guard: when max_nodes cuts mid-walk, one
             // endpoint may not be in `visited`. Dropping the edge keeps
@@ -367,9 +370,10 @@ impl Graph {
                 (Some(f), Some(t)) => (f, t),
                 _ => continue,
             };
-            // Dedupe on the materialized labels + orientation. First
-            // occurrence wins; a repeat triple is skipped outright.
-            if !seen.insert((from_label.clone(), to_label.clone(), direction)) {
+            // Dedupe on the materialized label pair. First occurrence
+            // wins; a repeat pair is skipped outright, keeping the
+            // direction tag the winning arm assigned.
+            if !seen.insert((from_label.clone(), to_label.clone())) {
                 continue;
             }
             result.edges.push(DiagramEdge {
@@ -880,21 +884,24 @@ mod tests {
             .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 2, 30)
             .expect("a is known");
         assert_eq!(result.center, "a");
-        // Both arms run: the forward walk surfaces a -> b and b -> c
-        // tagged `Calls`; the reverse walk from b surfaces the same
-        // a -> b labels tagged `CalledBy`. Direction is part of the
-        // dedupe key, so (a,b,Calls) and (a,b,CalledBy) are distinct
-        // edges — three in total, each forward-call label appears once
-        // per direction it was discovered in.
-        let triples: Vec<(String, String, EdgeDirection)> = result
+        // Under `Both` at depth 2 a single underlying call is reachable
+        // from both arms, but the dedupe is keyed on the rendered label
+        // pair only — orientation is not in the key — so each call edge
+        // surfaces exactly once. The chain `a -> b -> c` yields exactly
+        // the two forward calls.
+        assert_eq!(result.edges.len(), 2);
+        let pairs: Vec<(String, String)> = result
             .edges
             .iter()
-            .map(|e| (e.from.clone(), e.to.clone(), e.direction))
+            .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
-        assert_eq!(result.edges.len(), 3, "got: {triples:?}");
-        assert!(triples.contains(&("a".to_string(), "b".to_string(), EdgeDirection::Calls)));
-        assert!(triples.contains(&("b".to_string(), "c".to_string(), EdgeDirection::Calls)));
-        assert!(triples.contains(&("a".to_string(), "b".to_string(), EdgeDirection::CalledBy)));
+        assert!(pairs.contains(&("a".to_string(), "b".to_string())));
+        assert!(pairs.contains(&("b".to_string(), "c".to_string())));
+        // Each label pair appears exactly once — no per-arm duplication.
+        let ab = pairs.iter().filter(|p| p.0 == "a" && p.1 == "b").count();
+        let bc = pairs.iter().filter(|p| p.0 == "b" && p.1 == "c").count();
+        assert_eq!(ab, 1, "a -> b should appear exactly once: {pairs:?}");
+        assert_eq!(bc, 1, "b -> c should appear exactly once: {pairs:?}");
         for e in &result.edges {
             assert_eq!(e.label, "calls");
         }
@@ -931,9 +938,7 @@ mod tests {
         // The truncation guard is the invariant under test: with a
         // 3-node visit budget, only a/b/c are reachable, so EVERY
         // emitted edge endpoint must be one of those three. The
-        // out-of-budget chain tail d/e must never leak in, regardless
-        // of how the direction-aware dedupe key multiplies same-label
-        // pairs across arms.
+        // out-of-budget chain tail d/e must never leak in.
         for e in &result.edges {
             for endpoint in [&e.from, &e.to] {
                 assert!(
@@ -944,6 +949,16 @@ mod tests {
                 );
             }
         }
+        // At most 3 unique nodes participated; therefore at most 2
+        // edges among them (a chain of 3 nodes has 2 edges). With
+        // orientation out of the dedupe key, same-label pairs are not
+        // multiplied across arms, so the bound holds.
+        assert!(
+            result.edges.len() <= 2,
+            "expected ≤2 edges under max_nodes=3, got {}: {:?}",
+            result.edges.len(),
+            result.edges,
+        );
         // First chain edge must still be present.
         let pairs: Vec<(String, String)> = result
             .edges
@@ -1059,11 +1074,10 @@ mod tests {
     #[test]
     fn diagram_call_graph_dedupes() {
         // a -> b, b -> a (cycle). From a under `Both`, each rendered
-        // (label, label, direction) TRIPLE appears at most once: the
-        // dedupe is per-triple, not per-undirected-pair. A cycle
-        // traversed in both arms yields four distinct triples
-        // ((a,b,Calls), (b,a,Calls), (a,b,CalledBy), (b,a,CalledBy)) —
-        // none duplicated despite the BFS revisiting the cycle.
+        // (label, label) PAIR appears exactly once. The dedupe is keyed
+        // on the label pair only — orientation is not in the key — so
+        // even though the BFS revisits the cycle from both arms, each
+        // directed call collapses to a single edge.
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
@@ -1081,31 +1095,23 @@ mod tests {
         let result = g
             .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 5, 30)
             .expect("a is known");
-        let triples: Vec<(String, String, EdgeDirection)> = result
+        let pairs: Vec<(String, String)> = result
             .edges
             .iter()
-            .map(|e| (e.from.clone(), e.to.clone(), e.direction))
+            .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
-        // No triple repeats — the dedupe set held.
-        let uniq: HashSet<(String, String, EdgeDirection)> = triples.iter().cloned().collect();
+        // Both directed calls present, each exactly once.
+        let ab = pairs.iter().filter(|p| p.0 == "a" && p.1 == "b").count();
+        let ba = pairs.iter().filter(|p| p.0 == "b" && p.1 == "a").count();
+        assert_eq!(ab, 1, "a -> b should appear exactly once: {pairs:?}");
+        assert_eq!(ba, 1, "b -> a should appear exactly once: {pairs:?}");
+        // No label pair repeats — the dedupe set held.
+        let uniq: HashSet<(String, String)> = pairs.iter().cloned().collect();
         assert_eq!(
             uniq.len(),
-            triples.len(),
-            "every (from, to, direction) triple must be unique: {triples:?}",
+            pairs.len(),
+            "every (from, to) label pair must be unique: {pairs:?}",
         );
-        // Every triple is exactly one of the four cycle orientations.
-        for t in &triples {
-            assert!(
-                matches!(
-                    (t.0.as_str(), t.1.as_str(), t.2),
-                    ("a", "b", EdgeDirection::Calls)
-                        | ("b", "a", EdgeDirection::Calls)
-                        | ("a", "b", EdgeDirection::CalledBy)
-                        | ("b", "a", EdgeDirection::CalledBy)
-                ),
-                "unexpected triple {t:?} in {triples:?}",
-            );
-        }
     }
 
     #[test]
@@ -1162,15 +1168,19 @@ mod tests {
     }
 
     #[test]
-    fn diagram_keeps_same_label_edges_with_different_direction() {
-        // Single edge `A -> B`. Centered on `B` with `Both` at depth 2:
-        // the radj arm surfaces `(A, B)` tagged `CalledBy`; A is then
-        // enqueued and its adj arm surfaces the same `(A, B)` tagged
-        // `Calls`. The rendered label pair is identical for both, so if
-        // the dedupe key were just `(from_label, to_label)` one would be
-        // dropped. The `EdgeDirection` component keeps them distinct:
-        // both must survive. This pins the direction slot of the dedupe
-        // key as load-bearing, not decorative.
+    fn diagram_collapses_single_call_seen_from_both_arms() {
+        // Single underlying call `A -> B`. Centered on `B` with `Both`
+        // at depth 2, BFS reaches that one call from both arms:
+        //   1. Pop seed B. Forward (adj) arm: B calls nothing. Reverse
+        //      (radj) arm: A calls B, so the radj walk pushes
+        //      (A, B, CalledBy) FIRST and enqueues A.
+        //   2. Pop A. Forward (adj) arm: A calls B, pushing the same
+        //      label pair (A, B, Calls) second.
+        // The dedupe is keyed on the rendered label pair only, so the
+        // one call renders EXACTLY ONCE — not once solid + once dashed.
+        // The first arm to reach it in BFS order wins the direction
+        // tag; here that is the reverse (radj) arm processing the seed,
+        // so the survivor is tagged `CalledBy`.
         let mut g = Graph::new();
         g.merge_file_graph(make_fg(
             "/x.cpp",
@@ -1186,30 +1196,89 @@ mod tests {
             .diagram_call_graph("/x.cpp:B", DiagramDirection::Both, 2, 30)
             .expect("B is known");
 
-        let calls = result
+        let ab = result
             .edges
             .iter()
-            .filter(|e| e.from == "A" && e.to == "B" && e.direction == EdgeDirection::Calls)
-            .count();
-        let called_by = result
-            .edges
-            .iter()
-            .filter(|e| e.from == "A" && e.to == "B" && e.direction == EdgeDirection::CalledBy)
+            .filter(|e| e.from == "A" && e.to == "B")
             .count();
         assert_eq!(
-            calls, 1,
-            "the forward (Calls) A -> B edge must survive: {:?}",
+            ab, 1,
+            "a single underlying call seen from both arms must render \
+             exactly once: {:?}",
             result.edges,
         );
         assert_eq!(
-            called_by, 1,
-            "the reverse (CalledBy) A -> B edge must survive: {:?}",
+            result.edges.len(),
+            1,
+            "no other edges expected: {:?}",
+            result.edges,
+        );
+        // The reverse (radj) arm runs while processing the seed B,
+        // before A is even dequeued, so it wins the first-insert and
+        // its `CalledBy` tag is what survives.
+        assert_eq!(
+            result.edges[0].direction,
+            EdgeDirection::CalledBy,
+            "first arm in BFS order (reverse/radj from the seed) wins \
+             the direction tag: {:?}",
+            result.edges,
+        );
+        assert_eq!(result.edges[0].label, "calls");
+    }
+
+    #[test]
+    fn diagram_keeps_genuinely_bidirectional_pair() {
+        // Two genuinely distinct calls: `A -> B` AND `B -> A`. These
+        // are different label pairs ((A,B) vs (B,A)), so the label-only
+        // dedupe keeps BOTH. Centered on A with `Both` at depth 1, the
+        // forward arm surfaces A -> B (Calls) and the reverse arm
+        // surfaces B -> A (CalledBy); each is its own pair and both
+        // survive. This is the genuine-bidirectional counterpart to
+        // the single-call collapse above: collapsing only happens when
+        // the SAME directed call is reached twice, never when two
+        // opposite-direction calls genuinely exist.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("A", SymbolKind::Function, "/x.cpp"),
+                sym("B", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:A", "/x.cpp:B", "/x.cpp", 1),
+                call_edge("/x.cpp:B", "/x.cpp:A", "/x.cpp", 2),
+            ],
+        ));
+
+        let result = g
+            .diagram_call_graph("/x.cpp:A", DiagramDirection::Both, 1, 30)
+            .expect("A is known");
+
+        let ab = result
+            .edges
+            .iter()
+            .filter(|e| e.from == "A" && e.to == "B")
+            .count();
+        let ba = result
+            .edges
+            .iter()
+            .filter(|e| e.from == "B" && e.to == "A")
+            .count();
+        assert_eq!(
+            ab, 1,
+            "the A -> B call must survive exactly once: {:?}",
+            result.edges,
+        );
+        assert_eq!(
+            ba, 1,
+            "the B -> A call must survive exactly once: {:?}",
             result.edges,
         );
         assert_eq!(
             result.edges.len(),
             2,
-            "same labels + different direction = two distinct edges: {:?}",
+            "two genuinely distinct directed calls = two edges: {:?}",
             result.edges,
         );
     }
