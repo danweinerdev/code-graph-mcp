@@ -1,4 +1,5 @@
-//! Cache v2 persistence for the in-memory [`Graph`].
+//! Versioned cache persistence for the in-memory [`Graph`] (current
+//! schema: `CACHE_VERSION`).
 //!
 //! Phase 3.6 of the Rust rewrite. The on-disk cache lives at
 //! `<dir>/.code-graph-cache.json`. Two changes versus the Go binary's v1
@@ -147,14 +148,16 @@ fn simplify_symbol_id(id: &str) -> String {
 
 /// Walk every path-bearing field of `cache` and simplify in place.
 ///
-/// Migration target for v2 caches whose path strings still carry the
-/// Windows verbatim-extended prefix (`\\?\`). Phase 1 of the
-/// `PathNormalization` plan switched the indexer to write short-form paths
-/// via `paths::canonicalize`; pre-Phase-1 caches need an in-place rewrite
-/// before they materialize into a [`Graph`], or the resulting graph is
-/// silently inconsistent (e.g. `files` keys stripped while `nodes`
-/// SymbolId keys still prefixed → every file lookup returns empty with no
-/// error).
+/// Runs unconditionally on every successfully-loaded cache (any
+/// schema version). Its job is the path-normalization rewrite: older
+/// caches' path strings may still carry the Windows verbatim-extended
+/// prefix (`\\?\`). The `PathNormalization` work switched the indexer
+/// to write short-form paths via `paths::canonicalize`; a cache
+/// written before that needs an in-place rewrite before it
+/// materializes into a [`Graph`], or the resulting graph is silently
+/// inconsistent (e.g. `files` keys stripped while `nodes` SymbolId
+/// keys still prefixed → every file lookup returns empty with no
+/// error). On an already-clean cache the rewrite is a no-op.
 ///
 /// The 12 path-bearing locations rewritten (see Decision 5 of
 /// `Designs/PathNormalization/README.md`):
@@ -571,7 +574,8 @@ mod tests {
         let g = build_sample_graph();
         g.save(dir.path()).unwrap();
 
-        // Final file must now be the new content (parses as v2 cache).
+        // Final file must now be the new content (parses as a
+        // current-schema cache).
         let bytes = fs::read(&final_path).unwrap();
         let cache: GraphCache = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(cache.version, CACHE_VERSION);
@@ -1239,7 +1243,7 @@ mod tests {
         let loaded = graph.load(dir.path()).expect("load must not error");
         assert!(
             loaded,
-            "Graph::load must return Ok(true) for a v2 cache — \
+            "Graph::load must return Ok(true) for a current-version cache — \
              a version-mismatch silent re-index would mean the migration \
              never ran"
         );
@@ -1586,7 +1590,7 @@ mod tests {
         let loaded = graph.load(dir.path()).expect("load must not error");
         assert!(
             loaded,
-            "Graph::load must return Ok(true) for a v2 cache — \
+            "Graph::load must return Ok(true) for a current-version cache — \
              a silent re-index would mean the migration never ran"
         );
 
