@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(root.derived[0].name, "Leaf");
     }
 
-    // --- Task 2.3 fixtures: diamond, no-diamond, cycle, depth-0 ---
+    // --- ref-stub regression: diamond / no-diamond / cycle / depth-0 ---
 
     /// Walk a [`HierarchyNode`] and find the FIRST canonical occurrence of
     /// each name (canonical = `r#ref == None` AND at least one of
@@ -1258,12 +1258,12 @@ mod tests {
         }
     }
 
-    /// Build the "no-ref baseline" — the tree the algorithm WOULD have
+    /// Build the "no-ref baseline" — the tree the walk WOULD have
     /// emitted without diamond dedupe. Walks `node` recursively; every
     /// `r#ref: Some(true)` stub is replaced with a deep clone of the
-    /// canonical occurrence taken from `canonicals`. The result is what a
-    /// naive pre-Task-2.2 walk would produce, used to measure the byte-
-    /// length savings from the ref-stub mechanism.
+    /// canonical occurrence taken from `canonicals`. The result is what
+    /// a walk without the ref-stub branch would produce, used to
+    /// measure the byte-length savings from the ref-stub mechanism.
     fn expand_ref_stubs(
         node: &HierarchyNode,
         canonicals: &HashMap<String, HierarchyNode>,
@@ -1294,9 +1294,9 @@ mod tests {
         }
     }
 
-    /// Search the tree for a node with `name` AND `r#ref == None` AND
-    /// non-empty `bases`. Used as a one-shot "did the canonical full-
-    /// subtree expansion actually happen?" check.
+    /// Search the tree for a node with `name`, `r#ref == None`, and a
+    /// non-empty `bases` or `derived` list. Used as a one-shot "did the
+    /// canonical full-subtree expansion actually happen?" check.
     fn find_full_node<'a>(node: &'a HierarchyNode, name: &str) -> Option<&'a HierarchyNode> {
         if node.name == name
             && node.r#ref.is_none()
