@@ -4,11 +4,13 @@ expression: normalized
 ---
 [
   {
+    "direction": "calls",
     "from": "engine.cpp",
     "label": "includes",
     "to": "engine.h"
   },
   {
+    "direction": "calls",
     "from": "engine.cpp",
     "label": "includes",
     "to": "utils.h"

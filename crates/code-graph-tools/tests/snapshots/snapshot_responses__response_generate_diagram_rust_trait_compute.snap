@@ -4,11 +4,13 @@ expression: normalized
 ---
 [
   {
+    "direction": "calls",
     "from": "Bar<T>",
     "label": "inherits",
     "to": "Compute"
   },
   {
+    "direction": "calls",
     "from": "Foo<T>",
     "label": "inherits",
     "to": "Compute"

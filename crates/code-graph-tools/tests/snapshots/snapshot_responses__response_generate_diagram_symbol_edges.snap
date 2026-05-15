@@ -4,16 +4,19 @@ expression: normalized
 ---
 [
   {
+    "direction": "calls",
     "from": "Engine::update",
     "label": "calls",
     "to": "clamp"
   },
   {
+    "direction": "calls",
     "from": "Engine::update",
     "label": "calls",
     "to": "lerp"
   },
   {
+    "direction": "called_by",
     "from": "main",
     "label": "calls",
     "to": "Engine::update"

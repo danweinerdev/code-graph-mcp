@@ -8,5 +8,5 @@ graph TD
     n0["Engine::update"]
     n1["lerp"]
     n2["clamp"]
-    n3 -->|calls| n0
+    n3 -.->|called by| n0
     n3["main"]

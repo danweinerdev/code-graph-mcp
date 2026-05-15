@@ -1,9 +1,13 @@
 //! Coupling metrics and diagram BFS / Mermaid rendering.
 //!
-//! Mirrors the Go reference at `internal/graph/graph.go` lines 488–567
-//! (`Coupling`, `IncomingCoupling`, `mermaidLabel`) and `internal/graph/diagram.go`
+//! Mirrors the Go reference at `internal/graph/graph.go` lines 488–553
+//! (`Coupling`, `IncomingCoupling`) and `internal/graph/diagram.go`
 //! (full file: [`DiagramEdge`], [`DiagramResult`], `DiagramCallGraph`,
-//! `DiagramFileGraph`, `DiagramInheritance`, `RenderMermaid`).
+//! `DiagramFileGraph`, `DiagramInheritance`, `RenderMermaid`). The
+//! label helper deliberately diverges from Go's `mermaidLabel`: it
+//! returns `None` for unresolved ids instead of falling back to a
+//! file-basename, so unresolved call targets are dropped rather than
+//! rendered as pseudo-nodes.
 //!
 //! All BFS traversals are bounded by both `depth` and `max_nodes`. Edges
 //! are deduplicated before being emitted, and the truncation guard from
@@ -63,18 +67,43 @@ pub enum DiagramDirection {
     Both,
 }
 
+/// Per-edge orientation tag on a [`DiagramEdge`], independent of the
+/// caller's [`DiagramDirection`] request.
+///
+/// - `Calls`: the edge was discovered walking forward adjacency — the
+///   `from` endpoint calls the `to` endpoint (outgoing / callee).
+/// - `CalledBy`: the edge was discovered walking reverse adjacency — the
+///   `from` endpoint is an inbound caller of `to` (incoming / caller).
+///
+/// Even when the request is [`DiagramDirection::Both`], each edge still
+/// carries the single arm that produced it. This is distinct from
+/// `DiagramDirection`: that enum is the user-input request mode and
+/// serializes as `"callees"`/`"callers"`/`"both"`, whereas this per-edge
+/// tag serializes as `"calls"`/`"called_by"`. They are kept as separate
+/// Rust types so neither has to borrow the other's wire-format strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EdgeDirection {
+    #[serde(rename = "calls")]
+    Calls,
+    #[serde(rename = "called_by")]
+    CalledBy,
+}
+
 /// One labeled edge in a [`DiagramResult`]. The `from`/`to` are display
 /// names already (post `mermaid_label` for symbol diagrams, basename for
 /// file diagrams, raw class name for inheritance) — [`DiagramResult::render_mermaid`]
 /// does not transform them further.
 ///
-/// Field order matches the Go shape's JSON tags exactly so a mixed
-/// Go/Rust client cluster sees identical wire-format output.
+/// `direction` records which adjacency arm produced the edge; it is
+/// always present (every edge has an orientation) and is appended after
+/// the original Go-shape fields so existing `from`/`to`/`label`
+/// consumers see one purely-additive field rather than a reordering.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiagramEdge {
     pub from: String,
     pub to: String,
     pub label: String,
+    pub direction: EdgeDirection,
 }
 
 /// BFS traversal result ready for [`DiagramResult::render_mermaid`].
@@ -232,8 +261,11 @@ impl Graph {
         // raw_edges always stores (source, target) in forward direction:
         // adj traversal pushes (curr, target); radj traversal pushes
         // (radj_entry.target, curr) because radj's `target` field is the
-        // *source* of the original Calls edge.
-        let mut raw_edges: Vec<(String, String)> = Vec::new();
+        // *source* of the original Calls edge. The third tuple slot is
+        // the per-edge orientation: an adj-arm edge is the seed calling
+        // out (`Calls`); a radj-arm edge is an inbound caller of the
+        // seed (`CalledBy`), regardless of the requested direction mode.
+        let mut raw_edges: Vec<(String, String, EdgeDirection)> = Vec::new();
 
         while let Some((curr_id, curr_depth)) = queue.pop_front() {
             if visited.len() >= max_nodes {
@@ -251,7 +283,11 @@ impl Graph {
                         if entry.kind != EdgeKind::Calls {
                             continue;
                         }
-                        raw_edges.push((curr_id.clone(), entry.target.clone()));
+                        raw_edges.push((
+                            curr_id.clone(),
+                            entry.target.clone(),
+                            EdgeDirection::Calls,
+                        ));
                         if !visited.contains(&entry.target) && visited.len() < max_nodes {
                             visited.insert(entry.target.clone());
                             queue.push_back((entry.target.clone(), curr_depth + 1));
@@ -269,8 +305,14 @@ impl Graph {
                             continue;
                         }
                         // radj's `target` is the SOURCE of the original
-                        // Calls edge; emit the forward direction.
-                        raw_edges.push((entry.target.clone(), curr_id.clone()));
+                        // Calls edge; emit the forward direction. Tagged
+                        // CalledBy: this edge surfaced because someone
+                        // calls into `curr_id`.
+                        raw_edges.push((
+                            entry.target.clone(),
+                            curr_id.clone(),
+                            EdgeDirection::CalledBy,
+                        ));
                         if !visited.contains(&entry.target) && visited.len() < max_nodes {
                             visited.insert(entry.target.clone());
                             queue.push_back((entry.target.clone(), curr_depth + 1));
@@ -289,7 +331,7 @@ impl Graph {
             edges: Vec::new(),
         };
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for (from, to) in raw_edges {
+        for (from, to, direction) in raw_edges {
             if seen.contains(&(from.clone(), to.clone())) {
                 continue;
             }
@@ -315,6 +357,7 @@ impl Graph {
                 from: from_label,
                 to: to_label,
                 label: "calls".to_string(),
+                direction,
             });
         }
         Some(result)
@@ -404,10 +447,14 @@ impl Graph {
                 continue;
             }
             seen.insert((from.clone(), to.clone()));
+            // Include edges are emitted source→target (the file does the
+            // including), so they are forward relationships: tag `Calls`
+            // and render with the solid arrow.
             result.edges.push(DiagramEdge {
                 from: filename_only(&from),
                 to: filename_only(&to),
                 label: "includes".to_string(),
+                direction: EdgeDirection::Calls,
             });
         }
         Some(result)
@@ -511,10 +558,14 @@ impl Graph {
                 continue;
             }
             seen.insert((from.clone(), to.clone()));
+            // Inheritance edges are emitted child→parent (the derived
+            // type does the inheriting), so they are forward
+            // relationships: tag `Calls` and render with the solid arrow.
             result.edges.push(DiagramEdge {
                 from,
                 to,
                 label: "inherits".to_string(),
+                direction: EdgeDirection::Calls,
             });
         }
         Some(result)
@@ -530,6 +581,15 @@ impl DiagramResult {
     /// `:::center` and a `classDef center fill:#f96,stroke:#333` trailer
     /// is appended so the rendered diagram visually distinguishes the
     /// seed.
+    ///
+    /// Each edge's arrow style is chosen from its
+    /// [`EdgeDirection`]: an outgoing [`EdgeDirection::Calls`] edge
+    /// renders with a solid `-->` arrow and its own `|label|`, while an
+    /// incoming [`EdgeDirection::CalledBy`] edge renders with a dashed
+    /// `-.->` arrow and a fixed `|called by|` label so a reader can tell
+    /// at a glance which edges point *into* the seed. An edge with an
+    /// empty `label` and `Calls` direction falls through to the plain
+    /// unlabeled `-->` form.
     ///
     /// Determinism: node IDs (`n0`, `n1`, ...) are assigned in insertion
     /// order via [`indexmap::IndexMap`]. The Go reference iterates a
@@ -584,11 +644,22 @@ impl DiagramResult {
             let to_sid = short_ids
                 .get(&edge.to)
                 .expect("edge endpoint must be in short_ids");
-            if edge.label.is_empty() {
-                out.push_str(&format!("    {from_sid} --> {to_sid}\n"));
-            } else {
-                let label = &edge.label;
-                out.push_str(&format!("    {from_sid} -->|{label}| {to_sid}\n"));
+            match edge.direction {
+                // Incoming edge: dashed arrow + fixed "called by" label,
+                // so it reads visually distinct from outgoing calls
+                // even when both share a seed.
+                EdgeDirection::CalledBy => {
+                    out.push_str(&format!("    {from_sid} -.->|called by| {to_sid}\n"));
+                }
+                // Outgoing edge: solid arrow. An empty label falls
+                // through to the plain unlabeled `-->` form.
+                EdgeDirection::Calls if edge.label.is_empty() => {
+                    out.push_str(&format!("    {from_sid} --> {to_sid}\n"));
+                }
+                EdgeDirection::Calls => {
+                    let label = &edge.label;
+                    out.push_str(&format!("    {from_sid} -->|{label}| {to_sid}\n"));
+                }
             }
         }
 
@@ -1059,7 +1130,9 @@ mod tests {
                 // Resolves: both endpoints are indexed symbols.
                 call_edge("/x.cpp:caller", "/x.cpp:realCallee", "/x.cpp", 1),
                 // Does NOT resolve: target SymbolId is not a node key.
-                // Pre-fix this rendered as the basename "Platform.cpp".
+                // The old fallback rendered this as the path's last
+                // component ("Platform.cpp:doStuff"); now the edge is
+                // dropped entirely.
                 call_edge("/x.cpp:caller", "/ext/Platform.cpp:doStuff", "/x.cpp", 2),
             ],
         ));
@@ -1351,6 +1424,7 @@ mod tests {
                 from: "Foo".to_string(),
                 to: "Bar".to_string(),
                 label: "calls".to_string(),
+                direction: EdgeDirection::Calls,
             }],
         };
         let out = dr.render_mermaid("", false);
@@ -1378,6 +1452,7 @@ mod tests {
                 from: "Foo".to_string(),
                 to: "Bar".to_string(),
                 label: "calls".to_string(),
+                direction: EdgeDirection::Calls,
             }],
         };
         let out = dr.render_mermaid("TD", true);
@@ -1408,6 +1483,7 @@ mod tests {
                 from: "X".to_string(),
                 to: "Y".to_string(),
                 label: "inherits".to_string(),
+                direction: EdgeDirection::Calls,
             }],
         };
         let out = dr.render_mermaid("BT", false);
@@ -1428,21 +1504,25 @@ mod tests {
                     from: "root".to_string(),
                     to: "a".to_string(),
                     label: "calls".to_string(),
+                    direction: EdgeDirection::Calls,
                 },
                 DiagramEdge {
                     from: "root".to_string(),
                     to: "b".to_string(),
                     label: "calls".to_string(),
+                    direction: EdgeDirection::Calls,
                 },
                 DiagramEdge {
                     from: "a".to_string(),
                     to: "c".to_string(),
                     label: "calls".to_string(),
+                    direction: EdgeDirection::Calls,
                 },
                 DiagramEdge {
                     from: "b".to_string(),
                     to: "c".to_string(),
                     label: "calls".to_string(),
+                    direction: EdgeDirection::Calls,
                 },
             ],
         };
@@ -1461,6 +1541,7 @@ mod tests {
                 from: "X".to_string(),
                 to: "Y".to_string(),
                 label: String::new(),
+                direction: EdgeDirection::Calls,
             }],
         };
         let out = dr.render_mermaid("TD", false);
@@ -1471,6 +1552,109 @@ mod tests {
         assert!(
             !out.contains("-->|"),
             "unlabeled edge must not emit `|...|`: {out:?}",
+        );
+    }
+
+    #[test]
+    fn render_mermaid_outgoing_solid_incoming_dashed() {
+        // A diagram mixing one outgoing (Calls) and one incoming
+        // (CalledBy) edge must render BOTH a solid `-->` arrow and a
+        // dashed `-.->` arrow, with the incoming edge carrying the
+        // fixed "called by" label rather than its own.
+        let dr = DiagramResult {
+            center: "Seed".to_string(),
+            edges: vec![
+                DiagramEdge {
+                    from: "Seed".to_string(),
+                    to: "Callee".to_string(),
+                    label: "calls".to_string(),
+                    direction: EdgeDirection::Calls,
+                },
+                DiagramEdge {
+                    from: "Caller".to_string(),
+                    to: "Seed".to_string(),
+                    label: "calls".to_string(),
+                    direction: EdgeDirection::CalledBy,
+                },
+            ],
+        };
+        let out = dr.render_mermaid("TD", false);
+        // Solid arrow for the outgoing edge, with its own label.
+        assert!(
+            out.contains("-->|calls|"),
+            "outgoing Calls edge must render a solid `-->|calls|` arrow: {out:?}",
+        );
+        // Dashed arrow + fixed "called by" label for the incoming edge.
+        assert!(
+            out.contains("-.->|called by|"),
+            "incoming CalledBy edge must render a dashed `-.->|called by|` arrow: {out:?}",
+        );
+        // Both arrow operators present in the same rendered diagram.
+        assert!(
+            out.contains(" --> ") || out.contains("-->|"),
+            "rendered output must contain a solid `-->` arrow: {out:?}",
+        );
+        assert!(
+            out.contains("-.->"),
+            "rendered output must contain a dashed `-.->` arrow: {out:?}",
+        );
+        // The incoming edge must NOT leak its raw label.
+        assert!(
+            !out.contains("-.->|calls|"),
+            "CalledBy edge must use the fixed `called by` label, not its raw label: {out:?}",
+        );
+    }
+
+    #[test]
+    fn diagram_edge_direction_serializes_calls_and_called_by() {
+        // The per-edge tag serializes as the wire strings "calls" /
+        // "called_by" (distinct from DiagramDirection's
+        // "callees"/"callers"/"both"). Both arms of a BFS over a
+        // caller→target fixture are exercised: from the target's
+        // viewpoint, `target` calls `helper` (Calls) and `caller`
+        // calls into `target` (CalledBy).
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("caller", SymbolKind::Function, "/x.cpp"),
+                sym("target", SymbolKind::Function, "/x.cpp"),
+                sym("helper", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:caller", "/x.cpp:target", "/x.cpp", 1),
+                call_edge("/x.cpp:target", "/x.cpp:helper", "/x.cpp", 2),
+            ],
+        ));
+
+        let result = g
+            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30)
+            .expect("target is known");
+
+        let outgoing = result
+            .edges
+            .iter()
+            .find(|e| e.from == "target" && e.to == "helper")
+            .expect("the target -> helper outgoing edge must be present");
+        assert_eq!(outgoing.direction, EdgeDirection::Calls);
+
+        let incoming = result
+            .edges
+            .iter()
+            .find(|e| e.from == "caller" && e.to == "target")
+            .expect("the caller -> target incoming edge must be present");
+        assert_eq!(incoming.direction, EdgeDirection::CalledBy);
+
+        let outgoing_json = serde_json::to_string(outgoing).expect("edge serializes");
+        assert!(
+            outgoing_json.contains("\"direction\":\"calls\""),
+            "outgoing edge must serialize direction as \"calls\": {outgoing_json}",
+        );
+        let incoming_json = serde_json::to_string(incoming).expect("edge serializes");
+        assert!(
+            incoming_json.contains("\"direction\":\"called_by\""),
+            "incoming edge must serialize direction as \"called_by\": {incoming_json}",
         );
     }
 }

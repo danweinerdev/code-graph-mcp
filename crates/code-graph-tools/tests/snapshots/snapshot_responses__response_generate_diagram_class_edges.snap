@@ -4,6 +4,7 @@ expression: normalized
 ---
 [
   {
+    "direction": "calls",
     "from": "DebugEngine",
     "label": "inherits",
     "to": "Engine"
