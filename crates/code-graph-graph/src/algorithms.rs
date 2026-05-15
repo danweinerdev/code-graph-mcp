@@ -20,9 +20,11 @@
 //! [`Graph::class_hierarchy`] and the
 //! `class_hierarchy_diamond_4_level_fixture` test below.
 //!
-//! Locking is not handled in this module. Task 2.6 wraps [`Graph`] in
-//! `parking_lot::RwLock`; until then these methods take `&self` and rely
-//! on the caller for synchronization.
+//! Locking is not handled in this module: these methods take `&self`
+//! and rely on the caller for synchronization. The server-side
+//! [`Graph`] is wrapped in `parking_lot::RwLock` (re-exported from
+//! `code_graph_graph::RwLock`); query handlers take a read lock around
+//! the call.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -305,6 +307,31 @@ impl Graph {
             r#ref: None,
         };
 
+        // Depth-budget short-circuit. We've already charged this name's
+        // unique-slot into `visited_unique` above, before this early
+        // return — that insert is intentionally on the first-visit path,
+        // not gated by depth. Consequence: when two sibling subtrees both
+        // reach the same name at exactly `depth == 0`, the FIRST sibling
+        // emits a bare leaf (the `name` enters `visited_unique` here)
+        // and the SECOND sibling falls into the ref-stub branch above
+        // (the `visited_unique.contains(name)` check at case 2). Same
+        // name, two different JSON shapes — bare leaf vs `ref: true` —
+        // depending on visit order.
+        //
+        // The asymmetry is INTENTIONAL. `visited_unique` is the
+        // `max_nodes` budget account and the `total_nodes_seen` source
+        // of truth ("unique class names walked"); a depth==0 leaf is
+        // still a walked name and must charge a slot. Charging only
+        // after `depth > 0` would let a deep-tree query understate
+        // `total_nodes_seen` and over-budget against `max_nodes` for any
+        // name first reached at the depth horizon.
+        //
+        // Pinned by `hierarchy_depth_zero_sibling_reach_emits_ref_stub`
+        // in this module — that test constructs a Root with two derived
+        // arms both reaching the same name at `depth == 0` and asserts
+        // the bare-leaf-then-ref-stub asymmetry. If a future refactor
+        // moves the `visited_unique.insert` below this early return,
+        // that test fires and tells you which invariant was broken.
         if depth == 0 {
             return node;
         }
@@ -1208,5 +1235,422 @@ mod tests {
 
         assert_eq!(root.derived.len(), 1);
         assert_eq!(root.derived[0].name, "Leaf");
+    }
+
+    // --- Task 2.3 fixtures: diamond, no-diamond, cycle, depth-0 ---
+
+    /// Walk a [`HierarchyNode`] and find the FIRST canonical occurrence of
+    /// each name (canonical = `r#ref == None` AND at least one of
+    /// `bases`/`derived` non-empty, OR a leaf with `r#ref == None`).
+    ///
+    /// The walk preserves pre-order so the first canonical occurrence
+    /// matches the first non-ref node the algorithm emitted. Ref-stubs
+    /// (`r#ref == Some(true)`) are skipped — they don't define a canonical.
+    fn collect_canonicals(node: &HierarchyNode, out: &mut HashMap<String, HierarchyNode>) {
+        if node.r#ref.is_none() {
+            out.entry(node.name.clone()).or_insert_with(|| node.clone());
+        }
+        for b in &node.bases {
+            collect_canonicals(b, out);
+        }
+        for d in &node.derived {
+            collect_canonicals(d, out);
+        }
+    }
+
+    /// Build the "no-ref baseline" — the tree the algorithm WOULD have
+    /// emitted without diamond dedupe. Walks `node` recursively; every
+    /// `r#ref: Some(true)` stub is replaced with a deep clone of the
+    /// canonical occurrence taken from `canonicals`. The result is what a
+    /// naive pre-Task-2.2 walk would produce, used to measure the byte-
+    /// length savings from the ref-stub mechanism.
+    fn expand_ref_stubs(
+        node: &HierarchyNode,
+        canonicals: &HashMap<String, HierarchyNode>,
+    ) -> HierarchyNode {
+        if node.r#ref == Some(true) {
+            // Replace the stub with the canonical's full subtree; the
+            // canonical itself may contain ref-stubs internally, so we
+            // recurse into the expansion to inline those too.
+            if let Some(canon) = canonicals.get(&node.name) {
+                return expand_ref_stubs(canon, canonicals);
+            }
+            // No canonical found (shouldn't happen for a valid ref-stub
+            // from this algorithm); fall through to a bare-leaf clone.
+        }
+        HierarchyNode {
+            name: node.name.clone(),
+            bases: node
+                .bases
+                .iter()
+                .map(|b| expand_ref_stubs(b, canonicals))
+                .collect(),
+            derived: node
+                .derived
+                .iter()
+                .map(|d| expand_ref_stubs(d, canonicals))
+                .collect(),
+            r#ref: None,
+        }
+    }
+
+    /// Search the tree for a node with `name` AND `r#ref == None` AND
+    /// non-empty `bases`. Used as a one-shot "did the canonical full-
+    /// subtree expansion actually happen?" check.
+    fn find_full_node<'a>(node: &'a HierarchyNode, name: &str) -> Option<&'a HierarchyNode> {
+        if node.name == name
+            && node.r#ref.is_none()
+            && (!node.bases.is_empty() || !node.derived.is_empty())
+        {
+            return Some(node);
+        }
+        for b in &node.bases {
+            if let Some(found) = find_full_node(b, name) {
+                return Some(found);
+            }
+        }
+        for d in &node.derived {
+            if let Some(found) = find_full_node(d, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Count how many ref-stub (`r#ref == Some(true)`) nodes appear
+    /// anywhere in the tree.
+    fn count_ref_stubs(node: &HierarchyNode) -> usize {
+        let here = usize::from(node.r#ref == Some(true));
+        let bases: usize = node.bases.iter().map(count_ref_stubs).sum();
+        let derived: usize = node.derived.iter().map(count_ref_stubs).sum();
+        here + bases + derived
+    }
+
+    /// (a) Diamond fixture: D inherits from B1 AND B2, both inherit from
+    /// A. A has a fat downward subtree (Sub1/Sub2/Sub3 inherit from B2;
+    /// Inner inherits from Sub1) so the ref-stub mechanism has a real
+    /// subtree to dedupe — without that, the 20% byte-savings target
+    /// passes for shape reasons only and the assertion proves nothing.
+    ///
+    /// The discriminator: at least one ref-stub MUST appear in the walked
+    /// tree, the canonical subtree MUST appear fully expanded somewhere
+    /// in the result, and the serialized JSON MUST be at least 20%
+    /// shorter than the "expand every ref-stub" baseline — proving the
+    /// mechanism actually reduces wire size, not merely produces valid
+    /// output.
+    #[test]
+    fn hierarchy_diamond_emits_ref_stub() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/diamond.cpp",
+            Language::Cpp,
+            vec![
+                sym("D", SymbolKind::Class, "/diamond.cpp"),
+                sym("B1", SymbolKind::Class, "/diamond.cpp"),
+                sym("B2", SymbolKind::Class, "/diamond.cpp"),
+                sym("A", SymbolKind::Class, "/diamond.cpp"),
+                sym("Sub1", SymbolKind::Class, "/diamond.cpp"),
+                sym("Sub2", SymbolKind::Class, "/diamond.cpp"),
+                sym("Sub3", SymbolKind::Class, "/diamond.cpp"),
+                sym("Inner", SymbolKind::Class, "/diamond.cpp"),
+            ],
+            vec![
+                // Diamond: D -> {B1, B2}; B1 -> A; B2 -> A.
+                inherit_edge("D", "B1", "/diamond.cpp"),
+                inherit_edge("D", "B2", "/diamond.cpp"),
+                inherit_edge("B1", "A", "/diamond.cpp"),
+                inherit_edge("B2", "A", "/diamond.cpp"),
+                // Fatten B2's derived subtree so the ref-stub
+                // dedupe target is non-trivial. Without these, the byte
+                // savings is too small to clearly clear the 20% bar.
+                inherit_edge("Sub1", "B2", "/diamond.cpp"),
+                inherit_edge("Sub2", "B2", "/diamond.cpp"),
+                inherit_edge("Sub3", "B2", "/diamond.cpp"),
+                inherit_edge("Inner", "Sub1", "/diamond.cpp"),
+            ],
+        ));
+
+        let (result, _total, _truncated) = g.class_hierarchy("D", 5, u32::MAX).expect("D found");
+
+        // The canonical B2 (full subtree) lives under A's derived in this
+        // walk: A is reached via B1 first, then A's derived contains B2
+        // as the first-visit occurrence. The ref-stub for B2 lives at
+        // `D.bases[1]` (the second time we'd otherwise expand B2).
+        //
+        // Discriminator 1: AT LEAST ONE ref-stub appears in the result.
+        let stubs = count_ref_stubs(&result);
+        assert!(
+            stubs >= 1,
+            "diamond fixture must produce at least one ref-stub; got {stubs}",
+        );
+
+        // Discriminator 2: the canonical B2 (with its fat derived
+        // subtree) is fully expanded somewhere in the tree. Find it via
+        // `find_full_node`; assert non-empty `derived` so we know the
+        // expansion actually happened (not merely a bare-leaf B2).
+        let canon_b2 = find_full_node(&result, "B2")
+            .expect("canonical B2 (non-ref, non-empty subtree) must appear in the tree");
+        assert_eq!(canon_b2.r#ref, None);
+        assert!(
+            !canon_b2.derived.is_empty(),
+            "canonical B2 must carry its derived subtree; got empty derived",
+        );
+
+        // Discriminator 3 (the load-bearing one): serialize the actual
+        // result AND the no-ref baseline (every ref-stub re-expanded
+        // inline with the canonical's full subtree). The ref form must
+        // be at least 20% shorter — proving the mechanism reduces wire
+        // size in the diamond case.
+        let serialized = serde_json::to_string(&result).expect("serialize result");
+        let mut canonicals: HashMap<String, HierarchyNode> = HashMap::new();
+        collect_canonicals(&result, &mut canonicals);
+        let baseline = expand_ref_stubs(&result, &canonicals);
+        let baseline_json = serde_json::to_string(&baseline).expect("serialize baseline");
+
+        let with_ref_len = serialized.len();
+        let baseline_len = baseline_json.len();
+        assert!(
+            with_ref_len < baseline_len,
+            "ref form ({with_ref_len} B) must be strictly smaller than baseline ({baseline_len} B)",
+        );
+        // Target: ref form is at least 20% shorter (i.e. <= 80% of
+        // baseline). The phase spec calls for "at least 20%" reduction.
+        let ratio = (with_ref_len as f64) / (baseline_len as f64);
+        assert!(
+            ratio <= 0.80,
+            "ref form must be at least 20% shorter than baseline; \
+             got ratio {ratio:.3} ({with_ref_len} B / {baseline_len} B)",
+        );
+    }
+
+    /// (b) Linear inheritance fixture: D -> B -> A, no diamonds. The
+    /// serialized form MUST NOT contain the literal substring `"ref":`
+    /// anywhere — that's the agent-visible signal that the ref-stub
+    /// branch is dormant when no diamond exists.
+    #[test]
+    fn hierarchy_no_diamond_omits_ref_field() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/linear.cpp",
+            Language::Cpp,
+            vec![
+                sym("A", SymbolKind::Class, "/linear.cpp"),
+                sym("B", SymbolKind::Class, "/linear.cpp"),
+                sym("D", SymbolKind::Class, "/linear.cpp"),
+            ],
+            vec![
+                inherit_edge("B", "A", "/linear.cpp"),
+                inherit_edge("D", "B", "/linear.cpp"),
+            ],
+        ));
+
+        let (result, _total, _truncated) = g.class_hierarchy("D", 5, u32::MAX).expect("D found");
+
+        // Sanity: the tree shape is the linear chain we expect, with no
+        // ref-stubs anywhere.
+        assert_eq!(count_ref_stubs(&result), 0);
+        assert_eq!(result.name, "D");
+        assert_eq!(result.bases.len(), 1);
+        assert_eq!(result.bases[0].name, "B");
+        assert_eq!(result.bases[0].bases.len(), 1);
+        assert_eq!(result.bases[0].bases[0].name, "A");
+
+        // The load-bearing assertion: the literal `"ref":` substring
+        // must NOT appear in the serialized JSON. `skip_serializing_if =
+        // "Option::is_none"` drops the field when `r#ref` is `None`, so
+        // a no-diamond walk emits no `"ref":` key at all. This is the
+        // wire-shape promise to JSON consumers.
+        let serialized = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            !serialized.contains("\"ref\":"),
+            "no-diamond tree must not contain the literal `\"ref\":` substring; got:\n{serialized}",
+        );
+    }
+
+    /// (c) Cycle fixture: A inherits from B, B inherits from A. The
+    /// cycle return point (A reached from B's bases while A is still on
+    /// the DFS path) must emit a bare leaf `{name: "A"}` with `r#ref ==
+    /// None`, NOT a ref-stub. This pins the on_path-wins-over-
+    /// visited_unique precedence in [`Graph::build_hierarchy`] case (1)
+    /// vs case (2). Reversing the check order would make this test fail.
+    #[test]
+    fn hierarchy_cycle_emits_bare_leaf_not_ref() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/cycle.cpp",
+            Language::Cpp,
+            vec![
+                sym("A", SymbolKind::Class, "/cycle.cpp"),
+                sym("B", SymbolKind::Class, "/cycle.cpp"),
+            ],
+            vec![
+                inherit_edge("A", "B", "/cycle.cpp"),
+                inherit_edge("B", "A", "/cycle.cpp"),
+            ],
+        ));
+
+        // Generous depth so the budget doesn't gate the cycle guard.
+        let (result, _total, _truncated) = g.class_hierarchy("A", 10, u32::MAX).expect("A found");
+
+        // result is the canonical A. result.bases[0] is B (first visit).
+        // B's bases include A; at the point B walks adj["B"] = A, the
+        // on_path set is {A, B}, so the cycle guard fires and returns a
+        // bare leaf `{name: "A"}` — NOT a ref-stub. This is the load-
+        // bearing precedence assertion.
+        assert_eq!(result.name, "A");
+        assert_eq!(result.r#ref, None, "root A is canonical");
+        assert_eq!(result.bases.len(), 1, "A.bases = [B]");
+        let b = &result.bases[0];
+        assert_eq!(b.name, "B");
+        assert_eq!(b.r#ref, None, "B is canonical (first visit)");
+        assert_eq!(b.bases.len(), 1, "B.bases = [A cycle leaf]");
+        let a_cycle = &b.bases[0];
+        assert_eq!(a_cycle.name, "A");
+        assert_eq!(
+            a_cycle.r#ref, None,
+            "A reached at the cycle return point MUST be a bare leaf, \
+             NOT a ref-stub (`Some(true)`); a `Some(true)` here means the \
+             `on_path` check no longer wins over `visited_unique`, which \
+             would conflate cycles with diamonds in the wire shape",
+        );
+        assert!(
+            a_cycle.bases.is_empty() && a_cycle.derived.is_empty(),
+            "cycle leaf must carry empty bases/derived",
+        );
+
+        // Belt-and-suspenders: serialize and assert the cycle-leaf A
+        // emits NO `"ref":` field even though A is otherwise in
+        // `visited_unique`. The bare-leaf shape is the wire-level cycle
+        // indicator; ref-stubs would mis-signal a diamond.
+        let cycle_a_json = serde_json::to_string(a_cycle).expect("serialize cycle leaf");
+        assert_eq!(
+            cycle_a_json, r#"{"name":"A"}"#,
+            "cycle leaf must serialize to byte-identical `{{\"name\":\"A\"}}`, \
+             no `ref` field; got: {cycle_a_json}",
+        );
+    }
+
+    /// (d) Depth-0 sibling regression: two sibling sub-paths from the
+    /// same root both reach the same name at exactly `depth == 0` of the
+    /// recursion budget. The FIRST reach emits a bare leaf (the
+    /// `if depth == 0 { return node; }` early-return runs AFTER
+    /// `visited_unique.insert` charges the slot); the SECOND reach hits
+    /// the `visited_unique.contains` ref-stub branch. Same name, two
+    /// different JSON shapes.
+    ///
+    /// **The asymmetry is intentional.** See the inline comment near the
+    /// `if depth == 0 { return node; }` early-return in
+    /// [`Graph::build_hierarchy`] for the invariant explanation. This
+    /// test exists to pin the current behavior so future refactors
+    /// (e.g. moving the `visited_unique` insert below the depth-0
+    /// short-circuit) can't silently change the wire shape — moving the
+    /// insert would make BOTH depth-0 reaches emit bare leaves, which
+    /// would under-count `total_nodes_seen` and over-budget against
+    /// `max_nodes` for names first reached at the depth horizon.
+    ///
+    /// Fixture (Inherits flows child -> parent in this codebase):
+    /// ```text
+    ///   Root
+    ///    ^
+    ///   ├── A
+    ///   │    ^
+    ///   │    └── X    (X inherits from A, so X is in radj["A"])
+    ///   └── B
+    ///        ^
+    ///        └── X    (X also inherits from B, so X is in radj["B"])
+    /// ```
+    /// `class_hierarchy("Root", depth=2, ...)` walks Root with depth=2,
+    /// recurses into Root's derived (A, B) at depth=1, and each of those
+    /// recurses into X at depth=0. The first X reach is a bare leaf; the
+    /// second is a ref-stub.
+    #[test]
+    fn hierarchy_depth_zero_sibling_reach_emits_ref_stub() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/depth0.cpp",
+            Language::Cpp,
+            vec![
+                sym("Root", SymbolKind::Class, "/depth0.cpp"),
+                sym("A", SymbolKind::Class, "/depth0.cpp"),
+                sym("B", SymbolKind::Class, "/depth0.cpp"),
+                sym("X", SymbolKind::Class, "/depth0.cpp"),
+            ],
+            vec![
+                // Edge insertion order is preserved by `merge_file_graph`
+                // and is the source of truth for `radj` traversal order:
+                // A enters radj["Root"] before B, and similarly X enters
+                // radj["A"] before radj["B"]. So Root.derived = [A, B]
+                // (A first), and X is reached via A first.
+                inherit_edge("A", "Root", "/depth0.cpp"),
+                inherit_edge("B", "Root", "/depth0.cpp"),
+                inherit_edge("X", "A", "/depth0.cpp"),
+                inherit_edge("X", "B", "/depth0.cpp"),
+            ],
+        ));
+
+        // depth=2: Root at depth 2, Root's derived (A, B) at depth 1,
+        // X under each at depth 0. The depth-0 branch is what we're
+        // exercising — both X reaches happen at depth=0 in the recursion.
+        let (result, total, _truncated) =
+            g.class_hierarchy("Root", 2, u32::MAX).expect("Root found");
+        assert_eq!(result.name, "Root");
+        assert_eq!(result.bases.len(), 0, "Root has no bases in this fixture");
+        assert_eq!(result.derived.len(), 2, "Root.derived = [A, B]");
+        let a = &result.derived[0];
+        let b = &result.derived[1];
+        assert_eq!(a.name, "A");
+        assert_eq!(b.name, "B");
+
+        // A's derived must contain X as the FIRST-reach bare leaf.
+        // Discriminator: `r#ref == None` AND empty bases/derived.
+        assert_eq!(a.derived.len(), 1, "A.derived = [X]");
+        let x_under_a = &a.derived[0];
+        assert_eq!(x_under_a.name, "X");
+        assert_eq!(
+            x_under_a.r#ref, None,
+            "FIRST sibling reach of X at depth=0 must be a bare leaf \
+             (r#ref: None), not a ref-stub. The depth==0 early-return \
+             runs AFTER visited_unique.insert charges the slot, so the \
+             first reach exits via the depth gate before the ref-stub \
+             branch can fire.",
+        );
+        assert!(
+            x_under_a.bases.is_empty() && x_under_a.derived.is_empty(),
+            "depth-0 leaf must carry empty bases/derived",
+        );
+
+        // B's derived must contain X as the SECOND-reach ref-stub.
+        // Discriminator: `r#ref == Some(true)` AND empty bases/derived.
+        assert_eq!(b.derived.len(), 1, "B.derived = [X]");
+        let x_under_b = &b.derived[0];
+        assert_eq!(x_under_b.name, "X");
+        assert_eq!(
+            x_under_b.r#ref,
+            Some(true),
+            "SECOND sibling reach of X at depth=0 must be a ref-stub \
+             (r#ref: Some(true)). X is in visited_unique from the first \
+             reach above, so case (2) of build_hierarchy's three-way \
+             branch fires before depth is even consulted. This is the \
+             asymmetry the test pins — same name, two shapes, visit-order \
+             dependent.",
+        );
+        assert!(
+            x_under_b.bases.is_empty() && x_under_b.derived.is_empty(),
+            "ref-stub must carry empty bases/derived",
+        );
+
+        // `total_nodes_seen` invariant check: X was charged exactly one
+        // slot despite being reached twice. Root, A, B, X = 4 unique
+        // names walked. If the depth-0 visited_unique.insert moved below
+        // the early return, total would still be 4 here (X enters via
+        // the second reach's case-2 branch which would no longer fire),
+        // but the wire shape would change — which is exactly what this
+        // test detects.
+        assert_eq!(
+            total, 4,
+            "total_nodes_seen must equal the 4 unique names walked \
+             (Root, A, B, X); X charges one slot regardless of how many \
+             arms reach it",
+        );
     }
 }

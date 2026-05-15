@@ -7,13 +7,15 @@
 //! shape uses `int` for line and depth; the Rust port uses `u32` since
 //! both are non-negative by construction.
 //!
-//! Locking is not handled in this module. Task 2.6 wraps [`Graph`] in
-//! `parking_lot::RwLock`; until then these methods take `&self` and rely
-//! on the caller for synchronization.
+//! Locking is not handled in this module: these methods take `&self`
+//! and rely on the caller for synchronization. The server-side
+//! [`Graph`] is wrapped in `parking_lot::RwLock` (re-exported from
+//! `code_graph_graph::RwLock`); query handlers take a read lock
+//! around the call.
 //!
 //! Class-hierarchy traversal and cycle detection live in their own
-//! submodule (`algorithms.rs` from Task 2.4) — this module deliberately
-//! stays focused on the call-graph surface.
+//! submodule (`algorithms.rs`) — this module deliberately stays
+//! focused on the call-graph surface.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
