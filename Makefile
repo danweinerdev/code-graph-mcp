@@ -2,7 +2,7 @@
 # the binary for — `make release` produces a host-target release build.
 
 .PHONY: build release test lint fmt fmt-check clean \
-	snapshot-clean snapshot-audit install-hooks submodules \
+	snapshot-clean snapshot-accept snapshot-audit install-hooks submodules \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -48,6 +48,43 @@ snapshot-clean:
 		exit 1; \
 	fi
 	@echo "✓ No pending snapshots."
+
+# Accept exactly one pending insta snapshot by name. `cargo insta
+# accept --snapshot <name>` silently no-ops in this repo's layout (the
+# CLI's name matching does not line up with the nested snapshot path),
+# so a single snapshot has to be promoted by hand: `mv X.snap.new
+# X.snap`. This target does that safely — it refuses to act unless
+# EXACTLY one `*.snap.new` matches the given stem, so a typo or an
+# over-broad fragment can't silently promote the wrong file or sweep
+# several. After promoting it runs the `snapshot-clean` gate so any
+# OTHER still-pending snapshot is surfaced immediately rather than
+# riding along in the next commit.
+#
+#   make snapshot-accept FILE=snapshot_tools_list__tools_list_get_orphans
+#
+# FILE is the snapshot stem; a trailing .snap or .snap.new is tolerated.
+snapshot-accept:
+	@if [ -z "$(FILE)" ]; then \
+		echo "✗ FILE is required: make snapshot-accept FILE=<snapshot-stem>"; \
+		exit 1; \
+	fi
+	@stem=$$(echo "$(FILE)" | sed -e 's/\.snap\.new$$//' -e 's/\.snap$$//'); \
+	matches=$$(find crates -type f -name "$$stem.snap.new" 2>/dev/null); \
+	count=$$(printf '%s' "$$matches" | grep -c . || true); \
+	if [ "$$count" -eq 0 ]; then \
+		echo "✗ No pending snapshot matching '$$stem.snap.new' under crates/."; \
+		echo "  (run the failing snapshot test first, or check the stem)"; \
+		exit 1; \
+	elif [ "$$count" -gt 1 ]; then \
+		echo "✗ '$$stem' is ambiguous — $$count pending files match:"; \
+		echo "$$matches" | sed 's/^/    /'; \
+		echo "  Pass the full snapshot stem so exactly one matches."; \
+		exit 1; \
+	fi; \
+	target=$$(printf '%s' "$$matches" | sed 's/\.snap\.new$$/.snap/'); \
+	mv "$$matches" "$$target"; \
+	echo "✓ Accepted $$target"
+	@$(MAKE) --no-print-directory snapshot-clean
 
 # Snapshot delta audit: assert that any modified/untracked snapshot
 # file matches an expected name fragment. Catches accidental cross-tool
