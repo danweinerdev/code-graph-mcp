@@ -417,20 +417,28 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
     let depth = input.depth.filter(|&d| d > 0).unwrap_or(1);
     let max_nodes = input.max_nodes.filter(|&m| m > 0).unwrap_or(30);
 
-    // Absent or empty direction means "both arms" so callers predating
-    // the direction filter keep the original who-calls-X-and-who-X-calls
-    // behavior. Only the `symbol` (call graph) branch consults this; the
-    // accepted spellings mirror the serde renames on `DiagramDirection`.
-    let direction_spelling = input.direction.unwrap_or("");
-    let direction = match direction_spelling {
-        "" | "both" => DiagramDirection::Both,
-        "callees" => DiagramDirection::Callees,
-        "callers" => DiagramDirection::Callers,
-        other => {
-            return tool_error(format!(
-                "invalid direction: {other}. Expected one of: callees, callers, both"
-            ));
+    // Only the `symbol` (call graph) branch consults `direction`, so it is
+    // resolved and validated solely for that mode — a `direction` passed
+    // alongside `file=`/`class=` is ignored rather than rejected, keeping
+    // the "symbol mode only" contract honest. Absent or empty means "both
+    // arms" so callers predating the direction filter keep the original
+    // who-calls-X-and-who-X-calls behavior. Accepted spellings mirror the
+    // serde renames on `DiagramDirection`.
+    let direction = if symbol.is_some() {
+        match input.direction.unwrap_or("") {
+            "" | "both" => DiagramDirection::Both,
+            "callees" => DiagramDirection::Callees,
+            "callers" => DiagramDirection::Callers,
+            other => {
+                return tool_error(format!(
+                    "invalid direction: {other}. Expected one of: callees, callers, both"
+                ));
+            }
         }
+    } else {
+        // Unused by the file/class branches; the value never reaches a
+        // traversal so the choice is irrelevant.
+        DiagramDirection::Both
     };
 
     let format = input.format.unwrap_or("");
@@ -1593,6 +1601,46 @@ mod tests {
         assert_eq!(
             body_text(&r),
             "invalid format: svg. Expected 'edges' or 'mermaid'"
+        );
+    }
+
+    #[test]
+    fn diagram_invalid_direction_errors_in_symbol_mode() {
+        let g = locked(diagram_graph());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                direction: Some("calle_es"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(
+            body_text(&r),
+            "invalid direction: calle_es. Expected one of: callees, callers, both"
+        );
+    }
+
+    #[test]
+    fn diagram_invalid_direction_ignored_in_file_mode() {
+        // `direction` is symbol-mode-only. A bad spelling alongside
+        // `file=` must NOT surface a direction error — the file diagram
+        // is produced as if no direction were given.
+        let g = locked(diagram_graph());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                file: Some("/x.cpp"),
+                direction: Some("not-a-direction"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert_ne!(
+            r.is_error,
+            Some(true),
+            "file-mode diagram must ignore an invalid direction, got error: {}",
+            body_text(&r)
         );
     }
 

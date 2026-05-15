@@ -281,7 +281,11 @@ impl Graph {
         }
 
         let mut result = DiagramResult {
-            center: mermaid_label(start_id, &self.nodes),
+            // The seed normally resolves (callers pre-check it), but a
+            // resolved symbol with an empty `name` yields `None`. Fall
+            // back to the raw SymbolId so the center always renders
+            // something rather than dropping the whole diagram.
+            center: mermaid_label(start_id, &self.nodes).unwrap_or_else(|| start_id.to_string()),
             edges: Vec::new(),
         };
         let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -295,10 +299,21 @@ impl Graph {
             if !visited.contains(&from) || !visited.contains(&to) {
                 continue;
             }
+            // Drop edges whose endpoints don't resolve to a real symbol.
+            // An unresolved endpoint would otherwise render as a
+            // path-basename pseudo-node with no symbol behind it;
+            // emitting nothing is the truer signal.
+            let (from_label, to_label) = match (
+                mermaid_label(&from, &self.nodes),
+                mermaid_label(&to, &self.nodes),
+            ) {
+                (Some(f), Some(t)) => (f, t),
+                _ => continue,
+            };
             seen.insert((from.clone(), to.clone()));
             result.edges.push(DiagramEdge {
-                from: mermaid_label(&from, &self.nodes),
-                to: mermaid_label(&to, &self.nodes),
+                from: from_label,
+                to: to_label,
                 label: "calls".to_string(),
             });
         }
@@ -587,31 +602,26 @@ impl DiagramResult {
 
 /// Display label for a node ID in a call-graph diagram.
 ///
-/// If `id` is a known symbol, return `Parent::Name` when `Parent` is
-/// non-empty, otherwise `Name`. If `id` is *not* a known symbol it might
-/// be a bare callee name extracted by the parser (an unresolved external
-/// call) — in that case absolute paths are shortened to their basename
-/// for readability, while non-path identifiers are returned verbatim.
+/// Returns `Some(Parent::Name)` when `id` resolves to a known symbol
+/// with a non-empty parent, `Some(Name)` when it resolves with an empty
+/// parent, and `None` when `id` does not resolve to a node *or* resolves
+/// to a node whose `name` is empty.
 ///
-/// Mirrors the Go reference at `graph.go:555–567`. The `is_absolute`
-/// check uses [`Path::is_absolute`] which is correct on Unix; on
-/// Windows it's slightly more lenient than Go's `filepath.IsAbs` but
-/// the Rust binary is built and run on the same platforms as the Go
-/// reference, so the divergence has no observable effect.
-fn mermaid_label(id: &str, nodes: &HashMap<SymbolId, Node>) -> String {
-    if let Some(node) = nodes.get(id) {
-        if !node.symbol.parent.is_empty() {
-            return format!("{}::{}", node.symbol.parent, node.symbol.name);
-        }
-        return node.symbol.name.clone();
+/// An unresolved `id` is typically a bare callee string the parser
+/// extracted but the call resolver could not bind to a definition (an
+/// external or unresolvable call). Returning `None` lets callers drop
+/// such edges entirely rather than rendering a pseudo-node derived from
+/// a path basename — an absent edge is a truer signal than a synthetic
+/// `File.cpp` node that has no symbol behind it.
+fn mermaid_label(id: &str, nodes: &HashMap<SymbolId, Node>) -> Option<String> {
+    let node = nodes.get(id)?;
+    if node.symbol.name.is_empty() {
+        return None;
     }
-    let p = Path::new(id);
-    if p.is_absolute() {
-        if let Some(base) = p.file_name() {
-            return base.to_string_lossy().into_owned();
-        }
+    if !node.symbol.parent.is_empty() {
+        return Some(format!("{}::{}", node.symbol.parent, node.symbol.name));
     }
-    id.to_string()
+    Some(node.symbol.name.clone())
 }
 
 /// Display name for a file path in a file-graph diagram. Returns the
@@ -1028,6 +1038,55 @@ mod tests {
         assert_eq!(result.center, "MyClass::doWork");
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].from, "MyClass::doWork");
+    }
+
+    #[test]
+    fn diagram_drops_edge_with_unresolved_endpoint() {
+        // `caller` calls a target SymbolId that was never indexed as a
+        // symbol (the call resolver bottomed out on a path string). The
+        // edge's target does not resolve to a node, so it must be
+        // dropped entirely — no path-basename pseudo-node may leak into
+        // `result.edges`.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("caller", SymbolKind::Function, "/x.cpp"),
+                sym("realCallee", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                // Resolves: both endpoints are indexed symbols.
+                call_edge("/x.cpp:caller", "/x.cpp:realCallee", "/x.cpp", 1),
+                // Does NOT resolve: target SymbolId is not a node key.
+                // Pre-fix this rendered as the basename "Platform.cpp".
+                call_edge("/x.cpp:caller", "/ext/Platform.cpp:doStuff", "/x.cpp", 2),
+            ],
+        ));
+
+        let result = g
+            .diagram_call_graph("/x.cpp:caller", DiagramDirection::Both, 1, 30)
+            .expect("caller is known");
+
+        assert_eq!(result.center, "caller");
+        // Only the resolved edge survives; the unresolved one is gone.
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "unresolved-endpoint edge must be dropped: {:?}",
+            result.edges,
+        );
+        assert_eq!(result.edges[0].from, "caller");
+        assert_eq!(result.edges[0].to, "realCallee");
+        // No edge label may be a file basename — the leak being fixed.
+        for e in &result.edges {
+            for label in [&e.from, &e.to] {
+                assert!(
+                    !label.ends_with(".cpp") && !label.ends_with(".h") && !label.ends_with(".rs"),
+                    "edge label {label:?} looks like a file basename pseudo-node",
+                );
+            }
+        }
     }
 
     // ----- diagram_file_graph -----
