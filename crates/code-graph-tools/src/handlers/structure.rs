@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use code_graph_core::{paths, symbol_id, SymbolKind};
-use code_graph_graph::{DiagramEdge, Graph, HierarchyNode};
+use code_graph_graph::{DiagramDirection, DiagramEdge, Graph, HierarchyNode};
 use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
@@ -373,6 +373,12 @@ pub struct GenerateDiagramInput<'a> {
     pub max_nodes: Option<u32>,
     pub format: Option<&'a str>,
     pub styled: bool,
+    /// Which arms of the call graph the `symbol` mode walks, as the raw
+    /// wire spelling (`"callees"` / `"callers"` / `"both"`). Absent or
+    /// empty resolves to both arms so callers predating the direction
+    /// filter keep the original behavior. An unrecognized spelling is a
+    /// handler-level error. Ignored by the `file` and `class` modes.
+    pub direction: Option<&'a str>,
 }
 
 /// `generate_diagram` body. Dispatches on the exclusive parameter
@@ -410,6 +416,23 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
 
     let depth = input.depth.filter(|&d| d > 0).unwrap_or(1);
     let max_nodes = input.max_nodes.filter(|&m| m > 0).unwrap_or(30);
+
+    // Absent or empty direction means "both arms" so callers predating
+    // the direction filter keep the original who-calls-X-and-who-X-calls
+    // behavior. Only the `symbol` (call graph) branch consults this; the
+    // accepted spellings mirror the serde renames on `DiagramDirection`.
+    let direction_spelling = input.direction.unwrap_or("");
+    let direction = match direction_spelling {
+        "" | "both" => DiagramDirection::Both,
+        "callees" => DiagramDirection::Callees,
+        "callers" => DiagramDirection::Callers,
+        other => {
+            return tool_error(format!(
+                "invalid direction: {other}. Expected one of: callees, callers, both"
+            ));
+        }
+    };
+
     let format = input.format.unwrap_or("");
     let format = if format.is_empty() { "edges" } else { format };
 
@@ -424,7 +447,7 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
 
     let g = graph.read();
     let dr_opt = if let Some(id) = symbol {
-        g.diagram_call_graph(id, depth, max_nodes)
+        g.diagram_call_graph(id, direction, depth, max_nodes)
     } else if let Some(path) = file {
         // PathNormalization Phase 3.2: same normalize wrap as `get_coupling`
         // and `get_file_symbols`. Only the file-mode branch needs it — the

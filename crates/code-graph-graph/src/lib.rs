@@ -21,7 +21,7 @@ mod test_fixtures;
 
 pub use algorithms::HierarchyNode;
 pub use callgraph::CallChain;
-pub use diagrams::{DiagramEdge, DiagramResult};
+pub use diagrams::{DiagramDirection, DiagramEdge, DiagramResult};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, Node};
 pub use persist::{cache_path, stale_paths, PersistError};
 pub use queries::{SearchParams, SearchResult};

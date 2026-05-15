@@ -422,6 +422,11 @@ pub struct GenerateDiagramArgs {
     #[serde(default)]
     pub format: Option<String>,
     #[schemars(
+        description = "Call-graph direction (symbol mode only): 'callees', 'callers', or 'both' (default)"
+    )]
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[schemars(
         description = "When format=mermaid, add CSS styling and center node highlighting (default false)"
     )]
     #[serde(default)]
@@ -891,6 +896,7 @@ impl CodeGraphServer {
                 max_nodes: args.max_nodes,
                 format: args.format.as_deref(),
                 styled: args.styled.unwrap_or(false),
+                direction: args.direction.as_deref(),
             };
             handlers::structure::generate_diagram(&inner.graph, input)
         })
@@ -1327,6 +1333,7 @@ mod tests {
                 max_nodes: None,
                 format: None,
                 styled: None,
+                direction: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

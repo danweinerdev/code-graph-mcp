@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 101
 expression: "tool_entry(\"generate_diagram\")"
 ---
 {
@@ -23,6 +24,14 @@ expression: "tool_entry(\"generate_diagram\")"
         "minimum": 0,
         "type": [
           "integer",
+          "null"
+        ]
+      },
+      "direction": {
+        "default": null,
+        "description": "Call-graph direction (symbol mode only): 'callees', 'callers', or 'both' (default)",
+        "type": [
+          "string",
           "null"
         ]
       },

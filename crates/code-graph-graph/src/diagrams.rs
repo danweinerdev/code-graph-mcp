@@ -41,6 +41,28 @@ use indexmap::IndexMap;
 use crate::graph::Node;
 use crate::Graph;
 
+/// Which arms of the call graph a [`Graph::diagram_call_graph`] BFS
+/// walks from the seed symbol.
+///
+/// - `Callees`: only outgoing `Calls` edges (who the seed calls); the
+///   reverse-adjacency walk is skipped.
+/// - `Callers`: only incoming `Calls` edges (who calls the seed); the
+///   forward-adjacency walk is skipped.
+/// - `Both`: both arms — the seed's callees and its callers in one
+///   diagram.
+///
+/// The serde renames are the wire form clients pass through the MCP
+/// tool input (`"callees"` / `"callers"` / `"both"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DiagramDirection {
+    #[serde(rename = "callees")]
+    Callees,
+    #[serde(rename = "callers")]
+    Callers,
+    #[serde(rename = "both")]
+    Both,
+}
+
 /// One labeled edge in a [`DiagramResult`]. The `from`/`to` are display
 /// names already (post `mermaid_label` for symbol diagrams, basename for
 /// file diagrams, raw class name for inheritance) — [`DiagramResult::render_mermaid`]
@@ -173,8 +195,14 @@ impl Graph {
     /// `Some` (possibly with an empty `edges` vec).
     ///
     /// `depth = 0` is normalized to `1`; `max_nodes = 0` is normalized
-    /// to `30`. Both forward (`adj`) and reverse (`radj`) `Calls` edges
-    /// are walked so the diagram shows both who-calls-X and who-X-calls.
+    /// to `30`.
+    ///
+    /// `direction` selects which arms of the call graph are walked:
+    /// [`DiagramDirection::Callees`] follows only the forward `adj`
+    /// `Calls` edges (who the seed calls), [`DiagramDirection::Callers`]
+    /// follows only the reverse `radj` `Calls` edges (who calls the
+    /// seed), and [`DiagramDirection::Both`] follows both — the latter
+    /// preserves the original who-calls-X-and-who-X-calls behavior.
     ///
     /// The truncation guard `!visited[from] || !visited[to]` after the
     /// BFS is essential: when `max_nodes` cuts the visit budget mid-walk,
@@ -184,6 +212,7 @@ impl Graph {
     pub fn diagram_call_graph(
         &self,
         start_id: &str,
+        direction: DiagramDirection,
         depth: u32,
         max_nodes: u32,
     ) -> Option<DiagramResult> {
@@ -214,30 +243,38 @@ impl Graph {
                 continue;
             }
 
-            if let Some(entries) = self.adj.get(&curr_id) {
-                for entry in entries {
-                    if entry.kind != EdgeKind::Calls {
-                        continue;
-                    }
-                    raw_edges.push((curr_id.clone(), entry.target.clone()));
-                    if !visited.contains(&entry.target) && visited.len() < max_nodes {
-                        visited.insert(entry.target.clone());
-                        queue.push_back((entry.target.clone(), curr_depth + 1));
+            // Forward (callees) arm: who `curr_id` calls. Skipped when
+            // the caller asked for callers-only.
+            if direction != DiagramDirection::Callers {
+                if let Some(entries) = self.adj.get(&curr_id) {
+                    for entry in entries {
+                        if entry.kind != EdgeKind::Calls {
+                            continue;
+                        }
+                        raw_edges.push((curr_id.clone(), entry.target.clone()));
+                        if !visited.contains(&entry.target) && visited.len() < max_nodes {
+                            visited.insert(entry.target.clone());
+                            queue.push_back((entry.target.clone(), curr_depth + 1));
+                        }
                     }
                 }
             }
 
-            if let Some(entries) = self.radj.get(&curr_id) {
-                for entry in entries {
-                    if entry.kind != EdgeKind::Calls {
-                        continue;
-                    }
-                    // radj's `target` is the SOURCE of the original
-                    // Calls edge; emit the forward direction.
-                    raw_edges.push((entry.target.clone(), curr_id.clone()));
-                    if !visited.contains(&entry.target) && visited.len() < max_nodes {
-                        visited.insert(entry.target.clone());
-                        queue.push_back((entry.target.clone(), curr_depth + 1));
+            // Reverse (callers) arm: who calls `curr_id`. Skipped when
+            // the caller asked for callees-only.
+            if direction != DiagramDirection::Callees {
+                if let Some(entries) = self.radj.get(&curr_id) {
+                    for entry in entries {
+                        if entry.kind != EdgeKind::Calls {
+                            continue;
+                        }
+                        // radj's `target` is the SOURCE of the original
+                        // Calls edge; emit the forward direction.
+                        raw_edges.push((entry.target.clone(), curr_id.clone()));
+                        if !visited.contains(&entry.target) && visited.len() < max_nodes {
+                            visited.insert(entry.target.clone());
+                            queue.push_back((entry.target.clone(), curr_depth + 1));
+                        }
                     }
                 }
             }
@@ -714,7 +751,9 @@ mod tests {
     #[test]
     fn diagram_call_graph_unknown_returns_none() {
         let g = Graph::new();
-        assert!(g.diagram_call_graph("nonexistent", 1, 30).is_none());
+        assert!(g
+            .diagram_call_graph("nonexistent", DiagramDirection::Both, 1, 30)
+            .is_none());
     }
 
     #[test]
@@ -735,7 +774,9 @@ mod tests {
             ],
         ));
 
-        let result = g.diagram_call_graph("/x.cpp:a", 2, 30).expect("a is known");
+        let result = g
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 2, 30)
+            .expect("a is known");
         assert_eq!(result.center, "a");
         assert_eq!(result.edges.len(), 2);
         // Edges are deduplicated and contain exactly the two forward calls.
@@ -776,7 +817,9 @@ mod tests {
             ],
         ));
 
-        let result = g.diagram_call_graph("/x.cpp:a", 10, 3).expect("a is known");
+        let result = g
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 10, 3)
+            .expect("a is known");
         // At most 3 unique nodes participated; therefore at most 2
         // edges among them (a chain of 3 nodes has 2 edges).
         assert!(
@@ -810,13 +853,69 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:target", 1, 30)
+            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30)
             .expect("target is known");
         assert_eq!(result.center, "target");
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].from, "caller");
         assert_eq!(result.edges[0].to, "target");
         assert_eq!(result.edges[0].label, "calls");
+    }
+
+    #[test]
+    fn diagram_call_graph_direction_gates_each_arm() {
+        // C -> A -> B. Centered on A: Callees walks only the forward
+        // (adj) arm and surfaces just A -> B; Callers walks only the
+        // reverse (radj) arm and surfaces just C -> A; Both surfaces
+        // the full neighborhood C -> A and A -> B.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("c", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp", 1),
+                call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp", 2),
+            ],
+        ));
+
+        let pairs = |dir| {
+            g.diagram_call_graph("/x.cpp:a", dir, 1, 30)
+                .expect("a is known")
+                .edges
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let callees = pairs(DiagramDirection::Callees);
+        assert_eq!(
+            callees,
+            vec![("a".to_string(), "b".to_string())],
+            "Callees must skip the radj walk: only A -> B, got {callees:?}",
+        );
+
+        let callers = pairs(DiagramDirection::Callers);
+        assert_eq!(
+            callers,
+            vec![("c".to_string(), "a".to_string())],
+            "Callers must skip the adj walk: only C -> A, got {callers:?}",
+        );
+
+        let both = pairs(DiagramDirection::Both);
+        assert_eq!(both.len(), 2, "Both must surface both arms: {both:?}");
+        assert!(
+            both.contains(&("a".to_string(), "b".to_string())),
+            "Both must include the callee edge A -> B: {both:?}",
+        );
+        assert!(
+            both.contains(&("c".to_string(), "a".to_string())),
+            "Both must include the caller edge C -> A: {both:?}",
+        );
     }
 
     #[test]
@@ -837,7 +936,9 @@ mod tests {
             ],
         ));
 
-        let result = g.diagram_call_graph("/x.cpp:a", 5, 30).expect("a is known");
+        let result = g
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 5, 30)
+            .expect("a is known");
         let pairs: Vec<(String, String)> = result
             .edges
             .iter()
@@ -872,8 +973,12 @@ mod tests {
             ],
         ));
 
-        let zero = g.diagram_call_graph("/x.cpp:a", 0, 30).expect("a is known");
-        let one = g.diagram_call_graph("/x.cpp:a", 1, 30).expect("a is known");
+        let zero = g
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 0, 30)
+            .expect("a is known");
+        let one = g
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 1, 30)
+            .expect("a is known");
         assert_eq!(
             zero.edges, one.edges,
             "depth=0 must produce the same edges as depth=1",
@@ -918,7 +1023,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:MyClass::doWork", 1, 30)
+            .diagram_call_graph("/x.cpp:MyClass::doWork", DiagramDirection::Both, 1, 30)
             .expect("method is known");
         assert_eq!(result.center, "MyClass::doWork");
         assert_eq!(result.edges.len(), 1);
