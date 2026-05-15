@@ -523,7 +523,11 @@ impl Graph {
             return None;
         }
 
-        // Inheritance default depth is 2, NOT 1. See `diagram.go:183`.
+        // Graph-level inheritance default depth is 2, NOT 1 (mirrors
+        // `diagram.go:183`). NOTE: this `depth == 0` branch is only
+        // reachable on direct/test calls — the MCP handler normalizes
+        // an absent/zero `depth` to 1 for all diagram modes before it
+        // reaches here, so the MCP-visible inheritance default is 1.
         let depth = if depth == 0 { 2 } else { depth };
         let max_nodes = if max_nodes == 0 { 30 } else { max_nodes } as usize;
 

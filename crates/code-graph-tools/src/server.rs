@@ -892,16 +892,19 @@ impl CodeGraphServer {
                        than a synthetic node with no symbol behind it). `format` is `\"edges\"` \
                        (default; JSON array of `{from, to, label, direction}` objects, `[]` \
                        when empty) or `\"mermaid\"` (Mermaid flowchart text). Every edge carries \
-                       `direction`: `\"calls\"` (outgoing — the `from` endpoint calls `to`; \
-                       rendered solid `-->|calls|` in Mermaid) or `\"called_by\"` (incoming — \
-                       `from` is an inbound caller of `to`; rendered dashed `-.->|called by|`). \
-                       In `both` mode a single underlying call reachable from both traversal \
-                       arms is emitted ONCE, tagged by whichever arm reached it first in BFS \
-                       order; a genuinely bidirectional pair (A→B and B→A) survives as two \
-                       edges. `depth` (default 1; 0 or omitted resolves to 1) bounds BFS \
+                       `direction`: `\"calls\"` (outgoing — the `from` endpoint calls `to`) or \
+                       `\"called_by\"` (incoming — `from` is an inbound caller of `to`). In \
+                       call-graph (`symbol=`) Mermaid output `\"calls\"` renders as a solid \
+                       `-->|calls|` arrow and `\"called_by\"` as a dashed `-.->|called by|`; \
+                       `file=` and `class=` modes always emit solid arrows with their own \
+                       edge labels (`-->|includes|`, `-->|inherits|`). In `both` mode a \
+                       single underlying call reachable from both traversal arms is emitted \
+                       ONCE, tagged by whichever arm reached it first in BFS order; a \
+                       genuinely bidirectional pair (A→B and B→A) survives as two edges. \
+                       `depth` (default 1; 0 or omitted resolves to 1) bounds BFS \
                        traversal distance. `max_nodes` (default 30; 0 or omitted resolves to \
-                       30; no upper clamp) bounds nodes visited by the BFS; raise it for \
-                       high-fan-in symbols whose neighborhood exceeds 30. `styled` (default \
+                       30; no upper clamp) bounds nodes visited by the BFS in every mode; \
+                       raise it when a symbol/file/class neighborhood exceeds 30. `styled` (default \
                        false, mermaid format only) highlights the center node. On a `symbol=` \
                        or `class=` miss the error carries did-you-mean suggestions; a `file=` \
                        miss returns a bare not-found (no suggestion source for filenames). When \
