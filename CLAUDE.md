@@ -96,7 +96,7 @@ Tool descriptions in `#[tool(description=…)]` strings (server.rs) are **produc
   ```
   - `total_nodes_seen` = unique class names walked (diamond ancestor = 1 slot, not 1-per-arm).
   - `truncated: true` → partial tree is well-formed; retry with larger `max_nodes` (≤ 1000).
-  - `HierarchyNode` = `{ name, bases?: HierarchyNode[], derived?: HierarchyNode[], ref?: bool }`. Walks both directions (no direction arg): `bases` = ancestors (forward `Inherits`), `derived` = descendants (reverse `Inherits`). Empty `bases`/`derived` and `ref:false` omitted.
+  - `HierarchyNode` = `{ name, bases?: HierarchyNode[], derived?: HierarchyNode[], ref?: true }`. Walks both directions (no direction arg): `bases` = ancestors (forward `Inherits`), `derived` = descendants (reverse `Inherits`). Empty `bases`/`derived` omitted; `ref` present only when `true` (never emitted as false).
   - `HierarchyNode.ref`: in diamond graphs, the FIRST DFS pre-order occurrence of a name is canonical (full `bases`/`derived`); every later occurrence is a `{name, ref: true}` stub with empty `bases`/`derived`. Clients reconstruct the full tree by keying a `name -> node` map on first non-ref occurrences and treating `ref:true` nodes as pointers to the canonical entry. Cycle-guard halts emit a bare `{name}` node with NO `ref` field — semantically distinct from a ref-stub: a `{name}` node without `ref` is a natural leaf OR a cycle halt (both walk-terminal), only `ref:true` resolves back to the map.
 
 ## Configuration (`.code-graph.toml`)

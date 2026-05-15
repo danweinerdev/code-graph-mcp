@@ -798,7 +798,8 @@ impl CodeGraphServer {
                        {hierarchy, truncated, max_nodes, total_nodes_seen} envelope: \
                        `hierarchy` is the `HierarchyNode` tree rooted at the queried class; \
                        `truncated: true` flags that the `max_nodes` budget cut off children \
-                       (retry with a larger `max_nodes` ≤ 1000, or narrow `depth`); \
+                       — raise `max_nodes` (≤ 1000) to lift the budget, or lower `depth` to \
+                       request a smaller tree that fits the current budget; \
                        `total_nodes_seen` is the count of UNIQUE class names walked — a \
                        diamond ancestor reachable via N arms counts as 1, not N, so this can \
                        be far smaller than the number of nodes rendered when ref-stubs are \
@@ -809,8 +810,9 @@ impl CodeGraphServer {
                        tree — 250 fits most hierarchies under the MCP token ceiling, but a \
                        single deep tree (e.g. UE's UObject) can exceed it; raise `max_nodes` \
                        (not `depth`) to render more of a truncated tree. Each `HierarchyNode` \
-                       is {name, bases?, derived?, ref?}; empty `bases`/`derived` and \
-                       `ref: false` are omitted. SHAPE: in multi-inheritance (diamond) graphs \
+                       is {name, bases?, derived?, ref?}; empty `bases`/`derived` are omitted, \
+                       and `ref` is present only when `true` (it is never emitted as false). \
+                       SHAPE: in multi-inheritance (diamond) graphs \
                        a shared base/derived appears once in canonical form and then as \
                        ref-stubs. The FIRST occurrence of a name in DFS pre-order is the \
                        canonical node carrying the full `bases`/`derived` subtree; every \
@@ -818,11 +820,10 @@ impl CodeGraphServer {
                        `bases`/`derived`. To reconstruct the full tree, maintain a \
                        `name -> node` map keyed on the first NON-ref occurrence of each name \
                        and treat a `ref: true` node as a pointer back to that canonical entry, \
-                       NOT as a leaf. Cycles are different: a cycle-guard halt emits a bare \
-                       {name} node with NO `ref` field — a {name} node without `ref` is either \
-                       a natural leaf or a cycle halt, and both are walk-terminal (do not \
-                       resolve them against the map). A `ref: true` stub is the ONLY node you \
-                       follow back to a canonical entry."
+                       NOT as a leaf. A `{name}` node with NO `ref` field is walk-terminal: \
+                       it is either a natural leaf or a cycle-guard halt (the two are \
+                       JSON-indistinguishable) — do not resolve it against the map. A \
+                       `ref: true` stub is the ONLY node you follow back to a canonical entry."
     )]
     async fn get_class_hierarchy(
         &self,
