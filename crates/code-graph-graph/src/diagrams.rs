@@ -22,19 +22,23 @@
 //! randomness is not portable to a test gate, so the Rust port pins
 //! determinism at this layer instead.
 //!
-//! The BFS methods (`diagram_call_graph`, `diagram_file_graph`,
-//! `diagram_inheritance`), in contrast, traverse `HashMap`-backed
-//! adjacency maps (`adj` / `radj` / `includes`) whose iteration order
-//! is randomized. The resulting [`DiagramResult::edges`] ordering is
-//! **not** stable across invocations — only the *set* of emitted edges
-//! is deterministic. Tests that need byte-equality of rendered output
-//! must construct the `DiagramResult` directly rather than rely on BFS
-//! output; tests over BFS results must compare edges as a set (e.g. via
-//! `contains` checks on `(from, to)` pairs).
+//! `diagram_call_graph` and `diagram_inheritance` access adjacency by
+//! single-key lookup (`adj.get(&id)` / `radj.get(&id)`) into
+//! insertion-ordered `Vec`s, so their edge order IS deterministic.
+//! `diagram_file_graph`'s incoming-edge scan, by contrast, iterates the
+//! `HashMap`-backed `files` index, so ITS [`DiagramResult::edges`]
+//! ordering is **not** stable across invocations — only the *set* of
+//! emitted edges is deterministic for that one method. Tests that need
+//! byte-equality of rendered output should construct the
+//! `DiagramResult` directly; tests over `diagram_file_graph` results
+//! must compare edges as a set (e.g. `contains` checks on `(from, to)`
+//! pairs) rather than by position.
 //!
-//! Locking is not handled in this module. Task 2.6 wraps [`Graph`] in
-//! `parking_lot::RwLock`; until then these methods take `&self` and rely
-//! on the caller for synchronization.
+//! Locking is not handled in this module: these methods take `&self`
+//! and rely on the caller for synchronization. The server-side
+//! [`Graph`] is wrapped in `parking_lot::RwLock` (re-exported from
+//! `code_graph_graph::RwLock`); query handlers take a read lock
+//! around the call.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1112,6 +1116,9 @@ mod tests {
             pairs.len(),
             "every (from, to) label pair must be unique: {pairs:?}",
         );
+        // Exactly the two cycle edges, nothing more — pins the total so
+        // a future fixture edit can't smuggle in extra edges unnoticed.
+        assert_eq!(pairs.len(), 2, "only a->b and b->a expected: {pairs:?}");
     }
 
     #[test]

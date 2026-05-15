@@ -1714,6 +1714,200 @@ mod tests {
         assert_eq!(body_text(&r), "[]");
     }
 
+    /// Fixture: `c -> a -> b`. `a` calls `b`; `c` calls `a`. Used by the
+    /// direction-filter tests below, exercised through the handler so the
+    /// `direction` string arg parsing is covered end to end.
+    fn directional_call_graph() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("c", SymbolKind::Function, "/x.cpp"),
+            ],
+            edges: vec![
+                call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp"),
+                call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp"),
+            ],
+        });
+        g
+    }
+
+    #[test]
+    fn generate_diagram_direction_callees_only() {
+        // Centered on `a` with direction=callees: only the forward arm
+        // is walked, so the client sees exactly the a -> b edge and
+        // never the c -> a inbound edge.
+        let g = locked(directional_call_graph());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                direction: Some("callees"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "callees must surface only a -> b: {arr:?}");
+        assert_eq!(arr[0]["from"], serde_json::json!("a"));
+        assert_eq!(arr[0]["to"], serde_json::json!("b"));
+        // No edge whose endpoints are the inbound caller `c`.
+        assert!(
+            !arr.iter()
+                .any(|e| e["from"] == serde_json::json!("c") || e["to"] == serde_json::json!("c")),
+            "callees must NOT surface the c -> a inbound edge: {arr:?}",
+        );
+    }
+
+    #[test]
+    fn generate_diagram_direction_callers_only() {
+        // Same fixture, direction=callers: only the reverse arm is
+        // walked, so the client sees exactly the c -> a edge and never
+        // the a -> b outbound edge.
+        let g = locked(directional_call_graph());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                direction: Some("callers"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "callers must surface only c -> a: {arr:?}");
+        assert_eq!(arr[0]["from"], serde_json::json!("c"));
+        assert_eq!(arr[0]["to"], serde_json::json!("a"));
+        // No edge whose endpoints are the outbound callee `b`.
+        assert!(
+            !arr.iter()
+                .any(|e| e["from"] == serde_json::json!("b") || e["to"] == serde_json::json!("b")),
+            "callers must NOT surface the a -> b outbound edge: {arr:?}",
+        );
+    }
+
+    #[test]
+    fn generate_diagram_label_dedupe_pins_user_report() {
+        // The user-reported triple-duplicate scenario, pinned at the
+        // handler boundary. Two free functions both named `Tick` live in
+        // DIFFERENT files, so their SymbolIds are DISTINCT
+        // (`/a.cpp:Tick` vs `/b.cpp:Tick`); both call a function
+        // rendering to the label `Update`. Centered on `Update` with
+        // direction=callers, the reverse walk surfaces two inbound edges
+        // that reduce to the identical rendered pair ("Tick", "Update").
+        // Under raw-SymbolId dedupe this emitted the edge more than once
+        // (the user saw 3x with extra macro-blind collisions); with
+        // label-keyed dedupe exactly one survives in `result.edges`.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Tick", SymbolKind::Function, "/a.cpp")],
+            edges: vec![call_edge("/a.cpp:Tick", "/shared.cpp:Update", "/a.cpp")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Tick", SymbolKind::Function, "/b.cpp")],
+            edges: vec![call_edge("/b.cpp:Tick", "/shared.cpp:Update", "/b.cpp")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/shared.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Update", SymbolKind::Function, "/shared.cpp")],
+            edges: vec![],
+        });
+        let g = locked(g);
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/shared.cpp:Update"),
+                direction: Some("callers"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        let tick_update = arr
+            .iter()
+            .filter(|e| {
+                e["from"] == serde_json::json!("Tick") && e["to"] == serde_json::json!("Update")
+            })
+            .count();
+        assert_eq!(
+            tick_update, 1,
+            "two distinct `Tick` SymbolIds rendering to the same label \
+             must collapse into exactly one Tick -> Update edge: {arr:?}",
+        );
+        assert_eq!(
+            arr.len(),
+            1,
+            "exactly the single deduped edge survives: {arr:?}",
+        );
+    }
+
+    #[test]
+    fn generate_diagram_no_file_basename_leak() {
+        // `a` has a `Calls` edge to `/missing.cpp:gone`, but no symbol
+        // named `gone` is ever declared, so that SymbolId is NOT a node
+        // in the graph (unresolved call target). Before the fix an
+        // unresolved endpoint rendered as a file-basename pseudo-node
+        // (`missing.cpp`); now the edge is dropped entirely. Assert no
+        // entry in `result.edges` has a `from` or `to` that looks like a
+        // source-file basename.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("a", SymbolKind::Function, "/x.cpp")],
+            edges: vec![call_edge("/x.cpp:a", "/missing.cpp:gone", "/x.cpp")],
+        });
+        let g = locked(g);
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        // The only edge had an unresolved target, so it is dropped:
+        // the diagram is empty rather than leaking `missing.cpp`.
+        assert!(
+            arr.is_empty(),
+            "the sole edge has an unresolved target and must be dropped: {arr:?}",
+        );
+        const SOURCE_EXTS: &[&str] = &[
+            ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx", ".rs", ".go", ".py", ".pyi", ".cs",
+            ".java",
+        ];
+        let looks_like_basename = |v: &serde_json::Value| {
+            v.as_str()
+                .map(|s| SOURCE_EXTS.iter().any(|ext| s.ends_with(ext)))
+                .unwrap_or(false)
+        };
+        for e in arr {
+            assert!(
+                !looks_like_basename(&e["from"]),
+                "no edge endpoint may render as a file basename, got from={:?}",
+                e["from"],
+            );
+            assert!(
+                !looks_like_basename(&e["to"]),
+                "no edge endpoint may render as a file basename, got to={:?}",
+                e["to"],
+            );
+        }
+    }
+
     // --- PathNormalization Phase 3.2 --------------------------------------
 
     #[test]
