@@ -165,7 +165,7 @@ impl Graph {
         // the per-target counter increments unconditionally.
         if let Some(incs) = self.includes.get(path) {
             for inc in incs {
-                *counts.entry(inc.clone()).or_insert(0) += 1;
+                *counts.entry(inc.path.clone()).or_insert(0) += 1;
             }
         }
 
@@ -213,7 +213,7 @@ impl Graph {
                 continue;
             }
             for inc in incs {
-                if inc == path {
+                if inc.path == path {
                     *counts.entry(from.clone()).or_insert(0) += 1;
                 }
             }
@@ -437,10 +437,10 @@ impl Graph {
             // Outgoing includes from `curr`.
             if let Some(incs) = self.includes.get(&curr) {
                 for inc in incs {
-                    raw_edges.push((curr.clone(), inc.clone()));
-                    if !visited.contains(inc) && visited.len() < max_nodes {
-                        visited.insert(inc.clone());
-                        queue.push_back((inc.clone(), curr_depth + 1));
+                    raw_edges.push((curr.clone(), inc.path.clone()));
+                    if !visited.contains(&inc.path) && visited.len() < max_nodes {
+                        visited.insert(inc.path.clone());
+                        queue.push_back((inc.path.clone(), curr_depth + 1));
                     }
                 }
             }
@@ -449,7 +449,7 @@ impl Graph {
             // for entries pointing at `curr`. Faithful O(N×M) port.
             for (from, incs) in &self.includes {
                 for inc in incs {
-                    if inc == &curr {
+                    if inc.path == curr {
                         raw_edges.push((from.clone(), curr.clone()));
                         if !visited.contains(from) && visited.len() < max_nodes {
                             visited.insert(from.clone());

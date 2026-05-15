@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use code_graph_core::{EdgeKind, Symbol, SymbolId, SymbolKind};
 
-use crate::{EdgeEntry, Graph};
+use crate::{EdgeEntry, Graph, IncludeEntry};
 
 /// One hop on a call chain returned by [`Graph::callers`] / [`Graph::callees`].
 ///
@@ -146,11 +146,12 @@ impl Graph {
         result
     }
 
-    /// Files included by `path` (`#include`-style edges). Returns an
-    /// empty `Vec` for unknown paths so JSON serializes as `[]`, never
-    /// `null`. The returned `Vec` is a clone — callers may mutate it
-    /// without affecting the graph.
-    pub fn file_dependencies(&self, path: &Path) -> Vec<PathBuf> {
+    /// Files included by `path` (`#include`-style edges), each paired with
+    /// the source line of the include directive. Returns an empty `Vec`
+    /// for unknown paths so JSON serializes as `[]`, never `null`. The
+    /// returned `Vec` is a clone — callers may mutate it without affecting
+    /// the graph.
+    pub fn file_dependencies(&self, path: &Path) -> Vec<IncludeEntry> {
         match self.includes.get(path) {
             Some(deps) => deps.clone(),
             None => Vec::new(),
@@ -161,8 +162,8 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
-    use code_graph_core::Language;
+    use crate::test_fixtures::{call_edge, inherit_edge, make_fg, sym};
+    use code_graph_core::{Edge, Language};
 
     /// Linear chain `a -> b -> c -> d` all in `/x.cpp`.
     fn linear_chain() -> Graph {
@@ -458,20 +459,40 @@ mod tests {
     #[test]
     fn file_dependencies_known_path() {
         let mut g = Graph::new();
+        // Build the include edges inline with distinctive, non-zero
+        // source lines (the `include_edge` fixture hardcodes `line: 0`,
+        // which would make a `line` assertion vacuous). This pins that
+        // `file_dependencies` reports the include directive's real source
+        // line, not a defaulted placeholder.
+        let include = |to: &str, line: u32| Edge {
+            from: "/a.cpp".to_string(),
+            to: to.to_string(),
+            kind: EdgeKind::Includes,
+            file: "/a.cpp".to_string(),
+            line,
+        };
         g.merge_file_graph(make_fg(
             "/a.cpp",
             Language::Cpp,
             vec![],
-            vec![
-                include_edge("/a.cpp", "/utils.h", "/a.cpp"),
-                include_edge("/a.cpp", "/types.h", "/a.cpp"),
-            ],
+            vec![include("/utils.h", 4), include("/types.h", 9)],
         ));
 
         let deps = g.file_dependencies(&PathBuf::from("/a.cpp"));
+        // Assert BOTH path AND line for every entry: a regression that
+        // dropped the line back to 0 would fail here.
         assert_eq!(
             deps,
-            vec![PathBuf::from("/utils.h"), PathBuf::from("/types.h")],
+            vec![
+                IncludeEntry {
+                    path: PathBuf::from("/utils.h"),
+                    line: 4,
+                },
+                IncludeEntry {
+                    path: PathBuf::from("/types.h"),
+                    line: 9,
+                },
+            ],
         );
     }
 

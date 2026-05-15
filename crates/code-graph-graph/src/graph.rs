@@ -27,15 +27,16 @@ use serde::{Deserialize, Serialize};
 /// - `adj` / `radj`: symbol id → outgoing / incoming `Calls` and `Inherits`
 ///   edges (the Go binary keeps both directions for cheap callers/callees)
 /// - `files`: file path → [`FileEntry`] (language + owned symbol IDs)
-/// - `includes`: file path → included file paths (kept separate from
-///   `adj`/`radj` because include edges are file-to-file, not symbol-to-symbol)
+/// - `includes`: file path → [`IncludeEntry`] list (included file path +
+///   source line; kept separate from `adj`/`radj` because include edges
+///   are file-to-file, not symbol-to-symbol)
 #[derive(Debug, Default)]
 pub struct Graph {
     pub(crate) nodes: HashMap<SymbolId, Node>,
     pub(crate) adj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub(crate) radj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub(crate) files: HashMap<PathBuf, FileEntry>,
-    pub(crate) includes: HashMap<PathBuf, Vec<PathBuf>>,
+    pub(crate) includes: HashMap<PathBuf, Vec<IncludeEntry>>,
 }
 
 /// Wrapper around a [`Symbol`] stored in the graph. Mirrors Go's `Node`.
@@ -72,6 +73,21 @@ pub struct EdgeEntry {
 pub struct FileEntry {
     pub language: Language,
     pub symbol_ids: Vec<SymbolId>,
+}
+
+/// One entry in a file's include list: the included file path plus the
+/// source line of the `#include`-style directive that produced it.
+///
+/// The include map previously stored bare `PathBuf`s, discarding the line.
+/// Carrying the line lets the dependency query report *where* in the
+/// source each include was declared instead of just *that* it exists.
+/// `path`/`line` mirror the wire-format field names directly (no
+/// `rename_all` needed); serde derives match the sibling cached structs so
+/// the on-disk cache shape stays a single-deserializer-compatible JSON.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncludeEntry {
+    pub path: PathBuf,
+    pub line: u32,
 }
 
 /// Quick storage-size summary returned by [`Graph::stats`]. The `edges`
@@ -149,7 +165,10 @@ impl Graph {
                     self.includes
                         .entry(PathBuf::from(&edge.from))
                         .or_default()
-                        .push(PathBuf::from(&edge.to));
+                        .push(IncludeEntry {
+                            path: PathBuf::from(&edge.to),
+                            line: edge.line,
+                        });
                 }
                 // `EdgeKind` is `#[non_exhaustive]`; future variants are silently
                 // ignored here until the routing rule is extended.
@@ -331,7 +350,7 @@ impl Graph {
     }
 
     #[cfg(test)]
-    fn includes(&self) -> &HashMap<PathBuf, Vec<PathBuf>> {
+    fn includes(&self) -> &HashMap<PathBuf, Vec<IncludeEntry>> {
         &self.includes
     }
 }
@@ -340,7 +359,7 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
-    use code_graph_core::SymbolKind;
+    use code_graph_core::{Edge, SymbolKind};
 
     #[test]
     fn merge_one_file_adds_nodes_and_edges() {
@@ -354,7 +373,17 @@ mod tests {
             ],
             vec![
                 call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1),
-                include_edge("/a.cpp", "/utils.h", "/a.cpp"),
+                // Inline (not the `line: 0` fixture) so the include's
+                // source line is a distinctive non-zero value: this is
+                // what proves `merge_file_graph` propagates `edge.line`
+                // into the stored `IncludeEntry` rather than defaulting it.
+                Edge {
+                    from: "/a.cpp".to_string(),
+                    to: "/utils.h".to_string(),
+                    kind: EdgeKind::Includes,
+                    file: "/a.cpp".to_string(),
+                    line: 12,
+                },
             ],
         );
 
@@ -374,9 +403,16 @@ mod tests {
         assert_eq!(g.radj()["/a.cpp:bar"][0].target, "/a.cpp:foo");
         assert_eq!(g.radj()["/a.cpp:bar"][0].kind, EdgeKind::Calls);
 
-        // Include edge: in includes, NOT in adj/radj.
+        // Include edge: in includes (with its source line preserved),
+        // NOT in adj/radj.
         let key = PathBuf::from("/a.cpp");
-        assert_eq!(g.includes()[&key], vec![PathBuf::from("/utils.h")]);
+        assert_eq!(
+            g.includes()[&key],
+            vec![IncludeEntry {
+                path: PathBuf::from("/utils.h"),
+                line: 12,
+            }],
+        );
 
         // Files map records the language.
         assert!(g.files().contains_key(&key));
@@ -617,7 +653,15 @@ mod tests {
         ));
 
         let key = PathBuf::from("/a.cpp");
-        assert_eq!(g.includes()[&key], vec![PathBuf::from("/utils.h")]);
+        // This test pins the *routing* invariant; the `include_edge`
+        // fixture carries `line: 0`, which flows through unchanged.
+        assert_eq!(
+            g.includes()[&key],
+            vec![IncludeEntry {
+                path: PathBuf::from("/utils.h"),
+                line: 0,
+            }],
+        );
         // Must NOT leak into adj/radj.
         assert!(g.adj().is_empty());
         assert!(g.radj().is_empty());

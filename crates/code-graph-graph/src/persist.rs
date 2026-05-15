@@ -15,11 +15,13 @@
 //!    1.84 (which the workspace already requires).
 //!
 //! Version handling:
-//! - v2 cache → loaded.
-//! - v1 cache (Go-written) or any other version → silent re-index
-//!   (`Ok(false)`). Version mismatch is **not** an error; it is the
-//!   expected outcome the first time the Rust binary runs against a cache
-//!   produced by the Go binary.
+//! - current-version cache → loaded.
+//! - v1 cache (Go-written), an older Rust cache, or any other version →
+//!   silent re-index (`Ok(false)`). Version mismatch is **not** an error;
+//!   it is the expected outcome the first time the Rust binary runs
+//!   against a cache produced by the Go binary, and also whenever the
+//!   schema is bumped (no transparent migration is attempted across a
+//!   schema break).
 //! - JSON parse errors and IO errors → loud (`Err(PersistError::*)`).
 
 use std::collections::HashMap;
@@ -31,10 +33,15 @@ use std::time::UNIX_EPOCH;
 use code_graph_core::{paths, Symbol, SymbolId};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{EdgeEntry, FileEntry, Graph, Node};
+use crate::graph::{EdgeEntry, FileEntry, Graph, IncludeEntry, Node};
 
 const CACHE_FILE_NAME: &str = ".code-graph-cache.json";
-const CACHE_VERSION: u32 = 2;
+// v3: include entries now carry the source line of the `#include`
+// directive (was a bare path list) so the dependency query can report
+// where each include was declared. The shape change is not
+// backward-compatible; a v2 cache fails the version check below and the
+// caller silently re-indexes (no transparent migration is attempted).
+const CACHE_VERSION: u32 = 3;
 const GENERATOR: &str = "code-graph-graph (rust)";
 
 /// Errors returned by [`Graph::save`], [`Graph::load`], and [`stale_paths`].
@@ -61,7 +68,7 @@ struct GraphCache {
     adj: HashMap<SymbolId, Vec<EdgeEntry>>,
     radj: HashMap<SymbolId, Vec<EdgeEntry>>,
     files: HashMap<PathBuf, FileEntry>,
-    includes: HashMap<PathBuf, Vec<PathBuf>>,
+    includes: HashMap<PathBuf, Vec<IncludeEntry>>,
     /// Nanoseconds since UNIX_EPOCH per indexed file. Stored as `u64`
     /// (Go uses `int64`); truncation is fine because negative timestamps
     /// are not real on any filesystem we support. Files whose mtime cannot
@@ -159,7 +166,8 @@ fn simplify_symbol_id(id: &str) -> String {
 /// 6. every `EdgeEntry.target` inside `adj` (file-portion of the SymbolId)
 /// 7. every `EdgeEntry.file` inside `adj`
 ///    8/9/10. the same three fields inside `radj`
-/// 11. `includes` map keys AND every inner `Vec<PathBuf>` entry
+/// 11. `includes` map keys AND every inner `IncludeEntry.path` (the
+///     `line` field carries no path and is left untouched)
 /// 12. `mtimes` map keys
 ///
 /// **Idempotency.** [`paths::simplify`] is identity on non-extended paths,
@@ -196,13 +204,15 @@ fn simplify_cache(cache: &mut GraphCache) {
     // (8, 9, 10) same three for radj.
     simplify_edge_map(&mut cache.radj);
 
-    // (11) includes map keys AND each inner Vec<PathBuf> entry.
+    // (11) includes map keys AND each inner IncludeEntry.path (line kept).
     let old_includes = std::mem::take(&mut cache.includes);
     cache.includes.reserve(old_includes.len());
-    for (path, deps) in old_includes {
+    for (path, mut deps) in old_includes {
         let new_path = paths::simplify(&path);
-        let new_deps: Vec<PathBuf> = deps.iter().map(|p| paths::simplify(p)).collect();
-        cache.includes.insert(new_path, new_deps);
+        for dep in &mut deps {
+            dep.path = paths::simplify(&dep.path);
+        }
+        cache.includes.insert(new_path, deps);
     }
 
     // (12) mtimes map keys.
@@ -308,8 +318,11 @@ impl Graph {
     ///   has no `language` field; both shape mismatches surface as
     ///   `PersistError::Json`. The handler in `analyze_codebase` (Phase
     ///   3.4) should treat any `Err` here the same as `Ok(false)` — drop
-    ///   the cache, re-index. The structurally-valid `version != 2` path
-    ///   exists for a future Rust→Rust schema bump.
+    ///   the cache, re-index. The structurally-valid `version !=
+    ///   CACHE_VERSION` path is exercised by Rust→Rust schema bumps: a
+    ///   cache written by an older Rust version parses cleanly but trips
+    ///   the version check and falls through to a full re-index, with no
+    ///   transparent migration.
     pub fn load(&mut self, dir: &Path) -> Result<bool, PersistError> {
         let path = cache_path(dir);
         let data = match fs::read(&path) {
@@ -884,9 +897,21 @@ mod tests {
         );
 
         let mut includes = HashMap::new();
+        // Distinctive non-zero lines so the round-trip / migration tests
+        // prove `IncludeEntry.line` survives serialization and the
+        // path-simplify pass (which must leave `line` untouched).
         includes.insert(
             path_buf.clone(),
-            vec![dep_path_buf.clone(), other_path_buf.clone()],
+            vec![
+                IncludeEntry {
+                    path: dep_path_buf.clone(),
+                    line: 11,
+                },
+                IncludeEntry {
+                    path: other_path_buf.clone(),
+                    line: 22,
+                },
+            ],
         );
 
         let mut mtimes = HashMap::new();
@@ -1017,7 +1042,8 @@ mod tests {
             "radj EdgeEntry.file not simplified"
         );
 
-        // (11) includes map keys AND inner Vec<PathBuf> entries.
+        // (11) includes map keys AND inner IncludeEntry.path values; the
+        // `line` field must pass through the simplify unchanged.
         assert!(
             cache.includes.contains_key(&expected_path),
             "includes key not simplified: keys={:?}",
@@ -1025,12 +1051,14 @@ mod tests {
         );
         let inner = cache.includes.get(&expected_path).unwrap();
         assert!(
-            inner.contains(&expected_dep),
-            "includes inner Vec missing simplified dep: {inner:?}"
+            inner.iter().any(|e| e.path == expected_dep && e.line == 11),
+            "includes inner Vec missing simplified dep with preserved line: {inner:?}"
         );
         assert!(
-            inner.contains(&expected_other),
-            "includes inner Vec missing simplified other: {inner:?}"
+            inner
+                .iter()
+                .any(|e| e.path == expected_other && e.line == 22),
+            "includes inner Vec missing simplified other with preserved line: {inner:?}"
         );
 
         // (12) mtimes map keys.
@@ -1372,14 +1400,20 @@ mod tests {
             "includes inner Vec: 2 deps (.dep + .other)"
         );
 
-        // (11b) inner `Vec<PathBuf>` entries in `includes`.
+        // (11b) inner `IncludeEntry` entries in `includes`: the path is
+        // migrated and the source line round-trips through load.
         assert!(
-            includes_inner.contains(&expected_dep),
-            "includes inner Vec missing migrated dep ({expected_dep:?}): actual={includes_inner:?}"
+            includes_inner
+                .iter()
+                .any(|e| e.path == expected_dep && e.line == 11),
+            "includes inner Vec missing migrated dep ({expected_dep:?}) with preserved line: \
+             actual={includes_inner:?}"
         );
         assert!(
-            includes_inner.contains(&expected_other),
-            "includes inner Vec missing migrated other ({expected_other:?}): \
+            includes_inner
+                .iter()
+                .any(|e| e.path == expected_other && e.line == 22),
+            "includes inner Vec missing migrated other ({expected_other:?}) with preserved line: \
              actual={includes_inner:?}"
         );
 

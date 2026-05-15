@@ -107,14 +107,21 @@ impl Graph {
         // both as a source and as a target. Mirrors the Go reference's
         // `allFiles` map.
         let mut all_files: HashSet<PathBuf> = HashSet::new();
+        // Cycle detection is a property of file-to-file include topology
+        // only; the include line is irrelevant here, so project the
+        // entries down to their target paths for the Tarjan adjacency.
+        let mut adj: HashMap<PathBuf, Vec<PathBuf>> = HashMap::with_capacity(self.includes.len());
         for (from, tos) in &self.includes {
             all_files.insert(from.clone());
+            let mut targets = Vec::with_capacity(tos.len());
             for to in tos {
-                all_files.insert(to.clone());
+                all_files.insert(to.path.clone());
+                targets.push(to.path.clone());
             }
+            adj.insert(from.clone(), targets);
         }
 
-        tarjan_scc(&all_files, &self.includes)
+        tarjan_scc(&all_files, &adj)
     }
 
     /// Inheritance tree rooted at `name`, with a global unique-name budget.

@@ -137,9 +137,16 @@ pub fn get_dependencies(graph: &RwLock<Graph>, file: &str) -> CallToolResult {
     // so existing snapshots / tests stay byte-identical.
     let path = paths::normalize_user_path(file);
     let deps = graph.read().file_dependencies(&path);
+    // `file_dependencies` now returns include entries that also carry the
+    // source line of each `#include`. This handler keeps emitting the
+    // legacy flat `Vec<String>` of paths (the `line` is intentionally
+    // discarded here) so the existing wire shape and snapshots stay
+    // byte-identical; a follow-up reshapes this into a paginated
+    // line-bearing response and is the only place that should consume the
+    // line.
     let strings: Vec<String> = deps
         .into_iter()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|inc| inc.path.to_string_lossy().into_owned())
         .collect();
     tool_success_json(&strings)
 }
