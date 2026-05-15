@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 96
 expression: "tool_entry(\"get_coupling\")"
 ---
 {
@@ -19,6 +20,26 @@ expression: "tool_entry(\"get_coupling\")"
       "file": {
         "description": "Absolute path to the source file",
         "type": "string"
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum results to return per side (default 50, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N matches for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
       }
     },
     "required": [

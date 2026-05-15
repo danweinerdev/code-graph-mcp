@@ -259,7 +259,14 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // key. The unresolved Includes edge (to="util::helper") also lands in
     // the response as a key, but we only assert on the util.rs key — the
     // resolved cross-file *edge*, which is the load-bearing one.
-    let r = get_coupling(&fx.inner.graph, &fx.main_rs, None);
+    let r = get_coupling(
+        &fx.inner.graph,
+        &fx.main_rs,
+        None,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_coupling: expected non-error result for short-form path {:?}, got: {:?}",
@@ -267,13 +274,15 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
         r,
     );
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&r))
-        .expect("get_coupling returns a JSON object keyed by file path");
-    let obj = parsed
-        .as_object()
-        .expect("get_coupling: response is a JSON object");
+        .expect("get_coupling returns a Page<CouplingEntry> envelope");
+    let has_util = parsed["results"]
+        .as_array()
+        .expect("get_coupling: response carries a results array")
+        .iter()
+        .any(|row| row["file"] == serde_json::json!(fx.util_rs));
     assert!(
-        obj.contains_key(&fx.util_rs),
-        "get_coupling: expected coupling entry for sibling {:?} (resolved cross-file Calls edge), got: {parsed:?}",
+        has_util,
+        "get_coupling: expected a coupling row for sibling {:?} (resolved cross-file Calls edge), got: {parsed:?}",
         fx.util_rs,
     );
 
@@ -405,18 +414,21 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     );
 
     // get_coupling
-    let r = get_coupling(&fx.inner.graph, &dotty, None);
+    let r = get_coupling(&fx.inner.graph, &dotty, None, None, None, NO_BYTE_BUDGET);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_coupling: dotty path {dotty:?} must resolve; got: {r:?}",
     );
-    let obj = serde_json::from_str::<serde_json::Value>(&first_text(&r))
-        .expect("get_coupling returns JSON object")
-        .as_object()
+    let parsed = serde_json::from_str::<serde_json::Value>(&first_text(&r))
+        .expect("get_coupling returns a Page<CouplingEntry> envelope");
+    let has_util = parsed["results"]
+        .as_array()
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .any(|row| row["file"] == serde_json::json!(fx.util_rs));
     assert!(
-        obj.contains_key(&fx.util_rs),
+        has_util,
         "get_coupling: dotty path {dotty:?} did not surface util.rs coupling — \
          normalize_user_path wrap likely missing in get_coupling",
     );

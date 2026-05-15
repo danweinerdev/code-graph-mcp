@@ -95,6 +95,63 @@ pub(super) struct SummaryRow {
     pub count: u32,
 }
 
+/// One cross-file coupling row: the other file's path and the number of
+/// edges (calls + includes) connecting it to the queried file in the
+/// requested direction.
+///
+/// `file` is owned (the path string is materialized from a `PathBuf` at
+/// row-build time). `count` is `u32` for byte-identical JSON across
+/// platforms — same convention as [`Page`] and [`SummaryRow`].
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; clients consume it as
+/// JSON via `CallToolResult`, never as a Rust type. Derive set matches
+/// [`SummaryRow`] (`Debug`, `Serialize` only — no `Deserialize`).
+#[derive(Debug, Serialize)]
+pub(super) struct CouplingEntry {
+    pub file: String,
+    pub count: u32,
+}
+
+/// One dependency row: a file this file depends on, the dependency kind
+/// (`"call"` or `"include"`), and the source line the dependency was
+/// observed on.
+///
+/// `kind` reuses the `&'static str` convention from [`SummaryRow`]'s
+/// `kind` so dependency-kind names stay byte-identical across surfaces.
+/// `line` is `u32` for byte-identical JSON across platforms. Visibility
+/// and derive set match [`CouplingEntry`] / [`SummaryRow`].
+///
+/// `#[allow(dead_code)]`: this type is the response row for the
+/// `get_dependencies` handler, which has not yet been reshaped to emit
+/// it. The wire shape is pinned now by a serialization test so the
+/// dependencies handler can adopt it without a follow-on shape debate;
+/// the attribute is removed once that handler constructs the type.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub(super) struct DependencyEntry {
+    pub file: String,
+    pub kind: &'static str,
+    pub line: u32,
+}
+
+/// Bundled response for `get_coupling` with `direction = "both"`: each
+/// side carries its own independently-paginated [`Page<CouplingEntry>`].
+///
+/// Field-declaration order — `incoming`, `outgoing` — is the wire-format
+/// contract (`serde` serializes derived structs in declaration order).
+/// The two pages are byte-budgeted sequentially: incoming is sized first
+/// against the full budget, and outgoing receives whatever remains after
+/// the incoming page plus a fixed outer-wrapper overhead is subtracted.
+/// If incoming exhausts the budget, outgoing is an empty page flagged
+/// `truncated: true` with `next_offset: Some(0)` so a client knows to
+/// re-request the outgoing side fresh.
+#[derive(Debug, Serialize)]
+pub(super) struct CouplingBoth {
+    pub incoming: Page<CouplingEntry>,
+    pub outgoing: Page<CouplingEntry>,
+}
+
 /// Shared pagination envelope for list-shaped tool responses.
 ///
 /// Field-declaration order — `results`, `total`, `offset`, `limit`,

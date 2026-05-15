@@ -995,7 +995,14 @@ async fn response_get_coupling_engine_cpp_outgoing() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_coupling(&fx.inner.graph, &file, Some("outgoing"));
+    let r = get_coupling(
+        &fx.inner.graph,
+        &file,
+        Some("outgoing"),
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1010,7 +1017,14 @@ async fn response_get_coupling_engine_cpp_incoming() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_coupling(&fx.inner.graph, &file, Some("incoming"));
+    let r = get_coupling(
+        &fx.inner.graph,
+        &file,
+        Some("incoming"),
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1025,7 +1039,14 @@ async fn response_get_coupling_engine_cpp_both() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_coupling(&fx.inner.graph, &file, Some("both"));
+    let r = get_coupling(
+        &fx.inner.graph,
+        &file,
+        Some("both"),
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

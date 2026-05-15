@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use super::{
     byte_budget_take, parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json,
-    Page, SymbolResult,
+    CouplingBoth, CouplingEntry, Page, SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -295,53 +295,89 @@ fn suggest_class_symbols(graph: &Graph, name: &str, limit: usize) -> Vec<String>
 
 // ----- get_coupling -----
 
+/// Fixed reserve, in bytes, for the [`CouplingBoth`] outer wrapper
+/// (`{"incoming":<page>,"outgoing":<page>}`) when sizing the `both`
+/// response. The literal wrapper text outside the two nested pages is
+/// `{"incoming":,"outgoing":}` = 24 bytes; this rounds up to a
+/// conservative 48 so the envelope can never exceed `max_bytes` even
+/// after the incoming page is serialized at its full byte cost.
+/// Under-estimating here risks an over-budget envelope, so the slack is
+/// deliberate.
+const COUPLING_BOTH_WRAPPER_OVERHEAD: usize = 48;
+
+/// Sort coupling rows by `count` descending, then `file` ascending. The
+/// secondary file-ascending key makes pagination deterministic across
+/// calls when several files share the same edge count (the underlying
+/// `Graph::coupling` walks a `HashMap`, so insertion order is not
+/// stable). Page 1 + page 2 partition the result deterministically.
+fn sort_coupling_rows(rows: &mut [CouplingEntry]) {
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.file.cmp(&b.file)));
+}
+
+/// Map a raw `HashMap<PathBuf, u32>` of coupling counts into sorted
+/// [`CouplingEntry`] rows. Path keys are stringified via
+/// `to_string_lossy` for stable cross-platform JSON (`PathBuf`
+/// serializes through `OsStr`, which on Windows can hold a non-UTF-8
+/// surrogate) — same pattern as `detect_cycles`.
+fn coupling_rows(counts: HashMap<PathBuf, u32>) -> Vec<CouplingEntry> {
+    let mut rows: Vec<CouplingEntry> = counts
+        .into_iter()
+        .map(|(path, count)| CouplingEntry {
+            file: path.to_string_lossy().into_owned(),
+            count,
+        })
+        .collect();
+    sort_coupling_rows(&mut rows);
+    rows
+}
+
 /// `get_coupling` body. Required `file` string; optional `direction` in
-/// `{outgoing(default), incoming, both}`.
+/// `{outgoing(default), incoming, both}`; optional `offset`/`limit`
+/// pagination.
+///
+/// `incoming` / `outgoing` return a [`Page<CouplingEntry>`] — rows sorted
+/// by `count` descending then `file` ascending, then sliced+byte-budgeted
+/// via `byte_budget_take`. `both` returns a [`CouplingBoth`] carrying two
+/// independently-paginated pages; the budget is allocated sequentially
+/// (incoming first against the full `max_bytes`, outgoing against the
+/// remainder after the incoming page plus a fixed wrapper overhead).
+/// When incoming exhausts the budget, outgoing is an empty page flagged
+/// `truncated: true` with `next_offset: Some(0)` so a client can
+/// re-request the outgoing side fresh via `direction=outgoing offset=0`.
+///
+/// Defaults: `limit = 50` per side (zero-or-missing resolves to the
+/// default; mirrors `get_orphans` / `search_symbols`), clamped at 1000;
+/// `offset = 0`. An unknown file is not an error — it yields empty
+/// page(s), matching the previous empty-object contract.
 ///
 /// Unknown direction returns
 /// `"invalid direction: <direction>. Expected one of: outgoing, incoming, both"`
 /// — this is a deliberate divergence from the Go wording
 /// `"'direction' must be 'incoming', 'outgoing', or 'both'"`. The Rust
 /// form matches the `invalid kind: <kind>` and `invalid format: <fmt>`
-/// shapes used elsewhere in the handler suite, and includes the bad
-/// value verbatim so users can self-correct.
-pub fn get_coupling(graph: &RwLock<Graph>, file: &str, direction: Option<&str>) -> CallToolResult {
+/// shapes used elsewhere in the handler suite (and `generate_diagram`'s
+/// own `invalid direction:` message), and includes the bad value
+/// verbatim so users can self-correct.
+pub fn get_coupling(
+    graph: &RwLock<Graph>,
+    file: &str,
+    direction: Option<&str>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
     if file.is_empty() {
         return tool_error("'file' is required");
     }
 
-    let direction = direction.unwrap_or("");
-    let direction = if direction.is_empty() {
-        "outgoing"
-    } else {
-        direction
-    };
-
-    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
-    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
-    // form when the path exists on disk (resolving `.` / `..` and stripping
-    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
-    // On Linux with an already-canonical path this is effectively identity,
-    // so existing snapshots stay byte-identical.
-    let path = paths::normalize_user_path(file);
-    let counts: HashMap<PathBuf, u32> = match direction {
-        "outgoing" => graph.read().coupling(&path),
-        "incoming" => graph.read().incoming_coupling(&path),
-        "both" => {
-            let g = graph.read();
-            let outgoing = g.coupling(&path);
-            let incoming = g.incoming_coupling(&path);
-            drop(g);
-            let mut merged: HashMap<PathBuf, u32> =
-                HashMap::with_capacity(outgoing.len() + incoming.len());
-            for (k, v) in outgoing {
-                merged.insert(k, v);
-            }
-            for (k, v) in incoming {
-                *merged.entry(k).or_insert(0) += v;
-            }
-            merged
-        }
+    // Resolve direction up front so an invalid spelling errors before any
+    // graph work. Empty / absent resolves to "outgoing". Accepted
+    // spellings and the error wording mirror `generate_diagram`'s
+    // direction validation idiom.
+    let direction = match direction.unwrap_or("") {
+        "" | "outgoing" => "outgoing",
+        "incoming" => "incoming",
+        "both" => "both",
         other => {
             return tool_error(format!(
                 "invalid direction: {other}. Expected one of: outgoing, incoming, both"
@@ -349,14 +385,111 @@ pub fn get_coupling(graph: &RwLock<Graph>, file: &str, direction: Option<&str>) 
         }
     };
 
-    // Stringify keys for stable JSON output (PathBuf serializes through
-    // OsStr, which on Windows can be a non-UTF-8 surrogate). Mirrors
-    // the same pattern used in `detect_cycles`.
-    let stringified: HashMap<String, u32> = counts
-        .into_iter()
-        .map(|(k, v)| (k.to_string_lossy().into_owned(), v))
-        .collect();
-    tool_success_json(&stringified)
+    // Resolve defaults: zero-or-missing limit -> 50; clamp at 1000.
+    // Matches the pagination convention used by `get_orphans` /
+    // `search_symbols` for limit resolution.
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(50).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
+    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
+    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
+    // form when the path exists on disk (resolving `.` / `..` and stripping
+    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
+    // On Linux with an already-canonical path this is effectively identity.
+    let path = paths::normalize_user_path(file);
+
+    if direction == "both" {
+        // Sequential budget allocation. Incoming is sized first against
+        // the full `max_bytes`. The incoming page's serialized cost plus
+        // a conservative fixed wrapper overhead is then subtracted from
+        // `max_bytes` (floored at 0) and the remainder is passed to a
+        // second `byte_budget_take` for outgoing. This guarantees the
+        // `{"incoming":<page>,"outgoing":<page>}` envelope stays within
+        // `max_bytes` even when incoming is large.
+        let g = graph.read();
+        let incoming_rows = coupling_rows(g.incoming_coupling(&path));
+        let outgoing_rows = coupling_rows(g.coupling(&path));
+        drop(g);
+
+        let incoming_total = incoming_rows.len() as u32;
+        let outgoing_total = outgoing_rows.len() as u32;
+
+        let (in_results, _in_kept, in_truncated, in_next) =
+            byte_budget_take(incoming_rows, resolved_offset, resolved_limit, max_bytes);
+        let incoming = Page::<CouplingEntry> {
+            results: in_results,
+            total: incoming_total,
+            offset: resolved_offset,
+            limit: resolved_limit,
+            truncated: in_truncated,
+            next_offset: in_next,
+        };
+
+        // Bytes already spent by the serialized incoming page, plus the
+        // fixed outer-wrapper reserve. `to_string` on plain owned data is
+        // infallible in practice; the empty-string fallback only over-
+        // estimates the remaining budget downward (safe — never produces
+        // an over-budget envelope).
+        let incoming_bytes = serde_json::to_string(&incoming)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let remaining = max_bytes
+            .saturating_sub(incoming_bytes)
+            .saturating_sub(COUPLING_BOTH_WRAPPER_OVERHEAD);
+
+        let outgoing = if remaining == 0 {
+            // Incoming ate the whole budget. Emit an empty outgoing page
+            // flagged truncated with `next_offset: Some(0)` — the
+            // start-fresh marker telling the client to re-call with
+            // `direction=outgoing offset=0`.
+            Page::<CouplingEntry> {
+                results: vec![],
+                total: outgoing_total,
+                offset: resolved_offset,
+                limit: resolved_limit,
+                truncated: true,
+                next_offset: Some(0),
+            }
+        } else {
+            let (out_results, _out_kept, out_truncated, out_next) =
+                byte_budget_take(outgoing_rows, resolved_offset, resolved_limit, remaining);
+            Page::<CouplingEntry> {
+                results: out_results,
+                total: outgoing_total,
+                offset: resolved_offset,
+                limit: resolved_limit,
+                truncated: out_truncated,
+                next_offset: out_next,
+            }
+        };
+
+        return tool_success_json(&CouplingBoth { incoming, outgoing });
+    }
+
+    let rows = {
+        let g = graph.read();
+        let counts = if direction == "incoming" {
+            g.incoming_coupling(&path)
+        } else {
+            g.coupling(&path)
+        };
+        drop(g);
+        coupling_rows(counts)
+    };
+    let total = rows.len() as u32;
+
+    let (results, _kept, truncated, next_offset) =
+        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
+
+    let response = Page::<CouplingEntry> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
+    tool_success_json(&response)
 }
 
 // ----- generate_diagram -----
@@ -1326,38 +1459,104 @@ mod tests {
         g
     }
 
+    /// Parse a `Page<CouplingEntry>` body into `(rows, total, truncated,
+    /// next_offset)`. Each row is `(file, count)`. Mirrors the
+    /// `page_parts` convention but specialized for the `{file, count}`
+    /// record shape so tests can assert ordering and the file-asc
+    /// tiebreak directly.
+    fn coupling_page(r: &CallToolResult) -> (Vec<(String, u32)>, u32, bool, Option<u32>) {
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
+        let rows = parsed["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| {
+                (
+                    v["file"].as_str().unwrap().to_string(),
+                    v["count"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect();
+        let total = parsed["total"].as_u64().unwrap_or(0) as u32;
+        let truncated = parsed["truncated"].as_bool().unwrap_or(false);
+        let next_offset = parsed["next_offset"].as_u64().map(|n| n as u32);
+        (rows, total, truncated, next_offset)
+    }
+
     #[test]
     fn coupling_missing_file_param_errors() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "", None);
+        let r = get_coupling(&g, "", None, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
 
     #[test]
-    fn coupling_outgoing_default() {
+    fn coupling_outgoing_default_returns_page() {
         let g = locked(coupling_graph());
-        let r = get_coupling(&g, "/a.cpp", None);
+        let r = get_coupling(&g, "/a.cpp", None, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let obj = parsed.as_object().unwrap();
-        // 1 call + 1 include into /b.cpp.
-        assert_eq!(obj["/b.cpp"], serde_json::json!(2));
+        let (rows, total, truncated, next) = coupling_page(&r);
+        // 1 call + 1 include into /b.cpp -> a single row with count 2.
+        assert_eq!(rows, vec![("/b.cpp".to_string(), 2)]);
+        assert_eq!(total, 1);
+        assert!(!truncated);
+        assert_eq!(next, None);
     }
 
     #[test]
-    fn coupling_incoming_returns_callers_and_includers() {
+    fn coupling_incoming_returns_callers_and_includers_page() {
         let g = locked(coupling_graph());
-        let r = get_coupling(&g, "/b.cpp", Some("incoming"));
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let obj = parsed.as_object().unwrap();
-        assert_eq!(obj["/a.cpp"], serde_json::json!(2));
+        let r = get_coupling(&g, "/b.cpp", Some("incoming"), None, None, NO_BYTE_BUDGET);
+        let (rows, total, _, _) = coupling_page(&r);
+        assert_eq!(rows, vec![("/a.cpp".to_string(), 2)]);
+        assert_eq!(total, 1);
+    }
+
+    /// Three files all couple to the query file with the SAME count (2),
+    /// so the primary count-desc key is a tie. The secondary file-asc
+    /// key must order them deterministically `/a < /b < /c`. Proves the
+    /// `then_with(file.cmp)` tiebreak.
+    #[test]
+    fn coupling_sorts_desc_count_then_asc_file() {
+        let mut g = Graph::new();
+        // /hub.cpp includes /c.cpp, /b.cpp, /a.cpp twice each -> count 2
+        // per target, deliberately added out of file order so the sort,
+        // not insertion order, decides the result sequence.
+        g.merge_file_graph(FileGraph {
+            path: "/hub.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![
+                include_edge("/hub.cpp", "/c.cpp"),
+                include_edge("/hub.cpp", "/c.cpp"),
+                include_edge("/hub.cpp", "/b.cpp"),
+                include_edge("/hub.cpp", "/b.cpp"),
+                include_edge("/hub.cpp", "/a.cpp"),
+                include_edge("/hub.cpp", "/a.cpp"),
+            ],
+        });
+        let g = locked(g);
+        let r = get_coupling(&g, "/hub.cpp", Some("outgoing"), None, None, NO_BYTE_BUDGET);
+        let (rows, total, _, _) = coupling_page(&r);
+        assert_eq!(
+            rows,
+            vec![
+                ("/a.cpp".to_string(), 2),
+                ("/b.cpp".to_string(), 2),
+                ("/c.cpp".to_string(), 2),
+            ],
+            "equal counts must tiebreak by file ascending"
+        );
+        assert_eq!(total, 3);
     }
 
     #[test]
-    fn coupling_both_merges_outgoing_and_incoming() {
-        // Set up a graph where /a.cpp has 1 outgoing call to /b.cpp and
-        // /c.cpp includes /a.cpp incoming. "both" must surface both keys.
+    fn coupling_both_returns_both_pages_populated() {
+        // /a.cpp has 1 outgoing call to /b.cpp and /c.cpp includes
+        // /a.cpp (incoming). "both" must populate both pages with the
+        // direction-appropriate file.
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/a.cpp".to_string(),
@@ -1378,18 +1577,86 @@ mod tests {
             edges: vec![include_edge("/c.cpp", "/a.cpp")],
         });
         let g = locked(g);
-        let r = get_coupling(&g, "/a.cpp", Some("both"));
+        let r = get_coupling(&g, "/a.cpp", Some("both"), None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let obj = parsed.as_object().unwrap();
-        // /b.cpp from outgoing (1 call), /c.cpp from incoming (1 include).
-        assert_eq!(obj["/b.cpp"], serde_json::json!(1));
-        assert_eq!(obj["/c.cpp"], serde_json::json!(1));
+        let incoming = &parsed["incoming"]["results"];
+        let outgoing = &parsed["outgoing"]["results"];
+        // Outgoing: the call /a -> /b -> /b.cpp count 1.
+        assert_eq!(outgoing[0]["file"], serde_json::json!("/b.cpp"));
+        assert_eq!(outgoing[0]["count"], serde_json::json!(1));
+        // Incoming: /c.cpp includes /a.cpp -> /c.cpp count 1.
+        assert_eq!(incoming[0]["file"], serde_json::json!("/c.cpp"));
+        assert_eq!(incoming[0]["count"], serde_json::json!(1));
+        assert_eq!(parsed["outgoing"]["total"], serde_json::json!(1));
+        assert_eq!(parsed["incoming"]["total"], serde_json::json!(1));
+    }
+
+    /// Sequential budget: incoming has many rows; outgoing has one. With
+    /// a `max_bytes` tuned so the incoming `byte_budget_take` (full
+    /// `max_bytes`) consumes essentially all of it, the remaining budget
+    /// after subtracting the serialized incoming page plus the 48-byte
+    /// wrapper overhead floors at 0, so outgoing must be the empty
+    /// start-fresh page: `truncated: true, next_offset: Some(0)`.
+    ///
+    /// Byte math: `ENVELOPE_OVERHEAD_BYTES` is 512 (mod.rs), and the
+    /// incoming page wrapper itself is ~100 bytes. We set `max_bytes =
+    /// 560`. The incoming `byte_budget_take` reserves 512 for its own
+    /// envelope (560 - 512 = 48 bytes of record budget) — enough for at
+    /// least one short `{"file":"/x","count":N}` row but not many. The
+    /// full serialized incoming `Page` (envelope + the kept row(s)) then
+    /// runs to ~120+ bytes. `560 - incoming_bytes - 48` saturates to 0
+    /// long before outgoing can be sized, so the handler emits the empty
+    /// outgoing page. This pins the "incoming exhausts the budget" branch.
+    #[test]
+    fn coupling_both_sequential_budget_starves_outgoing() {
+        let mut g = Graph::new();
+        // Several files include /target.cpp (incoming rows) and
+        // /target.cpp includes one file (an outgoing row that must be
+        // starved out).
+        g.merge_file_graph(FileGraph {
+            path: "/target.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/target.cpp", "/out_dep.cpp")],
+        });
+        for name in ["/in_a.cpp", "/in_b.cpp", "/in_c.cpp", "/in_d.cpp"] {
+            g.merge_file_graph(FileGraph {
+                path: name.to_string(),
+                language: Language::Cpp,
+                symbols: vec![],
+                edges: vec![include_edge(name, "/target.cpp")],
+            });
+        }
+        let g = locked(g);
+        let r = get_coupling(&g, "/target.cpp", Some("both"), None, None, 560);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        // Incoming has all 4 includers as `total`; whatever fits is fine,
+        // the discriminator is the outgoing starvation.
+        assert_eq!(parsed["incoming"]["total"], serde_json::json!(4));
+        let outgoing = &parsed["outgoing"];
+        assert_eq!(
+            outgoing["results"],
+            serde_json::json!([]),
+            "incoming should exhaust the budget, leaving outgoing empty"
+        );
+        assert_eq!(
+            outgoing["truncated"],
+            serde_json::json!(true),
+            "starved outgoing page must flag truncated"
+        );
+        assert_eq!(
+            outgoing["next_offset"],
+            serde_json::json!(0),
+            "starved outgoing page must carry the start-fresh marker next_offset=0"
+        );
+        // `total` is still the true pre-pagination count even when starved.
+        assert_eq!(outgoing["total"], serde_json::json!(1));
     }
 
     #[test]
     fn coupling_invalid_direction_errors() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "/a.cpp", Some("sideways"));
+        let r = get_coupling(&g, "/a.cpp", Some("sideways"), None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             body_text(&r),
@@ -1398,10 +1665,35 @@ mod tests {
     }
 
     #[test]
-    fn coupling_unknown_file_returns_empty_object() {
+    fn coupling_unknown_file_returns_empty_page() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "/never.cpp", None);
-        assert_eq!(body_text(&r), "{}");
+        let r = get_coupling(&g, "/never.cpp", None, None, None, NO_BYTE_BUDGET);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let (rows, total, truncated, next) = coupling_page(&r);
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
+        assert!(!truncated);
+        assert_eq!(next, None);
+    }
+
+    /// `DependencyEntry` is defined ahead of its consumer (the
+    /// `get_dependencies` handler rewrite). This trivial type-level test
+    /// constructs and serializes one so every field is exercised — keeps
+    /// the wire shape `{file, kind, line}` pinned and avoids a dead-code
+    /// warning on the not-yet-wired type without reaching for an
+    /// `#[allow(dead_code)]` attribute.
+    #[test]
+    fn dependency_entry_serializes_with_expected_shape() {
+        let entry = super::super::DependencyEntry {
+            file: "/dep.cpp".to_string(),
+            kind: "include",
+            line: 7,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(json["file"], serde_json::json!("/dep.cpp"));
+        assert_eq!(json["kind"], serde_json::json!("include"));
+        assert_eq!(json["line"], serde_json::json!(7));
     }
 
     // --- generate_diagram ---
@@ -1965,12 +2257,10 @@ mod tests {
 
         // (1) Canonical form — the baseline. Asserts the fixture is sound
         // before we exercise the normalize path.
-        let r_canonical = get_coupling(&g, canonical_str, None);
+        let r_canonical = get_coupling(&g, canonical_str, None, None, None, NO_BYTE_BUDGET);
         assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
-        let parsed_canonical: serde_json::Value =
-            serde_json::from_str(&body_text(&r_canonical)).unwrap();
-        let obj_canonical = parsed_canonical.as_object().unwrap();
-        assert_eq!(obj_canonical["/b.cpp"], serde_json::json!(1));
+        let (rows_canonical, _, _, _) = coupling_page(&r_canonical);
+        assert_eq!(rows_canonical, vec![("/b.cpp".to_string(), 1)]);
 
         // (2) `./sub/../a.cpp` form — the load-bearing assertion. Without
         // `normalize_user_path`, this string would fail an exact-match graph
@@ -1982,18 +2272,17 @@ mod tests {
             "messy fixture must differ from canonical for the test to be meaningful"
         );
 
-        let r_messy = get_coupling(&g, messy_str, None);
+        let r_messy = get_coupling(&g, messy_str, None, None, None, NO_BYTE_BUDGET);
         assert!(
             r_messy.is_error.is_none() || r_messy.is_error == Some(false),
             "messy form must succeed after normalize: body={}",
             body_text(&r_messy),
         );
-        let parsed_messy: serde_json::Value = serde_json::from_str(&body_text(&r_messy)).unwrap();
-        let obj_messy = parsed_messy.as_object().unwrap();
+        let (rows_messy, _, _, _) = coupling_page(&r_messy);
         assert_eq!(
-            obj_messy["/b.cpp"],
-            serde_json::json!(1),
-            "messy form must return the same coupling map as canonical",
+            rows_messy,
+            vec![("/b.cpp".to_string(), 1)],
+            "messy form must return the same coupling page as canonical",
         );
     }
 

@@ -1,10 +1,41 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1052
 expression: parsed
 ---
 {
-  "[testdata]/engine.h": 1,
-  "[testdata]/main.cpp": 3,
-  "[testdata]/utils.cpp": 3,
-  "[testdata]/utils.h": 1
+  "incoming": {
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "results": [
+      {
+        "count": 3,
+        "file": "[testdata]/main.cpp"
+      }
+    ],
+    "total": 1,
+    "truncated": false
+  },
+  "outgoing": {
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "results": [
+      {
+        "count": 3,
+        "file": "[testdata]/utils.cpp"
+      },
+      {
+        "count": 1,
+        "file": "[testdata]/engine.h"
+      },
+      {
+        "count": 1,
+        "file": "[testdata]/utils.h"
+      }
+    ],
+    "total": 3,
+    "truncated": false
+  }
 }

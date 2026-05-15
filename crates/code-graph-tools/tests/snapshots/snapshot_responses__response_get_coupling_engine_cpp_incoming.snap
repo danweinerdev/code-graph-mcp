@@ -1,7 +1,18 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1030
 expression: parsed
 ---
 {
-  "[testdata]/main.cpp": 3
+  "limit": 50,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "count": 3,
+      "file": "[testdata]/main.cpp"
+    }
+  ],
+  "total": 1,
+  "truncated": false
 }

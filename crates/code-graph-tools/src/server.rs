@@ -397,6 +397,12 @@ pub struct GetCouplingArgs {
     #[schemars(description = "'outgoing' (default), 'incoming', or 'both'")]
     #[serde(default)]
     pub direction: Option<String>,
+    #[schemars(description = "Skip first N matches for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[schemars(description = "Maximum results to return per side (default 50, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -858,11 +864,19 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         // `paths::normalize_user_path` inside the handler may block on a
         // filesystem stat (see `get_file_symbols` comment).
         let inner = self.inner.clone();
         let result = tokio::task::spawn_blocking(move || {
-            handlers::structure::get_coupling(&inner.graph, &args.file, args.direction.as_deref())
+            handlers::structure::get_coupling(
+                &inner.graph,
+                &args.file,
+                args.direction.as_deref(),
+                args.offset,
+                args.limit,
+                max_bytes,
+            )
         })
         .await;
         Ok(match result {
@@ -1349,6 +1363,8 @@ mod tests {
             .get_coupling(Parameters(GetCouplingArgs {
                 file: "/x.cpp".to_string(),
                 direction: None,
+                offset: None,
+                limit: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
