@@ -1854,19 +1854,26 @@ mod tests {
 
     #[test]
     fn generate_diagram_no_file_basename_leak() {
-        // `a` has a `Calls` edge to `/missing.cpp:gone`, but no symbol
-        // named `gone` is ever declared, so that SymbolId is NOT a node
-        // in the graph (unresolved call target). Before the fix an
+        // `a` calls a resolved `helper` AND an unresolved
+        // `/missing.cpp:gone` (no symbol named `gone` is declared, so
+        // that SymbolId is not a graph node). Before the fix the
         // unresolved endpoint rendered as a file-basename pseudo-node
-        // (`missing.cpp`); now the edge is dropped entirely. Assert no
-        // entry in `result.edges` has a `from` or `to` that looks like a
-        // source-file basename.
+        // (`missing.cpp`); now that edge is dropped while the resolved
+        // `a -> helper` edge survives. Pinning BOTH halves: the resolved
+        // edge is not collateral-dropped, and no surviving endpoint
+        // renders as a source-file basename.
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/x.cpp".to_string(),
             language: Language::Cpp,
-            symbols: vec![sym("a", SymbolKind::Function, "/x.cpp")],
-            edges: vec![call_edge("/x.cpp:a", "/missing.cpp:gone", "/x.cpp")],
+            symbols: vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("helper", SymbolKind::Function, "/x.cpp"),
+            ],
+            edges: vec![
+                call_edge("/x.cpp:a", "/x.cpp:helper", "/x.cpp"),
+                call_edge("/x.cpp:a", "/missing.cpp:gone", "/x.cpp"),
+            ],
         });
         let g = locked(g);
         let r = generate_diagram(
@@ -1877,14 +1884,21 @@ mod tests {
             },
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
-        // The only edge had an unresolved target, so it is dropped:
-        // the diagram is empty rather than leaking `missing.cpp`.
-        assert!(
-            arr.is_empty(),
-            "the sole edge has an unresolved target and must be dropped: {arr:?}",
+        let body = body_text(&r);
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("handler returned malformed JSON ({e}): {body}"));
+        let arr = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("edges body must be a JSON array, got: {body}"));
+        // Resolved edge survives; unresolved one is dropped (not
+        // leaked as `missing.cpp`).
+        assert_eq!(
+            arr.len(),
+            1,
+            "only the resolved a -> helper edge survives: {arr:?}",
         );
+        assert_eq!(arr[0]["from"], "a");
+        assert_eq!(arr[0]["to"], "helper");
         const SOURCE_EXTS: &[&str] = &[
             ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx", ".rs", ".go", ".py", ".pyi", ".cs",
             ".java",

@@ -872,7 +872,45 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Generate a graph diagram: call graph (symbol), file dependencies (file), or inheritance tree (class). Returns edges as JSON by default, or Mermaid syntax when format=mermaid. When `file=` is used, the path is resolved against the indexed graph; `\\\\?\\` extended-path prefix is handled automatically, and relative segments (`.` / `..`) resolve against the on-disk file when it exists (otherwise lexical-only). The `symbol=` and `class=` modes take identifiers, not paths, and are NOT normalized — pass them exactly as they appear in the index."
+        description = "Generate a graph diagram: call graph (`symbol=`), file dependencies \
+                       (`file=`), or inheritance tree (`class=`). Provide EXACTLY ONE of \
+                       `symbol`/`file`/`class` (empty strings count as absent); zero or more \
+                       than one is an error. `direction` (symbol mode only) is one of \
+                       `\"callees\"` (only what the symbol calls), `\"callers\"` (only what \
+                       calls the symbol), or `\"both\"` (default — callees and callers in one \
+                       diagram); set `direction=\"callees\"` to show only outgoing calls. \
+                       `direction` is IGNORED for `file=`/`class=` modes — passing it there is \
+                       silently accepted, NOT rejected; an unrecognized spelling IS rejected, \
+                       but only in symbol mode. LOSSY DEDUPE: edges that render to the same \
+                       (from_label, to_label) pair collapse into ONE — two distinct symbols \
+                       whose display labels collide (e.g. same `parent::name` in different \
+                       files) become a single diagram edge by design (visual coherence over \
+                       ID-level fidelity). Clients needing ID-level fidelity should call \
+                       `get_callers`/`get_callees` instead. UNRESOLVED-TARGET FILTER: calls to \
+                       symbols not in the index are dropped from the diagram — they no longer \
+                       appear as file-basename pseudo-nodes (an absent edge is a truer signal \
+                       than a synthetic node with no symbol behind it). `format` is `\"edges\"` \
+                       (default; JSON array of `{from, to, label, direction}` objects, `[]` \
+                       when empty) or `\"mermaid\"` (Mermaid flowchart text). Every edge carries \
+                       `direction`: `\"calls\"` (outgoing — the `from` endpoint calls `to`; \
+                       rendered solid `-->|calls|` in Mermaid) or `\"called_by\"` (incoming — \
+                       `from` is an inbound caller of `to`; rendered dashed `-.->|called by|`). \
+                       In `both` mode a single underlying call reachable from both traversal \
+                       arms is emitted ONCE, tagged by whichever arm reached it first in BFS \
+                       order; a genuinely bidirectional pair (A→B and B→A) survives as two \
+                       edges. `depth` (default 1; 0 or omitted resolves to 1) bounds BFS \
+                       traversal distance. `max_nodes` (default 30; 0 or omitted resolves to \
+                       30; no upper clamp) bounds nodes visited by the BFS; raise it for \
+                       high-fan-in symbols whose neighborhood exceeds 30. `styled` (default \
+                       false, mermaid format only) highlights the center node. On a `symbol=` \
+                       or `class=` miss the error carries did-you-mean suggestions; a `file=` \
+                       miss returns a bare not-found (no suggestion source for filenames). When \
+                       `file=` is used, the path is resolved against the indexed graph; \
+                       `\\\\?\\` extended-path prefix is handled automatically, and relative \
+                       segments (`.` / `..`) resolve against the on-disk file when it exists \
+                       (otherwise lexical-only). The `symbol=` and `class=` modes take \
+                       identifiers, not paths, and are NOT normalized — pass them exactly as \
+                       they appear in the index."
     )]
     async fn generate_diagram(
         &self,
