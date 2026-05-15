@@ -427,12 +427,15 @@ pub fn get_coupling(
 
         // Bytes already spent by the serialized incoming page, plus the
         // fixed outer-wrapper reserve. `to_string` on plain owned data is
-        // infallible in practice; the empty-string fallback only over-
-        // estimates the remaining budget downward (safe — never produces
-        // an over-budget envelope).
+        // infallible in practice; on the unreachable failure path fall
+        // back to the full budget so `remaining` saturates to 0 and the
+        // outgoing side is starved rather than handed a budget that
+        // could overflow `max_bytes` (a `0` fallback would do the
+        // opposite — the conservative direction is "assume incoming
+        // consumed everything").
         let incoming_bytes = serde_json::to_string(&incoming)
             .map(|s| s.len())
-            .unwrap_or(0);
+            .unwrap_or(max_bytes);
         let remaining = max_bytes
             .saturating_sub(incoming_bytes)
             .saturating_sub(COUPLING_BOTH_WRAPPER_OVERHEAD);

@@ -750,5 +750,28 @@ mod tests {
             !main_after.edges.iter().any(|e| e.to.ends_with(".ini")),
             "no include edge may point at a .ini target"
         );
+
+        // End-to-end: the filtered .ini must not reach Graph::includes
+        // either. This is the whole reason the filter physically removes
+        // the edge rather than just skipping the rewrite —
+        // merge_file_graph pushes every surviving Includes edge's target
+        // into the graph unconditionally, so a survived-but-unrewritten
+        // edge would still leak in. Asserting on FileGraph.edges alone
+        // would not catch a regression that re-introduced that leak.
+        use code_graph_graph::Graph;
+        let mut g = Graph::new();
+        g.merge_file_graph(main_after.clone());
+        let deps = g.file_dependencies(Path::new(&main_path));
+        assert!(
+            deps.iter()
+                .any(|d| d.path.as_path() == Path::new(&header_path)),
+            "resolved .h include must reach Graph::includes: {deps:?}"
+        );
+        assert!(
+            !deps
+                .iter()
+                .any(|d| d.path.to_string_lossy().ends_with(".ini")),
+            "filtered .ini include must NOT reach Graph::includes: {deps:?}"
+        );
     }
 }
