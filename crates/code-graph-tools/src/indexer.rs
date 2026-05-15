@@ -287,10 +287,20 @@ pub fn resolve_all_edges(
             None => continue,
         };
         let path_for_ctx = PathBuf::from(&fg.path);
-        for edge in &mut fg.edges {
+        fg.edges.retain_mut(|edge| {
             match edge.kind {
                 EdgeKind::Includes => {
                     if let Some(resolved) = plugin.resolve_include(&edge.to, &file_index) {
+                        // Drop include edges whose resolved target is not a
+                        // file any language plugin claims (system headers like
+                        // `stdio.h` resolving outside the indexed tree, config
+                        // files like `.ini`/`.cfg`, plain `.txt`). Such edges
+                        // would otherwise pollute the dependency graph with
+                        // non-source noise. Not logged: this fires constantly
+                        // in real C++ codebases and would flood stderr.
+                        if registry.language_for_path(&resolved).is_none() {
+                            return false;
+                        }
                         edge.to = resolved.to_string_lossy().into_owned();
                     }
                 }
@@ -310,7 +320,8 @@ pub fn resolve_all_edges(
                 EdgeKind::Inherits => {}
                 _ => {}
             }
-        }
+            true
+        });
     }
 }
 
@@ -647,6 +658,97 @@ mod tests {
             call_edge.to,
             format!("{header_path}:do_thing"),
             "call must resolve to symbol ID"
+        );
+    }
+
+    /// An include whose resolved target is not a file any language plugin
+    /// claims (here a `.ini` config file: the StubPlugin owns only `.cpp`
+    /// and `.h`) must be dropped during edge resolution. The sibling
+    /// include to a real `.h` survives. The watch reindex path
+    /// (`handlers/watch.rs::try_reindex_file`) applies the textually
+    /// identical `registry.language_for_path(...).is_none()` filter on its
+    /// own copy of this loop; it has no separately-testable resolve seam,
+    /// so this indexer-layer test is the canonical regression target.
+    #[test]
+    fn resolve_all_edges_drops_include_to_non_source_target() {
+        // The .ini file gets its own FileGraph so build_file_index puts its
+        // basename in the FileIndex — that's what makes the default
+        // basename resolver return Some(.../config.ini), which the new
+        // language_for_path filter must then reject.
+        let ini_path = "/proj/config/config.ini".to_string();
+        let ini = FileGraph {
+            path: ini_path.clone(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        };
+        let header_path = "/proj/inc/sibling.h".to_string();
+        let header = FileGraph {
+            path: header_path.clone(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        };
+        let main_path = "/proj/src/main.cpp".to_string();
+        let main = FileGraph {
+            path: main_path.clone(),
+            language: Language::Cpp,
+            symbols: vec![Symbol {
+                name: "main".to_string(),
+                kind: SymbolKind::Function,
+                file: main_path.clone(),
+                line: 5,
+                column: 0,
+                end_line: 7,
+                signature: "int main()".to_string(),
+                namespace: String::new(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }],
+            edges: vec![
+                Edge {
+                    from: main_path.clone(),
+                    // Resolves (basename) to /proj/config/config.ini, whose
+                    // extension no plugin claims → must be dropped.
+                    to: "config.ini".to_string(),
+                    kind: EdgeKind::Includes,
+                    file: main_path.clone(),
+                    line: 1,
+                },
+                Edge {
+                    from: main_path.clone(),
+                    // Resolves to the real .h source → must survive.
+                    to: "sibling.h".to_string(),
+                    kind: EdgeKind::Includes,
+                    file: main_path.clone(),
+                    line: 2,
+                },
+            ],
+        };
+
+        let mut graphs = vec![ini, header, main];
+        let reg = cpp_only_registry();
+        resolve_all_edges(&mut graphs, &reg, &NoopProgressSink);
+
+        let main_after = graphs.iter().find(|g| g.path == main_path).unwrap();
+        let include_edges: Vec<&Edge> = main_after
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Includes))
+            .collect();
+        assert_eq!(
+            include_edges.len(),
+            1,
+            "only the .h include must survive; got: {:?}",
+            include_edges.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            include_edges[0].to, header_path,
+            "the surviving include must be the resolved .h path"
+        );
+        assert!(
+            !main_after.edges.iter().any(|e| e.to.ends_with(".ini")),
+            "no include edge may point at a .ini target"
         );
     }
 }

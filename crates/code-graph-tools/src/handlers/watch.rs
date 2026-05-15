@@ -401,10 +401,20 @@ pub async fn try_reindex_file(
         return ReindexOutcome::NotASource;
     };
     let path_for_ctx = std::path::PathBuf::from(&new_fg.path);
-    for edge in &mut new_fg.edges {
+    new_fg.edges.retain_mut(|edge| {
         match edge.kind {
             EdgeKind::Includes => {
                 if let Some(resolved) = plugin.resolve_include(&edge.to, &file_index) {
+                    // Drop include edges whose resolved target is not a
+                    // file any language plugin claims (system headers like
+                    // `stdio.h` resolving outside the indexed tree, config
+                    // files like `.ini`/`.cfg`, plain `.txt`). Such edges
+                    // would otherwise pollute the dependency graph with
+                    // non-source noise. Not logged: this fires constantly
+                    // in real C++ codebases and would flood stderr.
+                    if inner.registry.language_for_path(&resolved).is_none() {
+                        return false;
+                    }
                     edge.to = resolved.to_string_lossy().into_owned();
                 }
             }
@@ -423,7 +433,8 @@ pub async fn try_reindex_file(
             EdgeKind::Inherits => {}
             _ => {}
         }
-    }
+        true
+    });
 
     // Merge + dangling-edge prune under one write lock. `merge_file_graph`
     // calls `remove_file_unsafe` internally which scrubs *outbound* edges
