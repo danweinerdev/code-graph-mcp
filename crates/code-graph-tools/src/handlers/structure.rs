@@ -39,6 +39,12 @@ use super::{
 /// (mirrors `search_symbols` / `get_orphans`); `limit` clamps at 1000.
 /// `offset >= total` returns an empty `results` page with the correct
 /// `total`.
+///
+/// The envelope's `truncated`/`next_offset` are honest: when the slice
+/// stops short of `total`, `truncated` is `true` and `next_offset`
+/// points one past the last emitted cycle so a client can resume
+/// paging. Pagination is purely by COUNT — the byte-budget cap that
+/// governs the symbol-list tools is intentionally NOT consulted here.
 pub fn detect_cycles(
     graph: &RwLock<Graph>,
     limit: Option<u32>,
@@ -78,18 +84,38 @@ pub fn detect_cycles(
         .take(resolved_limit as usize)
         .map(|files| Cycle {
             files,
+            // Per-cycle truncation (a single oversized cycle's `files`
+            // list being clipped) is a separate axis from envelope
+            // pagination; it stays unset here and is governed elsewhere.
             truncated: false,
             original_len: None,
         })
         .collect();
+
+    // Cycle pagination is by COUNT, not by serialized byte size: the
+    // envelope's `truncated`/`next_offset` are derived purely from
+    // offset/emitted/total, NOT from `[response].max_bytes`. A future
+    // reader must NOT "fix" this by routing through `byte_budget_take`
+    // — detect_cycles deliberately has no byte budget threaded in.
+    // `resolved_offset` and `emitted` are both `u32` bounded by the
+    // 1000-clamped limit and a graph that fits in memory, so the sum
+    // cannot overflow; the `as u32` cast matches the handler's existing
+    // count-cast idiom.
+    let emitted = results.len() as u32;
+    let truncated = (resolved_offset + emitted) < total;
+    let next_offset = if truncated {
+        Some(resolved_offset + emitted)
+    } else {
+        None
+    };
 
     let response = Page::<Cycle> {
         results,
         total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated: false,
-        next_offset: None,
+        truncated,
+        next_offset,
     };
     tool_success_json(&response)
 }
@@ -861,6 +887,50 @@ mod tests {
             "no overlap between pages"
         );
         assert_eq!(all_first_paths.len(), 30, "pages cover the full cycle set");
+
+        // The envelope must now tell the truth: page 1 stopped short of
+        // the 30-cycle total, so truncated=true and next_offset points
+        // at the start of page 2. Page 2 is the natural tail, so it must
+        // report truncated=false / next_offset=None.
+        let (t1, n1) = super::super::test_helpers::page_extras(&r1);
+        assert!(t1, "page 1 of a 30-cycle set with limit 20 is truncated");
+        assert_eq!(n1, Some(20), "next_offset resumes exactly at page 2");
+        let (t2, n2) = super::super::test_helpers::page_extras(&r2);
+        assert!(!t2, "page 2 reaches the end of the cycle set");
+        assert_eq!(n2, None, "no further page after the tail");
+    }
+
+    #[test]
+    fn detect_cycles_partial_first_page_envelope_reports_truncated_with_next_offset() {
+        // 100 cycles, limit 10, offset 0: the page is a strict prefix of
+        // the full set, so the envelope must advertise that more cycles
+        // exist (truncated=true) and where to resume (next_offset=10).
+        let g = locked(graph_with_n_cycles(100));
+        let r = detect_cycles(&g, Some(10), Some(0));
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert_eq!(arr.len(), 10, "limit caps the page at 10 cycles");
+        assert_eq!(total, 100, "total is the pre-pagination cycle count");
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 10);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert!(truncated, "90 cycles remain past this page");
+        assert_eq!(next_offset, Some(10), "client resumes at offset 10");
+    }
+
+    #[test]
+    fn detect_cycles_final_partial_page_envelope_reports_not_truncated() {
+        // Same 100-cycle fixture, offset 95: only 5 cycles remain, fewer
+        // than the limit. offset(95) + emitted(5) == total(100), so this
+        // is the natural tail — truncated=false, next_offset=None.
+        let g = locked(graph_with_n_cycles(100));
+        let r = detect_cycles(&g, Some(10), Some(95));
+        let (arr, total, offset, _) = page_parts(&r);
+        assert_eq!(arr.len(), 5, "only the trailing 5 cycles remain");
+        assert_eq!(total, 100);
+        assert_eq!(offset, 95);
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert!(!truncated, "no cycles remain past the final page");
+        assert_eq!(next_offset, None, "tail page has no resume offset");
     }
 
     #[test]
