@@ -130,6 +130,42 @@ pub(super) struct DependencyEntry {
     pub line: u32,
 }
 
+/// One detected include cycle: the set of files that mutually `#include`
+/// each other (a strongly-connected component of size > 1 in the include
+/// graph), plus per-cycle truncation metadata.
+///
+/// `files` is owned (each path string is materialized from a `PathBuf`
+/// via `to_string_lossy` at row-build time) and is sorted into canonical
+/// order by the handler so page boundaries are reproducible. It always
+/// serializes.
+///
+/// `truncated` reports whether this individual cycle's `files` list was
+/// shortened (a per-cycle size cap, distinct from the page-level byte
+/// budget). It always serializes — no `skip_serializing_if` — mirroring
+/// the always-present `truncated` bool on [`Page`] so a single client
+/// deserializer covers both the envelope and each cycle uniformly; the
+/// handful of bytes per cycle is negligible against the wire savings the
+/// surrounding response-shape work already banked.
+///
+/// `original_len` is `Some(n)` only when `files` was truncated, carrying
+/// the pre-truncation file count so a client knows how many entries were
+/// dropped. It is absent from the JSON when `None`, matching the
+/// established `Option` skip pattern on the optional fields of sibling
+/// response-row types.
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; clients consume it as
+/// JSON via `CallToolResult`, never as a Rust type. Derive set matches
+/// [`SummaryRow`] / [`CouplingEntry`] (`Debug`, `Serialize` only — no
+/// `Deserialize`).
+#[derive(Debug, Serialize)]
+pub(super) struct Cycle {
+    pub files: Vec<String>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_len: Option<u32>,
+}
+
 /// Bundled response for `get_coupling` with `direction = "both"`: each
 /// side carries its own independently-paginated [`Page<CouplingEntry>`].
 ///

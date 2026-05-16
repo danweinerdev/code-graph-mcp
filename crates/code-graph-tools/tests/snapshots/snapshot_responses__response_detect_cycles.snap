@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 439
 expression: parsed
 ---
 {
@@ -7,10 +8,13 @@ expression: parsed
   "next_offset": null,
   "offset": 0,
   "results": [
-    [
-      "[testdata]/circular_a.h",
-      "[testdata]/circular_b.h"
-    ]
+    {
+      "files": [
+        "[testdata]/circular_a.h",
+        "[testdata]/circular_b.h"
+      ],
+      "truncated": false
+    }
   ],
   "total": 1,
   "truncated": false

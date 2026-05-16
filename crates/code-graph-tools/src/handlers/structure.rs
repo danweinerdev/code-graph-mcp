@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use super::{
     byte_budget_take, parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json,
-    CouplingBoth, CouplingEntry, Page, SymbolResult,
+    CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -27,12 +27,13 @@ use super::{
 /// graph wrapped in the shared [`Page`] envelope so a UE-scale codebase
 /// with many circular includes doesn't blow the MCP token ceiling.
 ///
-/// Each cycle is a `Vec<String>` of file path strings (PathBuf →
-/// String via `to_string_lossy` for cross-platform stability). For
-/// deterministic pagination the inner cycle paths are sorted, then the
-/// outer cycle list is sorted by each cycle's first path — Tarjan's
-/// SCC output order is stable per build but not lexicographic, so we
-/// canonicalize both axes to keep page boundaries reproducible.
+/// Each cycle is a [`Cycle`] whose `files` is a list of file path
+/// strings (PathBuf → String via `to_string_lossy` for cross-platform
+/// stability). For deterministic pagination the inner cycle paths are
+/// sorted, then the outer cycle list is sorted by each cycle's first
+/// path — Tarjan's SCC output order is stable per build but not
+/// lexicographic, so we canonicalize both axes to keep page boundaries
+/// reproducible.
 ///
 /// Defaults: `limit = 20`, `offset = 0`. `limit = 0` resolves to 20
 /// (mirrors `search_symbols` / `get_orphans`); `limit` clamps at 1000.
@@ -71,13 +72,18 @@ pub fn detect_cycles(
     stringified.sort_by(|a, b| a.first().cmp(&b.first()));
 
     let total = stringified.len() as u32;
-    let results: Vec<Vec<String>> = stringified
+    let results: Vec<Cycle> = stringified
         .into_iter()
         .skip(resolved_offset as usize)
         .take(resolved_limit as usize)
+        .map(|files| Cycle {
+            files,
+            truncated: false,
+            original_len: None,
+        })
         .collect();
 
-    let response = Page::<Vec<String>> {
+    let response = Page::<Cycle> {
         results,
         total,
         offset: resolved_offset,
@@ -799,11 +805,18 @@ mod tests {
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1, "exactly one cycle in results");
         assert_eq!(total, 1, "total reports the full cycle count");
-        let cycle = arr[0].as_array().unwrap();
+        let cycle = arr[0]["files"].as_array().unwrap();
         assert_eq!(cycle.len(), 2);
         // Inner cycle paths sorted in canonical order, no need to sort here.
         let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(names, vec!["/a.h", "/b.h"]);
+        // Each cycle is now a {files, truncated} object; an untruncated
+        // cycle emits truncated:false and omits original_len.
+        assert_eq!(arr[0]["truncated"], serde_json::json!(false));
+        assert!(
+            arr[0].as_object().unwrap().get("original_len").is_none(),
+            "original_len absent when the cycle is not truncated"
+        );
     }
 
     #[test]
@@ -832,7 +845,12 @@ mod tests {
         let mut all_first_paths: Vec<String> = arr1
             .iter()
             .chain(arr2.iter())
-            .map(|c| c.as_array().unwrap()[0].as_str().unwrap().to_string())
+            .map(|c| {
+                c["files"].as_array().unwrap()[0]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         let len_before_dedup = all_first_paths.len();
         all_first_paths.sort();
@@ -870,6 +888,21 @@ mod tests {
         let r = detect_cycles(&g, Some(0), None);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn untruncated_cycle_serializes_with_files_and_truncated_only() {
+        // A non-truncated cycle carries files and an explicit
+        // truncated:false (always emitted, mirroring the Page envelope's
+        // always-present truncated bool); original_len is absent because
+        // it is None. The exact byte shape is a wire-format contract.
+        let c = Cycle {
+            files: vec!["a".into(), "b".into()],
+            truncated: false,
+            original_len: None,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"files":["a","b"],"truncated":false}"#);
     }
 
     // --- get_orphans ---
