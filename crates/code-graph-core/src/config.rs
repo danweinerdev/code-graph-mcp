@@ -1385,5 +1385,15 @@ max_bytes = 200000
             cfg.cpp.macro_strip_with_args.is_empty(),
             "the UE macro_strip_with_args preset must stay commented out"
         );
+        // The [response] table is active in the example with `max_bytes`
+        // commented out, so it must resolve to the documented default.
+        // Pins the same "stays inert until uncommented" guard as the
+        // cpp/discovery presets above — an accidental small literal
+        // (e.g. `max_bytes = 50`) would otherwise pass unnoticed.
+        assert_eq!(
+            cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES,
+            "response.max_bytes must be the documented default while \
+             the example leaves it commented"
+        );
     }
 }

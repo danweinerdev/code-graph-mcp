@@ -247,7 +247,7 @@ pub struct Page<T: Serialize> {
 pub(super) struct SearchSymbolsResponse {
     #[serde(flatten)]
     pub page: Page<SymbolResult>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<String>,
 }
 
