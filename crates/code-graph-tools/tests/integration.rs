@@ -96,9 +96,18 @@ async fn analyze_then_query_pipeline() {
     let deps = get_dependencies(&server.inner.graph, &engine_cpp, None, None, NO_BYTE_BUDGET);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&deps)).unwrap();
     let arr = parsed["results"].as_array().expect("results array");
+    let dep_files: Vec<&str> = arr.iter().filter_map(|v| v["file"].as_str()).collect();
     assert!(
-        !arr.is_empty(),
-        "engine.cpp has at least one resolved include",
+        dep_files.iter().any(|f| f.ends_with("engine.h")),
+        "engine.cpp must depend on engine.h; got {dep_files:?}",
+    );
+    assert!(
+        dep_files.iter().any(|f| f.ends_with("utils.h")),
+        "engine.cpp must depend on utils.h; got {dep_files:?}",
+    );
+    assert!(
+        arr.iter().all(|v| v["kind"].as_str() == Some("includes")),
+        "every dependency row must carry kind=includes; got {arr:?}",
     );
 
     // detect_cycles surfaces the circular_a/circular_b cycle. Wrapped in

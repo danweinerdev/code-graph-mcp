@@ -609,6 +609,27 @@ mod tests {
     }
 
     #[test]
+    fn edge_kind_str_matches_serde_lowercase_for_every_known_variant() {
+        // `edge_kind_str` is the wire source for `DependencyEntry.kind`.
+        // It must stay byte-identical to `EdgeKind`'s serde output, or
+        // the dependencies response would disagree with every other
+        // kind-string surface. Pin each variant against its actual
+        // serialization so a typo in either drifts loudly.
+        for k in [EdgeKind::Calls, EdgeKind::Includes, EdgeKind::Inherits] {
+            let serde_str = serde_json::to_value(k)
+                .expect("EdgeKind serializes")
+                .as_str()
+                .expect("EdgeKind serializes to a string")
+                .to_string();
+            assert_eq!(
+                edge_kind_str(k),
+                serde_str,
+                "edge_kind_str must equal EdgeKind's serde string for {k:?}",
+            );
+        }
+    }
+
+    #[test]
     fn parse_kind_unknown_returns_none() {
         assert!(parse_kind("not_a_kind").is_none());
         assert!(parse_kind("").is_none());
