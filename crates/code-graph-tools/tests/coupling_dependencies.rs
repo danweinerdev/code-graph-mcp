@@ -275,15 +275,27 @@ async fn get_coupling_byte_budget_sequential() {
     );
     let body = ok_json(&r);
 
-    // Incoming consumed (essentially) the whole budget — it must be
-    // non-empty (sanity: the starvation is real, not an empty graph).
-    let incoming_results = body["incoming"]["results"]
-        .as_array()
-        .expect("incoming.results array");
-    assert!(
-        !incoming_results.is_empty(),
-        "incoming side must emit at least one row (else the test proves \
-         nothing about *sequential* starvation); body: {body}",
+    // Sanity: the graph genuinely has a large incoming side (12 TUs all
+    // include hub.h). `total` is the pre-pagination count, independent
+    // of the tempdir path width — so this rules out the "everything is
+    // empty because the graph was empty" false pass without depending
+    // on exactly how many rows physically fit the byte budget.
+    let incoming = &body["incoming"];
+    assert_eq!(
+        incoming["total"].as_u64(),
+        Some(12),
+        "incoming side must have 12 real entries (else starvation is \
+         trivial, not sequential); body: {body}",
+    );
+    // The incoming byte budget genuinely bit: it is itself truncated.
+    // This is the path-width-independent proof that incoming consumed
+    // the budget (a wide /tmp prefix changes how many rows fit but not
+    // that the cap fired), which is what starves outgoing below.
+    assert_eq!(
+        incoming["truncated"].as_bool(),
+        Some(true),
+        "incoming side must be byte-capped (truncated=true) so the \
+         sequential starvation of outgoing is real; body: {body}",
     );
 
     // Outgoing was starved: empty results, truncated=true, next_offset=0.
@@ -704,6 +716,11 @@ async fn watch_reindex_applies_ini_filter() {
     // None and the edge would be dropped by the pre-existing resolve-miss,
     // not the watch-path language_for_path filter under test.
     std::fs::write(&ini_path, b"[section]\nk=v\n").unwrap();
+    // The `language` tag here is irrelevant — only the path needs to
+    // appear in file_graphs_snapshot() so the watch FileIndex carries
+    // the .ini basename. The watch filter under test keys off the
+    // resolved path's extension (`.ini`) via `language_for_path`, not
+    // off this stored tag, so `Cpp` is an arbitrary filler.
     server.inner.graph.write().merge_file_graph(FileGraph {
         path: ini_path.to_string_lossy().into_owned(),
         language: Language::Cpp,
