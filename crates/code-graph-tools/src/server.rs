@@ -731,8 +731,9 @@ impl CodeGraphServer {
                        envelope; each `results[i]` is {file, kind, line} where `file` is \
                        the included path, `kind` is \"includes\", and `line` is the source \
                        line of the include/import directive. Only includes that resolve \
-                       to an indexed source file appear: targets that do not (system/ \
-                       external headers, `.ini`/`.cfg`, `.txt`, anything no language \
+                       to an indexed source file appear: targets that do not \
+                       (system/external headers, `.ini`/`.cfg`, `.txt`, anything no \
+                       language \
                        plugin claims) are filtered at index time and are absent from \
                        dependencies. Rows are sorted by (file, \
                        line) ascending so pagination is deterministic. An unknown file is \
