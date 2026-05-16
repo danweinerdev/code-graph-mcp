@@ -853,6 +853,11 @@ mod tests {
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
         assert_eq!(limit, 20);
+        // Default-limited first page of a 25-cycle graph is partial:
+        // the envelope must report more pages remain (0+20 < 25).
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert!(truncated, "20-of-25 first page must be truncated");
+        assert_eq!(next_offset, Some(20));
     }
 
     #[test]
@@ -941,6 +946,11 @@ mod tests {
         assert!(arr.is_empty());
         assert_eq!(total, 3, "total still reports full cycle count");
         assert_eq!(offset, 999);
+        // Over-offset empty page is the natural end of the set, not a
+        // truncated page: no further page exists to fetch.
+        let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
+        assert!(!truncated, "over-offset empty page must not be truncated");
+        assert_eq!(next_offset, None);
     }
 
     #[test]
