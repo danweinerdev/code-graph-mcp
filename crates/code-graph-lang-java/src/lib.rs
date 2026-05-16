@@ -4,31 +4,29 @@
 //! to extract symbols, calls, import edges, and inheritance edges from
 //! `.java` source files.
 //!
-//! # Phase status
+//! # Extraction surface
 //!
-//! Phase 3.1 shipped the crate scaffold: dependency wiring, empty query
-//! string constants in [`queries`] that compile against tree-sitter-java
-//! 0.23.5, the [`JavaParser`] struct with cached `Query` objects, and
-//! the [`LanguagePlugin`] impl.
+//! The crate compiles empty-safe query string constants in [`queries`]
+//! against tree-sitter-java 0.23.5, exposes the [`JavaParser`] struct with
+//! cached `Query` objects, and implements [`LanguagePlugin`]. Every
+//! extractor below is live.
 //!
-//! Phase 3.2 wires `extract_definitions` (classes, interfaces, enums,
-//! records, methods, constructors) and switches `parse_to_filegraph`
-//! from the empty-graph stub to a real tree-sitter-driven parse.
-//! Anonymous classes (Decision 4), records (Decision 6), default
-//! interface methods (Decision 11), and enum-with-method-bodies
-//! (Decision 12) are covered with inline tests.
+//! `extract_definitions` covers classes, interfaces, enums, records,
+//! methods, and constructors. Anonymous classes (Decision 4), records
+//! (Decision 6), default interface methods (Decision 11), and
+//! enum-with-method-bodies (Decision 12) are covered with inline tests.
 //!
-//! Phase 3.3 wires `extract_calls` covering `method_invocation` (direct,
-//! member-access, chained, generic), `object_creation_expression`
-//! (constructor calls in bare / generic / qualified / qualified-generic
-//! forms), `explicit_constructor_invocation` (`this(...)` and `super(...)`
+//! `extract_calls` covers `method_invocation` (direct, member-access,
+//! chained, generic), `object_creation_expression` (constructor calls in
+//! bare / generic / qualified / qualified-generic forms),
+//! `explicit_constructor_invocation` (`this(...)` and `super(...)`
 //! constructor chaining), and `method_reference` (identifier-on-RHS form:
 //! `String::length`, `obj::method`, `this::doIt`, `super::doIt`).
 //! Constructor references (`Type::new`) are deliberately not matched —
 //! see `queries::CALL_QUERIES` for rationale.
 //!
-//! Phase 3.4 wires `extract_imports`, producing [`EdgeKind::Includes`]
-//! edges for `import_declaration` in all five forms — plain
+//! `extract_imports` produces [`EdgeKind::Includes`] edges for
+//! `import_declaration` in all five forms — plain
 //! (`import com.foo.Bar;`), single-segment (`import Foo;`), wildcard
 //! (`import com.foo.*;` → `to = "com.foo.*"`), static
 //! (`import static com.foo.Bar.X;` → `to = "com.foo.Bar.X"`, `static`
@@ -37,10 +35,9 @@
 //! record the dotted path verbatim per Decision 7; no resolution
 //! against build metadata (`pom.xml`, `build.gradle`).
 //!
-//! Phase 3.5 wires `extract_inheritance`, producing
-//! [`EdgeKind::Inherits`] edges for `superclass` (extends) and
-//! `super_interfaces` (implements) on `class_declaration` /
-//! `record_declaration` / `enum_declaration`, plus
+//! `extract_inheritance` produces [`EdgeKind::Inherits`] edges for
+//! `superclass` (extends) and `super_interfaces` (implements) on
+//! `class_declaration` / `record_declaration` / `enum_declaration`, plus
 //! `extends_interfaces` on `interface_declaration`. Per Decision 2,
 //! `extends` and `implements` produce the same edge kind — agents
 //! disambiguate via the target Symbol's kind. Per Decision 9, generic
@@ -161,11 +158,9 @@ impl JavaParser {
     /// compile against the pinned grammar version.
     ///
     /// Successful return is the gate that proves every query string in
-    /// [`queries`] parses against tree-sitter-java 0.23.5. Phase 3.2
-    /// filled [`DEFINITION_QUERIES`]; Phase 3.3 filled [`CALL_QUERIES`];
-    /// Phase 3.4 filled [`IMPORT_QUERIES`]; Phase 3.5 filled
-    /// [`INHERITANCE_QUERIES`]. All four query strings are live as of
-    /// 3.5.
+    /// [`queries`] parses against tree-sitter-java 0.23.5.
+    /// [`DEFINITION_QUERIES`], [`CALL_QUERIES`], [`IMPORT_QUERIES`], and
+    /// [`INHERITANCE_QUERIES`] are all populated and live.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_java::LANGUAGE.into();
 
@@ -201,9 +196,8 @@ impl JavaParser {
     /// without exposing it. Mirrors the Python/C# plugins'
     /// `parse_to_filegraph` indirection.
     ///
-    /// Phase 3.2 wired `extract_definitions` into the pipeline; Phase 3.3
-    /// wired `extract_calls`; Phase 3.4 wired `extract_imports`; Phase
-    /// 3.5 wires `extract_inheritance`. All four extractors are live —
+    /// All four extractors (`extract_definitions`, `extract_calls`,
+    /// `extract_imports`, `extract_inheritance`) are wired and live —
     /// `parse_file` produces Symbol records, `Calls` edges, `Includes`
     /// edges, and `Inherits` edges from a single tree-sitter parse.
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
@@ -655,8 +649,7 @@ impl JavaParser {
     /// Run the inheritance query and produce [`EdgeKind::Inherits`]
     /// edges, one per base in each extends/implements clause. Mirrors
     /// the C++/Rust/Go/Python/C# plugins' `extract_inheritance` for the
-    /// bare-name `from`-field contract (cite Phase 1 / Phase 5 of
-    /// RustRewrite and the C# 2.5 precedent at
+    /// bare-name `from`-field contract (see the C# precedent at
     /// `crates/code-graph-lang-csharp/src/lib.rs::extract_inheritance`).
     ///
     /// **Per-match shape.** The query returns one match *per base*:
@@ -782,7 +775,7 @@ impl LanguagePlugin for JavaParser {
 
     /// Parse `content` (UTF-8 bytes) as Java and produce a [`FileGraph`].
     /// All four extractors (definitions, calls, imports, inheritance)
-    /// are live as of Phase 3.5.
+    /// are live.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -860,7 +853,7 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// the empty string defensively.
 ///
 /// Decision 9 (generic parameter text preserved verbatim) — and the
-/// Phase 1 / Phase 5 bare-name `from`-field rule — are both enforced
+/// bare-name `from`-field rule — are both enforced
 /// here. The result is the bare type name, EXCEPT for generic types
 /// where the `type_parameters` text is appended verbatim.
 ///
@@ -877,8 +870,8 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// adjacency lookup misses (edges are keyed under `"Foo<T>"`).
 /// Generic-class hierarchy walks are effectively unsupported by the
 /// graph layer in its current form. Same limitation exists in the
-/// Rust and C# plugins; the trade-off is documented in Phase 4.4's
-/// CLAUDE.md "Java Parser Limitations" section.
+/// Rust and C# plugins; the trade-off is documented in CLAUDE.md's
+/// Java parser limitations.
 ///
 /// In tree-sitter-java 0.23.5 the generic parameter list is the named
 /// child of kind `type_parameters` (reached via the `type_parameters:`
@@ -971,7 +964,7 @@ fn enclosing_named_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// Build a `path:fn_name` or `path:Parent::fn_name` symbol-ID anchor for
 /// the function/method/constructor enclosing `node`. Mirrors the
 /// C++/Rust/Go/Python/C# plugins' `enclosing_function_id` and matches
-/// the [`code_graph_core::symbol_id`] shape produced by Phase 3.2's
+/// the [`code_graph_core::symbol_id`] shape produced by the
 /// definition extractor so call edges' `from` fields line up exactly
 /// with definition IDs.
 ///
@@ -1093,7 +1086,7 @@ fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
 /// node, or `None` if the directive has no recoverable path (defensive
 /// — well-formed Java always has at least one named path child).
 ///
-/// Rules (per the tree-sitter-java 0.23.5 probe at Phase 3.4):
+/// Rules (per the tree-sitter-java 0.23.5 grammar):
 /// - **Plain** (`import com.foo.Bar;`): the path is the single named
 ///   `scoped_identifier` child; its text is the verbatim dotted path
 ///   (`com.foo.Bar`).
@@ -1196,16 +1189,14 @@ fn make_symbol(
 
 #[cfg(test)]
 mod tests {
-    //! Phase 3.1 structural smoke tests + Phase 3.2 definition-extraction
-    //! coverage + Phase 3.3 call-extraction coverage + Phase 3.4
-    //! import-extraction coverage + Phase 3.5 inheritance-extraction
-    //! coverage. All four extractors are live.
+    //! Structural smoke tests plus definition-, call-, import-, and
+    //! inheritance-extraction coverage. All four extractors are live.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
 
     // ----------------------------------------------------------------
-    // Phase 3.1 — structural smoke tests
+    // Structural smoke tests
     // ----------------------------------------------------------------
 
     #[test]
@@ -1215,11 +1206,11 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 3.2 — definition extraction
+    // Definition extraction
     // ----------------------------------------------------------------
 
     /// Parse `src` against `JavaParser` at a synthetic absolute path.
-    /// Used by every Phase 3.2 behavioral test below.
+    /// Used by every definition-extraction behavioral test below.
     fn parse(src: &str) -> FileGraph {
         parse_at(src, "/tmp/Test.java")
     }
@@ -1855,7 +1846,7 @@ class Foo {
     }
 
     // ----------------------------------------------------------------
-    // Phase 3.3 — call extraction
+    // Call extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Calls` edges of `fg` (drops Includes edges
@@ -2365,7 +2356,7 @@ class C {
     }
 
     // ----------------------------------------------------------------
-    // Phase 3.4 — import extraction
+    // Import extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Includes` edges of `fg`. Mirrors the C#
@@ -2558,7 +2549,7 @@ import com.baz.C;
     }
 
     // ----------------------------------------------------------------
-    // Phase 3.5 — inheritance extraction
+    // Inheritance extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Inherits` edges of `fg`. Mirrors the `calls`
@@ -2575,10 +2566,10 @@ import com.baz.C;
     #[test]
     fn single_extends_produces_one_inherits_edge() {
         // `class Foo extends Bar { }` → 1 Inherits edge with from="Foo",
-        // to="Bar". The bare-name `from`-field rule (Phase 1 / Phase 5
-        // of RustRewrite, reaffirmed by Decision 9 in this design) is
-        // load-bearing — see `crates/code-graph-graph/src/algorithms.rs`,
-        // which looks up classes by `Symbol.name`.
+        // to="Bar". The bare-name `from`-field rule (reaffirmed by
+        // Decision 9 in this design) is load-bearing — see
+        // `crates/code-graph-graph/src/algorithms.rs`, which looks up
+        // classes by `Symbol.name`.
         let fg = parse_at("class Foo extends Bar { }\n", "/p/Test.java");
         let edges = inherits(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);
@@ -2661,8 +2652,7 @@ import com.baz.C;
         // Symbol.name then walks adj.get(name), but the adjacency map
         // is keyed under "Foo<T>". Same limitation exists in the Rust
         // and C# plugins; the accepted Decision 9 trade-off is
-        // documented in Phase 4.4's CLAUDE.md "Java Parser Limitations"
-        // section.
+        // documented in CLAUDE.md's Java parser limitations.
         let fg = parse_at("class Foo<T> extends Bar<T> { }\n", "/p/Test.java");
         let edges = inherits(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);

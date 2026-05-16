@@ -1,10 +1,10 @@
 //! Helper routines for the Python parser.
 //!
-//! Phase status: Phase 7.1 ships the small structural helpers
-//! ([`find_enclosing_class`], [`extract_module_path`],
-//! [`enclosing_function_id`]) used by the upcoming 7.2/7.3/7.4 extractors.
-//! `truncate_signature` is re-exported from `code_graph_lang::helpers` (the
-//! cross-language consolidation that Phase 7.1 also performed).
+//! The small structural helpers ([`find_enclosing_class`],
+//! [`extract_module_path`], [`enclosing_function_id`]) feed the
+//! definition/call/import extractors. `truncate_signature` is
+//! re-exported from the shared `code_graph_lang::helpers` module so
+//! every language plugin reuses the same logic.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub`
 //! as a crate-internal convention so callers within `lib.rs` can `use`
@@ -21,9 +21,10 @@ use tree_sitter::Node;
 /// Walk `node`'s parent chain and return the first ancestor that is a
 /// `class_definition`, or `None` if `node` is not nested inside a class.
 ///
-/// Used by Phase 7.2's definition extractor to decide whether a
-/// `function_definition` is a free function or a method, and by 7.3 to
-/// build `<path>:<Class>::<method>` symbol IDs for calls inside methods.
+/// Used by the definition extractor to decide whether a
+/// `function_definition` is a free function or a method, and by the call
+/// extractor to build `<path>:<Class>::<method>` symbol IDs for calls
+/// inside methods.
 ///
 /// **Decorator transparency:** `@property def foo(self)` parses as
 /// `decorated_definition > function_definition`. The `decorated_definition`
@@ -89,7 +90,7 @@ pub fn extract_module_path(import_node: Node<'_>, content: &[u8]) -> String {
 /// Build a `path:fn_name` (free function) or `path:Class::fn_name` (method)
 /// symbol-ID anchor for the function enclosing `node`. Mirrors the C++/
 /// Rust/Go plugins' `enclosing_function_id` and matches the
-/// [`code_graph_core::symbol_id`] shape produced by Phase 7.2's definition
+/// [`code_graph_core::symbol_id`] shape produced by the definition
 /// extractor so call edges' `from` fields line up exactly with definition
 /// IDs.
 ///

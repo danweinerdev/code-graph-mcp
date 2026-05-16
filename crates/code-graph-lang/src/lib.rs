@@ -5,14 +5,14 @@
 //! [`LanguageRegistry`] maps file extensions to plugins; it mirrors the Go
 //! `parser.Registry` in `internal/parser/registry.go`.
 //!
-//! Phase 3.3 wires up the real default impls of
-//! [`LanguagePlugin::resolve_call`] and [`LanguagePlugin::resolve_include`].
-//! The scope-aware resolver and the basename resolver port the Go
-//! reference at `internal/tools/analyze.go` (`resolveCall` and
-//! `resolveInclude`) byte-for-byte, including a known dead-code path in
-//! `resolveCall` that the Go implementation kept. The supporting types
-//! [`CallContext`], [`SymbolIndex`], [`FileIndex`] now carry real fields
-//! populated by the Phase 3.3 indexer.
+//! The default impls of [`LanguagePlugin::resolve_call`] and
+//! [`LanguagePlugin::resolve_include`] are the scope-aware resolver and
+//! the basename resolver; they port the Go reference at
+//! `internal/tools/analyze.go` (`resolveCall` and `resolveInclude`)
+//! byte-for-byte, including a known dead-code path in `resolveCall` that
+//! the Go implementation kept. The supporting types [`CallContext`],
+//! [`SymbolIndex`], [`FileIndex`] carry real fields populated by the
+//! indexer.
 
 pub mod helpers;
 
@@ -64,7 +64,7 @@ pub enum RegistryError {
 }
 
 // Edge-resolution support types -------------------------------------------
-// Populated by the Phase 3.3 indexer (`code-graph-tools::indexer`) and
+// Populated by the indexer (`code-graph-tools::indexer`) and
 // consumed by the default impls of [`LanguagePlugin::resolve_call`] /
 // [`LanguagePlugin::resolve_include`]. Per-language plugins may override the
 // trait methods to add language-specific scoping.
@@ -162,8 +162,8 @@ impl FileIndex {
 /// The trailing `_ = callerNS` line in Go suppresses the unused-variable
 /// warning. We replicate the dead branch verbatim here so this resolver
 /// produces byte-identical edge resolution against Go-binary baselines for
-/// the cases where it matters — the parity gates in Phase 3.2 and Phase
-/// 3.7 depend on this match.
+/// the cases where it matters — the Go-parity regression tests depend on
+/// this match.
 ///
 /// The same-parent extraction in [`caller_id_parent`] uses a
 /// singleton-colon rule rather than Go's `strings.LastIndex(":")`. The Go
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(fg.path, "/tmp/sample.fake");
     }
 
-    // -- Edge resolver tests (Phase 3.3) ---------------------------------
+    // -- Edge resolver tests ---------------------------------------------
 
     fn entry(id: &str, file: &str, parent: &str, namespace: &str) -> SymbolEntry {
         SymbolEntry {
@@ -1016,10 +1016,11 @@ mod tests {
         // Pins the disabled-precedence contract for the C# additive list:
         // even when `[extensions].csharp = [".cs"]` deliberately claims
         // `.cs`, a `[extensions].disabled = [".cs"]` entry suppresses
-        // dispatch entirely. No C# plugin is registered yet (Phase 2),
-        // so this test only exercises the dispatch — it asserts `None`,
-        // which is also what we'd see if no plugin is present and no
-        // additive claimed the extension. The discriminator is the
+        // dispatch entirely. This test exercises only the config-driven
+        // dispatch (no plugin registered in the test harness) — it
+        // asserts `None`, which is also what we'd see if no plugin is
+        // present and no additive claimed the extension. The discriminator
+        // is the
         // additive: without `disabled`, `language_for_path_with_config`
         // would return `Some(Language::CSharp)` even with no plugin
         // registered, because the dispatch is purely config-driven.

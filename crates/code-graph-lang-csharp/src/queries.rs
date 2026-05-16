@@ -3,10 +3,9 @@
 //! Validated against tree-sitter-c-sharp v0.23.5 — `CSharpParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 2.2 filled [`DEFINITION_QUERIES`]; Phase 2.3
-//! filled [`CALL_QUERIES`]; Phase 2.4 filled [`IMPORT_QUERIES`]; Phase
-//! 2.5 filled [`INHERITANCE_QUERIES`]. All four query constants are
-//! live — the C# plugin's query surface is complete.
+//! [`DEFINITION_QUERIES`], [`CALL_QUERIES`], [`IMPORT_QUERIES`], and
+//! [`INHERITANCE_QUERIES`] are all populated and live — the C# plugin's
+//! query surface is complete.
 //!
 //! ## C#-specific node-kind notes (tree-sitter-c-sharp 0.23.5)
 //!

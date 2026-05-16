@@ -4,9 +4,9 @@
 //! 1–175 (`Graph`, `Node`, `EdgeEntry`, `New`, `MergeFileGraph`, `RemoveFile`,
 //! `removeFileUnsafe`, `Clear`). The Rust port adds a [`FileEntry`] that
 //! records the source [`Language`] alongside the file's symbol IDs so the
-//! Phase-3 cache v2 format can persist the language without re-deriving it
-//! from the file extension. Locking is **not** introduced here — Task 2.6
-//! wraps [`Graph`] behind a `parking_lot::RwLock`.
+//! cache v2 format can persist the language without re-deriving it from the
+//! file extension. Locking is **not** introduced here — the server-side
+//! [`Graph`] is wrapped behind a `parking_lot::RwLock` at the call site.
 //!
 //! Keys for the file-scoped maps (`files`, `includes`) are `PathBuf` rather
 //! than `String` so callers do not have to launder `Path` ↔ `String`
@@ -67,7 +67,7 @@ pub struct EdgeEntry {
 
 /// Per-file metadata recorded at merge time. The Go reference stores only
 /// `map[string][]string` (path → symbol IDs); the Rust port also captures
-/// the source [`Language`] so cache v2 (Phase 3) can persist it without
+/// the source [`Language`] so the cache v2 format can persist it without
 /// re-deriving from the path extension.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -191,8 +191,9 @@ impl Graph {
         self.remove_file_unsafe(path);
     }
 
-    // "unsafe" here means "caller must hold the write lock once Task 2.6 wraps
-    // Graph in parking_lot::RwLock". No Rust `unsafe` code is involved.
+    // "unsafe" here means "caller must hold the write lock on the
+    // `parking_lot::RwLock` that wraps the server-side Graph". No Rust
+    // `unsafe` code is involved.
     fn remove_file_unsafe(&mut self, path: &Path) {
         // Remove nodes for this file's symbols.
         if let Some(entry) = self.files.get(path) {
@@ -324,11 +325,10 @@ impl Graph {
         }
     }
 
-    // ----- Phase 2.1 read accessors used only by the in-module tests.
-    // The public query surface arrives in Tasks 2.2–2.5, which will add
-    // proper APIs (`file_symbols`, `symbol_detail`, etc.) on top of these
-    // private maps. Gated to `cfg(test)` so the dead_code lint stays clean
-    // until then.
+    // ----- Read accessors used only by the in-module tests. The public
+    // query surface (`file_symbols`, `symbol_detail`, etc.) is built on top
+    // of these private maps. Gated to `cfg(test)` so the dead_code lint
+    // stays clean.
     #[cfg(test)]
     fn nodes(&self) -> &HashMap<SymbolId, Node> {
         &self.nodes
@@ -624,7 +624,7 @@ mod tests {
                 sym("Base", SymbolKind::Class, "/a.cpp"),
                 sym("Derived", SymbolKind::Class, "/a.cpp"),
             ],
-            // Inherits edges use bare derived/base names per the Phase 1 quirk.
+            // Inherits edges use bare (non-generic) derived/base names.
             vec![inherit_edge("Derived", "Base", "/a.cpp")],
         ));
 
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn file_graphs_snapshot_returns_one_entry_per_file_with_no_edges() {
-        // Phase 4.2 watch-mode helper: must reconstruct one FileGraph per
+        // The watch-mode snapshot helper must reconstruct one FileGraph per
         // stored file with the file's symbols (in insertion order) and an
         // empty `edges` Vec — edges are merged into adj/radj/includes at
         // merge time and aren't recoverable from internal storage in

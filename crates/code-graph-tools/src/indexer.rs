@@ -4,16 +4,16 @@
 //! This module orchestrates the discover → parse → resolve pipeline for the
 //! `analyze_codebase` MCP tool. The flow is:
 //!
-//! 1. [`super::discovery::discover`] enumerates source files (Phase 3.2).
+//! 1. [`super::discovery::discover`] enumerates source files.
 //! 2. [`index_directory`] spins up a per-job `rayon::ThreadPool` sized by
 //!    `cfg.parsing.max_threads`, calls
 //!    `LanguagePlugin::parse_file` in parallel inside that pool, and reports
-//!    progress through a [`ProgressSink`] (Phase 3.3).
+//!    progress through a [`ProgressSink`].
 //! 3. [`resolve_all_edges`] walks every produced [`FileGraph`] and rewrites
 //!    `Calls` and `Includes` edges via the per-language
 //!    `LanguagePlugin::resolve_call` / `LanguagePlugin::resolve_include`
 //!    default impls, using a `(Language, name)`-keyed [`SymbolIndex`] so a
-//!    Python `init` is never returned for a C++ caller (Phase 3.3).
+//!    Python `init` is never returned for a C++ caller.
 //!
 //! Per-job pool, not the global rayon pool — `analyze_codebase` runs other
 //! work (search, BFS) concurrently, and we don't want one analyze to
@@ -26,7 +26,7 @@
 //! [`ChannelProgressSink`] takes a `tokio::sync::mpsc::Sender<ProgressEvent>`
 //! and pushes events from rayon worker threads via `try_send` (best-effort:
 //! a full channel drops events rather than blocking the parser pool). The
-//! `analyze_codebase` handler — Phase 3.4 — owns the receiver and forwards
+//! `analyze_codebase` handler owns the receiver and forwards
 //! each event to `peer.notify_progress`. When the blocking job ends, the
 //! sender drops and the receiver task exits cleanly.
 
@@ -42,7 +42,7 @@ use crate::discovery;
 
 /// Aggregate result of an indexing pass.
 ///
-/// Phase 3.4's `analyze_codebase` handler will compose this from the values
+/// The `analyze_codebase` handler composes this from the values
 /// returned by [`index_directory`] and [`resolve_all_edges`].
 #[derive(Debug, Clone)]
 pub struct IndexResult {

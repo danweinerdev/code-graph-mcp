@@ -1,6 +1,5 @@
-//! Watch-mode handlers — Phase 4.1 shipped the lifecycle (start / stop) and a
-//! placeholder watch_loop body that simply drained debouncer events. Phase 4.2
-//! fills in the real loop: each batch of debounced filesystem events drives
+//! Watch-mode handlers — the `watch_start` / `watch_stop` lifecycle plus
+//! the reindex loop: each batch of debounced filesystem events drives
 //! a per-file reindex through [`try_reindex_file`], which is index-lock-aware
 //! so an in-flight `analyze_codebase` can never race a watch-driven merge.
 //!
@@ -149,9 +148,8 @@ pub fn watch_stop(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
 ///
 /// The closure is `Fn`, so it must be cheap to call repeatedly — captures
 /// `events_tx` by move, then `clone`s for each invocation. Errors from
-/// notify itself are swallowed: Phase 4.2 will surface them via tracing
-/// once the loop has somewhere to log to. Today's contract is "stop
-/// crashing the watcher thread".
+/// notify itself are swallowed: the contract is "do not crash the
+/// watcher thread".
 fn forward_events(events_tx: mpsc::Sender<Vec<DebouncedEvent>>) -> impl Fn(DebounceEventResult) {
     move |result| {
         let events = match result {
@@ -247,7 +245,7 @@ pub async fn try_reindex_file(
     // for parsing/discovery settings; re-reading on every event would let a
     // stale on-disk config diverge from the live indexer state.
     //
-    // CppMacroStrip Phase 2.3: bind the cached `RootConfig` so we can pass
+    // Bind the cached `RootConfig` so we can pass
     // it into `LanguagePlugin::preprocess` below — `[cpp].macro_strip` is
     // a per-file knob and watch-mode reindex must apply the same
     // substitution the most-recent `analyze_codebase` did. The clone is
@@ -566,9 +564,9 @@ mod tests {
     }
 
     /// Wait briefly for the spawned watch_loop tokio task to deposit its
-    /// `WatchHandle` into `inner.watch`. The Phase 4.1 implementation
-    /// installs the handle synchronously inside `watch_start`, so this is
-    /// a defensive check — the assertion fires either way.
+    /// `WatchHandle` into `inner.watch`. `watch_start` installs the handle
+    /// synchronously, so this is a defensive check — the assertion fires
+    /// either way.
     async fn assert_watch_handle_present(server: &CodeGraphServer) {
         // No actual async wait is needed — `watch_start` writes the handle
         // before returning. Kept the helper signature async-ish so a
@@ -734,7 +732,7 @@ mod tests {
         let _: fn(&Path) = |_| {};
     }
 
-    // -- Phase 4.2: try_reindex_file -----------------------------------
+    // -- try_reindex_file ----------------------------------------------
 
     use crate::handlers::symbols::get_file_symbols;
 
@@ -788,7 +786,7 @@ mod tests {
             NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
-        // Phase 3: response is now a Page<SymbolResult> envelope.
+        // The response is a Page<SymbolResult> envelope.
         let arr = body["results"].as_array().expect("results array");
         assert!(
             arr.iter().all(|s| s["name"].as_str() != Some("changed")),
@@ -876,7 +874,7 @@ mod tests {
             NO_BYTE_BUDGET,
         );
         let body = body_json(&r);
-        // Phase 3: response is now a Page<SymbolResult> envelope.
+        // The response is a Page<SymbolResult> envelope.
         let names: Vec<&str> = body["results"]
             .as_array()
             .unwrap()

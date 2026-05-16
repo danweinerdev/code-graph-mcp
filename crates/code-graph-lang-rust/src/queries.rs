@@ -3,21 +3,21 @@
 //! Validated against tree-sitter-rust v0.24.2 — `RustParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 5.1 ships these query strings. Phase 5.2/5.3/5.4 wire
-//! them into `extract_*` loops on `RustParser`.
+//! These query strings are wired into the `extract_*` loops on
+//! `RustParser`.
 
 /// Definition queries: function items (free + impl methods), structs, enums,
 /// traits, type aliases, modules, impl-block methods.
 ///
 /// **Deliberate exclusion:** `macro_rules_definition` is intentionally NOT
 /// matched. `macro_rules!` definitions are not extracted as symbols; only
-/// invocations produce call edges (Phase 5.4). This matches the documented
+/// invocations produce call edges. This matches the documented
 /// Rust-plugin limitation.
 pub(crate) const DEFINITION_QUERIES: &str = r#"
 ; Free functions and impl methods both surface as `function_item` whose
 ; `name` is an `identifier`. The distinction (Function vs Method) is
 ; resolved at extraction time by walking up to look for an enclosing
-; `impl_item` — see helpers::find_enclosing_impl. Phase 5.2 implements
+; `impl_item` — see helpers::find_enclosing_impl, which implements
 ; the disambiguation; for `impl Trait for Type { fn m() }` the parent is
 ; Type, not Trait.
 (function_item
@@ -41,7 +41,8 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
   name: (type_identifier) @type.name) @type.def
 
 ; Modules: `mod foo { ... }` and `mod foo;`
-; Phase 5.2 walks ancestors to compute Symbol.namespace as `a::b::c`.
+; The definition extractor walks ancestors to compute Symbol.namespace
+; as `a::b::c`.
 (mod_item
   name: (identifier) @mod.name) @mod.def
 "#;
@@ -74,7 +75,7 @@ pub(crate) const CALL_QUERIES: &str = r#"
     function: (scoped_identifier) @call.qname)) @call.expr
 
 ; Macro invocation: foo!() / println!("..."). The leading identifier
-; (without the `!`) is the macro name. Captured here for Phase 5.4 call
+; (without the `!`) is the macro name. Captured here for call
 ; edges — `macro_rules!` definitions are NOT captured (see
 ; DEFINITION_QUERIES).
 (macro_invocation
@@ -88,7 +89,7 @@ pub(crate) const CALL_QUERIES: &str = r#"
 ///
 /// `use` paths are parsed via tree-sitter's `use_declaration > use_*` family
 /// of nodes; full expansion (grouped imports, wildcards, aliases, `self`) is
-/// done by [`crate::helpers::split_use_path`] in Phase 5.3. Here we capture
+/// done by [`crate::helpers::split_use_path`]. Here we capture
 /// the top-level `use_declaration` and the `argument` field that holds the
 /// use-tree; the recursive walker handles the rest.
 ///
@@ -98,7 +99,7 @@ pub(crate) const CALL_QUERIES: &str = r#"
 pub(crate) const USE_QUERIES: &str = r#"
 ; Top-level use declaration. The `argument` field is the use-tree
 ; (identifier, scoped_identifier, scoped_use_list, use_list, use_wildcard,
-; use_as_clause, or self). Phase 5.3 walks it via split_use_path.
+; use_as_clause, or self). split_use_path walks it.
 (use_declaration
   argument: (_) @use.tree) @use.decl
 
@@ -110,8 +111,8 @@ pub(crate) const USE_QUERIES: &str = r#"
 /// Inheritance queries: `impl Trait for Type` blocks. Captures both the
 /// `type` field (the implementing type) and the `trait` field (the trait
 /// being implemented). Inherent impls (`impl Type { ... }`, no trait field)
-/// are also matched here but Phase 5.4's extractor only emits an inherits
-/// edge when the trait field is present.
+/// are also matched here but the inheritance extractor only emits an
+/// inherits edge when the trait field is present.
 pub(crate) const INHERITANCE_QUERIES: &str = r#"
 (impl_item
   trait: (_) @impl.trait

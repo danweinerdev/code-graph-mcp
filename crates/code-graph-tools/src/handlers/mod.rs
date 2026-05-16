@@ -13,8 +13,8 @@
 //! - `query` — `get_callers`, `get_callees`, `get_dependencies`.
 //! - `structure` — `detect_cycles`, `get_orphans`, `get_class_hierarchy`,
 //!   `get_coupling`, `generate_diagram`.
-//! - `watch` — `watch_start` and `watch_stop` (lifecycle: Phase 4.1;
-//!   reindex pipeline: Phase 4.2).
+//! - `watch` — `watch_start` and `watch_stop` (lifecycle + reindex
+//!   pipeline).
 //!
 //! All public functions in these submodules return `CallToolResult` (never
 //! `McpError`), matching the wire-envelope rule the design pinned in
@@ -40,11 +40,10 @@ use serde::Serialize;
 /// which the `skip_serializing_if` annotations then drop from the JSON
 /// output.
 ///
-/// **No `file` field.** Phase 3.4 of `PaginatedResponseSizeSafety` dropped
-/// it as a wire-format optimization: the `id` already encodes the file
-/// path (per [`code_graph_core::symbol_id`] — `file:name` or
-/// `file:Parent::name`), so the dedicated `file` key was a 100% redundant
-/// payload tax. Clients recover the absolute path via
+/// **No `file` field.** It is deliberately dropped as a wire-format
+/// optimization: the `id` already encodes the file path (per
+/// [`code_graph_core::symbol_id`] — `file:name` or `file:Parent::name`),
+/// so a dedicated `file` key would be a 100% redundant payload tax. Clients recover the absolute path via
 /// [`code_graph_core::id_to_file`], the documented inverse contract.
 /// Wire-format breaking, pre-1.0 acceptable.
 #[derive(Debug, Serialize)]
@@ -196,8 +195,7 @@ pub(super) struct CouplingBoth {
 /// (not `usize`) so JSON output is byte-identical across platforms.
 ///
 /// `truncated` is `true` when the handler stopped emitting results before
-/// reaching `limit` due to a byte-budget cap (see Phase 2 of the
-/// `PaginatedResponseSizeSafety` plan). `next_offset` is `Some(n)` when a
+/// reaching `limit` due to a byte-budget cap. `next_offset` is `Some(n)` when a
 /// client should re-request with `offset = n` to continue paging — `None`
 /// when there is no further page. The fields always serialize (no
 /// `skip_serializing_if`) so MCP clients can rely on a stable envelope
@@ -391,8 +389,8 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// Apply `offset` + `limit` pagination to `iter` while enforcing a
 /// JSON-serialized byte budget on the returned page. This is the drop-in
 /// replacement for the `.skip(offset).take(limit).collect()` pattern used by
-/// the four materializing handlers (orphans, file_symbols, callers, callees)
-/// today; Phase 2 of the `PaginatedResponseSizeSafety` plan wires it through.
+/// the four materializing handlers (orphans, file_symbols, callers, callees);
+/// those handlers route their pages through this helper.
 ///
 /// Behavior:
 /// - Skips the first `offset` items from `iter`, then accumulates up to
@@ -517,9 +515,9 @@ pub(super) mod test_helpers {
     }
 
     /// Sibling accessor (not a wider tuple) so existing call sites continue to
-    /// compile unchanged. Reads the two `Page<T>` envelope fields added in
-    /// Phase 1 of the `PaginatedResponseSizeSafety` plan — `truncated` and
-    /// `next_offset` — from the same parsed JSON body. `next_offset == null`
+    /// compile unchanged. Reads the two `Page<T>` envelope fields
+    /// `truncated` and `next_offset` from the same parsed JSON body.
+    /// `next_offset == null`
     /// in the wire JSON returns `None`; a number returns `Some(n as u32)`.
     pub fn page_extras(r: &CallToolResult) -> (bool, Option<u32>) {
         let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
@@ -596,9 +594,9 @@ mod tests {
 
     #[test]
     fn id_to_file_recovers_dropped_file_field() {
-        // Phase 3.4 of PaginatedResponseSizeSafety: `SymbolResult.file`
-        // was dropped from the wire format because the `id` already
-        // encodes the file path. This test is the round-trip contract:
+        // `SymbolResult.file` is intentionally absent from the wire
+        // format because the `id` already encodes the file path. This
+        // test is the round-trip contract:
         // for any record emitted by `symbol_to_result`, feeding
         // `record.id` through `code_graph_core::id_to_file` MUST yield
         // the source `Symbol.file` byte-for-byte. If `id_to_file` ever
@@ -622,10 +620,11 @@ mod tests {
         );
         // Spot-check the id shape: it MUST contain `Parent::name`.
         assert_eq!(id_method, "/a.cpp:Widget::do_thing");
-        // And the record MUST NOT carry a `file` key (Phase 3.4 drop).
+        // And the record MUST NOT carry a `file` key (intentionally
+        // dropped from the wire format).
         assert!(
             v_method.as_object().unwrap().get("file").is_none(),
-            "SymbolResult must not serialize a `file` key post-Phase 3.4"
+            "SymbolResult must not serialize a `file` key"
         );
 
         // Free-function shape — clear parent to flip the id branch.

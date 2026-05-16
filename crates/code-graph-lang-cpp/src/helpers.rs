@@ -10,11 +10,10 @@
 //! freely. The effective visibility cap remains crate-internal.
 //!
 //! `truncate_signature` and `find_enclosing_kind` are re-exported from
-//! `code_graph_lang::helpers` (the shared cross-language module). Phase 7.1
-//! consolidated `truncate_signature`; Phase 7.7 consolidated
-//! `find_enclosing_kind` (previously five byte-identical copies). The
-//! `pub use` re-exports keep the historical `crate::helpers::*` import
-//! paths working from `lib.rs`.
+//! `code_graph_lang::helpers` (the shared cross-language module). Both were
+//! consolidated there from previously per-crate copies (five byte-identical
+//! copies in the case of `find_enclosing_kind`). The `pub use` re-exports
+//! keep the `crate::helpers::*` import paths working from `lib.rs`.
 
 pub use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 

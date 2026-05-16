@@ -3,10 +3,9 @@
 //! Validated against tree-sitter-python v0.25.0 — `PythonParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 7.1 ships these query strings and the
-//! `PythonParser::new()` compile gate. Phases 7.2/7.3/7.4/7.5 wire them
-//! into per-extractor methods on `PythonParser` (definitions, calls,
-//! imports, inheritance).
+//! These query strings and the `PythonParser::new()` compile gate are
+//! wired into per-extractor methods on `PythonParser` (definitions,
+//! calls, imports, inheritance).
 //!
 //! ## Python-specific node-kind notes (tree-sitter-python 0.25.0)
 //!
@@ -17,8 +16,8 @@
 //!   `async_function_definition` node. The leading `async` keyword is a
 //!   sibling token of the `function_definition` (in the `decorated_definition`
 //!   wrapper or directly as part of the `function_definition`'s leading
-//!   children). Phase 7.2's fixture confirms this; for 7.1 we just author
-//!   the query for `function_definition` and trust the grammar.
+//!   children). The definition-extraction fixture confirms this; the
+//!   query targets `function_definition` and trusts the grammar.
 //! - **`@decorator` wraps the inner definition** in a `decorated_definition`
 //!   node whose `definition` field is the `class_definition` /
 //!   `function_definition`. tree-sitter queries match the entire tree, so
@@ -34,11 +33,11 @@
 //!   argument_list — typically `identifier` for bare names, `attribute`
 //!   for qualified bases like `module.Base`, and `keyword_argument` for
 //!   `metaclass=Meta` style kwargs (which are NOT bases and are filtered
-//!   out by 7.5).
+//!   out by the inheritance extractor).
 
 /// Definition queries: top-level `function_definition` and
 /// `class_definition`. The function-vs-method distinction is computed at
-/// extraction time in 7.2 (a `function_definition` whose ancestor chain
+/// extraction time (a `function_definition` whose ancestor chain
 /// contains a `class_definition` is a Method; otherwise it is a Function),
 /// so we do not try to encode that distinction in the query string.
 ///
@@ -90,13 +89,14 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 /// `len`) likewise. Calls inside list comprehensions, lambdas, and default
 /// arguments parse as ordinary `call` nodes nested under their enclosing
 /// statement, so the queries match them naturally; the `from` of each edge
-/// is computed by [`crate::helpers::enclosing_function_id`] in 7.3.
+/// is computed by [`crate::helpers::enclosing_function_id`] at extraction
+/// time.
 ///
-/// Following the Phase 6.4 cleanup that flagged dead `@call.expr`-style
-/// outer captures across the C++/Rust/Go plugins as Minor, we deliberately
-/// bind only `@call.name` here. The enclosing `call` node is reachable via
-/// `find_enclosing_kind(.., "call")` at extraction time when 7.3 needs to
-/// re-anchor the line.
+/// Consistent with the C++/Rust/Go plugins, we deliberately bind only
+/// `@call.name` here rather than a dead `@call.expr`-style outer capture.
+/// The enclosing `call` node is reachable via
+/// `find_enclosing_kind(.., "call")` at extraction time when the call
+/// extractor needs to re-anchor the line.
 pub(crate) const CALL_QUERIES: &str = r#"
 ; Direct call: foo() / MyClass() / super() / print(...)
 (call
@@ -118,12 +118,12 @@ pub(crate) const CALL_QUERIES: &str = r#"
 ///   names possible: `import a, b`). For `aliased_import` the underlying
 ///   path is in the `name` field of the alias node; the alias name itself
 ///   is in `alias`. We drop the alias and record the path — same rule as
-///   Go (Phase 6.4) and Rust (Phase 5).
+///   the Go and Rust plugins.
 /// - `import_from_statement` → `module_name: (dotted_name | relative_import)`
 ///   carries the module path; the `name` field carries the imported
 ///   symbol(s) but is NOT the dependency target (the *module* is what we
-///   depend on, not the symbol). 7.4's extractor reads `module_name` and
-///   ignores the `name` field by design.
+///   depend on, not the symbol). The import extractor reads `module_name`
+///   and ignores the `name` field by design.
 /// - `future_import_statement` → tree-sitter-python parses
 ///   `from __future__ import annotations` as a **distinct node kind**,
 ///   NOT as an `import_from_statement`. The grammar special-cases the
@@ -136,20 +136,20 @@ pub(crate) const CALL_QUERIES: &str = r#"
 /// We capture only the path nodes — `@import.module` from
 /// `import_statement`, `@import.from_module` /
 /// `@import.from_module_relative` from `import_from_statement`, and
-/// `@import.future` from `future_import_statement`. Extraction time at 7.4
+/// `@import.future` from `future_import_statement`. The import extractor
 /// walks each capture to recover the dotted path (handling `dotted_name`
 /// directly, `relative_import` for `from . import x` style imports —
 /// preserved verbatim, including leading dots — and the
 /// `future_import_statement` form by emitting a fixed `__future__` edge).
 ///
-/// Following the Phase 6.4 cleanup, we do NOT bind a dead `@import.stmt`
-/// capture on the outer statement — the line is recovered by walking up
-/// to the enclosing import-statement node at extraction time.
+/// We do NOT bind a dead `@import.stmt` capture on the outer statement —
+/// the line is recovered by walking up to the enclosing import-statement
+/// node at extraction time.
 pub(crate) const IMPORT_QUERIES: &str = r#"
 ; import foo / import foo.bar / import foo as f / import a, b
 ; The `name` field is the dotted_name path or an aliased_import wrapping a
-; dotted_name. 7.4 walks each capture to extract the path text (alias
-; dropped).
+; dotted_name. The import extractor walks each capture to extract the
+; path text (alias dropped).
 (import_statement
   name: (dotted_name) @import.module)
 
@@ -163,8 +163,9 @@ pub(crate) const IMPORT_QUERIES: &str = r#"
 (import_from_statement
   module_name: (dotted_name) @import.from_module)
 
-; from . import utils / from .. import x — relative import. 7.4 records
-; the relative_import text verbatim (e.g. `.utils` if a dotted_name follows
+; from . import utils / from .. import x — relative import. The import
+; extractor records the relative_import text verbatim (e.g. `.utils` if a
+; dotted_name follows
 ; the dots, or combines the dots with the imported name(s) for the
 ; dots-only form `from . import utils`). Captured here as a separate
 ; capture name so the extractor branches on relative-vs-absolute form.
@@ -185,14 +186,15 @@ pub(crate) const IMPORT_QUERIES: &str = r#"
 /// keyword arguments, not as base classes, and the `superclasses` argument
 /// list is the only place metaclass kwargs appear in tree-sitter-python.
 ///
-/// 7.5 extraction reads each capture's text directly (for `identifier`)
-/// or via a small descend (for `attribute` — joining `object` and
+/// The inheritance extractor reads each capture's text directly (for
+/// `identifier`) or via a small descend (for `attribute` — joining `object` and
 /// `attribute` fields with `.`) to form the `to` of each `Inherits` edge.
 /// Multiple bases produce multiple matches naturally (one capture per base
 /// in the argument_list).
 ///
 /// `class C:` (no parens, no superclasses field) produces zero matches —
-/// nothing to capture — so 7.5 emits zero edges by construction.
+/// nothing to capture — so the inheritance extractor emits zero edges by
+/// construction.
 pub(crate) const INHERITANCE_QUERIES: &str = r#"
 ; class D(B): / class D(A, B): — bare-identifier bases.
 (class_definition

@@ -8,9 +8,9 @@
 //!
 //! These types are **not** designed to deserialize Go-produced cache files.
 //! `Symbol` and `FileGraph` require `language`, which Go output does not
-//! produce. Phase 4 of the Rust rewrite bumps the on-disk cache format to
-//! v2; older Go-written caches are detected by the version tag and trigger
-//! a silent re-index rather than being parsed.
+//! produce. The on-disk cache format is v2; older Go-written caches are
+//! detected by the version tag and trigger a silent re-index rather than
+//! being parsed.
 
 mod config;
 pub mod paths;
@@ -122,9 +122,8 @@ pub fn symbol_id(s: &Symbol) -> SymbolId {
 ///
 /// This is the **public id-recovery contract** for MCP consumers: any consumer
 /// that needs to map a `SymbolId` back to the originating file path MUST use
-/// this function rather than rolling its own split. Phase 4 of the
-/// `PaginatedResponseSizeSafety` plan references this as the canonical inverse
-/// of [`symbol_id`].
+/// this function rather than rolling its own split. It is the canonical
+/// inverse of [`symbol_id`].
 ///
 /// # Algorithm
 ///
@@ -466,9 +465,8 @@ mod tests {
     // id_to_file recovery tests
     //
     // These tests pin the rightmost-not-part-of-`::` contract documented on
-    // `id_to_file`. Phase 4 of PaginatedResponseSizeSafety references this
-    // function as the canonical inverse of `symbol_id`; consumers must use it
-    // rather than rolling their own split.
+    // `id_to_file`, the canonical inverse of `symbol_id`; consumers must use
+    // it rather than rolling their own split.
     // -------------------------------------------------------------------
 
     #[test]

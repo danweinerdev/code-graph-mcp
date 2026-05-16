@@ -3,7 +3,7 @@
 //! Read from `<root>/.code-graph.toml`. Missing file → [`RootConfig::default`].
 //! Parse failure → [`ConfigError::Toml`] (we never silently fall back, since a
 //! typo in a thread-count is the kind of silent perf-degradation that wastes
-//! hours — see Phase 1.3 design notes / Decision 8).
+//! hours).
 //!
 //! After loading, call [`RootConfig::resolve_concurrency`] exactly once to
 //! materialize any `0 = auto` values against
@@ -127,7 +127,7 @@ pub struct ParsingConfig {
 /// **Empty-string entries are filtered at load time.** An empty pattern would
 /// match every byte position with zero advancement and infinite-loop the
 /// substitution scan in production. [`RootConfig::load`] drains empty entries
-/// and warns once per drop. The substitution algorithm (Phase 1.2) is allowed
+/// and warns once per drop. The downstream substitution algorithm is allowed
 /// to assume every pattern has length > 0.
 ///
 /// The fields are `Vec<String>` (not `Vec<&'static str>`); patterns are checked
@@ -272,12 +272,10 @@ impl ExtensionsConfig {
 /// Response-shaping tunables. Controls the byte budget that paginated tool
 /// handlers honor when materializing a page of results.
 ///
-/// `max_bytes` is a soft per-response ceiling that will be enforced by the
-/// `byte_budget_take` helper in `code-graph-tools` (wired in Phase 2 of the
-/// `PaginatedResponseSizeSafety` plan). When a candidate record would push
-/// the running serialized size over the budget, the page is cut short with
-/// `truncated=true` and `next_offset` set so the caller can resume. See
-/// `Plans/PaginatedResponseSizeSafety/README.md` for the full rationale.
+/// `max_bytes` is a soft per-response ceiling enforced by the
+/// `byte_budget_take` helper in `code-graph-tools`. When a candidate record
+/// would push the running serialized size over the budget, the page is cut
+/// short with `truncated=true` and `next_offset` set so the caller can resume.
 ///
 /// The default (`102_400` bytes = 100 KB) is sized to fit a page of
 /// typical-size records under a single MCP tool response that an AI agent
@@ -366,8 +364,8 @@ impl RootConfig {
         // Drain empty-string entries from `[cpp].macro_strip`. An empty
         // pattern would match every byte position with zero advancement and
         // infinite-loop the substitution scan in release builds — the
-        // substitution algorithm (Phase 1.2) is allowed to assume every
-        // pattern has length > 0, so the filter must run unconditionally.
+        // substitution algorithm is allowed to assume every pattern has
+        // length > 0, so the filter must run unconditionally.
         // We use `eprintln!` rather than `tracing::warn!` because this
         // workspace deliberately has no `tracing` dependency
         // (see `crates/code-graph-tools/src/handlers/watch.rs:461`).
@@ -384,8 +382,8 @@ impl RootConfig {
         // Parallel validation for `[cpp].macro_strip_with_args`. Two extra
         // steps relative to `macro_strip`:
         //   1. Drain empty-string entries (same per-drop `eprintln!` cadence
-        //      as `macro_strip` above; the substitution algorithm in Phase 3
-        //      requires every pattern to have length > 0).
+        //      as `macro_strip` above; the substitution algorithm requires
+        //      every pattern to have length > 0).
         //   2. Silently deduplicate within-list duplicates while preserving
         //      first-occurrence order. A user repeating the same macro is
         //      almost always a paste-mistake, not an intentional weighting,
@@ -690,12 +688,12 @@ mod tests {
         );
     }
 
-    // --- CppConfig tests (CppMacroStrip Phase 1.1) -------------------------
+    // --- CppConfig tests ---------------------------------------------------
 
     #[test]
     fn cpp_config_default_is_empty() {
         // Zero-config users see an empty `macro_strip` list. The substitution
-        // layer (Phase 1.2) short-circuits on empty list to `Cow::Borrowed`.
+        // layer short-circuits on empty list to `Cow::Borrowed`.
         let cfg = RootConfig::default();
         assert!(
             cfg.cpp.macro_strip.is_empty(),
@@ -1008,7 +1006,7 @@ disabled = [""]
         assert!(cfg.extensions.disabled.is_empty());
     }
 
-    // --- ResponseConfig tests (PaginatedResponseSizeSafety Phase 1.2) ------
+    // --- ResponseConfig tests ----------------------------------------------
 
     #[test]
     fn response_config_default_is_100kb() {
@@ -1187,7 +1185,7 @@ max_bytes = 200000
         );
     }
 
-    // --- CppConfig macro_strip_with_args tests (UeMacroSupport Phase 1.4) ---
+    // --- CppConfig macro_strip_with_args tests -----------------------------
 
     #[test]
     fn cpp_macro_strip_with_args_default_empty() {

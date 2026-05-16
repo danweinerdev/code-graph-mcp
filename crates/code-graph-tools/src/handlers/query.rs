@@ -104,7 +104,7 @@ pub fn callers_or_callees(
             .then_with(|| a.symbol_id.cmp(&b.symbol_id))
     });
 
-    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety).
+    // Route through byte_budget_take so the page honors the byte budget.
     // The helper internally applies offset+limit skip/take and stops early if
     // the running serialized byte count would exceed `max_bytes -
     // ENVELOPE_OVERHEAD_BYTES`. The helper preserves iteration order, so the
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
     }
 
-    // --- Phase 3 pagination invariants ------------------------------------
+    // --- pagination invariants --------------------------------------------
 
     /// Build a graph with a single hub symbol called by `n` distinct callers
     /// named `caller_000`, `caller_001`, ... — zero-padded to 3 digits so the
@@ -689,11 +689,10 @@ mod tests {
         assert_eq!(arr[2]["symbol_id"], serde_json::json!("/x.cpp:d_far"));
     }
 
-    // --- Phase 2 byte-budget invariants (callers direction) --------------
+    // --- byte-budget invariants (callers direction) ----------------------
     //
-    // Task 2.3 of PaginatedResponseSizeSafety. The companion callees-side
-    // test lives in task 2.4 (same handler, same wiring — distinct
-    // fixture/assertions).
+    // The companion callees-side test lives below (same handler, same
+    // wiring — distinct fixture/assertions).
 
     /// Build a graph with `per_depth` distinct callers at each of three
     /// depths (1, 2, 3) feeding a single hub `target`. Names are
@@ -756,8 +755,8 @@ mod tests {
 
     #[test]
     fn callers_byte_budget_preserves_depth_sort_order() {
-        // Phase 2 of PaginatedResponseSizeSafety, task 2.3: byte-budget
-        // truncation must not reorder the (depth, symbol_id)-sorted chain
+        // Byte-budget truncation must not reorder the
+        // (depth, symbol_id)-sorted chain
         // set. The helper preserves iteration order, so kept records are a
         // strict prefix of the sorted chain — i.e. `max(kept depth) <=
         // min(would-be-next-page depth)` and within-depth ties are
@@ -1038,11 +1037,11 @@ mod tests {
         assert_eq!(limit, 100);
     }
 
-    // --- Phase 2 byte-budget invariants (callees direction) -------------
+    // --- byte-budget invariants (callees direction) ---------------------
     //
-    // Task 2.4 of PaginatedResponseSizeSafety. Mirrors the callers-side
-    // tests above (2.3). The wiring is identical — both directions flow
-    // through the same `callers_or_callees` handler — so these tests cover
+    // Mirrors the callers-side tests above. The wiring is identical — both
+    // directions flow through the same `callers_or_callees` handler — so
+    // these tests cover
     // the callee-side BFS edge construction and lock the documented
     // sort-determinism contract for `Direction::Callees`.
 
@@ -1114,8 +1113,8 @@ mod tests {
 
     #[test]
     fn callees_byte_budget_preserves_depth_sort_order() {
-        // Phase 2 of PaginatedResponseSizeSafety, task 2.4: byte-budget
-        // truncation must not reorder the (depth, symbol_id)-sorted chain
+        // Byte-budget truncation must not reorder the
+        // (depth, symbol_id)-sorted chain
         // set in the callees direction. The helper preserves iteration
         // order, so kept records are a strict prefix of the sorted chain
         // — i.e. `max(kept depth) <= min(would-be-next-page depth)` and
@@ -1396,13 +1395,13 @@ mod tests {
         }
     }
 
-    // --- PathNormalization Phase 3.2 --------------------------------------
+    // --- user-path normalization ------------------------------------------
 
     #[test]
     fn dependencies_resolves_dot_segments_to_canonical_lookup() {
-        // PathNormalization Phase 3.2: `get_dependencies` wraps the
-        // user-supplied `file` argument with `paths::normalize_user_path`
-        // before the graph lookup. Mirrors the Phase 3.1 test in `symbols.rs`.
+        // `get_dependencies` wraps the user-supplied `file` argument with
+        // `paths::normalize_user_path` before the graph lookup. Mirrors
+        // the sibling normalization test in `symbols.rs`.
         // Plant include edges keyed by a real canonical filesystem path,
         // then query the handler twice — once with the canonical form, once
         // with a `./sub/../` injected form — and assert both return the same

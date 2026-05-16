@@ -5,12 +5,11 @@
 //! symbols, edges, and warnings. The output format is byte-equivalent to the
 //! Go binary's so a `diff` between them validates Rust/Go output parity.
 //!
-//! Phase 3.2 swaps the Phase 1.6 synchronous `walkdir` scan for
-//! [`code_graph_tools::discovery::discover`], the parallel walker. Filtering
-//! moves into the walker (`registry.language_for_path` per worker thread)
-//! and the walk's deterministic ordering is restored by sorting paths in
-//! the discovery layer before returning. Output bytes are unchanged versus
-//! the Phase 1.6 baseline.
+//! The directory scan uses [`code_graph_tools::discovery::discover`], the
+//! parallel walker. Filtering happens inside the walker
+//! (`registry.language_for_path` per worker thread) and deterministic
+//! ordering is restored by sorting paths in the discovery layer before
+//! returning, so the output bytes stay stable.
 
 use std::env;
 use std::fs;
@@ -56,7 +55,7 @@ fn main() -> ExitCode {
         eprintln!("Error registering C++ parser: {e}");
         return ExitCode::from(1);
     }
-    // Phase 5.5: register the Rust parser so the dogfood pass against this
+    // Register the Rust parser so the dogfood pass against this
     // workspace's `crates/` tree can extract symbols from `.rs` files.
     let rust_parser = match RustParser::new() {
         Ok(p) => p,
@@ -132,7 +131,7 @@ fn main() -> ExitCode {
     let mut all_edges: Vec<Edge> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Phase 3.2: parallel walker. The discovery layer applies the registry
+    // Parallel walker. The discovery layer applies the registry
     // extension filter in-thread and returns a path-sorted Vec — matching
     // the Go binary's `sort.Strings(files)` ordering so the output diff
     // stays byte-clean.

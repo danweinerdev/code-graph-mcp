@@ -4,13 +4,14 @@
 //! tree-sitter (via the `tree-sitter` and `tree-sitter-cpp` crates) to extract
 //! symbols, calls, includes, and inheritance edges from C/C++ source.
 //!
-//! # Phase status
+//! # Extraction pipeline
 //!
-//! Phase 1.5 wires the four extraction loops (`extract_definitions`,
-//! `extract_calls`, `extract_includes`, `extract_inheritance`) into
-//! [`CppParser::parse_file`]. The full 24-test corpus is ported in Phase 1.6;
-//! the inline tests at the bottom of this file cover one representative
-//! example of every extraction path so regressions surface immediately.
+//! Four extraction loops (`extract_definitions`, `extract_calls`,
+//! `extract_includes`, `extract_inheritance`) feed
+//! [`CppParser::parse_file`]. The full behavioral corpus lives in
+//! `tests/corpus.rs`; the inline tests at the bottom of this file cover
+//! one representative example of every extraction path so regressions
+//! surface immediately.
 //!
 //! # Macro stripping (`preprocess` / [`strip_macros`])
 //!
@@ -580,13 +581,13 @@ const _: fn() = || {
 mod tests {
     //! Structural smoke tests that rely on `CppParser` internals
     //! (`language`, `def_query`, `call_query`, etc.). Behavioral coverage
-    //! lives in `tests/corpus.rs` (the full Phase 1.6 corpus).
+    //! lives in `tests/corpus.rs` (the full corpus).
     use super::*;
 
     #[test]
     fn new_compiles_all_four_queries() {
-        // The whole point of Phase 1.4: every query string parses against
-        // tree-sitter-cpp 0.23.4. Failure here means a query needs updating.
+        // Every query string must parse against tree-sitter-cpp 0.23.4.
+        // Failure here means a query needs updating.
         let p = CppParser::new().expect("CppParser::new must succeed");
         let _ = (
             &p.language,

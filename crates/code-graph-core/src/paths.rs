@@ -149,8 +149,7 @@ mod tests {
     // `#[cfg(windows)]` attribute conditionally removes them at compile time,
     // so `cargo test -p code-graph-core paths` on Linux still reports 5 tests.
     // Manual smoke on Windows before each release is the supplementary
-    // verification — see Phase 4 task 4.3 of the PathNormalization plan for
-    // the CI-coverage disclosure.
+    // verification, since Linux CI cannot exercise the verbatim-prefix strip.
 
     /// (f, Windows-only) `simplify` strips the verbatim disk prefix
     /// (`\\?\D:\...` → `D:\...`).

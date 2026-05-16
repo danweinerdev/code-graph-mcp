@@ -61,9 +61,8 @@ pub(crate) fn call_edge(from: &str, to: &str, file: &str, line: u32) -> Edge {
 }
 
 /// `Inherits` edge from `from` to `to`, attributed to `file`. Inherits
-/// edges in this codebase use bare derived/base names (Phase 1 quirk
-/// preserved); see `EdgeKind::Inherits` and the `merge_routes_inherits_*`
-/// tests for context.
+/// edges in this codebase use bare (non-generic) derived/base names; see
+/// `EdgeKind::Inherits` and the `merge_routes_inherits_*` tests for context.
 pub(crate) fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
     Edge {
         from: from.to_string(),
@@ -90,8 +89,8 @@ pub(crate) fn include_edge(from: &str, to: &str, file: &str) -> Edge {
 /// Construct a [`FileGraph`] with explicit `language`. Tests in the
 /// `algorithms.rs` / `callgraph.rs` modules historically defaulted to Cpp
 /// and dropped the language argument; the canonical signature here keeps
-/// language explicit so language-sensitive query tests (Phase 2.2's
-/// `search_language_filter`) work the same way.
+/// language explicit so language-sensitive query tests (the
+/// `search_language_filter` test) work the same way.
 pub(crate) fn make_fg(
     path: &str,
     language: Language,

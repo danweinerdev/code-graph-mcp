@@ -1,11 +1,11 @@
 //! Helper routines for the Go parser.
 //!
-//! Phase status: Phase 6.1 shipped the small structural helpers
-//! ([`extract_receiver_type`], [`extract_package_name`]) used by the
-//! Phase 6.2 definition extractor; Phase 7.1 consolidated `truncate_signature`
-//! into the shared `code_graph_lang::helpers` module (see the `pub use`
-//! below) so the Python plugin could reuse the same logic without spawning
-//! a fourth byte-identical copy.
+//! The small structural helpers ([`extract_receiver_type`],
+//! [`extract_package_name`]) feed the definition extractor.
+//! `truncate_signature` is consolidated into the shared
+//! `code_graph_lang::helpers` module (re-exported via the `pub use`
+//! below) so every language plugin reuses the same logic without
+//! per-crate byte-identical copies.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub` as a
 //! crate-internal convention so callers within `lib.rs` can `use` them
@@ -127,7 +127,7 @@ pub fn extract_package_name(root: Node<'_>, content: &[u8]) -> String {
 /// Build a `path:fn_name` (free fn) or `path:Parent::fn_name` (method)
 /// symbol-ID anchor for the function enclosing `node`. Mirrors the C++/Rust
 /// plugins' `enclosing_function_id` and matches the [`code_graph_core::symbol_id`]
-/// shape produced by Phase 6.2's definition extractor so call edges' `from`
+/// shape produced by the definition extractor so call edges' `from`
 /// fields line up exactly with definition IDs.
 ///
 /// Behavior:

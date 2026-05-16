@@ -1,11 +1,9 @@
 //! MCP server that exposes the code graph as 15 rmcp tools over stdio.
 //!
-//! Phase 3.1 ships the scaffold: [`CodeGraphServer`] with all 15 tools wired
-//! through `#[tool_router]` plus the `ServerInner` state struct that future
-//! tasks will read from. Every tool handler currently returns
-//! `McpError::internal_error("not yet implemented (Phase 3.X)", None)` —
-//! Phase 3.4 fills in the eight P0 handlers and Phase 3.5 fills in the
-//! remaining seven.
+//! Phase 3.1 shipped the scaffold: [`CodeGraphServer`] with all 15 tools
+//! wired through `#[tool_router]` plus the `ServerInner` state struct.
+//! Every tool handler is now implemented; query handlers gate on
+//! `ServerInner::require_indexed` before touching the graph.
 //!
 //! ## Tool wire format
 //!
@@ -20,7 +18,7 @@
 //!   parameter ("Filter by source language: cpp, rust, go, python, csharp, or
 //!   java").
 //!
-//! Phase 3.7 captures these strings as wire-format snapshots; any future
+//! These strings are captured as wire-format snapshots; any future
 //! divergence triggers `cargo insta review`.
 
 use std::path::PathBuf;
@@ -87,7 +85,7 @@ pub struct ServerInner {
     pub indexed: AtomicBool,
     /// Single-flight guard for `analyze_codebase`. `try_lock` returns
     /// "indexing already in progress" identical to the Go behavior; the
-    /// watch loop's `reindex_file` (Phase 4) also acquires this lock to
+    /// watch loop's `reindex_file` also acquires this lock to
     /// close the analyze-vs-watch merge race the Go implementation has.
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
@@ -144,7 +142,7 @@ impl CodeGraphServer {
     }
 
     /// Snapshot of every registered tool descriptor (`name`, `description`,
-    /// `inputSchema`, …). Used by the Phase 3.7 wire-format snapshot suite
+    /// `inputSchema`, …). Used by the wire-format snapshot suite
     /// — the macro-generated `Self::tool_router()` factory is private, so
     /// tests reach for this helper instead.
     pub fn tool_descriptors(&self) -> Vec<rmcp::model::Tool> {
@@ -174,7 +172,7 @@ impl CodeGraphServer {
     /// (`{"error":{"code":-32603,…}}`) that `McpError` propagates to.
     ///
     /// The error message itself matches the Go reference byte-for-byte;
-    /// the em-dash is U+2014 (not a hyphen-minus) and Phase 3.7's snapshot
+    /// the em-dash is U+2014 (not a hyphen-minus) and the snapshot
     /// suite locks the byte sequence in across all error paths.
     pub fn require_indexed(&self) -> Result<(), CallToolResult> {
         if self
@@ -196,8 +194,7 @@ impl CodeGraphServer {
 // One struct per tool; `Parameters<T>` extracts `T` from the JSON-RPC
 // request's `arguments` field. `Option<T>` fields mean "absent in the
 // request"; required fields are `T` directly. Validation (e.g. "at least
-// one of query/kind/namespace/language") is the handler's job — Phase 3.4
-// adds it.
+// one of query/kind/namespace/language") is the handler's job.
 
 /// Empty parameter struct for tools that take no arguments
 /// (`detect_cycles`, `watch_start`, `watch_stop`). The empty `{}` JSON
@@ -458,7 +455,7 @@ pub struct GenerateDiagramArgs {
 
 #[tool_router]
 impl CodeGraphServer {
-    // -- P0 (Phase 3.4) ----------------------------------------------------
+    // -- P0 -----------------------------------------------------------------
 
     #[tool(
         description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools."
@@ -785,7 +782,7 @@ impl CodeGraphServer {
         })
     }
 
-    // -- P1+P2 + watch (Phase 3.5) -----------------------------------------
+    // -- P1+P2 + watch ------------------------------------------------------
 
     #[tool(
         description = "Detect circular include dependencies (strongly-connected components of the include graph). Returns the {results, total, offset, limit, truncated, next_offset} envelope; each `results[i]` is a `Cycle` {files, truncated, original_len?} — `files` is the file paths in one cycle in canonical sorted order, `truncated` is that cycle's own per-file-list flag, and `original_len` (the pre-truncation file count) is present ONLY when that cycle's file list was shortened. There are TWO independent `truncated` notions: the ENVELOPE's `truncated` means there are more cycles in further pages; each `Cycle.truncated` means that one cycle's `files` list was capped — they do not imply each other. The envelope's `truncated`/`next_offset` are honest and by-COUNT: `truncated=true` with a non-null `next_offset` means more cycles remain — re-call with `offset = next_offset` to resume; `truncated=false` plus `next_offset=null` means this page is the complete/last set of cycles. Cycles are sorted internally by path and the outer list by each cycle's first path, so pagination is deterministic across calls. The byte budget at [response].max_bytes does NOT apply to `detect_cycles`: cycle pagination is purely by-count via `limit`/`offset`, never by serialized size. `limit` defaults to 20 (0 resolves to 20; clamped at 1000, the echoed `limit` reflects the resolved value); the default is small because cycles are rare in well-maintained codebases. `offset` defaults to 0; to advance through pages set `offset = next_offset` from the truncated envelope (not an arbitrary increment). `max_cycle_size` defaults to 50 (0 resolves to 50; clamped at 500) and caps each returned cycle's `files` list: a cycle longer than the cap is shortened in place and reports `Cycle.truncated: true` with `Cycle.original_len` = the pre-truncation file count; cycles at or under the cap keep `truncated: false` with `original_len` absent. Raise `max_cycle_size` to see fuller file lists for large SCCs. Consult the envelope `truncated`, not `results.length`, to detect whether more cycle pages remain."
@@ -1079,9 +1076,9 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// The Phase 3.1 acceptance gate: `tools/list` must surface exactly 15
-    /// tools. If a future task adds or removes a `#[tool]`, this assertion
-    /// is the first place a wire-format change shows up.
+    /// `tools/list` must surface exactly 15 tools. If a future change adds
+    /// or removes a `#[tool]`, this assertion is the first place a
+    /// wire-format change shows up.
     #[test]
     fn tool_router_registers_fifteen_tools() {
         let server = empty_server();
@@ -1132,8 +1129,7 @@ mod tests {
     /// `require_indexed` must produce the tool-level error envelope (the
     /// same shape Go's `mcp.NewToolResultError` produces) and the Go
     /// reference's exact wording (em-dash U+2014, not a hyphen-minus).
-    /// Snapshot tests in Phase 3.7 will lock the byte sequence in across
-    /// all error paths.
+    /// Snapshot tests lock the byte sequence in across all error paths.
     #[test]
     fn require_indexed_returns_exact_go_wording() {
         let server = empty_server();
@@ -1169,7 +1165,7 @@ mod tests {
         server.require_indexed().expect("indexed flag must pass");
     }
 
-    /// Phase 3.4 P0 handlers must enforce the require_indexed gate before
+    /// P0 query handlers must enforce the require_indexed gate before
     /// running. Each query handler returns the tool-level "no codebase
     /// indexed" error when the server has not yet been indexed.
     #[tokio::test]
@@ -1350,11 +1346,10 @@ mod tests {
     /// format-of-record (`tests/snapshot_tools_list.rs`); this test
     /// guards just the em-dash byte sequence.
     ///
-    /// ResponseShapePolish Phase 1 (Task 1.1) rewrote the description
-    /// to mention the new `Page<SummaryRow>` envelope shape; the
-    /// em-dash is preserved verbatim. Task 1.5 will rewrite the
-    /// description again with the full envelope/sort/count_only
-    /// wording — keep the em-dash check intact through that edit.
+    /// The `get_symbol_summary` description has been rewritten to mention
+    /// the `Page<SummaryRow>` envelope shape (and its sort / count_only
+    /// wording), but the em-dash is preserved verbatim. Keep this em-dash
+    /// check intact through any future description edit.
     #[test]
     fn tool_descriptions_match_go_reference_for_get_symbol_summary() {
         let tools = CodeGraphServer::tool_router().list_all();
@@ -1373,7 +1368,7 @@ mod tests {
         );
     }
 
-    // -- Phase 3.5 require_indexed gates -----------------------------------
+    // -- require_indexed gates ---------------------------------------------
     //
     // Each P1+P2 handler enforces the require_indexed gate before doing
     // any work. Same exact-text assertion as the P0 family above.
@@ -1487,11 +1482,10 @@ mod tests {
         assert_eq!(text, "no codebase indexed — call analyze_codebase first");
     }
 
-    // -- Phase 4.1 watch require_indexed gates -----------------------------
+    // -- watch require_indexed gates ---------------------------------------
     //
     // Both watch handlers must short-circuit on require_indexed before
-    // touching debouncer state. Phase 3.5's stubs deliberately skipped
-    // this; Phase 4 restores it. Lifecycle tests live in
+    // touching debouncer state. Lifecycle tests live in
     // `handlers/watch.rs`.
 
     #[tokio::test]
@@ -1558,7 +1552,7 @@ mod tests {
         assert_eq!(parsed["total"].as_u64().unwrap(), 0);
     }
 
-    // -- Phase 3.1 count_only Args deserialization -------------------------
+    // -- count_only Args deserialization -----------------------------------
     //
     // The `count_only: Option<bool>` field on GetOrphansArgs,
     // SearchSymbolsArgs, GetFileSymbolsArgs, and GetSymbolSummaryArgs must

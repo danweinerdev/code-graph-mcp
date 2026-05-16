@@ -176,8 +176,8 @@ impl Graph {
     /// **into** `path` from each other file.
     ///
     /// The reverse-include scan is `O(N×M)` (every other file's include
-    /// list is scanned) — that mirrors the Go reference exactly. Phase 3
-    /// may add a reverse-include index; this task just preserves parity.
+    /// list is scanned) — that mirrors the Go reference exactly. There is
+    /// no reverse-include index; parity with the Go reference is preserved.
     ///
     /// Mirrors the Go reference at `graph.go:518–553`.
     pub fn incoming_coupling(&self, path: &Path) -> HashMap<PathBuf, u32> {
@@ -398,8 +398,8 @@ impl Graph {
     /// outgoing (the file's includes) and incoming (other files that
     /// include this one) edges are walked. The incoming scan is O(N×M)
     /// — every other file's include list is checked at every BFS step.
-    /// This mirrors the Go reference exactly; Phase 3 may add a reverse
-    /// include index.
+    /// This mirrors the Go reference exactly; there is no reverse-include
+    /// index.
     ///
     /// Display names use the file basename (`Path::file_name`) so a
     /// rendered graph stays readable even with deep paths. The center

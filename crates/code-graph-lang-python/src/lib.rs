@@ -4,14 +4,15 @@
 //! to extract symbols, calls, import edges, and inheritance edges from
 //! `.py` and `.pyi` source files.
 //!
-//! # Phase status
+//! # Extraction surface
 //!
-//! Phase 7.1 shipped the crate scaffold: dependency wiring, query strings
-//! that compile against tree-sitter-python 0.25, the `PythonParser` struct
-//! with cached `Query` objects, and the `LanguagePlugin` impl.
+//! The crate compiles query strings against tree-sitter-python 0.25,
+//! exposes the `PythonParser` struct with cached `Query` objects, and
+//! implements `LanguagePlugin`. Every extractor below is live and
+//! `parse_file` is fully populated.
 //!
-//! Phase 7.2 wires `extract_definitions` — function/method/class extraction
-//! with method-vs-function disambiguation (via [`find_enclosing_class`]),
+//! `extract_definitions` covers function/method/class extraction with
+//! method-vs-function disambiguation (via [`find_enclosing_class`]),
 //! decorator transparency (queries match the inner `function_definition` /
 //! `class_definition` directly through any `decorated_definition` wrapper),
 //! `async def` support (parses as `function_definition` in tree-sitter-python
@@ -19,12 +20,12 @@
 //! class as its parent), and `.pyi` stub-file parity (stubs use the same
 //! grammar — `def f() -> int: ...` is still a `function_definition`).
 //!
-//! Phase 7.3 wires `extract_calls` — direct calls, attribute calls,
-//! chained calls, and the module-top-level fallback (`from = path` when
-//! there is no enclosing `function_definition`).
+//! `extract_calls` covers direct calls, attribute calls, chained calls,
+//! and the module-top-level fallback (`from = path` when there is no
+//! enclosing `function_definition`).
 //!
-//! Phase 7.4 wires `extract_imports` — both `import_statement` (`import
-//! foo`, `import foo.bar`, `import foo as f`, `import a, b`) and
+//! `extract_imports` covers both `import_statement` (`import foo`,
+//! `import foo.bar`, `import foo as f`, `import a, b`) and
 //! `import_from_statement` (`from foo import bar`, `from foo.bar import
 //! baz`, `from foo import bar, qux`, `from . import utils`, `from
 //! ..pkg.mod import x`) plus the dedicated `future_import_statement`
@@ -33,16 +34,15 @@
 //! top-level guard in `extract_imports` so the dependency graph stays
 //! stable across files that guard imports behind feature flags.
 //!
-//! Phase 7.5 wires `extract_inheritance` — single (`class D(B)`),
-//! multiple (`class D(A, B, C)`), and qualified (`class D(module.Base)`)
-//! bases all produce `Inherits` edges with `from = bare derived class
+//! `extract_inheritance` covers single (`class D(B)`), multiple
+//! (`class D(A, B, C)`), and qualified (`class D(module.Base)`) bases —
+//! all produce `Inherits` edges with `from = bare derived class
 //! name` (matching C++/Rust so `class_hierarchy` adjacency lookups work)
 //! and `to = base name as written` (qualified bases preserve the dotted
 //! text verbatim). Keyword-argument metaclass kwargs (`metaclass=Meta`,
 //! `total=False`) parse as `keyword_argument` nodes inside the
 //! `argument_list` and are silently filtered — neither inheritance query
-//! pattern matches them. After 7.5, `parse_file` is fully populated and
-//! every extractor is live.
+//! pattern matches them.
 //!
 //! # Default trait methods
 //!
@@ -132,9 +132,8 @@ impl PythonParser {
     /// (wrapping the query compiler's message) if any query fails to
     /// compile against the pinned grammar version.
     ///
-    /// Successful return is the Phase 7.1 acceptance gate that proves
-    /// every query string in `queries.rs` parses against tree-sitter-
-    /// python 0.25.
+    /// Successful return proves every query string in `queries.rs` parses
+    /// against tree-sitter-python 0.25.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_python::LANGUAGE.into();
 
@@ -166,9 +165,9 @@ impl PythonParser {
     /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
     /// Internal entry point for [`Self::parse_file`] (the trait method);
     /// kept crate-private so the public surface stays the trait method
-    /// while each per-extractor method (`extract_definitions`, and the
-    /// upcoming 7.3/7.4/7.5 extractors) can be tested via `parse_file`
-    /// without exposing them. Mirrors the Phase 6 Go plugin's structural
+    /// while each per-extractor method (`extract_definitions` and the
+    /// call/import/inheritance extractors) can be tested via `parse_file`
+    /// without exposing them. Mirrors the Go plugin's structural
     /// pattern (`parse_to_filegraph` indirection).
     fn parse_to_filegraph(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         let tree = parse_tree(&self.language, content)?;
@@ -648,12 +647,11 @@ impl LanguagePlugin for PythonParser {
 
     /// Parse `content` (UTF-8 bytes) as Python and produce a [`FileGraph`].
     ///
-    /// Phase 7.2 wires the definition extractor; Phase 7.3 wires the call
-    /// extractor; Phase 7.4 wires the import extractor (both forms plus
-    /// the special `future_import_statement` node and the conditional-
-    /// import filter); Phase 7.5 wires the inheritance extractor (single,
-    /// multi, and qualified bases; keyword-argument metaclass kwargs
-    /// silently filtered). After 7.5 every extractor is live.
+    /// All extractors are live: definitions, calls, imports (both forms
+    /// plus the special `future_import_statement` node and the
+    /// conditional-import filter), and inheritance (single, multi, and
+    /// qualified bases; keyword-argument metaclass kwargs silently
+    /// filtered).
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -740,8 +738,7 @@ fn imported_names<'a>(stmt: Node<'a>, content: &'a [u8]) -> Vec<String> {
 /// Mirrors the C++/Rust/Go plugins' `make_symbol`.
 ///
 /// Python `Symbol.namespace` is always `""` — the module concept is
-/// encoded in the file path. Phase 7.7's documentation makes this
-/// explicit.
+/// encoded in the file path.
 fn make_symbol(
     name: &str,
     kind: SymbolKind,
@@ -768,22 +765,20 @@ fn make_symbol(
 
 #[cfg(test)]
 mod tests {
-    //! Phase 7.1 structural smoke tests + Phase 7.2 definition-extraction
-    //! coverage. Behavioral coverage of call / import / inheritance
-    //! extraction lands in 7.3-7.5.
+    //! Structural smoke tests plus definition-, call-, import-, and
+    //! inheritance-extraction coverage.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
 
     // ----------------------------------------------------------------
-    // Phase 7.1 — structural smoke tests
+    // Structural smoke tests
     // ----------------------------------------------------------------
 
     #[test]
     fn new_compiles_all_four_queries() {
-        // The whole point of Phase 7.1: every query string parses against
-        // the pinned tree-sitter-python. Failure here means a query needs
-        // updating.
+        // Every query string must parse against the pinned
+        // tree-sitter-python. Failure here means a query needs updating.
         let p = PythonParser::new().expect("PythonParser::new must succeed");
         let _ = (
             &p.language,
@@ -809,9 +804,7 @@ mod tests {
 
     /// Canonical compile-time-interface check + `id() -> Language::Python`
     /// assertion. Mirrors the C++ test at
-    /// `crates/code-graph-lang-cpp/src/lib.rs:542-545` exactly. This is the
-    /// Phase 7.1 verification field's named test
-    /// (`python_parser_is_object_safe_via_box_dyn`).
+    /// `crates/code-graph-lang-cpp/src/lib.rs:542-545` exactly.
     #[test]
     fn python_parser_is_object_safe_via_box_dyn() {
         let p: Box<dyn LanguagePlugin> = Box::new(PythonParser::new().unwrap());
@@ -819,11 +812,11 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7.2 — definition extraction
+    // Definition extraction
     // ----------------------------------------------------------------
 
     /// Parse `src` against `PythonParser` at a synthetic absolute path.
-    /// Used by every Phase 7.2 behavioral test below.
+    /// Used by every definition-extraction behavioral test below.
     fn parse(src: &str) -> FileGraph {
         parse_at(src, "/tmp/test.py")
     }
@@ -1123,7 +1116,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7.3 — call extraction
+    // Call extraction
     // ----------------------------------------------------------------
 
     /// Filter `fg.edges` to just the `Calls` edges for ergonomic asserts.
@@ -1287,7 +1280,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7.4 — import extraction
+    // Import extraction
     // ----------------------------------------------------------------
 
     /// Filter `fg.edges` to just the `Includes` edges for ergonomic asserts.
@@ -1556,7 +1549,7 @@ import a, b
     }
 
     // ----------------------------------------------------------------
-    // Phase 7.5 — inheritance extraction
+    // Inheritance extraction
     // ----------------------------------------------------------------
 
     /// Filter `fg.edges` to just the `Inherits` edges for ergonomic asserts.
@@ -1748,7 +1741,7 @@ import a, b
         assert_eq!(m.parent, "D");
     }
 
-    // ---- Spec-named coverage (Task 7.5 verification) ----------------
+    // ---- Contract-shape coverage ------------------------------------
     //
     // The tests below pin contract shapes that the granular tests above
     // do not cover: nested-class `from`-field shape and the bare-name

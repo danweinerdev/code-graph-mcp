@@ -41,21 +41,21 @@ use super::{
 /// silently clamped at 1000. `offset >= total` returns an empty `results`
 /// page with the correct `total`.
 ///
-/// When `count_only = true` (Phase 3 of `PaginatedResponseSizeSafety`),
-/// the handler returns the sentinel response shape `Page { results: [],
-/// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
-/// after computing `total` via the cheap path (filter + count), without
-/// ever materializing `SymbolResult`s or invoking the byte-budget helper.
-/// The empty-raw-set check still runs first, so a misspelled file path
-/// surfaces the diagnostic error wording even on a count_only call. See
-/// plan Decision 9 for why `limit: 0` is a deliberate exception to the
-/// "envelope echoes resolved limit" contract.
+/// When `count_only = true`, the handler returns the sentinel response
+/// shape `Page { results: [], total, offset: 0, limit: 0,
+/// truncated: false, next_offset: None }` after computing `total` via the
+/// cheap path (filter + count), without ever materializing
+/// `SymbolResult`s or invoking the byte-budget helper. The empty-raw-set
+/// check still runs first, so a misspelled file path surfaces the
+/// diagnostic error wording even on a count_only call. `limit: 0` is a
+/// deliberate exception to the "envelope echoes resolved limit" contract
+/// (documented in CLAUDE.md).
 ///
 /// `#[allow(clippy::too_many_arguments)]`: the existing call-site
 /// convention for `get_file_symbols` (and `get_orphans`) is positional
-/// args. Phase 3.2 of `PaginatedResponseSizeSafety` adds `count_only` as
-/// the 8th positional parameter to preserve that convention for the ~25
-/// existing call sites (tests, watch handlers, integration). The
+/// args. `count_only` is the 8th positional parameter, preserving that
+/// convention for the ~25 existing call sites (tests, watch handlers,
+/// integration). The
 /// `GenerateDiagramInput` / `SearchSymbolsInput` struct pattern is used
 /// elsewhere in this module where the arg count crossed the threshold
 /// before any consumers existed; here, we accept the lint to avoid a
@@ -75,8 +75,8 @@ pub fn get_file_symbols(
         return tool_error("'file' is required");
     }
 
-    // PathNormalization Phase 3.1: normalize the user-supplied file argument
-    // before graph lookup. `normalize_user_path` returns the canonical form
+    // Normalize the user-supplied file argument before graph lookup.
+    // `normalize_user_path` returns the canonical form
     // when the path exists on disk (resolving `.` / `..` and stripping the
     // Windows `\\?\` extended-path prefix when the short form is valid) and
     // falls back to a lexical strip otherwise. On Linux with an already-
@@ -86,15 +86,15 @@ pub fn get_file_symbols(
     let symbols = graph.read().file_symbols(&path);
     // Raw-set-empty -> existing tool error. Wording preserved byte-for-byte
     // so agents that match against this string keep working. This branch
-    // executes BEFORE the byte-budget step (PaginationOverhaul Phase 3
-    // decision) so a misspelled file path always surfaces the diagnostic
-    // error wording rather than an empty Page<T>.
+    // executes BEFORE the byte-budget step so a misspelled file path
+    // always surfaces the diagnostic error wording rather than an
+    // empty Page<T>.
     if symbols.is_empty() {
         return tool_error(format!("no symbols found in file: {file}"));
     }
 
-    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
-    // count the post-filter match set WITHOUT materializing SymbolResults or
+    // Count-only short-circuit: count the post-filter match set WITHOUT
+    // materializing SymbolResults or
     // invoking `byte_budget_take`. Order is load-bearing — must run AFTER
     // the empty-raw-set check (so misspelled files keep the diagnostic
     // error wording) but BEFORE the materialization step below.
@@ -105,11 +105,11 @@ pub fn get_file_symbols(
             symbols.len() as u32
         };
         // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract — see plan Decision 9.
-        // count_only callers opted out of paging; echoing a would-have-been
-        // limit would mislead them into thinking there's a record page to
-        // fetch. The exception is documented in CLAUDE.md alongside the
-        // count_only sub-block (Phase 4.2).
+        // "envelope echoes resolved limit" contract. count_only callers
+        // opted out of paging; echoing a would-have-been limit would
+        // mislead them into thinking there's a record page to fetch. The
+        // exception is documented in CLAUDE.md alongside the count_only
+        // sub-block.
         let response = Page::<SymbolResult> {
             results: vec![],
             total,
@@ -145,7 +145,7 @@ pub fn get_file_symbols(
     // canonicalizes the sequence.
     results.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety):
+    // Route through byte_budget_take so the page honors the byte budget:
     // the helper internally applies offset+limit skip/take and stops early
     // if the running serialized byte count would exceed
     // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
@@ -180,9 +180,8 @@ pub struct SearchSymbolsInput<'a> {
     /// When `true`, the handler returns the sentinel envelope
     /// (`results: []`, `total: <real count>`, `offset: 0`, `limit: 0`,
     /// `truncated: false`, `next_offset: None`) without materializing
-    /// `SymbolResult`s. Wired into the early-return path in Phase 3.2
-    /// of `PaginatedResponseSizeSafety`; the Graph-layer heap short-
-    /// circuit (`SearchParams.count_only`) lands in task 3.3 so the
+    /// `SymbolResult`s. Wired into the early-return path; the Graph-layer
+    /// heap short-circuit (`SearchParams.count_only`) ensures the
     /// BinaryHeap<TopEntry> is never constructed on this path.
     pub count_only: bool,
 }
@@ -192,7 +191,7 @@ pub struct SearchSymbolsInput<'a> {
 /// `Graph::search`. The pagination envelope is always present — `total`
 /// is reported pre-pagination so callers can render "page X of Y" UIs.
 ///
-/// **Architectural exception (Phase 2 of `PaginatedResponseSizeSafety`):**
+/// **Architectural exception:**
 /// unlike the four materializing handlers (orphans, file_symbols, callers,
 /// callees) that operate on a full match set before pagination, this handler
 /// receives an already-sliced page from `Graph::search` (the heap inside
@@ -223,7 +222,7 @@ pub fn search_symbols(
         && language_str.is_empty()
     {
         // Four-term message (vs. Go's three) — `language` is a Rust-only filter
-        // addition (Phase 1's Symbol::language is its first consumer). Listing
+        // addition (the first consumer of `Symbol::language`). Listing
         // it here keeps the error truthful about what satisfies the validation.
         return tool_error("'query', 'kind', 'namespace', or 'language' is required");
     }
@@ -249,8 +248,8 @@ pub fn search_symbols(
     let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
 
-    // Count-only short-circuit (Phase 3.3 of PaginatedResponseSizeSafety):
-    // delegate to `Graph::search` with `count_only=true` so the
+    // Count-only short-circuit: delegate to `Graph::search` with
+    // `count_only=true` so the
     // BinaryHeap<TopEntry> is never constructed. `sr.symbols` is guaranteed
     // empty on this path; only `sr.total` (the pre-pagination match count)
     // is meaningful. Emit the documented sentinel envelope.
@@ -269,11 +268,11 @@ pub fn search_symbols(
             count_only: true,
         });
         // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract — see plan Decision 9.
-        // count_only callers opted out of paging; echoing a would-have-been
-        // limit would mislead them into thinking there's a record page to
-        // fetch. The exception is documented in CLAUDE.md alongside the
-        // count_only sub-block (Phase 4.2).
+        // "envelope echoes resolved limit" contract. count_only callers
+        // opted out of paging; echoing a would-have-been limit would
+        // mislead them into thinking there's a record page to fetch. The
+        // exception is documented in CLAUDE.md alongside the count_only
+        // sub-block.
         let response = Page::<SymbolResult> {
             results: vec![],
             total: sr.total,
@@ -436,16 +435,14 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// `get_symbol_summary` body. Returns a [`Page`]`<`[`SummaryRow`]`>`
 /// envelope where each row is one `(namespace, kind, count)` triple.
 ///
-/// ResponseShapePolish Phase 1 (Task 1.1) flattened the previous nested
-/// `HashMap<String, HashMap<&'static str, u32>>` shape into the shared
-/// `Page<T>` envelope so the summary handler can use the existing
-/// pagination + byte-budget machinery (eliminating the 196 KB UE-scale
-/// rejection the nested shape caused). Task 1.2 wires real pagination
-/// through: flatten → sort by `(namespace, kind)` → `byte_budget_take`.
-/// Task 1.3 added the `<global>` display rename for empty namespaces (a
-/// row-build-time substitution; the graph's `Symbol.namespace` field is
-/// never mutated, and `search_symbols(namespace="")` still filters by
-/// the empty string).
+/// The response is the shared `Page<T>` envelope rather than a nested
+/// `HashMap<String, HashMap<&'static str, u32>>` so the summary handler
+/// reuses the existing pagination + byte-budget machinery (the nested
+/// shape caused a 196 KB UE-scale rejection). Pagination flow:
+/// flatten → sort by `(namespace, kind)` → `byte_budget_take`. Empty
+/// namespaces display as `<global>` via a row-build-time substitution;
+/// the graph's `Symbol.namespace` field is never mutated, and
+/// `search_symbols(namespace="")` still filters by the empty string.
 ///
 /// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
 /// default" (mirrors `get_orphans` and `get_file_symbols`); `limit` is
@@ -455,7 +452,7 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// across calls. The `<global>` substitution happens BEFORE the sort, so
 /// `<global>` rows sort wherever `<` lands in ASCII (between `;` and `=`).
 ///
-/// When `count_only = true` (Task 1.4), the handler returns the sentinel
+/// When `count_only = true`, the handler returns the sentinel
 /// response shape `Page { results: [], total, offset: 0, limit: 0,
 /// truncated: false, next_offset: None }` without flattening, sorting, or
 /// invoking the byte-budget helper. `total` is the count of distinct
@@ -475,7 +472,7 @@ pub fn get_symbol_summary(
     let path: Option<&Path> = file.filter(|s| !s.is_empty()).map(Path::new);
     let summary = graph.read().symbol_summary(path);
 
-    // Count-only short-circuit (Task 1.4): emit the sentinel envelope
+    // Count-only short-circuit: emit the sentinel envelope
     // WITHOUT flattening rows or invoking `byte_budget_take`. `total` is
     // the number of distinct `(namespace, kind)` pairs — i.e. the row
     // count the paginated path below would emit (one row per inner-map
@@ -501,7 +498,7 @@ pub fn get_symbol_summary(
     }
 
     // Flatten the nested map: one row per (namespace, kind) pair. The
-    // empty-namespace -> `<global>` rename (Task 1.3) is applied at row
+    // empty-namespace -> `<global>` rename is applied at row
     // build time, BEFORE the sort, and only here — the graph's
     // `Symbol.namespace` stays empty and `search_symbols(namespace="")`
     // still filters by the empty string. The rename is intentionally
@@ -535,7 +532,7 @@ pub fn get_symbol_summary(
     let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
     let resolved_offset = offset.unwrap_or(0);
 
-    // Route through byte_budget_take (Phase 2 of PaginatedResponseSizeSafety):
+    // Route through byte_budget_take so the page honors the byte budget:
     // the helper internally applies offset+limit skip/take and stops early
     // if the running serialized byte count would exceed
     // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
@@ -695,16 +692,15 @@ mod tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(total, 3);
         // All three include id/name/kind/line; namespace is "" so omitted.
-        // Phase 3.4 of PaginatedResponseSizeSafety dropped `file` from
-        // SymbolResult — the id already encodes it via
-        // `code_graph_core::symbol_id` (`file:name` /
+        // SymbolResult carries no `file` field — the id already encodes
+        // it via `code_graph_core::symbol_id` (`file:name` /
         // `file:Parent::name`). Clients recover via
         // `code_graph_core::id_to_file`.
         for entry in arr {
             assert!(entry.get("id").is_some());
             assert!(entry.get("name").is_some());
             assert!(entry.get("kind").is_some());
-            // `file` must NOT be in the record (dropped in Phase 3.4).
+            // `file` must NOT be in the record (intentionally not serialized).
             assert!(entry.get("file").is_none());
             // brief: signature must be absent.
             assert!(entry.get("signature").is_none());
@@ -749,7 +745,7 @@ mod tests {
         }
     }
 
-    // --- Phase 3 pagination invariants ------------------------------------
+    // --- pagination invariants --------------------------------------------
 
     /// Build a graph with `n` free-function symbols in a single file. Names
     /// are zero-padded to 3 digits so the natural `symbol_id` sort order is
@@ -937,20 +933,20 @@ mod tests {
         assert_eq!(limit, 100);
     }
 
-    // --- Phase 2 byte-budget invariants -----------------------------------
+    // --- byte-budget invariants -------------------------------------------
 
     #[test]
     fn file_symbols_byte_budget_truncates_oversized_page() {
-        // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` must
-        // make `get_file_symbols` stop emitting records before reaching
-        // `limit`, surface `truncated=true`, and report a usable `next_offset`.
+        // A tight `max_bytes` must make `get_file_symbols` stop emitting
+        // records before reaching `limit`, surface `truncated=true`, and
+        // report a usable `next_offset`.
         //
         // Fixture: 30 free functions named `func_000`..`func_029` in
         // `/big.cpp`. Each serialized SymbolResult in brief mode is ~60-70
         // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
         // "function","line":1}` plus the helper's +1 inter-record comma).
-        // Phase 3.4 of PaginatedResponseSizeSafety dropped the `file`
-        // field from SymbolResult — the `id` already encodes it.
+        // SymbolResult carries no `file` field — the `id` already
+        // encodes it.
         //
         // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
         // overhead reservation is 300 bytes, fits a handful of records
@@ -1030,8 +1026,8 @@ mod tests {
 
     #[test]
     fn file_symbols_byte_budget_does_not_change_empty_raw_set_error() {
-        // CRITICAL invariant per PaginationOverhaul Phase 3: empty raw set
-        // returns the documented error envelope (NOT a Page<T>) regardless
+        // CRITICAL invariant: an empty raw set returns the documented
+        // error envelope (NOT a Page<T>) regardless
         // of `max_bytes`. The byte-budget step runs after the empty-raw-set
         // check, so a tight budget cannot mask the diagnostic error.
         let g = locked(Graph::new());
@@ -1042,12 +1038,12 @@ mod tests {
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
     }
 
-    // --- PathNormalization Phase 3.1 --------------------------------------
+    // --- user-path normalization ------------------------------------------
 
     #[test]
     fn file_symbols_resolves_dot_segments_to_canonical_lookup() {
-        // PathNormalization Phase 3.1: the handler wraps the user-supplied
-        // `file` argument with `paths::normalize_user_path` before the graph
+        // The handler wraps the user-supplied `file` argument with
+        // `paths::normalize_user_path` before the graph
         // lookup. This test plants a symbol in the graph keyed by a real
         // canonical filesystem path, then queries the handler twice — once
         // with the canonical form, once with a `./` + `subdir/..` injected
@@ -1138,12 +1134,12 @@ mod tests {
         assert_eq!(arr_messy[0]["id"], arr_canonical[0]["id"]);
     }
 
-    // --- Phase 3 count_only invariants ------------------------------------
+    // --- count_only invariants --------------------------------------------
 
     #[test]
     fn file_symbols_count_only_returns_sentinel_envelope_under_1kb() {
-        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
-        // handler emits Page { results: [], total: <real count>, offset: 0,
+        // When count_only=true, the handler emits
+        // Page { results: [], total: <real count>, offset: 0,
         // limit: 0, truncated: false, next_offset: None } regardless of how
         // many records WOULD have been returned. Serialized envelope size
         // must stay < 1KB even at the 1000-symbol scale.
@@ -1541,8 +1537,8 @@ mod tests {
 
     #[test]
     fn search_symbols_byte_budget_truncates_oversized_page() {
-        // Phase 2.5 of PaginatedResponseSizeSafety: a tight `max_bytes`
-        // must make the handler trim its already-sliced page from
+        // A tight `max_bytes` must make the handler trim its
+        // already-sliced page from
         // `Graph::search` and surface `truncated=true` with a usable
         // `next_offset`. Architectural distinction from the other four
         // paginated handlers: search_symbols receives a page that's
@@ -1834,12 +1830,12 @@ mod tests {
         assert_eq!(next_offset, serde_json::Value::Null);
     }
 
-    // --- Phase 3 search_symbols count_only invariants ---------------------
+    // --- search_symbols count_only invariants -----------------------------
 
     #[test]
     fn search_symbols_count_only_returns_sentinel_envelope_under_1kb() {
-        // Phase 3 of PaginatedResponseSizeSafety: when count_only=true, the
-        // handler emits Page { results: [], total: <real count>, offset: 0,
+        // When count_only=true, the handler emits
+        // Page { results: [], total: <real count>, offset: 0,
         // limit: 0, truncated: false, next_offset: None } regardless of how
         // many records WOULD have been returned. Serialized envelope must
         // stay < 1KB even at the 1000-match scale.
@@ -1847,11 +1843,11 @@ mod tests {
         // Asserts: (a) results is empty, (b) total reflects the true
         // pre-pagination match count from Graph::search (not zero),
         // (c) limit=0 (deliberate exception to the "envelope echoes
-        // resolved limit" contract per plan Decision 9),
+        // resolved limit" contract, documented in CLAUDE.md),
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         //
-        // Task 3.3 threads `count_only` into `SearchParams`, so the
+        // `count_only` is threaded into `SearchParams`, so the
         // BinaryHeap<TopEntry> is never constructed on this path — the
         // wire-format contract above is unchanged.
         let g = locked(graph_with_n_broad_matches(1000));
@@ -2172,12 +2168,11 @@ mod tests {
 
     // --- get_symbol_summary ---
     //
-    // ResponseShapePolish Phase 1 (Task 1.1) flipped the response shape
-    // from the nested `HashMap<String, HashMap<&str, u32>>` to a
-    // `Page<SummaryRow>` envelope. The assertions below were rewritten
-    // to read the new flat-row shape; the underlying counts are
-    // unchanged. Tasks 1.2–1.4 will add pagination, sort, `<global>`
-    // rename, and `count_only` tests on top of this baseline.
+    // The response shape is a `Page<SummaryRow>` envelope (flat rows)
+    // rather than a nested `HashMap<String, HashMap<&str, u32>>`. The
+    // assertions below read the flat-row shape; pagination, sort,
+    // `<global>` rename, and `count_only` are covered by the test
+    // groups further down.
 
     /// Pick a single `SummaryRow` out of the response by `(namespace, kind)`.
     /// Panics with a helpful message if no row matches — callers want a
@@ -2208,9 +2203,9 @@ mod tests {
         let g = locked(small_graph());
         let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        // Phase 1: response is now `Page<SummaryRow>`. All 3 sample
-        // symbols carry namespace="" in the graph; Task 1.3's display
-        // rename surfaces them under `<global>` in the response.
+        // The response is a `Page<SummaryRow>`. All 3 sample symbols
+        // carry namespace="" in the graph; the display rename surfaces
+        // them under `<global>` in the response.
         let results = parsed["results"].as_array().expect("results array");
         assert_eq!(pick_count(results, "<global>", "function"), 1);
         assert_eq!(pick_count(results, "<global>", "class"), 1);
@@ -2229,8 +2224,8 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        // Phase 1: empty graph now yields an empty Page envelope, NOT a
-        // bare empty object. The shape change is intentional (see plan).
+        // An empty graph yields an empty Page envelope, NOT a bare
+        // empty object. The shape is intentional.
         let results = parsed["results"].as_array().expect("results array");
         assert!(results.is_empty());
         assert_eq!(parsed["total"].as_u64().unwrap(), 0);
@@ -2249,17 +2244,16 @@ mod tests {
         let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
-        // Task 1.3: empty namespace renders as `<global>` in the response.
+        // An empty namespace renders as `<global>` in the response.
         assert_eq!(pick_count(results, "<global>", "function"), 1);
         // No method or class rows — those are in /a.cpp only.
         assert!(!has_row(results, "<global>", "method"));
         assert!(!has_row(results, "<global>", "class"));
     }
 
-    // --- Task 1.2 pagination tests ------------------------------------------
+    // --- pagination tests ---------------------------------------------------
     //
-    // ResponseShapePolish Phase 1 Task 1.2 wires real pagination through
-    // `get_symbol_summary`. These tests pin:
+    // `get_symbol_summary` wires real pagination through. These tests pin:
     //   * basic round-trip with multiple namespaces (deterministic ordering),
     //   * sort stability across two pages,
     //   * `limit=0` resolves to the default (mirrors `get_orphans`),
@@ -2303,7 +2297,7 @@ mod tests {
     #[test]
     fn symbol_summary_basic_round_trip_multiple_namespaces() {
         // Two namespaces ("alpha", "beta") plus the default ""-namespace
-        // rows from `small_graph` (rendered as `<global>` after Task 1.3) —
+        // rows from `small_graph` (rendered as `<global>`) —
         // three distinct namespaces, multiple kinds. Asserts `total`,
         // `results.len()`, and that two back-to-back calls produce the
         // same ordering (sort is deterministic).
@@ -2366,9 +2360,9 @@ mod tests {
             "row order must be deterministic across repeated calls",
         );
 
-        // Sort order: namespace asc, then kind asc. After Task 1.3's
-        // `<global>` rename happens at row-build time (i.e. BEFORE the
-        // sort), `<` (ASCII 60) sorts before `a` (97) and `b` (98), so
+        // Sort order: namespace asc, then kind asc. The `<global>`
+        // rename happens at row-build time (i.e. BEFORE the sort), so
+        // `<` (ASCII 60) sorts before `a` (97) and `b` (98), and
         // the `<global>` rows still come first. Expected sequence:
         //   ("<global>", "class"),
         //   ("<global>", "function"),
@@ -2492,7 +2486,7 @@ mod tests {
         // >100-row fixture: build 1200 distinct namespaces (each yielding
         // one row). Call with default limit; under the production 100KB
         // `max_bytes` this MUST cap the page at exactly 100 rows (the
-        // count cap). Pins the regression the Task 1.1 stub was hiding:
+        // count cap). Pins the regression an earlier stub was hiding:
         // the stub ignored `limit` entirely and emitted all 1200 rows.
         //
         // Each SummaryRow serialized is roughly
@@ -2530,7 +2524,7 @@ mod tests {
         // ensures the count cap never bites first.
         //
         // This is the load-bearing complement to the previous test: it
-        // pins the truncation half of the Task 1.1 regression. Without
+        // pins the truncation half of that regression. Without
         // pagination wired through, the stub would have emitted all
         // 1200 rows and overflowed any client harness's response budget.
         let g = locked(multi_namespace_graph(1200));
@@ -2556,10 +2550,10 @@ mod tests {
         );
     }
 
-    // --- Task 1.3 <global> rename tests ------------------------------------
+    // --- <global> rename tests --------------------------------------------
     //
-    // ResponseShapePolish Phase 1 Task 1.3 renames the empty namespace to
-    // the literal string `<global>` when building each `SummaryRow` — a
+    // The empty namespace renders as the literal string `<global>` when
+    // building each `SummaryRow` — a
     // row-build-time substitution that does NOT mutate `Symbol.namespace`
     // in the graph. The asymmetry is load-bearing: display label is
     // `<global>`, but `search_symbols(namespace="")` still filters by the
@@ -2723,22 +2717,20 @@ mod tests {
         }
     }
 
-    // --- Task 1.4 count_only invariants -------------------------------------
+    // --- count_only invariants ----------------------------------------------
     //
-    // ResponseShapePolish Phase 1 Task 1.4 adds a `count_only: bool` argument
-    // to `get_symbol_summary`. When true, the handler returns the sentinel
-    // envelope (`results: []`, `limit: 0`, `offset: 0`, `truncated: false`,
-    // `next_offset: None`) and reports `total` as the count of distinct
-    // `(namespace, kind)` pairs — i.e. the number of rows the paginated
-    // path would emit, NOT the sum of per-pair symbol counts. The pair-vs-
-    // symbol distinction is load-bearing in the verification frontmatter;
-    // `symbol_summary_count_only_does_not_count_individual_symbols` pins
-    // it against the worst-case shape (many symbols, one pair).
+    // `get_symbol_summary` takes a `count_only: bool` argument. When true,
+    // the handler returns the sentinel envelope (`results: []`,
+    // `limit: 0`, `offset: 0`, `truncated: false`, `next_offset: None`)
+    // and reports `total` as the count of distinct `(namespace, kind)`
+    // pairs — i.e. the number of rows the paginated path would emit, NOT
+    // the sum of per-pair symbol counts. The pair-vs-symbol distinction
+    // is load-bearing; `symbol_summary_count_only_does_not_count_individual_symbols`
+    // pins it against the worst-case shape (many symbols, one pair).
     //
-    // The sentinel shape mirrors `get_orphans` / `search_symbols` /
-    // `get_file_symbols` count_only paths (Phase 3 of
-    // `PaginatedResponseSizeSafety`), so a single client deserializer
-    // covers all four tools.
+    // The sentinel shape mirrors the `get_orphans` / `search_symbols` /
+    // `get_file_symbols` count_only paths, so a single client
+    // deserializer covers all four tools.
 
     /// Build a graph with N Function symbols all in namespace `"foo"`. The
     /// inner map under `summary["foo"]` therefore has exactly ONE entry

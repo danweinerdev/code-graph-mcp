@@ -1,13 +1,12 @@
 //! Shared helpers used by every per-language plugin crate.
 //!
 //! The first inhabitant is [`truncate_signature`], which was originally
-//! duplicated byte-identical across the C++, Rust, and Go plugin crates. The
-//! Phase 6 debrief flagged consolidation as the natural follow-up once a
-//! third copy landed; Phase 7.1 promotes it here so the about-to-be-fourth
-//! Python plugin can reuse the same logic without spawning yet another copy.
+//! duplicated byte-identical across the C++, Rust, and Go plugin crates and
+//! is consolidated here so every plugin (including Python) reuses the same
+//! logic without spawning yet another copy.
 //!
-//! Phase 7.7 added [`find_enclosing_kind`] — the second cross-plugin helper
-//! that was duplicated five times (C++ helpers, Rust helpers, Rust lib, Go
+//! [`find_enclosing_kind`] is the second cross-plugin helper; it was
+//! duplicated five times (C++ helpers, Rust helpers, Rust lib, Go
 //! lib, Python lib). All copies were functionally identical
 //! (`Node<'a>, &str -> Option<Node<'a>>`, walk-up-parent-chain semantics);
 //! consolidation here keeps every plugin's call-site shape unchanged.
@@ -25,9 +24,9 @@ use tree_sitter::Node;
 /// `node` itself) whose kind matches `kind`. Returns `None` if no such
 /// ancestor exists.
 ///
-/// Phase 7.7 consolidated five byte-identical copies (C++ `helpers.rs`,
-/// Rust `helpers.rs`, Rust `lib.rs`, Go `lib.rs`, Python `lib.rs`) into
-/// this canonical implementation. Every plugin's call sites now route
+/// This canonical implementation replaced five byte-identical copies
+/// (C++ `helpers.rs`, Rust `helpers.rs`, Rust `lib.rs`, Go `lib.rs`,
+/// Python `lib.rs`). Every plugin's call sites now route
 /// through this function — call sites stay unchanged; only the import
 /// path for the helper differs.
 ///
@@ -76,10 +75,10 @@ mod tests {
     //! the cross-language braces/semicolons/whitespace/UTF-8 paths all stay
     //! exercised at this layer.
     //!
-    //! Phase 7.7 added the [`find_enclosing_kind`] tests below, exercising
-    //! the parent-walk semantics that all four plugins relied on. Tests use
-    //! the Rust grammar (already a dev-dep) but the helper itself is
-    //! grammar-agnostic — the kind strings happen to be Rust node kinds.
+    //! The [`find_enclosing_kind`] tests below exercise the parent-walk
+    //! semantics that all four plugins rely on. Tests use the Rust grammar
+    //! (already a dev-dep) but the helper itself is grammar-agnostic — the
+    //! kind strings happen to be Rust node kinds.
     use super::*;
 
     #[test]

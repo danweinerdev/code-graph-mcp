@@ -4,18 +4,17 @@
 //! to extract symbols, calls, use-declarations, and trait-impl edges from
 //! Rust source files.
 //!
-//! # Phase status
+//! # Extraction surface
 //!
-//! Phase 5.1 ships the crate scaffold: dependency wiring, query strings
-//! that compile against tree-sitter-rust 0.24.x, the `RustParser` struct
-//! with cached `Query` objects, and the `LanguagePlugin` impl with a
-//! stubbed `parse_file` that returns an empty `FileGraph`.
+//! The crate compiles query strings against tree-sitter-rust 0.24.x,
+//! exposes the `RustParser` struct with cached `Query` objects, and
+//! implements `LanguagePlugin`. Every extractor below is live and
+//! `parse_file` is fully populated.
 //!
-//! Phase 5.2 wires `extract_definitions` into `parse_file`. Phase 5.3 wires
-//! `extract_uses` (use-tree expansion + `extern crate`). Phase 5.4 wires
-//! `extract_calls` (direct, method, scoped, macro) and `extract_inheritance`
-//! (`impl Trait for Type`). After 5.4, `parse_file` is fully populated and
-//! every extractor is live.
+//! `extract_definitions` feeds `parse_file`. `extract_uses` covers
+//! use-tree expansion + `extern crate`. `extract_calls` covers direct,
+//! method, scoped, and macro calls. `extract_inheritance` covers
+//! `impl Trait for Type`.
 //!
 //! # Known Rust parser limitations
 //!
@@ -23,11 +22,11 @@
 //! built out. They are intentional, not bugs.
 //!
 //! 1. **`macro_rules!` definitions are not extracted as symbols.** Only
-//!    invocations produce call edges (Phase 5.4). The `DEFINITION_QUERIES`
+//!    invocations produce call edges. The `DEFINITION_QUERIES`
 //!    constant explicitly does not match `macro_definition` (the
 //!    tree-sitter-rust 0.24 node type that wraps `macro_rules!` blocks),
-//!    and Phase 5.2 ships an anti-regression test
-//!    (`macro_rules_definition_produces_zero_symbols`) that asserts a
+//!    and an anti-regression test
+//!    (`macro_rules_definition_produces_zero_symbols`) asserts a
 //!    fixture with `macro_rules! foo { ... }` yields no Symbol records.
 //! 2. **Forward declarations excluded.** Trait method declarations like
 //!    `fn bar();` are `function_signature_item`, not `function_item`, in
@@ -39,7 +38,7 @@
 //!    also produce symbols.
 //! 3. **`#[derive(...)]` and proc-macro attributes** appear as
 //!    `attribute_item` (not `macro_invocation`) so they are NOT captured
-//!    as call edges (Phase 5.4 limitation).
+//!    as call edges.
 //! 4. **Call resolution is heuristic** — same-file > same-parent >
 //!    same-namespace > global, identical to the C++ plugin's behavior via
 //!    the default `LanguagePlugin::resolve_call` impl.
@@ -95,9 +94,8 @@ impl RustParser {
     /// [`anyhow::Error`] (wrapping the query compiler's message) if any
     /// query fails to compile against the pinned grammar version.
     ///
-    /// Successful return is the Phase 5.1 acceptance gate that proves
-    /// every query string in `queries.rs` parses against
-    /// tree-sitter-rust 0.24.x.
+    /// Successful return proves every query string in `queries.rs` parses
+    /// against tree-sitter-rust 0.24.x.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_rust::LANGUAGE.into();
 
@@ -161,7 +159,7 @@ impl RustParser {
     ///   `impl_node.child_by_field_name("type")` text. For
     ///   `impl Trait for Type { fn m() }` the parent is **`Type`, not
     ///   `Trait`** — the trait relationship lives only in the inheritance
-    ///   edge (Phase 5.4). The trait-impl-method test
+    ///   edge. The trait-impl-method test
     ///   (`trait_impl_method_parent_is_type_not_trait`) is the
     ///   anti-regression for that rule.
     /// - `function_item` at module level → [`SymbolKind::Function`], no
@@ -574,23 +572,20 @@ fn make_symbol(
 
 #[cfg(test)]
 mod tests {
-    //! Phase 5.1 structural smoke tests + Phase 5.2 definition extraction
-    //! coverage.
-    //!
-    //! Behavioral coverage for uses (5.3), calls (5.4), and inheritance
-    //! (5.4) lands alongside the corresponding `extract_*` loops.
+    //! Structural smoke tests plus definition-extraction coverage, and
+    //! behavioral coverage for uses, calls, and inheritance alongside the
+    //! corresponding `extract_*` loops.
     use super::*;
     use code_graph_core::symbol_id;
 
     // ----------------------------------------------------------------
-    // Phase 5.1 — structural smoke tests
+    // Structural smoke tests
     // ----------------------------------------------------------------
 
     #[test]
     fn new_compiles_all_four_queries() {
-        // The whole point of Phase 5.1: every query string parses against
-        // the pinned tree-sitter-rust. Failure here means a query needs
-        // updating.
+        // Every query string must parse against the pinned
+        // tree-sitter-rust. Failure here means a query needs updating.
         let p = RustParser::new().expect("RustParser::new must succeed");
         let _ = (
             &p.language,
@@ -621,12 +616,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5.2 — definition extraction
+    // Definition extraction
     // ----------------------------------------------------------------
 
     /// Parse `src` against `RustParser` and return the resulting
-    /// FileGraph at a synthetic absolute path. Used by every Phase 5.2
-    /// behavioral test below.
+    /// FileGraph at a synthetic absolute path. Used by every
+    /// definition-extraction behavioral test below.
     fn parse(src: &str) -> FileGraph {
         let p = RustParser::new().unwrap();
         p.parse_file(Path::new("/tmp/test.rs"), src.as_bytes())
@@ -652,9 +647,8 @@ mod tests {
 
     #[test]
     fn parse_file_returns_correct_path_and_language() {
-        // Phase 5.1's empty-graph stub assertion is now obsolete — 5.2
-        // populates symbols. Keep the path/language assertion which
-        // still belongs at this layer.
+        // `parse_file` populates symbols; this test pins the
+        // path/language assertion that belongs at this layer.
         let fg = parse("fn foo() {}");
         assert_eq!(fg.path, "/tmp/test.rs");
         assert_eq!(fg.language, Language::Rust);
@@ -681,7 +675,7 @@ mod tests {
 
     /// CRITICAL anti-regression: for `impl Trait for Type { fn m() }` the
     /// method's parent MUST be `Type`, never `Trait`. The trait
-    /// relationship lives only in the inheritance edge (Phase 5.4).
+    /// relationship lives only in the inheritance edge.
     #[test]
     fn trait_impl_method_parent_is_type_not_trait() {
         let src = "trait Trait {} struct Foo; impl Trait for Foo { fn bar() {} }";
@@ -851,12 +845,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5.3 — use-tree expansion + extern crate edges
+    // Use-tree expansion + extern crate edges
     // ----------------------------------------------------------------
 
-    /// Collect just the `Includes`-kind edges from a `FileGraph`. Phase 5.3
-    /// only emits `Includes`; this filter future-proofs the helpers
-    /// against Phase 5.4 adding `Calls`/`Inherits` to the same fixture.
+    /// Collect just the `Includes`-kind edges from a `FileGraph`. This
+    /// filter isolates use-tree edges so the assertions stay robust when a
+    /// fixture also produces `Calls`/`Inherits` edges.
     fn includes(fg: &FileGraph) -> Vec<&Edge> {
         fg.edges
             .iter()
@@ -982,7 +976,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5.4 — call extraction
+    // Call extraction
     // ----------------------------------------------------------------
 
     /// Just the call edges from a `FileGraph`, in emission order.
@@ -1150,7 +1144,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5.4 — inheritance edges (impl Trait for Type)
+    // Inheritance edges (impl Trait for Type)
     // ----------------------------------------------------------------
 
     #[test]

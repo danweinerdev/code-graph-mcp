@@ -3,8 +3,8 @@
 //!
 //! Mirrors the Go reference at `internal/graph/graph.go` lines 177–320
 //! (`FileSymbols`, `SymbolDetail`, `Search`, `SearchSymbols`, `SymbolSummary`)
-//! with one new feature: the optional `language` filter on [`SearchParams`].
-//! Phase 1 added `Language` to every [`Symbol`]; this is its first consumer.
+//! with one new feature: the optional `language` filter on [`SearchParams`],
+//! the first consumer of the `Language` field carried on every [`Symbol`].
 //!
 //! All methods take `&self` — querying never mutates state. Pagination
 //! correctness (stable order under repeat queries, `total` reported before
@@ -21,9 +21,9 @@ use regex::Regex;
 use crate::Graph;
 
 // Test-only counter incremented on every `BinaryHeap::push` call inside
-// `Graph::search`. Used by the heap-not-touched test in Phase 3.3 of
-// `PaginatedResponseSizeSafety` to pin the cost win of `count_only=true` to
-// observable behavior: a future refactor that accidentally re-introduces
+// `Graph::search`. Used by the heap-not-touched test to pin the cost win
+// of `count_only=true` to observable behavior: a future refactor that
+// accidentally re-introduces
 // heap construction on the count-only path would make
 // `search_count_only_does_not_push_heap` fail immediately. Reset between
 // measurements via `reset_heap_pushes`; read via `heap_pushes`. Hidden
@@ -108,8 +108,8 @@ pub struct SearchParams {
     pub kind: Option<SymbolKind>,
     /// Case-insensitive substring filter on `Symbol::namespace`. Empty = off.
     pub namespace: String,
-    /// Exact-match language filter. `None` keeps all languages. **New in
-    /// Phase 2.2** — Go has no equivalent because the Go binary only ships a
+    /// Exact-match language filter. `None` keeps all languages. The Go
+    /// reference has no equivalent because the Go binary only ships a
     /// C++ parser.
     pub language: Option<Language>,
     /// Page size. `0` is treated as the default (20).
@@ -124,10 +124,9 @@ pub struct SearchParams {
     /// heap or cloning a Symbol. The wire-format envelope is unchanged; the
     /// optimization is internal. `Default` is `false`, so existing call sites
     /// that construct via `..SearchParams::default()` keep their behavior.
-    /// Threaded into the search-symbols count-only path in Phase 3.3 of
-    /// `PaginatedResponseSizeSafety` (the architectural exception path for
-    /// search-symbols-specific count-only — orphans / file_symbols compute
-    /// `total` directly from their filtered Vec, no heap involved).
+    /// Threaded into the search-symbols count-only path (the exception path
+    /// for search-symbols-specific count-only — orphans / file_symbols
+    /// compute `total` directly from their filtered Vec, no heap involved).
     pub count_only: bool,
 }
 
@@ -202,8 +201,8 @@ impl Graph {
         };
         let lower_ns = params.namespace.to_lowercase();
 
-        // count_only short-circuit (Phase 3.3 of PaginatedResponseSizeSafety):
-        // walk the match predicate exactly as the materializing path does,
+        // count_only short-circuit: walk the match predicate exactly as
+        // the materializing path does,
         // but skip the BinaryHeap allocation, the per-match `symbol_id`
         // formatting, and the Vec<Symbol> clone at the end. The returned
         // `total` is byte-identical to the materializing path's total because
@@ -924,7 +923,7 @@ mod tests {
         // — the increment on the test thread is observed only here.
         let g = graph_with_n_matching(100);
 
-        // Phase 1: count_only=true MUST push zero entries.
+        // Step 1: count_only=true MUST push zero entries.
         reset_heap_pushes();
         let count_only = g.search(SearchParams {
             pattern: "match".to_string(),
@@ -939,10 +938,10 @@ mod tests {
             "count_only=true must skip the heap entirely; got {pushes_count_only} pushes"
         );
 
-        // Phase 2: count_only=false MUST push at least once. This sentinel
+        // Step 2: count_only=false MUST push at least once. This sentinel
         // catches the inverse failure mode — a refactor that accidentally
         // disables the counter (e.g. removes the `#[cfg(test)]` increment
-        // sites) — which would make Phase 1's assertion trivially pass.
+        // sites) — which would make Step 1's assertion trivially pass.
         reset_heap_pushes();
         let regular = g.search(SearchParams {
             pattern: "match".to_string(),

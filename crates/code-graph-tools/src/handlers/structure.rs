@@ -2,10 +2,10 @@
 //! `get_class_hierarchy`, `get_coupling`, `generate_diagram`.
 //!
 //! Mirrors the Go reference at `internal/tools/structure.go` for shape
-//! and JSON output. Error wording follows the Phase 3.4 carry-forward
-//! principle: Rust idioms (e.g. listing valid values inline) over rote
-//! Go parity. Specific divergences are documented inline so future
-//! readers understand which strings are deliberate.
+//! and JSON output. Error wording favors Rust idioms (e.g. listing valid
+//! values inline) over rote Go parity. Specific divergences are
+//! documented inline so future readers understand which strings are
+//! deliberate.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -166,8 +166,8 @@ pub fn detect_cycles(
 /// silently clamped at 1000. `offset >= total` returns an empty `results`
 /// page with the correct `total`.
 ///
-/// When `count_only = true` (Phase 3 of `PaginatedResponseSizeSafety`),
-/// the handler returns the sentinel response shape `Page { results: [],
+/// When `count_only = true`, the handler returns the sentinel response
+/// shape `Page { results: [],
 /// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
 /// without ever materializing `SymbolResult`s or invoking the byte-budget
 /// helper. `total` reflects the true pre-pagination match count after the
@@ -191,19 +191,19 @@ pub fn get_orphans(
             },
         };
 
-    // Count-only short-circuit (Phase 3.2 of PaginatedResponseSizeSafety):
-    // compute `total` via the cheap path (filter + count) and emit the
+    // Count-only short-circuit: compute `total` via the cheap path
+    // (filter + count) and emit the
     // sentinel envelope WITHOUT materializing SymbolResults or invoking
     // `byte_budget_take`. Order is load-bearing — must precede the
     // materialization step below so the byte-budget cost is never paid.
     if count_only {
         let total = graph.read().orphans(parsed_kind).len() as u32;
         // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract — see plan Decision 9.
-        // count_only callers opted out of paging; echoing a would-have-been
-        // limit would mislead them into thinking there's a record page to
-        // fetch. The exception is documented in CLAUDE.md alongside the
-        // count_only sub-block (Phase 4.2).
+        // "envelope echoes resolved limit" contract. count_only callers
+        // opted out of paging; echoing a would-have-been limit would
+        // mislead them into thinking there's a record page to fetch. The
+        // exception is documented in CLAUDE.md alongside the count_only
+        // sub-block.
         let response = Page::<SymbolResult> {
             results: vec![],
             total,
@@ -230,8 +230,8 @@ pub fn get_orphans(
     // tie-break rules.
     matches.sort_by_key(symbol_id);
 
-    // Materialize to SymbolResult first, then route through byte_budget_take
-    // (Phase 2 of PaginatedResponseSizeSafety): the helper internally applies
+    // Materialize to SymbolResult first, then route through byte_budget_take:
+    // the helper internally applies
     // offset+limit skip/take and stops early if the running serialized byte
     // count would exceed `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept`
     // from the helper is `results.len() as u32`, NOT the pre-pagination match
@@ -305,7 +305,7 @@ pub fn get_class_hierarchy(
 
     let depth = depth.filter(|&d| d > 0).unwrap_or(1);
     // Resolve max_nodes: zero-or-missing -> default 250; clamp at 1000.
-    // Matches the Phase 2/3 pagination convention for limit resolution.
+    // Matches the pagination convention for limit resolution.
     let resolved_max_nodes = max_nodes.filter(|&n| n != 0).unwrap_or(250).min(1000);
 
     let g = graph.read();
@@ -451,9 +451,9 @@ pub fn get_coupling(
     let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(50).min(1000);
     let resolved_offset = offset.unwrap_or(0);
 
-    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
-    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
-    // form when the path exists on disk (resolving `.` / `..` and stripping
+    // Normalize the user-supplied `file` argument before graph lookup.
+    // Mirrors `get_file_symbols`: canonical form when the path exists on
+    // disk (resolving `.` / `..` and stripping
     // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
     // On Linux with an already-canonical path this is effectively identity.
     let path = paths::normalize_user_path(file);
@@ -653,8 +653,8 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
     let dr_opt = if let Some(id) = symbol {
         g.diagram_call_graph(id, direction, depth, max_nodes)
     } else if let Some(path) = file {
-        // PathNormalization Phase 3.2: same normalize wrap as `get_coupling`
-        // and `get_file_symbols`. Only the file-mode branch needs it — the
+        // Same normalize wrap as `get_coupling` and `get_file_symbols`.
+        // Only the file-mode branch needs it — the
         // `symbol` and `class` branches take symbol IDs, not file paths.
         let normalized = paths::normalize_user_path(path);
         g.diagram_file_graph(&normalized, depth, max_nodes)
@@ -1220,7 +1220,7 @@ mod tests {
         }
     }
 
-    // --- Phase 2 pagination invariants ------------------------------------
+    // --- pagination invariants --------------------------------------------
 
     /// Build a graph with exactly `n` orphan functions named `func_000`,
     /// `func_001`, ..., zero-padded to 3 digits so the natural sort order
@@ -1386,20 +1386,20 @@ mod tests {
         }
     }
 
-    // --- Phase 2 byte-budget invariants -----------------------------------
+    // --- byte-budget invariants -------------------------------------------
 
     #[test]
     fn orphans_byte_budget_truncates_oversized_page() {
-        // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` must
-        // make `get_orphans` stop emitting records before reaching `limit`,
+        // A tight `max_bytes` must make `get_orphans` stop emitting
+        // records before reaching `limit`,
         // surface `truncated=true`, and report a usable `next_offset`.
         //
         // Fixture: 30 orphan functions named `func_000`..`func_029` in
         // `/big.cpp`. Each serialized SymbolResult in brief mode is ~60-70
         // bytes (`{"id":"/big.cpp:func_NNN","name":"func_NNN","kind":
         // "function","line":1}` plus the helper's +1 inter-record comma).
-        // Phase 3.4 of PaginatedResponseSizeSafety dropped the `file`
-        // field from SymbolResult — the `id` already encodes it.
+        // SymbolResult carries no `file` field — the `id` already
+        // encodes it.
         //
         // Pick `max_bytes = ENVELOPE_OVERHEAD_BYTES + 300`: budget after
         // overhead reservation is 300 bytes, which fits ~4 records before
@@ -1459,12 +1459,12 @@ mod tests {
         assert_eq!(next_offset, None);
     }
 
-    // --- Phase 3 count_only invariants ------------------------------------
+    // --- count_only invariants --------------------------------------------
 
     #[test]
     fn orphans_count_only_returns_sentinel_envelope_under_1kb() {
-        // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true, the
-        // handler returns Page { results: [], total: <real count>, offset: 0,
+        // When count_only=true, the handler returns Page { results: [],
+        // total: <real count>, offset: 0,
         // limit: 0, truncated: false, next_offset: None } regardless of how
         // many records WOULD have been returned. Serialized envelope size
         // must be < 1KB even at the 1000-orphan scale.
@@ -1578,7 +1578,7 @@ mod tests {
         let r = get_class_hierarchy(&g, "Mid", Some(1), None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        // Phase 4: response is wrapped in {hierarchy, truncated, max_nodes,
+        // The response is wrapped in {hierarchy, truncated, max_nodes,
         // total_nodes_seen}; the tree itself lives under `hierarchy`.
         let hierarchy = &parsed["hierarchy"];
         assert_eq!(hierarchy["name"], serde_json::json!("Mid"));
@@ -2470,13 +2470,13 @@ mod tests {
         }
     }
 
-    // --- PathNormalization Phase 3.2 --------------------------------------
+    // --- user-path normalization ------------------------------------------
 
     #[test]
     fn coupling_resolves_dot_segments_to_canonical_lookup() {
-        // PathNormalization Phase 3.2: `get_coupling` wraps the user-supplied
-        // `file` argument with `paths::normalize_user_path` before the graph
-        // lookup. Mirrors the Phase 3.1 test in `symbols.rs`. Plant a coupling
+        // `get_coupling` wraps the user-supplied `file` argument with
+        // `paths::normalize_user_path` before the graph lookup. Mirrors
+        // the sibling normalization test in `symbols.rs`. Plant a coupling
         // edge keyed by a real canonical filesystem path, then query the
         // handler twice — once with the canonical form, once with a
         // `./sub/../` injected form that resolves to the same canonical via
@@ -2544,9 +2544,9 @@ mod tests {
 
     #[test]
     fn diagram_file_mode_resolves_dot_segments_to_canonical_lookup() {
-        // PathNormalization Phase 3.2: `generate_diagram` (file mode) wraps
-        // the user-supplied `file` argument with `paths::normalize_user_path`
-        // before the graph lookup. Mirrors the Phase 3.1 test in `symbols.rs`.
+        // `generate_diagram` (file mode) wraps the user-supplied `file`
+        // argument with `paths::normalize_user_path` before the graph
+        // lookup. Mirrors the sibling normalization test in `symbols.rs`.
         // Plant an include edge keyed by a real canonical filesystem path,
         // then query the handler twice — once with the canonical form, once
         // with a `./sub/../` injected form — and assert both produce a

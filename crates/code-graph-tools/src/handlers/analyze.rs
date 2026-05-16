@@ -70,7 +70,7 @@ pub async fn analyze_codebase(
         // "directory does not exist" message, but Rust's `paths::canonicalize`
         // already gave us the richer information and discarding it just for Go
         // byte-identity would make the error less helpful for no real benefit.
-        // Phase 3.7 snapshots will lock in the Rust-specific wording.
+        // The snapshot suite locks in this Rust-specific wording.
         return tool_error(format!("path is not a directory: {}", abs_path.display()));
     }
 

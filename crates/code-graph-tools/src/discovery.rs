@@ -12,8 +12,8 @@
 //! result `Vec` never contains `.png`/`.o`/`node_modules/*.js` entries that
 //! would have to be discarded post-walk.
 //!
-//! The walker is synchronous; the Phase 3.4 `analyze_codebase` handler will
-//! call it from `tokio::task::spawn_blocking`.
+//! The walker is synchronous; the `analyze_codebase` handler calls it
+//! from `tokio::task::spawn_blocking`.
 //!
 //! ## extra_ignore semantics
 //!

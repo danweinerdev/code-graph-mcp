@@ -4,61 +4,53 @@
 //! crates) to extract symbols, calls, import edges, and inheritance edges
 //! from `.cs` source files.
 //!
-//! # Phase status
+//! # Extraction surface
 //!
-//! Phase 2.1 shipped the crate scaffold: dependency wiring, empty query
-//! string constants in [`queries`] that compile against tree-sitter-c-sharp
-//! 0.23.5, the [`CSharpParser`] struct with cached `Query` objects, and
-//! the [`LanguagePlugin`] impl.
+//! The crate compiles empty-safe query string constants in [`queries`]
+//! against tree-sitter-c-sharp 0.23.5, exposes the [`CSharpParser`] struct
+//! with cached `Query` objects, and implements [`LanguagePlugin`]. All
+//! four extractors below are live and the plugin is registered in the
+//! binary.
 //!
-//! Phase 2.2 wires `extract_definitions` (classes, records, structs,
-//! interfaces, enums, methods, constructors, local functions) and
-//! switches `parse_to_filegraph` from the empty-graph stub to a real
-//! tree-sitter-driven parse. Partial classes (Decision 3), default
-//! interface methods (Decision 11), and extension methods (Decision 5) are
-//! covered with inline tests.
+//! `extract_definitions` extracts classes, records, structs, interfaces,
+//! enums, methods, constructors, and local functions. Partial classes
+//! (Decision 3), default interface methods (Decision 11), and extension
+//! methods (Decision 5) are covered with inline tests.
 //!
-//! Phase 2.3 wires `extract_calls`, producing
-//! [`EdgeKind::Calls`] edges for direct (`Foo()`), member-access
-//! (`obj.Foo()`), chained (`a.B().C()` → 2 edges), null-conditional
-//! (`obj?.Foo()`), generic (`Foo<int>()` → `to = "Foo"`), constructor
-//! (`new Foo()` → `to = "Foo"`), lambda-body, and LINQ-select-clause
-//! call patterns. The enclosing-function walk is transparent through
-//! lambda and query expressions (a call inside `() => Foo()` or
-//! `select Foo(x)` reports the enclosing method as `from`). Cast
-//! expressions, `typeof`, `sizeof`, `default`, `checked`, and `unchecked`
-//! parse as dedicated node kinds and do NOT produce spurious call edges.
-//! `nameof(X)` parses as an `invocation_expression` in this grammar but
-//! is filtered as a compile-time name operator, not a call.
+//! `extract_calls` produces [`EdgeKind::Calls`] edges for direct
+//! (`Foo()`), member-access (`obj.Foo()`), chained (`a.B().C()` → 2
+//! edges), null-conditional (`obj?.Foo()`), generic (`Foo<int>()` →
+//! `to = "Foo"`), constructor (`new Foo()` → `to = "Foo"`), lambda-body,
+//! and LINQ-select-clause call patterns. The enclosing-function walk is
+//! transparent through lambda and query expressions (a call inside
+//! `() => Foo()` or `select Foo(x)` reports the enclosing method as
+//! `from`). Cast expressions, `typeof`, `sizeof`, `default`, `checked`,
+//! and `unchecked` parse as dedicated node kinds and do NOT produce
+//! spurious call edges. `nameof(X)` parses as an `invocation_expression`
+//! in this grammar but is filtered as a compile-time name operator, not a
+//! call.
 //!
-//! Phase 2.4 wires `extract_imports`, producing [`EdgeKind::Includes`]
-//! edges for plain (`using System;`), dotted (`using
-//! System.Collections.Generic;`), `using static` (the `static` modifier
-//! is dropped from `to`), `using A = X.Y` (the alias is dropped; the
-//! target path is preserved), and `global using` (the `global` modifier
-//! is dropped) forms. The `using` directive inside a namespace block
+//! `extract_imports` produces [`EdgeKind::Includes`] edges for plain
+//! (`using System;`), dotted (`using System.Collections.Generic;`),
+//! `using static` (the `static` modifier is dropped from `to`),
+//! `using A = X.Y` (the alias is dropped; the target path is preserved),
+//! and `global using` (the `global` modifier is dropped) forms. The
+//! `using` directive inside a namespace block
 //! (`namespace Foo { using Bar; ... }`) is captured because tree-sitter
 //! queries walk the entire tree by default. Per Decision 7 the path is
 //! recorded verbatim — no resolution against build metadata.
 //!
-//! Phase 2.5 wires `extract_inheritance`, producing
-//! [`EdgeKind::Inherits`] edges for every `base_list` child under
-//! `class_declaration`, `struct_declaration`, `interface_declaration`,
-//! and `record_declaration`. Both class extension and interface
-//! implementation produce the same edge kind per Decision 2 (no
-//! separate `Implements` edge). Generic parameter text is preserved
-//! verbatim per Decision 9: `class Foo<T> : Bar<T>` emits one edge with
-//! `from = "Foo<T>", to = "Bar<T>"`. The `from` field is the bare class
-//! name (including any generic parameter list), NOT a `symbol_id` — the
-//! contract is consumed by `Graph::class_hierarchy` in
+//! `extract_inheritance` produces [`EdgeKind::Inherits`] edges for every
+//! `base_list` child under `class_declaration`, `struct_declaration`,
+//! `interface_declaration`, and `record_declaration`. Both class
+//! extension and interface implementation produce the same edge kind per
+//! Decision 2 (no separate `Implements` edge). Generic parameter text is
+//! preserved verbatim per Decision 9: `class Foo<T> : Bar<T>` emits one
+//! edge with `from = "Foo<T>", to = "Bar<T>"`. The `from` field is the
+//! bare class name (including any generic parameter list), NOT a
+//! `symbol_id` — the contract is consumed by `Graph::class_hierarchy` in
 //! `crates/code-graph-graph/src/algorithms.rs`, which looks up classes
 //! by `Symbol.name`.
-//!
-//! As of Phase 2.5, all four extractors are live; the C# plugin's
-//! per-file parse surface is complete. Phase 2.6 will add the
-//! `testdata/csharp/` corpus and the efcore dogfood baseline; the
-//! plugin is NOT YET registered in the binary — Phase 4 wires
-//! registration.
 //!
 //! # Default trait methods
 //!
@@ -67,7 +59,7 @@
 //!
 //! - `resolve_call`: the default scope-aware heuristic (same file > same
 //!   parent > same namespace > global) is the documented contract,
-//!   mirroring the four shipped plugins. Phase 2.3's `extract_calls`
+//!   mirroring the other shipped plugins. `extract_calls`
 //!   produces purely syntactic edges — the `to` field is the rightmost
 //!   identifier on the callee chain (`Foo` for `obj.Foo()`, `Foo` for
 //!   `Ns.Type.Foo()`, `Foo` for `obj?.Foo()`, `Foo` for `Foo<int>()`,
@@ -148,7 +140,7 @@ pub const EXTENSIONS: &[&str] = &[".cs"];
 
 /// C# source-file parser. Holds the tree-sitter `Language` and the four
 /// pre-compiled queries used to drive symbol/edge extraction. All four
-/// extractors are live as of Phase 2.5.
+/// extractors are live.
 ///
 /// Construct with [`CSharpParser::new`]; share across threads (queries
 /// are `Send + Sync`).
@@ -173,9 +165,8 @@ impl CSharpParser {
     /// (wrapping the query compiler's message) if any query fails to
     /// compile against the pinned grammar version.
     ///
-    /// Successful return is the Phase 2.1 acceptance gate that proves
-    /// every query string in [`queries`] parses against tree-sitter-c-
-    /// sharp 0.23.5. As of Phase 2.5 all four query constants
+    /// Successful return proves every query string in [`queries`] parses
+    /// against tree-sitter-c-sharp 0.23.5. All four query constants
     /// ([`DEFINITION_QUERIES`], [`CALL_QUERIES`], [`IMPORT_QUERIES`],
     /// [`INHERITANCE_QUERIES`]) are live and drive their corresponding
     /// extractors.
@@ -703,7 +694,7 @@ impl CSharpParser {
     /// Run the inheritance query and produce [`EdgeKind::Inherits`]
     /// edges, one per base in each `base_list`. Mirrors the C++/Rust
     /// plugins' `extract_inheritance` for the bare-name `from`-field
-    /// contract (see Phase 1 / Phase 5 of RustRewrite).
+    /// contract.
     ///
     /// **Per-match shape.** The query returns one match *per base* — a
     /// declaration with three bases (`class Foo : Bar, IBaz, IQux`)
@@ -816,7 +807,7 @@ impl LanguagePlugin for CSharpParser {
 
     /// Parse `content` (UTF-8 bytes) as C# and produce a [`FileGraph`].
     /// All four extractors (definitions, calls, imports, inheritance)
-    /// are live as of Phase 2.5.
+    /// are live.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
@@ -892,7 +883,7 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// return the empty string defensively.
 ///
 /// Decision 9 (generic parameter text preserved verbatim) — and the
-/// Phase 1 / Phase 5 bare-name `from`-field rule — are both enforced
+/// bare-name `from`-field rule — are both enforced
 /// here. The result is the bare type name, EXCEPT for generic types
 /// where the `type_parameter_list` text is appended verbatim.
 ///
@@ -908,8 +899,8 @@ fn enclosing_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// Generic-class hierarchy walks are effectively unsupported by the
 /// graph layer in its current form. Same limitation exists in the Rust
 /// plugin and is the trade-off Decision 9 inherits from the Rust
-/// precedent. Phase 4.4's CLAUDE.md "C# Parser Limitations" section
-/// documents this for agent-facing visibility.
+/// precedent. CLAUDE.md's C# parser limitations document this for
+/// agent-facing visibility.
 ///
 /// `type_parameter_list` is an unnamed-field child on
 /// `class_declaration` / `struct_declaration` / `record_declaration`,
@@ -996,7 +987,7 @@ fn enclosing_namespace(def_node: Node<'_>, content: &[u8]) -> String {
 /// node, or `None` if the directive has no recoverable path (defensive
 /// — well-formed C# always has one named path child).
 ///
-/// Rules (per the tree-sitter-c-sharp 0.23.5 probe at Phase 2.4):
+/// Rules (per the tree-sitter-c-sharp 0.23.5 grammar):
 /// - **Plain / static / global / static+global** (no `name:` field):
 ///   the path is the single named child whose kind is either
 ///   `identifier` (single-segment path) or `qualified_name` (dotted).
@@ -1075,16 +1066,15 @@ fn make_symbol(
 
 #[cfg(test)]
 mod tests {
-    //! Phase 2.1 structural smoke tests + Phase 2.2 definition-extraction
-    //! coverage + Phase 2.3 call-extraction coverage + Phase 2.4
-    //! import-extraction coverage + Phase 2.5 inheritance-extraction
-    //! coverage. All four extractors are exercised here.
+    //! Structural smoke tests plus definition-, call-, import-, and
+    //! inheritance-extraction coverage. All four extractors are exercised
+    //! here.
     use super::*;
     use code_graph_core::symbol_id;
     use code_graph_lang::LanguagePlugin;
 
     // ----------------------------------------------------------------
-    // Phase 2.1 — structural smoke tests
+    // Structural smoke tests
     // ----------------------------------------------------------------
 
     #[test]
@@ -1094,11 +1084,11 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 2.2 — definition extraction
+    // Definition extraction
     // ----------------------------------------------------------------
 
     /// Parse `src` against `CSharpParser` at a synthetic absolute path.
-    /// Used by every Phase 2.2 behavioral test below.
+    /// Used by every definition-extraction behavioral test below.
     fn parse(src: &str) -> FileGraph {
         parse_at(src, "/tmp/test.cs")
     }
@@ -1692,7 +1682,7 @@ class Foo {
     }
 
     // ----------------------------------------------------------------
-    // Phase 2.3 — call extraction
+    // Call extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Calls` edges of `fg` (drops Inherits and
@@ -2016,8 +2006,8 @@ class C {
     fn call_inside_constructor_records_enclosing_class_as_parent() {
         // The from-field for a call inside a constructor is
         // `<path>:Class::Class` (the constructor's name matches its
-        // class). This pins that constructor calls (Phase 2.2's `ctor`
-        // capture) and method calls (Phase 2.2's `method` capture)
+        // class). This pins that constructor calls (the `ctor`
+        // capture) and method calls (the `method` capture)
         // route through the same enclosing-function rule.
         let fg = parse_at(
             r#"
@@ -2148,7 +2138,7 @@ class C {
     }
 
     // ----------------------------------------------------------------
-    // Phase 2.4 — import extraction
+    // Import extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Includes` edges of `fg`.
@@ -2396,7 +2386,7 @@ namespace Foo {
     }
 
     // ----------------------------------------------------------------
-    // Phase 2.5 — inheritance extraction
+    // Inheritance extraction
     // ----------------------------------------------------------------
 
     /// Filter to just the `Inherits` edges of `fg`. Mirrors the `calls`
@@ -2412,10 +2402,10 @@ namespace Foo {
     #[test]
     fn single_base_class_produces_one_inherits_edge() {
         // `class Foo : Bar { }` → 1 Inherits edge with from="Foo",
-        // to="Bar". The bare-name `from`-field rule (Phase 1 / Phase 5
-        // of RustRewrite, reaffirmed by Decision 9 in this design) is
-        // load-bearing — see `crates/code-graph-graph/src/algorithms.rs`,
-        // which looks up classes by `Symbol.name`.
+        // to="Bar". The bare-name `from`-field rule (reaffirmed by
+        // Decision 9 in this design) is load-bearing — see
+        // `crates/code-graph-graph/src/algorithms.rs`, which looks up
+        // classes by `Symbol.name`.
         let fg = parse_at("class Foo : Bar { }\n", "/p/x.cs");
         let edges = inherits(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);
@@ -2469,8 +2459,8 @@ namespace Foo {
         // inheritance for generic classes — it looks up symbols by
         // Symbol.name then walks adj.get(name), but the adjacency map
         // is keyed under "Foo<T>". Same limitation exists in the Rust
-        // plugin and is the accepted Decision 9 trade-off. Phase 4.4's
-        // CLAUDE.md documents this for agent-facing visibility.
+        // plugin and is the accepted Decision 9 trade-off. CLAUDE.md
+        // documents this for agent-facing visibility.
         let fg = parse_at("class Foo<T> : Bar<T> { }\n", "/p/x.cs");
         let edges = inherits(&fg);
         assert_eq!(edges.len(), 1, "got: {:?}", edges);

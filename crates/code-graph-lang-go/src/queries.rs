@@ -3,8 +3,7 @@
 //! Validated against tree-sitter-go v0.25.0 — `GoParser::new()` returning
 //! `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 6.1 ships these query strings. Phase 6.2/6.3/6.4 wire
-//! them into `extract_*` loops on `GoParser`.
+//! These query strings are wired into the `extract_*` loops on `GoParser`.
 
 /// Definition queries: free functions (`function_declaration`), methods on
 /// receivers (`method_declaration`), and named type declarations
@@ -24,22 +23,24 @@
 /// - `type_alias` → `name: type_identifier`, `type: _type`. This is the Go 1.9+
 ///   alias form `type ID = string`. (Distinct AST node from `type_spec`.)
 /// - `package_clause` → has a single named child of kind `package_identifier`
-///   (no fields). Phase 6.2 walks this to populate `Symbol.namespace`.
+///   (no fields). The definition extractor walks this to populate
+///   `Symbol.namespace`.
 pub(crate) const DEFINITION_QUERIES: &str = r#"
 ; Free function: func foo() { ... }
 (function_declaration
   name: (identifier) @func.name) @func.def
 
 ; Method with receiver: func (s *Server) M() { ... } or func (s Server) M() { ... }
-; The receiver type is extracted from the receiver field by helpers::extract_receiver_type
-; in Phase 6.2 (handles both pointer_type and value type_identifier forms).
+; The receiver type is extracted from the receiver field by
+; helpers::extract_receiver_type at extraction time (handles both
+; pointer_type and value type_identifier forms).
 (method_declaration
   receiver: (parameter_list) @method.receiver
   name: (field_identifier) @method.name) @method.def
 
 ; Named type declarations (struct, interface, or other named type bodies).
 ; The body kind (struct_type, interface_type, or anything else) is dispatched
-; on at extraction time in Phase 6.2 to produce Struct / Interface / Typedef
+; on at extraction time to produce Struct / Interface / Typedef
 ; symbol kinds respectively.
 (type_spec
   name: (type_identifier) @type.name
@@ -50,8 +51,9 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
   name: (type_identifier) @alias.name
   type: (_) @alias.body) @alias.def
 
-; Package clause: `package foo` — captured so Phase 6.2 can populate
-; Symbol.namespace from it. Note: package_clause has no named fields; the
+; Package clause: `package foo` — captured so the definition extractor
+; can populate Symbol.namespace from it. Note: package_clause has no
+; named fields; the
 ; package_identifier is a direct named child.
 (package_clause
   (package_identifier) @package.name) @package.def
@@ -96,14 +98,14 @@ pub(crate) const CALL_QUERIES: &str = r#"
 /// `import _ "image/png"` forms — they all parse as `import_spec` with the
 /// same `path` field.
 ///
-/// Quote stripping happens at extraction time in Phase 6.4
+/// Quote stripping happens at extraction time
 /// (`interpreted_string_literal` text includes the surrounding `"`s).
 ///
 /// `raw_string_literal` (backtick-quoted import paths) is a valid grammar
 /// alternative for the `path` field but is not idiomatic Go and is not
 /// produced by `gofmt`; capturing only `interpreted_string_literal` matches
-/// the documented brief. The Phase 6.5 anti-regression test
-/// `backtick_import_produces_no_includes_edge` pins this behavior.
+/// the documented brief. The `backtick_import_produces_no_includes_edge`
+/// anti-regression test pins this behavior.
 ///
 /// Only `@import.path` is captured. `extract_imports` consumes the path
 /// capture and re-anchors the line by walking up to the enclosing

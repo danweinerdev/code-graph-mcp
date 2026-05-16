@@ -6,10 +6,9 @@
 //! cleaned bytes; line/column offsets are preserved exactly because spaces
 //! have the same byte count as the original macro identifier.
 //!
-//! This module is the algorithm-only deliverable for Phase 1.2 of the
-//! `CppMacroStrip` plan. Phase 2 wires it into `CppParser::preprocess` (a
-//! `LanguagePlugin` trait method that does not yet exist); for now the
-//! function is callable but uncalled in production code paths.
+//! This module holds the substitution algorithm; it is wired into
+//! production through `CppParser::preprocess` (the `LanguagePlugin` trait
+//! method that runs the byte-level rewrite before parsing).
 //!
 //! # Whole-word matching
 //!
@@ -519,7 +518,7 @@ mod tests {
     }
 
     /// Run the C++ parser against bytes that have already been preprocessed
-    /// by `strip_macros`. Mirrors how Phase 2 will wire the call.
+    /// by `strip_macros`. Mirrors how `CppParser::preprocess` wires the call.
     fn parse_cleaned(src: &str, macros: &[String]) -> FileGraph {
         let cleaned = strip_macros(src.as_bytes(), macros);
         let p = CppParser::new().expect("CppParser::new must succeed");

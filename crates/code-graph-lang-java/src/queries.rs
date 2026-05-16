@@ -3,10 +3,9 @@
 //! Validated against tree-sitter-java v0.23.5 — `JavaParser::new()`
 //! returning `Ok(_)` is the gate that proves every query string compiles.
 //!
-//! Phase status: Phase 3.2 filled [`DEFINITION_QUERIES`]; Phase 3.3
-//! filled [`CALL_QUERIES`]; Phase 3.4 filled [`IMPORT_QUERIES`]; Phase
-//! 3.5 filled [`INHERITANCE_QUERIES`]. All four query constants are
-//! live — the Java plugin's query surface is complete.
+//! [`DEFINITION_QUERIES`], [`CALL_QUERIES`], [`IMPORT_QUERIES`], and
+//! [`INHERITANCE_QUERIES`] are all populated and live — the Java plugin's
+//! query surface is complete.
 //!
 //! Naming follows the established `*_QUERIES` convention shared with
 //! the C++/Rust/Go/Python/C# plugins (plural form, `pub(crate)`).

@@ -3,28 +3,28 @@
 //! Uses tree-sitter (via the `tree-sitter` and `tree-sitter-go` crates) to
 //! extract symbols, calls, and import edges from Go source files.
 //!
-//! # Phase status
+//! # Extraction surface
 //!
-//! Phase 6.1 shipped the crate scaffold: dependency wiring, query strings
-//! that compile against tree-sitter-go 0.25, the `GoParser` struct with
-//! cached `Query` objects, and the `LanguagePlugin` impl.
+//! The crate compiles query strings against tree-sitter-go 0.25, exposes
+//! the `GoParser` struct with cached `Query` objects, and implements
+//! `LanguagePlugin`. Every extractor below is live and `parse_file` is
+//! fully populated.
 //!
-//! Phase 6.2 wires `extract_definitions` — function/method/type-spec/
-//! type_alias extraction with method-receiver-as-parent (including pointer,
-//! value, generic, and anonymous receiver forms) and
-//! package-clause-as-namespace. Embedded struct fields produce no
-//! `Inherits` edge (anti-regression test in `tests` module).
+//! `extract_definitions` covers function/method/type-spec/type_alias
+//! extraction with method-receiver-as-parent (including pointer, value,
+//! generic, and anonymous receiver forms) and package-clause-as-namespace.
+//! Embedded struct fields produce no `Inherits` edge (anti-regression test
+//! in `tests` module).
 //!
-//! Phase 6.3 wires `extract_calls` — direct calls, selector-expression
-//! calls (method / package-qualified / chained), `go` and `defer` statements
+//! `extract_calls` covers direct calls, selector-expression calls
+//! (method / package-qualified / chained), `go` and `defer` statements
 //! (naturally captured because they wrap a `call_expression`), and calls
 //! inside closure literals (the enclosing function/method's symbol ID is
 //! recorded as the edge's `from`; package-level closures fall back to the
 //! file path).
 //!
-//! Phase 6.4 wires `extract_imports` (single, grouped, aliased, dot, blank
-//! — quotes stripped, alias names dropped). With 6.4 wired, `parse_file`
-//! is fully populated and every extractor is live.
+//! `extract_imports` covers single, grouped, aliased, dot, and blank
+//! forms (quotes stripped, alias names dropped).
 //!
 //! # Default trait methods
 //!
@@ -40,7 +40,7 @@
 //!   filesystem paths. The wire format records the full import path
 //!   verbatim as the `to` field; leaving it unresolved is the intended
 //!   behavior. Module-path resolution (go.mod / vendor) is explicitly out
-//!   of scope (see Phase 6.6 limitations).
+//!   of scope (see the Go parser limitations below).
 //!
 //! # Known Go parser limitations
 //!
@@ -50,10 +50,10 @@
 //! 1. **Structural interface implementation produces no edges.** Go's
 //!    interfaces are satisfied structurally — a concrete type implements an
 //!    interface by having the right method set, with no syntactic
-//!    declaration. There is no `Inherits` edge for Go (Phase 6.2/6.6).
+//!    declaration. There is no `Inherits` edge for Go.
 //! 2. **Embedded struct fields produce no `Inherits` edge.** `type T struct
 //!    { Bar }` is structural composition (method-set promotion), not
-//!    inheritance — no edge is emitted (Phase 6.2 anti-regression test).
+//!    inheritance — no edge is emitted (pinned by an anti-regression test).
 //! 3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins —
 //!    call edges resolve via scope-aware heuristic matching, which is
 //!    syntactic, not semantic. Methods on different receiver types that
@@ -94,11 +94,11 @@ pub struct GoParser {
     /// instances built inside `parse_file` can attach to it without
     /// rebuilding the `LanguageFn`.
     language: TsLanguage,
-    /// Compiled definition query (wired in Phase 6.2).
+    /// Compiled definition query (drives `extract_definitions`).
     def_query: Query,
-    /// Compiled call query (wired in Phase 6.3).
+    /// Compiled call query (drives `extract_calls`).
     call_query: Query,
-    /// Compiled import query (wired in Phase 6.4).
+    /// Compiled import query (drives `extract_imports`).
     import_query: Query,
 }
 
@@ -108,8 +108,8 @@ impl GoParser {
     /// (wrapping the query compiler's message) if any query fails to compile
     /// against the pinned grammar version.
     ///
-    /// Successful return is the Phase 6.1 acceptance gate that proves every
-    /// query string in `queries.rs` parses against tree-sitter-go 0.25.x.
+    /// Successful return proves every query string in `queries.rs` parses
+    /// against tree-sitter-go 0.25.x.
     pub fn new() -> anyhow::Result<Self> {
         let language: TsLanguage = tree_sitter_go::LANGUAGE.into();
 
@@ -197,8 +197,8 @@ impl GoParser {
     /// Embedded struct fields (`type Foo struct { Bar }`) parse as
     /// `field_declaration` nodes with no name field and are not matched
     /// by any branch above — no symbol and no `Inherits` edge is emitted,
-    /// matching the Phase 6.2 design intent (Go's structural composition
-    /// is not a syntactic inheritance relationship).
+    /// because Go's structural composition is not a syntactic inheritance
+    /// relationship.
     fn extract_definitions(
         &self,
         root: Node<'_>,
@@ -567,20 +567,19 @@ fn make_symbol(
 
 #[cfg(test)]
 mod tests {
-    //! Phase 6.1 structural smoke tests + Phase 6.2 definition extraction
-    //! + Phase 6.3 call extraction + Phase 6.4 import extraction coverage.
+    //! Structural smoke tests plus definition-, call-, and
+    //! import-extraction coverage.
     use super::*;
     use code_graph_core::{symbol_id, Edge, EdgeKind};
 
     // ----------------------------------------------------------------
-    // Phase 6.1 — structural smoke tests
+    // Structural smoke tests
     // ----------------------------------------------------------------
 
     #[test]
     fn new_compiles_all_three_queries() {
-        // The whole point of Phase 6.1: every query string parses against
-        // the pinned tree-sitter-go. Failure here means a query needs
-        // updating.
+        // Every query string must parse against the pinned tree-sitter-go.
+        // Failure here means a query needs updating.
         let p = GoParser::new().expect("GoParser::new must succeed");
         let _ = (&p.language, &p.def_query, &p.call_query, &p.import_query);
     }
@@ -608,12 +607,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 6.2 — definition extraction
+    // Definition extraction
     // ----------------------------------------------------------------
 
     /// Parse `src` against `GoParser` and return the resulting FileGraph
-    /// at a synthetic absolute path. Used by every Phase 6.2 behavioral
-    /// test below.
+    /// at a synthetic absolute path. Used by every definition-extraction
+    /// behavioral test below.
     fn parse(src: &str) -> FileGraph {
         let p = GoParser::new().unwrap();
         p.parse_file(Path::new("/tmp/test.go"), src.as_bytes())
@@ -639,9 +638,8 @@ mod tests {
 
     #[test]
     fn parse_file_returns_correct_path_and_language() {
-        // Phase 6.1's empty-graph stub assertion is now obsolete — 6.2
-        // populates symbols. Keep the path/language assertion which still
-        // belongs at this layer.
+        // `parse_file` populates symbols; this test pins the
+        // path/language assertion that belongs at this layer.
         let fg = parse("package main\n");
         assert_eq!(fg.path, "/tmp/test.go");
         assert_eq!(fg.language, Language::Go);
@@ -836,10 +834,8 @@ func Helper() {}
 
     /// CRITICAL anti-regression: `type Foo struct { Bar }` is structural
     /// composition (method-set promotion at runtime), NOT inheritance —
-    /// no `Inherits` edge is emitted. Phase 6.2 establishes this design
-    /// intent before call/import extraction wires up edges in 6.3/6.4.
-    /// (At Phase 6.2 the edges list is unconditionally empty, but the
-    /// assertion still pins the rule against a future regression.)
+    /// no `Inherits` edge is emitted. This pins the rule against a future
+    /// regression even once call/import extraction begins emitting edges.
     #[test]
     fn embedded_struct_field_produces_no_inherits_edge() {
         let fg = parse("package main\ntype Foo struct { Bar }\n");
@@ -887,7 +883,7 @@ func Helper() {}
     }
 
     // ----------------------------------------------------------------
-    // Phase 6.3 — call extraction
+    // Call extraction
     // ----------------------------------------------------------------
 
     /// Filter `Calls` edges from a FileGraph for assertion convenience.
@@ -1049,7 +1045,7 @@ func Helper() {}
     }
 
     // ----------------------------------------------------------------
-    // Phase 6.4 — import extraction
+    // Import extraction
     // ----------------------------------------------------------------
 
     /// Filter `Includes` edges from a FileGraph for assertion convenience.

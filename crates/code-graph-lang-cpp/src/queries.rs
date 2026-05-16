@@ -1,8 +1,7 @@
 //! Tree-sitter query patterns for C++ symbol extraction.
 //!
-//! These are ported verbatim from `internal/lang/cpp/queries.go`. They are
-//! validated against tree-sitter-cpp v0.23.4. Any change here must be matched
-//! by a corresponding change in the Go side until Phase 4 retires Go.
+//! These were ported verbatim from the original `internal/lang/cpp/queries.go`
+//! and are validated against tree-sitter-cpp v0.23.4.
 
 /// Definition queries: functions, methods, classes, structs, enums, typedefs,
 /// operator overloads, and inline methods.

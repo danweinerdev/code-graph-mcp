@@ -12,7 +12,7 @@ use tree_sitter::Node;
 /// `path:Parent::fn_name` (method/constructor) symbol-ID anchor for the
 /// function enclosing `node`. Mirrors the C++/Rust/Go/Python plugins'
 /// `enclosing_function_id` and matches the [`code_graph_core::symbol_id`]
-/// shape produced by Phase 2.2's definition extractor so call edges'
+/// shape produced by the definition extractor so call edges'
 /// `from` fields line up exactly with definition IDs.
 ///
 /// Behavior:

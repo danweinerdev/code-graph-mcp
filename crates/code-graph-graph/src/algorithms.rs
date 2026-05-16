@@ -130,8 +130,8 @@ impl Graph {
     /// the graph with a class-like kind (`Class`, `Struct`, `Interface`,
     /// or `Trait`). The Go reference checks only `Class`/`Struct`; this
     /// Rust port widens the filter to include `Interface` and `Trait` so
-    /// Rust traits and Go interfaces (Phase 1's added kinds) resolve as
-    /// hierarchy roots without a separate API.
+    /// Rust traits and Go interfaces resolve as hierarchy roots without a
+    /// separate API.
     ///
     /// `depth = 0` is normalized to `1` to match the Go behavior — the
     /// Go binary uses `if depth <= 0 { depth = 1 }` so an agent passing
@@ -746,8 +746,8 @@ mod tests {
 
     /// Byte-identical-JSON regression: a leaf `HierarchyNode` with
     /// `r#ref: None` and empty `bases`/`derived` must serialize to
-    /// EXACTLY `{"name":"X"}` — the same wire shape it had before the
-    /// `ref` field was added in Task 2.1. This pins down two contracts
+    /// EXACTLY `{"name":"X"}` — the same wire shape it has when the
+    /// optional `ref` field is absent. This pins down two contracts
     /// simultaneously:
     /// 1. `#[serde(default, skip_serializing_if = "Option::is_none")]`
     ///    drops the field from the JSON output when `ref` is `None`, so

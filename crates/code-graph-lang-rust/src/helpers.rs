@@ -1,8 +1,7 @@
 //! Helper routines for the Rust parser.
 //!
-//! Phase status: Phase 5.1 ships the small ancestor-walk helpers
-//! ([`find_enclosing_impl`], [`resolve_mod_namespace`]) in working form;
-//! Phase 5.3 promotes [`split_use_path`] from a stub to a full recursive
+//! The small ancestor-walk helpers ([`find_enclosing_impl`],
+//! [`resolve_mod_namespace`]) plus [`split_use_path`], a full recursive
 //! walker over `use_tree` variants.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub` as
@@ -10,9 +9,9 @@
 //! freely. The effective visibility cap remains crate-internal.
 //!
 //! `truncate_signature` and `find_enclosing_kind` are re-exported from
-//! `code_graph_lang::helpers` (the shared cross-language module). Phase 7.1
-//! consolidated `truncate_signature`; Phase 7.7 consolidated
-//! `find_enclosing_kind` (previously five byte-identical copies — including
+//! `code_graph_lang::helpers` (the shared cross-language module). Both
+//! were consolidated there from previously per-crate copies (five
+//! byte-identical copies in the case of `find_enclosing_kind` — including
 //! one in this crate's `lib.rs` and one in this very file). The `pub use`
 //! re-export keeps `crate::helpers::find_enclosing_kind` working unchanged
 //! and `lib.rs` calls into it from one canonical place.
@@ -25,7 +24,7 @@ use tree_sitter::Node;
 /// node nested inside a `scoped_use_list`/`use_list`) and produce one
 /// fully-qualified path string per terminal leaf.
 ///
-/// Behavior (from Phase 5.3's verification):
+/// Behavior:
 /// - `use foo;` → `["foo"]`
 /// - `use foo::bar;` → `["foo::bar"]`
 /// - `use foo::{a, b};` → `["foo::a", "foo::b"]`
@@ -133,7 +132,7 @@ fn join_scope(scope: &str, leaf: &str) -> String {
 /// Walk `node`'s parent chain and return the first ancestor that is an
 /// `impl_item`, or `None` if `node` is not inside an impl block.
 ///
-/// Used by Phase 5.2's definition extractor to decide whether a
+/// Used by the definition extractor to decide whether a
 /// `function_item` is a free function or a method, and to look up the
 /// impl block's `type` field for the parent.
 pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
@@ -171,7 +170,7 @@ pub fn resolve_mod_namespace(node: Node<'_>, content: &str) -> String {
 /// Build a `path:fn_name` (free fn) or `path:Type::fn_name` (impl method)
 /// symbol-ID anchor for the function enclosing `node`. Mirrors the C++
 /// plugin's `enclosing_function_id` and matches the `symbol_id()` shape
-/// produced by Phase 5.2's definition extractor so call edges' `from`
+/// produced by the definition extractor so call edges' `from`
 /// fields line up exactly with definition IDs.
 ///
 /// Behavior:
@@ -183,7 +182,8 @@ pub fn resolve_mod_namespace(node: Node<'_>, content: &str) -> String {
 /// - `function_item` inside an `impl_item` → returns
 ///   `<path>:<Type>::<fn_name>` where `Type` is the impl's `type` field
 ///   text. For `impl Trait for Type { fn m() }` the prefix is `Type`,
-///   never `Trait` — matches Phase 5.2's trait-impl disambiguation.
+///   never `Trait` — matches the definition extractor's trait-impl
+///   disambiguation.
 /// - Closures (`closure_expression`) are transparent: a call inside a
 ///   closure walks past the closure and reports the closure's enclosing
 ///   `function_item` as the `from`.
@@ -241,7 +241,7 @@ mod tests {
     }
 
     /// Locate the `argument` node of the (first) `use_declaration` in
-    /// `tree`. Phase 5.3 helper tests drive `split_use_path` against this
+    /// `tree`. The `split_use_path` helper tests drive it against this
     /// node directly to verify per-form behavior in isolation from
     /// `extract_uses`.
     fn use_argument<'a>(tree: &'a tree_sitter::Tree) -> tree_sitter::Node<'a> {

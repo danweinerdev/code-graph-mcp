@@ -1,12 +1,11 @@
 //! Versioned cache persistence for the in-memory [`Graph`] (current
 //! schema: `CACHE_VERSION`).
 //!
-//! Phase 3.6 of the Rust rewrite. The on-disk cache lives at
-//! `<dir>/.code-graph-cache.json`. Two changes versus the Go binary's v1
-//! format (`internal/graph/persist.go`):
+//! The on-disk cache lives at `<dir>/.code-graph-cache.json`. Two changes
+//! versus the Go binary's v1 format (`internal/graph/persist.go`):
 //!
-//! 1. **`FileEntry { language, symbol_ids }`** instead of `[]string`. Phase
-//!    2.1 added `Language` to `FileEntry`; v2 records it on disk so [`load`]
+//! 1. **`FileEntry { language, symbol_ids }`** instead of `[]string`. The
+//!    `Language` recorded on `FileEntry` is persisted on disk so [`load`]
 //!    does not have to re-derive it from the file extension.
 //! 2. **Atomic save**. v1 wrote directly to the final path with
 //!    `os.WriteFile`, leaving a partial-write window if the process died
@@ -720,7 +719,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 2.1: simplify_cache / simplify_symbol_id unit tests.
+    // simplify_cache / simplify_symbol_id unit tests.
     //
     // Platform note: `paths::simplify` is identity on non-Windows targets
     // (per `dunce::simplified`'s documented behavior). The "strips the
@@ -1147,9 +1146,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 2.3: end-to-end anti-regression test for `Graph::load` wiring.
+    // End-to-end anti-regression test for `Graph::load` wiring.
     //
-    // The 2.1 unit test `simplify_cache_strips_all_fields` exercises
+    // The `simplify_cache_strips_all_fields` unit test exercises
     // `simplify_cache` DIRECTLY — i.e., without the disk write or the
     // `Graph::load` plumbing. This test covers the END-TO-END path:
     //   (1) build a `GraphCache` with `\\?\D:\proj\…` in every path-bearing
@@ -1281,8 +1280,8 @@ mod tests {
 
         // ---------- Per-location assertions ----------
         //
-        // Each of the 12 granular path-bearing locations from Task 2.1 is
-        // asserted independently. On Linux these confirm the planted
+        // Each of the 12 granular path-bearing locations is asserted
+        // independently. On Linux these confirm the planted
         // strings survived `simplify_cache` unchanged; on Windows they
         // confirm each `\\?\` prefix was stripped. The expected strings
         // are computed via `paths::simplify` so the same assertion holds
@@ -1534,9 +1533,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 2.4: end-to-end cross-field consistency test for `Graph::load`.
+    // End-to-end cross-field consistency test for `Graph::load`.
     //
-    // The 2.3 test (`cache_migration_strips_all_path_locations_end_to_end`)
+    // The `cache_migration_strips_all_path_locations_end_to_end` test
     // verifies each path-bearing field is migrated in isolation. This test
     // is the **user-experience** check: does a real lookup against a
     // migrated cache return the expected symbols?
