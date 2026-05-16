@@ -235,14 +235,6 @@ pub struct Page<T: Serialize> {
 /// JSON via `CallToolResult`, never as a Rust type. Derive set matches the
 /// sibling response types (`Debug`, `Serialize` only — no `Deserialize`;
 /// the response is serialize-only).
-// Suppressed only in NON-test builds: the type is currently constructed
-// solely by serialization tests, so a non-test build sees it as dead code.
-// Test builds DO construct it, so the suppression is gated off there —
-// keeping the dead-code check live in the profile `cargo clippy
-// --all-targets` actually compiles, which would catch a genuinely-orphaned
-// type. Once the `search_symbols` handler emits this response, the type is
-// constructed in non-test builds too and this attribute should be removed.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Serialize)]
 pub(super) struct SearchSymbolsResponse {
     #[serde(flatten)]

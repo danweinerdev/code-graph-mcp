@@ -7,14 +7,15 @@
 
 use std::path::Path;
 
-use code_graph_core::paths;
+use code_graph_core::{paths, symbol_id};
 use code_graph_graph::{Graph, SearchParams};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 
 use super::{
     byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    tool_error, tool_success_json, Page, SummaryRow, SymbolResult, ENVELOPE_OVERHEAD_BYTES,
+    tool_error, tool_success_json, Page, SearchSymbolsResponse, SummaryRow, SymbolResult,
+    ENVELOPE_OVERHEAD_BYTES,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
@@ -345,7 +346,7 @@ pub fn search_symbols(
         results.push(record);
     }
 
-    let response = Page::<SymbolResult> {
+    let page = Page::<SymbolResult> {
         results,
         total: sr.total,
         offset: resolved_offset,
@@ -353,6 +354,53 @@ pub fn search_symbols(
         truncated,
         next_offset,
     };
+
+    // Anchored-zero suggestion trigger. Only an *exact-match* query
+    // (`^…$`) that found zero results earns did-you-mean candidates: an
+    // anchored query expresses "I expect this precise symbol to exist", so
+    // a zero-result anchored query is most likely a typo of a real symbol.
+    // A non-anchored zero-result query is treated as "this concept is not
+    // in the codebase" and gets NO suggestions — the absence is the
+    // answer, not an error to recover from. `query_str` is the raw,
+    // untransformed user input the tool received, so the `^`/`$` test
+    // keys off exactly what the caller typed.
+    //
+    // The candidate pool comes from a broad substring match on the
+    // anchors-stripped inner pattern via `Graph::search_symbols(inner,
+    // None)` (no kind filter), taking the first five matches' symbol-id
+    // strings. `Graph::search_symbols` returns `Vec<Symbol>`, so the id
+    // string is constructed with `symbol_id` (the same idiom
+    // `suggest_symbols` uses); it is intentionally NOT reused here because
+    // it returns a comma-joined `String` shaped for error messages, and
+    // its other callers depend on that form.
+    //
+    // A degenerate `"^$"` query strips to an empty inner pattern. Calling
+    // the broad matcher with `""` would match every symbol in the graph
+    // and surface noise, so the empty-inner case is short-circuited to no
+    // suggestions — an exact-match request for the empty string has no
+    // meaningful "did you mean".
+    let suggestions: Vec<String> = if page.total == 0
+        && query_str.starts_with('^')
+        && query_str.ends_with('$')
+        && query_str.len() >= 2
+    {
+        let inner = &query_str[1..query_str.len() - 1];
+        if inner.is_empty() {
+            Vec::new()
+        } else {
+            graph
+                .read()
+                .search_symbols(inner, None)
+                .iter()
+                .take(5)
+                .map(symbol_id)
+                .collect()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let response = SearchSymbolsResponse { page, suggestions };
     tool_success_json(&response)
 }
 
@@ -1915,6 +1963,162 @@ mod tests {
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
+    }
+
+    // --- search_symbols anchored-zero suggestion trigger ------------------
+
+    /// Graph for the anchored-zero suggestion tests. Holds a class literally
+    /// named `ExistingClass` (so `^ExistingClass$` matches exactly) and a
+    /// class named `NotFoundClassHelper` whose name *contains*
+    /// `NotFoundClass` as a substring (so the anchors-stripped broad match
+    /// surfaces it as a candidate even though `^NotFoundClass$` matches
+    /// nothing exactly).
+    fn suggestion_graph() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/s.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("ExistingClass", SymbolKind::Class, "/s.cpp", ""),
+                sym("NotFoundClassHelper", SymbolKind::Class, "/s.cpp", ""),
+            ],
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    #[test]
+    fn anchored_exact_zero_result_query_emits_substring_suggestions() {
+        // `^NotFoundClass$` is an exact-match request: the case-insensitive
+        // `(?i)^NotFoundClass$` regex matches no symbol (the only near name
+        // is `NotFoundClassHelper`, which the anchors exclude), so
+        // `total == 0`. The anchors-stripped inner pattern `NotFoundClass`
+        // is then broad-matched, surfacing `NotFoundClassHelper` as a
+        // did-you-mean candidate. `suggestions` must be PRESENT, hold the
+        // symbol-id string, and be capped at five entries.
+        let g = locked(suggestion_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^NotFoundClass$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(
+            parsed["total"],
+            serde_json::json!(0),
+            "anchored exact query must find zero results"
+        );
+        let suggestions = parsed
+            .get("suggestions")
+            .expect("anchored zero-result query must emit a `suggestions` key");
+        let arr = suggestions.as_array().expect("suggestions is an array");
+        assert!(
+            !arr.is_empty() && arr.len() <= 5,
+            "suggestions must hold 1..=5 entries, got {}",
+            arr.len()
+        );
+        assert_eq!(
+            arr[0],
+            serde_json::json!("/s.cpp:NotFoundClassHelper"),
+            "suggestion entries are symbol-id strings"
+        );
+    }
+
+    #[test]
+    fn non_anchored_zero_result_query_omits_suggestions_key() {
+        // A non-anchored zero-result query expresses "this concept is not
+        // in the codebase", not "typo of a real symbol". It earns NO
+        // suggestions: the `suggestions` key must be ABSENT entirely (not
+        // an empty `[]`), keeping the response byte-identical to the legacy
+        // bare envelope. `Zzz_absent_Zzz` matches nothing in the fixture.
+        let g = locked(suggestion_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Zzz_absent_Zzz"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(
+            parsed["total"],
+            serde_json::json!(0),
+            "the query must find zero results"
+        );
+        assert!(
+            parsed.get("suggestions").is_none(),
+            "a non-anchored zero-result query must NOT carry a `suggestions` key: {parsed}"
+        );
+        assert!(
+            !body_text(&r).contains("suggestions"),
+            "the `suggestions` key must be wholly absent from the wire JSON"
+        );
+    }
+
+    #[test]
+    fn anchored_query_with_results_omits_suggestions_key() {
+        // `^ExistingClass$` matches the literally-named `ExistingClass`
+        // symbol exactly, so `total >= 1`. With results present there is
+        // nothing to suggest: the `suggestions` key must be ABSENT.
+        let g = locked(suggestion_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^ExistingClass$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let total = parsed["total"].as_u64().unwrap();
+        assert!(
+            total >= 1,
+            "anchored query for an existing symbol must find >=1 result, got {total}"
+        );
+        assert!(
+            parsed.get("suggestions").is_none(),
+            "a query with results must NOT carry a `suggestions` key: {parsed}"
+        );
+        assert!(
+            !body_text(&r).contains("suggestions"),
+            "the `suggestions` key must be wholly absent from the wire JSON"
+        );
+    }
+
+    #[test]
+    fn degenerate_caret_dollar_query_does_not_panic_and_omits_suggestions() {
+        // Guard pin: `^$` is anchored (`^`-prefixed AND `$`-suffixed) with
+        // `len() == 2`, so the slice `[1..len-1]` is the empty string. An
+        // empty inner pattern would broad-match every symbol in the graph,
+        // so the handler short-circuits the empty-inner case to NO
+        // suggestions rather than dumping the whole index. The regex
+        // `(?i)^$` itself matches no symbol here, so `total == 0` — this
+        // is the anchored-zero path, and the guard (not the trigger) is
+        // what suppresses suggestions. Must not panic on the slice.
+        let g = locked(suggestion_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(
+            parsed["total"],
+            serde_json::json!(0),
+            "`^$` matches no symbol in the fixture"
+        );
+        assert!(
+            parsed.get("suggestions").is_none(),
+            "empty inner pattern must short-circuit to NO suggestions, not match all symbols: {parsed}"
+        );
     }
 
     // --- get_symbol_detail ---
