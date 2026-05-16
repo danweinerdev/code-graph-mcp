@@ -28,7 +28,7 @@ pub mod structure;
 pub mod symbols;
 pub mod watch;
 
-use code_graph_core::{symbol_id, Language, Symbol, SymbolKind};
+use code_graph_core::{symbol_id, EdgeKind, Language, Symbol, SymbolKind};
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
@@ -114,20 +114,15 @@ pub(super) struct CouplingEntry {
 }
 
 /// One dependency row: a file this file depends on, the dependency kind
-/// (`"call"` or `"include"`), and the source line the dependency was
+/// (`"calls"` or `"includes"`), and the source line the dependency was
 /// observed on.
 ///
 /// `kind` reuses the `&'static str` convention from [`SummaryRow`]'s
 /// `kind` so dependency-kind names stay byte-identical across surfaces.
+/// The value is produced by [`edge_kind_str`] so it matches `EdgeKind`'s
+/// serde serialization (`#[serde(rename_all = "lowercase")]`) exactly.
 /// `line` is `u32` for byte-identical JSON across platforms. Visibility
 /// and derive set match [`CouplingEntry`] / [`SummaryRow`].
-///
-/// `#[allow(dead_code)]`: this type is the response row for the
-/// `get_dependencies` handler, which has not yet been reshaped to emit
-/// it. The wire shape is pinned now by a serialization test so the
-/// dependencies handler can adopt it without a follow-on shape debate;
-/// the attribute is removed once that handler constructs the type.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub(super) struct DependencyEntry {
     pub file: String,
@@ -218,6 +213,24 @@ pub fn kind_str(kind: SymbolKind) -> &'static str {
         SymbolKind::Trait => "trait",
         // SymbolKind is `#[non_exhaustive]`. New variants would surface here as
         // a fall-back; tests in code-graph-core lock the existing variants in.
+        _ => "unknown",
+    }
+}
+
+/// Lowercase string for an [`EdgeKind`]. Matches the JSON serialization
+/// of `EdgeKind` (`#[serde(rename_all = "lowercase")]`) so the wire
+/// format is consistent across every surface that emits an edge-kind
+/// name. Returning `&'static str` (rather than `String`) lets dependency
+/// rows store the kind without an allocation and keeps the value
+/// byte-identical to `EdgeKind`'s serde output.
+pub fn edge_kind_str(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Calls => "calls",
+        EdgeKind::Includes => "includes",
+        EdgeKind::Inherits => "inherits",
+        // EdgeKind is `#[non_exhaustive]`. New variants would surface here
+        // as a fall-back; tests in code-graph-core lock the existing
+        // variants in. Mirrors `kind_str`'s handling of `SymbolKind`.
         _ => "unknown",
     }
 }

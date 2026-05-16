@@ -91,10 +91,11 @@ async fn analyze_then_query_pipeline() {
     let results = parsed["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "indexed fixture has at least one row");
 
-    // Dependencies returns engine.h + utils.h for engine.cpp.
-    let deps = get_dependencies(&server.inner.graph, &engine_cpp);
+    // Dependencies returns engine.h + utils.h for engine.cpp, now as a
+    // Page<DependencyEntry> envelope ({file, kind, line} rows).
+    let deps = get_dependencies(&server.inner.graph, &engine_cpp, None, None, NO_BYTE_BUDGET);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&deps)).unwrap();
-    let arr = parsed.as_array().expect("array of paths");
+    let arr = parsed["results"].as_array().expect("results array");
     assert!(
         !arr.is_empty(),
         "engine.cpp has at least one resolved include",

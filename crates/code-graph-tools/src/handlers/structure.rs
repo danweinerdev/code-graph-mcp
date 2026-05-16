@@ -1679,23 +1679,22 @@ mod tests {
         assert_eq!(next, None);
     }
 
-    /// `DependencyEntry` is defined ahead of its consumer (the
-    /// `get_dependencies` handler rewrite). This trivial type-level test
-    /// constructs and serializes one so every field is exercised — keeps
-    /// the wire shape `{file, kind, line}` pinned and avoids a dead-code
-    /// warning on the not-yet-wired type without reaching for an
-    /// `#[allow(dead_code)]` attribute.
+    /// Type-level shape pin for `DependencyEntry`: construct and serialize
+    /// one so every field is exercised, keeping the wire shape
+    /// `{file, kind, line}` frozen. `kind` is `"includes"` — the value
+    /// `edge_kind_str(EdgeKind::Includes)` produces, matching `EdgeKind`'s
+    /// serde serialization across every surface.
     #[test]
     fn dependency_entry_serializes_with_expected_shape() {
         let entry = super::super::DependencyEntry {
             file: "/dep.cpp".to_string(),
-            kind: "include",
+            kind: "includes",
             line: 7,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
         assert_eq!(json["file"], serde_json::json!("/dep.cpp"));
-        assert_eq!(json["kind"], serde_json::json!("include"));
+        assert_eq!(json["kind"], serde_json::json!("includes"));
         assert_eq!(json["line"], serde_json::json!(7));
     }
 

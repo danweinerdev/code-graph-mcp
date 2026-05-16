@@ -1,8 +1,24 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1789
 expression: parsed
 ---
-[
-  "abc",
-  "typing"
-]
+{
+  "limit": 100,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "file": "abc",
+      "kind": "includes",
+      "line": 1
+    },
+    {
+      "file": "typing",
+      "kind": "includes",
+      "line": 2
+    }
+  ],
+  "total": 2,
+  "truncated": false
+}

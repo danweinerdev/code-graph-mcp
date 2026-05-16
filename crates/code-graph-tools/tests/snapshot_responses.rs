@@ -415,7 +415,7 @@ async fn response_get_dependencies_engine_cpp() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_dependencies(&fx.inner.graph, &file);
+    let r = get_dependencies(&fx.inner.graph, &file, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1783,7 +1783,7 @@ async fn response_get_dependencies_python_models() {
     // models.py imports `abc` and `typing` — both record verbatim as the
     // dotted module path (the from-form points at the module, not the
     // imported name). The snapshot pins this contract for Python.
-    let r = get_dependencies(&fx.inner.graph, &file);
+    let r = get_dependencies(&fx.inner.graph, &file, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

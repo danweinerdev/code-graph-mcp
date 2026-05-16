@@ -7,12 +7,15 @@
 //! return `[]` for a known symbol that just has no callers/callees, and
 //! to return a tool error only when the symbol itself isn't in the graph.
 
-use code_graph_core::paths;
+use code_graph_core::{paths, EdgeKind};
 use code_graph_graph::{CallChain, Graph};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 
-use super::{byte_budget_take, suggest_symbols, tool_error, tool_success_json, Page};
+use super::{
+    byte_budget_take, edge_kind_str, suggest_symbols, tool_error, tool_success_json,
+    DependencyEntry, Page,
+};
 
 /// Direction for [`callers_or_callees`]. Reverse → [`Graph::callers`];
 /// Forward → [`Graph::callees`].
@@ -122,33 +125,86 @@ pub fn callers_or_callees(
     tool_success_json(&response)
 }
 
-/// `get_dependencies` body. Returns the dependency list as a JSON array
-/// of strings — never `null`, even for an unknown file.
-pub fn get_dependencies(graph: &RwLock<Graph>, file: &str) -> CallToolResult {
+/// `get_dependencies` body. Returns the shared [`Page`]`<`[`DependencyEntry`]`>`
+/// envelope: one row per included file carrying the included path, the
+/// edge kind (`"includes"`), and the source line of the `#include`
+/// directive. An unknown file is not an error — it yields an empty page
+/// (`results: []`, `total: 0`), preserving the prior "never `null`"
+/// contract in the reshaped envelope form.
+///
+/// Rows are sorted by `(file, line)` ascending so pagination partitions
+/// the result deterministically across calls. `total` is the
+/// pre-pagination match count; the page itself is byte-budgeted via
+/// [`byte_budget_take`] so a file with thousands of includes cannot blow
+/// the response-size cap.
+///
+/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
+/// default" (mirrors the other paginated handlers); `limit` is silently
+/// clamped at 1000.
+pub fn get_dependencies(
+    graph: &RwLock<Graph>,
+    file: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
     if file.is_empty() {
         return tool_error("'file' is required");
     }
 
-    // PathNormalization Phase 3.2: normalize the user-supplied `file` argument
-    // before graph lookup. Mirrors `get_file_symbols` (Phase 3.1): canonical
-    // form when the path exists on disk (resolving `.` / `..` and stripping
-    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
-    // On Linux with an already-canonical path this is effectively identity,
-    // so existing snapshots / tests stay byte-identical.
+    // Normalize the user-supplied `file` argument before graph lookup.
+    // Mirrors `get_file_symbols`: canonical form when the path exists on
+    // disk (resolving `.` / `..` and stripping the Windows `\\?\`
+    // extended-path prefix), lexical fallback otherwise. On Linux with an
+    // already-canonical path this is effectively identity, so existing
+    // tests stay byte-identical.
     let path = paths::normalize_user_path(file);
     let deps = graph.read().file_dependencies(&path);
-    // `file_dependencies` now returns include entries that also carry the
-    // source line of each `#include`. This handler keeps emitting the
-    // legacy flat `Vec<String>` of paths (the `line` is intentionally
-    // discarded here) so the existing wire shape and snapshots stay
-    // byte-identical; a follow-up reshapes this into a paginated
-    // line-bearing response and is the only place that should consume the
-    // line.
-    let strings: Vec<String> = deps
+
+    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
+    // `file_dependencies` returns include entries each carrying the source
+    // line of the `#include`. Map every entry to a `DependencyEntry`; the
+    // kind is always `Includes` here (the include graph holds only
+    // include edges), routed through `edge_kind_str` so the wire string
+    // stays identical to `EdgeKind`'s serde output.
+    let mut rows: Vec<DependencyEntry> = deps
         .into_iter()
-        .map(|inc| inc.path.to_string_lossy().into_owned())
+        .map(|inc| DependencyEntry {
+            file: inc.path.to_string_lossy().into_owned(),
+            kind: edge_kind_str(EdgeKind::Includes),
+            line: inc.line,
+        })
         .collect();
-    tool_success_json(&strings)
+
+    // Sort by (file, line) ascending so offset/limit pagination
+    // partitions deterministically across calls. `file_dependencies`
+    // clones the stored Vec in insertion order, which is not a stable
+    // contract; this canonicalizes the sequence.
+    rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+
+    let total = rows.len() as u32;
+
+    // Route through byte_budget_take: the helper applies offset+limit
+    // skip/take and stops early if the running serialized byte count
+    // would exceed `max_bytes - ENVELOPE_OVERHEAD_BYTES`. It preserves
+    // iteration order, so the (file, line) sort above survives
+    // truncation. `total` (captured above) stays the pre-pagination match
+    // count regardless of truncation.
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
+
+    let response = Page::<DependencyEntry> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
+    tool_success_json(&response)
 }
 
 #[cfg(test)]
@@ -1237,24 +1293,43 @@ mod tests {
 
     // --- get_dependencies ---
 
+    /// Build an include edge carrying an explicit source line so tests can
+    /// pin `DependencyEntry.line`. `include_edge` always uses line 1; this
+    /// helper lets a fixture place each `#include` at a distinct line.
+    fn include_edge_at(from: &str, to: &str, line: u32) -> Edge {
+        Edge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: EdgeKind::Includes,
+            file: from.to_string(),
+            line,
+        }
+    }
+
     #[test]
     fn dependencies_missing_param_errors() {
         let g = locked(Graph::new());
-        let r = get_dependencies(&g, "");
+        let r = get_dependencies(&g, "", None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
 
     #[test]
-    fn dependencies_unknown_file_returns_empty_array() {
+    fn dependencies_unknown_file_returns_empty_page() {
         let g = locked(Graph::new());
-        let r = get_dependencies(&g, "/never-merged.cpp");
+        let r = get_dependencies(&g, "/never-merged.cpp", None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
-        assert_eq!(body_text(&r), "[]");
+        // Unknown file is not an error: it yields an empty Page envelope
+        // (results=[], total=0), not the legacy `[]` bare array.
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 100);
     }
 
     #[test]
-    fn dependencies_returns_string_array() {
+    fn dependencies_returns_dependency_entry_page() {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/a.cpp".to_string(),
@@ -1266,13 +1341,59 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = get_dependencies(&g, "/a.cpp");
-        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let arr = parsed.as_array().unwrap();
+        let r = get_dependencies(&g, "/a.cpp", None, None, NO_BYTE_BUDGET);
+        let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2);
-        let strings: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(strings.contains(&"/utils.h"));
-        assert!(strings.contains(&"/types.h"));
+        assert_eq!(total, 2);
+        // The two dependencies asserted present in the old flat-array test
+        // must still be present, now as DependencyEntry.file values.
+        let files: Vec<&str> = arr.iter().map(|v| v["file"].as_str().unwrap()).collect();
+        assert!(files.contains(&"/utils.h"));
+        assert!(files.contains(&"/types.h"));
+        // Every row's kind is the EdgeKind::Includes serde string.
+        for row in &arr {
+            assert_eq!(row["kind"], serde_json::json!("includes"));
+        }
+    }
+
+    #[test]
+    fn dependencies_rows_carry_include_line_and_sort_by_file_then_line() {
+        // Three #include directives at distinct known lines, each resolving
+        // to a real source-file-style path (no `.ini`-style entries that a
+        // downstream filter would drop). Assert the Page<DependencyEntry>
+        // is sorted (file, line) ascending and that each row carries its
+        // include's source line verbatim.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: vec![
+                // Inserted out of order on purpose so the handler's
+                // (file, line) sort is actually exercised.
+                include_edge_at("/a.cpp", "/zeta.h", 15),
+                include_edge_at("/a.cpp", "/alpha.h", 5),
+                include_edge_at("/a.cpp", "/mid.h", 10),
+            ],
+        });
+        let g = locked(g);
+        let r = get_dependencies(&g, "/a.cpp", None, None, NO_BYTE_BUDGET);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(total, 3);
+
+        // Sorted by (file, line) ascending: alpha.h(5) < mid.h(10) < zeta.h(15).
+        assert_eq!(arr[0]["file"], serde_json::json!("/alpha.h"));
+        assert_eq!(arr[0]["line"], serde_json::json!(5));
+        assert_eq!(arr[1]["file"], serde_json::json!("/mid.h"));
+        assert_eq!(arr[1]["line"], serde_json::json!(10));
+        assert_eq!(arr[2]["file"], serde_json::json!("/zeta.h"));
+        // Pins `line` specifically: the last include's source line is 15.
+        assert_eq!(arr[2]["line"], serde_json::json!(15));
+
+        for row in &arr {
+            assert_eq!(row["kind"], serde_json::json!("includes"));
+        }
     }
 
     // --- PathNormalization Phase 3.2 --------------------------------------
@@ -1319,14 +1440,14 @@ mod tests {
         let g = locked(g);
 
         // (1) Canonical form — baseline.
-        let r_canonical = get_dependencies(&g, canonical_str);
+        let r_canonical = get_dependencies(&g, canonical_str, None, None, NO_BYTE_BUDGET);
         assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
-        let parsed_canonical: serde_json::Value =
-            serde_json::from_str(&body_text(&r_canonical)).unwrap();
-        let arr_canonical = parsed_canonical.as_array().unwrap();
+        let (arr_canonical, _, _, _) = page_parts(&r_canonical);
         assert_eq!(arr_canonical.len(), 2);
-        let strings_canonical: Vec<&str> =
-            arr_canonical.iter().map(|v| v.as_str().unwrap()).collect();
+        let strings_canonical: Vec<&str> = arr_canonical
+            .iter()
+            .map(|v| v["file"].as_str().unwrap())
+            .collect();
         assert!(strings_canonical.contains(&"/utils.h"));
         assert!(strings_canonical.contains(&"/types.h"));
 
@@ -1338,20 +1459,22 @@ mod tests {
             "messy fixture must differ from canonical for the test to be meaningful"
         );
 
-        let r_messy = get_dependencies(&g, messy_str);
+        let r_messy = get_dependencies(&g, messy_str, None, None, NO_BYTE_BUDGET);
         assert!(
             r_messy.is_error.is_none() || r_messy.is_error == Some(false),
             "messy form must succeed after normalize: body={}",
             body_text(&r_messy),
         );
-        let parsed_messy: serde_json::Value = serde_json::from_str(&body_text(&r_messy)).unwrap();
-        let arr_messy = parsed_messy.as_array().unwrap();
+        let (arr_messy, _, _, _) = page_parts(&r_messy);
         assert_eq!(
             arr_messy.len(),
             2,
             "messy form must return the same dep list as canonical",
         );
-        let mut strings_messy: Vec<&str> = arr_messy.iter().map(|v| v.as_str().unwrap()).collect();
+        let mut strings_messy: Vec<&str> = arr_messy
+            .iter()
+            .map(|v| v["file"].as_str().unwrap())
+            .collect();
         let mut strings_canonical_sorted = strings_canonical.clone();
         strings_messy.sort();
         strings_canonical_sorted.sort();

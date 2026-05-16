@@ -288,15 +288,16 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
 
     // ---------- get_dependencies --------------------------------------
     //
-    // `get_dependencies` returns the raw `Graph.includes[main.rs]` list as
-    // strings. For Rust the `use util::helper;` statement produces an
-    // Includes edge with `to="util::helper"` that does NOT basename-
-    // resolve (Rust dotted module paths aren't filesystem paths, per the
-    // RustParser doc), so the entry stays as the literal use-path. The
-    // "expected cross-file edge to the sibling file" assertion is met
-    // structurally: the response carries a non-empty entry that names
-    // `util` (the module name shared with the sibling `util.rs` file).
-    let r = get_dependencies(&fx.inner.graph, &fx.main_rs);
+    // `get_dependencies` returns a Page<DependencyEntry> envelope: one
+    // {file, kind, line} row per `Graph.includes[main.rs]` entry. For Rust
+    // the `use util::helper;` statement produces an Includes edge with
+    // `to="util::helper"` that does NOT basename-resolve (Rust dotted
+    // module paths aren't filesystem paths, per the RustParser doc), so
+    // the `file` stays as the literal use-path. The "expected cross-file
+    // edge to the sibling file" assertion is met structurally: the
+    // response carries a non-empty row whose `file` names `util` (the
+    // module name shared with the sibling `util.rs` file).
+    let r = get_dependencies(&fx.inner.graph, &fx.main_rs, None, None, NO_BYTE_BUDGET);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_dependencies: expected non-error result for short-form path {:?}, got: {:?}",
@@ -304,15 +305,15 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
         r,
     );
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&r))
-        .expect("get_dependencies returns a JSON array of strings");
-    let arr = parsed
+        .expect("get_dependencies returns a Page<DependencyEntry> envelope");
+    let arr = parsed["results"]
         .as_array()
-        .expect("get_dependencies: response is a JSON array");
+        .expect("get_dependencies: response carries a `results` array");
     assert!(
         arr.iter()
-            .filter_map(|v| v.as_str())
+            .filter_map(|v| v["file"].as_str())
             .any(|s| s.contains("util")),
-        "get_dependencies: expected at least one entry naming the `util` sibling (got: {parsed:?})",
+        "get_dependencies: expected at least one row whose `file` names the `util` sibling (got: {parsed:?})",
     );
 
     // ---------- generate_diagram(file=…) ------------------------------
@@ -434,19 +435,17 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     );
 
     // get_dependencies
-    let r = get_dependencies(&fx.inner.graph, &dotty);
+    let r = get_dependencies(&fx.inner.graph, &dotty, None, None, NO_BYTE_BUDGET);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_dependencies: dotty path {dotty:?} must resolve; got: {r:?}",
     );
-    let arr = serde_json::from_str::<serde_json::Value>(&first_text(&r))
-        .expect("get_dependencies returns JSON array")
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(&first_text(&r))
+        .expect("get_dependencies returns a Page<DependencyEntry> envelope");
+    let arr = parsed["results"].as_array().cloned().unwrap_or_default();
     assert!(
         arr.iter()
-            .filter_map(|v| v.as_str())
+            .filter_map(|v| v["file"].as_str())
             .any(|s| s.contains("util")),
         "get_dependencies: dotty path {dotty:?} did not surface `util` dependency — \
          normalize_user_path wrap likely missing in get_dependencies",

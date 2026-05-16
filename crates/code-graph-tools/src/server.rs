@@ -335,6 +335,12 @@ pub struct GetCalleesArgs {
 pub struct GetDependenciesArgs {
     #[schemars(description = "Absolute path to the source file")]
     pub file: String,
+    #[schemars(description = "Max dependency rows to return (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N rows for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -720,7 +726,23 @@ impl CodeGraphServer {
         description = "List files included/imported by the given file. Path is resolved \
                        against the indexed graph; `\\\\?\\` extended-path prefix is handled \
                        automatically, and relative segments (`.` / `..`) resolve against \
-                       the on-disk file when it exists (otherwise lexical-only)."
+                       the on-disk file when it exists (otherwise lexical-only). Returns \
+                       the {results, total, offset, limit, truncated, next_offset} \
+                       envelope; each `results[i]` is {file, kind, line} where `file` is \
+                       the included path, `kind` is \"includes\", and `line` is the source \
+                       line of the include/import directive. Rows are sorted by (file, \
+                       line) ascending so pagination is deterministic. An unknown file is \
+                       not an error — it returns an empty page (results: [], total: 0). \
+                       `limit` defaults to 100 (max 1000, clamped silently — the echoed \
+                       `limit` reflects the resolved value); raise `limit` for files with \
+                       many includes, or use `offset` to page through. Responses are also \
+                       capped by `[response].max_bytes` (default 100KB); when the byte \
+                       budget bites, `truncated` is true and `next_offset` points at the \
+                       first un-emitted record — re-call with `offset = next_offset` to \
+                       resume. `truncated=false` plus `next_offset=null` means the page \
+                       is complete. `results.length` may be less than `limit` when the \
+                       byte cap fires, so consult `truncated`, not length, to detect \
+                       partial pages."
     )]
     async fn get_dependencies(
         &self,
@@ -729,11 +751,18 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let max_bytes = self.inner.config.read().response.max_bytes;
         // `paths::normalize_user_path` inside the handler may block on a
         // filesystem stat (see `get_file_symbols` comment).
         let inner = self.inner.clone();
         let result = tokio::task::spawn_blocking(move || {
-            handlers::query::get_dependencies(&inner.graph, &args.file)
+            handlers::query::get_dependencies(
+                &inner.graph,
+                &args.file,
+                args.limit,
+                args.offset,
+                max_bytes,
+            )
         })
         .await;
         Ok(match result {
@@ -1218,6 +1247,8 @@ mod tests {
         let r = server
             .get_dependencies(Parameters(GetDependenciesArgs {
                 file: "/x.cpp".to_string(),
+                limit: None,
+                offset: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

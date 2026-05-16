@@ -1,8 +1,24 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 421
 expression: parsed
 ---
-[
-  "[testdata]/engine.h",
-  "[testdata]/utils.h"
-]
+{
+  "limit": 100,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "file": "[testdata]/engine.h",
+      "kind": "includes",
+      "line": 1
+    },
+    {
+      "file": "[testdata]/utils.h",
+      "kind": "includes",
+      "line": 2
+    }
+  ],
+  "total": 2,
+  "truncated": false
+}
