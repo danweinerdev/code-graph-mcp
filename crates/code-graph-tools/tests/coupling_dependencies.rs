@@ -72,7 +72,6 @@ async fn analyze(server: &CodeGraphServer, dir: &std::path::Path) {
     );
 }
 
-
 /// Extract `(file, count)` rows out of a `Page<CouplingEntry>` JSON value
 /// in serialized order (the handler's desc-count / asc-file sort must be
 /// observable here, so this preserves array order — no re-sorting).
