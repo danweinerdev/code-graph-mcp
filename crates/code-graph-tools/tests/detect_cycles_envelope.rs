@@ -14,18 +14,19 @@
 //! this suite proves the same guarantees survive the full
 //! discover -> parse -> resolve -> merge -> handler pipeline.
 //!
-//! Phase-4 carry-forward (why the fixtures are real source files): the
-//! include graph now contains ONLY edges between *indexed source files* —
+//! Why the fixtures must be real source files: the include graph
+//! contains ONLY edges between *indexed source files* —
 //! `resolve_all_edges` drops an `Includes` edge unless it resolves to a
-//! discovered file whose extension a language plugin claims. `detect_cycles`
-//! runs Tarjan SCC over `Graph::includes`, so a cycle only forms if every
-//! edge in it is a source-to-source `#include` between files that are
-//! themselves in the indexed set. Each fixture below therefore writes real
-//! `.h` files that `#include` each other by (unique) basename so the
-//! basename resolver keeps every cycle edge; a fixture whose cycle edges
-//! would be dropped by the Phase-4 filter would yield ZERO detected cycles,
-//! so every test early-asserts the expected `total` to prove the cycles
-//! actually formed (a guard against a vacuous pass).
+//! discovered file whose extension a language plugin claims.
+//! `detect_cycles` runs Tarjan SCC over `Graph::includes`, so a cycle
+//! only forms if every edge in it is a source-to-source `#include`
+//! between files that are themselves in the indexed set. Each fixture
+//! below therefore writes real `.h` files that `#include` each other by
+//! (unique) basename so the basename resolver keeps every cycle edge; a
+//! fixture whose cycle edges would be dropped by the include-resolution
+//! filter would yield ZERO detected cycles, so every test early-asserts
+//! the expected `total` to prove the cycles actually formed (a guard
+//! against a vacuous pass).
 
 mod common;
 use common::first_text;
@@ -122,10 +123,10 @@ fn cycle_first_file(c: &serde_json::Value) -> String {
 // REUSED vs REBUILT: the unit-test helpers `graph_with_n_cycles` /
 // `graph_with_one_cycle_of_n_files` (handlers/structure.rs, `#[cfg(test)]`)
 // are NOT visible to `tests/`, and they construct a `Graph` directly via
-// `merge_file_graph` — which bypasses the Phase-4 `resolve_all_edges`
+// `merge_file_graph` — which bypasses the `resolve_all_edges` include
 // filter entirely. An integration suite must drive the real pipeline, so
 // these generators are REBUILT to write real `.h` files whose mutual
-// `#include`s survive the Phase-4 source-to-source filter. They mirror the
+// `#include`s survive the source-to-source include filter. They mirror the
 // unit helpers' topology exactly: `write_n_disjoint_2cycles` is the on-disk
 // analogue of `graph_with_n_cycles` (n disjoint A<->B pairs);
 // `write_one_ring_of_n` is the analogue of `graph_with_one_cycle_of_n_files`
@@ -158,8 +159,8 @@ fn write_n_disjoint_2cycles(root: &std::path::Path, n: usize) {
 /// Write a single `n`-file include ring into `root`:
 /// `ring{0:04}.h` -> `ring{1:04}.h` -> ... -> `ring{n-1:04}.h` ->
 /// `ring{0:04}.h`. Every header `#include`s exactly the next one by unique
-/// basename so all `n` edges survive the Phase-4 filter and Tarjan
-/// collapses the whole ring into ONE SCC of size `n`.
+/// basename so all `n` edges survive the include-resolution filter and
+/// Tarjan collapses the whole ring into ONE SCC of size `n`.
 fn write_one_ring_of_n(root: &std::path::Path, n: usize) {
     for i in 0..n {
         let here = format!("ring{i:04}.h");
@@ -198,14 +199,15 @@ async fn envelope_honesty_mid_page() {
     let b1 = ok_json(&r1);
     let (arr1, total1, offset1, limit1) = page_parts(&b1);
 
-    // Early total guard (Phase-4 carry-forward): if the mutual #includes
-    // had been dropped by the source-to-source filter, total would be 0
-    // and every assertion below would pass vacuously. 100 disjoint
-    // 2-cycles MUST yield exactly 100 SCCs.
+    // Early total guard: if the mutual #includes had been dropped by the
+    // source-to-source include filter, total would be 0 and every
+    // assertion below would pass vacuously. 100 disjoint 2-cycles MUST
+    // yield exactly 100 SCCs.
     assert_eq!(
         total1, 100,
-        "fixture must form exactly 100 cycles post-Phase-4 filter (total=0 \
-         would mean the mutual #includes were dropped as non-source); body: {b1}",
+        "fixture must form exactly 100 cycles through the real index \
+         pipeline (total=0 would mean the mutual #includes were dropped \
+         as non-source); body: {b1}",
     );
     assert_eq!(offset1, 30, "envelope echoes the resolved offset");
     assert_eq!(limit1, 10, "envelope echoes the resolved limit");
@@ -316,15 +318,15 @@ async fn per_cycle_cap_truncates_large_scc() {
     let body = ok_json(&r);
     let (arr, total, _, _) = page_parts(&body);
 
-    // Early total guard (Phase-4 carry-forward): a 200-file ring must
-    // collapse into exactly ONE SCC. total=0 would mean the ring's
-    // #include edges were dropped as non-source; total>1 would mean the
-    // ring didn't actually close.
+    // Early total guard: a 200-file ring must collapse into exactly ONE
+    // SCC. total=0 would mean the ring's #include edges were dropped as
+    // non-source by the include-resolution filter; total>1 would mean
+    // the ring didn't actually close.
     assert_eq!(
         total, 1,
-        "the 200-file ring must form exactly one SCC post-Phase-4 filter \
-         (total != 1 means the ring's #includes did not all survive / close); \
-         body: {body}",
+        "the 200-file ring must form exactly one SCC through the real \
+         index pipeline (total != 1 means the ring's #includes did not \
+         all survive / close); body: {body}",
     );
     assert_eq!(arr.len(), 1, "the single cycle is on the page");
 
@@ -388,11 +390,12 @@ async fn per_cycle_cap_default_50() {
     let body = ok_json(&r);
     let (arr, total, _, _) = page_parts(&body);
 
-    // Early total guard (Phase-4 carry-forward): same as (b).
+    // Early total guard: same as the explicit-cap test — the 200-file
+    // ring must collapse into exactly ONE SCC through the real pipeline.
     assert_eq!(
         total, 1,
-        "the 200-file ring must form exactly one SCC post-Phase-4 filter; \
-         body: {body}",
+        "the 200-file ring must form exactly one SCC through the real \
+         index pipeline; body: {body}",
     );
     assert_eq!(arr.len(), 1, "the single cycle is on the page");
 
