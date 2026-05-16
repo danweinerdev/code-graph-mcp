@@ -213,6 +213,44 @@ pub struct Page<T: Serialize> {
     pub next_offset: Option<u32>,
 }
 
+/// Response payload for `search_symbols`: the standard paginated
+/// [`Page`]`<`[`SymbolResult`]`>` envelope plus an optional list of
+/// did-you-mean candidate names.
+///
+/// `page` is `#[serde(flatten)]`, so the envelope fields (`results`,
+/// `total`, `offset`, `limit`, `truncated`, `next_offset`) serialize at
+/// the top level exactly as they did before this wrapper existed. Clients
+/// pattern-matching on the top-level `results`/`total`/`offset`/`limit`
+/// keys keep working unchanged — the wrapper is wire-compatible with the
+/// bare `Page<SymbolResult>` it replaces on this surface.
+///
+/// `suggestions` is purely additive: a list of nearby symbol names
+/// surfaced when an anchored query found zero exact matches. It carries
+/// `skip_serializing_if = "Vec::is_empty"`, so an empty list is **absent**
+/// from the JSON entirely (no `"suggestions": []` key) — a non-suggesting
+/// response is byte-identical to the legacy bare envelope.
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; clients consume it as
+/// JSON via `CallToolResult`, never as a Rust type. Derive set matches the
+/// sibling response types (`Debug`, `Serialize` only — no `Deserialize`;
+/// the response is serialize-only).
+// Suppressed only in NON-test builds: the type is currently constructed
+// solely by serialization tests, so a non-test build sees it as dead code.
+// Test builds DO construct it, so the suppression is gated off there —
+// keeping the dead-code check live in the profile `cargo clippy
+// --all-targets` actually compiles, which would catch a genuinely-orphaned
+// type. Once the `search_symbols` handler emits this response, the type is
+// constructed in non-test builds too and this attribute should be removed.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Serialize)]
+pub(super) struct SearchSymbolsResponse {
+    #[serde(flatten)]
+    pub page: Page<SymbolResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
+}
+
 /// Convert a [`Symbol`] to a [`SymbolResult`]. In `brief` mode, `column`,
 /// `end_line`, and `signature` are reset to defaults so they drop out of
 /// the JSON output via `skip_serializing_if`. Mirrors Go's `symbolToResult`.

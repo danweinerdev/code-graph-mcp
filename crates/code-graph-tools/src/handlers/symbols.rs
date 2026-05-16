@@ -1206,6 +1206,118 @@ mod tests {
     }
 
     #[test]
+    fn search_symbols_response_flatten_hoists_page_fields_and_keeps_suggestions() {
+        // The `#[serde(flatten)]` on `page` must hoist every Page envelope
+        // field to the top level (NOT nest them under a `"page"` key), and
+        // `suggestions` rides alongside as an additive sibling array. This
+        // is the wire-shape contract a suggesting search_symbols response
+        // must honor so agents pattern-matching on top-level
+        // results/total/offset/limit keep working unchanged.
+        use super::super::SearchSymbolsResponse;
+
+        let resp = SearchSymbolsResponse {
+            page: Page {
+                results: vec![],
+                total: 0,
+                offset: 0,
+                limit: 20,
+                truncated: false,
+                next_offset: None,
+            },
+            suggestions: vec!["Foo".into(), "Bar".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+
+        // Flatten hoisted the envelope fields to the top level.
+        assert!(
+            json.contains(r#""results":[]"#),
+            "flatten must hoist `results` to the top level: {json}"
+        );
+        assert!(
+            json.contains(r#""total":0"#),
+            "flatten must hoist `total` to the top level: {json}"
+        );
+        assert!(
+            json.contains(r#""offset":0"#),
+            "flatten must hoist `offset` to the top level: {json}"
+        );
+        assert!(
+            json.contains(r#""limit":20"#),
+            "flatten must hoist `limit` to the top level: {json}"
+        );
+        // No `"page"` wrapper key — flatten erases the nesting.
+        assert!(
+            !json.contains(r#""page""#),
+            "flatten must NOT emit a `page` wrapper key: {json}"
+        );
+        // Suggestions present, top-level, in declaration order.
+        assert!(
+            json.contains(r#""suggestions":["Foo","Bar"]"#),
+            "suggestions must serialize as a top-level array: {json}"
+        );
+
+        // Re-parse and assert structurally (not just substring) that the
+        // envelope fields live at the root, never under a `page` object.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("results"));
+        assert!(obj.contains_key("total"));
+        assert!(obj.contains_key("truncated"));
+        assert!(obj.contains_key("next_offset"));
+        assert!(
+            !obj.contains_key("page"),
+            "flattened response must not carry a nested `page` object"
+        );
+        assert_eq!(
+            obj["suggestions"],
+            serde_json::json!(["Foo", "Bar"]),
+            "suggestions array round-trips at the root"
+        );
+    }
+
+    #[test]
+    fn search_symbols_response_empty_suggestions_omits_the_key_entirely() {
+        // `skip_serializing_if = "Vec::is_empty"` contract: an empty
+        // suggestions list must be ABSENT from the JSON (no
+        // `"suggestions":[]`), so a non-suggesting response is
+        // byte-identical to the legacy bare Page<SymbolResult> envelope.
+        use super::super::SearchSymbolsResponse;
+
+        let resp = SearchSymbolsResponse {
+            page: Page {
+                results: vec![],
+                total: 0,
+                offset: 0,
+                limit: 20,
+                truncated: false,
+                next_offset: None,
+            },
+            suggestions: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("suggestions"),
+            "empty suggestions must be absent, not serialized as []: {json}"
+        );
+        // The flattened envelope must still be byte-identical to a bare
+        // Page<SymbolResult> with the same field values — proving the
+        // wrapper is wire-compatible when not suggesting.
+        let bare: Page<SymbolResult> = Page {
+            results: vec![],
+            total: 0,
+            offset: 0,
+            limit: 20,
+            truncated: false,
+            next_offset: None,
+        };
+        assert_eq!(
+            json,
+            serde_json::to_string(&bare).unwrap(),
+            "non-suggesting response must match the legacy bare envelope byte-for-byte"
+        );
+    }
+
+    #[test]
     fn search_symbols_no_filter_errors() {
         let g = locked(small_graph());
         let r = search_symbols(&g, search_input(), NO_BYTE_BUDGET);
