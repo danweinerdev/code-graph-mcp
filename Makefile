@@ -1,7 +1,7 @@
 # Rust workspace build targets. Build natively on each platform you need
 # the binary for — `make release` produces a host-target release build.
 
-.PHONY: build release test lint fmt fmt-check clean \
+.PHONY: build release test lint fmt fmt-check clean verify \
 	snapshot-clean snapshot-accept snapshot-audit install-hooks submodules \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
@@ -28,6 +28,27 @@ fmt-check:
 
 clean:
 	cargo clean
+
+# Single structural-verification gate: clippy (deny warnings), rustfmt
+# check, the full workspace test suite, and the pending-snapshot check,
+# run in sequence and ABORTING on the first failure with a loud,
+# non-zero exit. This exists because chaining checks by hand as
+# `<cmd>; echo ok` silently swallows a non-zero exit (the `echo`
+# after `;` runs regardless) — a real defect that let a rustfmt
+# violation ride undetected across several commits. `make verify` is
+# the canonical end-of-wave / end-of-phase gate: one command, one
+# exit code, no way to mask a failure. Recipe lines run under make's
+# default fail-fast, so the first non-zero step stops the target.
+verify:
+	@echo ">>> verify: clippy (deny warnings)"
+	cargo clippy --workspace --all-targets -- -D warnings
+	@echo ">>> verify: rustfmt check"
+	cargo fmt --all --check
+	@echo ">>> verify: workspace tests"
+	cargo test --workspace
+	@echo ">>> verify: pending snapshots"
+	@$(MAKE) --no-print-directory snapshot-clean
+	@echo "✓ verify: all structural checks passed"
 
 # Verify no pending insta snapshots in the working tree. `*.snap.new`
 # files exist when a snapshot test produced new output that hasn't been
