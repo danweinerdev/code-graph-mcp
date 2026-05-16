@@ -730,7 +730,11 @@ impl CodeGraphServer {
                        the {results, total, offset, limit, truncated, next_offset} \
                        envelope; each `results[i]` is {file, kind, line} where `file` is \
                        the included path, `kind` is \"includes\", and `line` is the source \
-                       line of the include/import directive. Rows are sorted by (file, \
+                       line of the include/import directive. Only includes that resolve \
+                       to an indexed source file appear: targets that do not (system/ \
+                       external headers, `.ini`/`.cfg`, `.txt`, anything no language \
+                       plugin claims) are filtered at index time and are absent from \
+                       dependencies. Rows are sorted by (file, \
                        line) ascending so pagination is deterministic. An unknown file is \
                        not an error — it returns an empty page (results: [], total: 0). \
                        `limit` defaults to 100 (max 1000, clamped silently — the echoed \
@@ -881,10 +885,47 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Get cross-file dependency counts for a file. Path is resolved \
-                       against the indexed graph; `\\\\?\\` extended-path prefix is handled \
-                       automatically, and relative segments (`.` / `..`) resolve against \
-                       the on-disk file when it exists (otherwise lexical-only)."
+        description = "Cross-file coupling counts for a file: how many call+include \
+                       edges connect it to each other indexed source file. `direction` \
+                       selects the response SHAPE: `\"outgoing\"` (DEFAULT — edges \
+                       leaving `file`) or `\"incoming\"` (edges pointing into `file`) \
+                       each return the {results, total, offset, limit, truncated, \
+                       next_offset} envelope where each `results[i]` is {file, count} \
+                       (count = number of edges between the two files). `\"both\"` \
+                       returns a DIFFERENT shape: {incoming, outgoing} where each value \
+                       is its own independent {results, total, offset, limit, \
+                       truncated, next_offset} page — there is NO top-level `results` \
+                       array in `both` mode. Accepted `direction` values are \
+                       `outgoing`, `incoming`, `both`; absent/empty resolves to \
+                       `outgoing`; any other spelling is a tool error. Rows are sorted \
+                       by `count` descending, then `file` ascending, so the most \
+                       tightly-coupled files page first and pagination is deterministic \
+                       across calls. `limit` defaults to 50 per side (max 1000, clamped \
+                       silently — the echoed `limit` reflects the resolved value; 0 \
+                       resolves to the default); raise `limit` for highly-coupled \
+                       files, or use `offset` (default 0) to page through. An unknown \
+                       file is not an error — it returns empty page(s) (results: [], \
+                       total: 0). Responses are capped by `[response].max_bytes` \
+                       (default 100KB). In `both` mode the budget is allocated \
+                       SEQUENTIALLY: the incoming page is sized first against the full \
+                       budget, then the outgoing page receives only what remains after \
+                       the incoming page plus a fixed wrapper reserve; if incoming \
+                       consumes the whole budget the outgoing page comes back empty \
+                       with `truncated:true` and `next_offset:0` (a start-fresh \
+                       marker). When `truncated` is true on either side, that side was \
+                       cut by the byte budget — re-call with that single \
+                       `direction=\"incoming\"` (or `\"outgoing\"`) and `offset = \
+                       next_offset` from the truncated page to resume; `truncated=false` \
+                       plus `next_offset=null` means that page is complete. \
+                       `results.length` may be less than `limit` when the byte cap \
+                       fires, so consult `truncated`, not length, to detect partial \
+                       pages. Path is resolved against the indexed graph; `\\\\?\\` \
+                       extended-path prefix is handled automatically, and relative \
+                       segments (`.` / `..`) resolve against the on-disk file when it \
+                       exists (otherwise lexical-only). Counts cover only edges between \
+                       indexed source files: targets that do not resolve to an indexed \
+                       source file (system/external headers, `.ini`/`.cfg`, `.txt`) are \
+                       filtered at index time and never contribute to a count."
     )]
     async fn get_coupling(
         &self,
