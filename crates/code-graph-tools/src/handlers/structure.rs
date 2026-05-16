@@ -45,13 +45,25 @@ use super::{
 /// points one past the last emitted cycle so a client can resume
 /// paging. Pagination is purely by COUNT — the byte-budget cap that
 /// governs the symbol-list tools is intentionally NOT consulted here.
+///
+/// `max_cycle_size` (default 50, clamped at 500; `0` resolves to the
+/// default) caps the number of file paths kept *within* each cycle on
+/// the page. This is an axis orthogonal to envelope pagination: a cycle
+/// whose `files` list exceeds the cap is shortened in place, its
+/// `truncated` flag set, and `original_len` set to the pre-truncation
+/// count; the envelope's `truncated`/`next_offset` are unaffected. Per-
+/// cycle truncation is applied AFTER the page slice, so only cycles
+/// actually returned on the page pay the cost. Cycles at or under the
+/// cap keep `truncated: false` / `original_len: None`.
 pub fn detect_cycles(
     graph: &RwLock<Graph>,
     limit: Option<u32>,
     offset: Option<u32>,
+    max_cycle_size: Option<u32>,
 ) -> CallToolResult {
     let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
     let resolved_offset = offset.unwrap_or(0);
+    let resolved_max = max_cycle_size.filter(|&n| n != 0).unwrap_or(50).min(500);
 
     let cycles: Vec<Vec<PathBuf>> = graph.read().detect_cycles();
 
@@ -78,19 +90,35 @@ pub fn detect_cycles(
     stringified.sort_by(|a, b| a.first().cmp(&b.first()));
 
     let total = stringified.len() as u32;
-    let results: Vec<Cycle> = stringified
+    let mut results: Vec<Cycle> = stringified
         .into_iter()
         .skip(resolved_offset as usize)
         .take(resolved_limit as usize)
         .map(|files| Cycle {
             files,
-            // Per-cycle truncation (a single oversized cycle's `files`
-            // list being clipped) is a separate axis from envelope
-            // pagination; it stays unset here and is governed elsewhere.
+            // Per-cycle truncation is a separate axis from envelope
+            // pagination; the cap is applied below, after the page slice,
+            // so only cycles actually on this page pay the cost.
             truncated: false,
             original_len: None,
         })
         .collect();
+
+    // Per-cycle file-list cap, applied to the cycles ON THIS PAGE only
+    // (after skip/take above). This shrinks an oversized cycle's `files`
+    // in place and records the pre-truncation length; it never adds or
+    // removes cycles, so the by-count envelope arithmetic below
+    // (offset/emitted/total) is untouched. A cycle whose file list is at
+    // or under the cap is left exactly as built (truncated:false,
+    // original_len:None) — the two truncation axes stay independent.
+    for cycle in &mut results {
+        if cycle.files.len() as u32 > resolved_max {
+            let original = cycle.files.len() as u32;
+            cycle.files.truncate(resolved_max as usize);
+            cycle.truncated = true;
+            cycle.original_len = Some(original);
+        }
+    }
 
     // Cycle pagination is by COUNT, not by serialized byte size: the
     // envelope's `truncated`/`next_offset` are derived purely from
@@ -780,7 +808,7 @@ mod tests {
     #[test]
     fn detect_cycles_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = detect_cycles(&g, None, None);
+        let r = detect_cycles(&g, None, None, None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -805,7 +833,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None);
+        let r = detect_cycles(&g, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -827,7 +855,7 @@ mod tests {
             edges: vec![include_edge("/b.h", "/a.h")],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None);
+        let r = detect_cycles(&g, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1, "exactly one cycle in results");
         assert_eq!(total, 1, "total reports the full cycle count");
@@ -848,7 +876,7 @@ mod tests {
     #[test]
     fn detect_cycles_default_limit_is_20() {
         let g = locked(graph_with_n_cycles(25));
-        let r = detect_cycles(&g, None, None);
+        let r = detect_cycles(&g, None, None, None);
         let (arr, total, _, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -863,9 +891,9 @@ mod tests {
     #[test]
     fn detect_cycles_page_1_and_page_2_cover_full_set_no_overlap() {
         let g = locked(graph_with_n_cycles(30));
-        let r1 = detect_cycles(&g, Some(20), Some(0));
+        let r1 = detect_cycles(&g, Some(20), Some(0), None);
         let (arr1, total1, _, _) = page_parts(&r1);
-        let r2 = detect_cycles(&g, Some(20), Some(20));
+        let r2 = detect_cycles(&g, Some(20), Some(20), None);
         let (arr2, total2, _, _) = page_parts(&r2);
         assert_eq!(total1, 30);
         assert_eq!(total2, 30, "total invariant across pages");
@@ -911,7 +939,7 @@ mod tests {
         // the full set, so the envelope must advertise that more cycles
         // exist (truncated=true) and where to resume (next_offset=10).
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, Some(10), Some(0));
+        let r = detect_cycles(&g, Some(10), Some(0), None);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 10, "limit caps the page at 10 cycles");
         assert_eq!(total, 100, "total is the pre-pagination cycle count");
@@ -928,7 +956,7 @@ mod tests {
         // than the limit. offset(95) + emitted(5) == total(100), so this
         // is the natural tail — truncated=false, next_offset=None.
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, Some(10), Some(95));
+        let r = detect_cycles(&g, Some(10), Some(95), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert_eq!(arr.len(), 5, "only the trailing 5 cycles remain");
         assert_eq!(total, 100);
@@ -941,7 +969,7 @@ mod tests {
     #[test]
     fn detect_cycles_offset_beyond_total_returns_empty_envelope() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, None, Some(999));
+        let r = detect_cycles(&g, None, Some(999), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 3, "total still reports full cycle count");
@@ -956,7 +984,7 @@ mod tests {
     #[test]
     fn detect_cycles_limit_clamps_at_1000() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, Some(999_999), None);
+        let r = detect_cycles(&g, Some(999_999), None, None);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000, "echo the clamped limit");
         assert_eq!(arr.len(), 3, "all 3 cycles returned when data < cap");
@@ -965,7 +993,7 @@ mod tests {
     #[test]
     fn detect_cycles_zero_limit_uses_default() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, Some(0), None);
+        let r = detect_cycles(&g, Some(0), None, None);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -983,6 +1011,119 @@ mod tests {
         };
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, r#"{"files":["a","b"],"truncated":false}"#);
+    }
+
+    /// Build a graph with exactly ONE cycle that contains `n` files: a
+    /// ring `ring_000.h -> ring_001.h -> … -> ring_NNN.h -> ring_000.h`.
+    /// Every file in the ring includes the next and the last closes back
+    /// to the first, so Tarjan collapses all `n` into a single SCC. Used
+    /// by the per-cycle file-list truncation tests, which need one cycle
+    /// whose `files` list is large enough to exceed the size cap.
+    fn graph_with_one_cycle_of_n_files(n: usize) -> Graph {
+        let mut g = Graph::new();
+        for i in 0..n {
+            let from = format!("/ring_{i:03}.h");
+            let to = format!("/ring_{:03}.h", (i + 1) % n);
+            g.merge_file_graph(FileGraph {
+                path: from.clone(),
+                language: Language::Cpp,
+                symbols: vec![],
+                edges: vec![include_edge(&from, &to)],
+            });
+        }
+        g
+    }
+
+    #[test]
+    fn detect_cycles_explicit_max_cycle_size_truncates_oversized_cycle() {
+        // One cycle of 100 files, max_cycle_size=Some(50): the single
+        // cycle on the page is clipped to 50 paths and self-reports the
+        // truncation via truncated:true + original_len:Some(100).
+        let g = locked(graph_with_one_cycle_of_n_files(100));
+        let r = detect_cycles(&g, None, None, Some(50));
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 1, "still exactly one cycle");
+        assert_eq!(arr.len(), 1);
+        let files = arr[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 50, "files clipped to the resolved cap");
+        assert_eq!(
+            arr[0]["truncated"],
+            serde_json::json!(true),
+            "the clipped cycle self-reports truncated:true"
+        );
+        assert_eq!(
+            arr[0]["original_len"],
+            serde_json::json!(100),
+            "original_len carries the pre-truncation file count"
+        );
+    }
+
+    #[test]
+    fn detect_cycles_default_max_cycle_size_is_50() {
+        // Same 100-file cycle, NO max_cycle_size arg: the default of 50
+        // must apply, producing the identical clip/flag/original_len as
+        // the explicit-50 case above. Pins the default resolution.
+        let g = locked(graph_with_one_cycle_of_n_files(100));
+        let r = detect_cycles(&g, None, None, None);
+        let (arr, _, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 1);
+        let files = arr[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 50, "absent max_cycle_size resolves to 50");
+        assert_eq!(arr[0]["truncated"], serde_json::json!(true));
+        assert_eq!(arr[0]["original_len"], serde_json::json!(100));
+    }
+
+    #[test]
+    fn detect_cycles_cycle_at_or_under_cap_is_not_truncated() {
+        // One cycle of 10 files, default cap (50): 10 <= 50, so the cycle
+        // is left exactly as built — truncated:false (always emitted) and
+        // original_len ABSENT (skipped when None). Pins the not-truncated
+        // path and the orthogonality of the two truncation axes.
+        let g = locked(graph_with_one_cycle_of_n_files(10));
+        let r = detect_cycles(&g, None, None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 1);
+        assert_eq!(arr.len(), 1);
+        let files = arr[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 10, "under-cap cycle keeps all files");
+        assert_eq!(
+            arr[0]["truncated"],
+            serde_json::json!(false),
+            "an under-cap cycle emits truncated:false"
+        );
+        assert!(
+            arr[0].as_object().unwrap().get("original_len").is_none(),
+            "original_len absent when the cycle is not truncated"
+        );
+    }
+
+    #[test]
+    fn detect_cycles_envelope_and_per_cycle_truncation_are_independent() {
+        // A single 100-file cycle with a generous limit: the page holds
+        // every cycle (only one exists), so the ENVELOPE is complete
+        // (truncated=false / next_offset=None). The cycle itself still
+        // exceeds the file cap, so its PER-CYCLE truncated=true. The two
+        // axes are orthogonal: a non-truncated envelope can carry a
+        // per-cycle-truncated cycle.
+        let g = locked(graph_with_one_cycle_of_n_files(100));
+        let r = detect_cycles(&g, Some(1000), Some(0), Some(50));
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 1);
+        assert_eq!(arr.len(), 1);
+        // Envelope: complete page, nothing more to fetch.
+        let (env_truncated, env_next) = super::super::test_helpers::page_extras(&r);
+        assert!(
+            !env_truncated,
+            "the single cycle fits the page; envelope must NOT be truncated"
+        );
+        assert_eq!(env_next, None, "no further page after the only cycle");
+        // Per-cycle: the cycle's own file list WAS clipped.
+        assert_eq!(
+            arr[0]["truncated"],
+            serde_json::json!(true),
+            "per-cycle truncated:true despite the complete envelope"
+        );
+        assert_eq!(arr[0]["original_len"], serde_json::json!(100));
     }
 
     // --- get_orphans ---

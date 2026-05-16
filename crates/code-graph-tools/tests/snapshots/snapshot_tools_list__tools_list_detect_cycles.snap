@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 81
 expression: "tool_entry(\"detect_cycles\")"
 ---
 {
@@ -11,6 +12,16 @@ expression: "tool_entry(\"detect_cycles\")"
       "limit": {
         "default": null,
         "description": "Maximum cycles to return (default 20, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "max_cycle_size": {
+        "default": null,
+        "description": "Maximum file paths to keep per cycle (default 50, max 500). Cycles longer than this have their `files` list truncated; the cycle then carries `truncated: true` and `original_len` = the pre-truncation file count.",
         "format": "uint32",
         "minimum": 0,
         "type": [

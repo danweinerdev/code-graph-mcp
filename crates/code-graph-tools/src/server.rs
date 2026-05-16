@@ -351,6 +351,14 @@ pub struct DetectCyclesArgs {
     #[schemars(description = "Skip first N cycles for pagination (default 0)")]
     #[serde(default)]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "Maximum file paths to keep per cycle (default 50, max 500). \
+                       Cycles longer than this have their `files` list truncated; \
+                       the cycle then carries `truncated: true` and \
+                       `original_len` = the pre-truncation file count."
+    )]
+    #[serde(default)]
+    pub max_cycle_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -792,6 +800,7 @@ impl CodeGraphServer {
             &self.inner.graph,
             args.limit,
             args.offset,
+            args.max_cycle_size,
         ))
     }
 
@@ -1699,6 +1708,43 @@ mod tests {
         assert!(
             result.is_err(),
             "string instead of bool must produce a deserialization error; got {result:?}",
+        );
+    }
+
+    // -- max_cycle_size Args deserialization -------------------------------
+    //
+    // The `max_cycle_size: Option<u32>` field on DetectCyclesArgs must
+    // deserialize via the same contract as the existing `Option<u32>`
+    // fields (`limit`, `offset`): absent → None, present-and-number →
+    // Some(value), wrong-type → deserialization error. The None default
+    // is what lets the handler resolve it to 50 via the
+    // `.filter(|&n| n != 0).unwrap_or(50).min(500)` idiom; the test
+    // guards the pre-condition that flow depends on.
+
+    #[test]
+    fn detect_cycles_args_max_cycle_size_absent_is_none() {
+        let args: DetectCyclesArgs = serde_json::from_str("{}").expect("empty object deserializes");
+        assert!(
+            args.max_cycle_size.is_none(),
+            "absent max_cycle_size must deserialize to None (handler resolves None to the default 50); got {:?}",
+            args.max_cycle_size,
+        );
+    }
+
+    #[test]
+    fn detect_cycles_args_max_cycle_size_number_is_some() {
+        let args: DetectCyclesArgs = serde_json::from_str(r#"{"max_cycle_size": 50}"#)
+            .expect("max_cycle_size=50 deserializes");
+        assert_eq!(args.max_cycle_size, Some(50));
+    }
+
+    #[test]
+    fn detect_cycles_args_max_cycle_size_malformed_string_rejected() {
+        let result: Result<DetectCyclesArgs, _> =
+            serde_json::from_str(r#"{"max_cycle_size": "fifty"}"#);
+        assert!(
+            result.is_err(),
+            "string instead of integer must produce a deserialization error; got {result:?}",
         );
     }
 }
