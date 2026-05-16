@@ -115,3 +115,17 @@ pub fn first_text(r: &CallToolResult) -> String {
         .map(|t| t.text.to_string())
         .unwrap_or_default()
 }
+
+/// Parse a tool response body into a JSON value, asserting it is not an
+/// error result first (so a failed handler surfaces its message instead
+/// of an opaque JSON-parse panic). Centralized so every integration
+/// suite shares one definition.
+#[allow(dead_code)]
+pub fn ok_json(r: &CallToolResult) -> serde_json::Value {
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "expected a non-error result; body: {}",
+        first_text(r),
+    );
+    serde_json::from_str(&first_text(r)).expect("response body must be valid JSON")
+}

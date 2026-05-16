@@ -31,7 +31,7 @@
 //! genuinely carries it).
 
 mod common;
-use common::first_text;
+use common::ok_json;
 
 use code_graph_core::{FileGraph, Language};
 use code_graph_lang::LanguageRegistry;
@@ -72,17 +72,6 @@ async fn analyze(server: &CodeGraphServer, dir: &std::path::Path) {
     );
 }
 
-/// Parse a tool response body into a JSON value, asserting it is not an
-/// error result first (so a failed handler surfaces its message instead
-/// of an opaque JSON-parse panic).
-fn ok_json(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-    assert!(
-        r.is_error.is_none() || r.is_error == Some(false),
-        "expected a non-error result; body: {}",
-        first_text(r),
-    );
-    serde_json::from_str(&first_text(r)).expect("response body must be valid JSON")
-}
 
 /// Extract `(file, count)` rows out of a `Page<CouplingEntry>` JSON value
 /// in serialized order (the handler's desc-count / asc-file sort must be
