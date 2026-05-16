@@ -162,7 +162,7 @@ pub(super) struct DependencyEntry {
 pub(super) struct Cycle {
     pub files: Vec<String>,
     pub truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub original_len: Option<u32>,
 }
 

@@ -430,9 +430,10 @@ async fn response_detect_cycles() {
     let r = detect_cycles(&fx.inner.graph, None, None);
     // The handler now sorts each cycle's inner paths in canonical order
     // and sorts the outer cycle list by first path, then wraps in the
-    // shared Page<Vec<String>> envelope. Sort discipline lives in the
-    // handler now; the test-time normalize that used to sort here is no
-    // longer needed. `parsed_sorted` still normalizes object key order
+    // shared Page<Cycle> envelope (each cycle is {files, truncated,
+    // original_len?}). Sort discipline lives in the handler now; the
+    // test-time normalize that used to sort here is no longer needed.
+    // `parsed_sorted` still normalizes object key order
     // (the envelope itself).
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
