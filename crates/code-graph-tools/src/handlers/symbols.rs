@@ -254,6 +254,10 @@ pub fn search_symbols(
     // BinaryHeap<TopEntry> is never constructed. `sr.symbols` is guaranteed
     // empty on this path; only `sr.total` (the pre-pagination match count)
     // is meaningful. Emit the documented sentinel envelope.
+    // The `^…$` anchored-zero `suggestions` enrichment deliberately does NOT
+    // apply on this path: count_only callers opted out of the records-bearing
+    // response, and a suggestion list would breach the < 1 KB sentinel
+    // contract. Anchored-exact misses under count_only get a bare count only.
     if input.count_only {
         let sr = graph.read().search(SearchParams {
             pattern: query_str.to_string(),
@@ -2118,6 +2122,10 @@ mod tests {
         assert!(
             parsed.get("suggestions").is_none(),
             "empty inner pattern must short-circuit to NO suggestions, not match all symbols: {parsed}"
+        );
+        assert!(
+            !body_text(&r).contains("suggestions"),
+            "empty inner pattern: the `suggestions` key must be wholly absent from the wire JSON: {parsed}"
         );
     }
 
