@@ -1345,4 +1345,45 @@ max_bytes = 200000
             "macro_strip_with_args entry must survive case-unchanged"
         );
     }
+
+    // --- Shipped example file -------------------------------------------
+
+    #[test]
+    fn shipped_example_file_is_valid_toml_and_deserializes() {
+        // The committed `.code-graph.toml.example` is what users copy to
+        // `.code-graph.toml`. Every opt-in preset in it is fully commented,
+        // so the default-state file must parse as valid TOML AND
+        // round-trip into `RootConfig` with no unknown-key surprises. This
+        // guards the example against TOML-syntax rot (a stray comment-out,
+        // an unbalanced array, a misnamed key) that wouldn't be caught by
+        // any other test, since nothing else loads this file.
+        let raw = include_str!("../../../.code-graph.toml.example");
+        let cfg: RootConfig = toml::from_str(raw)
+            .expect("shipped .code-graph.toml.example must parse as valid RootConfig");
+        // With every preset commented out, the example must yield exactly
+        // the documented active defaults — proving the opt-in blocks really
+        // are inert until uncommented.
+        assert_eq!(cfg.discovery.max_threads, 0);
+        assert!(cfg.discovery.respect_gitignore);
+        assert!(!cfg.discovery.follow_symlinks);
+        assert_eq!(
+            cfg.discovery.extra_ignore,
+            vec![
+                "build/".to_string(),
+                "node_modules/".to_string(),
+                "vendor/".to_string(),
+            ],
+            "the active extra_ignore must be the documented default trio; \
+             the UE preset line must stay commented out"
+        );
+        assert_eq!(cfg.parsing.max_threads, 0);
+        assert!(
+            cfg.cpp.macro_strip.is_empty(),
+            "the UE macro_strip preset must stay commented out"
+        );
+        assert!(
+            cfg.cpp.macro_strip_with_args.is_empty(),
+            "the UE macro_strip_with_args preset must stay commented out"
+        );
+    }
 }

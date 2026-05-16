@@ -26,6 +26,21 @@ follow_symlinks = false
 # gitignore syntax.
 extra_ignore = ["build/", "node_modules/", "vendor/"]
 
+# Recommended starting point for Unreal Engine codebases (opt-in: replace
+# the `extra_ignore` line above with this one, or merge the entries you
+# want). Left commented so the default behavior is unchanged — a user who
+# copies this example as-is gets no UE-specific exclusions until they opt
+# in. Every directory below is engine-side scratch that regenerates on
+# every build and carries zero source signal: `Intermediate/` (build
+# intermediates), `Saved/` (autosaves, logs, crash dumps), `Binaries/`
+# (compiled module DLLs/PDBs), `DerivedDataCache/` (the DDC blob store).
+# `.vs/`, `.idea/`, `.vscode/` are IDE working dirs. `*.uasset` and
+# `*.umap` are large packed binary content assets, not parseable source —
+# excluding them keeps the walker off multi-gigabyte content trees.
+# Indexing any of these wastes discovery time and pollutes the graph with
+# regenerated noise.
+# extra_ignore = ["Intermediate/", "Saved/", "Binaries/", "DerivedDataCache/", ".vs/", ".idea/", ".vscode/", "*.uasset", "*.umap"]
+
 [parsing]
 # Number of threads for the rayon parsing pool. 0 = auto. Same clamping rule
 # as `discovery.max_threads`. The discovery and parsing pools share the host
