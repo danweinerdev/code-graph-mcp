@@ -1,16 +1,24 @@
 //! Baseline integration test for `analyze_codebase` against `testdata/cpp`.
 //!
-//! Locks in the empirical Phase 1.6 byte-counts (8 files, 18 symbols, 21
-//! edges, 0 warnings) so any future change to discovery, parsing, or edge
+//! Locks in the empirical indexed totals (8 files, 18 symbols, 17 edges,
+//! 0 warnings) so any future change to discovery, parsing, or edge
 //! resolution that drifts the totals trips this test before a snapshot
 //! review catches it. Calls the analyze handler function directly to keep
 //! the test focused on the indexing pipeline rather than the rmcp wire
 //! plumbing — `binary_advertises_fifteen_tools` already covers the wire
 //! path.
 //!
-//! The edge count baseline comes from the Phase 1.6 debrief, which is
-//! authoritative; `testdata/cpp/MANIFEST.md` only enumerates a subset of
-//! edges and does not match the indexed total.
+//! Edge-count provenance: an Includes edge is retained only when it
+//! resolves to an indexed source file. The `testdata/cpp` fixture's four
+//! angle-bracket system-header includes (`<iostream>` in `main.cpp`,
+//! `<string>` in `engine.h`, `orphan.cpp`, and `utils.h`) never resolve to
+//! an indexed file, so they are dropped rather than leaked into the
+//! dependency graph as unresolvable noise — they do not count toward the
+//! edge total. The 17 retained edges are the resolvable source-to-source
+//! `#include`s plus the Calls/Inherits edges among the indexed symbols;
+//! `files` (8) and `symbols` (18) are unaffected by the include filter.
+//! `testdata/cpp/MANIFEST.md` only enumerates a subset of edges and does
+//! not match the indexed total.
 
 use std::path::PathBuf;
 
@@ -84,7 +92,7 @@ async fn analyze_testdata_cpp_locks_in_baseline_counts() {
     );
     assert_eq!(
         parsed["edges"],
-        serde_json::json!(21),
+        serde_json::json!(17),
         "edges count drifted from baseline; full body: {body}",
     );
     // `warnings` is `omitempty`-flavored on the Rust side: the field is

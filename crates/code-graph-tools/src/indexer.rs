@@ -290,18 +290,19 @@ pub fn resolve_all_edges(
         fg.edges.retain_mut(|edge| {
             match edge.kind {
                 EdgeKind::Includes => {
-                    if let Some(resolved) = plugin.resolve_include(&edge.to, &file_index) {
-                        // Drop include edges whose resolved target is not a
-                        // file any language plugin claims (system headers like
-                        // `stdio.h` resolving outside the indexed tree, config
-                        // files like `.ini`/`.cfg`, plain `.txt`). Such edges
-                        // would otherwise pollute the dependency graph with
-                        // non-source noise. Not logged: this fires constantly
-                        // in real C++ codebases and would flood stderr.
-                        if registry.language_for_path(&resolved).is_none() {
-                            return false;
+                    match plugin.resolve_include(&edge.to, &file_index) {
+                        Some(resolved) if registry.language_for_path(&resolved).is_some() => {
+                            edge.to = resolved.to_string_lossy().into_owned();
                         }
-                        edge.to = resolved.to_string_lossy().into_owned();
+                        // Unresolved, or resolved to a non-source target: this
+                        // include does not point at an indexed source file
+                        // (system headers like `stdio.h`, external paths never
+                        // in the FileIndex, config files like `.ini`/`.cfg`,
+                        // plain `.txt`). It is not a graph edge — drop it
+                        // rather than leak a raw/unresolvable string into the
+                        // dependency graph. Not logged: this fires constantly
+                        // in real C++ codebases and would flood stderr.
+                        _ => return false,
                     }
                 }
                 EdgeKind::Calls => {
