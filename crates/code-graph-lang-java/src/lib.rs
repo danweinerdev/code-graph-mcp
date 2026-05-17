@@ -486,8 +486,8 @@ impl JavaParser {
     /// - `this(...)` / `super(...)` constructor chaining → `to = "this"`
     ///   / `to = "super"`. These ARE genuine constructor invocations
     ///   (Java syntactically requires them in the first statement of a
-    ///   constructor body when used) and produce call edges per the
-    ///   design brief — no filter is applied. Agents disambiguate from
+    ///   constructor body when used) and produce call edges — no
+    ///   filter is applied. Agents disambiguate from
     ///   ordinary method calls via the literal `"this"` / `"super"`
     ///   callee name, which is not a valid Java identifier in a normal
     ///   call position.
