@@ -9,7 +9,7 @@
 //! Per-file breakdowns are also asserted so a regression is localized to
 //! a single fixture rather than reporting only the global total drift.
 //!
-//! Edge-case coverage (per Phase 3.6 verification):
+//! Edge-case coverage:
 //!   - empty class body → 1 Class symbol, 0 method symbols, no panic
 //!     (Java requires at least a class declaration for the file to
 //!     parse — there is no zero-symbol equivalent to C#'s 0-byte
@@ -21,8 +21,8 @@
 //!     of `5` (NOT zero — tree-sitter-java 0.23.5 recovers `bar` as a
 //!     method despite the malformed parameter list, plus the enclosing
 //!     `Broken` class, the sibling `good` method, and the post-error
-//!     `AlsoGood` class with its `run` method). Mirrors the Phase 7
-//!     `broken.py` discovery
+//!     `AlsoGood` class with its `run` method). Mirrors the
+//!     `broken.py` partial-recovery behavior
 //!   - 2-level nested classes → immediate-parent contract
 //!   - anonymous-class-inside-method → Decision 4 collision: two anon
 //!     `run()` methods produce two `AnonymousInside::run` symbols with
@@ -34,7 +34,7 @@
 //!     all extracted methods parent to the enum type (NOT a synthetic
 //!     `Planet$EARTH`); enum-level abstract method filtered as forward
 //!     declaration
-//!   - method references → Phase 3.3 documented limitation: `Type::new`
+//!   - method references → documented Java parser limitation: `Type::new`
 //!     constructor references produce zero call edges
 //!
 //! The dogfood-baseline regression test
@@ -350,8 +350,8 @@ fn broken_file_recovers_around_error_nodes_without_panic() {
     // STILL extracts the malformed `bar` method (the recovery is
     // aggressive enough that the `method_declaration` node matches
     // the definition query). The other symbols all extract cleanly.
-    // The recovered count is **5**, NOT zero — mirrors the Phase 7
-    // `broken.py` discovery (tree-sitter recovers more than expected).
+    // The recovered count is **5**, NOT zero — mirrors the `broken.py`
+    // partial-recovery behavior (tree-sitter recovers more than expected).
     let parser = JavaParser::new().expect("JavaParser::new");
     let corpus = parse_corpus(&parser);
     let broken = corpus.get("Broken.java").expect("Broken.java in corpus");
@@ -599,7 +599,7 @@ fn enum_with_methods_records_enum_type_as_parent_for_all_methods() {
 
 #[test]
 fn method_references_record_identifier_rhs_only_constructor_ref_is_limitation() {
-    // Phase 3.3 documented limitation: method references with an
+    // Documented Java parser limitation: method references with an
     // identifier on the right-hand side (`String::length`, `this::len`)
     // produce Calls edges to the bare RHS name. Constructor references
     // (`Type::new`) are NOT matched by the query — they produce zero
@@ -639,7 +639,7 @@ fn method_references_record_identifier_rhs_only_constructor_ref_is_limitation() 
     assert!(
         !call_targets.contains(&"new"),
         "constructor reference `MethodReferences::new` MUST NOT produce \
-         a Calls edge (Phase 3.3 documented limitation); got: \
+         a Calls edge (documented Java parser limitation); got: \
          {call_targets:?}"
     );
 }

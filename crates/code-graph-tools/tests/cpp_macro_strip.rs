@@ -1,4 +1,4 @@
-//! End-to-end integration test for `[cpp].macro_strip` — Phase 2.4.
+//! End-to-end integration test for `[cpp].macro_strip`.
 //!
 //! These tests close the "config flows from `.code-graph.toml` through
 //! `analyze_codebase` into the C++ plugin's substitution" gap that pure
@@ -8,9 +8,6 @@
 //! silently breaking macro stripping; the discriminator below is Test 1
 //! (positive) + Test 2 (control) on identical fixture content but
 //! differing config.
-//!
-//! See `Designs/CppMacroStrip/README.md` and Plan
-//! `Plans/Active/CppMacroStrip/02-Wire-Through.md::2.4`.
 
 use code_graph_core::SymbolKind;
 use code_graph_lang::LanguageRegistry;
@@ -140,7 +137,7 @@ async fn cpp_macro_strip_extracts_class_with_api_macro() {
 #[tokio::test]
 async fn cpp_macro_strip_control_empty_list_does_not_extract() {
     // No `.code-graph.toml` at all — equivalent to `[cpp]\nmacro_strip = []`
-    // (Phase 1.1 anti-regression in `code-graph-core` covers the explicit
+    // (a `code-graph-core` anti-regression test covers the explicit
     // empty-array form; here we verify the implicit default).
     let (dir, root) = seed_root(None);
     let server = fresh_server();

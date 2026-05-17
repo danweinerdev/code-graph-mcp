@@ -16,7 +16,7 @@
 //! would make this probabilistic and flaky.
 //!
 //! Inbound re-resolution (rebinding B's call to `A:new_fn`) is
-//! intentionally out of scope per the Phase 4.2 brief — that requires
+//! intentionally out of scope — that requires
 //! re-parsing B, which the watch event for A does not warrant. The
 //! test accepts either:
 //! - `get_callees(B::caller)` returns an empty list, or
@@ -102,7 +102,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         "pre-rename callees must succeed: {r:?}"
     );
     let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-    // Phase 3: callees response is now a Page<CallChain> envelope.
+    // The callees response is a Page<CallChain> envelope.
     let pre_targets: Vec<&str> = body["results"]
         .as_array()
         .unwrap()
@@ -139,7 +139,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {
         let parsed: serde_json::Value = serde_json::from_str(&post_text).unwrap();
-        // Phase 3: callees response is now a Page<CallChain> envelope.
+        // The callees response is a Page<CallChain> envelope.
         let post_targets: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()

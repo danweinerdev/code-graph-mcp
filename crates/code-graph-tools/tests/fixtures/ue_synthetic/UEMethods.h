@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — UFUNCTION shapes (single-line, multi-arg,
+// Synthetic UE fixture — UFUNCTION shapes (single-line, multi-arg,
 // comma-in-string, comma-in-meta).
 
 UCLASS()

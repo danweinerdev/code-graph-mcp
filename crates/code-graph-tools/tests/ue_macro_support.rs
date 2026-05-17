@@ -1,4 +1,4 @@
-//! UE-style macro extraction end-to-end tests — `UeMacroSupport` Phase 4.2 + 4.3.
+//! UE-style macro extraction end-to-end tests.
 //!
 //! These tests close the "config flows from `.code-graph.toml` through
 //! `analyze_codebase` into the C++ plugin's parameterized-macro substitution"
@@ -154,7 +154,7 @@ fn search_for(inner: &Arc<ServerInner>, pattern: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("search_symbols({pattern:?}) body must be JSON: {e}"))
 }
 
-/// Phase 4.2 — preset-on integration test.
+/// Preset-on integration test.
 ///
 /// Indexes the in-tree UE fixture with its bundled `.code-graph.toml`
 /// (which enables `[cpp].macro_strip` for the bare `_API` macros AND
@@ -243,7 +243,7 @@ async fn ue_fixture_extracts_uclass_with_preset() {
 
     // ---------- (e) Tick line preserved (byte-offset invariant) ----------
     //
-    // The parameterized-macro substitution (Phase 2 of UeMacroSupport)
+    // The parameterized-macro substitution
     // overwrites the matched span with same-length spaces, preserving
     // every subsequent byte's offset. The fixture's `Actor.h` declares
     // `virtual void Tick(float DeltaSeconds) override {}` on line 8
@@ -261,9 +261,9 @@ async fn ue_fixture_extracts_uclass_with_preset() {
     // builds the regex match target as `{parent}::{name}` when `parent`
     // is non-empty (queries.rs:235-240), so an anchored pattern on the
     // bare name `Tick` never matches a method whose effective full-name
-    // is `AActor::Tick`. The plan task description specified `^Tick$`,
-    // but that pattern returns 0 results for parented methods — implementer
-    // note surfaced in the phase report.
+    // is `AActor::Tick`. An anchored bare-name pattern `^Tick$` returns
+    // 0 results for parented methods, so the parent-qualified pattern is
+    // required here.
     let envelope = search_for(&fx.inner, "^AActor::Tick$");
     let aactor_tick_line = envelope["results"]
         .as_array()
@@ -325,8 +325,8 @@ async fn ue_fixture_extracts_uclass_with_preset() {
 async fn ue_fixture_no_config_extracts_zero_aactor_symbols() {
     // Same fixture content (`Object.h`/`Actor.h`/`ActorComponent.h`), but
     // overwrite the `.code-graph.toml` with one that has BOTH strip lists
-    // empty (the unconfigured-user baseline). The plan task description
-    // permits "omit `macro_strip` entirely" as an option; empirically on
+    // empty (the unconfigured-user baseline). Omitting `macro_strip`
+    // entirely is an equivalent option; empirically on
     // this fixture, leaving the bare-word `_API` macros in place defeats
     // tree-sitter's class extraction on the very first declaration —
     // `class ENGINE_API AActor : public UObject {` — independent of the
@@ -392,7 +392,7 @@ macro_strip_with_args = []
     );
 }
 
-/// Phase 4.6 follow-up — pins the `macro_strip = [], macro_strip_with_args =
+/// Follow-up — pins the `macro_strip = [], macro_strip_with_args =
 /// [...]` code path through `CppParser::preprocess`. The two preset-on/preset-
 /// off tests above always populate both lists; this one isolates the case
 /// where pass 1 (`strip_macros`) is a no-op (returns `Cow::Borrowed`) and

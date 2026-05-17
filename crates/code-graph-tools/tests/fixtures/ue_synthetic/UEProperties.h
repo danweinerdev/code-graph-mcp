@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — UPROPERTY shapes. Fields are not extracted
+// Synthetic UE fixture — UPROPERTY shapes. Fields are not extracted
 // as Symbol records by the parser (fields aren't in the definition queries),
 // so this file's role is to confirm UPROPERTY(...) macros don't break the
 // surrounding class extraction even when their args are complex.

@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — DECLARE_*_DELEGATE shapes at module scope.
+// Synthetic UE fixture — DECLARE_*_DELEGATE shapes at module scope.
 // Delegate macros expand to type definitions; after stripping, only the
 // surviving non-macro content (classes below) should produce symbols.
 

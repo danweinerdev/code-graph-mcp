@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — adversarial cases. Each negative case
+// Synthetic UE fixture — adversarial cases. Each negative case
 // asserts that a macro lookalike in a non-code region is NOT stripped.
 
 // (a) Macro lookalike inside a `//` line comment must NOT trigger a strip.

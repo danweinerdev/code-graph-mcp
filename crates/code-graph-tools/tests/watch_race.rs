@@ -1,6 +1,6 @@
 //! Watch + analyze race regression and editor-rename coalescing tests.
 //!
-//! Phase 4.2 verification headline: spawn a watch loop on a tempdir AND a
+//! Verification headline: spawn a watch loop on a tempdir AND a
 //! parallel `analyze_codebase` loop on the same dir AND mutate files in
 //! the tempdir, all concurrent. Assert no panics, no deadlocks, every
 //! query returns a coherent snapshot. The index_lock is the load-bearing
@@ -163,7 +163,7 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                     } else {
                         let parsed: serde_json::Value =
                             serde_json::from_str(&body).expect("body is JSON");
-                        // Phase 3: expect Page<SymbolResult> envelope.
+                        // Expect Page<SymbolResult> envelope.
                         assert!(parsed["results"].is_array(), "non-envelope body: {body}");
                     }
                 }
@@ -232,7 +232,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
         "expected file to be reindexed; got error: {body}"
     );
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    // Phase 3: response is now a Page<SymbolResult> envelope.
+    // The response is a Page<SymbolResult> envelope.
     let arr = parsed["results"].as_array().expect("results array");
     let names: Vec<&str> = arr.iter().filter_map(|s| s["name"].as_str()).collect();
     assert_eq!(

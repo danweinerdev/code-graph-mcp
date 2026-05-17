@@ -9,7 +9,7 @@
 //! Per-file breakdowns are also asserted so a regression is localized to
 //! a single fixture rather than reporting only the global total drift.
 //!
-//! Edge-case coverage (per Phase 2.6 verification):
+//! Edge-case coverage:
 //!   - empty file (zero bytes) → 0 symbols, 0 edges, no panic
 //!   - comments-only file → same
 //!   - syntax-error file → parser skips ERROR nodes gracefully (4
@@ -306,8 +306,8 @@ fn broken_file_recovers_around_error_nodes_without_panic() {
     // recovered tree, but `Foo` (the enclosing class), `Good` (the
     // sibling method after Bar), and the subsequent `AlsoGood` class
     // with its `Run` method all extract. The recovered count is
-    // **4**, NOT zero — mirrors the Phase 7 `broken.py` discovery
-    // (tree-sitter recovers more than expected).
+    // **4**, NOT zero — mirrors the `broken.py` partial-recovery
+    // behavior (tree-sitter recovers more than expected).
     let parser = CSharpParser::new().expect("CSharpParser::new");
     let corpus = parse_corpus(&parser);
     let broken = corpus.get("broken.cs").expect("broken.cs in corpus");

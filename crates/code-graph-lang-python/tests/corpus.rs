@@ -9,7 +9,7 @@
 //! Per-file breakdowns are also asserted so a regression is localized to
 //! a single fixture rather than reporting only the global total drift.
 //!
-//! Edge-case coverage (per Phase 7.6 verification):
+//! Edge-case coverage:
 //!   - empty file (zero bytes) → 0 symbols, 0 edges, no panic
 //!   - comments-only file → same
 //!   - syntax-error file → parser skips ERROR nodes gracefully

@@ -1,14 +1,14 @@
 //! Phase 3.6 watch-mode reindex regression test for the Java parser.
 //!
-//! Mirrors `watch_csharp_reindex.rs` (Phase 2.6) and the analogous Go /
+//! Mirrors `watch_csharp_reindex.rs` and the analogous Go /
 //! Python / Rust tests but drives the Java plugin instead. The point is
 //! to confirm:
 //!
 //!   1. The watch path's `try_reindex_file` works end-to-end against
 //!      real `.java` source — same `index_lock` + parse + reconstruct +
-//!      merge pipeline that ships in Phase 4.2.
-//!   2. `Graph::prune_dangling_edges` (the invariant that closed the
-//!      Phase 4.2 dangling-edge bug) is exercised by Java changes for
+//!      merge pipeline the watch reindex uses.
+//!   2. `Graph::prune_dangling_edges` (the invariant that prevents
+//!      dangling edges after a re-parse) is exercised by Java changes for
 //!      BOTH edge kinds — `Inherits` AND `Calls`. When `Beta` is
 //!      removed from `Models.java` by a re-parse, no `adj`/`radj` entries
 //!      continue to point at the removed `Beta` symbol's ID (the
@@ -172,14 +172,14 @@ fn derived_from(body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// CRITICAL — Phase 3.6 verification: a watch-driven reindex of a
+/// CRITICAL: a watch-driven reindex of a
 /// `.java` file that removes a class (and removes the only call to its
 /// constructor) must:
 ///   1. Drop the removed class symbol AND its method from the graph.
 ///   2. Surface the new class symbol on subsequent queries.
 ///   3. NOT leave any dangling `Inherits` edge with `from = "Beta"`
 ///      (this is the inheritance half of `Graph::prune_dangling_edges`
-///      from Phase 4.2 — pruning must hold for Java the same way it
+///      — pruning must hold for Java the same way it
 ///      does for C++/Rust/Go/Python/C#).
 ///   4. NOT leave any dangling `Calls` edge from `Delta::useBeta` to
 ///      `Beta` (the calls half — both edge kinds flow through the
@@ -457,8 +457,8 @@ class Gamma extends Alpha { public void m() { } }\n",
     drop(dir);
 }
 
-/// CRITICAL — Phase 3.6 anonymous-class lifecycle (Decision 4
-/// discriminator):
+/// CRITICAL — anonymous-class lifecycle (anonymous classes are invisible
+/// to the symbol index):
 ///
 /// Java does NOT have C#'s partial-class construct. The load-bearing
 /// Java-specific discriminator is anonymous-class behavior:
@@ -681,7 +681,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     drop(dir);
 }
 
-/// Phase 3.6 lifecycle test: `watch_start` against a Java temp project
+/// Lifecycle test: `watch_start` against a Java temp project
 /// must succeed, `watch_stop` must clean up. Distinct from the
 /// deterministic-edit tests above so a watcher-construction or
 /// shutdown regression is not masked by the per-edit pipeline.

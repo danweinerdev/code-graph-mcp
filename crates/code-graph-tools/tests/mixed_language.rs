@@ -1,6 +1,5 @@
-//! Phase 5.6 + 6.6 + 7.7 + 4.2 integration tests — exercise the full
-//! MCP-server path with the C++, Rust, Go, Python, C#, and Java language
-//! plugins registered.
+//! Integration tests — exercise the full MCP-server path with the C++,
+//! Rust, Go, Python, C#, and Java language plugins registered.
 //!
 //! All six plugins share the [`LanguageRegistry`]; this file confirms
 //! they coexist correctly and that the symbol/edge surface continues to
@@ -16,7 +15,7 @@
 //! `foo.rs`, `foo.go`, and `foo.py` — all defining `helper`) so the
 //! search-by-language tests assert per-language isolation deterministically
 //! with a single shared anchor. The trait/diagram pieces use
-//! `testdata/rust/` (the Phase 5.5 corpus) so the assertions ride on the
+//! `testdata/rust/` (the Rust corpus) so the assertions ride on the
 //! existing manifest-locked symbol set rather than a parallel inline
 //! fixture. The Go interface and cross-language `init`-collision pieces
 //! use inline fixtures synthesized per-test inside a TempDir so they
@@ -118,8 +117,7 @@ async fn build_indexed_from_dir(dir: TempDir) -> IndexedFixture {
 
 // ---------------------------------------------------------------------
 // Mixed C++ + Rust + Go + Python indexing — all four `helper` symbols
-// must coexist. Phase 7.7 widened the original 3-language assertion to
-// cover the fourth (and final) plugin.
+// must coexist across the four language plugins.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -168,13 +166,12 @@ async fn mixed_cpp_rust_go_python_indexes_all_four() {
 
 /// Infer the language of a `search_symbols` result from its `file`
 /// extension. The wire format (`SymbolResult`) deliberately omits the
-/// `language` field — Phase 1 keeps the JSON shape byte-identical with
-/// the Go reference, which never serialized it. Phase 3.4 of
-/// `PaginatedResponseSizeSafety` then dropped the `file` field as well
-/// (the `id` already encodes it via `file:name` /
+/// `language` field — the JSON shape stays byte-identical with the Go
+/// reference, which never serialized it. The `file` field was later
+/// dropped too (the `id` already encodes it via `file:name` /
 /// `file:Parent::name`), so this helper now recovers the file path via
 /// [`code_graph_core::id_to_file`] on the `id` field — the documented
-/// inverse contract from Phase 1.4.
+/// inverse contract of the `id`-to-file split.
 ///
 /// The file extension is the next-cheapest discriminant and is
 /// unambiguous for the mixed fixture (`.cpp` ↔ Cpp, `.rs` ↔ Rust, `.go`
@@ -202,10 +199,9 @@ fn language_from_file(file: &str) -> &'static str {
 /// Pull a per-result language tag out of a `search_symbols` response,
 /// using the file extension as the discriminant (see `language_from_file`).
 /// Recovers the file portion from each record's `id` via
-/// [`code_graph_core::id_to_file`] — Phase 3.4 of
-/// `PaginatedResponseSizeSafety` removed the dedicated `file` field from
-/// `SymbolResult` records because it duplicated information already in
-/// the `id`.
+/// [`code_graph_core::id_to_file`] — the dedicated `file` field was
+/// removed from `SymbolResult` records because it duplicated information
+/// already in the `id`.
 fn result_languages(body: &str) -> Vec<&'static str> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).expect("search_symbols returns JSON");
@@ -348,7 +344,7 @@ async fn search_helper_language_python_returns_only_python() {
 }
 
 // ---------------------------------------------------------------------
-// get_class_hierarchy on a Rust trait — regression for Phase 2's
+// get_class_hierarchy on a Rust trait — regression for the
 // widened {Class, Struct, Interface, Trait} root filter.
 // ---------------------------------------------------------------------
 
@@ -356,8 +352,8 @@ async fn search_helper_language_python_returns_only_python() {
 async fn get_class_hierarchy_for_rust_trait() {
     let fx = build_indexed(&testdata_rust_path()).await;
     // `Greet` is the trait that `Greeter` implements (see
-    // `testdata/rust/src/traits.rs`). Pre-Phase 2 the lookup would have
-    // narrowed to {Class, Struct, Interface} and skipped the trait — so
+    // `testdata/rust/src/traits.rs`). With a root filter narrowed to
+    // {Class, Struct, Interface} the lookup would skip the trait — so
     // the success of this lookup is the regression assertion.
     let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
     assert!(
@@ -366,7 +362,7 @@ async fn get_class_hierarchy_for_rust_trait() {
     );
 
     let body = first_text(&r);
-    // Phase 4: response is wrapped — `{hierarchy, truncated, ...}`. Tree
+    // The response is wrapped — `{hierarchy, truncated, ...}`. Tree
     // assertions read from `parsed["hierarchy"]`.
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("hierarchy is JSON");
     let hierarchy = &parsed["hierarchy"];
@@ -425,7 +421,7 @@ async fn generate_diagram_for_rust_trait_inheritance() {
         })
         .collect();
 
-    // The Phase 5.5 manifest documents three Inherits edges in
+    // The Rust corpus manifest documents three Inherits edges in
     // traits.rs: `Greeter -> Greet`, `Foo<T> -> Compute`, `Bar<T> ->
     // Compute`. The Compute-rooted diagram must surface the latter two.
     assert!(
@@ -439,20 +435,18 @@ async fn generate_diagram_for_rust_trait_inheritance() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6.6 / 7.7 / 4.2 — 5-way collision fixture across the 6-language
-// registry. Rust is excluded by design (see history below).
+// 5-way collision fixture across the 6-language registry. Rust is
+// excluded by design (see rationale below).
 //
 // A function named `init` exists in C++, Go, Python, C#, AND Java; the
-// `(Language, name)`-keyed `SymbolIndex` from Phase 3 must keep them
-// isolated during call resolution. Each language's caller resolves to
-// its own-language `init`; nothing leaks across language boundaries.
-// Inline fixture so it stays close to the assertions and doesn't
-// pollute the shared `testdata/mixed/` corpus.
+// `(Language, name)`-keyed `SymbolIndex` must keep them isolated during
+// call resolution. Each language's caller resolves to its own-language
+// `init`; nothing leaks across language boundaries. Inline fixture so
+// it stays close to the assertions and doesn't pollute the shared
+// `testdata/mixed/` corpus.
 //
-// History: Phase 6.6 shipped this as a 2-way (C++ + Go) regression;
-// Phase 7.7 widened to 3-way (C++ + Go + Python); Phase 4.2 of the
-// CSharpJavaSupport plan widens to 5-way (adds C# and Java) to confirm
-// the SymbolIndex keying scales with the fifth and sixth plugins. Rust
+// The collision spans five languages (C++, Go, Python, C#, Java) to
+// confirm the SymbolIndex keying scales as plugins are added. Rust
 // is excluded by design: Rust's `init` would parse as an ordinary
 // function and would add no new structural pressure (the load-bearing
 // assertion is asymmetric isolation across distinct *languages*, not
@@ -579,7 +573,7 @@ async fn search_init_returns_all_five_languages() {
 /// CRITICAL regression: with `init` defined in C++, Go, Python, C#, AND
 /// Java, the in-language caller's `Calls` edge must resolve to the
 /// same-language `init`. The (Language, name) keying of `SymbolIndex`
-/// (Phase 3 invariant at `crates/code-graph-lang/src/lib.rs:116`) is
+/// (invariant at `crates/code-graph-lang/src/lib.rs:116`) is
 /// what prevents any caller from showing up in another language's
 /// init's caller list. If that keying ever degrades to bare `name`,
 /// callers from one language would be candidates for another language's
@@ -590,8 +584,8 @@ async fn search_init_returns_all_five_languages() {
 /// that's **5 positive assertions plus 5 × 4 = 20 negative assertions**
 /// (each ordered pair), all of which must hold simultaneously. The
 /// asymmetric (positive AND negative) shape is the load-bearing pattern
-/// — Phase 6 debrief of RustRewrite established this, Phase 7 confirmed,
-/// and Phase 4.2 of CSharpJavaSupport widens to five.
+/// that catches a keying degradation, and it scales to all five
+/// colliding languages.
 #[tokio::test]
 async fn cross_language_init_callers_stay_isolated() {
     let fx = build_init_collision_fixture().await;
@@ -616,8 +610,8 @@ async fn cross_language_init_callers_stay_isolated() {
 
     /// Pull the `symbol_id` field from each entry in a `get_callers`
     /// response. Local helper — not pulled out to module scope because
-    /// only this test consumes the shape. Phase 3: callers response is now
-    /// a `Page<CallChain>` envelope with the rows under `results`.
+    /// only this test consumes the shape. The callers response is a
+    /// `Page<CallChain>` envelope with the rows under `results`.
     fn caller_ids(envelope: &serde_json::Value) -> Vec<String> {
         envelope["results"]
             .as_array()
@@ -714,14 +708,13 @@ async fn cross_language_init_callers_stay_isolated() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6.6 — get_class_hierarchy on a Go interface.
+// get_class_hierarchy on a Go interface.
 //
 // Go interfaces are structural — a concrete type satisfies an interface
 // by having the right method set, with no syntactic declaration. The
-// Go parser emits zero `Inherits` edges (Phase 6.2 design). The
-// hierarchy lookup must still succeed (Phase 2 widened the root filter
-// to `{Class, Struct, Interface, Trait}`), and the result must show
-// empty `bases` and `derived` arrays.
+// Go parser emits zero `Inherits` edges. The hierarchy lookup must
+// still succeed (the root filter accepts `{Class, Struct, Interface,
+// Trait}`), and the result must show empty `bases` and `derived` arrays.
 // ---------------------------------------------------------------------
 
 /// Synthesize a TempDir with a Go interface plus a struct that
@@ -744,12 +737,12 @@ async fn get_class_hierarchy_for_go_interface() {
     let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
-        "get_class_hierarchy must succeed for a Go interface (Phase 2 \
-         widened root filter accepts Interface): {r:?}",
+        "get_class_hierarchy must succeed for a Go interface (root \
+         filter accepts Interface): {r:?}",
     );
 
     let body = first_text(&r);
-    // Phase 4: tree lives under `parsed["hierarchy"]`.
+    // The tree lives under `parsed["hierarchy"]`.
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("hierarchy is JSON");
     let hierarchy = &parsed["hierarchy"];
     assert_eq!(
@@ -779,6 +772,6 @@ async fn get_class_hierarchy_for_go_interface() {
     assert!(
         derived_empty,
         "Go interface has no derived types — structural implementation \
-         is NOT represented as an edge (Phase 6.2 design intent); got: {parsed}",
+         is NOT represented as an edge (by design); got: {parsed}",
     );
 }

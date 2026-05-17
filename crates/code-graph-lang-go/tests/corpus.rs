@@ -9,7 +9,7 @@
 //! Per-file breakdowns are also asserted so a regression is localized to
 //! a single fixture rather than reporting only the global total drift.
 //!
-//! Edge-case coverage (per Phase 6.5 verification):
+//! Edge-case coverage:
 //!   - empty file with only `package` clause (`empty.go`)
 //!   - interface embedding interface (`Repo embeds Closer`,
 //!     `ReadWriter embeds Reader`)

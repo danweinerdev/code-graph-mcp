@@ -1,4 +1,4 @@
-//! Acceptance regression test for `PaginatedResponseSizeSafety` Phase 5.
+//! Acceptance regression test for paginated-response byte-budget safety.
 //!
 //! # Failure mode this test pins
 //!
@@ -11,14 +11,14 @@
 //! ceiling. The user could not page past the error: there was no
 //! truncation, no continuation hint, no recoverable state.
 //!
-//! Phases 1-4 added the byte budget (`[response].max_bytes`, default
-//! 102,400), the `{truncated, next_offset}` pagination envelope, the
-//! `count_only` short-circuit, and the `SymbolResult.file` drop. This
-//! test file's contract is that **no future refactor can re-introduce the
-//! 74K-token payload**. If the assertions below ever start failing, the
-//! plan's guard rails have been bypassed in some way and the original bug
-//! is back. The fix is to restore the byte-budget enforcement, not to
-//! loosen the assertions.
+//! The byte budget (`[response].max_bytes`, default 102,400), the
+//! `{truncated, next_offset}` pagination envelope, the `count_only`
+//! short-circuit, and the `SymbolResult.file` drop together prevent
+//! that payload. This test file's contract is that **no future refactor
+//! can re-introduce the 74K-token payload**. If the assertions below
+//! ever start failing, those guard rails have been bypassed in some way
+//! and the original bug is back. The fix is to restore the byte-budget
+//! enforcement, not to loosen the assertions.
 //!
 //! # Mechanism
 //!
@@ -47,12 +47,12 @@
 //! "responses fit 102,400 bytes" — same shape, the constant just keeps
 //! the two halves in sync.
 //!
-//! # Task 5.3 (count_only smoke tests) lands in this same file
+//! # count_only smoke tests in this same file
 //!
 //! Three tiny tests asserting `serde_json::to_string(&response).len() <
 //! 1024` for `get_orphans` / `search_symbols` / `get_file_symbols` with
-//! `count_only=true`. They will be added beneath the two acceptance tests
-//! and rely on the same fixture-building helper.
+//! `count_only=true`. They sit beneath the two acceptance tests and rely
+//! on the same fixture-building helper.
 
 mod common;
 use common::first_text;
@@ -420,7 +420,7 @@ async fn search_symbols_under_budget_at_limit_1000() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 5.3: count_only smoke tests
+// count_only smoke tests
 // ---------------------------------------------------------------------------
 //
 // Each test calls one of `get_orphans` / `search_symbols` /
@@ -458,7 +458,7 @@ async fn count_only_under_1kb_orphans() {
     let body_len = body.len();
     let (results_len, total, truncated, next_offset) = page_summary(&r);
 
-    // The 1KB contract. Phase 3.2's count-only sentinel envelope is
+    // The 1KB contract. The count-only sentinel envelope is
     // engineered to fit well under this ceiling regardless of fixture
     // size — `total` is the only variable-width field and it's a single
     // u32. If this fails, someone has added a per-call metadata field

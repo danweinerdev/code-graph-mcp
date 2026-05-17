@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — UCLASS shapes and inheritance.
+// Synthetic UE fixture — UCLASS shapes and inheritance.
 // Each class below exercises a specific parameterized-macro variant.
 
 // (a) Parameterless UCLASS()

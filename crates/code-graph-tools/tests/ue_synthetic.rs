@@ -1,7 +1,7 @@
-//! UE-pattern exhaustive synthetic fixture — `UeMacroSupport` Phase 5.
+//! UE-pattern exhaustive synthetic fixture.
 //!
-//! Replaces the original "third-party UE plugin submodule" plan with an
-//! in-tree fixture that exercises every macro shape we claim to handle.
+//! Uses an in-tree fixture rather than a third-party UE plugin submodule
+//! to exercise every macro shape we claim to handle.
 //! Compared to a submodule:
 //!
 //! - Deterministic: assertions are exact symbol-presence checks, not the
@@ -148,7 +148,7 @@ fn count_exact(inner: &Arc<ServerInner>, name: &str) -> u64 {
     parsed["total"].as_u64().unwrap_or(0)
 }
 
-/// Phase 5 Test 1 — class/method/property shapes across the headline
+/// Test 1 — class/method/property shapes across the headline
 /// fixture files. Every expected class and method MUST extract; absence
 /// is a real regression of the parameterized-macro scanner.
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn ue_synthetic_class_method_property_shapes_extract() {
     }
 }
 
-/// Phase 5 Test 2 — `USTRUCT` and `UENUM` shapes.
+/// Test 2 — `USTRUCT` and `UENUM` shapes.
 #[tokio::test]
 async fn ue_synthetic_struct_and_enum_shapes_extract() {
     let fx = build_indexed().await;
@@ -241,7 +241,7 @@ async fn ue_synthetic_struct_and_enum_shapes_extract() {
     }
 }
 
-/// Phase 5 Test 3 — edge cases (positive). After every adversarial macro
+/// Test 3 — edge cases (positive). After every adversarial macro
 /// lookalike (in comment, in string, with nested parens, with parens
 /// inside a string inside a meta block), the scanner must correctly
 /// resume normal scanning and let the real class declarations below
@@ -266,7 +266,7 @@ async fn ue_synthetic_edge_cases_real_classes_extract() {
     }
 }
 
-/// Phase 5 Test 4 — negative assertions. Macro lookalikes inside strings
+/// Test 4 — negative assertions. Macro lookalikes inside strings
 /// and comments must NOT have spawned fake symbols. And the documented
 /// "user function named like a macro disappears" case must hold for the
 /// `UCLASS` function in the collision file.

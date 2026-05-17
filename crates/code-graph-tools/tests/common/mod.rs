@@ -21,7 +21,7 @@ pub fn testdata_cpp_path() -> PathBuf {
     testdata_subdir("cpp")
 }
 
-/// Resolve the source `testdata/mixed` directory (Phase 5.6 cross-language
+/// Resolve the source `testdata/mixed` directory (cross-language
 /// fixture: `foo.cpp` + `foo.rs`, both defining `helper`). Canonicalizes
 /// for the same reason as `testdata_cpp_path`.
 #[allow(dead_code)]
@@ -29,16 +29,16 @@ pub fn testdata_mixed_path() -> PathBuf {
     testdata_subdir("mixed")
 }
 
-/// Resolve the source `testdata/rust` directory (Phase 5.5 fixture).
+/// Resolve the source `testdata/rust` directory (Rust corpus fixture).
 /// Canonicalizes for the same reason as `testdata_cpp_path`.
 #[allow(dead_code)]
 pub fn testdata_rust_path() -> PathBuf {
     testdata_subdir("rust")
 }
 
-/// Resolve the source `testdata/ue` directory (CppMacroStrip Phase 3.1
-/// fixture: a hand-crafted UE-style header with API-export macros plus a
-/// `.code-graph.toml` declaring the matching `[cpp].macro_strip`).
+/// Resolve the source `testdata/ue` directory (a hand-crafted UE-style
+/// header with API-export macros plus a `.code-graph.toml` declaring the
+/// matching `[cpp].macro_strip`).
 /// Canonicalizes for the same reason as `testdata_cpp_path`.
 #[allow(dead_code)]
 pub fn testdata_ue_path() -> PathBuf {
@@ -65,7 +65,7 @@ pub fn copy_testdata(dest: &Path) {
 }
 
 /// Recursively copy every file under `src` into `dest`. Generic counterpart
-/// to `copy_testdata` — used by Phase 5.6 mixed-language tests that seed
+/// to `copy_testdata` — used by mixed-language tests that seed
 /// from `testdata/mixed/` or `testdata/rust/` instead of the C++ corpus.
 #[allow(dead_code)]
 pub fn copy_testdata_from(src: &Path, dest: &Path) {
@@ -93,7 +93,7 @@ pub fn copy_testdata_from(src: &Path, dest: &Path) {
 /// `get_file_symbols` against a Go interface plus a struct that
 /// structurally implements it. The struct must NOT show up as `derived`
 /// for the interface — Go interfaces are structural, so the parser emits
-/// zero `Inherits` edges (Phase 6.2 design). Centralized here so both
+/// zero `Inherits` edges. Centralized here so both
 /// call sites stay byte-identical and any future shape tweak lands in
 /// one place.
 #[allow(dead_code)]

@@ -1,18 +1,18 @@
-//! PathNormalization Phase 3.4 — end-to-end verification that the four
-//! file-taking MCP tools (`get_file_symbols`, `get_coupling`,
-//! `get_dependencies`, `generate_diagram(file=…)`) resolve short-form path
-//! arguments after a real `analyze_codebase` round-trip.
+//! End-to-end verification that the four file-taking MCP tools
+//! (`get_file_symbols`, `get_coupling`, `get_dependencies`,
+//! `generate_diagram(file=…)`) resolve short-form path arguments after a
+//! real `analyze_codebase` round-trip.
 //!
 //! On Linux this is effectively a non-regression check: paths are already
 //! canonical and `normalize_user_path` is a near-identity transform, so the
-//! test's value is "the handler wrap from 3.1/3.2 didn't break the happy
-//! path." On Windows this same test becomes the load-bearing fix
-//! verification: the indexer stores short-form `D:\…` keys (Phase 1),
+//! test's value is "the handler `normalize_user_path` wrap didn't break the
+//! happy path." On Windows this same test becomes the load-bearing fix
+//! verification: the indexer stores short-form `D:\…` keys,
 //! `normalize_user_path` strips a user-supplied `\\?\D:\…` prefix on
 //! lookup, and the handlers find the records.
 //!
-//! Fixture choice (deviation from the plan's "two Rust files" recommendation):
-//! we use a C++ fixture — `src/main.cpp` with `#include "util.h"` plus a
+//! Fixture choice: we use a C++ fixture — `src/main.cpp` with
+//! `#include "util.h"` plus a
 //! call to `helper()`, and `src/util.h` which *defines* `helper()` inline.
 //! C++ is required here (not Rust) because the include-graph contract is
 //! "an Includes edge survives only if it resolves to an indexed source
@@ -76,7 +76,7 @@ struct Indexed {
     inner: Arc<ServerInner>,
     /// `root_path` field captured from the `analyze_codebase` response. On
     /// Linux this is the canonical absolute path; on Windows it should be
-    /// the short form (no `\\?\` prefix) after Phase 1.
+    /// the short form (no `\\?\` prefix) once the indexer canonicalizes.
     root_path: String,
     /// Absolute path to `src/main.cpp` inside the tempdir, used as the
     /// short-form `file` argument for each of the 4 tools under test.
@@ -157,9 +157,9 @@ async fn build_indexed() -> Indexed {
         .to_owned();
 
     // Use the canonicalized paths the indexer stores — these ARE the
-    // short-form paths on every platform after PathNormalization Phase 1
-    // (no `\\?\` prefix on Windows). Passing them through to the 4 tools
-    // exercises the handler wrap from 3.1/3.2: on Linux a no-op identity,
+    // short-form paths on every platform (no `\\?\` prefix on Windows).
+    // Passing them through to the 4 tools exercises the handler
+    // `normalize_user_path` wrap: on Linux a no-op identity,
     // on Windows a real prefix-strip path.
     let main_cpp = indexed_root
         .join("src")
@@ -194,7 +194,7 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     //
     // On Linux this is trivially true (no `\\?\` ever appears in
     // canonical POSIX paths). On Windows it's the load-bearing assertion
-    // that PathNormalization Phase 1 stripped the extended-path prefix
+    // that the indexer stripped the extended-path prefix
     // before storing the root.
     assert!(
         !fx.root_path.contains(r"\\?\"),
@@ -365,7 +365,8 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
 /// Closes the Linux-observability gap of the canonical-path test above.
 ///
 /// The canonical paths returned by `analyze_codebase`'s `root_path` field
-/// are already in their final form on every platform after Phase 1; on
+/// are already in their final form on every platform once the indexer
+/// canonicalizes; on
 /// Linux they are byte-equal to what `Path::new(file).to_path_buf()` would
 /// produce inside each handler, so the canonical-path test cannot
 /// distinguish "the `normalize_user_path` wrap runs" from "the wrap was

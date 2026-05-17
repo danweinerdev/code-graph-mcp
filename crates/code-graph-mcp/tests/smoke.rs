@@ -2,9 +2,9 @@
 //!
 //! Spawns the freshly-built `code-graph-mcp` debug binary, completes the
 //! `initialize` handshake, sends a `tools/list` request, and asserts that
-//! the response advertises 15 tools. Phase 3.7 expands this into a full
-//! wire-format snapshot suite; today the assertion is a coarse
-//! compile-and-handshake gate.
+//! the response advertises 15 tools. The full wire-format snapshot
+//! suite lives in `code-graph-tools`'s snapshot tests; this assertion
+//! is a coarse compile-and-handshake gate.
 //!
 //! This complements the unit-level `tool_router_registers_fifteen_tools`
 //! test in `code-graph-tools::server` — that test never starts the IO loop,

@@ -1,14 +1,14 @@
 //! Phase 7.6 watch-mode reindex regression test for the Python parser.
 //!
-//! Mirrors `watch_go_reindex.rs` (Phase 6.5) and `watch_rust_reindex.rs`
-//! (Phase 5.5) but drives the Python plugin instead of Go / Rust. The
+//! Mirrors `watch_go_reindex.rs` and `watch_rust_reindex.rs`
+//! but drives the Python plugin instead of Go / Rust. The
 //! point is to confirm:
 //!
 //!   1. The watch path's `try_reindex_file` works end-to-end against
 //!      real `.py` source — same `index_lock` + parse + reconstruct +
-//!      merge pipeline that ships in Phase 4.2.
-//!   2. `Graph::prune_dangling_edges` (the invariant that closed the
-//!      Phase 4.2 dangling-edge bug) is exercised by Python changes for
+//!      merge pipeline the watch reindex uses.
+//!   2. `Graph::prune_dangling_edges` (the invariant that prevents
+//!      dangling edges after a re-parse) is exercised by Python changes for
 //!      BOTH edge kinds — `Inherits` AND `Calls`. When `Beta` is removed
 //!      from `models.py` by a re-parse, no `adj`/`radj` entries continue
 //!      to point at the removed `Beta` symbol's ID (the dangling `Calls`
@@ -73,7 +73,7 @@ fn seed_python_project_with_alpha_beta_delta() -> (TempDir, PathBuf) {
 }
 
 /// Pull symbol names out of a `get_file_symbols` JSON response body.
-/// Phase 3: response is now a `Page<SymbolResult>` envelope with the rows
+/// The response is a `Page<SymbolResult>` envelope with the rows
 /// under `results`.
 fn symbol_names_from(body: &str) -> Vec<String> {
     let parsed: serde_json::Value =
@@ -89,7 +89,7 @@ fn symbol_names_from(body: &str) -> Vec<String> {
 }
 
 /// Pull derived class names out of a `get_class_hierarchy` JSON response
-/// body. Phase 4 wraps the response: `{hierarchy: {name, bases, derived},
+/// body. The response is wrapped: `{hierarchy: {name, bases, derived},
 /// truncated, max_nodes, total_nodes_seen}`. The tree itself lives under
 /// `parsed["hierarchy"]`; `derived` is a list of `HierarchyNode` objects
 /// (each with its own `name` field), not bare strings. `bases` and
@@ -108,14 +108,14 @@ fn derived_from(body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// CRITICAL — Phase 7.6 verification: a watch-driven reindex of a `.py`
+/// CRITICAL: a watch-driven reindex of a `.py`
 /// file that removes a class (and removes the only call to its
 /// constructor) must:
 ///   1. Drop the removed class symbol AND its method from the graph.
 ///   2. Surface the new class symbol on subsequent queries.
 ///   3. NOT leave any dangling `Inherits` edge with `from = "Beta"`
 ///      (this is the inheritance half of `Graph::prune_dangling_edges`
-///      from Phase 4.2 — pruning must hold for Python the same way it
+///      — pruning must hold for Python the same way it
 ///      does for C++/Rust/Go).
 ///   4. NOT leave any dangling `Calls` edge from `Delta::use_beta` to
 ///      `Beta` (the calls half — both edge kinds flow through the same
@@ -203,7 +203,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     );
     let pre_callee_body: serde_json::Value =
         serde_json::from_str(&first_text(&r)).expect("get_callees response is JSON");
-    // Phase 3: callees response is now a Page<CallChain> envelope.
+    // The callees response is a Page<CallChain> envelope.
     let pre_callee_ids: Vec<String> = pre_callee_body["results"]
         .as_array()
         .expect("results array")
@@ -341,7 +341,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         // Defensive branch — in case the deleted-from symbol survives
         // somehow, we still must not see Beta as a callee.
         let parsed: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-        // Phase 3: callees response is now a Page<CallChain> envelope.
+        // The callees response is a Page<CallChain> envelope.
         let post_callee_ids: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()
@@ -390,7 +390,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     drop(dir);
 }
 
-/// Phase 7.6 lifecycle test: `watch_start` against a Python temp project
+/// Lifecycle test: `watch_start` against a Python temp project
 /// must succeed, `watch_stop` must clean up. Distinct from the
 /// deterministic-edit test above so a watcher-construction or shutdown
 /// regression is not masked by the per-edit pipeline.

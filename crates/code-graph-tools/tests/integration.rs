@@ -8,9 +8,9 @@
 //!   triggers re-parse.
 //!
 //! They invoke the handler functions directly (not the rmcp router)
-//! because Phase 3.7 already covers the wire envelope via the snapshot
-//! suite. Direct invocation lets the tests assert against the
-//! `CallToolResult` body without juggling stdio/JSON-RPC plumbing.
+//! because the snapshot suite already covers the wire envelope. Direct
+//! invocation lets the tests assert against the `CallToolResult` body
+//! without juggling stdio/JSON-RPC plumbing.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -80,7 +80,7 @@ async fn analyze_then_query_pipeline() {
     );
     assert!(sr.is_error.is_none() || sr.is_error == Some(false));
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&sr)).unwrap();
-    // Phase 3: response is now a Page<SymbolResult> envelope.
+    // The response is a Page<SymbolResult> envelope.
     let arr = parsed["results"].as_array().expect("results array");
     assert!(!arr.is_empty(), "engine.cpp has at least one symbol");
 
@@ -111,8 +111,8 @@ async fn analyze_then_query_pipeline() {
     );
 
     // detect_cycles surfaces the circular_a/circular_b cycle. Wrapped in
-    // the Page<Vec<String>> envelope post-Phase 5 of the deferred-items
-    // ship — the cycle is in `results[0]`, count in `total`.
+    // the Page<Vec<String>> envelope — the cycle is in `results[0]`,
+    // count in `total`.
     let cycles = detect_cycles(&server.inner.graph, None, None, None);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&cycles)).unwrap();
     let arr = parsed["results"].as_array().expect("results array");
@@ -203,7 +203,7 @@ async fn analyze_bad_path_returns_directory_not_found() {
 
 #[tokio::test]
 async fn analyze_path_is_file_returns_not_a_directory() {
-    // Deliberate Rust-side divergence (Phase 3.4 carry-forward): Go
+    // Deliberate Rust-side divergence from the Go reference: Go
     // collapses this into "directory does not exist", but Rust's
     // canonicalize already distinguishes "missing" from "file" so we
     // surface the richer wording. This test locks the wording in.

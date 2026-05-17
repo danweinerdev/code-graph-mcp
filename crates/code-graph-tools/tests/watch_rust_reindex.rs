@@ -1,13 +1,13 @@
 //! Phase 5.5 watch-mode reindex regression test for the Rust parser.
 //!
-//! Mirrors the structure of `watch_dangling_edges.rs` (Phase 4.2) but
+//! Mirrors the structure of `watch_dangling_edges.rs` but
 //! drives the Rust plugin instead of C++. The point is to confirm:
 //!
 //!   1. The watch path's `try_reindex_file` works end-to-end against
 //!      real `.rs` source — same `index_lock` + parse + reconstruct +
-//!      merge pipeline that ships in Phase 4.2.
-//!   2. `Graph::prune_dangling_edges` (the invariant that closed the
-//!      Phase 4.2 dangling-edge bug) is exercised by Rust changes the
+//!      merge pipeline the watch reindex uses.
+//!   2. `Graph::prune_dangling_edges` (the invariant that prevents
+//!      dangling edges after a re-parse) is exercised by Rust changes the
 //!      same way it is by C++ changes — when a symbol is removed from
 //!      a file by a re-parse, no `adj`/`radj` entries continue to point
 //!      at the removed ID from any caller.
@@ -73,7 +73,7 @@ fn seed_rust_project_with_alpha_beta_caller() -> (TempDir, PathBuf) {
 }
 
 /// Pull symbol names out of a `get_file_symbols` JSON response body.
-/// Phase 3: response is now a `Page<SymbolResult>` envelope with the rows
+/// The response is a `Page<SymbolResult>` envelope with the rows
 /// under `results`.
 fn symbol_names_from(body: &str) -> Vec<String> {
     let parsed: serde_json::Value =
@@ -88,13 +88,13 @@ fn symbol_names_from(body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// CRITICAL — Phase 5.5 verification: a watch-driven reindex of a `.rs`
+/// CRITICAL: a watch-driven reindex of a `.rs`
 /// file that removes a function (and removes the only call to it) must:
 ///   1. Drop the removed symbol from the graph.
 ///   2. Surface the new symbol on subsequent queries.
 ///   3. NOT leave any dangling `Calls` edge pointing at the removed
 ///      symbol (this is the `Graph::prune_dangling_edges` invariant
-///      from Phase 4.2 — it must hold for the Rust plugin the same way
+///      — it must hold for the Rust plugin the same way
 ///      it does for C++).
 #[tokio::test]
 async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
@@ -160,7 +160,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
         "pre-edit callees must succeed: {r:?}"
     );
     let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
-    // Phase 3: callees response is now a Page<CallChain> envelope.
+    // The callees response is a Page<CallChain> envelope.
     let pre_callee_ids: Vec<String> = body["results"]
         .as_array()
         .unwrap()
@@ -232,7 +232,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {
         let parsed: serde_json::Value = serde_json::from_str(&post_text).unwrap();
-        // Phase 3: callees response is now a Page<CallChain> envelope.
+        // The callees response is a Page<CallChain> envelope.
         let post_callee_ids: Vec<String> = parsed["results"]
             .as_array()
             .unwrap()
@@ -286,7 +286,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     drop(dir);
 }
 
-/// Phase 5.5 lifecycle test: `watch_start` against a Rust temp project
+/// Lifecycle test: `watch_start` against a Rust temp project
 /// must succeed, `watch_stop` must clean up. Distinct from the
 /// deterministic-edit test above so a watcher-construction or shutdown
 /// regression is not masked by the per-edit pipeline.

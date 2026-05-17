@@ -22,7 +22,7 @@
 //! don't depend on key order while letting the snapshots stay stable.
 //!
 //! Vec-of-Symbol responses are sorted by the graph layer; orphans are
-//! now sorted by `symbol_id` ascending in the handler itself (Phase 2);
+//! now sorted by `symbol_id` ascending in the handler itself;
 //! BFS edge collections are not, so they are sorted in the test via
 //! [`sort_diagram_edges`] / [`sort_mermaid_lines`].
 
@@ -231,9 +231,9 @@ async fn response_search_symbols_query_engine() {
 
 #[tokio::test]
 async fn response_search_symbols_byte_budget_truncated() {
-    // Phase 2.5 of PaginatedResponseSizeSafety: a tight `max_bytes` makes
-    // the handler trim the already-sliced page that `Graph::search`
-    // returned. Architectural exception from the other four paginated
+    // A tight `max_bytes` makes the handler trim the already-sliced page
+    // that `Graph::search` returned. Architectural exception from the
+    // other four paginated
     // tools — search_symbols delegates pagination to `Graph::search`, so
     // the trim happens at the handler layer (NOT via `byte_budget_take`).
     //
@@ -271,15 +271,15 @@ async fn response_search_symbols_byte_budget_truncated() {
 
 #[tokio::test]
 async fn response_count_only_search_symbols() {
-    // Phase 3 of PaginatedResponseSizeSafety: when count_only=true,
-    // `search_symbols` returns the sentinel envelope shape `Page { results: [],
+    // When count_only=true, `search_symbols` returns the sentinel
+    // envelope shape `Page { results: [],
     // total: <real count>, offset: 0, limit: 0, truncated: false,
     // next_offset: None }`. `total` reflects the pre-pagination match count
     // from Graph::search (independent of any limit/offset). count_only opts
     // out of paging, so the `limit: 0` is a deliberate exception to the
     // "envelope echoes resolved limit" contract (see CLAUDE.md).
     //
-    // Task 3.3 threaded `count_only` into `SearchParams`, so `Graph::search`
+    // `count_only` is threaded into `SearchParams`, so `Graph::search`
     // short-circuits before the BinaryHeap<TopEntry> push/pop loop. The
     // wire-format snapshot below is unchanged — the optimization is
     // internal to Graph::search.
@@ -398,7 +398,7 @@ async fn response_get_callees_engine_update() {
     });
 }
 
-// (Phase 3) `sort_chains_by_symbol_id` removed: the handler now sorts the
+// `sort_chains_by_symbol_id` removed: the handler now sorts the
 // `Vec<CallChain>` by `(depth, symbol_id)` ascending and wraps in the
 // `Page<CallChain>` envelope, so test-side normalization is no longer
 // needed. `parsed_sorted` only normalizes object key order, which is the
@@ -526,7 +526,7 @@ async fn response_get_orphans_offset_beyond_total() {
 
 #[tokio::test]
 async fn response_get_orphans_byte_budget_truncated() {
-    // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` forces
+    // A tight `max_bytes` forces
     // the handler to stop emitting records before reaching `limit`, returns
     // `truncated=true` and a `next_offset` pointing past the partial page.
     //
@@ -557,7 +557,7 @@ async fn response_get_orphans_byte_budget_truncated() {
 
 #[tokio::test]
 async fn response_count_only_orphans() {
-    // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
+    // When count_only=true,
     // `get_orphans` returns the sentinel envelope shape `Page { results: [],
     // total: <real count>, offset: 0, limit: 0, truncated: false,
     // next_offset: None }`. count_only opts out of paging, so the
@@ -618,7 +618,7 @@ async fn build_indexed_fixture_with_many_orphans(n: usize) -> IndexedFixture {
     build_cpp_only_fixture(&[("orphans.cpp", &source)]).await
 }
 
-// --- Phase 3 paginated-offset snapshots ----------------------------------
+// --- Paginated-offset snapshots ------------------------------------------
 //
 // These three snapshots exercise the page-2 path for the new
 // `Page<T>`-wrapped tools: `get_file_symbols`, `get_callers`, `get_callees`.
@@ -666,7 +666,7 @@ async fn build_indexed_fixture_with_high_fan() -> IndexedFixture {
     build_cpp_only_fixture(&[("hub.cpp", &source)]).await
 }
 
-/// Shared workhorse for the three Phase 3 paginated-fixture builders
+/// Shared workhorse for the three paginated-fixture builders
 /// (`build_indexed_fixture_with_many_orphans`,
 /// `build_indexed_fixture_with_many_file_symbols`,
 /// `build_indexed_fixture_with_high_fan`).
@@ -746,7 +746,7 @@ async fn response_get_file_symbols_paginated_offset() {
 
 #[tokio::test]
 async fn response_get_file_symbols_byte_budget_truncated() {
-    // Phase 2 of PaginatedResponseSizeSafety: a tight `max_bytes` forces
+    // A tight `max_bytes` forces
     // the handler to stop emitting records before reaching `limit`, returns
     // `truncated=true` and a `next_offset` pointing past the partial page.
     //
@@ -783,7 +783,7 @@ async fn response_get_file_symbols_byte_budget_truncated() {
 
 #[tokio::test]
 async fn response_count_only_file_symbols() {
-    // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
+    // When count_only=true,
     // `get_file_symbols` returns the sentinel envelope shape `Page {
     // results: [], total: <real count>, offset: 0, limit: 0,
     // truncated: false, next_offset: None }` after counting matches via
@@ -861,7 +861,7 @@ async fn response_get_callers_paginated_offset() {
 
 #[tokio::test]
 async fn response_get_callers_byte_budget_truncated() {
-    // Phase 2 of PaginatedResponseSizeSafety (task 2.3): a tight `max_bytes`
+    // A tight `max_bytes`
     // forces the handler to stop emitting CallChain records before reaching
     // `limit`, returns `truncated=true` and a `next_offset` pointing past
     // the partial page.
@@ -919,7 +919,7 @@ async fn response_get_callees_paginated_offset() {
 
 #[tokio::test]
 async fn response_get_callees_byte_budget_truncated() {
-    // Phase 2 of PaginatedResponseSizeSafety (task 2.4): a tight `max_bytes`
+    // A tight `max_bytes`
     // forces the handler to stop emitting CallChain records before reaching
     // `limit`, returns `truncated=true` and a `next_offset` pointing past
     // the partial page.
@@ -965,7 +965,7 @@ async fn response_get_class_hierarchy_engine() {
     });
 }
 
-/// Phase 4: truncated-case snapshot.
+/// Truncated-case snapshot.
 ///
 /// Reuses an existing fixture with a tiny `max_nodes` budget (2) to force
 /// the Graph layer to flag `truncated: true`. This is the cheapest path —
@@ -1279,7 +1279,7 @@ fn rust_parser_registers_for_rust_language() {
 }
 
 /// Sanity check for the Go parser registration alongside C++ and Rust —
-/// mirrors the Phase 6.6 registration block in
+/// mirrors the parser-registration block in
 /// `crates/code-graph-mcp/src/main.rs` so a silent removal of
 /// `code_graph_lang_go::GoParser::new()` from the binary trips this test
 /// before any of the Go-specific snapshots below.
@@ -1301,7 +1301,7 @@ fn go_parser_registers_for_go_language() {
 }
 
 /// Sanity check for the Python parser registration alongside the other
-/// three plugins — mirrors the Phase 7.7 registration block in
+/// three plugins — mirrors the parser-registration block in
 /// `crates/code-graph-mcp/src/main.rs` so a silent removal of
 /// `code_graph_lang_python::PythonParser::new()` from the binary trips
 /// this test before any of the Python-specific snapshots below.
@@ -1326,7 +1326,7 @@ fn python_parser_registers_for_python_language() {
     assert!(registry.plugin_for(Language::Cpp).is_some());
 }
 
-// --- Phase 5.6 Rust-side snapshots --------------------------------------
+// --- Rust-side snapshots ------------------------------------------------
 //
 // These four snapshots lock the wire format for representative responses
 // driven by the Rust language plugin (registered alongside the C++ one,
@@ -1337,7 +1337,7 @@ fn python_parser_registers_for_python_language() {
 //   * search_symbols(query="helper", language=Rust) — exercises the
 //     language filter path on `testdata/mixed/`.
 //   * get_class_hierarchy on `Greet` — exercises the widened
-//     {Class, Struct, Interface, Trait} root filter from Phase 2 against
+//     {Class, Struct, Interface, Trait} root filter against
 //     the testdata/rust corpus.
 //   * generate_diagram(class="Compute", format="edges") — exercises the
 //     Inherits-edge dispatch for a Rust trait with two impls.
@@ -1390,8 +1390,8 @@ async fn build_indexed_fixture_for_dir_with_all_parsers(src: &Path) -> IndexedFi
 async fn response_analyze_codebase_testdata_mixed() {
     // Capture the analyze response itself rather than discarding it inside
     // the helper — same pattern as `response_analyze_codebase_testdata_cpp`.
-    // Registers all three parsers (Phase 6.6) so the snapshot reflects the
-    // post-Phase-6 binary's runtime shape (foo.cpp + foo.rs + foo.go).
+    // Registers all three parsers so the snapshot reflects the
+    // binary's runtime shape (foo.cpp + foo.rs + foo.go).
     let dir = TempDir::new().unwrap();
     copy_testdata_from(&testdata_mixed_path(), dir.path());
     let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1478,7 +1478,7 @@ async fn response_generate_diagram_rust_trait_compute() {
     });
 }
 
-// --- Phase 6.6 Go-side snapshots ----------------------------------------
+// --- Go-side snapshots --------------------------------------------------
 //
 // These snapshots lock the wire format for representative responses
 // driven by the Go language plugin (registered alongside C++ and Rust):
@@ -1486,7 +1486,7 @@ async fn response_generate_diagram_rust_trait_compute() {
 //   * search_symbols(query="helper", language=go) — exercises the
 //     language=go filter path on `testdata/mixed/`.
 //   * get_class_hierarchy on a Go interface — exercises the widened
-//     {Class, Struct, Interface, Trait} root filter from Phase 2 with a
+//     {Class, Struct, Interface, Trait} root filter with a
 //     Go interface as the root, asserting empty bases and derived
 //     (structural implementation produces no Inherits edges in Go).
 //   * get_file_symbols on a Go file — exercises the per-file symbol
@@ -1599,7 +1599,7 @@ async fn response_get_file_symbols_go_reader() {
     });
 }
 
-// --- Phase 7.7 Python-side snapshots ------------------------------------
+// --- Python-side snapshots ----------------------------------------------
 //
 // These snapshots lock the wire format for representative responses
 // driven by the Python language plugin (registered alongside C++, Rust,
@@ -1793,7 +1793,7 @@ async fn response_get_dependencies_python_models() {
     });
 }
 
-// --- CppMacroStrip Phase 3.2 UE-side snapshots --------------------------
+// --- UE-side snapshots --------------------------------------------------
 //
 // These two snapshots prove the user-facing payoff for the CppMacroStrip
 // plan: with `[cpp].macro_strip` listed in `.code-graph.toml`, classes
@@ -1837,7 +1837,7 @@ async fn response_get_class_hierarchy_ue_double_macro() {
     // tree-sitter sees a parseable `class UDoubleMacro : public AActor`.
     // Snapshotting at default depth=1 locks the AActor parent edge through
     // the public tool surface — proving multi-macro stripping works
-    // end-to-end and not just in the Phase 1 unit test.
+    // end-to-end and not just at the unit-test layer.
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_ue_path()).await;
     let r = get_class_hierarchy(&fx.inner.graph, "UDoubleMacro", None, None);
     let parsed = parsed_sorted(&r);

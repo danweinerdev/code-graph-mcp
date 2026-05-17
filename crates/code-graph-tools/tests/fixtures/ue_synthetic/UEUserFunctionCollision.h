@@ -1,10 +1,10 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — documented behavior: when a user lists
+// Synthetic UE fixture — documented behavior: when a user lists
 // a macro name (e.g. `UCLASS`) and their codebase has a real function
 // with that name, the function disappears from the symbol index. This
-// is by design (per UeMacroSupport design Decision 4: users should not
-// list macro names that collide with real symbols in their code).
+// is by design: users should not list macro names that collide with
+// real symbols in their code.
 //
 // This file declares a function named `UCLASS` — with the preset
 // enabled, that function MUST NOT extract. The test asserts on its

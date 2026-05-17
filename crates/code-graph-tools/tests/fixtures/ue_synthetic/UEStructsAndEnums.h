@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5 synthetic UE fixture — USTRUCT and UENUM shapes.
+// Synthetic UE fixture — USTRUCT and UENUM shapes.
 
 USTRUCT(BlueprintType)
 struct SAMPLE_API FBasicStruct {

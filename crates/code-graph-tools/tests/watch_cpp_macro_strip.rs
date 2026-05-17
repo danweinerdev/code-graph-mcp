@@ -1,4 +1,4 @@
-//! Watch-mode end-to-end test for `[cpp].macro_strip` — Phase 2.4 (Test 3).
+//! Watch-mode end-to-end test for `[cpp].macro_strip`.
 //!
 //! This is the ONLY test that catches a broken `preprocess` wiring in
 //! `code-graph-tools::handlers::watch::try_reindex_file`. The other watch
@@ -32,7 +32,7 @@ fn fresh_server() -> CodeGraphServer {
     CodeGraphServer::new(registry)
 }
 
-/// Phase 2.3 verification: `try_reindex_file` must call
+/// `try_reindex_file` must call
 /// `LanguagePlugin::preprocess` with the cached `RootConfig` (the same
 /// config the most-recent `analyze_codebase` saw), so a file written
 /// under a watched root after `analyze_codebase` extracts its
@@ -101,7 +101,7 @@ async fn cpp_macro_strip_watch_mode_picks_up_cached_config() {
     // Write the macro-prefixed-class header to the watched dir AFTER
     // the watcher is up. The debouncer (250ms window) collapses the
     // notify event(s) into a single batch; the loop's per-batch
-    // reindex calls `try_reindex_file`, which is where Phase 2.3's
+    // reindex calls `try_reindex_file`, which is where the
     // `preprocess` call site lives.
     let actor_path = root.join("MyActor.h");
     std::fs::write(

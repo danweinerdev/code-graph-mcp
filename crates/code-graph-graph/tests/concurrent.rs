@@ -140,7 +140,7 @@ fn seed_graph(graph: &RwLock<Graph>) {
 
 #[test]
 fn rwlock_concurrent_readers_and_writers() {
-    // Per the Phase 2.6 verification criterion: run for ≥ 1s. We pick 1.5s as
+    // The concurrency check runs for ≥ 1s. We pick 1.5s as
     // a balance between fishing out timing-dependent issues and keeping CI
     // fast. `Instant::now() < deadline` bounds each thread independently.
     let test_duration = Duration::from_millis(1_500);
