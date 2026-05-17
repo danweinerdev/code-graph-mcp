@@ -354,6 +354,9 @@ async fn get_class_hierarchy_emits_diamond_ref_stub() {
     // Sanity: the diamond actually materialized. If the Inherits edges
     // didn't fire, the apex would be a bare leaf and the ref-stub
     // assertion below would be vacuous rather than meaningful.
+    // `derived` is `skip_serializing_if = "Vec::is_empty"`, so a
+    // childless apex omits the key entirely: `as_array()` → `None` →
+    // `unwrap_or(false)`, which correctly fires this assert.
     assert!(
         hierarchy["derived"]
             .as_array()
@@ -451,16 +454,26 @@ async fn generate_diagram_both_directions_and_no_file_node_leak() {
 
     // No edge endpoint may be an unresolved file-basename / path
     // pseudo-node. A real resolved endpoint is a symbol display name
-    // (`name` or `Parent::name`) and never contains a path separator or
-    // a source-file extension; a leaked unresolved target would render as
-    // the bare basename, e.g. `fanout.rs`.
+    // (`name` or `Parent::name`) — never a path and never a `.<ext>`
+    // form. The load-bearing guard is the path-separator check: a leaked
+    // absolute path always carries `/` (Linux) or `\` (Windows). The
+    // extension check is a belt-and-suspenders guard against a bare
+    // basename (e.g. `fanout.rs`); it spans every language the indexer
+    // handles so this pin stays valid if the fixture grows a non-Rust
+    // file. Symbol display names contain no `.`, so no false positive.
+    const SRC_EXTS: &[&str] = &[
+        ".rs", ".go", ".py", ".pyi", ".cs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+        ".hxx",
+    ];
     for e in arr {
         for end in ["from", "to"] {
             let label = e[end]
                 .as_str()
                 .unwrap_or_else(|| panic!("diagram edge {end} must be a string; edge: {e}"));
             assert!(
-                !label.contains('/') && !label.contains('\\') && !label.ends_with(".rs"),
+                !label.contains('/')
+                    && !label.contains('\\')
+                    && !SRC_EXTS.iter().any(|ext| label.ends_with(ext)),
                 "diagram edge `{end}` is a file/path pseudo-node {label:?} \
                  — an unresolved call target leaked into the rendered graph \
                  instead of being dropped. This is the original \
