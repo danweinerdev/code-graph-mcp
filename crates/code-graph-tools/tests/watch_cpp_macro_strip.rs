@@ -22,6 +22,8 @@ use code_graph_tools::handlers::watch::{watch_start, watch_stop};
 use code_graph_tools::CodeGraphServer;
 use tempfile::TempDir;
 
+mod common;
+
 /// Fresh server with the C++ parser plugin registered. Mirrors
 /// `tests/watch_race.rs::fresh_server`.
 fn fresh_server() -> CodeGraphServer {
@@ -110,9 +112,23 @@ async fn cpp_macro_strip_watch_mode_picks_up_cached_config() {
     )
     .unwrap();
 
-    // 250ms debounce + generous slack so the merge has landed before
-    // we query. Same pattern as `watch_race.rs`.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Poll until the watch pipeline has merged the new file. The
+    // FS-event → 250ms debounce → channel → parse → merge sequence has
+    // no fixed upper bound under `cargo test --workspace` load, so a
+    // one-shot sleep is a flaky cliff. We poll the file-parsed sentinel
+    // `UObject`; once it lands the merge is complete and the existing
+    // two-tier UObject/AActor assertions run immediately (a genuine
+    // macro_strip-wiring break thus fails fast, not after a fixed wait).
+    common::wait_until(Duration::from_secs(10), || {
+        server
+            .inner
+            .graph
+            .read()
+            .file_symbols(&actor_path)
+            .iter()
+            .any(|s| s.name == "UObject")
+    })
+    .await;
 
     // The macro-prefixed class must be in the graph. If
     // `try_reindex_file` skipped `preprocess` or used a default

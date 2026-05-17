@@ -129,3 +129,33 @@ pub fn ok_json(r: &CallToolResult) -> serde_json::Value {
     );
     serde_json::from_str(&first_text(r)).expect("response body must be valid JSON")
 }
+
+/// Poll `cond` every 25ms until it returns `true` or `timeout` elapses;
+/// returns whether the condition was observed.
+///
+/// Watch-mode tests wait on an asynchronous pipeline with no fixed upper
+/// bound: filesystem event → 250ms debounce window → in-process channel
+/// → parse → graph merge under the write lock. A one-shot `sleep(800ms)`
+/// is a flaky cliff — it fails whenever `cargo test --workspace`
+/// parallelism pushes that pipeline past the slack. Polling returns as
+/// soon as the merge lands (≈300ms common case) and tolerates a slow or
+/// contended CI machine up to `timeout`. `cond` returns a bool, so any
+/// read-lock guard it takes is released at the end of each call and is
+/// never held across the poll-interval await.
+#[allow(dead_code)]
+pub async fn wait_until<F>(timeout: std::time::Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}

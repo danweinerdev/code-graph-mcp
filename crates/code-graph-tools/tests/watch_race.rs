@@ -211,9 +211,28 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
     std::fs::write(&tmp, b"void editor_added() {}\n").unwrap();
     std::fs::rename(&tmp, &final_path).unwrap();
 
-    // Debounce window is 250ms; give the loop one full window plus
-    // generous slack so the merge has landed before we query.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Poll until the renamed file is queryable. The FS-event → 250ms
+    // debounce → channel → parse → merge sequence has no fixed upper
+    // bound under `cargo test --workspace` load, so a one-shot sleep is
+    // a flaky cliff. The exact-symbol assertion below is unchanged; this
+    // only waits for the merge to land instead of guessing a duration.
+    common::wait_until(Duration::from_secs(10), || {
+        let r = get_file_symbols(
+            &server.inner.graph,
+            &final_path.to_string_lossy(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
+        serde_json::from_str::<serde_json::Value>(&first_text(&r))
+            .ok()
+            .and_then(|v| v["results"].as_array().map(|a| !a.is_empty()))
+            .unwrap_or(false)
+    })
+    .await;
 
     // The file should now be queryable with exactly the expected symbol.
     let r = get_file_symbols(
@@ -278,9 +297,25 @@ async fn watch_loop_handles_file_removal_end_to_end() {
         "watch_start failed: {r:?}"
     );
 
-    // Delete on disk; debounce window + slack.
+    // Delete on disk, then poll until the removal has propagated through
+    // the watch pipeline (no fixed upper bound under load — a one-shot
+    // sleep is a flaky cliff). The removal is observable as the error
+    // envelope the assertions below pin; we only wait for it to land.
     std::fs::remove_file(&target).unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    common::wait_until(Duration::from_secs(10), || {
+        let r = get_file_symbols(
+            &server.inner.graph,
+            &target.to_string_lossy(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
+        r.is_error == Some(true)
+    })
+    .await;
 
     let path_str = target.to_string_lossy().into_owned();
     let r = get_file_symbols(
