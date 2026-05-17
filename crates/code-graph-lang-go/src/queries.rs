@@ -53,8 +53,7 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 
 ; Package clause: `package foo` — captured so the definition extractor
 ; can populate Symbol.namespace from it. Note: package_clause has no
-; named fields; the
-; package_identifier is a direct named child.
+; named fields; the package_identifier is a direct named child.
 (package_clause
   (package_identifier) @package.name) @package.def
 "#;
@@ -112,7 +111,7 @@ pub(crate) const CALL_QUERIES: &str = r#"
 /// `import_declaration` via [`crate::find_enclosing_kind`]. We deliberately
 /// do not bind a `@import.spec` capture on the outer `import_spec`: it
 /// would be emitted on every match but never read, so it is dead weight —
-/// same rationale that removed `@call.expr` from `CALL_QUERIES` in 6.4.
+/// same rationale that removed `@call.expr` from `CALL_QUERIES`.
 pub(crate) const IMPORT_QUERIES: &str = r#"
 (import_spec
   path: (interpreted_string_literal) @import.path)

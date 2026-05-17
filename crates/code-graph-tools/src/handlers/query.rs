@@ -1041,9 +1041,8 @@ mod tests {
     //
     // Mirrors the callers-side tests above. The wiring is identical — both
     // directions flow through the same `callers_or_callees` handler — so
-    // these tests cover
-    // the callee-side BFS edge construction and lock the documented
-    // sort-determinism contract for `Direction::Callees`.
+    // these tests cover the callee-side BFS edge construction and lock the
+    // documented sort-determinism contract for `Direction::Callees`.
 
     /// Mirror of `graph_with_layered_callers` for the callees direction:
     /// a single hub `entry` calls `per_depth` distinct depth-1 callees,

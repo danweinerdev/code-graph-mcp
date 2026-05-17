@@ -3,7 +3,7 @@
 //! The `#[tool]` shells in `crate::server::CodeGraphServer` delegate here
 //! so each handler stays focused, testable, and short. Phase 3.4 filled in
 //! the P0 handlers; Phase 3.5 filled in P1+P2 plus watch stubs; Phase 4.1
-//! has now replaced the watch stubs with the real lifecycle.
+//! replaced the watch stubs with the real lifecycle.
 //!
 //! Module layout:
 //! - `analyze` — `analyze_codebase` (the big one: progress bridge, cache,
@@ -43,7 +43,8 @@ use serde::Serialize;
 /// **No `file` field.** It is deliberately dropped as a wire-format
 /// optimization: the `id` already encodes the file path (per
 /// [`code_graph_core::symbol_id`] — `file:name` or `file:Parent::name`),
-/// so a dedicated `file` key would be a 100% redundant payload tax. Clients recover the absolute path via
+/// so a dedicated `file` key would be a 100% redundant payload tax.
+/// Clients recover the absolute path via
 /// [`code_graph_core::id_to_file`], the documented inverse contract.
 /// Wire-format breaking, pre-1.0 acceptable.
 #[derive(Debug, Serialize)]
@@ -113,8 +114,8 @@ pub(super) struct CouplingEntry {
 }
 
 /// One dependency row: a file this file depends on, the dependency kind
-/// (`"calls"` or `"includes"`), and the source line the dependency was
-/// observed on.
+/// (always `"includes"` — the dependency graph holds only include
+/// edges), and the source line the dependency was observed on.
 ///
 /// `kind` reuses the `&'static str` convention from [`SummaryRow`]'s
 /// `kind` so dependency-kind names stay byte-identical across surfaces.
@@ -517,8 +518,8 @@ pub(super) mod test_helpers {
     /// Sibling accessor (not a wider tuple) so existing call sites continue to
     /// compile unchanged. Reads the two `Page<T>` envelope fields
     /// `truncated` and `next_offset` from the same parsed JSON body.
-    /// `next_offset == null`
-    /// in the wire JSON returns `None`; a number returns `Some(n as u32)`.
+    /// `next_offset == null` in the wire JSON returns `None`; a number
+    /// returns `Some(n as u32)`.
     pub fn page_extras(r: &CallToolResult) -> (bool, Option<u32>) {
         let parsed: serde_json::Value = serde_json::from_str(&body_text(r)).unwrap();
         // Page<T> always emits both fields (no skip_serializing_if); a missing

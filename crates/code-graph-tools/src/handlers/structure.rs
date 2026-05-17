@@ -285,7 +285,7 @@ struct ClassHierarchyResponse {
 /// `Trait`).
 ///
 /// The did-you-mean wording mirrors the symbol_detail / callers
-/// patterns in 3.4: `class not found: "<name>". Did you mean: a, b, c?`
+/// patterns: `class not found: "<name>". Did you mean: a, b, c?`
 /// when suggestions exist; otherwise just `class not found: "<name>"`.
 ///
 /// On success, returns the [`ClassHierarchyResponse`] envelope:
@@ -587,7 +587,7 @@ pub struct GenerateDiagramInput<'a> {
 /// Rust port unifies on `"TD"` per the task brief. This is a Rust-idiom
 /// divergence — having a single direction makes diagrams visually
 /// consistent regardless of which view a user requested. The snapshot
-/// suite in 3.7 will lock this in.
+/// suite locks this in.
 ///
 /// **Exactly-one-of**: when 0 or >1 of `symbol`/`file`/`class` are set,
 /// returns an error. The Go reference accepted multiple parameters and

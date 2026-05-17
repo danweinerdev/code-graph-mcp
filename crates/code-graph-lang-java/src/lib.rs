@@ -93,7 +93,7 @@
 //!   `toString`) are extracted ONLY if they appear in source — synthetic
 //!   members are correctly invisible to tree-sitter. Methods declared
 //!   inside a record body record the record name as parent (NOT as
-//!   orphan Function symbols — the same bug C# task 2.2 had to fix in
+//!   orphan Function symbols — the same bug the C# parser fixed in
 //!   commit `0cf200b`).
 //! - **Enum methods** (Decision 12) extract as [`SymbolKind::Method`]
 //!   with parent = enum type name. Both enum-level methods (`enum Planet
@@ -138,16 +138,13 @@ pub struct JavaParser {
     /// instances built inside `parse_file` can attach to it without
     /// rebuilding the `LanguageFn`.
     language: TsLanguage,
-    /// Compiled definition query (live in 3.2 — drives
-    /// [`Self::extract_definitions`]).
+    /// Compiled definition query (drives [`Self::extract_definitions`]).
     def_query: Query,
-    /// Compiled call query (live in 3.3 — drives [`Self::extract_calls`]).
+    /// Compiled call query (drives [`Self::extract_calls`]).
     call_query: Query,
-    /// Compiled import query (live in 3.4 — drives
-    /// [`Self::extract_imports`]).
+    /// Compiled import query (drives [`Self::extract_imports`]).
     import_query: Query,
-    /// Compiled inheritance query (live in 3.5 — drives
-    /// [`Self::extract_inheritance`]).
+    /// Compiled inheritance query (drives [`Self::extract_inheritance`]).
     inheritance_query: Query,
 }
 
@@ -1014,9 +1011,9 @@ fn enclosing_named_type_name(def_node: Node<'_>, content: &[u8]) -> String {
 /// [`enclosing_named_type_name`], walks past the
 /// `object_creation_expression` to the outer named type. So the `from`
 /// field for the `foo()` call is `<path>:<OuterClass>::run` (matching
-/// the symbol ID produced by 3.2's `extract_definitions`). Two
+/// the symbol ID produced by `extract_definitions`). Two
 /// anonymous classes in the same method that both define `run` produce
-/// two collisions by design (documented limitation in 3.2's
+/// two collisions by design (documented limitation, pinned by the
 /// `two_anonymous_classes_in_same_method_both_define_run_collide_by_design`
 /// test).
 ///

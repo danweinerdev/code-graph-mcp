@@ -73,7 +73,8 @@
 //! - **`async def` parses as `function_definition`** in tree-sitter-python
 //!   0.25 — there is no separate `async_function_definition` node. The
 //!   single `function_definition` query in `queries.rs` covers both sync
-//!   and async forms. Confirmed by fixture in 7.2's tests.
+//!   and async forms. Confirmed by fixture in the definition-extraction
+//!   tests.
 //! - `.py` and `.pyi` files share the same grammar; both extensions
 //!   dispatch to the same parser. `.pyi` stub files use the same
 //!   `function_definition` / `class_definition` nodes — `def f() -> int:
@@ -116,13 +117,13 @@ pub struct PythonParser {
     /// instances built inside `parse_file` can attach to it without
     /// rebuilding the `LanguageFn`.
     language: TsLanguage,
-    /// Compiled definition query (wired in 7.2).
+    /// Compiled definition query (drives [`Self::extract_definitions`]).
     def_query: Query,
-    /// Compiled call query (wired in 7.3).
+    /// Compiled call query (drives [`Self::extract_calls`]).
     call_query: Query,
-    /// Compiled import query (wired in 7.4).
+    /// Compiled import query (drives [`Self::extract_imports`]).
     import_query: Query,
-    /// Compiled inheritance query (wired in 7.5).
+    /// Compiled inheritance query (drives [`Self::extract_inheritance`]).
     inheritance_query: Query,
 }
 
@@ -700,7 +701,7 @@ fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
 /// ```
 ///
 /// Tree-sitter queries walk the entire tree by default, so the inner
-/// `import_statement` would otherwise match `IMPORT_QUERIES`. The phase 7.4
+/// `import_statement` would otherwise match `IMPORT_QUERIES`. The
 /// contract is that conditional imports are excluded from the dependency
 /// graph: a file's import edges should reflect what it depends on
 /// unconditionally at module load. This filter is the enforcement point.
@@ -1030,7 +1031,8 @@ mod tests {
     #[test]
     fn dunder_str_repr_call_are_ordinary_methods() {
         // Belt-and-suspenders for the "no special handling for dunders"
-        // rule documented in 7.2.
+        // rule: `__str__`/`__repr__`/`__call__` are ordinary methods, parented
+        // to their enclosing class like any other `def`.
         let src = "class C:\n    def __str__(self):\n        return ''\n    def __repr__(self):\n        return ''\n    def __call__(self):\n        pass\n";
         let fg = parse(src);
         for name in &["__str__", "__repr__", "__call__"] {
@@ -1043,9 +1045,9 @@ mod tests {
     #[test]
     fn class_with_base_still_emits_class_symbol() {
         // `class D(B): pass` — the `superclasses: argument_list` doesn't
-        // change the Class symbol. Inheritance edges land in 7.5; here we
-        // only verify that the presence of bases doesn't break definition
-        // extraction.
+        // change the Class symbol. Inheritance edges are produced by a
+        // separate extraction path; here we only verify that the presence of
+        // bases doesn't break definition extraction.
         let fg = parse("class D(B):\n    pass\n");
         let d = sym(&fg, "D");
         assert_eq!(d.kind, SymbolKind::Class);

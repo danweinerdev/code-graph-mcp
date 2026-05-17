@@ -21,11 +21,11 @@
 //!   extract as `Class`; the `enclosing_type_name` helper recognises
 //!   `record_declaration` as a type ancestor so methods inside records
 //!   record the record name as parent (NOT as orphan Function symbols —
-//!   the same bug C# task 2.2 had to fix in commit `0cf200b`).
+//!   the same bug the C# parser fixed in commit `0cf200b`).
 //! - **Sealed types**' `permits` clause appears as a `permits:` field on
 //!   the type declaration. Per Decision 6 the clause is ignored — no
-//!   inheritance edges are produced for it (3.5 will only match
-//!   `superclass`/`super_interfaces`/`extends_interfaces`).
+//!   inheritance edges are produced for it (inheritance extraction only
+//!   matches `superclass`/`super_interfaces`/`extends_interfaces`).
 //! - **Methods** use `method_declaration` with `name: (identifier)`. The
 //!   `body:` field is optional — abstract methods (interface forward
 //!   declarations and enum-level abstract methods) lack the field

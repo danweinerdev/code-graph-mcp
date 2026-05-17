@@ -23,11 +23,11 @@ use crate::Graph;
 // Test-only counter incremented on every `BinaryHeap::push` call inside
 // `Graph::search`. Used by the heap-not-touched test to pin the cost win
 // of `count_only=true` to observable behavior: a future refactor that
-// accidentally re-introduces
-// heap construction on the count-only path would make
-// `search_count_only_does_not_push_heap` fail immediately. Reset between
-// measurements via `reset_heap_pushes`; read via `heap_pushes`. Hidden
-// behind `#[cfg(test)]` so production builds carry no overhead.
+// accidentally re-introduces heap construction on the count-only path
+// would make `search_count_only_does_not_push_heap` fail immediately.
+// Reset between measurements via `reset_heap_pushes`; read via
+// `heap_pushes`. Hidden behind `#[cfg(test)]` so production builds carry
+// no overhead.
 //
 // **Thread-local on purpose:** cargo test runs `#[test]`s on a thread pool
 // by default, and many other tests in this module also exercise
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn search_count_only_total_matches_regular_search_total() {
-        // Behavioral test (plan task 3.3): a count_only=true call MUST report
+        // Behavioral test: a count_only=true call MUST report
         // the same `total` as a regular call (limit=1, count_only=false)
         // against the same fixture. `total` is the pre-pagination match count
         // and must be independent of the count_only flag.

@@ -492,8 +492,7 @@ pub(crate) fn strip_macros_with_args(content: &mut [u8], tokens: &HashSet<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    //! Algorithm-correctness suite for `strip_macros`. Cases mirror the
-    //! verification field of Plan task 1.2 (cases (a)–(k)).
+    //! Algorithm-correctness suite for `strip_macros` (cases (a)–(k)).
     //!
     //! Cases (a)–(e) feed the cleaned bytes through `CppParser::parse_file`
     //! and assert on the resulting `FileGraph`. Cases (f) and (h) also drive

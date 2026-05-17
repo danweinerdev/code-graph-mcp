@@ -728,9 +728,9 @@ impl CSharpParser {
     /// an unnamed-field child of `class_declaration` /
     /// `struct_declaration` / `record_declaration` and as a
     /// `type_parameters:`-field child of `interface_declaration` (the
-    /// grammar is asymmetric across declaration kinds in 0.23.5; the
-    /// kind-based scan in [`enclosing_type_name_with_generics`] handles
-    /// both).
+    /// grammar is asymmetric across declaration kinds in this pinned
+    /// tree-sitter-c-sharp version; the kind-based scan in
+    /// [`enclosing_type_name_with_generics`] handles both).
     ///
     /// **Decision 2 — no edge-kind distinction.** All bases — whether
     /// they reference a class, an interface, or a struct — produce the

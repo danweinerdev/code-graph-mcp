@@ -84,8 +84,7 @@ use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES};
 pub const EXTENSIONS: &[&str] = &[".go"];
 
 /// Go source-file parser. Holds the tree-sitter `Language` and the three
-/// pre-compiled queries used to drive symbol/edge extraction in Phases
-/// 6.2-6.4.
+/// pre-compiled queries used to drive symbol/edge extraction.
 ///
 /// Construct with [`GoParser::new`]; share across threads (queries are
 /// `Send + Sync`).
