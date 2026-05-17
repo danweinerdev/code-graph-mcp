@@ -232,10 +232,10 @@ async fn response_search_symbols_query_engine() {
 #[tokio::test]
 async fn response_search_symbols_byte_budget_truncated() {
     // A tight `max_bytes` makes the handler trim the already-sliced page
-    // that `Graph::search` returned. Architectural exception from the
-    // other four paginated
-    // tools — search_symbols delegates pagination to `Graph::search`, so
-    // the trim happens at the handler layer (NOT via `byte_budget_take`).
+    // that `Graph::search` returned. Architectural exception from the other
+    // four paginated tools — search_symbols delegates pagination to
+    // `Graph::search`, so the trim happens at the handler layer (NOT via
+    // `byte_budget_take`).
     //
     // Fixture: 30 free functions named `func_NNN` in a single C++ file.
     // `query="func"` matches all 30, so `sr.total = 30` regardless of

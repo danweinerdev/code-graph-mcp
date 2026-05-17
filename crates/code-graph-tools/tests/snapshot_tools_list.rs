@@ -32,7 +32,7 @@ fn tool_entry(name: &str) -> Tool {
         .unwrap_or_else(|| panic!("tool {name} missing from router"))
 }
 
-// --- P0 --------------------------------------------------------------------
+// --- Indexing + core symbol / call / dependency query tools ----------------
 
 #[test]
 fn tools_list_analyze_codebase() {
@@ -74,7 +74,7 @@ fn tools_list_get_dependencies() {
     insta::assert_json_snapshot!(tool_entry("get_dependencies"));
 }
 
-// --- P1+P2 -----------------------------------------------------------------
+// --- Structural-analysis + visualization tools -----------------------------
 
 #[test]
 fn tools_list_detect_cycles() {
@@ -101,7 +101,7 @@ fn tools_list_generate_diagram() {
     insta::assert_json_snapshot!(tool_entry("generate_diagram"));
 }
 
-// --- Watch stubs -----------------------------------------------------------
+// --- Watch lifecycle tools (real schemas, not stubs) -----------------------
 
 #[test]
 fn tools_list_watch_start() {

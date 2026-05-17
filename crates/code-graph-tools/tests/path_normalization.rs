@@ -366,8 +366,8 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
 ///
 /// The canonical paths returned by `analyze_codebase`'s `root_path` field
 /// are already in their final form on every platform once the indexer
-/// canonicalizes; on
-/// Linux they are byte-equal to what `Path::new(file).to_path_buf()` would
+/// canonicalizes. On Linux they are byte-equal to what
+/// `Path::new(file).to_path_buf()` would
 /// produce inside each handler, so the canonical-path test cannot
 /// distinguish "the `normalize_user_path` wrap runs" from "the wrap was
 /// silently removed." This test supplies a path with embedded `./` and
