@@ -1,7 +1,7 @@
 # Rust workspace build targets. Build natively on each platform you need
 # the binary for — `make release` produces a host-target release build.
 
-.PHONY: build release test lint fmt fmt-check clean verify \
+.PHONY: build release test lint fmt fmt-check clean verify leak-scan \
 	snapshot-clean snapshot-accept snapshot-audit install-hooks submodules \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
@@ -106,6 +106,18 @@ snapshot-accept:
 	mv "$$matches" "$$target"; \
 	echo "✓ Accepted $$target"
 	@$(MAKE) --no-print-directory snapshot-clean
+
+# Enforce the standing "no plan/task/phase pointers in source" rule.
+# Scans crates/*/src + crates/*/tests with a deliberately broad
+# detection pattern (every prose form prior remediation sweeps had to
+# converge on) and exits non-zero if any hit is NOT an allowlisted
+# canonical-origin preamble. The narrow-grep churn that cost three
+# corrective cycles in the one-time remediation cannot recur: the broad
+# pattern is baked in once; only the bucket-1-vs-bucket-2 judgment is
+# manual. Run end-of-wave alongside `make verify`, or wire into CI.
+# See scripts/leak-scan.sh for the pattern + the bucket-2 allowlist.
+leak-scan:
+	@scripts/leak-scan.sh $(ARGS)
 
 # Snapshot delta audit: assert that any modified/untracked snapshot
 # file matches an expected name fragment. Catches accidental cross-tool
