@@ -198,8 +198,8 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 ///   constructor body). The `constructor:` field is the bare `this` or
 ///   `super` keyword node — its `kind()` is the literal string `"this"`
 ///   or `"super"`, and its text is the same. Recorded with
-///   `to = "this"` or `to = "super"` per the design brief: these ARE
-///   genuine constructor invocations and SHOULD produce call edges.
+///   `to = "this"` or `to = "super"`: these ARE genuine constructor
+///   invocations and SHOULD produce call edges.
 /// - `(method_reference "::" (identifier) @call.name)` — method reference
 ///   with an identifier on the RHS. The `"::"` anchor matches the
 ///   `::` token; the captured `identifier` is the right-hand-side name

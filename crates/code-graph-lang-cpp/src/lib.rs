@@ -23,8 +23,7 @@
 //! that the tree-sitter-cpp v0.23.4 grammar otherwise drops as an `ERROR`
 //! node. The default behavior is unchanged — an empty `macro_strip` list
 //! short-circuits to `Cow::Borrowed` with zero allocation. See
-//! [`strip_macros`] for the substitution algorithm and the
-//! `Designs/CppMacroStrip` design doc for rationale.
+//! [`strip_macros`] for the substitution algorithm and rationale.
 //!
 //! # Known C++ parser limitations
 //!

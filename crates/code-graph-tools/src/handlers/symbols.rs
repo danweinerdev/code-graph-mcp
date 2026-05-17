@@ -459,8 +459,9 @@ pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult 
 /// `(namespace, kind)` pairs across the summary — i.e. the row count the
 /// paginated path would emit — NOT the sum of per-pair symbol counts.
 /// Mirrors `get_orphans` / `search_symbols` / `get_file_symbols` count_only
-/// semantics. See plan Decision 9 for why `limit: 0` is a deliberate
-/// exception to the "envelope echoes resolved limit" contract.
+/// semantics. `count_only` callers opt out of paging, so `limit: 0` is a
+/// deliberate exception to the "envelope echoes resolved limit" contract
+/// (see CLAUDE.md).
 pub fn get_symbol_summary(
     graph: &RwLock<Graph>,
     file: Option<&str>,
@@ -481,7 +482,7 @@ pub fn get_symbol_summary(
     if count_only {
         let total: u32 = summary.values().map(|m| m.len()).sum::<usize>() as u32;
         // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract — see plan Decision 9.
+        // "envelope echoes resolved limit" contract.
         // count_only callers opted out of paging; echoing a would-have-been
         // limit would mislead them into thinking there's a record page to
         // fetch. The exception is documented in CLAUDE.md alongside the
@@ -1145,8 +1146,9 @@ mod tests {
         // must stay < 1KB even at the 1000-symbol scale.
         //
         // Asserts: (a) results is empty, (b) total reflects the true match
-        // count (not zero), (c) limit=0 (deliberate exception to the
-        // "envelope echoes resolved limit" contract per plan Decision 9),
+        // count (not zero), (c) limit=0 (count_only opts out of paging, a
+        // deliberate exception to the "envelope echoes resolved limit"
+        // contract; see CLAUDE.md),
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         let g = locked(graph_with_n_file_symbols(1000));

@@ -171,8 +171,9 @@ pub fn detect_cycles(
 /// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
 /// without ever materializing `SymbolResult`s or invoking the byte-budget
 /// helper. `total` reflects the true pre-pagination match count after the
-/// kind filter. See plan Decision 9 for why `limit: 0` is a deliberate
-/// exception to the "envelope echoes resolved limit" contract.
+/// kind filter. `count_only` callers opt out of paging, so `limit: 0` is a
+/// deliberate exception to the "envelope echoes resolved limit" contract
+/// (see CLAUDE.md).
 pub fn get_orphans(
     graph: &RwLock<Graph>,
     kind: Option<&str>,
@@ -584,7 +585,7 @@ pub struct GenerateDiagramInput<'a> {
 ///
 /// **Direction**: hardcoded to `"TD"` for all three diagram types. The
 /// Go reference uses `"BT"` for inheritance and `"TD"` otherwise; the
-/// Rust port unifies on `"TD"` per the task brief. This is a Rust-idiom
+/// Rust port unifies on `"TD"` for all three diagram types. This is a Rust-idiom
 /// divergence — having a single direction makes diagrams visually
 /// consistent regardless of which view a user requested. The snapshot
 /// suite locks this in.
@@ -1470,8 +1471,9 @@ mod tests {
         // must be < 1KB even at the 1000-orphan scale.
         //
         // Asserts: (a) results is empty, (b) total reflects the true match
-        // count (not zero), (c) limit=0 (deliberate exception to the
-        // "envelope echoes resolved limit" contract per plan Decision 9),
+        // count (not zero), (c) limit=0 (count_only opts out of paging, a
+        // deliberate exception to the "envelope echoes resolved limit"
+        // contract; see CLAUDE.md),
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         let g = locked(graph_with_n_orphan_functions(1000));

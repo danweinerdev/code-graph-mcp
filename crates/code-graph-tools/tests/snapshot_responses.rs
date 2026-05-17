@@ -275,9 +275,9 @@ async fn response_count_only_search_symbols() {
     // `search_symbols` returns the sentinel envelope shape `Page { results: [],
     // total: <real count>, offset: 0, limit: 0, truncated: false,
     // next_offset: None }`. `total` reflects the pre-pagination match count
-    // from Graph::search (independent of any limit/offset). The `limit: 0`
-    // is a deliberate exception to the "envelope echoes resolved limit"
-    // contract per plan Decision 9.
+    // from Graph::search (independent of any limit/offset). count_only opts
+    // out of paging, so the `limit: 0` is a deliberate exception to the
+    // "envelope echoes resolved limit" contract (see CLAUDE.md).
     //
     // Task 3.3 threaded `count_only` into `SearchParams`, so `Graph::search`
     // short-circuits before the BinaryHeap<TopEntry> push/pop loop. The
@@ -560,8 +560,9 @@ async fn response_count_only_orphans() {
     // Phase 3.2 of PaginatedResponseSizeSafety: when count_only=true,
     // `get_orphans` returns the sentinel envelope shape `Page { results: [],
     // total: <real count>, offset: 0, limit: 0, truncated: false,
-    // next_offset: None }`. The `limit: 0` is a deliberate exception to
-    // the "envelope echoes resolved limit" contract per plan Decision 9.
+    // next_offset: None }`. count_only opts out of paging, so the
+    // `limit: 0` is a deliberate exception to the "envelope echoes resolved
+    // limit" contract (see CLAUDE.md).
     //
     // The snapshot locks the wire-format shape and the per-record size
     // contract: serialized body MUST stay under 1KB even at the 1000-orphan
@@ -788,8 +789,9 @@ async fn response_count_only_file_symbols() {
     // truncated: false, next_offset: None }` after counting matches via
     // the cheap path (no SymbolResult materialization, no byte budget).
     // `total` reflects the true post-filter, pre-pagination match count.
-    // The `limit: 0` is a deliberate exception to the "envelope echoes
-    // resolved limit" contract per plan Decision 9.
+    // count_only opts out of paging, so the `limit: 0` is a deliberate
+    // exception to the "envelope echoes resolved limit" contract
+    // (see CLAUDE.md).
     //
     // The snapshot locks the wire-format shape and the per-record size
     // contract: serialized body MUST stay under 1KB even at the 1000-symbol

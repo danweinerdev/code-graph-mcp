@@ -2005,8 +2005,8 @@ class Foo {
     #[test]
     fn this_constructor_call_records_to_this() {
         // `this(...)` inside a constructor body produces an
-        // explicit_constructor_invocation node. Per the design brief,
-        // these ARE genuine constructor invocations and SHOULD record
+        // explicit_constructor_invocation node. These ARE genuine
+        // constructor invocations and SHOULD record
         // edges with `to = "this"`. Agents disambiguate from ordinary
         // method calls via the literal `"this"` callee name, which
         // cannot appear as an identifier in a normal call position.
