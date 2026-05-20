@@ -14,4 +14,7 @@ pub mod handlers;
 pub mod indexer;
 pub mod server;
 
+#[cfg(test)]
+pub(crate) mod test_recording_plugin;
+
 pub use server::{CodeGraphServer, ServerInner, WatchHandle};

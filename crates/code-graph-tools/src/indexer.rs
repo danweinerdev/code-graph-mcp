@@ -789,59 +789,8 @@ mod tests {
 
     // -- post_index hook -------------------------------------------------
 
+    use crate::test_recording_plugin::RecordingPlugin;
     use std::sync::Arc;
-
-    /// Test plugin that records every `post_index` invocation into shared
-    /// state so the test can prove the hook fires exactly once over the
-    /// complete graph set. `parse_file` mirrors `StubPlugin` so the
-    /// surrounding indexer pipeline remains exercised end-to-end.
-    struct RecordingPlugin {
-        id: Language,
-        exts: &'static [&'static str],
-        /// Per-invocation log: each entry is the sorted `Vec<String>` of
-        /// `FileGraph.path` values the hook observed.
-        calls: Arc<Mutex<Vec<Vec<String>>>>,
-    }
-
-    impl LanguagePlugin for RecordingPlugin {
-        fn id(&self) -> Language {
-            self.id
-        }
-        fn extensions(&self) -> &'static [&'static str] {
-            self.exts
-        }
-        fn parse_file(&self, path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
-            // Mirror StubPlugin: one bare Function symbol per file so the
-            // graph is non-empty and downstream `resolve_all_edges` has
-            // something to walk if a future test wires it in.
-            let basename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-            let sym_name = format!("f_{basename}");
-            let file = path.to_string_lossy().into_owned();
-            let symbols = vec![Symbol {
-                name: sym_name.clone(),
-                kind: SymbolKind::Function,
-                file: file.clone(),
-                line: 1,
-                column: 0,
-                end_line: 1,
-                signature: format!("void {sym_name}()"),
-                namespace: String::new(),
-                parent: String::new(),
-                language: self.id,
-            }];
-            Ok(FileGraph {
-                path: file,
-                language: self.id,
-                symbols,
-                edges: Vec::new(),
-            })
-        }
-        fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
-            let mut paths: Vec<String> = graphs.iter().map(|g| g.path.clone()).collect();
-            paths.sort();
-            self.calls.lock().unwrap().push(paths);
-        }
-    }
 
     /// Analyze-path call site: `index_directory` must invoke
     /// `post_index` exactly once, over the full set of freshly-parsed
@@ -863,11 +812,11 @@ mod tests {
 
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut reg = LanguageRegistry::new();
-        reg.register(Box::new(RecordingPlugin {
-            id: Language::Cpp,
-            exts: &[".fake"],
-            calls: Arc::clone(&calls),
-        }))
+        reg.register(Box::new(RecordingPlugin::new(
+            Language::Cpp,
+            &[".fake"],
+            Arc::clone(&calls),
+        )))
         .unwrap();
 
         let cfg = cfg_with_threads(2);

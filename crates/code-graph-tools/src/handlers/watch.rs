@@ -389,10 +389,16 @@ pub async fn try_reindex_file(
     // The freshly-parsed `FileGraph` is the LAST entry in `all_graphs`
     // (pushed just above). After the hook may have rewritten its symbols
     // in place, copy the post-hook version back into `new_fg` so the
-    // downstream merge sees the rewritten state.
-    if let Some(last) = all_graphs.last() {
-        new_fg = last.clone();
-    }
+    // downstream merge sees the rewritten state. `expect` (not `if let`)
+    // because the invariant is unconditional: `new_fg.clone()` was pushed
+    // unconditionally a few lines up, so `all_graphs.last()` must be
+    // `Some`. A silent stale-state slip here would defeat the whole
+    // copy-back; surface a panic-with-context if the invariant ever
+    // breaks.
+    let last = all_graphs
+        .last()
+        .expect("all_graphs is non-empty: new_fg.clone() was pushed unconditionally above");
+    new_fg = last.clone();
     let symbol_index = build_symbol_index(&all_graphs);
 
     let new_ids: HashSet<SymbolId> = new_fg.symbols.iter().map(symbol_id).collect();
@@ -967,66 +973,20 @@ mod tests {
     /// followed by a watch reindex (which must produce another).
     #[tokio::test]
     async fn try_reindex_file_invokes_post_index_over_full_graph_set() {
-        use code_graph_core::{FileGraph, Language, Symbol, SymbolKind};
-        use code_graph_lang::{FileIndex, LanguagePlugin, ParseError};
+        use code_graph_core::Language;
         use std::sync::{Arc, Mutex};
 
-        // Per-invocation log: each entry is the sorted list of FileGraph
-        // paths the hook observed for that call.
-        type Log = Arc<Mutex<Vec<Vec<String>>>>;
-
-        struct RecordingPlugin {
-            calls: Log,
-        }
-
-        impl LanguagePlugin for RecordingPlugin {
-            fn id(&self) -> Language {
-                Language::Cpp
-            }
-            fn extensions(&self) -> &'static [&'static str] {
-                // Use a synthetic extension so the test doesn't fight
-                // real C++ parser behavior.
-                &[".rec"]
-            }
-            fn parse_file(
-                &self,
-                path: &std::path::Path,
-                _content: &[u8],
-            ) -> Result<FileGraph, ParseError> {
-                let basename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-                let sym_name = format!("f_{basename}");
-                let file = path.to_string_lossy().into_owned();
-                let symbols = vec![Symbol {
-                    name: sym_name.clone(),
-                    kind: SymbolKind::Function,
-                    file: file.clone(),
-                    line: 1,
-                    column: 0,
-                    end_line: 1,
-                    signature: format!("void {sym_name}()"),
-                    namespace: String::new(),
-                    parent: String::new(),
-                    language: Language::Cpp,
-                }];
-                Ok(FileGraph {
-                    path: file,
-                    language: Language::Cpp,
-                    symbols,
-                    edges: Vec::new(),
-                })
-            }
-            fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
-                let mut paths: Vec<String> = graphs.iter().map(|g| g.path.clone()).collect();
-                paths.sort();
-                self.calls.lock().unwrap().push(paths);
-            }
-        }
+        use crate::test_recording_plugin::{Log, RecordingPlugin};
 
         let calls: Log = Arc::new(Mutex::new(Vec::new()));
         let mut reg = LanguageRegistry::new();
-        reg.register(Box::new(RecordingPlugin {
-            calls: Arc::clone(&calls),
-        }))
+        // Use a synthetic `.rec` extension so the test doesn't fight
+        // real C++ parser behavior.
+        reg.register(Box::new(RecordingPlugin::new(
+            Language::Cpp,
+            &[".rec"],
+            Arc::clone(&calls),
+        )))
         .unwrap();
 
         let server = crate::server::CodeGraphServer::new(reg);
@@ -1103,6 +1063,108 @@ mod tests {
         assert!(
             watch_call.iter().any(|p| p == &want_b),
             "watch post_index must include the pre-existing file {want_b:?}; got {watch_call:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Copy-back round-trip: prove that mutations a `post_index` hook
+    /// writes into `all_graphs[last]` actually reach `new_fg` (and thus
+    /// the merged `Graph`). The sibling
+    /// `try_reindex_file_invokes_post_index_over_full_graph_set` test only
+    /// records that the hook fires — deleting the copy-back line that
+    /// lifts the post-hook last-entry back into `new_fg` would not change
+    /// that test's outcome. This test fails outright if the copy-back is
+    /// removed.
+    ///
+    /// Mechanism: a mutating recording plugin rewrites the LAST graph's
+    /// first symbol's `namespace` to a sentinel string during the watch
+    /// reindex's `post_index` call. Without the copy-back, the merged
+    /// `Graph::nodes` carries the pre-hook (empty) namespace; with the
+    /// copy-back, it carries the sentinel. `Symbol::namespace` is keyed
+    /// off the same `(file, name)` symbol ID either way — only the
+    /// namespace field changes — so the assertion below is sensitive to
+    /// the copy-back specifically, not to any structural difference.
+    #[tokio::test]
+    async fn mutating_post_index_writes_survive_copy_back() {
+        use code_graph_core::Language;
+        use std::sync::{Arc, Mutex};
+
+        use crate::test_recording_plugin::{Log, RecordingPlugin};
+
+        const SENTINEL: &str = "post_index_sentinel_ns";
+
+        let calls: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = LanguageRegistry::new();
+        // Mutator: rewrite the LAST graph's first symbol's `namespace` to
+        // SENTINEL. The last graph is the freshly-parsed `new_fg` clone
+        // the watch path pushed at line 374 — this is the slot that
+        // line 394's copy-back must lift back into `new_fg` for the
+        // sentinel to survive merge.
+        let mutator: crate::test_recording_plugin::Mutator =
+            Box::new(|graphs: &mut [code_graph_core::FileGraph], _file_index| {
+                if let Some(last) = graphs.last_mut() {
+                    if let Some(sym) = last.symbols.first_mut() {
+                        sym.namespace = SENTINEL.to_string();
+                    }
+                }
+            });
+        reg.register(Box::new(RecordingPlugin::with_mutator(
+            Language::Cpp,
+            &[".rec"],
+            Arc::clone(&calls),
+            mutator,
+        )))
+        .unwrap();
+
+        let server = crate::server::CodeGraphServer::new(reg);
+
+        // Seed two files so the `all_graphs` set has more than just the
+        // re-parsed file in it during the watch hook (mirrors the
+        // structure the existing post_index test uses).
+        let dir = TempDir::new().expect("TempDir");
+        std::fs::write(dir.path().join("a.rec"), b"// a\n").unwrap();
+        std::fs::write(dir.path().join("b.rec"), b"// b\n").unwrap();
+
+        let r = analyze_codebase(
+            server.inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "initial analyze must succeed: {r:?}"
+        );
+
+        // Drive the watch path on a.rec. The mutator runs once during
+        // the post_index hook and writes SENTINEL into the last graph's
+        // first symbol. The copy-back at line 394 lifts that state into
+        // `new_fg`, which `merge_file_graph` then inserts into the
+        // Graph's node table.
+        let a_rec = std::fs::canonicalize(dir.path().join("a.rec")).unwrap();
+        std::fs::write(&a_rec, b"// a edited\n").unwrap();
+        let outcome = try_reindex_file(&server.inner, &a_rec, false).await;
+        match outcome {
+            ReindexOutcome::Reindexed => {}
+            other => panic!("expected Reindexed, got {other:?}"),
+        }
+
+        // Observation: pull a.rec's symbols out of the merged graph and
+        // confirm the sentinel namespace is visible. Deleting line 394's
+        // copy-back leaves `new_fg` carrying the pre-hook (empty)
+        // namespace, and this assertion fails.
+        let symbols = server.inner.graph.read().file_symbols(&a_rec);
+        assert!(
+            !symbols.is_empty(),
+            "watch reindex must populate a.rec's symbols in the merged graph"
+        );
+        let observed: Vec<&str> = symbols.iter().map(|s| s.namespace.as_str()).collect();
+        assert!(
+            observed.contains(&SENTINEL),
+            "post_index sentinel namespace must survive copy-back into new_fg; got: {observed:?}"
         );
 
         drop(dir);

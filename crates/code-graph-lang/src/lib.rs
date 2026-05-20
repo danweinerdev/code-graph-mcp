@@ -329,10 +329,22 @@ pub trait LanguagePlugin: Send + Sync {
     }
 
     /// Optional whole-graph post-parse pass. Runs once over the FileGraph
-    /// set after parsing, before `resolve_all_edges`. Default: no-op.
-    /// Plugins that need crate-aware analysis (e.g. Rust's module model)
-    /// override this and write results into the slice in place — store
-    /// nothing on `&self`.
+    /// set after parsing, before the per-edge resolve loop (the
+    /// `resolve_all_edges` walk on the analyze path, or the inlined
+    /// per-edge dispatch on the watch path — both call sites invoke this
+    /// hook in the same position). Default: no-op. Plugins that need
+    /// crate-aware analysis (e.g. Rust's module model) override this and
+    /// write results into the slice in place — store nothing on `&self`.
+    ///
+    /// **Contract: `FileGraph::path` is immutable through this hook.**
+    /// Implementations MUST NOT mutate `graphs[i].path`. The surrounding
+    /// pipeline keys auxiliary structures on file paths: in particular,
+    /// the watch path builds the [`FileIndex`] passed in here *before*
+    /// `post_index` runs and reuses it for `resolve_include` *after*
+    /// `post_index` returns. Rewriting a `FileGraph::path` mid-hook would
+    /// silently desynchronize the pre-built index from the slice and
+    /// corrupt include resolution. Mutate `symbols`, `edges`, and the
+    /// fields on individual symbols freely; treat `path` as read-only.
     ///
     /// Object-safe: `&self`, concrete params, no `Self` return, no
     /// generics. `Box<dyn LanguagePlugin>` storage is unaffected.
