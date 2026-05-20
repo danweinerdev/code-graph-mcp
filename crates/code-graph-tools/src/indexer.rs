@@ -175,6 +175,17 @@ pub fn index_directory(
             Err(w) => warnings.push(w),
         }
     }
+
+    // Whole-graph post-parse pass. `index_directory` has no cache merge —
+    // on every analyze re-index the returned `graphs` already contains the
+    // complete set of freshly-parsed `FileGraph`s, so the build-once
+    // `FileIndex` covers the full file world the post-pass needs. Plugins
+    // with no crate-aware work inherit the trait's no-op default.
+    let file_index = build_file_index(&graphs);
+    for plugin in registry.plugins() {
+        plugin.post_index(&mut graphs, &file_index);
+    }
+
     Ok((graphs, warnings))
 }
 
@@ -774,5 +785,152 @@ mod tests {
                 .any(|d| d.path.to_string_lossy().ends_with(".ini")),
             "filtered .ini include must NOT reach Graph::includes: {deps:?}"
         );
+    }
+
+    // -- post_index hook -------------------------------------------------
+
+    use std::sync::Arc;
+
+    /// Test plugin that records every `post_index` invocation into shared
+    /// state so the test can prove the hook fires exactly once over the
+    /// complete graph set. `parse_file` mirrors `StubPlugin` so the
+    /// surrounding indexer pipeline remains exercised end-to-end.
+    struct RecordingPlugin {
+        id: Language,
+        exts: &'static [&'static str],
+        /// Per-invocation log: each entry is the sorted `Vec<String>` of
+        /// `FileGraph.path` values the hook observed.
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl LanguagePlugin for RecordingPlugin {
+        fn id(&self) -> Language {
+            self.id
+        }
+        fn extensions(&self) -> &'static [&'static str] {
+            self.exts
+        }
+        fn parse_file(&self, path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
+            // Mirror StubPlugin: one bare Function symbol per file so the
+            // graph is non-empty and downstream `resolve_all_edges` has
+            // something to walk if a future test wires it in.
+            let basename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+            let sym_name = format!("f_{basename}");
+            let file = path.to_string_lossy().into_owned();
+            let symbols = vec![Symbol {
+                name: sym_name.clone(),
+                kind: SymbolKind::Function,
+                file: file.clone(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: format!("void {sym_name}()"),
+                namespace: String::new(),
+                parent: String::new(),
+                language: self.id,
+            }];
+            Ok(FileGraph {
+                path: file,
+                language: self.id,
+                symbols,
+                edges: Vec::new(),
+            })
+        }
+        fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
+            let mut paths: Vec<String> = graphs.iter().map(|g| g.path.clone()).collect();
+            paths.sort();
+            self.calls.lock().unwrap().push(paths);
+        }
+    }
+
+    /// Analyze-path call site: `index_directory` must invoke
+    /// `post_index` exactly once, over the full set of freshly-parsed
+    /// FileGraphs, before returning. This is the (a) half of the Task 1.1
+    /// verification — it covers the "every analyze re-index runs the hook
+    /// over the complete graph set" contract that subsequent Rust-specific
+    /// work (Task 1.3) builds on.
+    #[test]
+    fn index_directory_invokes_post_index_over_full_graph_set() {
+        let dir = TempDir::new().unwrap();
+        // Three files so a missed iteration or a per-file-instead-of-
+        // whole-set call would be observable.
+        for i in 0..3 {
+            touch(
+                &dir.path().join(format!("p{i}.fake")),
+                b"// placeholder content\n",
+            );
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut reg = LanguageRegistry::new();
+        reg.register(Box::new(RecordingPlugin {
+            id: Language::Cpp,
+            exts: &[".fake"],
+            calls: Arc::clone(&calls),
+        }))
+        .unwrap();
+
+        let cfg = cfg_with_threads(2);
+        let sink = NoopProgressSink;
+        let (graphs, warnings) = index_directory(dir.path(), &reg, &cfg, &sink).unwrap();
+        assert_eq!(graphs.len(), 3, "all three files parsed");
+        assert!(warnings.is_empty(), "no parse warnings: {warnings:?}");
+
+        let log = calls.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "post_index must fire exactly once per index_directory call, got {} invocations",
+            log.len()
+        );
+        let observed = &log[0];
+        assert_eq!(
+            observed.len(),
+            3,
+            "post_index must see all three freshly-parsed FileGraphs: {observed:?}"
+        );
+        for i in 0..3 {
+            let want = dir
+                .path()
+                .join(format!("p{i}.fake"))
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                observed.iter().any(|p| p == &want),
+                "post_index must include {want:?}; got {observed:?}"
+            );
+        }
+    }
+
+    /// Non-Rust plugins inherit the trait's no-op `post_index` default.
+    /// This guards against a regression where the default body silently
+    /// starts mutating the FileGraph slice, which would corrupt every
+    /// other language's indexed output without the changed behavior being
+    /// visible at the call site.
+    #[test]
+    fn index_directory_default_post_index_does_not_mutate_graphs() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("a.cpp"), b"void a() {}\n");
+        touch(&dir.path().join("b.cpp"), b"void b() {}\n");
+
+        let reg = cpp_only_registry();
+        let cfg = cfg_with_threads(2);
+        let sink = NoopProgressSink;
+        let (graphs, _warnings) = index_directory(dir.path(), &reg, &cfg, &sink).unwrap();
+
+        // The stub plugin uses the default no-op `post_index`. Symbols
+        // and edges must match what `parse_file` produced — no rewrites
+        // sneaking in.
+        assert_eq!(graphs.len(), 2);
+        for g in &graphs {
+            assert_eq!(
+                g.symbols.len(),
+                1,
+                "each stub file produces exactly one symbol"
+            );
+            assert!(g.edges.is_empty(), "stub edges must be empty post-hook");
+            // The provisional empty namespace from StubPlugin survives.
+            assert_eq!(g.symbols[0].namespace, "");
+        }
     }
 }

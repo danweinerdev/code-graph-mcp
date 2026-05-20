@@ -328,6 +328,16 @@ pub trait LanguagePlugin: Send + Sync {
         default_basename_resolve(raw, file_index)
     }
 
+    /// Optional whole-graph post-parse pass. Runs once over the FileGraph
+    /// set after parsing, before `resolve_all_edges`. Default: no-op.
+    /// Plugins that need crate-aware analysis (e.g. Rust's module model)
+    /// override this and write results into the slice in place — store
+    /// nothing on `&self`.
+    ///
+    /// Object-safe: `&self`, concrete params, no `Self` return, no
+    /// generics. `Box<dyn LanguagePlugin>` storage is unaffected.
+    fn post_index(&self, _graphs: &mut [FileGraph], _file_index: &FileIndex) {}
+
     /// Release any resources held by the plugin (e.g. tree-sitter queries).
     /// Default is a no-op; tree-sitter `Query` already drops cleanly.
     fn close(&self) {}
@@ -424,6 +434,14 @@ impl LanguageRegistry {
     /// Useful when the caller already has a [`Language`] in hand.
     pub fn plugin_for(&self, lang: Language) -> Option<&dyn LanguagePlugin> {
         self.plugins.get(&lang).map(|b| &**b)
+    }
+
+    /// Iterate over every registered plugin, in unspecified order. Callers
+    /// that need to invoke a whole-registry hook (e.g.
+    /// [`LanguagePlugin::post_index`]) use this to walk the private
+    /// `plugins` map without exposing the underlying [`HashMap`].
+    pub fn plugins(&self) -> impl Iterator<Item = &dyn LanguagePlugin> + '_ {
+        self.plugins.values().map(|b| b.as_ref())
     }
 
     /// Like [`Self::language_for_path`], but consults the per-root
@@ -703,6 +721,63 @@ mod tests {
         let idx = FileIndex::new();
         // Empty index: no basenames known.
         assert!(plugin.resolve_include("foo.h", &idx).is_none());
+    }
+
+    #[test]
+    fn post_index_default_is_noop() {
+        // The trait's default `post_index` body must not touch the
+        // FileGraph slice — every non-Rust plugin inherits this default and
+        // a regression that flipped the no-op into a mutation would
+        // silently corrupt every other language's output.
+        let plugin = FakePlugin {
+            id: Language::Cpp,
+            exts: &[".fake"],
+        };
+        let before = FileGraph {
+            path: "/tmp/x.fake".to_string(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        };
+        let mut graphs = vec![before.clone()];
+        let file_index = FileIndex::new();
+        plugin.post_index(&mut graphs, &file_index);
+        assert_eq!(
+            graphs,
+            vec![before],
+            "default post_index must leave the graph slice untouched"
+        );
+    }
+
+    #[test]
+    fn post_index_invokable_via_trait_object() {
+        // Confirms post_index is reachable through `&dyn LanguagePlugin`
+        // — object safety holds for the new trait method.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".fake"])).unwrap();
+        let plugin: &dyn LanguagePlugin = reg.plugin_for(Language::Cpp).unwrap();
+        let mut graphs: Vec<FileGraph> = Vec::new();
+        let file_index = FileIndex::new();
+        // Just calling it through the trait object is the test — must
+        // compile and must not panic.
+        plugin.post_index(&mut graphs, &file_index);
+    }
+
+    #[test]
+    fn registry_plugins_iterator_yields_every_registered_plugin() {
+        // The new `plugins()` iterator is the access path the call sites
+        // use to invoke `post_index` across the whole registry. It must
+        // yield exactly one entry per registered language, regardless of
+        // hashing order.
+        let mut reg = LanguageRegistry::new();
+        reg.register(fake(Language::Cpp, &[".cpp"])).unwrap();
+        reg.register(fake(Language::Rust, &[".rs"])).unwrap();
+        reg.register(fake(Language::Go, &[".go"])).unwrap();
+        let mut ids: Vec<Language> = reg.plugins().map(|p| p.id()).collect();
+        ids.sort_by_key(|l| format!("{l:?}"));
+        let mut want = vec![Language::Cpp, Language::Rust, Language::Go];
+        want.sort_by_key(|l| format!("{l:?}"));
+        assert_eq!(ids, want, "plugins() must yield every registered plugin");
     }
 
     #[test]

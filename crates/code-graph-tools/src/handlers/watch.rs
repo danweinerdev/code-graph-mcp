@@ -372,8 +372,28 @@ pub async fn try_reindex_file(
         all_graphs = snapshot;
     }
     all_graphs.push(new_fg.clone());
-    let symbol_index = build_symbol_index(&all_graphs);
     let file_index = build_file_index(&all_graphs);
+
+    // Whole-graph post-parse pass. The watch path is a SECOND re-index
+    // path (separate from `index_directory`) that must run the same hook
+    // — otherwise plugins with crate-aware analysis (e.g. Rust's namespace
+    // assignment) silently regress on every watched file save. We run it
+    // BEFORE the per-edge resolve loop below so any in-place rewrites the
+    // hook performs (namespaces, mod-edge targets) are visible to the
+    // resolver — and BEFORE building the symbol index so the rewrites are
+    // reflected in resolver candidate scoring. Plugins with no
+    // post-processing inherit the trait's no-op default.
+    for plugin in inner.registry.plugins() {
+        plugin.post_index(&mut all_graphs, &file_index);
+    }
+    // The freshly-parsed `FileGraph` is the LAST entry in `all_graphs`
+    // (pushed just above). After the hook may have rewritten its symbols
+    // in place, copy the post-hook version back into `new_fg` so the
+    // downstream merge sees the rewritten state.
+    if let Some(last) = all_graphs.last() {
+        new_fg = last.clone();
+    }
+    let symbol_index = build_symbol_index(&all_graphs);
 
     let new_ids: HashSet<SymbolId> = new_fg.symbols.iter().map(symbol_id).collect();
     let removed_ids: HashSet<SymbolId> = pre_existing_ids
@@ -929,6 +949,160 @@ mod tests {
         assert_eq!(
             first_text(&r),
             format!("no symbols found in file: {path_str}"),
+        );
+
+        drop(dir);
+    }
+
+    /// Watch-path call site: `try_reindex_file` must invoke `post_index`
+    /// over the full graph set (existing graphs + the freshly-parsed
+    /// `new_fg`) before the per-edge resolve loop. This is the (b) half
+    /// of the Task 1.1 verification — the watch path is a SEPARATE
+    /// re-index path from `index_directory`, and omitting the hook here
+    /// silently regresses plugins with crate-aware analysis on every
+    /// watched file save.
+    ///
+    /// Uses a recording plugin that logs each `post_index` invocation;
+    /// the test drives an initial analyze (which produces one hook call)
+    /// followed by a watch reindex (which must produce another).
+    #[tokio::test]
+    async fn try_reindex_file_invokes_post_index_over_full_graph_set() {
+        use code_graph_core::{FileGraph, Language, Symbol, SymbolKind};
+        use code_graph_lang::{FileIndex, LanguagePlugin, ParseError};
+        use std::sync::{Arc, Mutex};
+
+        // Per-invocation log: each entry is the sorted list of FileGraph
+        // paths the hook observed for that call.
+        type Log = Arc<Mutex<Vec<Vec<String>>>>;
+
+        struct RecordingPlugin {
+            calls: Log,
+        }
+
+        impl LanguagePlugin for RecordingPlugin {
+            fn id(&self) -> Language {
+                Language::Cpp
+            }
+            fn extensions(&self) -> &'static [&'static str] {
+                // Use a synthetic extension so the test doesn't fight
+                // real C++ parser behavior.
+                &[".rec"]
+            }
+            fn parse_file(
+                &self,
+                path: &std::path::Path,
+                _content: &[u8],
+            ) -> Result<FileGraph, ParseError> {
+                let basename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+                let sym_name = format!("f_{basename}");
+                let file = path.to_string_lossy().into_owned();
+                let symbols = vec![Symbol {
+                    name: sym_name.clone(),
+                    kind: SymbolKind::Function,
+                    file: file.clone(),
+                    line: 1,
+                    column: 0,
+                    end_line: 1,
+                    signature: format!("void {sym_name}()"),
+                    namespace: String::new(),
+                    parent: String::new(),
+                    language: Language::Cpp,
+                }];
+                Ok(FileGraph {
+                    path: file,
+                    language: Language::Cpp,
+                    symbols,
+                    edges: Vec::new(),
+                })
+            }
+            fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
+                let mut paths: Vec<String> = graphs.iter().map(|g| g.path.clone()).collect();
+                paths.sort();
+                self.calls.lock().unwrap().push(paths);
+            }
+        }
+
+        let calls: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = LanguageRegistry::new();
+        reg.register(Box::new(RecordingPlugin {
+            calls: Arc::clone(&calls),
+        }))
+        .unwrap();
+
+        let server = crate::server::CodeGraphServer::new(reg);
+
+        // Seed two files so a missed iteration would be observable in
+        // the post_index call's path list.
+        let dir = TempDir::new().expect("TempDir");
+        std::fs::write(dir.path().join("a.rec"), b"// a\n").unwrap();
+        std::fs::write(dir.path().join("b.rec"), b"// b\n").unwrap();
+
+        // Initial analyze produces one post_index call over both files.
+        let r = analyze_codebase(
+            server.inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "initial analyze must succeed: {r:?}"
+        );
+        let analyze_log = calls.lock().unwrap().clone();
+        assert_eq!(
+            analyze_log.len(),
+            1,
+            "analyze path fires post_index exactly once: {analyze_log:?}"
+        );
+        assert_eq!(
+            analyze_log[0].len(),
+            2,
+            "analyze post_index must see both seeded files: {:?}",
+            analyze_log[0]
+        );
+
+        // Modify one file on disk and drive try_reindex_file directly
+        // (no debouncer wait — same determinism rationale as the other
+        // watch-path tests in this module).
+        let a_rec = std::fs::canonicalize(dir.path().join("a.rec")).unwrap();
+        std::fs::write(&a_rec, b"// a edited\n").unwrap();
+
+        let outcome = try_reindex_file(&server.inner, &a_rec, false).await;
+        match outcome {
+            ReindexOutcome::Reindexed => {}
+            other => panic!("expected Reindexed, got {other:?}"),
+        }
+
+        let total_log = calls.lock().unwrap().clone();
+        assert_eq!(
+            total_log.len(),
+            2,
+            "watch path must invoke post_index exactly once per try_reindex_file \
+             on top of the initial analyze call: {total_log:?}"
+        );
+        let watch_call = &total_log[1];
+        // The hook must see BOTH files (existing b.rec + freshly-parsed
+        // a.rec), not just the changed file.
+        assert_eq!(
+            watch_call.len(),
+            2,
+            "watch post_index must see the full graph set (existing + new), \
+             not just the changed file: {watch_call:?}"
+        );
+        let want_a = a_rec.to_string_lossy().into_owned();
+        let want_b = std::fs::canonicalize(dir.path().join("b.rec"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            watch_call.iter().any(|p| p == &want_a),
+            "watch post_index must include the re-parsed file {want_a:?}; got {watch_call:?}"
+        );
+        assert!(
+            watch_call.iter().any(|p| p == &want_b),
+            "watch post_index must include the pre-existing file {want_b:?}; got {watch_call:?}"
         );
 
         drop(dir);
