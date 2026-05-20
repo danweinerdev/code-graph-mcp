@@ -46,6 +46,7 @@
 //!    represented.** Use-edge `to` fields record the dotted path; generic
 //!    parameters and lifetime bounds are not part of the edge.
 
+pub(crate) mod crate_model;
 pub(crate) mod helpers;
 pub(crate) mod queries;
 

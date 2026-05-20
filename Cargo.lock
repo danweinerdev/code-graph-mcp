@@ -246,8 +246,10 @@ dependencies = [
  "insta",
  "pretty_assertions",
  "rstest",
+ "serde",
  "streaming-iterator",
  "thiserror",
+ "toml",
  "tree-sitter",
  "tree-sitter-rust",
 ]

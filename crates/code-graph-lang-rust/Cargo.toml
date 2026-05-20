@@ -18,6 +18,14 @@ tree-sitter-rust = { workspace = true }
 streaming-iterator = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# `toml` is the standard Rust TOML parser (already a workspace dep used by
+# `code-graph-core::config`). We need it here to read the `[package].name`
+# field from each crate's `Cargo.toml` while building the Rust Crate Module
+# Model (`crate_model.rs`). `serde` is required for the tiny manifest
+# struct's `Deserialize` derive — no other serde-derived types live in
+# this crate.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
