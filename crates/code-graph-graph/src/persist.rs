@@ -639,6 +639,10 @@ mod tests {
             ok,
             "freshly-written v4 cache must load successfully (Ok(true))",
         );
+        // `mtimes` is intentionally absent from this equality block: it
+        // lives in `GraphCache`, not `Graph`, and `load` never assigns it
+        // to `self` — there is nothing on the `Graph` side to compare
+        // against.
         assert_eq!(loaded.nodes, original.nodes);
         assert_eq!(loaded.adj, original.adj);
         assert_eq!(loaded.radj, original.radj);

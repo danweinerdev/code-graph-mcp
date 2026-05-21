@@ -404,11 +404,11 @@ impl Graph {
         //    carry raw unqualified target names (`edge.to = trait_text`
         //    in the Rust extractor; mirrored shape in the other plugins);
         //    two distinct types that happen to share a bare name collapse
-        //    to one child here. This is accepted per design Decision 5:
-        //    Rust trait-impl edges don't carry crate qualification, so
-        //    the engine cannot tell two same-named traits apart by
-        //    `Inherits.to` alone — collapsing them loses no real edge
-        //    beyond what the edge representation already loses.
+        //    to one child here. `Inherits.to` carries raw unqualified
+        //    text in every plugin, so the engine cannot distinguish two
+        //    same-named traits at the edge layer; dedup by name string
+        //    is the accepted invariant — collapsing them loses no real
+        //    edge beyond what the edge representation already loses.
         //
         // The dedup happens BEFORE the per-child budget gate AND before
         // recursion, so the diamond ref-stub branch (gated on
@@ -1886,5 +1886,207 @@ mod tests {
             root.derived,
         );
         assert_eq!(root.derived[0].name, "MyStruct");
+    }
+
+    /// Composition regression: per-frame dedup and cross-frame diamond
+    /// ref-stub logic must coexist when both apply to the same target name.
+    ///
+    /// Fixture (bases-direction diamond with a duplicated edge on the
+    /// second arm):
+    ///
+    /// ```text
+    ///   X --> A --> Y
+    ///   X --> B --> Y   (Inherits edge present twice in adj["B"])
+    /// ```
+    ///
+    /// Walk order under `class_hierarchy("X", depth=2, max_nodes=u32::MAX)`:
+    /// 1. Visit `X` (depth=2). `X.bases` collects `[A, B]` via the dedup
+    ///    pass on `adj["X"]` (no duplicates here; the pass is a no-op for
+    ///    `X`).
+    /// 2. Recurse into `A` (depth=1). `A.bases` walks `Y` at depth=0 as a
+    ///    canonical bare leaf (first encounter; `visited_unique` adds
+    ///    `Y`; the depth-zero early return prevents Y's own neighbors
+    ///    from being walked, which would otherwise pull `B` into
+    ///    `visited_unique` via `radj["Y"]` and break the discriminator
+    ///    below by marking `B` as visited before `X.bases` reached it).
+    ///    Pop `A` from `on_path`; `Y` remains in `visited_unique`.
+    /// 3. Recurse into `B` (depth=1). `adj["B"]` carries TWO
+    ///    `Inherits → Y` entries. The dedup pass collapses them to one
+    ///    before iteration.
+    /// 4. The single `Y` target hits the diamond branch:
+    ///    `visited_unique.contains("Y") && !on_path.contains("Y")` →
+    ///    emit `{name: "Y", ref: true}` stub.
+    ///
+    /// `depth=2` is load-bearing for the fixture, not for the layers
+    /// under test: a deeper walk would let `Y.derived` (via `radj["Y"]`)
+    /// reach `B` at depth=0 during step 2 and add it to
+    /// `visited_unique` BEFORE step 3, which would turn `B` itself into
+    /// a ref-stub at the outer level and bury the inner Y-under-B
+    /// ref-stub one level deeper. The composition under test is
+    /// independent of that wrinkle.
+    ///
+    /// The two mechanisms compose as follows:
+    /// - **Dedup discriminator:** `B.bases.len() == 1`. With the dedup
+    ///   pass removed, the loop would iterate both raw entries; each
+    ///   would hit the diamond branch independently and push its own
+    ///   ref-stub, yielding `B.bases.len() == 2` with two identical
+    ///   `{name: "Y", ref: true}` siblings.
+    /// - **Diamond discriminator:** `B.bases[0].r#ref == Some(true)`.
+    ///   With the diamond branch removed (the `visited_unique.contains`
+    ///   guard in `build_hierarchy`), `Y` is no longer on `on_path` at
+    ///   this point, so the walk would re-expand `Y` as a canonical
+    ///   full node — `B.bases[0].r#ref == None`.
+    ///
+    /// Both checks must hold simultaneously to prove the per-frame
+    /// dedup pass leaves the cross-frame diamond logic intact even when
+    /// both layers fire on the same target name.
+    ///
+    /// Only the bases direction is exercised here; the dedup pass is
+    /// the same helper on `adj` and `radj`, and the diamond branch is
+    /// direction-agnostic, so a symmetric derived-direction fixture
+    /// would carry no additional signal beyond the existing
+    /// `class_hierarchy_dedups_duplicate_inherits_edges_derived_direction`
+    /// test which already pins dedup on `radj`.
+    #[test]
+    fn class_hierarchy_dedup_and_diamond_compose() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.rs",
+            Language::Rust,
+            vec![
+                sym("Y", SymbolKind::Trait, "/a.rs"),
+                sym("A", SymbolKind::Trait, "/a.rs"),
+                sym("B", SymbolKind::Trait, "/a.rs"),
+                sym("X", SymbolKind::Struct, "/a.rs"),
+            ],
+            vec![
+                inherit_edge("X", "A", "/a.rs"),
+                inherit_edge("X", "B", "/a.rs"),
+                inherit_edge("A", "Y", "/a.rs"),
+                // Two identical Inherits edges B → Y. This is the
+                // duplicate the per-frame dedup pass at B's frame is
+                // expected to collapse.
+                inherit_edge("B", "Y", "/a.rs"),
+                inherit_edge("B", "Y", "/a.rs"),
+            ],
+        ));
+
+        // Fixture premise: adj["B"] really does carry two raw Inherits
+        // entries to Y. If a future change moved dedup up into
+        // `merge_file_graph` itself this assert fires first and tells
+        // the reader the test's premise no longer holds.
+        let adj_b = g.adj.get("B").expect("B must have an adjacency entry");
+        let b_to_y = adj_b
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits && e.target == "Y")
+            .count();
+        assert_eq!(
+            b_to_y, 2,
+            "fixture premise: adj['B'] must hold two Inherits→Y entries \
+             before build_hierarchy runs; got {b_to_y}",
+        );
+
+        let (root, total, truncated) = g.class_hierarchy("X", 2, u32::MAX).expect("X found");
+        assert!(!truncated, "u32::MAX budget never truncates");
+        assert_eq!(root.name, "X");
+
+        // X.bases must be [A, B] in merge order. Sort defensively so
+        // a future change to iteration order doesn't break the
+        // assertion locality.
+        let mut bases = root.bases.clone();
+        bases.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            bases.len(),
+            2,
+            "X must have two distinct bases (A, B); got {:?}",
+            bases.iter().map(|n| &n.name).collect::<Vec<_>>(),
+        );
+        let a_node = &bases[0];
+        let b_node = &bases[1];
+        assert_eq!(a_node.name, "A");
+        assert_eq!(b_node.name, "B");
+
+        // A's arm: Y reached first, becomes canonical.
+        assert_eq!(
+            a_node.r#ref, None,
+            "A is the first-visit arm and must be canonical (non-ref)",
+        );
+        assert_eq!(
+            a_node.bases.len(),
+            1,
+            "A.bases must hold exactly one entry (Y); got {:?}",
+            a_node.bases,
+        );
+        let y_under_a = &a_node.bases[0];
+        assert_eq!(y_under_a.name, "Y");
+        assert_eq!(
+            y_under_a.r#ref, None,
+            "Y under A is the canonical first occurrence and must NOT \
+             be a ref-stub; got {:?}",
+            y_under_a.r#ref,
+        );
+
+        // --- Discriminator (a): per-frame dedup at B's frame. ---
+        //
+        // With the dedup pass active, B.bases collapses two raw
+        // Inherits→Y entries to a single iteration. Length == 1.
+        // Without dedup, both raw entries would loop independently
+        // and each would hit the diamond branch, producing TWO
+        // ref-stub Y children with length == 2.
+        assert_eq!(
+            b_node.bases.len(),
+            1,
+            "B.bases must hold exactly one entry — the per-frame dedup \
+             pass collapsed the duplicate Inherits→Y edges. Length 2 \
+             here means the dedup pass at B's frame was removed; both \
+             raw entries iterated independently and each emitted its \
+             own ref-stub. Got bases={:?}",
+            b_node.bases,
+        );
+
+        // --- Discriminator (b): cross-frame diamond ref-stub logic. ---
+        //
+        // Y is already in visited_unique (from A's arm) but no longer
+        // on_path (A was popped before B was visited). The
+        // build_hierarchy diamond branch must emit a {name: "Y",
+        // ref: true} stub here. Without that branch the walk would
+        // re-expand Y as a full canonical node and r#ref would be
+        // None — that failure shape proves the diamond logic was
+        // removed, distinct from a dedup regression.
+        let y_under_b = &b_node.bases[0];
+        assert_eq!(y_under_b.name, "Y");
+        assert_eq!(
+            y_under_b.r#ref,
+            Some(true),
+            "Y under B must be a ref-stub (r#ref: Some(true)). \
+             r#ref == None here means the diamond branch in \
+             build_hierarchy was removed: Y is no longer on_path at \
+             B's frame but is in visited_unique, and the walk \
+             re-expanded it as a canonical full node instead of \
+             emitting a stub. Got r#ref={:?}",
+            y_under_b.r#ref,
+        );
+        assert!(
+            y_under_b.bases.is_empty(),
+            "ref-stub carries empty bases by definition; got {:?}",
+            y_under_b.bases,
+        );
+        assert!(
+            y_under_b.derived.is_empty(),
+            "ref-stub carries empty derived by definition; got {:?}",
+            y_under_b.derived,
+        );
+
+        // --- Discriminator (c): unique-name counter. ---
+        //
+        // Four distinct names walked: X, A, Y, B. The dedup pass
+        // does NOT change this count (the second Y at B's frame is
+        // already in visited_unique either way), but pinning total
+        // here guards against an accidental double-count regression
+        // in either layer.
+        assert_eq!(
+            total, 4,
+            "total_nodes_seen must count unique names: X, A, Y, B = 4",
+        );
     }
 }
