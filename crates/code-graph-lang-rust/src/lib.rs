@@ -50,15 +50,17 @@ pub(crate) mod crate_model;
 pub(crate) mod helpers;
 pub(crate) mod queries;
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
-use code_graph_lang::{LanguagePlugin, ParseError};
+use code_graph_lang::{FileIndex, LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
+use crate::crate_model::CrateModuleModel;
 use crate::helpers::{
     enclosing_function_id, find_enclosing_impl, find_enclosing_kind, resolve_mod_namespace,
     split_use_path, truncate_signature,
@@ -520,6 +522,114 @@ impl LanguagePlugin for RustParser {
     //   full `use` path as the edge's `to` field; leaving it unresolved is
     //   the intended behavior.
 
+    /// Crate-aware whole-graph rewrite. For every Rust [`FileGraph`] in
+    /// `graphs`, build the [`CrateModuleModel`] over the current Rust
+    /// file set, then overwrite each `Symbol.namespace` with
+    /// `crate_name::module::path` composed with any in-file inline `mod`
+    /// nesting already populated by `parse_file`.
+    ///
+    /// # Composition rule
+    ///
+    /// `parse_file` populated each symbol's `namespace` field via
+    /// [`resolve_mod_namespace`], which collects only inline `mod_item`
+    /// ancestors. Call its output `inline`. RCMM contributes the
+    /// crate-qualified prefix `rcmm`. The post-rewrite namespace is:
+    ///
+    /// | `rcmm`        | `inline` | result               |
+    /// |---------------|----------|----------------------|
+    /// | `Some(p)`     | `""`     | `p`                  |
+    /// | `Some(p)`     | non-empty| `format!("{p}::{inline}")` |
+    /// | `None`        | any      | `inline` (unchanged) |
+    ///
+    /// The `None` arm preserves the no-Cargo.toml fallback behavior:
+    /// the existing inline-only namespace stays in place, including the
+    /// empty string that renders as `<global>` in `get_symbol_summary`.
+    ///
+    /// # State
+    ///
+    /// Nothing is stored on `&self`. The RCMM is constructed inside this
+    /// call, used to rewrite namespaces in place, and dropped before
+    /// returning.
+    ///
+    /// # Path overrides
+    ///
+    /// The [`CrateModuleModel::with_path_overrides`] seam exists for
+    /// future `#[path = "x.rs"]` attribute work (an AST-walking
+    /// `mod`-resolution pass). This implementation does **not** parse
+    /// `.rs` source for `#[path]` attributes — the seam is intentionally
+    /// unused here.
+    ///
+    /// # `_file_index` ignored
+    ///
+    /// The hook receives a [`FileIndex`] for plugins that need basename
+    /// lookups (a future `mod`→file resolver would). The namespace
+    /// rewrite here operates on absolute file paths already present in
+    /// each `FileGraph::path`, so the index is unused.
+    fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
+        // Pass 1: collect every Rust file's absolute path.
+        let rust_paths: Vec<PathBuf> = graphs
+            .iter()
+            .filter(|fg| fg.language == Language::Rust)
+            .map(|fg| PathBuf::from(&fg.path))
+            .collect();
+
+        // No Rust files → nothing to do. Skip the manifest walk and
+        // model build entirely.
+        if rust_paths.is_empty() {
+            return;
+        }
+
+        // Pass 2: discover every `Cargo.toml` reachable up the ancestor
+        // chain of each Rust file. The indexer's discovery layer does not
+        // collect `Cargo.toml` (no plugin claims `.toml`), so RCMM cannot
+        // rely on them being in the FileGraph slice — we walk to disk
+        // ourselves. Dedupe via a HashSet to avoid stat-ing the same
+        // manifest once per `.rs` file in a deep crate.
+        let mut manifest_paths: HashSet<PathBuf> = HashSet::new();
+        for rs in &rust_paths {
+            let mut ancestor: Option<&Path> = rs.parent();
+            while let Some(dir) = ancestor {
+                let candidate = dir.join("Cargo.toml");
+                if candidate.is_file() {
+                    manifest_paths.insert(candidate);
+                }
+                ancestor = dir.parent();
+            }
+        }
+
+        // Pass 3: build the RCMM. `CrateModuleModel::build` expects a
+        // single iterator carrying both manifests and `.rs` files; it
+        // splits them internally. The production manifest reader wraps
+        // `std::fs::read_to_string(...).ok()` — the reader-callback seam
+        // RCMM exposes for filesystem-free unit testing; unreadable
+        // manifests get skipped without panic.
+        let combined = rust_paths.iter().cloned().chain(manifest_paths);
+        let rcmm = CrateModuleModel::build(combined, |p| std::fs::read_to_string(p).ok());
+
+        // Pass 4: rewrite each Rust FileGraph's symbol namespaces.
+        for fg in graphs.iter_mut() {
+            if fg.language != Language::Rust {
+                continue;
+            }
+            let file_path = PathBuf::from(&fg.path);
+            let rcmm_path = rcmm.module_path_for(&file_path);
+            for sym in fg.symbols.iter_mut() {
+                // `sym.namespace` is the inline-mod-only path populated by
+                // `parse_file::resolve_mod_namespace`. Compose with the
+                // RCMM prefix per the table in this method's docstring.
+                let inline = std::mem::take(&mut sym.namespace);
+                sym.namespace = match (rcmm_path, inline.is_empty()) {
+                    (Some(prefix), true) => prefix.to_owned(),
+                    (Some(prefix), false) => format!("{prefix}::{inline}"),
+                    // No RCMM prefix → preserve today's behavior. If
+                    // `inline` is empty, the empty namespace will render
+                    // as `<global>` downstream in `get_symbol_summary`.
+                    (None, _) => inline,
+                };
+            }
+        }
+    }
+
     fn close(&self) {}
 }
 
@@ -797,6 +907,14 @@ mod tests {
         assert_eq!(s.parent, "Foo");
     }
 
+    /// Pinned to the **no-Cargo.toml fallback**. This test goes through
+    /// `parse()` (which only calls `parse_file`, not `post_index`), so the
+    /// observed namespace is the inline-mod-only path
+    /// [`resolve_mod_namespace`] populates — exactly today's behavior.
+    /// The composed `crate::a::b::c` path that emerges when `post_index`
+    /// runs over a real Cargo crate is covered by
+    /// `post_index_composes_inline_mods_onto_crate_prefix` below; this
+    /// test is the fallback's anti-regression and stays unchanged.
     #[test]
     fn nested_mods_produce_namespace_a_b_c() {
         let fg = parse("mod a { mod b { mod c { fn x() {} } } }");
@@ -1223,5 +1341,342 @@ mod tests {
             pairs.contains(&("Foo", "B")),
             "expected Foo -> B, got {pairs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // post_index — crate-qualified namespace composition
+    // ----------------------------------------------------------------
+    //
+    // These tests exercise `RustParser::post_index`, which composes the
+    // RCMM-derived crate prefix onto the inline-mod-only namespace that
+    // `parse_file` populates. The hook walks the filesystem for
+    // `Cargo.toml` discovery, so the fixtures here materialize real
+    // multi-file crates in a `tempfile::TempDir` rather than using the
+    // in-memory `parse(src)` helper used above.
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Materialize one `.rs` file under `dir`, ensuring parent directories
+    /// exist first. `rel_path` is forward-slash-separated relative to
+    /// `dir` and converted to a platform-native PathBuf at write time.
+    fn write_rs(dir: &Path, rel_path: &str, contents: &str) -> PathBuf {
+        let abs = dir.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).expect("create_dir_all parent");
+        }
+        fs::write(&abs, contents).expect("write .rs file");
+        // Canonicalize so the assertion comparisons survive symlinked
+        // tempdir roots (e.g. /tmp -> /private/tmp on macOS).
+        fs::canonicalize(&abs).expect("canonicalize written file")
+    }
+
+    /// Write a minimal `Cargo.toml` containing only `[package].name` plus
+    /// the stock version/edition fields. Returns the canonicalized
+    /// manifest path.
+    fn write_cargo_toml(dir: &Path, crate_name: &str) -> PathBuf {
+        let manifest_path = dir.join("Cargo.toml");
+        let body = format!(
+            "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+        );
+        fs::write(&manifest_path, body).expect("write Cargo.toml");
+        fs::canonicalize(&manifest_path).expect("canonicalize Cargo.toml")
+    }
+
+    /// Drive `parse_file` + `post_index` over a list of absolute Rust
+    /// file paths, mirroring what the analyze path does after the rayon
+    /// parse loop. Returns the post-hook FileGraph slice keyed by path.
+    fn run_post_index(rs_paths: &[PathBuf]) -> Vec<FileGraph> {
+        let parser = RustParser::new().expect("RustParser::new");
+        let mut graphs: Vec<FileGraph> = rs_paths
+            .iter()
+            .map(|p| {
+                let content = fs::read(p).expect("read source file");
+                parser.parse_file(p, &content).expect("parse_file")
+            })
+            .collect();
+        // Production wires `_file_index` to the just-built FileIndex over
+        // the FileGraph set; the namespace rewrite does not consume it,
+        // so an empty one is sufficient here.
+        let file_index = FileIndex::new();
+        parser.post_index(&mut graphs, &file_index);
+        graphs
+    }
+
+    /// Find the FileGraph in `graphs` whose `path` matches `target`
+    /// after canonicalization. Panics with a helpful message if absent.
+    fn fg_for<'a>(graphs: &'a [FileGraph], target: &Path) -> &'a FileGraph {
+        let want = target.to_string_lossy().into_owned();
+        graphs.iter().find(|fg| fg.path == want).unwrap_or_else(|| {
+            panic!(
+                "expected FileGraph for {want}; got: {:?}",
+                graphs.iter().map(|fg| &fg.path).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// CRITICAL: multi-file Cargo crate fixture must produce the
+    /// canonical crate-qualified namespaces for every classic rule case:
+    /// - `src/lib.rs` → bare crate name
+    /// - `src/reactor.rs` → `crate::reactor`
+    /// - `src/a/b.rs` → `crate::a::b`
+    /// - `src/foo/mod.rs` → `crate::foo`
+    #[test]
+    fn post_index_assigns_crate_qualified_namespaces_across_layout_rules() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+
+        let lib = write_rs(dir.path(), "src/lib.rs", "fn root_fn() {}\n");
+        let reactor = write_rs(dir.path(), "src/reactor.rs", "fn react() {}\n");
+        let nested = write_rs(dir.path(), "src/a/b.rs", "fn deep() {}\n");
+        let modrs = write_rs(dir.path(), "src/foo/mod.rs", "fn in_mod_rs() {}\n");
+
+        let graphs = run_post_index(&[lib.clone(), reactor.clone(), nested.clone(), modrs.clone()]);
+
+        let root = sym(fg_for(&graphs, &lib), "root_fn");
+        assert_eq!(
+            root.namespace, "ark_core",
+            "lib.rs symbols must carry the bare crate name as namespace"
+        );
+
+        let r = sym(fg_for(&graphs, &reactor), "react");
+        assert_eq!(
+            r.namespace, "ark_core::reactor",
+            "src/reactor.rs symbols must carry crate::module"
+        );
+
+        let n = sym(fg_for(&graphs, &nested), "deep");
+        assert_eq!(
+            n.namespace, "ark_core::a::b",
+            "src/a/b.rs symbols must carry crate::a::b"
+        );
+
+        let m = sym(fg_for(&graphs, &modrs), "in_mod_rs");
+        assert_eq!(
+            m.namespace, "ark_core::foo",
+            "src/foo/mod.rs symbols must collapse to crate::foo (no `::mod` segment)"
+        );
+    }
+
+    /// Composition rule: inline `mod tests { ... }` inside a crate-owned
+    /// file must produce `crate_name::file_stem::tests`. Demonstrates the
+    /// `Some(rcmm_path) + non-empty inline` arm of post_index's
+    /// composition table.
+    #[test]
+    fn post_index_composes_inline_mods_onto_crate_prefix() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let reactor = write_rs(
+            dir.path(),
+            "src/reactor.rs",
+            "fn outer() {}\nmod tests { fn helper() {} }\n",
+        );
+
+        let graphs = run_post_index(std::slice::from_ref(&reactor));
+        let fg = fg_for(&graphs, &reactor);
+
+        let outer = sym(fg, "outer");
+        assert_eq!(
+            outer.namespace, "ark_core::reactor",
+            "module-level fn in src/reactor.rs takes the file-level prefix"
+        );
+
+        let helper = sym(fg, "helper");
+        assert_eq!(
+            helper.namespace, "ark_core::reactor::tests",
+            "inline `mod tests` composes `::tests` onto the file's crate prefix"
+        );
+    }
+
+    /// Three-level inline-mod nesting (`mod a { mod b { mod c { … } } }`)
+    /// inside `src/lib.rs` of a real crate composes onto the bare crate
+    /// name. Anti-regression for the composed-path counterpart of
+    /// `nested_mods_produce_namespace_a_b_c` (which exercises the
+    /// no-Cargo.toml fallback via `parse_file` directly).
+    #[test]
+    fn post_index_composes_deeply_nested_inline_mods_onto_crate_prefix() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(
+            dir.path(),
+            "src/lib.rs",
+            "mod a { mod b { mod c { fn x() {} } } }\n",
+        );
+
+        let graphs = run_post_index(std::slice::from_ref(&lib));
+        let fg = fg_for(&graphs, &lib);
+
+        let x = sym(fg, "x");
+        // `src/lib.rs` resolves to the bare crate name `ark_core`; the
+        // three inline mod ancestors compose as `::a::b::c`.
+        assert_eq!(
+            x.namespace, "ark_core::a::b::c",
+            "deep inline-mod nesting must compose onto the crate prefix"
+        );
+    }
+
+    /// Crate name with `-` must canonicalize to `_` (Cargo's identifier
+    /// conversion rule). Anti-regression for the post_index-side wiring
+    /// of `CrateModuleModel`'s normalization.
+    #[test]
+    fn post_index_normalizes_dash_in_crate_name_to_underscore() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "my-cool-crate");
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+
+        let graphs = run_post_index(std::slice::from_ref(&foo));
+        let fg = fg_for(&graphs, &foo);
+        assert_eq!(
+            sym(fg, "f").namespace,
+            "my_cool_crate::foo",
+            "Cargo's `-` → `_` conversion must reach the rewritten namespace"
+        );
+    }
+
+    /// A `.rs` file with NO `Cargo.toml` anywhere up its ancestor chain
+    /// must keep its inline-mod-only namespace (preserves today's
+    /// behavior, including the empty-string `<global>` rendering).
+    #[test]
+    fn post_index_fallback_when_no_cargo_toml_preserves_inline_only_namespace() {
+        let dir = TempDir::new().expect("TempDir");
+        // Intentionally no Cargo.toml written. The fixture lives directly
+        // under the tempdir root, which is itself under /tmp — and
+        // /tmp/.. is /, neither of which has a Cargo.toml. The walk's
+        // termination condition is `dir.parent() == None`, so this is
+        // safe to rely on for the duration of the test.
+        let standalone = write_rs(
+            dir.path(),
+            "standalone.rs",
+            "mod inner { fn helper() {} }\nfn top() {}\n",
+        );
+
+        let graphs = run_post_index(std::slice::from_ref(&standalone));
+        let fg = fg_for(&graphs, &standalone);
+
+        let top = sym(fg, "top");
+        assert!(
+            top.namespace.is_empty(),
+            "top-level fn outside any crate must keep empty namespace (renders as <global>); got {:?}",
+            top.namespace
+        );
+
+        let helper = sym(fg, "helper");
+        assert_eq!(
+            helper.namespace, "inner",
+            "inline-mod-only namespace must survive the no-Cargo.toml fallback path"
+        );
+    }
+
+    /// Multi-crate workspace: each member crate owns its own `.rs` files,
+    /// and `post_index` resolves each file against the nearest owning
+    /// `Cargo.toml`. Confirms the discovery walk finds nested manifests
+    /// independently for each file.
+    #[test]
+    fn post_index_resolves_each_member_independently_in_workspace() {
+        let dir = TempDir::new().expect("TempDir");
+        // Create both member crate directories first; `write_cargo_toml`
+        // assumes its directory exists.
+        fs::create_dir_all(dir.path().join("crates/a/src")).unwrap();
+        fs::create_dir_all(dir.path().join("crates/b/src")).unwrap();
+        write_cargo_toml(&dir.path().join("crates/a"), "a");
+        write_cargo_toml(&dir.path().join("crates/b"), "b");
+
+        let a_file = write_rs(dir.path(), "crates/a/src/foo.rs", "fn af() {}\n");
+        let b_file = write_rs(dir.path(), "crates/b/src/bar.rs", "fn bf() {}\n");
+
+        let graphs = run_post_index(&[a_file.clone(), b_file.clone()]);
+
+        let af = sym(fg_for(&graphs, &a_file), "af");
+        assert_eq!(
+            af.namespace, "a::foo",
+            "files in crate `a` must resolve to its owning manifest"
+        );
+
+        let bf = sym(fg_for(&graphs, &b_file), "bf");
+        assert_eq!(
+            bf.namespace, "b::bar",
+            "files in crate `b` must resolve to its owning manifest"
+        );
+    }
+
+    /// `post_index` stores nothing on `&self`. This is a compile-time +
+    /// behavioral check: calling `post_index` twice on the same parser
+    /// instance against the same fixture must produce byte-identical
+    /// output (no hidden state accumulation between calls).
+    #[test]
+    fn post_index_is_stateless_across_repeated_invocations() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "stateless_check");
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+
+        let parser = RustParser::new().expect("RustParser::new");
+        let file_index = FileIndex::new();
+        let read_one = || {
+            let content = fs::read(&foo).unwrap();
+            parser.parse_file(&foo, &content).expect("parse_file")
+        };
+
+        let mut first = vec![read_one()];
+        parser.post_index(&mut first, &file_index);
+
+        let mut second = vec![read_one()];
+        parser.post_index(&mut second, &file_index);
+
+        let first_ns = &sym(&first[0], "f").namespace;
+        let second_ns = &sym(&second[0], "f").namespace;
+        assert_eq!(
+            first_ns, "stateless_check::foo",
+            "first invocation must produce the expected crate-qualified namespace"
+        );
+        assert_eq!(
+            first_ns, second_ns,
+            "post_index must be stateless: repeated calls produce identical output"
+        );
+    }
+
+    /// Non-Rust FileGraphs in the slice must be untouched by Rust's
+    /// `post_index`. Anti-regression for accidental cross-language
+    /// mutation when the slice carries graphs from multiple plugins.
+    #[test]
+    fn post_index_leaves_non_rust_filegraphs_unmodified() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "mixed");
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+
+        let parser = RustParser::new().expect("RustParser::new");
+        let content = fs::read(&foo).unwrap();
+        let rust_fg = parser.parse_file(&foo, &content).expect("parse_file");
+
+        // A synthetic non-Rust FileGraph with a hand-set namespace. The
+        // Rust plugin must NOT touch its symbols.
+        let other = FileGraph {
+            path: "/synthetic/other.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![Symbol {
+                name: "untouched".to_string(),
+                kind: SymbolKind::Function,
+                file: "/synthetic/other.cpp".to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: "void untouched()".to_string(),
+                namespace: "original_namespace".to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }],
+            edges: Vec::new(),
+        };
+
+        let mut graphs = vec![rust_fg, other.clone()];
+        let file_index = FileIndex::new();
+        parser.post_index(&mut graphs, &file_index);
+
+        let touched_other = &graphs[1];
+        assert_eq!(
+            touched_other, &other,
+            "Rust post_index must leave non-Rust FileGraphs byte-identical"
+        );
+        // And the Rust file must have been rewritten as expected.
+        assert_eq!(sym(&graphs[0], "f").namespace, "mixed::foo");
     }
 }

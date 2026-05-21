@@ -8,7 +8,7 @@
 //! symbol declared in `src/reactor.rs` of crate `ark-core` therefore comes
 //! out of `parse_file` with no crate-qualified namespace. RCMM is the
 //! cross-file model that fills in that missing context, consumed at index
-//! time by `RustParser::post_index` (Phase 1 Task 1.3) to rewrite each
+//! time by [`crate::RustParser::post_index`] to rewrite each
 //! `Symbol.namespace` to the canonical module path.
 //!
 //! # Pure-logic, filesystem-free
@@ -19,7 +19,7 @@
 //!    same set the indexer already knows about).
 //! 2. A `read_manifest: impl Fn(&Path) -> Option<String>` callback that
 //!    returns the bytes of a `Cargo.toml` for a given path. The
-//!    production wiring (Task 1.3) passes `|p| std::fs::read_to_string(p).ok()`;
+//!    production wiring passes `|p| std::fs::read_to_string(p).ok()`;
 //!    tests pass an in-memory `HashMap<PathBuf, String>` lookup so they
 //!    can exercise every rule without touching disk.
 //!
@@ -27,29 +27,32 @@
 //! Windows path semantics, and obscure the model logic; the callback seam
 //! keeps the rule set under test.
 //!
-//! # Scope of v1
+//! # Scope
 //!
 //! - Root modules: `lib.rs` and `main.rs` only. `[[bin]]` target roots
 //!   (whose `path = "..."` lives in `Cargo.toml`) are deliberately
-//!   **out of scope** for Task 1.2. If a real codebase needs them, the
-//!   `read_manifest` callback already returns the full TOML; a follow-up
-//!   can extend [`CargoManifest`] to deserialize `[[bin]]` arrays
+//!   **out of scope**. If a real codebase needs them, the
+//!   `read_manifest` callback already returns the full TOML; an
+//!   extension can deserialize `[[bin]]` arrays from [`CargoManifest`]
 //!   without changing this module's public surface.
 //! - `#[path = "x.rs"]` overrides live in `.rs` source, not in
-//!   `Cargo.toml`. Task 1.2 does **not** parse `.rs` for `#[path]`. A
-//!   seam is provided via [`CrateModuleModel::with_path_overrides`] so
-//!   Task 1.3 (or Phase 2's `mod` resolution work) can plug in overrides
-//!   parsed from the AST without restructuring this module.
+//!   `Cargo.toml`. This module does **not** parse `.rs` for `#[path]`.
+//!   A seam is provided via [`CrateModuleModel::with_path_overrides`]
+//!   so an AST-walking caller can plug in overrides parsed from source
+//!   without restructuring this module.
 //! - Inline `mod foo { ... }` nesting is **not** RCMM's concern. RCMM
 //!   exposes a clean file-level prefix (e.g. `ark_core::reactor`); the
 //!   parser's existing inline-mod walker composes `::tests` etc. onto
-//!   that prefix at namespace-rewrite time (Task 1.3).
+//!   that prefix at namespace-rewrite time inside
+//!   [`crate::RustParser::post_index`].
 //!
 //! # Errors
 //!
 //! - No `Cargo.toml` found for a file's ancestor chain →
-//!   [`CrateModuleModel::module_path_for`] returns `None`. Task 1.3
-//!   translates that to today's empty-prefix / inline-mod-only fallback.
+//!   [`CrateModuleModel::module_path_for`] returns `None`. The
+//!   `post_index` consumer translates that to the empty-prefix /
+//!   inline-mod-only fallback (preserving today's `<global>` rendering
+//!   for files outside any crate).
 //! - Malformed `Cargo.toml` → that crate is skipped (its files get
 //!   `None`); one `eprintln!` per malformed manifest is emitted (this
 //!   workspace deliberately has no `tracing` dep — see CLAUDE.md
@@ -59,21 +62,16 @@
 //!   legitimate, not malformed). The per-member `Cargo.toml`s are what
 //!   carry crate identity.
 //!
-//! # Dead-code allowance during Task 1.2
+//! # Dead-code allowances (narrow, per item)
 //!
-//! This module ships as a pure-logic foundation; nothing in the parent
-//! crate consumes it yet. Task 1.3 wires `RustParser::post_index` into
-//! `CrateModuleModel::build` + `module_path_for`. Until then, rustc
-//! would emit unused-warnings that fail `clippy -D warnings` in CI. The
-//! `#[allow(dead_code)]` below is the documented seam — it lifts when
-//! Task 1.3 lands. Unit tests *do* exercise every public item, but they
-//! live in `#[cfg(test)]` and rustc considers that "unused" for the
-//! release build.
-
-#![allow(
-    dead_code,
-    reason = "Task 1.2 is the pure-logic foundation; Task 1.3 wires it into RustParser::post_index."
-)]
+//! Every public item in this module is consumed by
+//! [`crate::RustParser::post_index`] — except [`CargoPackage`]'s `name`
+//! (only read by `Deserialize`), [`CrateInfo::root`] (read only by a
+//! `#[cfg(debug_assertions)]` invariant in [`build_crates`]), and
+//! [`CrateModuleModel::with_path_overrides`] (a builder seam reserved
+//! for future `#[path]` / `mod` resolution work). Each carries a
+//! narrow `#[allow(dead_code, reason = …)]` instead of a module-wide
+//! suppression.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,6 +102,18 @@ struct CargoPackage {
 struct CrateInfo {
     /// Absolute path of the crate root directory (the directory that
     /// contains `Cargo.toml`).
+    ///
+    /// Only read by the `debug_assert!(c.src.starts_with(&c.root))`
+    /// invariant in [`build_crates`], which is gated on
+    /// `#[cfg(debug_assertions)]`. Release-build clippy therefore sees
+    /// the field as unread; the narrow allow keeps the invariant load-
+    /// bearing without forcing a module-wide `dead_code` suppression.
+    /// Reserved for follow-up `[[bin]]`-target / non-canonical layout
+    /// work that needs the crate root independent of the `src/` path.
+    #[allow(
+        dead_code,
+        reason = "Read only by a #[cfg(debug_assertions)] invariant in build_crates; reserved for future bin-target / non-canonical layout work."
+    )]
     root: PathBuf,
     /// Absolute path of the crate's `src/` directory. RCMM assumes the
     /// canonical Cargo layout; non-`src/` layouts would need a
@@ -118,8 +128,8 @@ struct CrateInfo {
 ///
 /// Built once per index pass from the indexed file set + a manifest
 /// reader callback. Exposes `module_path_for(file) -> Option<&str>` so
-/// consumers (Task 1.3's `RustParser::post_index`) can rewrite symbol
-/// namespaces without re-walking the filesystem.
+/// [`crate::RustParser::post_index`] can rewrite symbol namespaces
+/// without re-walking the filesystem.
 pub struct CrateModuleModel {
     /// Map from each indexed `.rs` file to its canonical crate-qualified
     /// module path. Files outside any discovered crate are deliberately
@@ -183,10 +193,15 @@ impl CrateModuleModel {
 
     /// Builder seam for `#[path = "x.rs"]` attribute overrides.
     ///
-    /// Task 1.2 does **not** parse `.rs` source for `#[path]` attributes
-    /// — that lives in the AST, not in `Cargo.toml`. This method is the
-    /// hook Task 1.3 (or Phase 2's `mod` resolution work) will use to
-    /// supply overrides parsed from the parser's AST walk.
+    /// `#[path]` attributes live in `.rs` source, not in `Cargo.toml`,
+    /// so RCMM cannot parse them itself. This method is the hook an
+    /// AST-walking caller (for instance, a future `mod`-resolution
+    /// pass) uses to supply overrides parsed from the parser's AST
+    /// walk. The current production consumer
+    /// ([`crate::RustParser::post_index`]) leaves the seam unused —
+    /// hence the narrow `dead_code` allow; the in-crate unit tests in
+    /// this module exercise it but `#[cfg(test)]` code does not count
+    /// against the release-build reachability analysis.
     ///
     /// `overrides` is a map of `.rs` file path → already-computed
     /// canonical module path. Each entry replaces whatever
@@ -195,6 +210,10 @@ impl CrateModuleModel {
     ///
     /// Builder-pattern semantics: returns `self` so callers can chain
     /// `CrateModuleModel::build(...).with_path_overrides(overrides)`.
+    #[allow(
+        dead_code,
+        reason = "Reserved for future `mod`/`#[path]` resolution; exercised only by in-crate #[cfg(test)] code."
+    )]
     pub fn with_path_overrides<I>(mut self, overrides: I) -> Self
     where
         I: IntoIterator<Item = (PathBuf, String)>,
@@ -307,10 +326,12 @@ fn build_crates(
     // invariant — if a future refactor changes how `src` is derived
     // (e.g. honoring a custom `[lib].path` or non-canonical layouts),
     // debug builds and tests will trip here rather than silently
-    // producing crates whose `src` is unrelated to their `root`. The
-    // module-level `#![allow(dead_code, reason = …)]` already silences
-    // the unused-field lint on `root`; this check is purely about
-    // correctness, not lint suppression.
+    // producing crates whose `src` is unrelated to their `root`. This is
+    // the *only* reader of `CrateInfo.root`; release-build clippy still
+    // sees the field as unread, hence the narrow `#[allow(dead_code, …)]`
+    // on the field itself (this is the only release-build reader of
+    // `CrateInfo.root`, so no module-wide `dead_code` suppression is
+    // required).
     #[cfg(debug_assertions)]
     for c in &crates {
         debug_assert!(c.src.starts_with(&c.root));
@@ -510,8 +531,9 @@ mod tests {
     #[test]
     fn file_outside_any_crate_returns_none() {
         // Indexed file with no `Cargo.toml` anywhere up its ancestor
-        // chain. Task 1.3 will translate this `None` to today's empty-
-        // prefix / inline-mod-only fallback.
+        // chain. `RustParser::post_index` translates this `None` to the
+        // empty-prefix / inline-mod-only fallback, preserving today's
+        // `<global>` rendering for files outside any crate.
         let lone = PathBuf::from("/standalone/foo.rs");
         let model = build_model(vec![lone.clone()], vec![]);
         assert_eq!(model.module_path_for(&lone), None);
@@ -655,8 +677,8 @@ mod tests {
 
     #[test]
     fn with_path_overrides_replaces_computed_path() {
-        // The `#[path]` seam: Task 1.3 (or Phase 2) will call this
-        // with overrides parsed from the AST. Here we exercise the
+        // The `#[path]` seam: an AST-walking caller can supply
+        // overrides parsed from the parser's AST. Here we exercise the
         // hook directly — a file that would naturally resolve to
         // `crate::foo` is overridden to `crate::renamed`.
         let manifest = PathBuf::from("/crate/Cargo.toml");
@@ -672,7 +694,7 @@ mod tests {
     #[test]
     fn with_path_overrides_can_supply_entry_for_unowned_file() {
         // The override map is the only source for files outside any
-        // discovered crate IF Task 1.3 chooses to populate it that
+        // discovered crate IF the caller chooses to populate it that
         // way (e.g. a `#[path]` pointing at a file the indexer found
         // but no Cargo.toml owns). The seam doesn't require the file
         // to already exist in the model.

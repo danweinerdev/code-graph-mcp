@@ -962,11 +962,10 @@ mod tests {
 
     /// Watch-path call site: `try_reindex_file` must invoke `post_index`
     /// over the full graph set (existing graphs + the freshly-parsed
-    /// `new_fg`) before the per-edge resolve loop. This is the (b) half
-    /// of the Task 1.1 verification — the watch path is a SEPARATE
-    /// re-index path from `index_directory`, and omitting the hook here
-    /// silently regresses plugins with crate-aware analysis on every
-    /// watched file save.
+    /// `new_fg`) before the per-edge resolve loop. The watch path is a
+    /// SEPARATE re-index path from `index_directory`, and omitting the
+    /// hook here silently regresses plugins with crate-aware analysis
+    /// on every watched file save.
     ///
     /// Uses a recording plugin that logs each `post_index` invocation;
     /// the test drives an initial analyze (which produces one hook call)

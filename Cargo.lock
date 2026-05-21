@@ -248,6 +248,7 @@ dependencies = [
  "rstest",
  "serde",
  "streaming-iterator",
+ "tempfile",
  "thiserror",
  "toml",
  "tree-sitter",

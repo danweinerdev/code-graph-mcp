@@ -794,10 +794,9 @@ mod tests {
 
     /// Analyze-path call site: `index_directory` must invoke
     /// `post_index` exactly once, over the full set of freshly-parsed
-    /// FileGraphs, before returning. This is the (a) half of the Task 1.1
-    /// verification — it covers the "every analyze re-index runs the hook
-    /// over the complete graph set" contract that subsequent Rust-specific
-    /// work (Task 1.3) builds on.
+    /// FileGraphs, before returning. Covers the "every analyze re-index
+    /// runs the hook over the complete graph set" contract that
+    /// crate-aware plugins (e.g. Rust's namespace rewrite) rely on.
     #[test]
     fn index_directory_invokes_post_index_over_full_graph_set() {
         let dir = TempDir::new().unwrap();

@@ -31,3 +31,8 @@ toml = { workspace = true }
 rstest = { workspace = true }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
+# Used by Task 1.3's `post_index` composition tests to materialize a real
+# multi-file Cargo crate layout on disk (the post_index hook walks the
+# filesystem for `Cargo.toml` discovery, so an in-memory fixture is not
+# expressive enough).
+tempfile = { workspace = true }
