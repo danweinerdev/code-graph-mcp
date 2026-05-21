@@ -1042,6 +1042,29 @@ mod tests {
     }
 
     #[test]
+    fn file_index_contains_path_handles_paths_without_filename() {
+        // `Path::file_name()` returns `None` for paths whose final
+        // component is not a normal file: bare root `/`, the empty
+        // string, and a few other pathological shapes. `contains_path`
+        // must short-circuit to `false` on those rather than panic
+        // or, worse, treat them as a wildcard. Populate the index
+        // with a normal entry first so the `false` result is genuinely
+        // load-bearing — not just a side-effect of an empty map.
+        let mut idx = FileIndex::new();
+        idx.by_basename
+            .entry("foo.rs".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/src/foo.rs"));
+
+        // Bare root `/` — `file_name()` returns `None`.
+        assert!(!idx.contains_path(Path::new("/")));
+        // Empty path — `file_name()` returns `None`.
+        assert!(!idx.contains_path(Path::new("")));
+        // A path ending in `..` — `file_name()` returns `None`.
+        assert!(!idx.contains_path(Path::new("/proj/..")));
+    }
+
+    #[test]
     fn caller_id_parent_extracts_class_from_method_id() {
         // Method-style ID: parent class is between final ':' and '::'.
         assert_eq!(caller_id_parent("file:Foo::bar"), "Foo");

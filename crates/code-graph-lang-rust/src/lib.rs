@@ -909,6 +909,23 @@ impl LanguagePlugin for RustParser {
             // candidate edge to fail the `(to, line)` lookup and pass
             // through to the resolve_include `None` drop. That fallback
             // is the same shape as the today's drop and is safe.
+            //
+            // Cost note for future readers: `scan_mod_decls` re-reads
+            // the file from disk AND re-runs tree-sitter on it. In
+            // `analyze_codebase` this happens once per Rust file at
+            // index time. In watch mode (`try_reindex_file`), this
+            // loop runs over the FULL graph snapshot on every
+            // file-save event — so the cost is O(N) reads + parses
+            // per keystroke-triggered reindex (N = total Rust files
+            // in the codebase). For typical crates (100–200 files)
+            // this is acceptable. If watch-mode latency complaints
+            // surface on larger codebases, two future optimization
+            // options without changing the production behavior here:
+            // (i) cache `scan_mod_decls` results by `(path, mtime)`,
+            // OR (ii) extract `#[path]` / inline-nested-flag into
+            // `parse_file`'s existing AST walk and side-channel via a
+            // Rust-specific field on `FileGraph` so post_index can
+            // skip the re-parse entirely. Neither is implemented now.
             let file_path = PathBuf::from(&fg.path);
             let Some(mod_decls) = scan_mod_decls(&file_path, &self.language) else {
                 continue;
@@ -1050,6 +1067,18 @@ fn collect_mod_decls(
                     return; // already descended
                 }
             }
+        } else {
+            // Nameless `mod_item` is only reachable from tree-sitter
+            // ERROR recovery on mid-edit source (e.g. `mod ` with no
+            // identifier yet). Stop here rather than falling through
+            // to the generic named-children walk below: that walk
+            // would descend with the OUTER caller's `inside_inline_mod`
+            // flag, which is the wrong scope for a body that lives
+            // inside a (broken) `mod_item`. A nameless mod_item
+            // contributes nothing to the mod-decl table anyway —
+            // there's no name to key on — so dropping the subtree is
+            // safe.
+            return;
         }
     }
     let mut cursor = node.walk();
@@ -2298,6 +2327,12 @@ mod tests {
     /// keyed, every graph contributes its path). Reproduced here so
     /// `code-graph-lang-rust`'s unit tests don't take a dep on the
     /// `code-graph-tools` crate.
+    //
+    // Production source of truth lives at
+    // `crates/code-graph-tools/src/indexer.rs::build_file_index`
+    // (line numbers may drift). If you change either, change both —
+    // these two functions must stay byte-equivalent so the test path's
+    // FileIndex matches what production builds at runtime.
     fn build_test_file_index(graphs: &[FileGraph]) -> FileIndex {
         let mut index = FileIndex::new();
         for fg in graphs {
@@ -2767,6 +2802,55 @@ mod tests {
             e.to,
             foo.to_string_lossy(),
             "#[path] override must NOT fall through to sibling foo.rs even when present"
+        );
+    }
+
+    /// `#[path = "missing.rs"] pub mod foo;` with `missing.rs` NOT in
+    /// the FileIndex but a sibling `foo.rs` that IS — the override is
+    /// authoritative and must NOT fall through to the sibling rule.
+    /// Mirrors rustc: a `#[path]` whose target file doesn't exist is a
+    /// compile error in real Rust, not a silent fallback to the
+    /// default file-lookup rules. Our index-side equivalent is to
+    /// drop the provisional edge entirely.
+    #[test]
+    fn mod_path_attribute_target_not_indexed_drops_edge_no_fallback() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(
+            dir.path(),
+            "src/lib.rs",
+            "#[path = \"missing.rs\"]\npub mod foo;\n",
+        );
+        // `foo.rs` is the file the sibling rule would resolve to if
+        // the `#[path]` override silently fell through. It IS in the
+        // index, so a fallback bug would surface as a surviving edge
+        // pointing at this path.
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn would_be_fallback() {}\n");
+        // `missing.rs` is deliberately NOT created on disk and
+        // therefore not in the FileIndex.
+
+        let graphs = run_post_index(&[lib.clone(), foo.clone()]);
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert!(
+            includes.is_empty(),
+            "#[path] override pointing at a non-indexed file must drop the edge — \
+             NOT silently fall through to the sibling foo.rs. Surviving edges: {:?}",
+            includes
+                .iter()
+                .map(|e| (&e.from, &e.to))
+                .collect::<Vec<_>>()
+        );
+        // Belt-and-suspenders: no surviving edge points at foo.rs.
+        // Equivalent assertion to `includes.is_empty()`, framed so a
+        // future regression that resolves to foo.rs (rather than
+        // missing.rs) produces a more pointed failure message.
+        let foo_str = foo.to_string_lossy().into_owned();
+        assert!(
+            !includes.iter().any(|e| e.to == foo_str),
+            "no surviving Includes edge may resolve to the sibling foo.rs; \
+             that would be a #[path]-fallback regression"
         );
     }
 
