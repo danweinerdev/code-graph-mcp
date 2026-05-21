@@ -1599,38 +1599,78 @@ mod tests {
         );
     }
 
-    /// `post_index` stores nothing on `&self`. This is a compile-time +
-    /// behavioral check: calling `post_index` twice on the same parser
-    /// instance against the same fixture must produce byte-identical
-    /// output (no hidden state accumulation between calls).
+    /// `post_index` stores nothing on `&self`. Drive a single
+    /// `RustParser` instance against TWO independent fixtures with
+    /// disjoint crate names and disjoint file paths; the second call's
+    /// resolutions must reflect ONLY the second fixture's manifest. A
+    /// stateful cache on `&self` (e.g. memoizing the first call's
+    /// manifest discoveries by directory or carrying a residual
+    /// `CrateModuleModel`) would leak the first crate's name into the
+    /// second result and trip the negative assertion below.
     #[test]
-    fn post_index_is_stateless_across_repeated_invocations() {
-        let dir = TempDir::new().expect("TempDir");
-        write_cargo_toml(dir.path(), "stateless_check");
-        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+    fn post_index_does_not_leak_state_between_calls_on_different_crates() {
+        // Fixture A: crate `crate_a` with src/lib.rs + src/foo.rs.
+        let dir_a = TempDir::new().expect("TempDir A");
+        write_cargo_toml(dir_a.path(), "crate_a");
+        let a_lib = write_rs(dir_a.path(), "src/lib.rs", "pub fn la() {}\n");
+        let a_foo = write_rs(dir_a.path(), "src/foo.rs", "fn af() {}\n");
+
+        // Fixture B: a SEPARATE TempDir, different crate name, different
+        // module file names — no overlap with A on any axis.
+        let dir_b = TempDir::new().expect("TempDir B");
+        write_cargo_toml(dir_b.path(), "crate_b");
+        let b_lib = write_rs(dir_b.path(), "src/lib.rs", "pub fn lb() {}\n");
+        let b_bar = write_rs(dir_b.path(), "src/bar.rs", "fn bf() {}\n");
 
         let parser = RustParser::new().expect("RustParser::new");
         let file_index = FileIndex::new();
-        let read_one = || {
-            let content = fs::read(&foo).unwrap();
-            parser.parse_file(&foo, &content).expect("parse_file")
+
+        let parse_one = |p: &PathBuf| {
+            let content = fs::read(p).expect("read source file");
+            parser.parse_file(p, &content).expect("parse_file")
         };
 
-        let mut first = vec![read_one()];
-        parser.post_index(&mut first, &file_index);
+        // First call: fixture A only.
+        let mut graphs_a = vec![parse_one(&a_lib), parse_one(&a_foo)];
+        parser.post_index(&mut graphs_a, &file_index);
 
-        let mut second = vec![read_one()];
-        parser.post_index(&mut second, &file_index);
-
-        let first_ns = &sym(&first[0], "f").namespace;
-        let second_ns = &sym(&second[0], "f").namespace;
+        let la_ns = &sym(fg_for(&graphs_a, &a_lib), "la").namespace;
+        let af_ns = &sym(fg_for(&graphs_a, &a_foo), "af").namespace;
         assert_eq!(
-            first_ns, "stateless_check::foo",
-            "first invocation must produce the expected crate-qualified namespace"
+            la_ns, "crate_a",
+            "fixture A's lib.rs must resolve under `crate_a`"
         );
         assert_eq!(
-            first_ns, second_ns,
-            "post_index must be stateless: repeated calls produce identical output"
+            af_ns, "crate_a::foo",
+            "fixture A's foo.rs must resolve under `crate_a::foo`"
+        );
+
+        // Second call: SAME parser instance, fixture B's independent
+        // FileGraph vec. None of fixture A's manifest/path data is
+        // visible to this call.
+        let mut graphs_b = vec![parse_one(&b_lib), parse_one(&b_bar)];
+        parser.post_index(&mut graphs_b, &file_index);
+
+        let lb_ns = &sym(fg_for(&graphs_b, &b_lib), "lb").namespace;
+        let bf_ns = &sym(fg_for(&graphs_b, &b_bar), "bf").namespace;
+        assert_eq!(
+            lb_ns, "crate_b",
+            "fixture B's lib.rs must resolve under `crate_b`, not the prior call's crate"
+        );
+        assert_eq!(
+            bf_ns, "crate_b::bar",
+            "fixture B's bar.rs must resolve under `crate_b::bar`, not the prior call's crate"
+        );
+
+        // Negative assertions: a stateful-cache bug would surface as
+        // `crate_a`-prefixed namespaces leaking into fixture B's output.
+        assert!(
+            !lb_ns.starts_with("crate_a"),
+            "state leak: fixture B's lib.rs resolved with crate_a prefix ({lb_ns})"
+        );
+        assert!(
+            !bf_ns.starts_with("crate_a"),
+            "state leak: fixture B's bar.rs resolved with crate_a prefix ({bf_ns})"
         );
     }
 
