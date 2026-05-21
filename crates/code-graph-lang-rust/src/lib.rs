@@ -72,7 +72,8 @@ use crate::helpers::{
     split_use_path, truncate_signature, NearestDefAncestor,
 };
 use crate::queries::{
-    CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, MOD_DECL_QUERIES, USE_QUERIES,
+    CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, MOD_DECL_QUERIES, SUPERTRAIT_QUERY,
+    USE_QUERIES,
 };
 
 /// File extensions the Rust parser claims.
@@ -97,6 +98,12 @@ pub struct RustParser {
     use_query: Query,
     /// Compiled inheritance / trait-impl query.
     inh_query: Query,
+    /// Compiled supertrait-bound query (drives `trait Sub: Super` →
+    /// `Inherits` edge emission via a separate loop in
+    /// [`Self::extract_inheritance`]; kept independent of `inh_query`
+    /// so the `impl_item` accumulate-then-emit shape and the
+    /// `trait_item` per-bound shape stay in dedicated loops).
+    supertrait_query: Query,
     /// Compiled module-declaration query (drives external-`mod`
     /// provisional `Includes` edge emission).
     mod_query: Query,
@@ -121,6 +128,8 @@ impl RustParser {
             Query::new(&language, USE_QUERIES).map_err(|e| anyhow::anyhow!("use query: {e}"))?;
         let inh_query = Query::new(&language, INHERITANCE_QUERIES)
             .map_err(|e| anyhow::anyhow!("inheritance query: {e}"))?;
+        let supertrait_query = Query::new(&language, SUPERTRAIT_QUERY)
+            .map_err(|e| anyhow::anyhow!("supertrait query: {e}"))?;
         let mod_query = Query::new(&language, MOD_DECL_QUERIES)
             .map_err(|e| anyhow::anyhow!("mod-declaration query: {e}"))?;
 
@@ -130,6 +139,7 @@ impl RustParser {
             call_query,
             use_query,
             inh_query,
+            supertrait_query,
             mod_query,
         })
     }
@@ -187,8 +197,9 @@ impl RustParser {
     ///   parent = trait name. This is a deliberate, Rust-trait-scoped
     ///   exception to the cross-language "forward declarations
     ///   excluded" invariant. No new [`SymbolKind`] variant; trait
-    ///   identity rides entirely on the `parent` field of the symbol
-    ///   (supertrait `Inherits` edges are a separate future addition).
+    ///   identity rides on the `parent` field of the symbol, AND on
+    ///   `Inherits` edges for supertrait bounds (`trait Sub: Super` —
+    ///   see the second loop in [`Self::extract_inheritance`]).
     /// - `function_signature_item` (`fn f(&self);` no-body
     ///   declarations) inside a `trait_item` → same as a trait default
     ///   method: [`SymbolKind::Method`], parent = trait name. A bare
@@ -267,9 +278,10 @@ impl RustParser {
                                 // body) — both classify as Method, with
                                 // the trait name as parent. No new
                                 // SymbolKind variant; trait identity
-                                // rides entirely on the parent field
-                                // (supertrait Inherits edges are a
-                                // separate future addition).
+                                // rides on the parent field AND on
+                                // `Inherits` edges for supertrait bounds
+                                // (`trait Sub: Super` — see the second
+                                // loop in `extract_inheritance`).
                                 let parent_text = trait_node
                                     .child_by_field_name("name")
                                     .and_then(|n| n.utf8_text(content).ok())
@@ -620,24 +632,71 @@ impl RustParser {
         }
     }
 
-    /// Run the inheritance query and produce `Inherits` edges for trait
-    /// impls. Mirrors the C++ plugin's `extract_inheritance` for the
-    /// single-base case (Rust's `impl Trait for Type` is always one base
-    /// per impl block; multi-trait impls are written as separate blocks).
+    /// Run the inheritance queries and produce `Inherits` edges from
+    /// two independent sources:
     ///
-    /// The query (`INHERITANCE_QUERIES`) requires both the `type` AND
-    /// `trait` fields to be present — inherent impls (no `trait`) do not
-    /// match, so no edge is emitted. Generic impls
-    /// (`impl<T> Trait for Vec<T>`) and impls with `where` clauses match
-    /// the same way; the `type` and `trait` field text is captured
-    /// verbatim (`Vec<T>` and `Trait`), with generics included as written.
+    /// 1. **`impl Trait for Type` blocks** (the existing loop, unchanged).
+    ///    Driven by [`INHERITANCE_QUERIES`]. Each match accumulates
+    ///    `@impl.type` and `@impl.trait` within ONE match and emits one
+    ///    edge per `impl_item`. Inherent impls (no `trait` field) do not
+    ///    match the query, so no edge is emitted. Generic impls
+    ///    (`impl<T> Trait for Vec<T>`) and impls with `where` clauses
+    ///    match the same way; `type`/`trait` text is captured verbatim
+    ///    (`Vec<T>` and `Trait`).
     ///
-    /// Edge shape: `from = type_text, to = trait_text, kind = Inherits,
-    /// file = path, line = impl_item.start_position().row + 1`. The
-    /// implementing type is the `from` (the "child" in the inheritance
-    /// hierarchy); the trait is the `to` (the "parent"). Matches the C++
-    /// `derived → base` direction.
+    ///    Edge shape: `from = type_text, to = trait_text, kind =
+    ///    Inherits, file = path, line = impl_item.start_position().row
+    ///    + 1`. The implementing type is the `from` (the "child" in the
+    ///    inheritance hierarchy); the trait is the `to` (the "parent").
+    ///    Mirrors the C++ `derived → base` direction.
+    ///
+    /// 2. **`trait Sub: Super1 + Super2 { … }` supertrait bounds** (the
+    ///    second loop, independent of the `impl` loop above). Driven by
+    ///    [`SUPERTRAIT_QUERY`]. Each match carries ONE
+    ///    `@sub.bound`, so a trait with N supertrait bounds yields N
+    ///    matches → N edges, all sharing the same `@sub.name` `from`.
+    ///    A `trait_item` with no `bounds` field never matches and emits
+    ///    nothing — the no-supertraits case is silent by query
+    ///    construction.
+    ///
+    ///    Edge shape:
+    ///    `from = sub_trait_name, to = super_trait_name, kind = Inherits,
+    ///    file = path, line = bound.start_position().row + 1`.
+    ///    The `line` anchors at each individual bound node, not at the
+    ///    `trait_item`, so multi-line supertrait lists carry one distinct
+    ///    line per emitted edge.
+    ///
+    ///    Bound filtering (filter at extraction, not in the query):
+    ///    - `lifetime` (`'a`, `'static`) — not a trait → no edge.
+    ///    - `removed_trait_bound` (`?Sized`, `?Send`) — opt-OUT marker,
+    ///      not a supertrait → no edge.
+    ///    - `type_identifier` (`Super`) — emit edge `to = "Super"`.
+    ///    - `scoped_type_identifier` (`module::Super`) — emit edge `to =
+    ///      verbatim text` (preserves the path).
+    ///    - `generic_type` (`Super<T>`) — emit edge `to = generic's
+    ///      `type` field text` (i.e. `Super`, generic args stripped) so
+    ///      downstream class-hierarchy keying matches the bare-name
+    ///      `Symbol.name` (consistent with Decision 5 in the design,
+    ///      which dedups by `Symbol.name`).
+    ///    - `higher_ranked_trait_bound` (`for<'a> Foo<'a>`) — walk into
+    ///      the inner `type` field and apply the rules above (typically
+    ///      a `generic_type` → bare name `Foo`).
+    ///    - Anything else — silently skipped (forward-compatible against
+    ///      grammar drift).
+    ///
+    /// The two loops share the function but consume distinct queries and
+    /// distinct accumulation shapes; neither can leak edges into the
+    /// other's behavior. The `impl` loop's anti-regression set
+    /// (`inherent_impl_produces_no_inheritance_edge`,
+    /// `trait_impl_produces_one_inheritance_edge`,
+    /// `generic_trait_impl`, `multiple_trait_impls_per_type`) cannot
+    /// regress, by construction.
     fn extract_inheritance(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        // Loop 1: `impl Trait for Type` blocks. This branch's behavior
+        // is pinned by the anti-regression tests listed in the doc above
+        // (`inherent_impl_produces_no_inheritance_edge`,
+        // `trait_impl_produces_one_inheritance_edge`, etc.) — the
+        // supertrait loop below MUST NOT alter what this loop emits.
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.inh_query, root, content);
         let cap_names = self.inh_query.capture_names();
@@ -681,6 +740,119 @@ impl RustParser {
                 line,
             });
         }
+
+        // Loop 2: `trait Sub: Super1 + Super2 { … }` supertrait bounds.
+        // Separate `QueryCursor` so the iterator state from loop 1
+        // cannot bleed in. The cap-names index belongs to
+        // `supertrait_query` exclusively.
+        let mut super_cursor = QueryCursor::new();
+        let mut super_matches = super_cursor.matches(&self.supertrait_query, root, content);
+        let super_cap_names = self.supertrait_query.capture_names();
+
+        while let Some(m) = super_matches.next() {
+            let mut sub_name = String::new();
+            let mut bound_node: Option<Node<'_>> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                match capture_name_for_index(super_cap_names, capture.index) {
+                    "sub.name" => {
+                        sub_name = cap_node.utf8_text(content).unwrap_or("").to_owned();
+                    }
+                    "sub.bound" => bound_node = Some(cap_node),
+                    _ => {}
+                }
+            }
+
+            let (Some(bound), false) = (bound_node, sub_name.is_empty()) else {
+                continue;
+            };
+
+            // Resolve the bound's nameable target (or skip via filter).
+            let Some(super_name) = resolve_supertrait_bound(bound, content) else {
+                continue;
+            };
+            if super_name.is_empty() {
+                continue;
+            }
+
+            fg.edges.push(Edge {
+                from: sub_name,
+                to: super_name,
+                kind: EdgeKind::Inherits,
+                file: path.to_owned(),
+                line: bound.start_position().row as u32 + 1,
+            });
+        }
+    }
+}
+
+/// Resolve a single `@sub.bound` node from `SUPERTRAIT_QUERY` to the
+/// emitted `Inherits.to` target name, or `None` if the bound is not a
+/// nameable trait (lifetime, `?Sized`-style marker, or any other
+/// grammar variant the filter does not recognize).
+///
+/// Rules (mirroring the doc on
+/// [`RustParser::extract_inheritance`]'s supertrait loop):
+///
+/// | Bound kind                  | Result                                  |
+/// |-----------------------------|-----------------------------------------|
+/// | `lifetime`                  | `None` (filtered — not a trait)        |
+/// | `removed_trait_bound`       | `None` (filtered — `?Sized`/opt-OUT)    |
+/// | `type_identifier`           | `Some(verbatim text)`                   |
+/// | `scoped_type_identifier`    | `Some(verbatim text)`                   |
+/// | `generic_type`              | `Some(generic's `type` field text)`     |
+/// | `higher_ranked_trait_bound` | recurse into the `type` field           |
+/// | any other kind              | `None` (forward-compatible skip)        |
+///
+/// `generic_type` resolves to its `type` field (the bare base name,
+/// e.g. `Super` from `Super<T>`) so the emitted `to` matches the
+/// bare-name `Symbol.name` carried on the corresponding `trait Super`
+/// definition. Symbol IDs and `class_hierarchy` keying both key on the
+/// bare name (see design Decision 5), so a generic-stripped `to`
+/// composes cleanly with the existing hierarchy walk and dedup.
+///
+/// A `higher_ranked_trait_bound` (`for<'a> Foo<'a>`) is rare in
+/// supertrait position but grammatically valid; the inner `type` field
+/// is what carries the actual nameable trait. One level of recursion
+/// suffices — HRTBs do not nest.
+fn resolve_supertrait_bound(bound: Node<'_>, content: &[u8]) -> Option<String> {
+    match bound.kind() {
+        // `'a`, `'static`. Filtered: lifetimes are not traits, never an
+        // `Inherits` edge target.
+        "lifetime" => None,
+        // `?Sized`, `?Send`, `?Unpin`. Filtered: these are opt-OUT
+        // markers (the sub-trait declares it does NOT require the
+        // marker), not supertrait relationships.
+        "removed_trait_bound" => None,
+        // Bare name: `Super`. Verbatim.
+        "type_identifier" => Some(bound.utf8_text(content).unwrap_or("").to_owned()),
+        // Path: `module::Super`. Preserve the verbatim text so the
+        // path-qualified spelling rides through to `class_hierarchy`
+        // (which keys by string identity).
+        "scoped_type_identifier" => Some(bound.utf8_text(content).unwrap_or("").to_owned()),
+        // `Super<T>`. Resolve to the generic's `type` field (the bare
+        // name) so the emitted edge matches the bare-name Symbol the
+        // trait definition carries.
+        "generic_type" => {
+            let inner = bound.child_by_field_name("type")?;
+            Some(inner.utf8_text(content).unwrap_or("").to_owned())
+        }
+        // `for<'a> Foo<'a>`. Walk into the inner `type` field and apply
+        // the same rules.
+        "higher_ranked_trait_bound" => {
+            let inner = bound.child_by_field_name("type")?;
+            resolve_supertrait_bound(inner, content)
+        }
+        // Defensive: unrecognized variant → skip silently (forward
+        // compatibility against grammar drift). Adding emission here
+        // would risk false-positive edges; better to under-emit and
+        // catch it via a missing-edge test than to over-emit and
+        // corrupt hierarchies.
+        _ => None,
     }
 }
 
@@ -1253,6 +1425,7 @@ mod tests {
             &p.call_query,
             &p.use_query,
             &p.inh_query,
+            &p.supertrait_query,
             &p.mod_query,
         );
     }
@@ -2256,6 +2429,170 @@ mod tests {
             pairs.contains(&("Foo", "B")),
             "expected Foo -> B, got {pairs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Supertrait bounds (`trait Sub: Super + …`)
+    // ----------------------------------------------------------------
+    //
+    // These tests exercise the second loop inside
+    // `extract_inheritance`, driven by `SUPERTRAIT_QUERY`. The `impl`-loop
+    // tests above are anti-regression guards for the FIRST loop: they
+    // must stay green, proving the two loops do not leak into each
+    // other.
+
+    #[test]
+    fn supertrait_single_bound_emits_one_inheritance_edge() {
+        // `trait Sub: Super {}` → one Inherits edge Sub → Super.
+        let fg = parse("trait Super {} trait Sub: Super {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 1, "expected 1 Inherits edge, got {is:?}");
+        let e = is[0];
+        assert_eq!(
+            e.from, "Sub",
+            "Inherits `from` must be the sub-trait declaring the bound"
+        );
+        assert_eq!(
+            e.to, "Super",
+            "Inherits `to` must be the supertrait named in the bound"
+        );
+        assert_eq!(e.kind, EdgeKind::Inherits);
+        assert_eq!(e.file, "/tmp/test.rs");
+        assert!(
+            e.line >= 1,
+            "line must be 1-indexed and populated, got {}",
+            e.line
+        );
+    }
+
+    #[test]
+    fn supertrait_multiple_bounds_emit_one_edge_each() {
+        // `trait S: A + B + C {}` → three Inherits edges, all from `S`.
+        let fg = parse("trait A {} trait B {} trait C {} trait S: A + B + C {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 3, "expected 3 Inherits edges, got {is:?}");
+        // All edges originate at `S`.
+        for e in &is {
+            assert_eq!(
+                e.from, "S",
+                "every supertrait edge must originate at the sub-trait `S`"
+            );
+            assert_eq!(e.kind, EdgeKind::Inherits);
+        }
+        let targets: Vec<&str> = is.iter().map(|e| e.to.as_str()).collect();
+        for want in ["A", "B", "C"] {
+            assert!(
+                targets.contains(&want),
+                "expected Inherits target {want}, got {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supertrait_with_generic_bound_emits_base_name() {
+        // `trait S: Super<T> {}` → one edge whose `to` is the bare base
+        // name `Super`, NOT the generic spelling `Super<T>`. Rationale:
+        // `Symbol.name` for `trait Super<T> {}` is the bare `Super`
+        // (the symbol extractor records the type_identifier in the
+        // `name` field, generics ride along separately), and Decision 5
+        // dedups class-hierarchy walks by `Symbol.name`. A bare-name
+        // `to` lets the supertrait edge compose with the hierarchy
+        // walk; a `Super<T>` spelling would miss the dedup key and
+        // fragment the hierarchy.
+        let fg = parse("trait Super<T> {} trait S<T>: Super<T> {}");
+        let is = inherits(&fg);
+        assert_eq!(is.len(), 1, "expected 1 Inherits edge, got {is:?}");
+        let e = is[0];
+        assert_eq!(e.from, "S");
+        assert_eq!(
+            e.to, "Super",
+            "generic_type bound must resolve to the bare base name, not the generic spelling"
+        );
+    }
+
+    #[test]
+    fn supertrait_lifetime_bound_is_filtered() {
+        // `trait S: 'static {}` → ZERO Inherits edges. A `lifetime`
+        // bound is not a trait and must not emit an edge.
+        let fg = parse("trait S: 'static {}");
+        let is = inherits(&fg);
+        assert!(
+            is.is_empty(),
+            "lifetime supertrait bound must produce zero Inherits edges, got {is:?}"
+        );
+    }
+
+    #[test]
+    fn supertrait_questionmark_sized_is_filtered() {
+        // `trait S: ?Sized {}` → ZERO Inherits edges. `?Sized` is a
+        // `removed_trait_bound` (opt-OUT marker), not a supertrait.
+        let fg = parse("trait S: ?Sized {}");
+        let is = inherits(&fg);
+        assert!(
+            is.is_empty(),
+            "?Sized supertrait bound must produce zero Inherits edges, got {is:?}"
+        );
+    }
+
+    #[test]
+    fn supertrait_mixed_with_lifetime_and_real_trait() {
+        // `trait S: Foo + 'a + Bar {}` — `Foo` and `Bar` survive, `'a`
+        // is filtered. Exactly two Inherits edges.
+        let fg = parse("trait Foo {} trait Bar {} trait S<'a>: Foo + 'a + Bar {}");
+        let is = inherits(&fg);
+        assert_eq!(
+            is.len(),
+            2,
+            "mixed lifetime+trait supertrait list must emit only the trait bounds; got {is:?}"
+        );
+        let targets: Vec<&str> = is.iter().map(|e| e.to.as_str()).collect();
+        assert!(
+            targets.contains(&"Foo"),
+            "expected Foo edge, got {targets:?}"
+        );
+        assert!(
+            targets.contains(&"Bar"),
+            "expected Bar edge, got {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.starts_with('\'')),
+            "lifetime token must NOT leak into Inherits targets, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn trait_with_no_bounds_emits_no_supertrait_edges() {
+        // `trait Plain {}` — no `bounds` field on the `trait_item`, so
+        // SUPERTRAIT_QUERY never matches and the new loop emits
+        // nothing. Anti-regression against a query that accidentally
+        // matches bounds-less traits (e.g. via a non-required field
+        // misspelling).
+        let fg = parse("trait Plain { fn m(&self); }");
+        let is = inherits(&fg);
+        assert!(
+            is.is_empty(),
+            "trait with no supertrait bounds must produce zero Inherits edges, got {is:?}"
+        );
+    }
+
+    #[test]
+    fn impl_for_inheritance_still_emits_one_edge() {
+        // Anti-regression: the `impl Trait for Type` loop is
+        // independent of the new supertrait loop. A bare `impl T for U`
+        // (no supertrait declarations in scope) must emit EXACTLY one
+        // Inherits edge — proving the new loop does not also pick up
+        // the `impl_item` (different grammar node) and double-emit.
+        let fg = parse("trait T {} struct U; impl T for U {}");
+        let is = inherits(&fg);
+        assert_eq!(
+            is.len(),
+            1,
+            "impl-for edge must remain a single emission; the new supertrait loop \
+             must NOT also fire on impl_item nodes — got {is:?}"
+        );
+        let e = is[0];
+        assert_eq!(e.from, "U");
+        assert_eq!(e.to, "T");
     }
 
     // ----------------------------------------------------------------

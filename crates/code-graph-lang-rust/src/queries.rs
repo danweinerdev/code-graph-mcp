@@ -137,6 +137,54 @@ pub(crate) const INHERITANCE_QUERIES: &str = r#"
   type: (_) @impl.type) @impl.def
 "#;
 
+/// Supertrait-bound query: `trait Sub: Super1 + Super2 { … }`.
+///
+/// Matches every `trait_item` whose `bounds` field is set (i.e. the
+/// sub-trait declares `: Super1 + … + SuperN`). Captures:
+///
+/// - `@sub.name` — the sub-trait's name (the `type_identifier` in the
+///   `name` field of `trait_item`). One per match.
+/// - `@sub.bound` — each individual bound node inside the `trait_bounds`
+///   list. The `(_)` child wildcard fires once per `+`-separated bound,
+///   so a trait with N supertrait bounds produces N matches sharing the
+///   same `@sub.name` but each carrying a distinct `@sub.bound`.
+///
+/// The captured `@sub.bound` node kind drives downstream filtering — the
+/// `trait_bounds` rule (per the tree-sitter-rust grammar) admits three
+/// alternation arms:
+///
+/// 1. `_type` (the type supertype) — the bound is a nameable trait when
+///    the concrete kind is `type_identifier` (`Super`),
+///    `scoped_type_identifier` (`module::Super`), or `generic_type`
+///    (`Super<T>`). One bound under `_type` is a `removed_trait_bound`
+///    (`?Sized`, `?Send`, …) — that variant carries the same `_type`
+///    supertype umbrella but represents an opt-OUT marker, not a real
+///    supertrait, so it must NOT emit an `Inherits` edge.
+/// 2. `higher_ranked_trait_bound` — `for<'a> Foo<'a>`. We dig into the
+///    inner `type` field for the actual nameable bound (typically a
+///    `generic_type` like `Foo<'a>` → base name `Foo`).
+/// 3. `lifetime` — `'a`, `'static`. Lifetimes are not traits and must NOT
+///    emit an `Inherits` edge.
+///
+/// Filtering of (1, `?Sized`) / (3, lifetimes) happens in the extractor
+/// loop (`extract_inheritance`'s supertrait branch), not in the query —
+/// the query stays simple and the filter rules live next to the edge
+/// emission they govern.
+///
+/// This query is deliberately separate from [`INHERITANCE_QUERIES`]: that
+/// query matches `impl_item` and the extractor's `impl` loop accumulates
+/// a `(type, trait)` pair within one match. A `trait_item` with N
+/// supertrait bounds yields N `(sub, super)` pairs — one match per bound
+/// — which the existing accumulate-then-emit shape cannot express. Each
+/// query is paired with its own dedicated loop so neither shape leaks
+/// into the other.
+pub(crate) const SUPERTRAIT_QUERY: &str = r#"
+(trait_item
+  name: (type_identifier) @sub.name
+  bounds: (trait_bounds
+    (_) @sub.bound))
+"#;
+
 /// Module-declaration query, feeding [`crate::RustParser::extract_mod_decls`].
 ///
 /// Captures every `mod_item` along with its `name` identifier. The
