@@ -386,6 +386,101 @@ async fn get_class_hierarchy_for_rust_trait() {
 }
 
 // ---------------------------------------------------------------------
+// get_class_hierarchy on a Rust trait with multiple supertrait bounds.
+//
+// `pub trait Sub: A + B {}` must emit two `Inherits` edges (Sub -> A,
+// Sub -> B) through the supertrait branch of `extract_inheritance`.
+// Walking the hierarchy from `Sub` with depth=2 must surface both
+// supertraits as bases; because `A` and `B` are independent leaves
+// (no further supertraits, no impls), neither base should come back
+// as a `{ref: true}` stub.
+//
+// Inline TempDir fixture (mirrors `build_go_interface_fixture` above)
+// so the assertion rides on a freshly-indexed graph rather than the
+// shared `testdata/rust/` corpus — keeping the supertrait-bound
+// invariant self-contained and independent of the corpus manifest.
+// ---------------------------------------------------------------------
+
+/// Synthesize a TempDir containing a single Rust source file with three
+/// traits: two independent leaves (`A`, `B`) and one trait that names
+/// both as supertrait bounds (`Sub: A + B`). The crate manifest is
+/// minimal — the parser doesn't need `cargo` machinery, just the `.rs`
+/// extension and a discoverable file root.
+async fn build_rust_supertrait_fixture() -> IndexedFixture {
+    let dir = TempDir::new().expect("TempDir for Rust supertrait fixture");
+    // Layout: a flat src/ tree with one file holding all three traits.
+    // The supertrait emission path doesn't care about module structure;
+    // a single-file fixture keeps the assertion focused on the
+    // supertrait edges and unrelated noise out of the indexed graph.
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub trait A {}\n\
+         pub trait B {}\n\
+         pub trait Sub: A + B {}\n",
+    )
+    .expect("write lib.rs");
+    build_indexed_from_dir(dir).await
+}
+
+#[tokio::test]
+async fn get_class_hierarchy_for_rust_trait_with_multiple_supertraits() {
+    let fx = build_rust_supertrait_fixture().await;
+    let r = get_class_hierarchy(&fx.inner.graph, "Sub", Some(2), None);
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "get_class_hierarchy must succeed for a Rust trait with \
+         supertrait bounds: {r:?}",
+    );
+
+    let body = first_text(&r);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("hierarchy is JSON");
+    let hierarchy = &parsed["hierarchy"];
+    assert_eq!(
+        hierarchy["name"].as_str(),
+        Some("Sub"),
+        "hierarchy root must be the queried trait, got: {parsed}",
+    );
+
+    // `Sub: A + B` produces two supertrait `Inherits` edges: Sub -> A
+    // and Sub -> B. Both supertraits MUST appear in the `bases` list.
+    let bases = hierarchy["bases"]
+        .as_array()
+        .expect("Sub has supertrait bases, so the `bases` array must be present");
+    assert_eq!(
+        bases.len(),
+        2,
+        "Sub has exactly two supertrait bounds (A, B), got: {bases:?}",
+    );
+
+    // Collect base names into a set so ordering is not load-bearing.
+    let base_names: std::collections::BTreeSet<&str> =
+        bases.iter().filter_map(|n| n["name"].as_str()).collect();
+    assert!(
+        base_names.contains("A"),
+        "Sub's bases must include `A`, got: {base_names:?}",
+    );
+    assert!(
+        base_names.contains("B"),
+        "Sub's bases must include `B`, got: {base_names:?}",
+    );
+
+    // Neither `A` nor `B` should be a `ref: true` stub — both are
+    // independent leaves, not duplicate diamond re-occurrences.
+    for base in bases {
+        let name = base["name"].as_str().unwrap_or("<unnamed>");
+        let is_ref = base.get("ref").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(
+            !is_ref,
+            "supertrait `{name}` must be a real hierarchy node, not a \
+             ref-stub — A and B are independent leaves with no diamond \
+             re-occurrence; got: {base:?}",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
 // generate_diagram for a Rust trait inheritance — `Compute` is impl'd
 // by both `Foo<T>` and `Bar<T>` in testdata/rust, so the inheritance
 // diagram has at least two Inherits edges from those types to `Compute`.

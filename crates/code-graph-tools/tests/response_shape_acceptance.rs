@@ -278,11 +278,18 @@ async fn get_symbol_summary_byte_budget_is_load_bearing() {
 // second arm to an empty leaf).
 // ---------------------------------------------------------------------------
 
-/// A genuine inheritance diamond expressed the only way the Rust parser
-/// emits `Inherits` edges: `impl Trait for Type` blocks (the parser's
-/// inheritance query matches `impl_item` with a `trait:` field; trait
-/// supertrait bounds like `trait Leaf: D1 + D2 {}` do NOT produce
-/// `Inherits` edges, so the diamond must be modeled through impls).
+/// A genuine inheritance diamond expressed via `impl Trait for Type`
+/// blocks. The Rust parser now emits `Inherits` edges from two sources:
+/// (a) `impl Trait for Type` blocks — matched via the `impl_item` query
+/// with a `trait:` field, in `extract_inheritance`'s impl loop; and
+/// (b) trait supertrait bounds (`trait Sub: Super1 + Super2 {}` — one
+/// `Inherits` edge from `Sub` to each nameable bound), matched via a
+/// separate supertrait-bound query in `extract_inheritance`'s
+/// supertrait loop. This fixture deliberately models the diamond
+/// through `impl` blocks only — that exercises the `impl_item` loop
+/// independently of the supertrait loop, keeping this scenario's
+/// `Inherits` surface attributable to one well-understood code path
+/// when the diamond `ref: true` assertion fires.
 ///
 /// Edges (child -> parent, the `derived -> base` direction):
 ///   Arm1 -> Root, Arm1 -> D1, Arm2 -> Root, Arm2 -> D2,

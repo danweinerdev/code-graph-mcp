@@ -153,8 +153,12 @@ pub mod b;
   `Method` symbols with parent = trait name. The default method
   `Greet::default_greet` (with a body) is also now `Method`/parent=`Greet`
   (pre-1.4 it was `Function` with empty parent). Trait identity rides on
-  the parent field; Phase 2 will add `Inherits` edges for supertrait
-  bounds.
+  the parent field.
+- The Rust parser also emits `Inherits` edges for trait supertrait
+  bounds (`pub trait Sub: Super { … }` → one `Inherits` edge from `Sub`
+  to each nameable bound). None of the traits in this fixture currently
+  declare supertrait bounds, so the aggregate `Inherits` count is
+  unchanged.
 
 ### `src/utils.rs`
 
