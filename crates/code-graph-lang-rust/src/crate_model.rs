@@ -301,10 +301,16 @@ fn build_crates(
         depth_b.cmp(&depth_a).then_with(|| a.src.cmp(&b.src))
     });
 
-    // Suppress unused warning on `root` — kept on the struct for
-    // future extension (bin target resolution, `[workspace.dependencies]`
-    // walks). Using `_ = …` here would discard the field; instead we
-    // touch it in a debug-only assertion so the compiler sees the read.
+    // Construction invariant: `src` is always built as `root.join("src")`
+    // (see the `CrateInfo` push above), so `src` must be a descendant of
+    // `root` for every crate we emit. This `debug_assert` pins that
+    // invariant — if a future refactor changes how `src` is derived
+    // (e.g. honoring a custom `[lib].path` or non-canonical layouts),
+    // debug builds and tests will trip here rather than silently
+    // producing crates whose `src` is unrelated to their `root`. The
+    // module-level `#![allow(dead_code, reason = …)]` already silences
+    // the unused-field lint on `root`; this check is purely about
+    // correctness, not lint suppression.
     #[cfg(debug_assertions)]
     for c in &crates {
         debug_assert!(c.src.starts_with(&c.root));
@@ -361,11 +367,17 @@ fn derive_module_path(file: &Path, crates: &[CrateInfo]) -> Option<String> {
         return Some(owner.name.clone());
     }
 
-    // `mod.rs` collapses to its parent directory's name. `<src>/mod.rs`
-    // (no intermediate dirs) is invalid Rust — there's no parent to
-    // borrow a name from — so we'd have returned `None` via the empty-
-    // `comps` guard above. Inside `<src>/foo/mod.rs`, the path is
-    // `crate::foo`, NOT `crate::foo::mod`.
+    // `mod.rs` collapses to its parent directory's name. Inside
+    // `<src>/foo/mod.rs`, the path is `crate::foo`, NOT
+    // `crate::foo::mod`. Note `<src>/mod.rs` (no intermediate dirs) is
+    // invalid Rust, but the code path here does NOT special-case it:
+    // `comps` is empty after the filename pop, the chain below yields
+    // just the bare crate name, and we'd return `Some(owner.name)`
+    // (same result the `lib`/`main` arm above produces). That output is
+    // never observed in practice because rustc would have rejected the
+    // file before it ever reached the indexer; we leave the arm
+    // un-guarded rather than add a check whose only trigger is invalid
+    // input.
     if stem == "mod" {
         let segments: Vec<&str> = std::iter::once(owner.name.as_str())
             .chain(comps.iter().copied())
@@ -562,6 +574,16 @@ mod tests {
 
     #[test]
     fn nested_workspace_member_wins_over_outer_workspace_root() {
+        // Note: this test does NOT exercise the depth-sort tiebreak.
+        // The outer `src/` is `/ws/src/`; the inner member `src/` is
+        // `/ws/crates/a/src/`. The two paths diverge at component
+        // index 2 (`src` vs `crates`), so only ONE crate's `src/` is
+        // an ancestor of `/ws/crates/a/src/foo.rs` — the outer's
+        // `starts_with` check fails outright. See
+        // `inner_crate_under_outer_src_wins_via_depth_sort` for the
+        // case where both crates' `src/` directories are ancestors
+        // and the depth sort actually decides the owner.
+        //
         // The deepest matching crate root wins for ancestor-prefix
         // matches. Even if a workspace `Cargo.toml` exists at the
         // outer level (here `[workspace]`-only, so it contributes no
@@ -583,6 +605,37 @@ mod tests {
         // The inner member wins (longest-prefix `src/` match), so the
         // crate name is `a`, not `outer`.
         assert_eq!(model.module_path_for(&file), Some("a::foo"));
+    }
+
+    #[test]
+    fn inner_crate_under_outer_src_wins_via_depth_sort() {
+        // The genuine depth-sort case: BOTH crates' `src/` directories
+        // are ancestors of the target file. The outer crate sits at
+        // `/ws/` with `src/` at `/ws/src/`; an inner crate is rooted
+        // INSIDE the outer's `src/` tree at `/ws/src/embedded/`, so
+        // its `src/` is `/ws/src/embedded/src/`. The target file
+        // `/ws/src/embedded/src/foo.rs` is a descendant of BOTH `src/`
+        // directories, so `find()` on an arbitrary ordering could pick
+        // either crate.
+        //
+        // Without the depth sort in `build_crates` (descending
+        // `src` component count), the outer crate could be visited
+        // first by `find()` and the file would resolve to
+        // `outer::embedded::src::foo` — the outer crate name plus
+        // the rest of the path as module segments. The depth sort
+        // guarantees the inner crate is checked first, so the file
+        // correctly resolves to `inner::foo`.
+        let outer_manifest = PathBuf::from("/ws/Cargo.toml");
+        let inner_manifest = PathBuf::from("/ws/src/embedded/Cargo.toml");
+        let file = PathBuf::from("/ws/src/embedded/src/foo.rs");
+        let model = build_model(
+            vec![outer_manifest.clone(), inner_manifest.clone(), file.clone()],
+            vec![
+                (outer_manifest, &minimal_manifest("outer")),
+                (inner_manifest, &minimal_manifest("inner")),
+            ],
+        );
+        assert_eq!(model.module_path_for(&file), Some("inner::foo"));
     }
 
     #[test]
