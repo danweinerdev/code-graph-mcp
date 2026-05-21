@@ -465,7 +465,11 @@ impl RustParser {
     ///   `@mod.name`, `line` = the `mod_item`'s start row (1-indexed). The
     ///   bare token is a provisional placeholder; whole-graph resolution
     ///   to the concrete child file (`dir/foo.rs`, `dir/foo/mod.rs`,
-    ///   `#[path]` override) is the job of [`Self::post_index`] later.
+    ///   `#[path]` override) lives in a follow-up resolver step and will
+    ///   be implemented in or alongside `post_index`. The link to
+    ///   `post_index` is intentionally omitted here because that method
+    ///   does not yet perform the resolution — its current body rewrites
+    ///   symbol namespaces only.
     /// - `mod_item` whose `body` field is **present** → inline declaration
     ///   → emit nothing. The body's contents live in the same file, so a
     ///   self-edge would only add noise to file-coupling/cycle queries.
@@ -1497,6 +1501,51 @@ mod tests {
         assert!(
             fg.symbols.iter().any(|s| s.name == "bar"),
             "inner `fn bar()` inside an inline mod must still extract as a Symbol"
+        );
+    }
+
+    #[test]
+    fn mod_inline_outer_external_inner_emits_edge_for_inner_only() {
+        // Mixed case: outer `mod a` is inline (has a body), inner
+        // `mod b;` is external (no body). The outer is suppressed by the
+        // `body`-field discriminator; the inner emits one provisional
+        // Includes edge with the bare modname `b` as `to`. The bare
+        // token deliberately does NOT carry the outer module's
+        // namespace prefix — `to` is the raw `@mod.name` capture text,
+        // not a path. A future resolver step will need this baseline:
+        // resolving `b` relative to `a`'s on-disk directory differs
+        // from resolving a top-level `mod b;`, and silently shifting
+        // the wire `to` value (to e.g. `a::b` or `a.b`) would lose the
+        // emission-vs-resolution boundary that this fixture pins.
+        let fg = parse("mod a { mod b; }");
+        let ts = include_targets(&fg);
+        assert_eq!(
+            ts,
+            vec!["b"],
+            "external inner `mod b;` inside inline outer `mod a {{ ... }}` must \
+             emit exactly one Includes edge to bare `b` (no `a::b` prefix), got: {ts:?}"
+        );
+        assert!(
+            !includes(&fg).iter().any(|e| e.to == "a"),
+            "inline outer `mod a {{ ... }}` must NOT emit an Includes edge for `a`"
+        );
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn mod_empty_inline_block_does_not_emit_includes_edge() {
+        // Literal empty body `mod foo {}`: tree-sitter-rust still emits
+        // a `declaration_list` node for the empty `{}`, so the
+        // `child_by_field_name("body")` lookup returns `Some(empty)` and
+        // the discriminator correctly treats this as inline. Pinning
+        // this defends against a future grammar drift where `{}` might
+        // stop producing the body field (which would silently flip the
+        // emission and create a phantom self-edge).
+        let fg = parse("mod foo {}");
+        assert!(
+            includes(&fg).is_empty(),
+            "empty inline `mod foo {{}}` must produce zero Includes edges, got: {:?}",
+            include_targets(&fg)
         );
     }
 
