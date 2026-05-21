@@ -218,7 +218,7 @@ Limitations:
 3. **Forward declarations excluded — Rust-trait-scoped exception.** A bare `function_signature_item` (no body) outside any trait (e.g. inside an `extern "C"` block) → no Symbol, preserving the cross-language invariant. INSIDE a `trait_item`, however, the abstract signature produces a `Method` symbol with `parent = trait_name` (same classification as default methods inside the trait — trait identity rides parent rather than the `Inherits` edge here, because there's no impl context). `function_item` inside a trait (the default-method body case) classifies the same way.
 4. **Call resolution heuristic** — same scope rule as C++.
 5. **Generic parents recorded verbatim.** Methods in `impl<T> Trait for Vec<T>` carry parent `Vec<T>` (not bare `Vec`). `Inherits.from` follows the same rule. → **Hierarchy lookup gap** (see C# limitation 2; same shape).
-6. **Inline-nested `mod` declarations unresolved (v1).** A `mod b;` declared inside an inline `mod a { … }` block emits a provisional edge with `to = "b"` (no inline-mod ancestor prefix). Per Rust's module rules that `b` would resolve relative to the inline mod's namespace directory (`parent/a/b.rs` or `parent/a/b/mod.rs`), but the inline-mod ancestor path is not encoded on the emitted edge and `post_index` does not reconstruct it. To avoid emitting false edges, `post_index` **drops** any `mod` edge whose declaring `mod_item` has an inline `mod_item` ancestor. Net effect: a `mod` decl at the top level of a file (the common case) resolves correctly; a `mod` decl nested inside an inline `mod a { … }` block produces no `Includes` edge. Anti-regression test: `mod_inside_inline_mod_remains_unresolved_in_v1`.
+6. **Inline-nested `mod` declarations unresolved.** A `mod b;` declared inside an inline `mod a { … }` block emits a provisional edge with `to = "b"` (no inline-mod ancestor prefix). Per Rust's module rules that `b` would resolve relative to the inline mod's namespace directory (`parent/a/b.rs` or `parent/a/b/mod.rs`), but the inline-mod ancestor path is not encoded on the emitted edge and `post_index` does not reconstruct it. To avoid emitting false edges, `post_index` **drops** any `mod` edge whose declaring `mod_item` has an inline `mod_item` ancestor. Net effect: a `mod` decl at the top level of a file (the common case) resolves correctly; a `mod` decl nested inside an inline `mod a { … }` block produces no `Includes` edge. Anti-regression test: `mod_inside_inline_mod_remains_unresolved_in_v1`.
 
 ### Go — tree-sitter-go v0.25.0
 
@@ -303,7 +303,7 @@ Limitations:
 
 | Capability | C++ | Rust | Go | Python | C# | Java |
 |---|---|---|---|---|---|---|
-| Inheritance edges | ✓ | trait impl + supertrait bounds | ✗ (structural) | ✓ multi-base | ✓ | ✓ |
+| Inheritance edges | ✓ | ✓ trait impl + super | ✗ (structural) | ✓ multi-base | ✓ | ✓ |
 | Generic verbatim in `Inherits.from` | n/a | ✓ → lookup gap | n/a | n/a | ✓ → lookup gap | ✓ → lookup gap |
 | Forward decls excluded | ✓ | ✓ (trait method signatures excepted — see Rust limitation 3) | ✓ | n/a | ✓ | ✓ |
 | Call resolution | heuristic | heuristic | heuristic | heuristic | heuristic | heuristic |
