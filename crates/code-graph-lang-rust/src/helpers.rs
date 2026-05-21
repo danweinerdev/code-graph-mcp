@@ -146,6 +146,81 @@ pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// Walk `node`'s parent chain and return the first ancestor that is a
+/// `trait_item`, or `None` if `node` is not inside a trait block.
+///
+/// Used alongside [`find_enclosing_impl`] to classify a function or
+/// signature inside a `trait T { ... }` body: if the nearest definition
+/// ancestor is `trait_item` (and **not** an enclosing `impl_item`), the
+/// function/signature is a trait method and its parent is the trait's
+/// name. Callers MUST resolve "nearest ancestor wins" themselves —
+/// `impl Trait for Type { fn m() { … } }` has both ancestors and the
+/// impl is nearer, so the impl rule (parent = Type) takes precedence;
+/// see [`find_nearest_def_ancestor`] for the canonical dispatch.
+///
+/// The production dispatch path consumes
+/// [`find_nearest_def_ancestor`] (single-walk, returns whichever it
+/// hits first); this single-target helper is kept as a peer to
+/// [`find_enclosing_impl`] for symmetry, future composition by other
+/// callers, and direct unit-testability — hence the narrow `dead_code`
+/// allow.
+#[allow(
+    dead_code,
+    reason = "Symmetric peer to find_enclosing_impl; the dispatch in extract_definitions consumes the composite find_nearest_def_ancestor instead. Exercised only by in-crate #[cfg(test)] code."
+)]
+pub fn find_enclosing_trait(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "trait_item" {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Tag describing the nearest enclosing *definition* ancestor of a
+/// function or signature node — either an `impl_item` block (i.e. inside
+/// an `impl Type { … }` or `impl Trait for Type { … }`) or a
+/// `trait_item` block (i.e. inside `trait T { … }`).
+///
+/// Used by the definition extractor to dispatch on "is this a free
+/// function, an impl method, or a trait method?" with **nearest ancestor
+/// wins** semantics. For
+/// `impl<T: Trait> Foo for Bar<T> { fn m() { … } }` the `m` function's
+/// nearest ancestor is the `impl_item`, not the `trait_item` referenced
+/// by the bound `T: Trait` — that bound is in the impl's `generics`
+/// field, not an ancestor of `m`. The walk halts at the first match so
+/// the impl always wins when it lexically encloses the trait.
+pub enum NearestDefAncestor<'tree> {
+    /// Nearest ancestor is an `impl_item` block.
+    Impl(Node<'tree>),
+    /// Nearest ancestor is a `trait_item` block (and no `impl_item`
+    /// is nested between `node` and the trait).
+    Trait(Node<'tree>),
+}
+
+/// Walk `node`'s parent chain top-down and return the first ancestor
+/// that is an `impl_item` OR `trait_item`. Returns `None` if neither is
+/// in the chain.
+///
+/// "Nearest" is determined by the actual parent-chain walk: whichever
+/// node is hit first wins, regardless of kind. This is the load-bearing
+/// dispatch for trait-method-vs-impl-method classification — see the
+/// example in [`NearestDefAncestor`].
+pub fn find_nearest_def_ancestor(node: Node<'_>) -> Option<NearestDefAncestor<'_>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        match n.kind() {
+            "impl_item" => return Some(NearestDefAncestor::Impl(n)),
+            "trait_item" => return Some(NearestDefAncestor::Trait(n)),
+            _ => {}
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// Walk `node`'s parent chain, collecting the names of every enclosing
 /// `mod_item`, and join them outermost-first with `::`.
 ///
@@ -336,6 +411,82 @@ mod tests {
         let tree = parse(src);
         let func = find_first(tree.root_node(), "function_item").expect("function_item");
         assert!(find_enclosing_impl(func).is_none());
+    }
+
+    #[test]
+    fn find_enclosing_trait_returns_some_for_default_method() {
+        let src = "trait T { fn f(&self) {} }";
+        let tree = parse(src);
+        let func = find_first(tree.root_node(), "function_item").expect("function_item");
+        let trait_node = find_enclosing_trait(func).expect("must find trait_item ancestor");
+        assert_eq!(trait_node.kind(), "trait_item");
+    }
+
+    #[test]
+    fn find_enclosing_trait_returns_some_for_abstract_signature() {
+        let src = "trait T { fn f(&self); }";
+        let tree = parse(src);
+        // Abstract trait method declarations parse as
+        // `function_signature_item`, not `function_item`.
+        let sig = find_first(tree.root_node(), "function_signature_item")
+            .expect("function_signature_item");
+        let trait_node = find_enclosing_trait(sig).expect("must find trait_item ancestor");
+        assert_eq!(trait_node.kind(), "trait_item");
+    }
+
+    #[test]
+    fn find_enclosing_trait_returns_none_for_free_function() {
+        let src = "fn foo() {}";
+        let tree = parse(src);
+        let func = find_first(tree.root_node(), "function_item").expect("function_item");
+        assert!(find_enclosing_trait(func).is_none());
+    }
+
+    /// CRITICAL "nearest ancestor wins": for
+    /// `impl Trait for Type { fn m() { … } }`, the function `m`'s
+    /// nearest definition ancestor is the `impl_item`, not the
+    /// `trait_item` declared elsewhere in the file. The bound trait
+    /// declaration is a separate top-level item, not an ancestor.
+    #[test]
+    fn find_nearest_def_ancestor_picks_impl_in_trait_impl_for_type() {
+        let src = "trait Trait {} struct Foo; impl Trait for Foo { fn m(&self) {} }";
+        let tree = parse(src);
+        let func = find_first(tree.root_node(), "function_item").expect("function_item");
+        match find_nearest_def_ancestor(func).expect("must find some ancestor") {
+            NearestDefAncestor::Impl(n) => assert_eq!(n.kind(), "impl_item"),
+            NearestDefAncestor::Trait(_) => panic!("must hit impl_item, not trait_item"),
+        }
+    }
+
+    #[test]
+    fn find_nearest_def_ancestor_picks_trait_for_default_method() {
+        let src = "trait T { fn f(&self) {} }";
+        let tree = parse(src);
+        let func = find_first(tree.root_node(), "function_item").expect("function_item");
+        match find_nearest_def_ancestor(func).expect("must find some ancestor") {
+            NearestDefAncestor::Trait(n) => assert_eq!(n.kind(), "trait_item"),
+            NearestDefAncestor::Impl(_) => panic!("must hit trait_item, not impl_item"),
+        }
+    }
+
+    #[test]
+    fn find_nearest_def_ancestor_picks_trait_for_abstract_signature() {
+        let src = "trait T { fn f(&self); }";
+        let tree = parse(src);
+        let sig = find_first(tree.root_node(), "function_signature_item")
+            .expect("function_signature_item");
+        match find_nearest_def_ancestor(sig).expect("must find some ancestor") {
+            NearestDefAncestor::Trait(n) => assert_eq!(n.kind(), "trait_item"),
+            NearestDefAncestor::Impl(_) => panic!("must hit trait_item, not impl_item"),
+        }
+    }
+
+    #[test]
+    fn find_nearest_def_ancestor_returns_none_for_free_function() {
+        let src = "fn foo() {}";
+        let tree = parse(src);
+        let func = find_first(tree.root_node(), "function_item").expect("function_item");
+        assert!(find_nearest_def_ancestor(func).is_none());
     }
 
     #[test]

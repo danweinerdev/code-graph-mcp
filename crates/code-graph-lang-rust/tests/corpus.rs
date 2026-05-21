@@ -112,7 +112,19 @@ fn count_edges_by_kind(edges: &[Edge]) -> HashMap<EdgeKind, usize> {
 /// MANIFEST asserts these aggregates across the entire corpus. If a fixture
 /// changes, update both this constant and `testdata/rust/MANIFEST.md` in
 /// the same commit.
-const TOTAL_SYMBOLS: usize = 39;
+///
+/// Trait-method classification rules (load-bearing for these counts):
+/// - A function inside a `trait_item` (default method with body) is a
+///   `Method` whose parent is the trait name (NOT a parent-less
+///   `Function`). In this corpus that affects `traits.rs::default_greet`.
+/// - An abstract method signature inside a `trait_item`
+///   (`function_signature_item`, no body — e.g.
+///   `fn greet(&self) -> String;`) ALSO produces a `Method` symbol with
+///   parent = trait name. This is the documented Rust-trait-scoped
+///   exception to the cross-language "forward declarations excluded"
+///   invariant. In this corpus that adds `Greet::greet` and
+///   `Compute::compute` to traits.rs's symbol set.
+const TOTAL_SYMBOLS: usize = 41;
 const TOTAL_EDGES: usize = 39;
 
 #[test]
@@ -146,13 +158,13 @@ fn corpus_aggregate_counts_match_manifest() {
     let by_kind = count_symbols_by_kind(&all_symbols);
     assert_eq!(
         by_kind.get(&SymbolKind::Function).copied().unwrap_or(0),
-        10,
-        "MANIFEST claims 10 Functions"
+        9,
+        "MANIFEST claims 9 Functions (default_greet is a Method, not a Function)"
     );
     assert_eq!(
         by_kind.get(&SymbolKind::Method).copied().unwrap_or(0),
-        11,
-        "MANIFEST claims 11 Methods"
+        14,
+        "MANIFEST claims 14 Methods (5 impl methods + default_greet + 2 abstract trait signatures + the 6 inherent/trait-impl methods elsewhere in the corpus = 14 — see per-file tables)"
     );
     assert_eq!(
         by_kind.get(&SymbolKind::Struct).copied().unwrap_or(0),
@@ -206,7 +218,7 @@ fn corpus_per_file_counts_match_manifest() {
         ("lib.rs", 2, 0),
         ("main.rs", 1, 16),
         ("models.rs", 9, 0),
-        ("traits.rs", 13, 7),
+        ("traits.rs", 15, 7),
         ("utils.rs", 6, 2),
         ("errors.rs", 8, 14),
     ];
@@ -372,11 +384,14 @@ fn empty_inherent_impl_produces_no_methods_no_inheritance() {
 }
 
 #[test]
-fn trait_default_method_extracts_as_function_no_parent() {
-    // `Greet::default_greet`'s body is inside a `trait_item`, not an
-    // `impl_item`, so the parent-resolution walk returns None; the
-    // extractor emits Kind=Function with empty parent. (Methods only
-    // exist inside impl blocks, by design.)
+fn trait_default_method_extracts_as_method_with_trait_parent() {
+    // `Greet::default_greet`'s body is inside a `trait_item`, so the
+    // dispatch's `NearestDefAncestor::Trait` branch emits
+    // Kind=Method with parent=`Greet`. The two abstract signatures in
+    // the same trait (`Greet::greet` and `Compute::compute`) are also
+    // extracted; see
+    // `trait_abstract_signature_extracts_as_method_with_trait_parent`
+    // for the abstract-signature counterpart.
     let parser = RustParser::new().expect("RustParser::new");
     let corpus = parse_corpus(&parser);
     let traits = corpus.get("traits.rs").expect("traits.rs in corpus");
@@ -387,11 +402,45 @@ fn trait_default_method_extracts_as_function_no_parent() {
         .expect("default_greet must exist");
     assert_eq!(
         dg.kind,
-        SymbolKind::Function,
-        "default trait method must extract as Function (not Method) — \
-         it's inside a trait_item, not an impl_item"
+        SymbolKind::Method,
+        "default trait method must extract as Method"
     );
-    assert!(dg.parent.is_empty(), "default_greet has no parent");
+    assert_eq!(
+        dg.parent, "Greet",
+        "default trait method parent must be the trait name"
+    );
+}
+
+/// CRITICAL: abstract trait method signatures (`fn f(&self);` no-body
+/// declarations parsed as `function_signature_item`) are extracted as
+/// Method symbols with the enclosing trait as parent. This is the
+/// documented Rust-trait-scoped exception to the cross-language
+/// "forward declarations excluded" invariant; other forward
+/// declarations (bare `function_signature_item`s outside any trait)
+/// remain excluded.
+#[test]
+fn trait_abstract_signature_extracts_as_method_with_trait_parent() {
+    let parser = RustParser::new().expect("RustParser::new");
+    let corpus = parse_corpus(&parser);
+    let traits = corpus.get("traits.rs").expect("traits.rs in corpus");
+
+    // `Greet::greet` (signature on line 38 of traits.rs):
+    //   fn greet(&self) -> String;
+    let greet_abstract = traits
+        .symbols
+        .iter()
+        .find(|s| s.name == "greet" && s.parent == "Greet")
+        .expect("abstract Greet::greet must exist as Method/parent=Greet");
+    assert_eq!(greet_abstract.kind, SymbolKind::Method);
+
+    // `Compute::compute` (signature on line 46 of traits.rs):
+    //   fn compute(&self) -> i32;
+    let compute_abstract = traits
+        .symbols
+        .iter()
+        .find(|s| s.name == "compute" && s.parent == "Compute")
+        .expect("abstract Compute::compute must exist as Method/parent=Compute");
+    assert_eq!(compute_abstract.kind, SymbolKind::Method);
 }
 
 #[test]
@@ -418,11 +467,15 @@ fn trait_impl_method_parent_is_implementing_type_not_trait() {
     }
 
     let traits = corpus.get("traits.rs").expect("traits.rs in corpus");
+    // There are TWO `greet` Method symbols in traits.rs: the abstract
+    // signature inside `trait Greet` (parent=Greet) AND the impl
+    // method inside `impl Greet for Greeter` (parent=Greeter).
+    // Disambiguate by filtering for the implementing-type case.
     let greet = traits
         .symbols
         .iter()
-        .find(|s| s.name == "greet" && s.kind == SymbolKind::Method)
-        .expect("greet method must exist");
+        .find(|s| s.name == "greet" && s.kind == SymbolKind::Method && s.parent == "Greeter")
+        .expect("trait-impl method `greet` with parent=Greeter must exist");
     assert_eq!(
         greet.parent, "Greeter",
         "trait-impl method parent must be the implementing type"

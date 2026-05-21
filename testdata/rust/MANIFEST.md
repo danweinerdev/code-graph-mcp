@@ -8,16 +8,22 @@ file; if you change a fixture, update both.
 
 ## Totals
 
-### Symbols by Kind (TOTAL = 39)
+### Symbols by Kind (TOTAL = 41)
 
 | Kind     | Count |
 |----------|------:|
-| Function |    10 |
-| Method   |    11 |
+| Function |     9 |
+| Method   |    14 |
 | Struct   |     9 |
 | Enum     |     3 |
 | Trait    |     3 |
 | Typedef  |     3 |
+
+Post-Task-1.4 totals. The 1.4 reshaping moves `traits.rs::default_greet`
+from `Function` → `Method`/parent=`Greet`, and extracts two abstract
+trait method signatures that previously produced no symbols
+(`Greet::greet` and `Compute::compute`, both `Method`/parent=trait).
+Net: `Function` -1, `Method` +3, totals +2.
 
 ### Edges by Kind (TOTAL = 39)
 
@@ -95,8 +101,10 @@ pub mod b;
 | Name             | Kind     | Line | Namespace | Parent  |
 |------------------|----------|-----:|-----------|---------|
 | Greet            | Trait    |   37 |           |         |
-| default_greet    | Function |   40 |           |         |
+| Greet::greet     | Method   |   38 |           | Greet   |
+| Greet::default_greet | Method | 40 |           | Greet   |
 | Compute          | Trait    |   45 |           |         |
+| Compute::compute | Method   |   46 |           | Compute |
 | Sized2           | Trait    |   52 |           |         |
 | Greeter          | Struct   |   54 |           |         |
 | Greeter::run_async | Method |   59 |           | Greeter |
@@ -108,7 +116,7 @@ pub mod b;
 | Foo<T>::compute  | Method   |   93 |           | Foo<T>  |
 | Bar<T>::compute  | Method   |  106 |           | Bar<T>  |
 
-- 13 symbols (3 Traits, 4 Structs, 1 Function, 5 Methods)
+- 15 symbols (3 Traits, 4 Structs, 8 Methods)
 - 7 edges:
   - 1 `Includes`: `std::fmt::Display`
   - 3 `Calls`: `default_greet -> String::from`, `Greeter::greet -> format`,
@@ -119,10 +127,13 @@ pub mod b;
 - The `impl EmptyImpl {}` block has no methods and produces 0 method symbols
   AND 0 inheritance edges (the inheritance query requires a `trait` field,
   which an inherent impl lacks).
-- `Greet`'s default method `default_greet` is inside a `trait_item`, not an
-  `impl_item`, so its parent is empty and its kind is `Function` — *not*
-  `Method`. This is the documented behavior: only `function_item`s inside
-  an `impl_item` become `Method`.
+- **Post-Task-1.4 trait-method classification:** abstract trait method
+  signatures (`Greet::greet`, `Compute::compute`) are now extracted as
+  `Method` symbols with parent = trait name. The default method
+  `Greet::default_greet` (with a body) is also now `Method`/parent=`Greet`
+  (pre-1.4 it was `Function` with empty parent). Trait identity rides on
+  the parent field; Phase 2 will add `Inherits` edges for supertrait
+  bounds.
 
 ### `src/utils.rs`
 
@@ -206,9 +217,16 @@ pub mod b;
   not themselves produce Symbol records.
 - **Inherent impl with no methods** (`impl EmptyImpl {}` in `traits.rs`)
   produces 0 method symbols and 0 inheritance edges.
-- **Trait with default methods** (`Greet::default_greet`): the default
-  method's body produces a Function symbol with empty parent (it is
-  inside a `trait_item`, not an `impl_item`).
+- **Trait with default methods** (`Greet::default_greet`): post-Task-1.4
+  the default method produces a `Method` symbol with parent =
+  `Greet` (the enclosing trait name). Pre-1.4 it was a Function with
+  empty parent.
+- **Trait abstract method signatures** (`Greet::greet`,
+  `Compute::compute`): post-Task-1.4 these produce `Method` symbols with
+  parent = trait name. This is the documented Rust-trait-scoped exception
+  to the "forward declarations excluded" invariant; bare
+  `function_signature_item`s outside any trait (e.g. inside
+  `extern "C"` blocks) remain excluded.
 - **Trait-impl method parent disambiguation**: every method inside an
   `impl Trait for Type {}` block has parent = `Type`, never `Trait`.
   Asserted both in the lib's unit tests and via this corpus's

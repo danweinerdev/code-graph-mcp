@@ -23,6 +23,18 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 (function_item
   name: (identifier) @func.name) @func.def
 
+; Abstract trait method declarations (`fn f(&self);` with NO body) parse
+; as `function_signature_item`, not `function_item`. We capture them so
+; the definition extractor can emit a Method symbol when their nearest
+; definition ancestor is a `trait_item` — see
+; helpers::find_nearest_def_ancestor. Bare signatures OUTSIDE any
+; trait (e.g. inside `extern "C"` blocks) remain excluded from the
+; symbol set: the extractor gates emission on the trait-ancestor branch
+; of the dispatch, preserving the cross-language "forward declarations
+; excluded" invariant everywhere except trait method declarations.
+(function_signature_item
+  name: (identifier) @func.name) @func.def
+
 ; Structs: tuple, named-field, and unit forms all share the struct_item
 ; node with a `type_identifier` name field.
 (struct_item

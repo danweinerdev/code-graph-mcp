@@ -28,14 +28,20 @@
 //!    and an anti-regression test
 //!    (`macro_rules_definition_produces_zero_symbols`) asserts a
 //!    fixture with `macro_rules! foo { ... }` yields no Symbol records.
-//! 2. **Forward declarations excluded.** Trait method declarations like
-//!    `fn bar();` are `function_signature_item`, not `function_item`, in
-//!    tree-sitter-rust 0.24. The DEFINITION_QUERIES only match
-//!    `function_item` (which requires a body), so trait method
-//!    declarations without bodies do not produce symbols. Methods inside
-//!    `impl Trait for Type { ... }` blocks DO produce symbols (with
-//!    parent=Type). Default methods inside trait bodies (with bodies)
-//!    also produce symbols.
+//! 2. **Forward declarations excluded — except for trait method
+//!    signatures.** Abstract trait method declarations
+//!    (`function_signature_item` inside a `trait_item`, e.g.
+//!    `fn bar();`) are extracted as `Method` symbols with
+//!    `parent = trait_name`. Other forward declarations — bare
+//!    `function_signature_item`s outside any trait (e.g. inside an
+//!    `extern "C"` block) — remain excluded. Trait default methods
+//!    (with bodies) classify as `Method`/parent=trait the same way
+//!    abstract signatures do. Methods inside
+//!    `impl Trait for Type { ... }` blocks still classify as Method
+//!    with parent=Type (nearest definition ancestor wins; see
+//!    `helpers::find_nearest_def_ancestor`). This is a deliberate,
+//!    Rust-trait-scoped exception to the cross-language "forward
+//!    declarations excluded" invariant.
 //! 3. **`#[derive(...)]` and proc-macro attributes** appear as
 //!    `attribute_item` (not `macro_invocation`) so they are NOT captured
 //!    as call edges.
@@ -62,8 +68,8 @@ use tree_sitter::{
 
 use crate::crate_model::CrateModuleModel;
 use crate::helpers::{
-    enclosing_function_id, find_enclosing_impl, find_enclosing_kind, resolve_mod_namespace,
-    split_use_path, truncate_signature,
+    enclosing_function_id, find_enclosing_kind, find_nearest_def_ancestor, resolve_mod_namespace,
+    split_use_path, truncate_signature, NearestDefAncestor,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, USE_QUERIES};
 
@@ -157,14 +163,30 @@ impl RustParser {
     ///
     /// Per-node-type behavior:
     ///
-    /// - `function_item` whose ancestor walk via [`find_enclosing_impl`]
-    ///   returns `Some(impl_node)` → [`SymbolKind::Method`], parent =
+    /// - `function_item` whose nearest definition ancestor (see
+    ///   [`find_nearest_def_ancestor`]) is an `impl_item` →
+    ///   [`SymbolKind::Method`], parent =
     ///   `impl_node.child_by_field_name("type")` text. For
     ///   `impl Trait for Type { fn m() }` the parent is **`Type`, not
     ///   `Trait`** — the trait relationship lives only in the inheritance
     ///   edge. The trait-impl-method test
     ///   (`trait_impl_method_parent_is_type_not_trait`) is the
     ///   anti-regression for that rule.
+    /// - `function_item` whose nearest definition ancestor is a
+    ///   `trait_item` (and not an `impl_item` — see "nearest ancestor
+    ///   wins" in [`NearestDefAncestor`]) → [`SymbolKind::Method`],
+    ///   parent = trait name. This is a deliberate, Rust-trait-scoped
+    ///   exception to the cross-language "forward declarations
+    ///   excluded" invariant. No new [`SymbolKind`] variant; trait
+    ///   identity rides entirely on the `parent` field of the symbol
+    ///   (supertrait `Inherits` edges are a separate future addition).
+    /// - `function_signature_item` (`fn f(&self);` no-body
+    ///   declarations) inside a `trait_item` → same as a trait default
+    ///   method: [`SymbolKind::Method`], parent = trait name. A bare
+    ///   `function_signature_item` OUTSIDE any trait (theoretically
+    ///   possible in some grammar constructs, rare in real Rust) is
+    ///   silently dropped — the dispatch's gating on the trait-ancestor
+    ///   branch is the load-bearing exclusion mechanism.
     /// - `function_item` at module level → [`SymbolKind::Function`], no
     ///   parent.
     /// - `struct_item` → [`SymbolKind::Struct`].
@@ -192,11 +214,30 @@ impl RustParser {
 
                 match cap_name {
                     "func.name" => {
-                        let Some(def_node) = find_enclosing_kind(cap_node, "function_item") else {
+                        // The `func.name` capture fires for BOTH
+                        // `function_item` (free fns, impl methods, trait
+                        // default methods with bodies) and
+                        // `function_signature_item` (abstract trait method
+                        // declarations, no body). Resolve the enclosing
+                        // definition node by trying both, taking whichever
+                        // is found first.
+                        let Some(def_node) = find_enclosing_kind(cap_node, "function_item")
+                            .or_else(|| find_enclosing_kind(cap_node, "function_signature_item"))
+                        else {
                             continue;
                         };
-                        let (kind, parent) = match find_enclosing_impl(cap_node) {
-                            Some(impl_node) => {
+                        let is_signature = def_node.kind() == "function_signature_item";
+
+                        // Nearest-ancestor-wins dispatch. The walk halts at
+                        // the first impl_item OR trait_item encountered, so
+                        // `impl Trait for Type { fn m() { … } }` correctly
+                        // picks the impl branch (m's nearest ancestor is the
+                        // impl_item that lexically encloses it; the
+                        // `Trait` declaration sits elsewhere in the file
+                        // and is not an ancestor at all).
+                        let nearest = find_nearest_def_ancestor(cap_node);
+                        let (kind, parent) = match nearest {
+                            Some(NearestDefAncestor::Impl(impl_node)) => {
                                 // Trait-impl disambiguation: parent is the
                                 // `type` field (the implementing type),
                                 // never the `trait` field. For
@@ -211,7 +252,36 @@ impl RustParser {
                                     .to_owned();
                                 (SymbolKind::Method, parent_text)
                             }
-                            None => (SymbolKind::Function, String::new()),
+                            Some(NearestDefAncestor::Trait(trait_node)) => {
+                                // Trait default method (with body) OR
+                                // abstract trait method signature (no
+                                // body) — both classify as Method, with
+                                // the trait name as parent. No new
+                                // SymbolKind variant; trait identity
+                                // rides entirely on the parent field
+                                // (supertrait Inherits edges are a
+                                // separate future addition).
+                                let parent_text = trait_node
+                                    .child_by_field_name("name")
+                                    .and_then(|n| n.utf8_text(content).ok())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                (SymbolKind::Method, parent_text)
+                            }
+                            None => {
+                                // No enclosing impl or trait. A free
+                                // function gets `Function`; a bare
+                                // `function_signature_item` outside any
+                                // trait (rare — e.g. an `extern "C"`
+                                // block) is DROPPED to preserve the
+                                // cross-language "forward declarations
+                                // excluded" invariant for everything
+                                // except trait method declarations.
+                                if is_signature {
+                                    continue;
+                                }
+                                (SymbolKind::Function, String::new())
+                            }
                         };
                         let ns = resolve_mod_namespace(cap_node, content_str);
                         fg.symbols
@@ -816,17 +886,202 @@ mod tests {
         assert_eq!(s.kind, SymbolKind::Enum);
     }
 
+    /// CRITICAL: the `Speak` trait is still extracted as
+    /// `SymbolKind::Trait`, AND the abstract method signature
+    /// `fn hello(&self);` is also extracted as a Method symbol with
+    /// `parent = "Speak"`. Rust traits are a deliberate, scoped
+    /// exception to the cross-language "forward declarations excluded"
+    /// invariant: trait method declarations (with OR without bodies)
+    /// always produce Method symbols whose parent is the enclosing
+    /// trait. This test is the anti-regression for that exception.
     #[test]
-    fn trait_item_produces_trait_kind() {
+    fn abstract_trait_method_signature_produces_method_with_trait_parent() {
         let fg = parse("trait Speak { fn hello(&self); }");
-        let s = sym(&fg, "Speak");
-        assert_eq!(s.kind, SymbolKind::Trait);
-        // Trait method declaration `fn hello(&self);` is a
-        // function_signature_item (no body) and is intentionally NOT
-        // emitted as a Symbol — see crate-level limitations docstring.
+
+        // The trait itself still extracts as Trait, namespace empty
+        // (top-level), no parent.
+        let speak = sym(&fg, "Speak");
+        assert_eq!(speak.kind, SymbolKind::Trait);
+        assert!(speak.parent.is_empty(), "trait has no parent");
+
+        // The abstract method signature now produces a Method symbol
+        // with the trait name as parent.
+        let hello = sym(&fg, "hello");
+        assert_eq!(
+            hello.kind,
+            SymbolKind::Method,
+            "abstract trait method signature must classify as Method"
+        );
+        assert_eq!(
+            hello.parent, "Speak",
+            "abstract trait method signature parent must be the trait name"
+        );
+        // The symbol records the source line (Speak is on line 1; the
+        // `fn hello(&self);` declaration is on the same line in this
+        // fixture, so its line is also 1).
         assert!(
-            !fg.symbols.iter().any(|s| s.name == "hello"),
-            "trait method declarations without bodies must not produce symbols"
+            hello.line >= 1,
+            "abstract trait method line must be 1-indexed and populated, got: {}",
+            hello.line
+        );
+        // Exactly two symbols: the trait + its one method.
+        assert_eq!(
+            fg.symbols.len(),
+            2,
+            "expected exactly 2 symbols (trait + abstract method), got: {:?}",
+            fg.symbols
+                .iter()
+                .map(|s| (s.name.as_str(), s.kind, s.parent.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Trait DEFAULT methods (with a body) classify as `Method` with
+    /// `parent = trait_name`, identical to the abstract-signature
+    /// case. They differ only in their AST node kind:
+    /// `function_item` (has body) vs `function_signature_item`
+    /// (no body) — but the dispatch treats both identically once
+    /// `find_nearest_def_ancestor` finds a `trait_item` ancestor.
+    #[test]
+    fn trait_default_method_with_body_produces_method_with_trait_parent() {
+        let fg = parse("trait Greet { fn greet(&self) -> String { String::from(\"hello\") } }");
+
+        let greet_trait = sym(&fg, "Greet");
+        assert_eq!(greet_trait.kind, SymbolKind::Trait);
+
+        let greet_method = sym(&fg, "greet");
+        assert_eq!(
+            greet_method.kind,
+            SymbolKind::Method,
+            "trait default method must classify as Method"
+        );
+        assert_eq!(
+            greet_method.parent, "Greet",
+            "trait default method parent must be the trait name"
+        );
+        assert!(
+            greet_method.line >= 1,
+            "trait default method line must be 1-indexed and populated, got: {}",
+            greet_method.line
+        );
+    }
+
+    /// `top_level_only=true` semantics: trait methods (Method kind,
+    /// non-empty parent) are filterable like impl methods. This is
+    /// verified at the parser layer by asserting every newly-classified
+    /// trait method has a non-empty `parent` — the handler filter
+    /// (`crates/code-graph-tools/src/handlers/symbols.rs`) drops any
+    /// symbol with a non-empty parent, so this is the necessary and
+    /// sufficient condition for `top_level_only=true` to filter them
+    /// out.
+    #[test]
+    fn trait_methods_have_non_empty_parent_so_top_level_only_filters_them() {
+        let fg =
+            parse("trait Speak {\n  fn abstract_method(&self);\n  fn default_method(&self) {}\n}");
+
+        let abstract_method = sym(&fg, "abstract_method");
+        let default_method = sym(&fg, "default_method");
+        for m in [abstract_method, default_method] {
+            assert_eq!(m.kind, SymbolKind::Method);
+            assert!(
+                !m.parent.is_empty(),
+                "trait method must have non-empty parent so top_level_only filters it; got: {m:?}"
+            );
+            assert_eq!(m.parent, "Speak");
+        }
+    }
+
+    /// `impl Trait for Type { fn m() { … } }` — the trait declaration
+    /// is in scope but the function's nearest definition ancestor is
+    /// the `impl_item` that lexically encloses it. The impl rule wins:
+    /// parent = `Type`, NOT `Trait`. This is the anti-regression for
+    /// the "nearest ancestor wins" dispatch in
+    /// [`find_nearest_def_ancestor`] — without it, a trait-impl
+    /// method's symbol parent would silently flip to the trait name
+    /// whenever the trait declaration happened to be discoverable
+    /// (which it always is in the same file).
+    #[test]
+    fn trait_impl_method_parent_is_type_when_both_ancestors_visible() {
+        // Two top-level items in one file: a trait declaration AND an
+        // impl of that trait for a struct. The function inside the
+        // impl has both items reachable via the file's named-children
+        // list, but only one — the `impl_item` — is an ANCESTOR via
+        // the parent chain. The trait declaration is a sibling, not
+        // an ancestor, so the dispatch correctly picks Impl.
+        let src = "trait Trait { fn declared(&self); }\n\
+                   struct Foo;\n\
+                   impl Trait for Foo {\n  fn declared(&self) {}\n}";
+        let fg = parse(src);
+        // The function inside `impl Trait for Foo` carries parent=Foo.
+        // The trait's abstract signature also produces a symbol named
+        // `declared`, but with parent=Trait. Verify both:
+        let impl_method = fg
+            .symbols
+            .iter()
+            .find(|s| s.name == "declared" && s.parent == "Foo")
+            .expect("impl method `declared` with parent=Foo must exist");
+        assert_eq!(impl_method.kind, SymbolKind::Method);
+        // And separately, the abstract signature inside the trait
+        // produces its own symbol — parent=Trait.
+        let trait_sig = fg
+            .symbols
+            .iter()
+            .find(|s| s.name == "declared" && s.parent == "Trait")
+            .expect("abstract trait signature `declared` with parent=Trait must exist");
+        assert_eq!(trait_sig.kind, SymbolKind::Method);
+    }
+
+    /// A bare `function_signature_item` outside any `trait_item`
+    /// (e.g. inside an `extern "C"` block) MUST NOT produce a symbol.
+    /// This preserves the cross-language "forward declarations
+    /// excluded" invariant for everything except trait method
+    /// declarations.
+    #[test]
+    fn bare_function_signature_outside_trait_produces_no_symbol() {
+        // `extern "C"` blocks contain `function_signature_item`s
+        // representing FFI declarations — bodies declared elsewhere.
+        // These must NOT classify as Method/parent=anything; the
+        // dispatch's None-arm-with-is_signature gating drops them.
+        let fg = parse("extern \"C\" {\n    fn bare_extern(x: i32) -> i32;\n}");
+        assert!(
+            !fg.symbols.iter().any(|s| s.name == "bare_extern"),
+            "bare `function_signature_item` outside any trait must NOT produce a symbol; got: {:?}",
+            fg.symbols
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Composition with `post_index`: a trait-method symbol's
+    /// namespace is rewritten to the crate-qualified path during
+    /// `post_index`, exactly like any other symbol. Trait-method
+    /// classification (parse-time) and the namespace rewrite
+    /// (post-index) compose orthogonally because `post_index` operates
+    /// on every Rust symbol's `namespace` field regardless of kind or
+    /// parent.
+    #[test]
+    fn post_index_rewrites_abstract_trait_method_namespace_to_crate_path() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let traits = write_rs(
+            dir.path(),
+            "src/traits.rs",
+            "pub trait Speak {\n    fn hello(&self);\n}\n",
+        );
+
+        let graphs = run_post_index(std::slice::from_ref(&traits));
+        let fg = fg_for(&graphs, &traits);
+
+        // The abstract method symbol carries the rewritten namespace,
+        // proving abstract-signature symbol emission flows through
+        // `post_index`'s crate-qualified namespace assignment.
+        let hello = sym(fg, "hello");
+        assert_eq!(hello.kind, SymbolKind::Method);
+        assert_eq!(hello.parent, "Speak");
+        assert_eq!(
+            hello.namespace, "ark_core::traits",
+            "abstract trait method must inherit the crate-qualified namespace"
         );
     }
 

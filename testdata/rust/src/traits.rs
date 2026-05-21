@@ -1,14 +1,15 @@
 //! Trait definitions and trait impls — exercises every Inherits-edge form.
 //!
 //! Exercises:
-//!   - Plain trait with a default method (the default method's body produces
-//!     a Method symbol with parent = trait name? NO — Phase 5.2 sets parent
-//!     to the impl block's `type` field; default methods inside trait_item
-//!     bodies have `find_enclosing_impl` returning None (no impl_item ancestor),
-//!     so they extract as `Function` (no parent). Verified by the corpus test.)
-//!   - Trait without any default methods (signatures-only — no symbols emitted
-//!     for the signature-only methods because they parse as
-//!     `function_signature_item`, not `function_item`)
+//!   - Plain trait with a default method (post-Task-1.4: the default
+//!     method's body produces a Method symbol with parent = trait name,
+//!     because the dispatch's NearestDefAncestor::Trait branch fires when
+//!     the function's nearest definition ancestor is `trait_item`).
+//!   - Trait with abstract method signatures (`fn f(&self);` no-body
+//!     declarations parsed as `function_signature_item`): post-Task-1.4
+//!     these are extracted as Method symbols with parent = trait name —
+//!     a deliberate, scoped exception to the "forward declarations
+//!     excluded" cross-language invariant.
 //!   - Inherent impl block with no methods (no symbols, no inheritance edge)
 //!   - `impl Trait for Type` (generates an Inherits edge)
 //!   - Generic trait impl with type bound: `impl<T: Display> Trait for Foo<T>`
@@ -20,13 +21,18 @@
 //! Symbol contract for `traits.rs` (asserted by `MANIFEST.md`):
 //!   Traits:  `Greet`, `Compute`, `Sized2` (3)
 //!   Structs: `Greeter`, `EmptyImpl`, `Foo`, `Bar` (4)
-//!   Functions (default trait methods, no impl ancestor): `default_greet` (1)
-//!   Methods (in `impl` blocks):
-//!       `Greeter::greet`,
-//!       `Greeter::run_async`,
-//!       `Greeter::do_unsafe`,
-//!       `Foo::compute`,
-//!       `Bar::compute`         (5)
+//!   Methods (post-Task-1.4):
+//!       Trait methods (default or abstract, parent = trait):
+//!           `Greet::greet`              (abstract signature)
+//!           `Greet::default_greet`      (default method body)
+//!           `Compute::compute`          (abstract signature)
+//!       Impl methods (parent = implementing type):
+//!           `Greeter::greet`,
+//!           `Greeter::run_async`,
+//!           `Greeter::do_unsafe`,
+//!           `Foo<T>::compute`,
+//!           `Bar<T>::compute`           (5)
+//!       Total methods: 8
 //!   Inheritance edges (from `impl Trait for Type`):
 //!       Greeter   -> Greet,
 //!       Foo<T>    -> Compute,
