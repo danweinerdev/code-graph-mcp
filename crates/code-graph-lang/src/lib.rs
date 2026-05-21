@@ -147,6 +147,29 @@ impl FileIndex {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Membership test: is `path` an indexed file?
+    ///
+    /// The underlying map is keyed by basename (so the default
+    /// basename resolver can match `#include "foo.h"` against multiple
+    /// candidate paths). For Rust's `mod`-resolution post-pass we need
+    /// the inverse — given a fully-constructed candidate path (e.g.
+    /// `parent.join("foo.rs")`), is *this exact path* in the indexed
+    /// set?
+    ///
+    /// Implementation: look up the candidate's basename and walk its
+    /// `Vec<PathBuf>` for an equality match. The walk is bounded by the
+    /// number of indexed files sharing that basename — typically one,
+    /// at most a handful even on huge codebases.
+    pub fn contains_path(&self, path: &Path) -> bool {
+        let Some(base) = path.file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let Some(candidates) = self.by_basename.get(base) else {
+            return false;
+        };
+        candidates.iter().any(|p| p == path)
+    }
 }
 
 /// Default scope-aware call resolver. Ports the Go reference at
@@ -976,6 +999,46 @@ mod tests {
     fn default_basename_resolve_returns_none_for_no_match() {
         let idx = FileIndex::new();
         assert!(default_basename_resolve("missing.h", &idx).is_none());
+    }
+
+    #[test]
+    fn file_index_contains_path_matches_indexed_entry() {
+        // FileIndex::contains_path is the membership-test API for
+        // post_index passes (e.g. Rust's `mod` resolution): given a
+        // candidate absolute path the post-pass constructed, was that
+        // exact path in the indexed set?
+        let mut idx = FileIndex::new();
+        idx.by_basename
+            .entry("foo.rs".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/src/foo.rs"));
+        assert!(idx.contains_path(Path::new("/proj/src/foo.rs")));
+        // Different basename → not in the map at all.
+        assert!(!idx.contains_path(Path::new("/proj/src/bar.rs")));
+        // Same basename, different directory → walks the bucket and
+        // misses on path equality.
+        assert!(!idx.contains_path(Path::new("/proj/elsewhere/foo.rs")));
+    }
+
+    #[test]
+    fn file_index_contains_path_disambiguates_basename_collisions() {
+        // Two files share a basename in different directories. `contains_path`
+        // must match the exact path, not just the basename — otherwise
+        // it would return `true` for any path with that basename.
+        let mut idx = FileIndex::new();
+        let bucket = idx.by_basename.entry("mod.rs".to_string()).or_default();
+        bucket.push(PathBuf::from("/proj/src/a/mod.rs"));
+        bucket.push(PathBuf::from("/proj/src/b/mod.rs"));
+        assert!(idx.contains_path(Path::new("/proj/src/a/mod.rs")));
+        assert!(idx.contains_path(Path::new("/proj/src/b/mod.rs")));
+        // A third path sharing the basename but not in the bucket.
+        assert!(!idx.contains_path(Path::new("/proj/src/c/mod.rs")));
+    }
+
+    #[test]
+    fn file_index_contains_path_empty_index_returns_false() {
+        let idx = FileIndex::new();
+        assert!(!idx.contains_path(Path::new("/anything.rs")));
     }
 
     #[test]

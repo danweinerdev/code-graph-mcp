@@ -56,7 +56,7 @@ pub(crate) mod crate_model;
 pub(crate) mod helpers;
 pub(crate) mod queries;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
@@ -477,15 +477,33 @@ impl RustParser {
     ///   their own query branches; the suppression is local to this
     ///   handler's `Includes` emission.
     ///
-    /// At edge-resolution time (`crates/code-graph-tools/src/indexer.rs`'s
-    /// `resolve_all_edges`) the default `resolve_include` basename-matches
-    /// the bare modname against the `FileIndex`. The basename of `"foo"`
-    /// has no `.rs` extension, so no entry matches and the edge is
-    /// dropped — the same way every dotted `use std::io;` token already
-    /// drops. The Rust `resolve_include` override that promotes these
-    /// edges to surviving file-level dependencies is a separate
-    /// follow-up; until it lands, the edges emitted here are emitted then
-    /// dropped, which is the intended steady state for this commit.
+    /// Resolution to a concrete child file (`dir/foo.rs`,
+    /// `dir/foo/mod.rs`, or a `#[path = "x.rs"]` override) is performed
+    /// in [`Self::post_index`]: it re-walks each Rust file's AST to
+    /// extract the `mod_item` set (modname + line + optional `#[path]`
+    /// override + inline-mod-ancestor flag) and matches that set
+    /// against this file's provisional edges by `(edge.to, edge.line)`.
+    /// Matched edges get rewritten to the absolute path of the resolved
+    /// child file (or dropped if the candidate is not in the
+    /// `FileIndex`). Unmatched `Includes` edges (i.e. those produced
+    /// by `extract_uses` for `use`/`extern crate`) are left untouched
+    /// and continue to drop at `resolve_all_edges` time exactly as
+    /// today — the Rust `resolve_include` override only ever returns
+    /// `Some(_)` for an absolute path that is already in the
+    /// `FileIndex`, which covers post-`post_index` mod edges and
+    /// nothing else.
+    ///
+    /// **Inline-nested mod limitation (v1).** A `mod b;` declared
+    /// inside an inline `mod a { … }` block emits an edge here with
+    /// `to = "b"` (the bare modname capture, with no namespace
+    /// prefix). Per Rust's module rules, `mod b;` inside `mod a` would
+    /// resolve relative to `a/b.rs` / `a/b/mod.rs` — but the
+    /// inline-mod ancestor path is not encoded on the emitted edge,
+    /// and `post_index` does not reconstruct it. As a conservative,
+    /// no-false-edges fallback, `post_index` **drops** any mod edge
+    /// whose declaring `mod_item` has an inline `mod_item` ancestor.
+    /// This is the documented v1 scope boundary; resolving
+    /// inline-nested mod decls is a follow-up.
     fn extract_mod_decls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.mod_query, root, content);
@@ -679,22 +697,82 @@ impl LanguagePlugin for RustParser {
         self.parse_to_filegraph(path, content)
     }
 
-    // resolve_call and resolve_include intentionally NOT overridden:
-    // - default resolve_call is the scope-aware heuristic used by the C++
-    //   plugin and is the right baseline for Rust.
-    // - default resolve_include is a basename match against the FileIndex,
-    //   which is a no-op for Rust `use` paths because they are dotted
-    //   module paths, not filesystem paths. The wire format records the
-    //   full `use` path as the edge's `to` field; leaving it unresolved is
-    //   the intended behavior.
+    // resolve_call intentionally NOT overridden: the default scope-aware
+    // heuristic used by the C++ plugin is the right baseline for Rust.
 
-    /// Crate-aware whole-graph rewrite. For every Rust [`FileGraph`] in
-    /// `graphs`, build the [`CrateModuleModel`] over the current Rust
-    /// file set, then overwrite each `Symbol.namespace` with
-    /// `crate_name::module::path` composed with any in-file inline `mod`
-    /// nesting already populated by `parse_file`.
+    /// Stateless `Includes` resolver for the Rust plugin.
     ///
-    /// # Composition rule
+    /// By the time [`code_graph_tools::indexer::resolve_all_edges`]
+    /// calls into this method, surviving Rust `Includes` edges fall
+    /// into exactly two shapes:
+    ///
+    /// 1. **`mod`-decl edges that [`Self::post_index`] resolved.** Their
+    ///    `to` field is the absolute path of a `.rs` file already
+    ///    present in the `FileIndex` (per the in-place rewrite inside
+    ///    `post_index`). The override returns `Some(PathBuf::from(raw))`
+    ///    so the edge survives the surrounding
+    ///    `language_for_path(&resolved).is_some()` filter — the resolved
+    ///    path is an indexed `.rs` file, which the registry's Rust
+    ///    plugin claims, and the call-tools layer keeps the edge.
+    /// 2. **`use`/`extern crate` dotted tokens** (`"std::io"`,
+    ///    `"ark_core::reactor"`, `"alloc"`, …). These are not paths
+    ///    and not in any `FileIndex` bucket — the override returns
+    ///    `None`, the surrounding loop drops the edge, identical to
+    ///    today's drop-via-basename-miss path.
+    ///
+    /// The override does **no I/O** and **no caching**. It consults
+    /// only `raw` and the passed `file_index`. The hard work — module
+    /// path discovery, `#[path]` attribute extraction, sibling /
+    /// `mod.rs` / `#[path]` candidate probing — lives in
+    /// [`Self::post_index`], which writes its results back into the
+    /// `graphs` slice in place. This keeps the per-edge resolve path
+    /// minimal and statelessness invariants intact.
+    ///
+    /// Bare absolute paths that happen to land in the `FileIndex` (an
+    /// adversarial `use /abs/path::foo;` is rejected by Rust at compile
+    /// time, but a future Rust grammar shift could conceivably surface
+    /// one) are accepted — the membership test is the sole gate, not
+    /// a `mod`-edge marker. This is intentionally permissive in the
+    /// direction that produces no false positives: an absolute path
+    /// *in* the index points at a real source file, so any Rust edge
+    /// whose `to` is that path is by definition resolved.
+    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
+        let candidate = Path::new(raw);
+        if !candidate.is_absolute() {
+            // `use`/`extern crate` tokens (`"std::io"`, `"alloc"`) are
+            // dotted module paths — never absolute, never in the
+            // `FileIndex`. Drop them here so the surrounding loop
+            // matches the today's behavior byte-for-byte.
+            return None;
+        }
+        if file_index.contains_path(candidate) {
+            Some(candidate.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    /// Crate-aware whole-graph rewrite. Two passes over the `graphs`
+    /// slice:
+    ///
+    /// 1. **Namespace rewrite.** Builds one [`CrateModuleModel`] over
+    ///    the indexed Rust file set + discovered `Cargo.toml`s and
+    ///    overwrites each Rust `Symbol.namespace` with
+    ///    `crate_name::module::path` composed with any in-file inline
+    ///    `mod` nesting already populated by `parse_file`.
+    /// 2. **`mod`-decl resolution.** Each Rust `FileGraph`'s
+    ///    provisional `mod` `Includes` edges (`to = bare modname`,
+    ///    `line = mod_item start row`) are resolved to an absolute
+    ///    indexed file path via Rust's module-file rules — sibling
+    ///    `dir/foo.rs` → `dir/foo/mod.rs`, with a `#[path = "x.rs"]`
+    ///    attribute on the `mod_item` overriding both. Edges whose
+    ///    candidates are not in the passed [`FileIndex`] are removed
+    ///    here; edges whose declaring `mod_item` is nested inside an
+    ///    inline `mod` block are removed too (v1 limitation — see
+    ///    "Inline-nested mod limitation" below). The per-file AST walk
+    ///    that drives this lives in [`scan_mod_decls`].
+    ///
+    /// # Namespace composition rule
     ///
     /// `parse_file` populated each symbol's `namespace` field via
     /// [`resolve_mod_namespace`], which collects only inline `mod_item`
@@ -711,27 +789,41 @@ impl LanguagePlugin for RustParser {
     /// the existing inline-only namespace stays in place, including the
     /// empty string that renders as `<global>` in `get_symbol_summary`.
     ///
+    /// # `mod`-edge discriminator
+    ///
+    /// `extract_uses` and `extract_mod_decls` both emit `Includes`
+    /// edges from a Rust file with the same shape (`from = file_path`,
+    /// `file = file_path`, `kind = Includes`); only the `to` and `line`
+    /// differ. To tell them apart in this hook, we re-walk each Rust
+    /// source file's AST and collect every external `mod_item`'s
+    /// `(modname, line, optional #[path] override, is_inline_nested)`
+    /// tuple. An edge is a `mod`-decl edge iff its `(to, line)` pair
+    /// matches one of those tuples. Every other `Includes` edge is a
+    /// `use` or `extern crate` token and survives this pass untouched
+    /// — it will drop later via the `resolve_include` override above
+    /// (the dotted token is not an absolute path, so it is filtered
+    /// out at edge-resolution time exactly as today).
+    ///
+    /// # Inline-nested mod limitation (v1)
+    ///
+    /// `mod b;` declared inside an inline `mod a { … }` block emits an
+    /// edge with `to = "b"` (no namespace prefix on the wire). Per
+    /// Rust's module rules, that `b` would resolve relative to the
+    /// inline mod's namespace directory (`parent/a/b.rs` or
+    /// `parent/a/b/mod.rs`), but the inline-mod ancestor path is not
+    /// encoded on the emitted edge, and this pass does not
+    /// reconstruct it. The conservative, no-false-edges fallback is
+    /// to **drop** any mod edge whose declaring `mod_item` has an
+    /// inline `mod_item` ancestor. The
+    /// `mod_inside_inline_mod_remains_unresolved_in_v1` test pins
+    /// this behavior. Resolving inline-nested mod decls is a follow-up.
+    ///
     /// # State
     ///
-    /// Nothing is stored on `&self`. The RCMM is constructed inside this
-    /// call, used to rewrite namespaces in place, and dropped before
-    /// returning.
-    ///
-    /// # Path overrides
-    ///
-    /// The [`CrateModuleModel::with_path_overrides`] seam exists for
-    /// future `#[path = "x.rs"]` attribute work (an AST-walking
-    /// `mod`-resolution pass). This implementation does **not** parse
-    /// `.rs` source for `#[path]` attributes — the seam is intentionally
-    /// unused here.
-    ///
-    /// # `_file_index` ignored
-    ///
-    /// The hook receives a [`FileIndex`] for plugins that need basename
-    /// lookups (a future `mod`→file resolver would). The namespace
-    /// rewrite here operates on absolute file paths already present in
-    /// each `FileGraph::path`, so the index is unused.
-    fn post_index(&self, graphs: &mut [FileGraph], _file_index: &FileIndex) {
+    /// Nothing is stored on `&self`. The RCMM, the per-file
+    /// mod-decl tables, and any tree-sitter trees built for the
+    /// `#[path]` walk are all local to this call.
+    fn post_index(&self, graphs: &mut [FileGraph], file_index: &FileIndex) {
         // Pass 1: collect every Rust file's absolute path.
         let rust_paths: Vec<PathBuf> = graphs
             .iter()
@@ -794,9 +886,271 @@ impl LanguagePlugin for RustParser {
                 };
             }
         }
+
+        // Pass 5: resolve provisional `mod` Includes edges.
+        //
+        // For each Rust file, build a `(modname, line) -> ModDeclInfo`
+        // map by re-walking the file's AST. Then iterate the file's
+        // edges in place: an Includes edge whose `(to, line)` pair is
+        // in the map is a mod-decl edge — resolve it via the rules in
+        // `resolve_mod_to_path` (path-override → sibling → mod.rs);
+        // rewrite or drop. Edges absent from the map are use/extern
+        // tokens; pass them through untouched (they drop later via
+        // `resolve_include`'s `None` arm).
+        for fg in graphs.iter_mut() {
+            if fg.language != Language::Rust {
+                continue;
+            }
+            // Read the file's source on disk and scan for mod_items.
+            // The file is normally still on disk at this point (the
+            // analyze and watch paths both call post_index moments
+            // after parsing the same bytes); a missing/unreadable file
+            // produces an empty mod-decl map, which causes every
+            // candidate edge to fail the `(to, line)` lookup and pass
+            // through to the resolve_include `None` drop. That fallback
+            // is the same shape as the today's drop and is safe.
+            let file_path = PathBuf::from(&fg.path);
+            let Some(mod_decls) = scan_mod_decls(&file_path, &self.language) else {
+                continue;
+            };
+
+            let parent = file_path.parent().map(Path::to_path_buf);
+            fg.edges.retain_mut(|edge| {
+                if edge.kind != EdgeKind::Includes {
+                    return true;
+                }
+                // Only consider edges whose `from` matches the file we
+                // just scanned. Defensive: extract_mod_decls always
+                // emits edges with `from = file_path`, but a future
+                // refactor could break that invariant; treat anything
+                // else as "not a mod-decl edge".
+                if edge.from != fg.path {
+                    return true;
+                }
+                let Some(info) = mod_decls.get(&(edge.to.clone(), edge.line)) else {
+                    return true;
+                };
+                // We have a mod-decl edge. Inline-nested mod decls are
+                // dropped as a v1 limitation; see the docstring on
+                // `post_index`.
+                if info.is_inline_nested {
+                    return false;
+                }
+                let Some(parent) = parent.as_deref() else {
+                    return false;
+                };
+                match resolve_mod_to_path(parent, &edge.to, info, file_index) {
+                    Some(resolved) => {
+                        edge.to = resolved.to_string_lossy().into_owned();
+                        true
+                    }
+                    None => false,
+                }
+            });
+        }
     }
 
     fn close(&self) {}
+}
+
+/// One external `mod_item`'s metadata, collected by [`scan_mod_decls`]
+/// from a Rust source file's AST.
+///
+/// Keyed by `(modname, line)` in the per-file table because that is
+/// the discriminator [`RustParser::post_index`] uses to match a
+/// provisional `Includes` edge to its declaring `mod_item`. The fields
+/// here are everything the resolution rules (`#[path]` → sibling →
+/// `mod.rs`) and the inline-nested drop need.
+#[derive(Debug, Clone)]
+struct ModDeclInfo {
+    /// Value of `#[path = "..."]` if present on the `mod_item`. The
+    /// override takes precedence over both sibling and `mod.rs`
+    /// candidates per Rust's module rules. Multiple `#[path]`
+    /// attributes on one `mod_item` is a Rust syntax error and not
+    /// expected; if it ever occurs, the last one wins (consistent with
+    /// the tree-sitter walk order).
+    path_override: Option<String>,
+    /// `true` iff the declaring `mod_item` has at least one `mod_item`
+    /// ancestor (i.e. it's `mod b;` inside an inline `mod a { … }`).
+    /// Per the v1 limitation in `post_index`'s docstring, these edges
+    /// are dropped rather than misresolved.
+    is_inline_nested: bool,
+}
+
+/// Parse `file` as Rust and collect every external `mod_item`'s
+/// metadata into a `(modname, line) -> ModDeclInfo` map.
+///
+/// Returns `None` if the file cannot be read or the parser cannot
+/// produce a tree. Returns `Some(empty)` if the file is readable but
+/// declares no external mods — distinguishing the two would force
+/// every call site to special-case unreadable files, which is the
+/// drop-everything semantics we already want (no map ⇒ no edges
+/// match ⇒ no resolution).
+///
+/// The returned map keys `(modname, line)` so [`RustParser::post_index`]
+/// can match provisional `Includes` edges (whose `to` and `line`
+/// fields carry the same values, by construction in
+/// [`RustParser::extract_mod_decls`]).
+fn scan_mod_decls(
+    file: &Path,
+    language: &TsLanguage,
+) -> Option<HashMap<(String, u32), ModDeclInfo>> {
+    let content = std::fs::read(file).ok()?;
+    let tree = parse_tree(language, &content).ok()?;
+    let mut out: HashMap<(String, u32), ModDeclInfo> = HashMap::new();
+    collect_mod_decls(tree.root_node(), &content, false, &mut out);
+    Some(out)
+}
+
+/// Recursively walk a Rust AST collecting every external `mod_item`'s
+/// `(modname, line) -> ModDeclInfo` entry.
+///
+/// `inside_inline_mod` flips to `true` when descending into a
+/// `declaration_list` child of a `mod_item` (i.e. an inline mod
+/// body), and stays `true` for the duration of that subtree. Any
+/// external `mod_item` discovered while the flag is `true` is
+/// recorded with `is_inline_nested = true`.
+fn collect_mod_decls(
+    node: Node<'_>,
+    content: &[u8],
+    inside_inline_mod: bool,
+    out: &mut HashMap<(String, u32), ModDeclInfo>,
+) {
+    if node.kind() == "mod_item" {
+        let modname = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(content).ok())
+            .map(|s| s.to_owned());
+        let has_body = node.child_by_field_name("body").is_some();
+        if let Some(modname) = modname {
+            if !has_body {
+                // External `mod foo;` declaration. The provisional
+                // edge that `extract_mod_decls` emitted carries
+                // `line = mod_item.start_position().row + 1`; match
+                // that here.
+                let line = node.start_position().row as u32 + 1;
+                let path_override = extract_path_attribute(node, content);
+                out.insert(
+                    (modname, line),
+                    ModDeclInfo {
+                        path_override,
+                        is_inline_nested: inside_inline_mod,
+                    },
+                );
+            }
+            // For inline mods (`mod foo { … }`), descend into the
+            // body with `inside_inline_mod = true` so nested external
+            // mods are flagged.
+            if has_body {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for child in body.named_children(&mut cursor) {
+                        collect_mod_decls(child, content, true, out);
+                    }
+                    return; // already descended
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_mod_decls(child, content, inside_inline_mod, out);
+    }
+}
+
+/// Extract the `#[path = "x.rs"]` attribute value from the
+/// `mod_item`'s preceding `attribute_item` siblings, if any.
+///
+/// AST shape: an `attribute_item` is a sibling of `mod_item` (NOT a
+/// child); chained attributes (`#[cfg(test)] #[path = "x.rs"]
+/// mod foo;`) produce a chain of `attribute_item` siblings. We walk
+/// `prev_named_sibling()` for as long as the previous node is an
+/// `attribute_item`; the first one whose inner `attribute > identifier`
+/// is `path` wins. Returns the `string_content` text (the bare
+/// `x.rs`, without quotes).
+fn extract_path_attribute(mod_item: Node<'_>, content: &[u8]) -> Option<String> {
+    let mut sibling = mod_item.prev_named_sibling();
+    while let Some(node) = sibling {
+        if node.kind() != "attribute_item" {
+            return None;
+        }
+        // attribute_item -> attribute -> identifier "path", string_literal -> string_content
+        if let Some(attr) = node.named_child(0) {
+            if attr.kind() == "attribute" {
+                // First named child is the attribute's path identifier
+                // (or a scoped_identifier for qualified attribute names).
+                if let Some(ident) = attr.named_child(0) {
+                    if ident.kind() == "identifier" && ident.utf8_text(content).ok() == Some("path")
+                    {
+                        // Find the `string_literal` -> `string_content`
+                        // capturing the override value.
+                        let mut cursor = attr.walk();
+                        for child in attr.named_children(&mut cursor) {
+                            if child.kind() == "string_literal" {
+                                let mut sc = child.walk();
+                                for grand in child.named_children(&mut sc) {
+                                    if grand.kind() == "string_content" {
+                                        return grand.utf8_text(content).ok().map(str::to_owned);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sibling = node.prev_named_sibling();
+    }
+    None
+}
+
+/// Resolve one `mod` declaration to an indexed file path.
+///
+/// Candidate order (Rust's documented module-file rules):
+///
+/// 1. **`#[path = "x.rs"]` override**: `parent.join(x_rs)`. Wins
+///    unconditionally when present — Rust does not fall back to
+///    sibling / `mod.rs` if the `#[path]` target is missing.
+/// 2. **Sibling**: `parent.join("{modname}.rs")`.
+/// 3. **`mod.rs` subdir**: `parent.join(modname).join("mod.rs")`.
+///
+/// For each candidate, the function probes the passed [`FileIndex`].
+/// **First match wins**; non-indexed candidates are skipped silently
+/// (an unindexed sibling shouldn't suppress a `mod.rs` that's in the
+/// index, since that means the indexer discovered the latter and
+/// the former is — from the graph's perspective — invisible).
+///
+/// Returns the resolved absolute path on a hit, `None` if no
+/// candidate is in the index. The `None` result causes
+/// [`RustParser::post_index`] to drop the edge rather than leave a
+/// bare-modname `to` for `resolve_all_edges` to misresolve.
+fn resolve_mod_to_path(
+    parent: &Path,
+    modname: &str,
+    info: &ModDeclInfo,
+    file_index: &FileIndex,
+) -> Option<PathBuf> {
+    if let Some(override_str) = &info.path_override {
+        let candidate = parent.join(override_str);
+        if file_index.contains_path(&candidate) {
+            return Some(candidate);
+        }
+        // `#[path]` is authoritative when present: if the override
+        // target is not in the FileIndex, do NOT fall through to
+        // sibling/`mod.rs` candidates. Rust itself would refuse to
+        // compile in this case (the file would just be missing); our
+        // index-side equivalent is to drop the edge entirely.
+        return None;
+    }
+    let sibling = parent.join(format!("{modname}.rs"));
+    if file_index.contains_path(&sibling) {
+        return Some(sibling);
+    }
+    let mod_rs = parent.join(modname).join("mod.rs");
+    if file_index.contains_path(&mod_rs) {
+        return Some(mod_rs);
+    }
+    None
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the Rust grammar.
@@ -1918,6 +2272,13 @@ mod tests {
     /// Drive `parse_file` + `post_index` over a list of absolute Rust
     /// file paths, mirroring what the analyze path does after the rayon
     /// parse loop. Returns the post-hook FileGraph slice keyed by path.
+    ///
+    /// Builds a real [`FileIndex`] over the parsed graph set (matching
+    /// `code_graph_tools::indexer::build_file_index`) so the
+    /// post_index mod-resolution pass has the index entries it probes.
+    /// The 1.x namespace-only tests work fine with an empty index too —
+    /// they don't exercise mod resolution — but the 2.2 mod-resolution
+    /// tests do, and sharing one helper keeps the test surface uniform.
     fn run_post_index(rs_paths: &[PathBuf]) -> Vec<FileGraph> {
         let parser = RustParser::new().expect("RustParser::new");
         let mut graphs: Vec<FileGraph> = rs_paths
@@ -1927,12 +2288,29 @@ mod tests {
                 parser.parse_file(p, &content).expect("parse_file")
             })
             .collect();
-        // Production wires `_file_index` to the just-built FileIndex over
-        // the FileGraph set; the namespace rewrite does not consume it,
-        // so an empty one is sufficient here.
-        let file_index = FileIndex::new();
+        let file_index = build_test_file_index(&graphs);
         parser.post_index(&mut graphs, &file_index);
         graphs
+    }
+
+    /// Build a `FileIndex` over the parsed `graphs` exactly the way
+    /// `code_graph_tools::indexer::build_file_index` does (basename
+    /// keyed, every graph contributes its path). Reproduced here so
+    /// `code-graph-lang-rust`'s unit tests don't take a dep on the
+    /// `code-graph-tools` crate.
+    fn build_test_file_index(graphs: &[FileGraph]) -> FileIndex {
+        let mut index = FileIndex::new();
+        for fg in graphs {
+            let path = PathBuf::from(&fg.path);
+            if let Some(base) = path.file_name().and_then(|s| s.to_str()) {
+                index
+                    .by_basename
+                    .entry(base.to_string())
+                    .or_default()
+                    .push(path);
+            }
+        }
+        index
     }
 
     /// Find the FileGraph in `graphs` whose `path` matches `target`
@@ -2250,5 +2628,409 @@ mod tests {
         );
         // And the Rust file must have been rewritten as expected.
         assert_eq!(sym(&graphs[0], "f").namespace, "mixed::foo");
+    }
+
+    // ----------------------------------------------------------------
+    // post_index — mod-declaration Includes edge resolution (2.2)
+    // ----------------------------------------------------------------
+    //
+    // These tests exercise the `post_index` pass that resolves
+    // provisional `mod` `Includes` edges (emitted by `extract_mod_decls`
+    // with `to = bare modname`) to absolute indexed file paths using
+    // Rust's module-file rules (#[path] → sibling → mod.rs). They share
+    // the `run_post_index` helper above, which now builds a real
+    // `FileIndex` over the parsed graph set.
+
+    /// Just the Includes-kind edges from a `FileGraph`, in emission order.
+    fn fg_include_edges(fg: &FileGraph) -> Vec<&Edge> {
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Includes)
+            .collect()
+    }
+
+    /// `pub mod foo;` in `src/lib.rs` with a sibling `src/foo.rs`
+    /// present → after `post_index`, the provisional Includes edge is
+    /// rewritten to the absolute path of `foo.rs`.
+    #[test]
+    fn mod_sibling_file_resolves() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(dir.path(), "src/lib.rs", "pub mod foo;\n");
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+
+        let graphs = run_post_index(&[lib.clone(), foo.clone()]);
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert_eq!(
+            includes.len(),
+            1,
+            "expected exactly 1 surviving Includes edge after post_index, got: {:?}",
+            includes
+                .iter()
+                .map(|e| (&e.from, &e.to))
+                .collect::<Vec<_>>()
+        );
+        let e = includes[0];
+        assert_eq!(
+            e.to,
+            foo.to_string_lossy(),
+            "sibling `mod foo;` must resolve to the absolute path of foo.rs"
+        );
+        // Identity invariants — `from`/`file` unchanged from emission.
+        assert_eq!(e.from, lib.to_string_lossy());
+        assert_eq!(e.file, lib.to_string_lossy());
+        assert_eq!(e.kind, EdgeKind::Includes);
+    }
+
+    /// `pub mod foo;` in `src/lib.rs` with `src/foo/mod.rs` (mod.rs
+    /// subdir layout) present → edge resolves to the absolute path of
+    /// `foo/mod.rs`.
+    #[test]
+    fn mod_mod_rs_layout_resolves() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(dir.path(), "src/lib.rs", "pub mod foo;\n");
+        let mod_rs = write_rs(dir.path(), "src/foo/mod.rs", "fn f() {}\n");
+
+        let graphs = run_post_index(&[lib.clone(), mod_rs.clone()]);
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert_eq!(
+            includes.len(),
+            1,
+            "expected exactly 1 surviving Includes edge"
+        );
+        assert_eq!(
+            includes[0].to,
+            mod_rs.to_string_lossy(),
+            "`mod foo;` with foo/mod.rs layout must resolve to the absolute path of mod.rs"
+        );
+    }
+
+    /// `mod orphan;` in `src/lib.rs` with NO matching `orphan.rs` or
+    /// `orphan/mod.rs` in the FileIndex → edge is removed from the
+    /// FileGraph's `edges` vector. Pinned via a sibling check that
+    /// confirms no Includes edge points at any path-shaped string.
+    #[test]
+    fn mod_no_indexed_file_is_dropped() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(dir.path(), "src/lib.rs", "mod orphan;\n");
+
+        let graphs = run_post_index(std::slice::from_ref(&lib));
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert!(
+            includes.is_empty(),
+            "mod-decl pointing at no indexed file must be dropped post_index; surviving edges: {:?}",
+            includes.iter().map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+    }
+
+    /// `#[path = "x.rs"] mod foo;` with both `x.rs` AND `foo.rs`
+    /// present → resolution picks `x.rs` (the attribute wins
+    /// unconditionally). Without `#[path]`, `foo.rs` would have been
+    /// the sibling-rule winner — so this fixture exercises the
+    /// path-override-beats-sibling discriminator directly.
+    #[test]
+    fn mod_path_attribute_override_resolves() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(
+            dir.path(),
+            "src/lib.rs",
+            "#[path = \"x.rs\"]\npub mod foo;\n",
+        );
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn would_lose() {}\n");
+        let x = write_rs(dir.path(), "src/x.rs", "fn wins() {}\n");
+
+        let graphs = run_post_index(&[lib.clone(), foo.clone(), x.clone()]);
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert_eq!(
+            includes.len(),
+            1,
+            "expected exactly 1 surviving Includes edge after post_index"
+        );
+        let e = includes[0];
+        assert_eq!(
+            e.to,
+            x.to_string_lossy(),
+            "#[path = \"x.rs\"] must override the sibling-rule winner foo.rs and resolve to x.rs"
+        );
+        assert_ne!(
+            e.to,
+            foo.to_string_lossy(),
+            "#[path] override must NOT fall through to sibling foo.rs even when present"
+        );
+    }
+
+    /// **v1 documented limitation.** `mod b;` declared inside an inline
+    /// `mod a { … }` block in `src/lib.rs`, with `b.rs` present in the
+    /// file's parent directory → the provisional edge is **dropped**
+    /// (not resolved to `b.rs`), because v1 cannot determine the
+    /// inline-mod ancestor path (`a/b.rs`/`a/b/mod.rs`) from the bare
+    /// emitted edge. This anti-regression pins the documented
+    /// conservative-drop behavior. Resolving inline-nested mod decls is
+    /// a future follow-up.
+    #[test]
+    fn mod_inside_inline_mod_remains_unresolved_in_v1() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(dir.path(), "src/lib.rs", "mod a {\n    mod b;\n}\n");
+        // `b.rs` sits in the same dir as lib.rs — Rust would NOT resolve
+        // `mod b;` (inside inline `mod a { … }`) to this file; the
+        // correct resolution would be `src/a/b.rs` (which we don't
+        // create). The v1 drop is the right outcome either way; the
+        // sibling `b.rs` here is the false-positive a naive resolver
+        // would emit.
+        let _decoy = write_rs(dir.path(), "src/b.rs", "fn d() {}\n");
+
+        let graphs = run_post_index(std::slice::from_ref(&lib));
+        let lib_fg = fg_for(&graphs, &lib);
+
+        let includes = fg_include_edges(lib_fg);
+        assert!(
+            includes.is_empty(),
+            "inline-nested `mod b;` inside `mod a {{ … }}` must drop in v1 — \
+             resolving it would risk a false src/b.rs edge. Got: {:?}",
+            includes
+                .iter()
+                .map(|e| (&e.from, &e.to))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Cross-section scope-boundary anti-regression: a mixed fixture
+    /// with `use std::io;`, `extern crate foo;`, a top-level `mod foo;`
+    /// (matched against the same-named sibling), and an unresolvable
+    /// `mod gone;` exercises every emission path in one pass.
+    ///
+    /// Expected post_index outcome:
+    /// - `use std::io;` edge → unchanged (dotted token; will drop later
+    ///   at `resolve_include` time via the `None` arm).
+    /// - `extern crate foo;` edge → unchanged (also a bare token; will
+    ///   drop later for the same reason — `"foo"` is not an absolute
+    ///   path).
+    /// - `mod foo;` edge → rewritten to absolute `foo.rs`.
+    /// - `mod gone;` edge → dropped (no candidate in FileIndex).
+    ///
+    /// After the surrounding `resolve_include` filter runs (mimicked
+    /// here by checking which `to` values are absolute paths in the
+    /// FileIndex), only the `mod foo;`-resolved edge survives.
+    #[test]
+    fn use_extern_crate_still_drop_after_resolve_include_override() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(
+            dir.path(),
+            "src/lib.rs",
+            "use std::io;\nextern crate foo;\nmod foo;\nmod gone;\n",
+        );
+        let foo = write_rs(dir.path(), "src/foo.rs", "fn f() {}\n");
+
+        let parser = RustParser::new().expect("RustParser::new");
+        let mut graphs: Vec<FileGraph> = [lib.clone(), foo.clone()]
+            .iter()
+            .map(|p| {
+                let content = fs::read(p).expect("read source file");
+                parser.parse_file(p, &content).expect("parse_file")
+            })
+            .collect();
+        let file_index = build_test_file_index(&graphs);
+        parser.post_index(&mut graphs, &file_index);
+
+        // Post-post_index: confirm `mod foo;` resolved, `mod gone;`
+        // dropped, and `use std::io;` + `extern crate foo;` still
+        // present (they'll drop at the next layer).
+        let lib_fg = fg_for(&graphs, &lib);
+        let includes = fg_include_edges(lib_fg);
+        let targets: Vec<&str> = includes.iter().map(|e| e.to.as_str()).collect();
+        let foo_str = foo.to_string_lossy().into_owned();
+        assert!(
+            targets.contains(&foo_str.as_str()),
+            "`mod foo;` must be rewritten to absolute foo.rs path, got targets: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"std::io"),
+            "`use std::io;` edge must still be present post_index, got: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"foo"),
+            "`extern crate foo;` edge (`to = \"foo\"`) must still be present post_index, got: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&"gone"),
+            "`mod gone;` must be dropped post_index (no indexed file), got: {targets:?}"
+        );
+
+        // Apply the resolve_include override + the surrounding
+        // `language_for_path(&resolved).is_some()` filter to simulate
+        // the analyze-path drop. Only the absolute-path mod edge
+        // survives; the dotted use/extern_crate tokens both drop.
+        let surviving_after_resolve: Vec<String> = includes
+            .iter()
+            .filter_map(|e| {
+                parser
+                    .resolve_include(&e.to, &file_index)
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert_eq!(
+            surviving_after_resolve,
+            vec![foo_str.clone()],
+            "after resolve_include filtering, only the mod-resolved foo.rs path must survive"
+        );
+    }
+
+    /// Direct unit test of the `resolve_include` override: indexed
+    /// absolute path → `Some(path)`.
+    #[test]
+    fn resolve_include_indexed_absolute_path_returns_some() {
+        let parser = RustParser::new().expect("RustParser::new");
+        let mut file_index = FileIndex::new();
+        file_index
+            .by_basename
+            .entry("foo.rs".to_string())
+            .or_default()
+            .push(PathBuf::from("/proj/src/foo.rs"));
+
+        let resolved = parser.resolve_include("/proj/src/foo.rs", &file_index);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(Path::new("/proj/src/foo.rs")),
+            "indexed absolute path must resolve to itself"
+        );
+    }
+
+    /// Direct unit test of the `resolve_include` override: dotted
+    /// use-path → `None`. Covers `use std::io;` (`std::io`) and
+    /// `extern crate alloc;` (`alloc`) — both shapes drop.
+    #[test]
+    fn resolve_include_dotted_use_path_returns_none() {
+        let parser = RustParser::new().expect("RustParser::new");
+        let file_index = FileIndex::new();
+
+        assert!(
+            parser.resolve_include("std::io", &file_index).is_none(),
+            "dotted `use` path must drop (not an absolute path)"
+        );
+        assert!(
+            parser.resolve_include("alloc", &file_index).is_none(),
+            "bare `extern crate` name must drop (not an absolute path)"
+        );
+        assert!(
+            parser
+                .resolve_include("foo::bar::baz", &file_index)
+                .is_none(),
+            "scoped path must drop"
+        );
+    }
+
+    /// Boundary case: an absolute path that is NOT in the FileIndex →
+    /// `None`. Pinned because the override deliberately doesn't blindly
+    /// echo absolute strings — it must also be a known indexed file.
+    #[test]
+    fn resolve_include_absolute_but_unindexed_returns_none() {
+        let parser = RustParser::new().expect("RustParser::new");
+        let file_index = FileIndex::new();
+        assert!(
+            parser
+                .resolve_include("/proj/src/foo.rs", &file_index)
+                .is_none(),
+            "absolute path not in FileIndex must drop"
+        );
+    }
+
+    /// Real cycle: `src/a.rs` has `mod b;` and `src/b.rs` has `mod a;`,
+    /// both at the top level. After post_index resolution, an
+    /// `a.rs <-> b.rs` cycle exists in the file graph; the higher-level
+    /// integration test that calls `Graph::detect_cycles` lives in
+    /// `crates/code-graph-tools/tests/rust_mod_resolution.rs`. This
+    /// unit test just pins the per-file resolved edges in both
+    /// directions.
+    #[test]
+    fn real_detect_cycles_with_mod_a_mod_b_mod_a() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "two_way");
+        let _lib = write_rs(dir.path(), "src/lib.rs", "pub mod a;\npub mod b;\n");
+        let a = write_rs(dir.path(), "src/a.rs", "mod b;\nfn f() {}\n");
+        let b = write_rs(dir.path(), "src/b.rs", "mod a;\nfn g() {}\n");
+
+        // Just the two crate-file modules need to round-trip post_index.
+        let graphs = run_post_index(&[_lib.clone(), a.clone(), b.clone()]);
+
+        let a_fg = fg_for(&graphs, &a);
+        let b_fg = fg_for(&graphs, &b);
+
+        let a_includes = fg_include_edges(a_fg);
+        let b_includes = fg_include_edges(b_fg);
+
+        assert_eq!(
+            a_includes.iter().map(|e| e.to.as_str()).collect::<Vec<_>>(),
+            vec![b.to_string_lossy().as_ref()],
+            "a.rs must resolve `mod b;` to absolute b.rs"
+        );
+        assert_eq!(
+            b_includes.iter().map(|e| e.to.as_str()).collect::<Vec<_>>(),
+            vec![a.to_string_lossy().as_ref()],
+            "b.rs must resolve `mod a;` to absolute a.rs"
+        );
+    }
+
+    /// `extract_path_attribute` walks chained attributes
+    /// (`#[cfg(test)] #[path = "x.rs"] mod foo;`) so the path override
+    /// is still found when other attributes precede it. Pinned to
+    /// defend against a future "only the immediately-preceding
+    /// attribute counts" regression.
+    #[test]
+    fn mod_path_attribute_resolution_through_chained_attributes() {
+        let dir = TempDir::new().expect("TempDir");
+        write_cargo_toml(dir.path(), "ark_core");
+        let lib = write_rs(
+            dir.path(),
+            "src/lib.rs",
+            "#[cfg(test)]\n#[path = \"x.rs\"]\npub mod foo;\n",
+        );
+        let x = write_rs(dir.path(), "src/x.rs", "fn fx() {}\n");
+
+        let graphs = run_post_index(&[lib.clone(), x.clone()]);
+        let lib_fg = fg_for(&graphs, &lib);
+        let includes = fg_include_edges(lib_fg);
+        assert_eq!(
+            includes.len(),
+            1,
+            "expected exactly 1 surviving include edge"
+        );
+        assert_eq!(
+            includes[0].to,
+            x.to_string_lossy(),
+            "chained attributes must not hide the #[path] override"
+        );
+    }
+
+    /// 2.1 baseline test must STILL PASS as-emitted: the parser
+    /// emits `to = "b"` for `mod a { mod b; }` regardless of whether
+    /// post_index later drops or resolves the edge. This test calls
+    /// only `parse_file` (no post_index), so it pins the emission
+    /// boundary — re-asserting it here against the 2.2 changes
+    /// ensures parser emission was not accidentally rewritten to
+    /// encode inline-nesting info on the edge `to` (which would
+    /// have changed `"b"` to e.g. `"a::b"` or similar).
+    #[test]
+    fn mod_inline_outer_external_inner_emits_edge_to_bare_b_still_2_2() {
+        let fg = parse("mod a { mod b; }");
+        let ts = include_targets(&fg);
+        assert_eq!(
+            ts,
+            vec!["b"],
+            "2.1 baseline must survive 2.2: parser still emits `to = \"b\"` \
+             for `mod a {{ mod b; }}` (resolution behavior is post_index's job)"
+        );
     }
 }
