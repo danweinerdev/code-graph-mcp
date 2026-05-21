@@ -125,7 +125,7 @@ fn count_edges_by_kind(edges: &[Edge]) -> HashMap<EdgeKind, usize> {
 ///   invariant. In this corpus that adds `Greet::greet` and
 ///   `Compute::compute` to traits.rs's symbol set.
 const TOTAL_SYMBOLS: usize = 41;
-const TOTAL_EDGES: usize = 39;
+const TOTAL_EDGES: usize = 45;
 
 #[test]
 fn corpus_aggregate_counts_match_manifest() {
@@ -195,8 +195,8 @@ fn corpus_aggregate_counts_match_manifest() {
     );
     assert_eq!(
         edge_by_kind.get(&EdgeKind::Includes).copied().unwrap_or(0),
-        11,
-        "MANIFEST claims 11 Includes edges"
+        17,
+        "MANIFEST claims 17 Includes edges (11 use/extern_crate + 6 mod-decl: 4 in lib.rs, 2 in mod_only.rs)"
     );
     assert_eq!(
         edge_by_kind.get(&EdgeKind::Inherits).copied().unwrap_or(0),
@@ -214,8 +214,8 @@ fn corpus_per_file_counts_match_manifest() {
     // per-file tables in the MANIFEST.
     let expected: &[(&str, usize, usize)] = &[
         ("empty.rs", 0, 0),
-        ("mod_only.rs", 0, 0),
-        ("lib.rs", 2, 0),
+        ("mod_only.rs", 0, 2),
+        ("lib.rs", 2, 4),
         ("main.rs", 1, 16),
         ("models.rs", 9, 0),
         ("traits.rs", 15, 7),
@@ -301,15 +301,36 @@ fn empty_file_produces_zero_symbols_and_zero_edges() {
 }
 
 #[test]
-fn mod_only_file_produces_zero_symbols_and_zero_edges() {
-    // `pub mod a; pub mod b;` declares external modules but defines
-    // nothing — no Symbols (mod_items are not symbols) and no Edges
-    // (no `use`, no `extern crate`, no calls).
+fn mod_only_file_produces_zero_symbols_and_provisional_mod_includes() {
+    // `pub mod a; pub mod b;` declares two external modules but defines
+    // no symbols (mod_items are namespace anchors, not Symbol records).
+    // Each external `mod foo;` produces one provisional Includes edge
+    // with the bare modname as `to`; whole-graph resolution of those
+    // bare tokens to concrete sibling files lives in `post_index` and
+    // ships in a follow-up task. There are no `use`, no `extern crate`,
+    // and no call sites, so the only edges in this file are the two
+    // mod-decl provisional includes.
     let parser = RustParser::new().expect("RustParser::new");
     let corpus = parse_corpus(&parser);
     let mo = corpus.get("mod_only.rs").expect("mod_only.rs in corpus");
     assert!(mo.symbols.is_empty(), "mod_only.rs must have 0 symbols");
-    assert!(mo.edges.is_empty(), "mod_only.rs must have 0 edges");
+    let targets: Vec<&str> = mo
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Includes)
+        .map(|e| e.to.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["a", "b"],
+        "mod_only.rs must produce two provisional mod-decl Includes edges to bare modnames"
+    );
+    // No other edge kinds in this file.
+    assert!(
+        mo.edges.iter().all(|e| e.kind == EdgeKind::Includes),
+        "mod_only.rs must contain only Includes edges, got: {:?}",
+        mo.edges.iter().map(|e| e.kind).collect::<Vec<_>>()
+    );
 }
 
 #[test]

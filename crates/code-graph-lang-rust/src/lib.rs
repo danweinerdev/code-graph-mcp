@@ -71,7 +71,9 @@ use crate::helpers::{
     enclosing_function_id, find_enclosing_kind, find_nearest_def_ancestor, resolve_mod_namespace,
     split_use_path, truncate_signature, NearestDefAncestor,
 };
-use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, USE_QUERIES};
+use crate::queries::{
+    CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, MOD_DECL_QUERIES, USE_QUERIES,
+};
 
 /// File extensions the Rust parser claims.
 pub const EXTENSIONS: &[&str] = &[".rs"];
@@ -95,13 +97,16 @@ pub struct RustParser {
     use_query: Query,
     /// Compiled inheritance / trait-impl query.
     inh_query: Query,
+    /// Compiled module-declaration query (drives external-`mod`
+    /// provisional `Includes` edge emission).
+    mod_query: Query,
 }
 
 impl RustParser {
-    /// Build a new parser, compiling all four tree-sitter queries against
-    /// the pinned tree-sitter-rust grammar. Returns an
-    /// [`anyhow::Error`] (wrapping the query compiler's message) if any
-    /// query fails to compile against the pinned grammar version.
+    /// Build a new parser, compiling every tree-sitter query against the
+    /// pinned tree-sitter-rust grammar. Returns an [`anyhow::Error`]
+    /// (wrapping the query compiler's message) if any query fails to
+    /// compile against the pinned grammar version.
     ///
     /// Successful return proves every query string in `queries.rs` parses
     /// against tree-sitter-rust 0.24.x.
@@ -116,6 +121,8 @@ impl RustParser {
             Query::new(&language, USE_QUERIES).map_err(|e| anyhow::anyhow!("use query: {e}"))?;
         let inh_query = Query::new(&language, INHERITANCE_QUERIES)
             .map_err(|e| anyhow::anyhow!("inheritance query: {e}"))?;
+        let mod_query = Query::new(&language, MOD_DECL_QUERIES)
+            .map_err(|e| anyhow::anyhow!("mod-declaration query: {e}"))?;
 
         Ok(Self {
             language,
@@ -123,6 +130,7 @@ impl RustParser {
             call_query,
             use_query,
             inh_query,
+            mod_query,
         })
     }
 
@@ -150,6 +158,7 @@ impl RustParser {
 
         self.extract_definitions(root, content, &path_str, &mut fg);
         self.extract_uses(root, content, &path_str, &mut fg);
+        self.extract_mod_decls(root, content, &path_str, &mut fg);
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_inheritance(root, content, &path_str, &mut fg);
 
@@ -437,6 +446,89 @@ impl RustParser {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Run the module-declaration query and produce **provisional**
+    /// `Includes` edges for every external `mod foo;` declaration.
+    ///
+    /// External vs inline discriminator: tree-sitter-rust gives a
+    /// `mod_item` a `body` field of kind `declaration_list` when the
+    /// source is `mod foo { … }`, and omits the field when the source is
+    /// `mod foo;`. Visibility modifiers (`pub`, `pub(crate)`, etc.) are
+    /// siblings of the `mod` keyword inside the `mod_item`; they do not
+    /// affect the discriminator. So:
+    ///
+    /// - `mod_item` whose `body` field is **absent** → external
+    ///   declaration → emit one `Includes` edge with `from` = the
+    ///   declaring file path, `to` = the bare modname token captured by
+    ///   `@mod.name`, `line` = the `mod_item`'s start row (1-indexed). The
+    ///   bare token is a provisional placeholder; whole-graph resolution
+    ///   to the concrete child file (`dir/foo.rs`, `dir/foo/mod.rs`,
+    ///   `#[path]` override) is the job of [`Self::post_index`] later.
+    /// - `mod_item` whose `body` field is **present** → inline declaration
+    ///   → emit nothing. The body's contents live in the same file, so a
+    ///   self-edge would only add noise to file-coupling/cycle queries.
+    ///   Inner items (functions, nested mods, …) still extract through
+    ///   their own query branches; the suppression is local to this
+    ///   handler's `Includes` emission.
+    ///
+    /// At edge-resolution time (`crates/code-graph-tools/src/indexer.rs`'s
+    /// `resolve_all_edges`) the default `resolve_include` basename-matches
+    /// the bare modname against the `FileIndex`. The basename of `"foo"`
+    /// has no `.rs` extension, so no entry matches and the edge is
+    /// dropped — the same way every dotted `use std::io;` token already
+    /// drops. The Rust `resolve_include` override that promotes these
+    /// edges to surviving file-level dependencies is a separate
+    /// follow-up; until it lands, the edges emitted here are emitted then
+    /// dropped, which is the intended steady state for this commit.
+    fn extract_mod_decls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.mod_query, root, content);
+        let cap_names = self.mod_query.capture_names();
+
+        while let Some(m) = matches.next() {
+            // Locate the captured `mod_item` (the `@mod.decl` capture) and
+            // the `@mod.name` identifier. Either may be absent only if the
+            // query stops matching the way the constant declares — defensive
+            // skips keep the loop robust to grammar drift without panicking.
+            let mut decl_node: Option<Node<'_>> = None;
+            let mut modname: Option<String> = None;
+
+            for capture in m.captures {
+                let cap_node = capture.node;
+                if cap_node.has_error() {
+                    continue;
+                }
+                match capture_name_for_index(cap_names, capture.index) {
+                    "mod.decl" => decl_node = Some(cap_node),
+                    "mod.name" => {
+                        let text = cap_node.utf8_text(content).unwrap_or("");
+                        if !text.is_empty() {
+                            modname = Some(text.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let (Some(mod_item), Some(name)) = (decl_node, modname) else {
+                continue;
+            };
+
+            // External vs inline: `body` field present → inline → suppress.
+            if mod_item.child_by_field_name("body").is_some() {
+                continue;
+            }
+
+            let line = mod_item.start_position().row as u32 + 1;
+            fg.edges.push(Edge {
+                from: path.to_owned(),
+                to: name,
+                kind: EdgeKind::Includes,
+                file: path.to_owned(),
+                line,
+            });
         }
     }
 
@@ -764,7 +856,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn new_compiles_all_four_queries() {
+    fn new_compiles_all_queries() {
         // Every query string must parse against the pinned
         // tree-sitter-rust. Failure here means a query needs updating.
         let p = RustParser::new().expect("RustParser::new must succeed");
@@ -774,6 +866,7 @@ mod tests {
             &p.call_query,
             &p.use_query,
             &p.inh_query,
+            &p.mod_query,
         );
     }
 
@@ -1347,6 +1440,141 @@ mod tests {
         let lines: Vec<u32> = includes(&fg).iter().map(|e| e.line).collect();
         // Both expanded paths share the use_declaration's start line (3).
         assert_eq!(lines, vec![3, 3]);
+    }
+
+    // ----------------------------------------------------------------
+    // Mod-declaration Includes edges
+    // ----------------------------------------------------------------
+    //
+    // These tests pin the parser-side emission rule for `mod` items: one
+    // provisional `Includes` edge per *external* `mod foo;` declaration
+    // (bare modname as `to`); zero edges for *inline* `mod foo { … }`.
+    // Whole-graph resolution of the bare modname to a concrete sibling
+    // file is the post_index follow-up; until then, the default
+    // `resolve_include` basename match drops these edges at resolution
+    // time. That drop is verified separately in the indexer's
+    // `resolve_all_edges_drops_include_to_non_source_target` anti-regression.
+
+    #[test]
+    fn mod_external_decl_emits_provisional_includes_edge() {
+        // `pub mod foo;` is a file-split mod declaration: the body lives
+        // in a sibling file, so the parser emits one provisional
+        // Includes edge with the bare modname as `to`.
+        let fg = parse("pub mod foo;");
+        let ts = include_targets(&fg);
+        assert_eq!(
+            ts,
+            vec!["foo"],
+            "external `mod foo;` must produce exactly one Includes edge to bare modname"
+        );
+        assert_include_edge_invariants(&fg);
+        // Pin the single-edge invariants explicitly: `from` and `file`
+        // both equal the declaring file's path; `line` is the source row
+        // of the `mod` declaration (line 1 for this single-line fixture).
+        let e = includes(&fg)[0];
+        assert_eq!(e.from, "/tmp/test.rs");
+        assert_eq!(e.to, "foo");
+        assert_eq!(e.file, "/tmp/test.rs");
+        assert_eq!(e.line, 1);
+        assert_eq!(e.kind, EdgeKind::Includes);
+    }
+
+    #[test]
+    fn mod_inline_block_does_not_emit_includes_edge() {
+        // `mod foo { fn bar() {} }` is an inline mod block: the body
+        // lives in the same file, so emitting a self-edge would only
+        // pollute coupling/cycle queries. Suppression happens at
+        // emission time (the `body` field discriminator), not at
+        // resolution time.
+        let fg = parse("mod foo { fn bar() {} }");
+        assert!(
+            includes(&fg).is_empty(),
+            "inline `mod foo {{ ... }}` must produce zero Includes edges, got: {:?}",
+            include_targets(&fg)
+        );
+        // Inner items still parse normally — the suppression is scoped
+        // to the mod self-edge, not to the inner symbol set.
+        assert!(
+            fg.symbols.iter().any(|s| s.name == "bar"),
+            "inner `fn bar()` inside an inline mod must still extract as a Symbol"
+        );
+    }
+
+    #[test]
+    fn mod_nested_inline_does_not_emit_edges() {
+        // Two levels of inline mod nesting: both blocks have bodies, so
+        // both are suppressed. The inner `fn c()` still extracts and
+        // carries the `a::b` inline-mod namespace.
+        let fg = parse("mod a { mod b { fn c() {} } }");
+        assert!(
+            includes(&fg).is_empty(),
+            "nested inline mods must produce zero Includes edges, got: {:?}",
+            include_targets(&fg)
+        );
+        // Sanity: the inner symbol still resolves with the nested
+        // inline-mod namespace.
+        let c = sym(&fg, "c");
+        assert_eq!(c.namespace, "a::b");
+    }
+
+    #[test]
+    fn mod_external_with_pub_visibility_emits_edge() {
+        // Visibility modifiers (`pub`, `pub(crate)`) are siblings of the
+        // `mod` keyword inside the `mod_item`; they do not affect
+        // emission. Three forms — bare, `pub`, `pub(crate)` — each
+        // produce one Includes edge to their bare modname.
+        let fg = parse("mod a;\npub mod b;\npub(crate) mod c;\n");
+        let ts = include_targets(&fg);
+        assert_eq!(
+            ts,
+            vec!["a", "b", "c"],
+            "visibility modifier must not affect mod-decl Includes emission, got: {ts:?}"
+        );
+        assert_include_edge_invariants(&fg);
+    }
+
+    #[test]
+    fn mod_external_line_matches_source_line() {
+        // Multi-line file: the `mod target;` declaration sits on line 4
+        // (two comment lines + one blank). The emitted edge's `line`
+        // must be the start row of the `mod_item`, 1-indexed.
+        let src = "// header\n// header\n\npub mod target;\n";
+        let fg = parse(src);
+        let es = includes(&fg);
+        assert_eq!(es.len(), 1, "expected exactly 1 Includes edge, got {es:?}");
+        assert_eq!(es[0].to, "target");
+        assert_eq!(
+            es[0].line, 4,
+            "mod-decl line must be 1-indexed start row of the `mod_item`"
+        );
+    }
+
+    #[test]
+    fn use_extern_crate_emission_unchanged() {
+        // Cross-section invariant: adding mod-decl emission must not
+        // alter the use/extern_crate edge set. A fixture with one of
+        // each kind exercises all three paths in one pass and pins the
+        // emission order: `use std::io;` runs through the use-tree
+        // walker, then `extern crate foo;` through the extern-crate
+        // branch (both inside `extract_uses`), then `mod bar;` through
+        // the dedicated mod-decl extractor. All three produce one
+        // Includes edge each, with the expected `to` strings.
+        let src = "use std::io;\nextern crate foo;\nmod bar;\n";
+        let fg = parse(src);
+        let ts = include_targets(&fg);
+        assert_eq!(
+            ts,
+            vec!["std::io", "foo", "bar"],
+            "use/extern_crate/mod edges must coexist with their existing targets and ordering, got: {ts:?}"
+        );
+        assert_include_edge_invariants(&fg);
+        // Pin per-edge line numbers so any future reordering of the
+        // three branches in `parse_to_filegraph` doesn't silently
+        // scramble them.
+        let edges = includes(&fg);
+        assert_eq!(edges[0].line, 1, "`use std::io;` is on line 1");
+        assert_eq!(edges[1].line, 2, "`extern crate foo;` is on line 2");
+        assert_eq!(edges[2].line, 3, "`mod bar;` is on line 3");
     }
 
     // ----------------------------------------------------------------

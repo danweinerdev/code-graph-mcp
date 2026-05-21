@@ -54,9 +54,13 @@ pub(crate) const DEFINITION_QUERIES: &str = r#"
 (type_item
   name: (type_identifier) @type.name) @type.def
 
-; Modules: `mod foo { ... }` and `mod foo;`
-; The definition extractor walks ancestors to compute Symbol.namespace
-; as `a::b::c`.
+; Modules: `mod foo { ... }` and `mod foo;`. Captured here as a
+; namespace anchor only — no Symbol is emitted (the extractor's
+; `mod.name` branch is intentionally empty). Inline-mod ancestor walks
+; populate `Symbol.namespace` (`a::b::c`) on symbols *inside* a `mod`
+; block via `resolve_mod_namespace`. File-level `Includes` edges for
+; external `mod foo;` declarations are emitted by the separate
+; `MOD_DECL_QUERIES` / `extract_mod_decls` path.
 (mod_item
   name: (identifier) @mod.name) @mod.def
 "#;
@@ -131,4 +135,31 @@ pub(crate) const INHERITANCE_QUERIES: &str = r#"
 (impl_item
   trait: (_) @impl.trait
   type: (_) @impl.type) @impl.def
+"#;
+
+/// Module-declaration query, feeding [`crate::RustParser::extract_mod_decls`].
+///
+/// Captures every `mod_item` along with its `name` identifier. The
+/// extractor uses the captured `mod_item`'s presence/absence of a `body`
+/// field (set when the source is `mod foo { … }`, absent when the source
+/// is `mod foo;`) to decide whether to emit an `Includes` edge:
+///
+/// - External `mod foo;` (no body) → emit one `Includes` edge with
+///   `from` = the declaring file path, `to` = the bare modname token, and
+///   `line` = the `mod_item`'s start row (1-indexed). The bare token is
+///   provisional; whole-graph resolution to a concrete child file lives
+///   in [`crate::RustParser::post_index`].
+/// - Inline `mod foo { … }` (has body) → no edge: the contents live in
+///   the same file, so a self-edge would be a no-op at best and noise at
+///   worst.
+///
+/// The same `mod_item` nodes are also matched by `DEFINITION_QUERIES`
+/// (the `@mod.def`/`@mod.name` pair there is **namespace-anchor only** —
+/// no Symbol is emitted; `resolve_mod_namespace` walks inline-mod
+/// ancestors of inner symbols to populate `Symbol.namespace`). This query
+/// stays independent of that one so the namespace-anchor mechanism in
+/// `extract_definitions` is unaffected by edge-emission changes here.
+pub(crate) const MOD_DECL_QUERIES: &str = r#"
+(mod_item
+  name: (identifier) @mod.name) @mod.decl
 "#;

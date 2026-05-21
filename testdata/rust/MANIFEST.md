@@ -25,13 +25,21 @@ trait method signatures that previously produced no symbols
 (`Greet::greet` and `Compute::compute`, both `Method`/parent=trait).
 Net: `Function` -1, `Method` +3, totals +2.
 
-### Edges by Kind (TOTAL = 39)
+### Edges by Kind (TOTAL = 45)
 
 | Kind     | Count |
 |----------|------:|
 | Calls    |    22 |
-| Includes |    11 |
+| Includes |    17 |
 | Inherits |     6 |
+
+`Includes` totals 17, split as 11 from `use`/`extern crate` declarations
+(unchanged) + 6 provisional mod-decl edges (4 in `lib.rs`, 2 in
+`mod_only.rs`). Provisional means the edge's `to` is a bare modname token
+that resolves to no indexed file under the default basename matcher and
+so is dropped at edge-resolution time; the parser still emits these edges
+unconditionally because whole-graph resolution to concrete sibling files
+is a separate post-parse pass.
 
 ## Per-file Breakdown
 
@@ -49,7 +57,12 @@ pub mod b;
 ```
 
 - 0 symbols (mod_items are namespace anchors, not Symbol records)
-- 0 edges (no `use`, no `extern crate`, no calls)
+- 2 edges (`Includes` to bare `a` and `b` — one per external `mod` decl):
+  - The `to` is the bare modname token (a provisional placeholder).
+  - The default basename matcher does not promote these to indexed
+    files, so they drop at edge-resolution time. Whole-graph resolution
+    of the bare modname to a concrete sibling file is a separate
+    post-parse pass.
 
 ### `src/lib.rs`
 
@@ -59,7 +72,11 @@ pub mod b;
 | Result2  | Typedef |   18 |           |        |
 
 - 2 symbols (2 Typedefs)
-- 0 edges (the four `pub mod foo;` declarations produce no edges)
+- 4 edges (`Includes` to bare `errors`, `models`, `traits`, `utils` —
+  one per external `pub mod foo;` declaration). These are provisional
+  bare-modname targets; they drop at edge-resolution time under the
+  default basename matcher (whole-graph mod→file resolution is a
+  separate post-parse pass).
 
 ### `src/main.rs`
 
@@ -92,7 +109,11 @@ pub mod b;
 | nested_helper     | Function |   60 | nested    |        |
 
 - 9 symbols (4 Structs, 2 Enums, 2 Methods, 1 Function)
-- 0 edges (no `use`, no `extern crate`, no calls inside any body)
+- 0 edges (no `use`, no `extern crate`, no calls inside any body, and
+  the `pub mod nested { … }` declaration is INLINE — its body lives in
+  the same file, so the mod-decl extractor suppresses the self-edge at
+  emission time. Only *external* `mod foo;` declarations contribute
+  provisional mod-decl Includes edges.)
 - The `nested` mod contributes namespace `nested` to `Inner` and `nested_helper`
   but is NOT itself emitted as a Symbol.
 
@@ -204,7 +225,12 @@ pub mod b;
 - **Empty file** (`empty.rs`) parses without error and contributes 0 symbols
   / 0 edges.
 - **Mod-only file** (`mod_only.rs`) parses without error and contributes 0
-  symbols / 0 edges (mod_items are namespace anchors, not Symbol records).
+  symbols (mod_items are namespace anchors, not Symbol records). Each
+  external `mod foo;` declaration produces one provisional `Includes`
+  edge to the bare modname token; under the default basename matcher,
+  those edges drop at edge-resolution time, so the *surviving* dependency
+  set is unchanged. Whole-graph mod→file resolution is a separate
+  post-parse pass.
 - **`unsafe { ... }` block** does not interfere with symbol extraction —
   `utils.rs::unsafe_op` and `traits.rs::Greeter::do_unsafe` both produce
   the expected single function/method symbol.
