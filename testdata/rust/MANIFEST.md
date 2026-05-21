@@ -100,27 +100,27 @@ pub mod b;
 
 | Name             | Kind     | Line | Namespace | Parent  |
 |------------------|----------|-----:|-----------|---------|
-| Greet            | Trait    |   37 |           |         |
-| Greet::greet     | Method   |   38 |           | Greet   |
-| Greet::default_greet | Method | 40 |           | Greet   |
-| Compute          | Trait    |   45 |           |         |
-| Compute::compute | Method   |   46 |           | Compute |
-| Sized2           | Trait    |   52 |           |         |
-| Greeter          | Struct   |   54 |           |         |
-| Greeter::run_async | Method |   59 |           | Greeter |
-| Greeter::do_unsafe | Method |   66 |           | Greeter |
-| Greeter::greet   | Method   |   78 |           | Greeter |
-| EmptyImpl        | Struct   |   85 |           |         |
-| Foo              | Struct   |   89 |           |         |
-| Bar              | Struct   |   90 |           |         |
-| Foo<T>::compute  | Method   |   93 |           | Foo<T>  |
-| Bar<T>::compute  | Method   |  106 |           | Bar<T>  |
+| Greet            | Trait    |   43 |           |         |
+| Greet::greet     | Method   |   44 |           | Greet   |
+| Greet::default_greet | Method | 46 |           | Greet   |
+| Compute          | Trait    |   51 |           |         |
+| Compute::compute | Method   |   52 |           | Compute |
+| Sized2           | Trait    |   58 |           |         |
+| Greeter          | Struct   |   60 |           |         |
+| Greeter::run_async | Method |   65 |           | Greeter |
+| Greeter::do_unsafe | Method |   72 |           | Greeter |
+| Greeter::greet   | Method   |   84 |           | Greeter |
+| EmptyImpl        | Struct   |   91 |           |         |
+| Foo              | Struct   |   95 |           |         |
+| Bar              | Struct   |   96 |           |         |
+| Foo<T>::compute  | Method   |   99 |           | Foo<T>  |
+| Bar<T>::compute  | Method   |  112 |           | Bar<T>  |
 
 - 15 symbols (3 Traits, 4 Structs, 8 Methods)
 - 7 edges:
   - 1 `Includes`: `std::fmt::Display`
-  - 3 `Calls`: `default_greet -> String::from`, `Greeter::greet -> format`,
-    `Foo<T>::compute -> format`
+  - 3 `Calls`: `Greet::default_greet -> String::from`,
+    `Greeter::greet -> format`, `Foo<T>::compute -> format`
   - 3 `Inherits`: `Greeter -> Greet`, `Foo<T> -> Compute`, `Bar<T> -> Compute`
 - The `Sized2` trait has no impl in the fixture and produces no inheritance
   edge — that's deliberate.

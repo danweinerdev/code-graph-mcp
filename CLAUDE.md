@@ -199,7 +199,7 @@ Limitations:
 ### Rust — tree-sitter-rust v0.24.0
 
 Supported:
-- Free functions; methods in `impl` blocks (`Type::method`); default methods in `trait` blocks (extracted as `Function`, NOT `Method` — only `impl` ancestry promotes to `Method`).
+- Free functions; methods in `impl` blocks (`Type::method`); default methods in `trait` blocks → `Method`/parent=trait (the trait method now classifies the same way as impl methods, parent set to the declaring trait).
 - Structs, enums (all variant kinds), traits, type aliases.
 - Generics (type-bound and where-clause); lifetime parameters.
 - `async fn`, `const fn`, `unsafe fn` → `Function` (or `Method` in `impl`).
@@ -212,7 +212,7 @@ Supported:
 Limitations:
 1. **`macro_rules!` definitions NOT symbols.** Only macro *invocations* produce `Calls` edges. Anti-regression test: `macro_rules_definition_produces_zero_symbols` in `code-graph-lang-rust`.
 2. **`#[derive(...)]` and proc-macro attributes NOT call edges.** They parse as `attribute_item`, not `macro_invocation`.
-3. **Forward declarations excluded.** `function_signature_item` (no body) → no Symbol. Only `function_item` matches.
+3. **Forward declarations excluded — Rust-trait-scoped exception.** A bare `function_signature_item` (no body) outside any trait (e.g. inside an `extern "C"` block) → no Symbol, preserving the cross-language invariant. INSIDE a `trait_item`, however, the abstract signature now produces a `Method` symbol with `parent = trait_name` (matches Task-1.4 trait-method classification). `function_item` inside a trait (the default-method body case) classifies the same way.
 4. **Call resolution heuristic** — same scope rule as C++.
 5. **Generic parents recorded verbatim.** Methods in `impl<T> Trait for Vec<T>` carry parent `Vec<T>` (not bare `Vec`). `Inherits.from` follows the same rule. → **Hierarchy lookup gap** (see C# limitation 2; same shape).
 

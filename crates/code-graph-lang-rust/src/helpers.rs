@@ -1,8 +1,21 @@
 //! Helper routines for the Rust parser.
 //!
-//! The small ancestor-walk helpers ([`find_enclosing_impl`],
-//! [`resolve_mod_namespace`]) plus [`split_use_path`], a full recursive
-//! walker over `use_tree` variants.
+//! Production exports:
+//!   - Ancestor-walk dispatch ([`find_nearest_def_ancestor`] + the
+//!     [`NearestDefAncestor`] tag) — the single-walk helper consumed by
+//!     both `extract_definitions` (Function/Method/parent classification)
+//!     and [`enclosing_function_id`] (call-edge `from` building) so the
+//!     trait-vs-impl "nearest ancestor wins" rule stays in one place.
+//!   - [`resolve_mod_namespace`] — walks `mod_item` ancestors to populate
+//!     `Symbol.namespace`.
+//!   - [`enclosing_function_id`] — builds the `from` field of `Calls`
+//!     edges so it matches the corresponding definition's `symbol_id()`.
+//!   - [`split_use_path`] — recursive walker over `use_tree` variants.
+//!
+//! Test-only helpers ([`find_enclosing_impl`], [`find_enclosing_trait`])
+//! are gated behind `#[cfg(test)]`. They were the single-target
+//! predecessors of the composite dispatch; kept as directly-callable
+//! peers for unit-testability and possible future composition.
 //!
 //! The module itself is `pub(crate)`; the individual functions are `pub` as
 //! a crate-internal convention so callers within `lib.rs` can `use` them
@@ -132,9 +145,13 @@ fn join_scope(scope: &str, leaf: &str) -> String {
 /// Walk `node`'s parent chain and return the first ancestor that is an
 /// `impl_item`, or `None` if `node` is not inside an impl block.
 ///
-/// Used by the definition extractor to decide whether a
-/// `function_item` is a free function or a method, and to look up the
-/// impl block's `type` field for the parent.
+/// Symmetric peer to [`find_enclosing_trait`]; the production dispatch
+/// (both definition extraction and call-edge `from` building) consumes
+/// the composite [`find_nearest_def_ancestor`] instead so the
+/// trait-vs-impl "nearest ancestor wins" semantics stay in one place.
+/// Kept as a directly-callable helper for unit-testability and as a
+/// peer for future composition — hence the test-only gate.
+#[cfg(test)]
 pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(n) = current {
@@ -162,12 +179,9 @@ pub fn find_enclosing_impl(node: Node<'_>) -> Option<Node<'_>> {
 /// [`find_nearest_def_ancestor`] (single-walk, returns whichever it
 /// hits first); this single-target helper is kept as a peer to
 /// [`find_enclosing_impl`] for symmetry, future composition by other
-/// callers, and direct unit-testability — hence the narrow `dead_code`
-/// allow.
-#[allow(
-    dead_code,
-    reason = "Symmetric peer to find_enclosing_impl; the dispatch in extract_definitions consumes the composite find_nearest_def_ancestor instead. Exercised only by in-crate #[cfg(test)] code."
-)]
+/// callers, and direct unit-testability — hence the test-only gate
+/// (exercised exclusively by in-crate `#[cfg(test)]` code).
+#[cfg(test)]
 pub fn find_enclosing_trait(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(n) = current {
@@ -242,26 +256,40 @@ pub fn resolve_mod_namespace(node: Node<'_>, content: &str) -> String {
     parts.join("::")
 }
 
-/// Build a `path:fn_name` (free fn) or `path:Type::fn_name` (impl method)
-/// symbol-ID anchor for the function enclosing `node`. Mirrors the C++
-/// plugin's `enclosing_function_id` and matches the `symbol_id()` shape
-/// produced by the definition extractor so call edges' `from`
-/// fields line up exactly with definition IDs.
+/// Build a `path:fn_name` (free fn), `path:Type::fn_name` (impl method),
+/// or `path:Trait::fn_name` (trait default method) symbol-ID anchor for
+/// the function enclosing `node`. Mirrors the C++ plugin's
+/// `enclosing_function_id` and matches the `symbol_id()` shape produced
+/// by the definition extractor so call edges' `from` fields line up
+/// exactly with definition IDs for all three ancestor cases (free /
+/// impl / trait).
 ///
 /// Behavior:
 /// - No enclosing `function_item` (e.g. a call at module-level inside a
 ///   `static` initializer) → returns `path` (the bare file path), matching
 ///   the C++ top-level-call rule.
-/// - `function_item` with no enclosing `impl_item` → returns
-///   `<path>:<fn_name>`.
-/// - `function_item` inside an `impl_item` → returns
-///   `<path>:<Type>::<fn_name>` where `Type` is the impl's `type` field
-///   text. For `impl Trait for Type { fn m() }` the prefix is `Type`,
-///   never `Trait` — matches the definition extractor's trait-impl
-///   disambiguation.
+/// - `function_item` with no enclosing `impl_item` or `trait_item` →
+///   returns `<path>:<fn_name>` (free function).
+/// - `function_item` whose nearest definition ancestor is an `impl_item`
+///   → returns `<path>:<Type>::<fn_name>` where `Type` is the impl's
+///   `type` field text. For `impl Trait for Type { fn m() }` the prefix
+///   is `Type`, never `Trait` — matches the definition extractor's
+///   trait-impl disambiguation.
+/// - `function_item` whose nearest definition ancestor is a `trait_item`
+///   (i.e. a trait *default* method with a body — post-Task-1.4 these
+///   are extracted as `Method`/parent=trait) → returns
+///   `<path>:<Trait>::<fn_name>`. Matches the symbol ID produced by the
+///   definition extractor for trait default methods so call edges
+///   originating inside the body land on the qualified ID, not the bare
+///   function name.
 /// - Closures (`closure_expression`) are transparent: a call inside a
 ///   closure walks past the closure and reports the closure's enclosing
 ///   `function_item` as the `from`.
+///
+/// Dispatch uses [`find_nearest_def_ancestor`] — the same composite
+/// helper the definition extractor consumes — so the trait-vs-impl
+/// "nearest ancestor wins" semantics are guaranteed to match the
+/// definition side bit-for-bit.
 pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> String {
     let Some(func) = find_enclosing_kind(node, "function_item") else {
         return path.to_owned();
@@ -271,8 +299,8 @@ pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> Stri
     };
     let fn_name = name_node.utf8_text(content).unwrap_or("");
 
-    match find_enclosing_impl(func) {
-        Some(impl_node) => {
+    match find_nearest_def_ancestor(func) {
+        Some(NearestDefAncestor::Impl(impl_node)) => {
             let parent_type = impl_node
                 .child_by_field_name("type")
                 .and_then(|n| n.utf8_text(content).ok())
@@ -281,6 +309,17 @@ pub fn enclosing_function_id(node: Node<'_>, content: &[u8], path: &str) -> Stri
                 format!("{path}:{fn_name}")
             } else {
                 format!("{path}:{parent_type}::{fn_name}")
+            }
+        }
+        Some(NearestDefAncestor::Trait(trait_node)) => {
+            let trait_name = trait_node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(content).ok())
+                .unwrap_or("");
+            if trait_name.is_empty() {
+                format!("{path}:{fn_name}")
+            } else {
+                format!("{path}:{trait_name}::{fn_name}")
             }
         }
         None => format!("{path}:{fn_name}"),
@@ -561,6 +600,25 @@ mod tests {
         let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
         assert_eq!(id, "/tmp/test.rs:Foo::bar");
         assert_ne!(id, "/tmp/test.rs:Trait::bar");
+    }
+
+    /// Anti-regression for the Task-1.4 follow-up Major #1: a call inside
+    /// a trait *default* method's body (`trait T { fn caller(&self) {
+    /// other_fn(); } }`) must produce a `from` of `path:T::caller`, NOT
+    /// `path:caller`. Pre-fix `enclosing_function_id` used
+    /// `find_enclosing_impl` and silently fell through to the
+    /// free-function branch for trait default methods, emitting
+    /// `path:caller` — which then orphaned every such call edge from the
+    /// definition's symbol ID (`path:T::caller`), making `get_callers` /
+    /// `get_callees` lookups on the qualified ID return zero results.
+    #[test]
+    fn call_inside_trait_default_method_has_trait_qualified_from() {
+        let src = "trait T { fn caller(&self) { other_fn(); } }";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call_expression").expect("call_expression");
+        let id = enclosing_function_id(call, src.as_bytes(), "/tmp/test.rs");
+        assert_eq!(id, "/tmp/test.rs:T::caller");
+        assert_ne!(id, "/tmp/test.rs:caller");
     }
 
     #[test]

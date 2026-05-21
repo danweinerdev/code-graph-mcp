@@ -424,7 +424,7 @@ fn trait_abstract_signature_extracts_as_method_with_trait_parent() {
     let corpus = parse_corpus(&parser);
     let traits = corpus.get("traits.rs").expect("traits.rs in corpus");
 
-    // `Greet::greet` (signature on line 38 of traits.rs):
+    // `Greet::greet` (signature on line 44 of traits.rs):
     //   fn greet(&self) -> String;
     let greet_abstract = traits
         .symbols
@@ -433,7 +433,7 @@ fn trait_abstract_signature_extracts_as_method_with_trait_parent() {
         .expect("abstract Greet::greet must exist as Method/parent=Greet");
     assert_eq!(greet_abstract.kind, SymbolKind::Method);
 
-    // `Compute::compute` (signature on line 46 of traits.rs):
+    // `Compute::compute` (signature on line 52 of traits.rs):
     //   fn compute(&self) -> i32;
     let compute_abstract = traits
         .symbols

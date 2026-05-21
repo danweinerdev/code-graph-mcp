@@ -14,12 +14,14 @@
 /// invocations produce call edges. This matches the documented
 /// Rust-plugin limitation.
 pub(crate) const DEFINITION_QUERIES: &str = r#"
-; Free functions and impl methods both surface as `function_item` whose
-; `name` is an `identifier`. The distinction (Function vs Method) is
-; resolved at extraction time by walking up to look for an enclosing
-; `impl_item` — see helpers::find_enclosing_impl, which implements
-; the disambiguation; for `impl Trait for Type { fn m() }` the parent is
-; Type, not Trait.
+; Free functions, impl methods, and trait default methods all surface as
+; `function_item` whose `name` is an `identifier`. The classification
+; (Function vs Method, and the parent string) is resolved at extraction
+; time by helpers::find_nearest_def_ancestor — a single composite walk
+; that returns whichever of `impl_item` or `trait_item` it hits first.
+; For `impl Trait for Type { fn m() }` the impl branch fires and the
+; parent is Type (never Trait); for `trait T { fn m(&self) {} }` the
+; trait branch fires and the parent is T.
 (function_item
   name: (identifier) @func.name) @func.def
 
