@@ -385,12 +385,42 @@ impl Graph {
         //   again on this branch). The actual `visited_unique` insert
         //   for the child happens inside the recursive call's first-
         //   visit branch.
+        // Collect-and-dedup pass. Both `bases` (forward adjacency) and
+        // `derived` (reverse adjacency) are deduped by target-name string
+        // BEFORE recursing, first-encountered wins. The dedup key matches
+        // the `visited_unique` key and the `adj`/`radj` keys so all three
+        // stay consistent.
+        //
+        // Two sources of duplicate `(from, to)` `Inherits` pairs the dedup
+        // collapses:
+        //
+        // 1. **Tree-sitter duplicate-match artifact.** A grammar query can
+        //    match the same syntactic edge twice (e.g. an `impl_item`
+        //    matched once via its own pattern and once via an outer
+        //    pattern that re-captures it). Without this dedup the same
+        //    edge surfaces as `[{X},{X}]` in the rendered hierarchy.
+        //
+        // 2. **Legitimate same-bare-name collisions.** `Inherits` edges
+        //    carry raw unqualified target names (`edge.to = trait_text`
+        //    in the Rust extractor; mirrored shape in the other plugins);
+        //    two distinct types that happen to share a bare name collapse
+        //    to one child here. This is accepted per design Decision 5:
+        //    Rust trait-impl edges don't carry crate qualification, so
+        //    the engine cannot tell two same-named traits apart by
+        //    `Inherits.to` alone — collapsing them loses no real edge
+        //    beyond what the edge representation already loses.
+        //
+        // The dedup happens BEFORE the per-child budget gate AND before
+        // recursion, so the diamond ref-stub branch (gated on
+        // `visited_unique.contains`) is unaffected: the dedup removes
+        // duplicate target STRINGS in this one node's neighbor list, while
+        // the diamond logic dedupes ACROSS distinct nodes whose
+        // recursive walks happen to revisit the same name. Both layers
+        // coexist; the diamond test (`get_class_hierarchy_emits_diamond_ref_stub`)
+        // remains green because each diamond arm still emits its own
+        // `Inherits` edge with a distinct source key in `adj`/`radj`.
         if let Some(entries) = self.adj.get(name) {
-            let bases: Vec<String> = entries
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Inherits)
-                .map(|e| e.target.clone())
-                .collect();
+            let bases = dedup_inherits_targets(entries);
             for target in bases {
                 if !visited_unique.contains(&target) && (visited_unique.len() as u32) >= max_nodes {
                     *truncated = true;
@@ -408,11 +438,7 @@ impl Graph {
         }
 
         if let Some(entries) = self.radj.get(name) {
-            let derived: Vec<String> = entries
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Inherits)
-                .map(|e| e.target.clone())
-                .collect();
+            let derived = dedup_inherits_targets(entries);
             for target in derived {
                 if !visited_unique.contains(&target) && (visited_unique.len() as u32) >= max_nodes {
                     *truncated = true;
@@ -435,6 +461,35 @@ impl Graph {
         drop(guard);
         node
     }
+}
+
+/// Collect the `Inherits` targets out of an adjacency-list slice, deduped
+/// by target-name string with first-encountered-wins semantics.
+///
+/// Iterates `entries` in storage order so the returned `Vec<String>`
+/// preserves insertion order modulo duplicates. The dedup key is the
+/// target name string — the same string used as the recursive lookup key
+/// in `adj`/`radj` and as the membership key in `visited_unique`, so the
+/// three stay consistent. Non-`Inherits` edges (e.g. call edges that
+/// happen to coexist in the same adjacency list) are filtered out, matching
+/// the pre-dedup behavior.
+///
+/// Complexity: O(n) over `entries`, O(d) extra space for the seen set
+/// where `d` is the number of distinct `Inherits` targets. The hot path
+/// is per-`build_hierarchy`-frame so the allocator cost is bounded by
+/// inheritance fan-out (a few dozen in pathological cases).
+fn dedup_inherits_targets(entries: &[crate::graph::EdgeEntry]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        if e.kind != EdgeKind::Inherits {
+            continue;
+        }
+        if seen.insert(e.target.clone()) {
+            out.push(e.target.clone());
+        }
+    }
+    out
 }
 
 /// Iterative Tarjan SCC over a directed graph keyed by `PathBuf`.
@@ -1659,5 +1714,177 @@ mod tests {
              (Root, A, B, X); X charges one slot regardless of how many \
              arms reach it",
         );
+    }
+
+    // --- class_hierarchy: collision dedup ---
+
+    /// Baseline: a struct that impl-s a trait exactly once produces a
+    /// single entry in `bases` — NOT `[{X},{X}]`. Pins the dedup pass's
+    /// no-op behavior on already-clean adjacency lists, so a future
+    /// regression that drops the dedup but happens to leave the
+    /// underlying single-edge case green is not silently masking the
+    /// duplicate-edge case.
+    ///
+    /// Direction note: the queried name is the *struct* `MyStruct`, and
+    /// the asserted child is in `bases` (forward `Inherits` walk), not
+    /// `derived`. The query MUST resolve `MyStruct` to a class-kind
+    /// symbol; if a future widened-filter change moved structs out of
+    /// the accepted set, this test would fire as "MyStruct not found"
+    /// rather than as a dedup miscount, which is also a meaningful
+    /// signal.
+    #[test]
+    fn class_hierarchy_no_collision_baseline_emits_single_base() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.rs",
+            Language::Rust,
+            vec![
+                sym("MyTrait", SymbolKind::Trait, "/a.rs"),
+                sym("MyStruct", SymbolKind::Struct, "/a.rs"),
+            ],
+            vec![inherit_edge("MyStruct", "MyTrait", "/a.rs")],
+        ));
+
+        let (root, _, _) = g
+            .class_hierarchy("MyStruct", 1, u32::MAX)
+            .expect("MyStruct found");
+        assert_eq!(root.name, "MyStruct");
+        assert_eq!(
+            root.bases.len(),
+            1,
+            "single impl edge must produce exactly one base entry, not a \
+             duplicate-match-multiplied list: bases={:?}",
+            root.bases,
+        );
+        assert_eq!(root.bases[0].name, "MyTrait");
+    }
+
+    /// Discriminator: two identical `Inherits` edges from `MyStruct` to
+    /// `MyTrait` (a tree-sitter duplicate-match artifact, or two distinct
+    /// types that happen to share the bare name `MyTrait` because
+    /// `Inherits.to` carries raw unqualified text) MUST dedup to a single
+    /// child in the rendered hierarchy.
+    ///
+    /// Without the dedup pass this test fires as `bases.len() == 2` with
+    /// two `{name: "MyTrait"}` siblings — the pre-dedup behavior. The
+    /// fixture injects the duplicate edges directly via two
+    /// `merge_file_graph` calls so the test is independent of any
+    /// language extractor's emission discipline; the dedup must hold
+    /// even when the underlying graph is "dirty".
+    #[test]
+    fn class_hierarchy_dedups_duplicate_inherits_edges() {
+        let mut g = Graph::new();
+        // First file: declares both symbols + emits the canonical edge.
+        g.merge_file_graph(make_fg(
+            "/a.rs",
+            Language::Rust,
+            vec![
+                sym("MyTrait", SymbolKind::Trait, "/a.rs"),
+                sym("MyStruct", SymbolKind::Struct, "/a.rs"),
+            ],
+            vec![inherit_edge("MyStruct", "MyTrait", "/a.rs")],
+        ));
+        // Second file: injects the duplicate edge from a different
+        // source path so the indexer's per-file overwrite logic
+        // (`remove_file_unsafe` clearing edges on re-merge of the same
+        // path) cannot collapse it. The end state is two
+        // `(MyStruct → MyTrait)` `Inherits` entries in `adj["MyStruct"]`.
+        g.merge_file_graph(make_fg(
+            "/b.rs",
+            Language::Rust,
+            vec![],
+            vec![inherit_edge("MyStruct", "MyTrait", "/b.rs")],
+        ));
+
+        // Sanity: the duplicate edges are actually present in the
+        // underlying adjacency map. If a future change moved the dedup
+        // up into `merge_file_graph` itself, this assert would fire
+        // first and tell the reader the test fixture's premise no
+        // longer matches what it claims to exercise.
+        let adj_entries = g
+            .adj
+            .get("MyStruct")
+            .expect("MyStruct must have an adjacency entry after both merges");
+        let inherits_count = adj_entries
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits && e.target == "MyTrait")
+            .count();
+        assert_eq!(
+            inherits_count, 2,
+            "fixture premise: adj['MyStruct'] must hold two Inherits→MyTrait \
+             entries before the dedup pass runs; got {inherits_count}",
+        );
+
+        let (root, _, _) = g
+            .class_hierarchy("MyStruct", 1, u32::MAX)
+            .expect("MyStruct found");
+        assert_eq!(
+            root.bases.len(),
+            1,
+            "duplicate Inherits edges must collapse to one base entry in \
+             the rendered hierarchy (build_hierarchy's collect-and-dedup \
+             contract): bases={:?}",
+            root.bases,
+        );
+        assert_eq!(root.bases[0].name, "MyTrait");
+    }
+
+    /// Mirror of the bases test, for the `derived` (reverse adjacency)
+    /// walk. Pins that dedup is applied to BOTH halves of the
+    /// build_hierarchy walk — a future change that adds dedup to only
+    /// the `bases` side would leave the reverse direction emitting
+    /// duplicate children silently, which this test catches.
+    ///
+    /// Fixture: two `Inherits` edges from `MyStruct` to `MyTrait`, then
+    /// query the *trait* — its `derived` is `MyStruct` (via reverse
+    /// adjacency), which must appear exactly once even with the
+    /// duplicate edges.
+    #[test]
+    fn class_hierarchy_dedups_duplicate_inherits_edges_derived_direction() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.rs",
+            Language::Rust,
+            vec![
+                sym("MyTrait", SymbolKind::Trait, "/a.rs"),
+                sym("MyStruct", SymbolKind::Struct, "/a.rs"),
+            ],
+            vec![inherit_edge("MyStruct", "MyTrait", "/a.rs")],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.rs",
+            Language::Rust,
+            vec![],
+            vec![inherit_edge("MyStruct", "MyTrait", "/b.rs")],
+        ));
+
+        // Sanity on `radj` side: two reverse Inherits entries into
+        // MyTrait, each pointing back to MyStruct.
+        let radj_entries = g
+            .radj
+            .get("MyTrait")
+            .expect("MyTrait must have a reverse adjacency entry");
+        let inherits_count = radj_entries
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits && e.target == "MyStruct")
+            .count();
+        assert_eq!(
+            inherits_count, 2,
+            "fixture premise: radj['MyTrait'] must hold two Inherits→MyStruct \
+             entries before the dedup pass runs; got {inherits_count}",
+        );
+
+        let (root, _, _) = g
+            .class_hierarchy("MyTrait", 1, u32::MAX)
+            .expect("MyTrait found");
+        assert_eq!(
+            root.derived.len(),
+            1,
+            "duplicate reverse Inherits edges must collapse to one derived \
+             entry — the collect-and-dedup pass applies to BOTH bases AND \
+             derived directions of build_hierarchy: derived={:?}",
+            root.derived,
+        );
+        assert_eq!(root.derived[0].name, "MyStruct");
     }
 }

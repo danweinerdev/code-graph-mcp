@@ -41,7 +41,22 @@ const CACHE_FILE_NAME: &str = ".code-graph-cache.json";
 // where each include was declared. The shape change is not
 // backward-compatible; a v2 cache fails the version check below and the
 // caller silently re-indexes (no transparent migration is attempted).
-const CACHE_VERSION: u32 = 3;
+//
+// v4: Rust symbol record VALUES changed shape. Two cached fields are
+// affected:
+// (1) `Symbol.namespace` — Rust namespaces are now crate-qualified
+// (`<crate>::<module-path>` instead of empty/inline-only) after the
+// `LanguagePlugin::post_index` hook rewrites them at index time;
+// (2) `Symbol.kind` / `Symbol.parent` for default and abstract trait
+// methods — these now classify as `Method` with `parent = trait_name`
+// rather than the prior `Function` classification.
+// The persisted JSON SHAPE is identical (same fields, same types), but
+// the *values* on a v3 cache no longer reflect what a fresh re-parse
+// produces, so honoring a v3 cache would yield stale symbol data. The
+// version-check branch in `Graph::load` returns `Ok(false)` on mismatch
+// → silent re-index, no `force=true` required, no transparent migration
+// attempted (mirrors the v2→v3 precedent).
+const CACHE_VERSION: u32 = 4;
 const GENERATOR: &str = "code-graph-graph (rust)";
 
 /// Errors returned by [`Graph::save`], [`Graph::load`], and [`stale_paths`].
@@ -335,8 +350,11 @@ impl Graph {
 
         let mut cache: GraphCache = serde_json::from_slice(&data)?;
         if cache.version != CACHE_VERSION {
-            // v1 (Go-written) or future version: silent re-index. Graph
-            // state is left untouched on this branch.
+            // v1 (Go-written), v2/v3 (older Rust schemas), or any future
+            // version: silent re-index. Graph state is left untouched on
+            // this branch. No transparent migration is attempted across a
+            // schema break — see the `CACHE_VERSION` constant doc-comment
+            // for the per-bump rationale.
             return Ok(false);
         }
 
@@ -533,6 +551,99 @@ mod tests {
             g.nodes, before_nodes,
             "graph must be unchanged on the false path"
         );
+    }
+
+    /// Pins the v3→v4 transition behavior.
+    ///
+    /// A structurally-valid cache whose `version` is the prior schema
+    /// (`3`) must trip `Graph::load`'s version-check branch and surface as
+    /// `Ok(false)` — silent re-index, no `force=true`, no transparent
+    /// migration attempted, no panic. The graph's prior state must be
+    /// untouched on the false path. This mirrors the existing v1/v2
+    /// precedent (`load_version_mismatch_returns_false`); we add a
+    /// dedicated v3 test here so a future regression that reverts the
+    /// `CACHE_VERSION` bump (the symbol-shape change that necessitated
+    /// the bump being silently honored) fires immediately on the v3
+    /// corpus instead of waiting for an integration suite to notice
+    /// stale data.
+    ///
+    /// Also asserts that a freshly-written v4 cache round-trips correctly,
+    /// so the new schema number is observed end-to-end (build → save →
+    /// load → equality).
+    #[test]
+    fn stale_v3_cache_returns_ok_false_silent_reindex() {
+        // Hand-craft a v3-shape cache. All required `GraphCache` fields
+        // are present with valid empty values; the version check fires
+        // before any of the other fields are inspected, so we don't have
+        // to mirror the actual v3 payload shape beyond the field set.
+        let dir = TempDir::new().unwrap();
+        let v3_json = serde_json::json!({
+            "version": 3,
+            "generator": "code-graph-graph (rust) pre-v4-bump",
+            "nodes": {},
+            "adj": {},
+            "radj": {},
+            "files": {},
+            "includes": {},
+            "mtimes": {},
+        });
+        fs::write(cache_path(dir.path()), v3_json.to_string()).unwrap();
+
+        // Pre-populate the in-memory graph so we can prove `load` does
+        // NOT touch state on the false path — same pattern as the
+        // existing v1 test.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/keep.rs",
+            Language::Rust,
+            vec![sym("keep_me", SymbolKind::Function, "/keep.rs")],
+            vec![],
+        ));
+        let before_nodes = g.nodes.clone();
+
+        let ok = g.load(dir.path()).unwrap();
+        assert!(
+            !ok,
+            "v3 cache must trip the version-check branch and return Ok(false) \
+             so the caller silently re-indexes — no force=true required, no \
+             transparent migration attempted",
+        );
+        assert_eq!(
+            g.nodes, before_nodes,
+            "graph state must be untouched when load returns Ok(false)",
+        );
+
+        // v4 fresh-write round-trip. Build a small graph, save to a
+        // separate directory (so the v3 file doesn't shadow), then load
+        // into a fresh `Graph` and prove the maps survive byte-identically.
+        // This pins that CACHE_VERSION = 4 is observed by both `save`
+        // (it writes 4 into the version field) and `load` (it accepts 4
+        // as current).
+        let dir_v4 = TempDir::new().unwrap();
+        let original = build_sample_graph();
+        original.save(dir_v4.path()).unwrap();
+
+        // On-disk version must be 4 — pin the literal so a future
+        // accidental revert of the bump fires this assert before any
+        // round-trip equality check could mask it.
+        let bytes = fs::read(cache_path(dir_v4.path())).unwrap();
+        let cache_on_disk: GraphCache = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            cache_on_disk.version, 4,
+            "freshly-written cache must carry version=4 (the current schema)",
+        );
+
+        let mut loaded = Graph::new();
+        let ok = loaded.load(dir_v4.path()).unwrap();
+        assert!(
+            ok,
+            "freshly-written v4 cache must load successfully (Ok(true))",
+        );
+        assert_eq!(loaded.nodes, original.nodes);
+        assert_eq!(loaded.adj, original.adj);
+        assert_eq!(loaded.radj, original.radj);
+        assert_eq!(loaded.files, original.files);
+        assert_eq!(loaded.includes, original.includes);
     }
 
     #[test]
