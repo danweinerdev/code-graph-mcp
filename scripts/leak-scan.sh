@@ -42,11 +42,11 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null)" || {
 	exit 2
 }
 
-# Default scan surface: all first-party Rust source/test files plus every
-# in-repo `Cargo.toml` (workspace root + per-crate manifests). Manifest
-# comments are agent-readable too, so they're subject to the same rule.
+# Default scan surface: all first-party Rust source/test files, every
+# in-repo `Cargo.toml` (workspace root + per-crate manifests), and the
+# repo-root `CLAUDE.md` (agent-facing reference doc — same rule applies).
 if [ "$#" -eq 0 ]; then
-	set -- 'crates/*/src/*' 'crates/*/tests/*' 'crates/*/Cargo.toml' 'Cargo.toml'
+	set -- 'crates/*/src/*' 'crates/*/tests/*' 'crates/*/Cargo.toml' 'Cargo.toml' 'CLAUDE.md'
 fi
 
 # --- Broad detection pattern (union of every form the sweeps converged on)
