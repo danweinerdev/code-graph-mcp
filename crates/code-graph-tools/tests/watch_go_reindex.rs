@@ -268,8 +268,8 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
 
     // get_symbol_detail on the removed Beta ID must return the canonical
     // not-found wording. This is the agent-visible half of the dangling
-    // bug — pre-Phase-4.2 this returned a result for a node that no
-    // longer existed in the index.
+    // bug — without the dangling-node sweep, this lookup would return a
+    // result for a node that no longer existed in the index.
     let r = get_symbol_detail(&server.inner.graph, &beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);

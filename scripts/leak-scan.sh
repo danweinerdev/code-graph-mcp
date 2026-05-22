@@ -53,7 +53,13 @@ fi
 # Case-insensitive `phase` (lowercase `phase 7.4` slipped a case-sensitive
 # pass). Prose forms (`wired in 7.3`, `live in 3.2`, `documented in 7.2`)
 # are the ones that historically evaded narrower patterns.
-DETECT='(Task [0-9]+\.[0-9]+|[Pp]hase [0-9]+|plan (Decision|task)|per the task brief|the task brief|per the (plan|spec|design)|plan doc|design (doc|brief)|spec [0-9]+\.|Plans/Active|ResponseShapePolish|\.plans/|\b(wired|live|lands?|documented|covered|defined) in [0-9]+\.[0-9])'
+# The `[Pp]hase[-\s ]` separator covers `Phase 1`, `Phase-1`, and
+# `Phase-3.1` (hyphenated forms had previously evaded the space-only
+# pattern). The trailing ` \([0-9]+\.[0-9]+\)` (leading-space required)
+# catches inline parenthesized task numbers like ` (3.1)`, ` (7.4)`,
+# ` (2.2)`, while skipping numeric C/C++ literals like
+# `static_cast<int>(3.14)` (no preceding space — preceded by `>`).
+DETECT='(Task [0-9]+\.[0-9]+|[Pp]hase[-\s ][0-9]+|plan (Decision|task)|per the task brief|the task brief|per the (plan|spec|design)|plan doc|design (doc|brief)|spec [0-9]+\.|Plans/Active|ResponseShapePolish|\.plans/|\b(wired|live|lands?|documented|covered|defined) in [0-9]+\.[0-9]| \([0-9]+\.[0-9]+\))'
 
 # --- Bucket-2 allowlist: canonical-origin preambles, matched by content.
 # Each alternative is a stable signature of a legitimately-preserved

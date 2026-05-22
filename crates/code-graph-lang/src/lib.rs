@@ -556,8 +556,8 @@ mod tests {
             self.exts
         }
         fn parse_file(&self, path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
-            // Phase-1 test plugin: produce an empty FileGraph so we exercise
-            // the trait surface without depending on tree-sitter yet.
+            // Test plugin: produce an empty FileGraph so we exercise the
+            // trait surface without depending on tree-sitter.
             Ok(FileGraph {
                 path: path.to_string_lossy().into_owned(),
                 language: self.id,

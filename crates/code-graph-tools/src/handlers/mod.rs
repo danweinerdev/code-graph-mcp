@@ -854,11 +854,11 @@ mod tests {
 
     #[test]
     fn page_parts_and_page_extras_agree_on_envelope_fields() {
-        // Pin both helpers' contracts together: construct a Page<T> with both
-        // Phase-1 envelope fields populated, round-trip through
-        // tool_success_json, then assert (a) page_parts still returns the
-        // legacy 4-tuple unchanged and (b) page_extras returns the new
-        // (truncated, next_offset) pair.
+        // Pin both helpers' contracts together: construct a Page<T> with
+        // every envelope field populated (including `truncated` and
+        // `next_offset`), round-trip through tool_success_json, then
+        // assert (a) page_parts still returns the legacy 4-tuple unchanged
+        // and (b) page_extras returns the (truncated, next_offset) pair.
         use super::test_helpers::{page_extras, page_parts};
 
         let page: Page<Rec> = Page {

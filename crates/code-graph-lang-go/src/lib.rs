@@ -500,8 +500,7 @@ impl LanguagePlugin for GoParser {
 
     /// Parse `content` (UTF-8 bytes) as Go and produce a [`FileGraph`].
     ///
-    /// All three extractors are wired: definitions (6.2), calls (6.3), and
-    /// imports (6.4).
+    /// All three extractors are wired: definitions, calls, and imports.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }

@@ -3003,7 +3003,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // post_index — mod-declaration Includes edge resolution (2.2)
+    // post_index — mod-declaration Includes edge resolution
     // ----------------------------------------------------------------
     //
     // These tests exercise the `post_index` pass that resolves

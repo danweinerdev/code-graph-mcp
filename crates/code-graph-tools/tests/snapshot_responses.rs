@@ -1447,8 +1447,8 @@ async fn response_search_symbols_helper_language_rust() {
 async fn response_get_class_hierarchy_rust_trait_greet() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
     // `Greet` is a trait that `Greeter` implements (testdata/rust/src/traits.rs).
-    // Pre-Phase-2 the lookup would have rejected the trait kind; this
-    // snapshot is the wire-format counterpart to the integration test
+    // This snapshot pins the wire format for the trait-rooted hierarchy
+    // walk and is the wire-format counterpart to the integration test
     // `get_class_hierarchy_for_rust_trait`.
     let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
     let parsed = parsed_sorted(&r);

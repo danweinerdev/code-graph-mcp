@@ -206,8 +206,8 @@ impl Graph {
         }
 
         // Files that include this file. The includes map has no reverse
-        // index (that's the Phase-3 optimization), so we scan every
-        // entry and check membership of `path` in its target list.
+        // index, so we scan every entry and check membership of `path`
+        // in its target list.
         for (from, incs) in &self.includes {
             if from == path {
                 continue;

@@ -360,8 +360,9 @@ impl Graph {
 
         // Migrate path-bearing fields in place. On already-clean caches
         // this is a no-op (per `paths::simplify`'s identity behavior on
-        // non-extended paths). Pre-Phase-1 caches written with Windows
-        // verbatim-extended (`\\?\`) prefixes get rewritten to short-form
+        // non-extended paths). Legacy caches written before path
+        // canonicalization shipped — i.e. with Windows verbatim-extended
+        // (`\\?\`) prefixes throughout — get rewritten to short-form
         // here, before the cache is consumed into the in-memory graph.
         simplify_cache(&mut cache);
 
@@ -406,9 +407,9 @@ pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
     // reformatting paths that `mtime_nanos` needs in their on-disk form
     // (paths > 260 chars on Windows may require the extended-path prefix).
     //
-    // Windows pre-Phase-1 cache migration story: a cache written before
-    // `paths::canonicalize` (with `\\?\`-prefixed `mtimes` keys) flows
-    // through `stale_paths` unchanged. The `mtime_nanos` call either
+    // Windows legacy-cache migration story: a cache written before
+    // `paths::canonicalize` shipped (with `\\?\`-prefixed `mtimes` keys)
+    // flows through `stale_paths` unchanged. The `mtime_nanos` call either
     // succeeds (because Windows accepts both forms for stat) and the cache
     // fast-path proceeds normally — then `Graph::load` runs and applies
     // `simplify_cache` so the in-memory graph is consistent. Or

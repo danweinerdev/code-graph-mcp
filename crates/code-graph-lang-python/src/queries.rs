@@ -26,7 +26,7 @@
 //! - **`from foo.bar import baz`** parses as `import_from_statement` with
 //!   a `module_name` field of kind `dotted_name` (or `relative_import` for
 //!   `from . import x`). The dependency edge points at the *module*, not at
-//!   the imported symbol — `extract_imports` (7.4) reads the `module_name`
+//!   the imported symbol — `extract_imports` reads the `module_name`
 //!   field, NOT the `name` field.
 //! - **`class D(B):`** parses as `class_definition` with a `superclasses`
 //!   field of kind `argument_list`. Each base appears as a child of the

@@ -36,14 +36,17 @@ fn symbol_id_basename(id: &str) -> &str {
 
 /// Whether `kind` is a non-callable [`SymbolKind`] for the `get_callers` /
 /// `get_callees` soft-hint branch. Disjoint from `Function` / `Method` so
-/// the load-bearing "callable with no resolved callers → empty envelope"
-/// contract (3.1) remains intact: only structurally-shaped kinds (types,
-/// type aliases, trait interfaces) trigger the advisory.
+/// the "callable with zero resolved callers/callees → empty envelope"
+/// invariant remains intact: only structurally-shaped kinds (types, type
+/// aliases, trait interfaces) trigger the advisory.
 ///
-/// Per design Decision 8, the set is `{Struct, Enum, Trait, Typedef,
-/// Interface}` (the design also lists `Field`, but `SymbolKind` has no
-/// `Field` variant today — the `#[non_exhaustive]` enum can grow into it
-/// without changing this predicate's call sites).
+/// The set is `{Struct, Enum, Trait, Typedef, Interface}`.
+///
+/// **Note for future maintainers:** `SymbolKind` is `#[non_exhaustive]`,
+/// so `matches!` will silently return `false` for any variant not
+/// explicitly listed below. If you add a new non-callable variant (e.g.
+/// `Field`, `Constant`), extend the `matches!` arm here — there is no
+/// compile-time signal when the predicate omits a new variant.
 fn is_non_callable_kind(kind: SymbolKind) -> bool {
     matches!(
         kind,
@@ -53,6 +56,18 @@ fn is_non_callable_kind(kind: SymbolKind) -> bool {
             | SymbolKind::Typedef
             | SymbolKind::Interface
     )
+}
+
+/// Pick the indefinite article (`"a"` / `"an"`) for `word` based on its
+/// first letter. ASCII-only — accepts any non-empty word and falls back to
+/// `"a"` for non-vowel starts, empty strings, or non-ASCII leaders. Used
+/// to keep the soft-hint grammar correct as the non-callable kind set
+/// grows (`"an enum"`, `"an interface"`, `"a struct"`, `"a typedef"`).
+fn article(word: &str) -> &'static str {
+    match word.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U') => "an",
+        _ => "a",
+    }
 }
 
 /// Pick the better alternative-tool suggestion for a non-callable kind.
@@ -127,13 +142,15 @@ pub fn callers_or_callees(
         // typedef/interface — structurally shaped, no call edges by
         // design), surface a soft-hint CallToolResult success that names
         // the kind and points the agent at the right alternative tool
-        // (`get_class_hierarchy` / `get_symbol_detail`). Per Decision 8,
-        // this branch is gated strictly on a kind set disjoint from the
-        // callable kinds (`Function` / `Method`), so callable-with-no-
-        // resolved-callers (including the Phase-3.1 "only-unresolved-
-        // callees" case) still falls through to the empty envelope below
-        // — that "wrong tool" vs "wrong symbol" vs "no callers in scope"
-        // trichotomy is the agent-facing contract this handler implements.
+        // (`get_class_hierarchy` / `get_symbol_detail`). This branch is
+        // gated strictly on a kind set disjoint from the callable kinds
+        // (`Function` / `Method`), so a callable symbol whose only
+        // resolved callers/callees were filtered out by the resolved-only
+        // BFS (e.g. a function whose only outgoing call edges target
+        // unresolved tokens) still falls through to the empty envelope
+        // below — that "wrong tool" vs "wrong symbol" vs "no callers in
+        // scope" trichotomy is the agent-facing contract this handler
+        // implements.
         //
         // The advisory is a `CallToolResult` success (not `Err`),
         // matching the workspace's core invariant that user-visible
@@ -154,10 +171,11 @@ pub fn callers_or_callees(
             Some(s) if is_non_callable_kind(s.kind) => {
                 let kind_name = kind_str(s.kind);
                 let basename = symbol_id_basename(symbol);
+                let kind_article = article(kind_name);
                 let alt = alternative_tool_hint(s.kind);
                 drop(g);
                 let advisory = format!(
-                    "{basename} is a {kind_name}; {kind_name}s don't have call edges. {alt}"
+                    "{basename} is {kind_article} {kind_name}; {kind_name}s don't have call edges. {alt}"
                 );
                 return CallToolResult::success(vec![Content::text(advisory)]);
             }
@@ -596,8 +614,8 @@ mod tests {
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let text = body_text(&r);
         assert!(
-            text.contains("Color is a enum") || text.contains("Color is an enum"),
-            "advisory must name the symbol basename + kind: got {text:?}",
+            text.contains("Color is an enum"),
+            "advisory must name the symbol basename + kind with correct article: got {text:?}",
         );
         assert!(
             text.contains("get_class_hierarchy") || text.contains("get_symbol_detail"),
@@ -635,6 +653,75 @@ mod tests {
         assert!(
             text.contains("get_class_hierarchy"),
             "trait advisory must specifically suggest get_class_hierarchy: got {text:?}",
+        );
+    }
+
+    #[test]
+    fn get_callers_on_typedef_returns_soft_hint_with_detail_hint() {
+        // For typedef specifically, the advisory should suggest
+        // get_symbol_detail (NOT get_class_hierarchy) — typedefs are not
+        // part of an inheritance graph, so the natural alternative is the
+        // full symbol view. alternative_tool_hint() picks detail-only for
+        // Typedef; this test pins that per-kind dispatch.
+        let g = locked(graph_with_kind_only(
+            "ByteBuf",
+            "/lib.rs",
+            SymbolKind::Typedef,
+        ));
+        let r = callers_or_callees(
+            &g,
+            "/lib.rs:ByteBuf",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = body_text(&r);
+        assert!(
+            text.contains("ByteBuf is a typedef"),
+            "advisory must name the symbol basename + kind with correct article: got {text:?}",
+        );
+        assert!(
+            text.contains("get_symbol_detail"),
+            "typedef advisory must suggest get_symbol_detail: got {text:?}",
+        );
+        assert!(
+            !text.contains("get_class_hierarchy"),
+            "typedef advisory must NOT route to get_class_hierarchy: got {text:?}",
+        );
+    }
+
+    #[test]
+    fn get_callers_on_interface_returns_soft_hint_with_hierarchy_hint() {
+        // For interface specifically, the advisory should suggest
+        // get_class_hierarchy — interfaces participate in inheritance like
+        // structs/enums/traits. The article must also be the vowel-aware
+        // "an interface" form (post-grammar-fix).
+        let g = locked(graph_with_kind_only(
+            "IDisposable",
+            "/lib.cs",
+            SymbolKind::Interface,
+        ));
+        let r = callers_or_callees(
+            &g,
+            "/lib.cs:IDisposable",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = body_text(&r);
+        assert!(
+            text.contains("IDisposable is an interface"),
+            "advisory must name the symbol basename + kind with correct article: got {text:?}",
+        );
+        assert!(
+            text.contains("get_class_hierarchy"),
+            "interface advisory must specifically suggest get_class_hierarchy: got {text:?}",
         );
     }
 
