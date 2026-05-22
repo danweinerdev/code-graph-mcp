@@ -107,6 +107,25 @@ impl Graph {
         Self::default()
     }
 
+    /// Whether `id` resolves to a node currently stored in this graph.
+    ///
+    /// The "resolved" predicate shared by call-graph BFS and diagram
+    /// edge rendering: an edge target string that fails this check is a
+    /// bare callee token the parser captured but the call resolver could
+    /// not bind to a definition (external function, macro identifier,
+    /// stdlib call like `Ok`/`Err`/`printf`/`to_string`, etc.). Such
+    /// tokens must NOT enter call-graph BFS `visited` sets — their
+    /// presence would distort depth attribution for resolved neighbors at
+    /// depth >= 2 by short-circuiting later legitimate visits via false
+    /// `visited` membership — and must not render as path-basename
+    /// pseudo-nodes in diagrams. Both [`Graph::bfs`] (used by
+    /// `callers`/`callees`) and `diagrams::mermaid_label` pivot on this
+    /// exact `nodes.contains_key` check so the two tools stay
+    /// behaviorally consistent on what counts as a "real" callee.
+    pub(crate) fn is_resolved_node(&self, id: &str) -> bool {
+        self.nodes.contains_key(id)
+    }
+
     /// Add or replace all symbols and edges from a parsed [`FileGraph`].
     ///
     /// If the path is already known, its previous contents are removed first

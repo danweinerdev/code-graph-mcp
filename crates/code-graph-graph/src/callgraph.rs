@@ -65,6 +65,19 @@ impl Graph {
     /// The `start` node is pre-inserted into `visited` so it never
     /// appears in the result, even if the graph contains a self-loop or
     /// a cycle that would otherwise revisit it.
+    ///
+    /// Hops whose target is not a resolved node ([`Graph::is_resolved_node`])
+    /// are skipped entirely: they neither emit a `CallChain` nor enter
+    /// `visited`. This brings `get_callers`/`get_callees` to parity with
+    /// `generate_diagram`'s edge filter (both gate on `nodes.contains_key`)
+    /// and — critically — keeps unresolved tokens out of the visited set,
+    /// so two resolved callers that both happen to reach the same bare
+    /// token (e.g. `Ok`, `printf`) don't cross-poison each other's
+    /// depth-`>= 2` traversal of resolved neighbors. A callable symbol
+    /// whose only callees are unresolved produces an empty result vec —
+    /// that is the natural "no resolved hops" case, indistinguishable
+    /// from "callable with no callees at all", and the handler renders
+    /// both as the empty `Page<CallChain>` envelope.
     fn bfs(
         &self,
         start: &str,
@@ -95,6 +108,17 @@ impl Graph {
                     continue;
                 }
                 if visited.contains(&entry.target) {
+                    continue;
+                }
+                // Resolved-only filter (design Decision 7). Unresolved
+                // targets (raw callee tokens the resolver couldn't bind)
+                // are dropped BEFORE the `visited` insert so they don't
+                // suppress legitimate later visits of resolved neighbors
+                // along a different path. The predicate is the same
+                // `nodes.contains_key` check `mermaid_label` applies for
+                // diagram edges, so `get_callers`/`get_callees` and
+                // `generate_diagram` agree on what counts as a real hop.
+                if !self.is_resolved_node(&entry.target) {
                     continue;
                 }
                 visited.insert(entry.target.clone());
@@ -377,6 +401,175 @@ mod tests {
             names,
             vec!["/x.cpp:a".to_string()],
             "only the Calls source is reported; Inherits source is filtered out"
+        );
+    }
+
+    // --- resolved-only filter (design Decision 7) ---
+
+    #[test]
+    fn callees_filters_unresolved_targets() {
+        // `A` has Calls edges to a project symbol (`B`, present in
+        // `nodes`) and three bare unresolved tokens (`Ok`, `info`,
+        // `to_string` — NOT present in `nodes`). The unresolved targets
+        // must not appear in the result; only `B` survives.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.rs",
+            Language::Rust,
+            vec![
+                sym("A", SymbolKind::Function, "/x.rs"),
+                sym("B", SymbolKind::Function, "/x.rs"),
+            ],
+            vec![
+                call_edge("/x.rs:A", "/x.rs:B", "/x.rs", 1),
+                call_edge("/x.rs:A", "Ok", "/x.rs", 2),
+                call_edge("/x.rs:A", "info", "/x.rs", 3),
+                call_edge("/x.rs:A", "to_string", "/x.rs", 4),
+            ],
+        ));
+
+        let chain = g.callees("/x.rs:A", 1);
+        assert_eq!(
+            ids(&chain),
+            vec!["/x.rs:B".to_string()],
+            "only the resolved project symbol survives: {chain:?}",
+        );
+        let raw_ids: Vec<&str> = chain.iter().map(|c| c.symbol_id.as_str()).collect();
+        for tok in ["Ok", "info", "to_string"] {
+            assert!(
+                !raw_ids.contains(&tok),
+                "unresolved token {tok:?} must not appear in callees: {raw_ids:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn callees_unresolved_token_does_not_pollute_visited_at_depth_2() {
+        // Two-arm fixture exercising the depth->=2 visited-pollution
+        // failure mode. The point: if the filter ran in the handler
+        // (post-BFS) rather than in `Graph::bfs`, the BFS would still
+        // insert the unresolved token `Ok` into `visited` on the first
+        // arm. The second arm — which legitimately reaches resolved
+        // descendants by way of a DIFFERENT path — would then have its
+        // `visited`-membership checks falsely satisfied for the shared
+        // token, distorting depth attribution for the resolved
+        // neighbors reached after it. Filtering inside `bfs` keeps `Ok`
+        // out of `visited` entirely, so both arms walk their resolved
+        // sub-trees faithfully.
+        //
+        // Edges from the start `Entry`:
+        //     Entry -> Ok           (unresolved; must NOT enter visited)
+        //     Entry -> B            (resolved)
+        //     B     -> C            (resolved)
+        //     Entry -> D            (resolved)
+        //     D     -> Ok           (unresolved; reached by a 2nd arm)
+        //     D     -> C            (resolved; second arm to C — would
+        //                            be suppressed if `Ok` had polluted
+        //                            visited and we did handler-level
+        //                            filtering)
+        //
+        // Depth=3 walk from `Entry` must yield {B, C, D} as resolved
+        // descendants. `Ok` must be absent. `C` is reached exactly once
+        // (it is a true diamond apex), but the visit must succeed —
+        // proving that the unresolved-token detour didn't trip the
+        // dedup guard for a resolved node downstream.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.rs",
+            Language::Rust,
+            vec![
+                sym("Entry", SymbolKind::Function, "/x.rs"),
+                sym("B", SymbolKind::Function, "/x.rs"),
+                sym("C", SymbolKind::Function, "/x.rs"),
+                sym("D", SymbolKind::Function, "/x.rs"),
+            ],
+            vec![
+                call_edge("/x.rs:Entry", "Ok", "/x.rs", 1),
+                call_edge("/x.rs:Entry", "/x.rs:B", "/x.rs", 2),
+                call_edge("/x.rs:B", "/x.rs:C", "/x.rs", 3),
+                call_edge("/x.rs:Entry", "/x.rs:D", "/x.rs", 4),
+                call_edge("/x.rs:D", "Ok", "/x.rs", 5),
+                call_edge("/x.rs:D", "/x.rs:C", "/x.rs", 6),
+            ],
+        ));
+
+        let chain = g.callees("/x.rs:Entry", 3);
+        let resolved_ids = ids(&chain);
+        assert_eq!(
+            resolved_ids,
+            vec![
+                "/x.rs:B".to_string(),
+                "/x.rs:C".to_string(),
+                "/x.rs:D".to_string(),
+            ],
+            "all resolved descendants reached; no Ok: {chain:?}",
+        );
+        // C must be present exactly once (BFS dedup on resolved IDs).
+        let c_count = chain.iter().filter(|c| c.symbol_id == "/x.rs:C").count();
+        assert_eq!(c_count, 1, "C reached exactly once: {chain:?}");
+    }
+
+    #[test]
+    fn callees_all_unresolved_returns_empty_chain_set() {
+        // `F` calls only unresolved tokens — every callee is a raw
+        // identifier that doesn't bind to a Symbol in `nodes`. The BFS
+        // returns an empty Vec; the handler then surfaces the empty
+        // `Page<CallChain>` envelope (the existing "callable with no
+        // callees" path), NOT a tool error.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.rs",
+            Language::Rust,
+            vec![sym("F", SymbolKind::Function, "/x.rs")],
+            vec![
+                call_edge("/x.rs:F", "Ok", "/x.rs", 1),
+                call_edge("/x.rs:F", "Err", "/x.rs", 2),
+                call_edge("/x.rs:F", "info", "/x.rs", 3),
+            ],
+        ));
+
+        let chain = g.callees("/x.rs:F", 2);
+        assert!(
+            chain.is_empty(),
+            "every callee is unresolved -> empty BFS result: {chain:?}",
+        );
+    }
+
+    #[test]
+    fn callers_filters_unresolved_targets() {
+        // Symmetric to `callees_filters_unresolved_targets` on the
+        // callers side. `S` has reverse-adjacency entries for two
+        // resolved callers (`R1`, `R2`) and one unresolved bare token
+        // (`some_macro` — a raw caller-side identifier whose definition
+        // isn't in `nodes`, e.g. a macro invocation captured as a call
+        // edge from a phantom source). `Graph::callers("S")` must
+        // return only the two resolved chains.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.rs",
+            Language::Rust,
+            vec![
+                sym("S", SymbolKind::Function, "/x.rs"),
+                sym("R1", SymbolKind::Function, "/x.rs"),
+                sym("R2", SymbolKind::Function, "/x.rs"),
+            ],
+            vec![
+                call_edge("/x.rs:R1", "/x.rs:S", "/x.rs", 1),
+                call_edge("/x.rs:R2", "/x.rs:S", "/x.rs", 2),
+                call_edge("some_macro", "/x.rs:S", "/x.rs", 3),
+            ],
+        ));
+
+        let chain = g.callers("/x.rs:S", 1);
+        assert_eq!(
+            ids(&chain),
+            vec!["/x.rs:R1".to_string(), "/x.rs:R2".to_string()],
+            "only resolved callers survive: {chain:?}",
+        );
+        let raw_ids: Vec<&str> = chain.iter().map(|c| c.symbol_id.as_str()).collect();
+        assert!(
+            !raw_ids.contains(&"some_macro"),
+            "unresolved caller token must not appear: {raw_ids:?}",
         );
     }
 
