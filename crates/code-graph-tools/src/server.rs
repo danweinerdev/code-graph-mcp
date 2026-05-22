@@ -696,11 +696,13 @@ impl CodeGraphServer {
                        kind is `struct`, `enum`, `trait`, `typedef`, or `interface` \
                        returns a `CallToolResult` SUCCESS (`is_error: false`) whose body \
                        is a plain-text advisory naming the symbol + kind and routing to \
-                       `get_class_hierarchy` (structural kinds) or `get_symbol_detail` \
-                       (typedef) — NOT the `Page<CallChain>` envelope, so a JSON parse \
-                       of the body will fail; clients pattern-matching the envelope \
-                       must try plain-text first. A callable symbol with zero resolved \
-                       callers still returns the empty `Page<CallChain>` envelope, \
+                       `get_class_hierarchy` or `get_symbol_detail` (structural kinds: \
+                       struct/enum/trait/interface — both tools offered), or to \
+                       `get_symbol_detail` only (typedef) — NOT the `Page<CallChain>` \
+                       envelope, so a JSON parse of the body will fail; clients \
+                       pattern-matching the envelope must try plain-text first. A \
+                       callable symbol with zero resolved callers still returns the \
+                       empty `Page<CallChain>` envelope, \
                        preserving the trichotomy (wrong symbol → tool error; wrong tool \
                        for the kind → soft-hint success; callable with no resolved \
                        callers → empty envelope). `depth` defaults to 1 (direct callers \
@@ -751,13 +753,16 @@ impl CodeGraphServer {
                        DEFINITION site (the callee being reported, in \
                        `file:name`/`file:Parent::name` form); `file` and `line` are the \
                        CALL site — the source file and line of the `Calls` edge that \
-                       reached this hop. At depth 1 the call site lives in the queried \
-                       symbol's own file by definition; at depth ≥ 2 `file` and the \
-                       file segment of `symbol_id` routinely diverge across crates (a \
-                       callee defined in crate `foo` may be reached through a call site \
-                       that lives in crate `baz`). To recover \"where is this \
+                       reached this hop. The call site (`file`) is always in the \
+                       queried symbol's file — the function making the call — never \
+                       in the callee's definition file. So `file` and the file segment \
+                       of `symbol_id` diverge whenever the callee is defined outside \
+                       the queried symbol's file, including at depth 1 (any cross-file \
+                       call); at depth ≥ 2 the same asymmetry compounds as the BFS \
+                       hops through intermediate frames. To recover \"where is this \
                        defined?\" split `symbol_id` on the rightmost `:` not part of \
-                       `::` — do NOT read `file`. **Resolved-only filter (parity with \
+                       `::` — do NOT read `file`; that rule applies uniformly at all \
+                       depths. **Resolved-only filter (parity with \
                        `generate_diagram`):** hops whose target is not a resolved \
                        project symbol are dropped at BFS time and never appear — \
                        bare-token unresolved callees (e.g. `Ok`, `printf`, \
@@ -769,11 +774,13 @@ impl CodeGraphServer {
                        `struct`, `enum`, `trait`, `typedef`, or `interface` returns a \
                        `CallToolResult` SUCCESS (`is_error: false`) whose body is a \
                        plain-text advisory naming the symbol + kind and routing to \
-                       `get_class_hierarchy` (structural kinds) or `get_symbol_detail` \
-                       (typedef) — NOT the `Page<CallChain>` envelope, so a JSON parse \
-                       of the body will fail; clients pattern-matching the envelope \
-                       must try plain-text first. A callable symbol with zero resolved \
-                       callees still returns the empty `Page<CallChain>` envelope, \
+                       `get_class_hierarchy` or `get_symbol_detail` (structural kinds: \
+                       struct/enum/trait/interface — both tools offered), or to \
+                       `get_symbol_detail` only (typedef) — NOT the `Page<CallChain>` \
+                       envelope, so a JSON parse of the body will fail; clients \
+                       pattern-matching the envelope must try plain-text first. A \
+                       callable symbol with zero resolved callees still returns the \
+                       empty `Page<CallChain>` envelope, \
                        preserving the trichotomy (wrong symbol → tool error; wrong \
                        tool for the kind → soft-hint success; callable with no \
                        resolved callees → empty envelope). `depth` defaults to 1 \
