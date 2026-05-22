@@ -119,9 +119,13 @@ impl Graph {
     /// depth >= 2 by short-circuiting later legitimate visits via false
     /// `visited` membership — and must not render as path-basename
     /// pseudo-nodes in diagrams. Both [`Graph::bfs`] (used by
-    /// `callers`/`callees`) and `diagrams::mermaid_label` pivot on this
-    /// exact `nodes.contains_key` check so the two tools stay
-    /// behaviorally consistent on what counts as a "real" callee.
+    /// `callers`/`callees`) and `Graph::diagram_call_graph`'s BFS
+    /// expansion pivot on this exact `nodes.contains_key` check before
+    /// inserting into `visited`, so the two tools stay behaviorally
+    /// consistent on what counts as a "real" callee. The diagram path
+    /// additionally uses the same predicate inside `diagrams::mermaid_label`
+    /// as a post-BFS defense-in-depth filter for `raw_edges` entries
+    /// that bypassed the expansion-time guard (truncation tail).
     pub(crate) fn is_resolved_node(&self, id: &str) -> bool {
         self.nodes.contains_key(id)
     }

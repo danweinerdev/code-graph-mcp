@@ -507,6 +507,41 @@ mod tests {
         // C must be present exactly once (BFS dedup on resolved IDs).
         let c_count = chain.iter().filter(|c| c.symbol_id == "/x.rs:C").count();
         assert_eq!(c_count, 1, "C reached exactly once: {chain:?}");
+
+        // Per-hop depth assertions. The commit message that introduced
+        // the BFS-side filter (5c92c0a) named depth-attribution
+        // distortion as the failure mode — a visited-set polluted by an
+        // unresolved token would short-circuit a later legitimate visit
+        // and either drop the resolved neighbor entirely (the identity
+        // assertion above already pins this) OR record it at the wrong
+        // hop count. The depth checks below pin the latter explicitly,
+        // so a regression that smuggles `Ok` back into `visited` is
+        // caught even if some other change masks the identity-set
+        // failure.
+        let depth_of =
+            |id: &str| -> Option<u32> { chain.iter().find(|c| c.symbol_id == id).map(|c| c.depth) };
+        assert_eq!(
+            depth_of("/x.rs:B"),
+            Some(1),
+            "B is a direct callee of Entry: depth 1 expected: {chain:?}",
+        );
+        assert_eq!(
+            depth_of("/x.rs:D"),
+            Some(1),
+            "D is a direct callee of Entry: depth 1 expected: {chain:?}",
+        );
+        // C is reachable from BOTH first-level arms; whichever wins the
+        // visited-insert race (HashMap iteration order over adj[Entry]'s
+        // Vec is deterministic insertion-order but the post-fix BFS pops
+        // (B,1) and (D,1) before (C,?), so C is always reached AT depth
+        // 2. We do NOT pin the parent (deduped by `visited`); we only
+        // pin the depth attribution, which is the discriminator.
+        assert_eq!(
+            depth_of("/x.rs:C"),
+            Some(2),
+            "C is reached one hop past a first-level resolved arm: \
+             depth 2 expected: {chain:?}",
+        );
     }
 
     #[test]

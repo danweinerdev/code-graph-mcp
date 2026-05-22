@@ -292,6 +292,21 @@ impl Graph {
                             entry.target.clone(),
                             EdgeDirection::Calls,
                         ));
+                        // Resolved-only filter (mirrors `Graph::bfs` in
+                        // callgraph.rs). Unresolved targets are dropped
+                        // BEFORE the `visited.insert`, so a raw token a
+                        // forward arm bumps into never short-circuits a
+                        // legitimate later visit of the same token along
+                        // a different arm — visited-set pollution that
+                        // would distort depth/edge attribution at depth
+                        // >= 2. The post-BFS `mermaid_label` filter
+                        // survives as defense-in-depth: it now never
+                        // fires for an unresolved endpoint queued by
+                        // this loop, but still catches raw `raw_edges`
+                        // entries whose endpoints were never queued.
+                        if !self.is_resolved_node(&entry.target) {
+                            continue;
+                        }
                         if !visited.contains(&entry.target) && visited.len() < max_nodes {
                             visited.insert(entry.target.clone());
                             queue.push_back((entry.target.clone(), curr_depth + 1));
@@ -317,6 +332,14 @@ impl Graph {
                             curr_id.clone(),
                             EdgeDirection::CalledBy,
                         ));
+                        // Resolved-only filter; same rationale as the
+                        // forward arm above. radj's `target` is the
+                        // *source* of the original Calls edge, so it is
+                        // the candidate to enqueue / mark visited — and
+                        // it is the same string we must guard on.
+                        if !self.is_resolved_node(&entry.target) {
+                            continue;
+                        }
                         if !visited.contains(&entry.target) && visited.len() < max_nodes {
                             visited.insert(entry.target.clone());
                             queue.push_back((entry.target.clone(), curr_depth + 1));
@@ -1422,6 +1445,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn diagram_call_graph_unresolved_token_does_not_pollute_visited_at_depth_2() {
+        // Diagram-side mirror of
+        // `callees_unresolved_token_does_not_pollute_visited_at_depth_2`
+        // in callgraph.rs. The point: if the unresolved-endpoint filter
+        // ran only post-BFS (via `mermaid_label`), the BFS would still
+        // insert the unresolved token `Ok` into `visited` on the first
+        // arm. That `Ok` membership consumes a `max_nodes` budget slot
+        // (and survives the post-BFS truncation guard, since the guard
+        // only drops edges whose endpoints are absent from `visited`).
+        // The next legitimately-resolved descendant beyond the budget
+        // ceiling — `C`, reached after the budget fills with the
+        // unresolved-laden first level — never enters `visited`, so the
+        // truncation guard at the rendering step drops every edge to
+        // `C` even though those edges sit in `raw_edges`. Filtering
+        // inside the expansion loop keeps `Ok` out of `visited`
+        // entirely, freeing the budget slot for `C`.
+        //
+        // Edges from the start `Entry` (same shape as the callgraph
+        // sibling test, with the budget tuned so the discriminator
+        // fires):
+        //     Entry -> Ok           (unresolved; must NOT enter visited)
+        //     Entry -> B            (resolved)
+        //     B     -> C            (resolved)
+        //     Entry -> D            (resolved)
+        //     D     -> Ok           (unresolved; reached by a 2nd arm)
+        //     D     -> C            (resolved; second arm to C)
+        //
+        // With `max_nodes = 5` (the tight budget that exercises the
+        // discriminator): the OLD behavior fills visited with {Entry,
+        // Ok, B, D, C} as the seed + first-level successors are
+        // processed, hitting the `visited.len() >= max_nodes` break the
+        // first time `(D, 1)` is popped — so D's outbound edges
+        // (including `D -> C`) are never recorded in `raw_edges` and
+        // the rendered edge set is missing the second-arm reach of C.
+        // The NEW behavior never admits `Ok`, so visited only grows to
+        // {Entry, B, D, C}; `(D, 1)` is popped with visited.len()=4 < 5,
+        // D's outbound expansion runs, `(D, C)` enters `raw_edges`, and
+        // the rendered set contains both arms.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.rs",
+            Language::Rust,
+            vec![
+                sym("Entry", SymbolKind::Function, "/x.rs"),
+                sym("B", SymbolKind::Function, "/x.rs"),
+                sym("C", SymbolKind::Function, "/x.rs"),
+                sym("D", SymbolKind::Function, "/x.rs"),
+            ],
+            vec![
+                call_edge("/x.rs:Entry", "Ok", "/x.rs", 1),
+                call_edge("/x.rs:Entry", "/x.rs:B", "/x.rs", 2),
+                call_edge("/x.rs:B", "/x.rs:C", "/x.rs", 3),
+                call_edge("/x.rs:Entry", "/x.rs:D", "/x.rs", 4),
+                call_edge("/x.rs:D", "Ok", "/x.rs", 5),
+                call_edge("/x.rs:D", "/x.rs:C", "/x.rs", 6),
+            ],
+        ));
+
+        // depth=3 walks past C; max_nodes=5 is the tight budget that
+        // makes visited-pollution observable in the rendered edge set
+        // (see comment above for the trace).
+        let result = g
+            .diagram_call_graph("/x.rs:Entry", DiagramDirection::Callees, 3, 5)
+            .expect("Entry is known");
+        assert_eq!(result.center, "Entry");
+
+        // No edge may reference the unresolved token `Ok` — the
+        // post-BFS mermaid_label filter survives as defense in depth.
+        for e in &result.edges {
+            assert_ne!(
+                e.from, "Ok",
+                "unresolved `Ok` must not be a from-label: {:?}",
+                result.edges,
+            );
+            assert_ne!(
+                e.to, "Ok",
+                "unresolved `Ok` must not be a to-label: {:?}",
+                result.edges,
+            );
+        }
+
+        let pairs: std::collections::HashSet<(String, String)> = result
+            .edges
+            .iter()
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+
+        // Both first-level resolved successors must surface.
+        assert!(
+            pairs.contains(&("Entry".to_string(), "B".to_string())),
+            "first-arm resolved successor B must surface: {pairs:?}",
+        );
+        assert!(
+            pairs.contains(&("Entry".to_string(), "D".to_string())),
+            "second-arm resolved successor D must surface — the \
+             `visited`-pollution failure mode hides this if the filter \
+             is moved post-BFS: {pairs:?}",
+        );
+
+        // The DISCRIMINATOR: with the BFS-expansion-time filter, `Ok`
+        // never enters `visited`, so the `(D, 1)` pop sees
+        // visited.len()=4 < max_nodes=5 and proceeds to expand D's
+        // outbound edges, including `D -> C`. Under the pre-fix
+        // post-BFS-only filter, `Ok` consumes a visited slot, the
+        // `(D, 1)` pop hits the `visited.len() >= max_nodes` break, and
+        // D's outbound edges are never recorded — `D -> C` is missing
+        // from the rendered set. This is the assertion that FAILS if
+        // the filter regresses back to post-BFS only.
+        assert!(
+            pairs.contains(&("B".to_string(), "C".to_string())),
+            "the first-arm `B -> C` edge must survive: {pairs:?}",
+        );
+        assert!(
+            pairs.contains(&("D".to_string(), "C".to_string())),
+            "the second-arm `D -> C` edge must survive — pre-fix \
+             code dropped it because `Ok` polluted visited and the \
+             `(D, 1)` pop hit the max_nodes break before D's outbound \
+             expansion ran: {pairs:?}",
+        );
     }
 
     // ----- diagram_file_graph -----
