@@ -538,27 +538,45 @@ impl CodeGraphServer {
 
     #[tool(
         description = "Search for symbols by name pattern across the indexed codebase. \
-                       Returns the {results, total, offset, limit, truncated, next_offset} \
-                       envelope, sorted by symbol_id ascending. At least one filter is \
-                       expected: `query` (substring or regex on the symbol name), `kind` \
-                       (function, method, class, struct, enum, typedef, interface, \
-                       trait), `namespace` (substring match against the symbol's \
-                       namespace path, e.g. 'Nfs' matches 'Ark::Nfs::V4'), and/or \
-                       `language` (cpp, rust, go, python, csharp, java). `limit` defaults \
-                       to 20 (max 1000, clamped silently — the echoed `limit` reflects \
-                       the resolved value); raise `limit` for broad searches expected to \
-                       return many hits, and use `offset` to advance through the \
-                       remainder. `brief` (default true) omits signature, column, and \
-                       end_line; set false for full detail. `count_only=true` returns \
-                       the match total with an empty `results` array in a < 1KB bounded \
-                       response — use it to size a search before committing to paging. \
-                       Responses are also capped by `[response].max_bytes` (default \
-                       100KB); when the byte budget bites, `truncated` is true and \
-                       `next_offset` points at the first un-emitted record — re-call \
-                       with `offset = next_offset` to resume. `truncated=false` plus \
-                       `next_offset=null` means the page is complete. `results.length` \
-                       may be less than `limit` when the byte cap fires, so consult \
-                       `truncated`, not length, to detect partial pages."
+                       Returns the `Page<SymbolResult>` envelope {results, total, \
+                       offset, limit, truncated, next_offset} (flattened on the wire), \
+                       sorted by symbol_id ascending, PLUS an optional `suggestions: \
+                       string[]` field — see the suggestions block below. At least one \
+                       filter is expected: `query` (substring or regex on the symbol \
+                       name), `kind` (function, method, class, struct, enum, typedef, \
+                       interface, trait), `namespace` (substring match against the \
+                       symbol's namespace path, e.g. 'Nfs' matches 'Ark::Nfs::V4'), \
+                       and/or `language` (cpp, rust, go, python, csharp, java). `limit` \
+                       defaults to 20 (max 1000, clamped silently — the echoed `limit` \
+                       reflects the resolved value); raise `limit` for broad searches \
+                       expected to return many hits, and use `offset` to advance \
+                       through the remainder. `offset` defaults to 0; raise `offset` \
+                       to skip past previous results, or set `offset = next_offset` to \
+                       resume after a truncated page. `brief` (default true) omits \
+                       signature, column, and end_line; set false for full detail. \
+                       `count_only=true` returns the match total with an empty \
+                       `results` array in a < 1KB bounded response — use it to size a \
+                       search before committing to paging. **`suggestions: string[]` \
+                       (did-you-mean field):** included in the response ONLY when (a) \
+                       `query` is anchored as `^…$` with length ≥ 2 (and the inner \
+                       pattern is non-empty), AND (b) `total == 0` (no matches under \
+                       the anchored query). Holds up to 5 candidate symbol-id strings \
+                       drawn from a broad substring match on the anchors-stripped \
+                       inner pattern. **Absent from the wire entirely when empty** (no \
+                       `\"suggestions\": []` key — serialization skips empty lists), \
+                       so a present `suggestions` field is itself a signal that the \
+                       anchored query missed. **Never emitted on `count_only=true`** \
+                       (the count_only path short-circuits before the suggestion \
+                       block), so clients counting matches must use plain \
+                       `query` (no anchors) or call again without `count_only` to \
+                       receive suggestions. Responses are also capped by \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
+                       un-emitted record — re-call with `offset = next_offset` to \
+                       resume. `truncated=false` plus `next_offset=null` means the page \
+                       is complete. `results.length` may be less than `limit` when the \
+                       byte cap fires, so consult `truncated`, not length, to detect \
+                       partial pages."
     )]
     async fn search_symbols(
         &self,
@@ -653,14 +671,46 @@ impl CodeGraphServer {
         description = "Find functions that call the given symbol (upstream call chain). \
                        `symbol` is a Symbol ID in the `file:name` or `file:Parent::name` \
                        format returned by get_file_symbols/search_symbols. Returns the \
-                       {results, total, offset, limit, truncated, next_offset} envelope, \
-                       sorted by (depth, symbol_id) ascending so the closest callers \
-                       appear first. `depth` defaults to 1 (direct callers only); raise \
-                       it to walk further upstream. `limit` defaults to 100 (max 1000, \
-                       clamped silently — the echoed `limit` reflects the resolved \
-                       value); raise `limit` for hot symbols with high fan-in (e.g. \
-                       UObject::Serialize), use `offset` to page through the remainder, \
-                       or narrow by lowering `depth`. Responses are also capped by \
+                       `Page<CallChain>` envelope {results, total, offset, limit, \
+                       truncated, next_offset}, where each `CallChain` is \
+                       `{symbol_id, file, line, depth}` and is sorted by \
+                       (depth, symbol_id) ascending so the closest callers appear first. \
+                       **CallChain field semantics:** `symbol_id` is the DEFINITION site \
+                       (the caller being reported, in `file:name`/`file:Parent::name` \
+                       form); `file` and `line` are the CALL site — the source file and \
+                       line of the `Calls` edge that reached this hop. At depth 1 the \
+                       call site lives in the caller's own file by definition; at depth \
+                       ≥ 2 `file` and the file segment of `symbol_id` routinely diverge \
+                       across crates (a caller defined in crate `foo` may be reached \
+                       through a call site that lives in crate `baz`). To recover \
+                       \"where is this defined?\" split `symbol_id` on the rightmost `:` \
+                       not part of `::` — do NOT read `file`. **Resolved-only filter \
+                       (parity with `generate_diagram`):** hops whose target is not a \
+                       resolved project symbol are dropped at BFS time and never appear \
+                       — bare-token unresolved callers (e.g. `Ok`, `printf`, \
+                       `to_string`, language-builtin macros/stdlib calls) are filtered \
+                       out uniformly across all six languages, so a function whose only \
+                       incoming callers are unresolved tokens returns an empty page, \
+                       not a page of bare-token rows. **Non-callable soft-hint \
+                       (success, not error):** calling `get_callers` on a symbol whose \
+                       kind is `struct`, `enum`, `trait`, `typedef`, or `interface` \
+                       returns a `CallToolResult` SUCCESS (`is_error: false`) whose body \
+                       is a plain-text advisory naming the symbol + kind and routing to \
+                       `get_class_hierarchy` (structural kinds) or `get_symbol_detail` \
+                       (typedef) — NOT the `Page<CallChain>` envelope, so a JSON parse \
+                       of the body will fail; clients pattern-matching the envelope \
+                       must try plain-text first. A callable symbol with zero resolved \
+                       callers still returns the empty `Page<CallChain>` envelope, \
+                       preserving the trichotomy (wrong symbol → tool error; wrong tool \
+                       for the kind → soft-hint success; callable with no resolved \
+                       callers → empty envelope). `depth` defaults to 1 (direct callers \
+                       only); raise it to walk further upstream. `limit` defaults to \
+                       100 (max 1000, clamped silently — the echoed `limit` reflects \
+                       the resolved value); raise `limit` for hot symbols with high \
+                       fan-in (e.g. UObject::Serialize), use `offset` to page through \
+                       the remainder, or narrow by lowering `depth`. `offset` defaults \
+                       to 0; raise `offset` to skip past previous results, or set \
+                       `offset = next_offset` to resume. Responses are also capped by \
                        `[response].max_bytes` (default 100KB); when the byte budget \
                        bites, `truncated` is true and `next_offset` points at the first \
                        un-emitted record — re-call with `offset = next_offset` to \
@@ -692,22 +742,55 @@ impl CodeGraphServer {
         description = "Find functions called by the given symbol (downstream call \
                        chain). `symbol` is a Symbol ID in the `file:name` or \
                        `file:Parent::name` format returned by \
-                       get_file_symbols/search_symbols. Returns the {results, total, \
-                       offset, limit, truncated, next_offset} envelope, sorted by \
+                       get_file_symbols/search_symbols. Returns the `Page<CallChain>` \
+                       envelope {results, total, offset, limit, truncated, \
+                       next_offset}, where each `CallChain` is \
+                       `{symbol_id, file, line, depth}` and is sorted by \
                        (depth, symbol_id) ascending so the closest callees appear \
-                       first. `depth` defaults to 1 (direct callees only); raise it to \
-                       walk further downstream. `limit` defaults to 100 (max 1000, \
-                       clamped silently — the echoed `limit` reflects the resolved \
-                       value); raise `limit` for symbols with wide fan-out, use \
-                       `offset` to page through the remainder, or narrow by lowering \
-                       `depth` to scope a specific subtree. Responses are also capped \
-                       by `[response].max_bytes` (default 100KB); when the byte budget \
-                       bites, `truncated` is true and `next_offset` points at the \
-                       first un-emitted record — re-call with `offset = next_offset` \
-                       to resume. `truncated=false` plus `next_offset=null` means the \
-                       page is complete. `results.length` may be less than `limit` \
-                       when the byte cap fires, so consult `truncated`, not length, \
-                       to detect partial pages."
+                       first. **CallChain field semantics:** `symbol_id` is the \
+                       DEFINITION site (the callee being reported, in \
+                       `file:name`/`file:Parent::name` form); `file` and `line` are the \
+                       CALL site — the source file and line of the `Calls` edge that \
+                       reached this hop. At depth 1 the call site lives in the queried \
+                       symbol's own file by definition; at depth ≥ 2 `file` and the \
+                       file segment of `symbol_id` routinely diverge across crates (a \
+                       callee defined in crate `foo` may be reached through a call site \
+                       that lives in crate `baz`). To recover \"where is this \
+                       defined?\" split `symbol_id` on the rightmost `:` not part of \
+                       `::` — do NOT read `file`. **Resolved-only filter (parity with \
+                       `generate_diagram`):** hops whose target is not a resolved \
+                       project symbol are dropped at BFS time and never appear — \
+                       bare-token unresolved callees (e.g. `Ok`, `printf`, \
+                       `to_string`, language-builtin macros/stdlib calls) are filtered \
+                       out uniformly across all six languages, so a function whose only \
+                       outgoing calls hit unresolved tokens returns an empty page, not \
+                       a page of bare-token rows. **Non-callable soft-hint (success, \
+                       not error):** calling `get_callees` on a symbol whose kind is \
+                       `struct`, `enum`, `trait`, `typedef`, or `interface` returns a \
+                       `CallToolResult` SUCCESS (`is_error: false`) whose body is a \
+                       plain-text advisory naming the symbol + kind and routing to \
+                       `get_class_hierarchy` (structural kinds) or `get_symbol_detail` \
+                       (typedef) — NOT the `Page<CallChain>` envelope, so a JSON parse \
+                       of the body will fail; clients pattern-matching the envelope \
+                       must try plain-text first. A callable symbol with zero resolved \
+                       callees still returns the empty `Page<CallChain>` envelope, \
+                       preserving the trichotomy (wrong symbol → tool error; wrong \
+                       tool for the kind → soft-hint success; callable with no \
+                       resolved callees → empty envelope). `depth` defaults to 1 \
+                       (direct callees only); raise it to walk further downstream. \
+                       `limit` defaults to 100 (max 1000, clamped silently — the echoed \
+                       `limit` reflects the resolved value); raise `limit` for symbols \
+                       with wide fan-out, use `offset` to page through the remainder, \
+                       or narrow by lowering `depth` to scope a specific subtree. \
+                       `offset` defaults to 0; raise `offset` to skip past previous \
+                       results, or set `offset = next_offset` to resume. Responses are \
+                       also capped by `[response].max_bytes` (default 100KB); when the \
+                       byte budget bites, `truncated` is true and `next_offset` points \
+                       at the first un-emitted record — re-call with `offset = \
+                       next_offset` to resume. `truncated=false` plus `next_offset=null` \
+                       means the page is complete. `results.length` may be less than \
+                       `limit` when the byte cap fires, so consult `truncated`, not \
+                       length, to detect partial pages."
     )]
     async fn get_callees(
         &self,

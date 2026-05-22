@@ -112,3 +112,104 @@ fn tools_list_watch_start() {
 fn tools_list_watch_stop() {
     insta::assert_json_snapshot!(tool_entry("watch_stop"));
 }
+
+// --- Load-bearing description-substring regressions ------------------------
+//
+// The tool description strings are production behavior — agents pattern-match
+// on them. The snapshots above pin every byte; these targeted assertions name
+// the specific contract clauses that future edits must keep present, so a
+// well-intentioned rewrite cannot silently drop a load-bearing phrase while
+// the snapshot is re-accepted.
+//
+// Coverage:
+// - `get_callers` / `get_callees`: CallChain field semantics (`file` = call
+//   SITE, `symbol_id` = DEFINITION site, divergence at depth ≥ 2),
+//   resolved-only filter (parity with `generate_diagram`), and non-callable
+//   soft-hint behavior (kind names + the alternative-tool routing).
+// - `search_symbols`: `suggestions` field semantics (anchored `^…$` AND
+//   `total == 0` trigger condition, `count_only` exclusion).
+
+fn description_of(name: &str) -> String {
+    let tool = tool_entry(name);
+    tool.description
+        .as_ref()
+        .map(|d| d.to_string())
+        .unwrap_or_default()
+}
+
+fn assert_contains(haystack: &str, needle: &str, tool: &str) {
+    assert!(
+        haystack.contains(needle),
+        "{tool} description must contain {needle:?}; got:\n{haystack}"
+    );
+}
+
+#[test]
+fn get_callers_description_documents_callchain_field_semantics() {
+    let d = description_of("get_callers");
+    assert_contains(&d, "CALL site", "get_callers");
+    assert_contains(&d, "DEFINITION site", "get_callers");
+    assert_contains(&d, "depth ≥ 2", "get_callers");
+}
+
+#[test]
+fn get_callees_description_documents_callchain_field_semantics() {
+    let d = description_of("get_callees");
+    assert_contains(&d, "CALL site", "get_callees");
+    assert_contains(&d, "DEFINITION site", "get_callees");
+    assert_contains(&d, "depth ≥ 2", "get_callees");
+}
+
+#[test]
+fn get_callers_description_documents_resolved_only_filter() {
+    let d = description_of("get_callers");
+    assert_contains(&d, "Resolved-only filter", "get_callers");
+    assert_contains(&d, "generate_diagram", "get_callers");
+}
+
+#[test]
+fn get_callees_description_documents_resolved_only_filter() {
+    let d = description_of("get_callees");
+    assert_contains(&d, "Resolved-only filter", "get_callees");
+    assert_contains(&d, "generate_diagram", "get_callees");
+}
+
+#[test]
+fn get_callers_description_documents_non_callable_soft_hint() {
+    let d = description_of("get_callers");
+    assert_contains(&d, "Non-callable soft-hint", "get_callers");
+    // Each non-callable kind name + the routed alternative tools.
+    for kind in ["struct", "enum", "trait", "typedef", "interface"] {
+        assert_contains(&d, kind, "get_callers");
+    }
+    assert_contains(&d, "get_class_hierarchy", "get_callers");
+    assert_contains(&d, "get_symbol_detail", "get_callers");
+}
+
+#[test]
+fn get_callees_description_documents_non_callable_soft_hint() {
+    let d = description_of("get_callees");
+    assert_contains(&d, "Non-callable soft-hint", "get_callees");
+    for kind in ["struct", "enum", "trait", "typedef", "interface"] {
+        assert_contains(&d, kind, "get_callees");
+    }
+    assert_contains(&d, "get_class_hierarchy", "get_callees");
+    assert_contains(&d, "get_symbol_detail", "get_callees");
+}
+
+#[test]
+fn search_symbols_description_documents_suggestions_field() {
+    let d = description_of("search_symbols");
+    assert_contains(&d, "suggestions", "search_symbols");
+    // Anchored `^…$` trigger condition + zero-match precondition.
+    assert_contains(&d, "^…$", "search_symbols");
+    assert_contains(&d, "total == 0", "search_symbols");
+    // Absent-when-empty contract.
+    assert_contains(
+        &d,
+        "Absent from the wire entirely when empty",
+        "search_symbols",
+    );
+    // `count_only` exclusion.
+    assert_contains(&d, "Never emitted on `count_only=true`", "search_symbols");
+}
