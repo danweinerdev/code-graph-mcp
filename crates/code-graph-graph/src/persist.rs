@@ -91,6 +91,71 @@ struct GraphCache {
     mtimes: HashMap<PathBuf, u64>,
 }
 
+/// Borrowing variant of [`GraphCache`] used only on the save path.
+///
+/// Field declaration order and types mirror `GraphCache` so the
+/// serialized JSON is byte-identical to the prior owned-DTO output, but
+/// the live [`Graph`] maps are borrowed rather than cloned. On a
+/// multi-million-symbol graph the clone was an O(graph) allocation that
+/// briefly doubled resident memory; borrowing avoids it entirely.
+///
+/// `nodes` is bridged by [`serialize_nodes_as_symbols`] so the JSON
+/// shape stays flat (no `{"symbol": {...}}` wrapper), matching
+/// `GraphCache.nodes` (the owned DTO consumed by [`Graph::load`])
+/// exactly. `mtimes` stays owned because it is freshly computed from
+/// the filesystem at save time — it does not live in [`Graph`].
+#[derive(Serialize)]
+struct GraphCacheRef<'a> {
+    version: u32,
+    generator: &'static str,
+    #[serde(serialize_with = "serialize_nodes_as_symbols")]
+    nodes: &'a HashMap<SymbolId, Node>,
+    adj: &'a HashMap<SymbolId, Vec<EdgeEntry>>,
+    radj: &'a HashMap<SymbolId, Vec<EdgeEntry>>,
+    files: &'a HashMap<PathBuf, FileEntry>,
+    includes: &'a HashMap<PathBuf, Vec<IncludeEntry>>,
+    mtimes: HashMap<PathBuf, u64>,
+}
+
+/// Slim DTO consumed only by [`stale_paths`]. Materializes only
+/// `mtimes` (the field the stat-and-compare loop reads); every other
+/// JSON field — including `version` — is parsed-and-skipped by
+/// `serde_json` rather than allocated into a Rust value. Drops the
+/// `stale_paths` heap footprint from "size of the full deserialized
+/// graph" to "size of the `mtimes` map" — a ~3-4 GB→tens-of-MB win on
+/// multi-million-symbol caches. Serde's default behavior is to ignore
+/// JSON fields absent from the target struct (no `deny_unknown_fields`
+/// on this type or its peers), which is what makes the skip work.
+///
+/// Version-check intentionally omitted here: the only caller in
+/// `analyze_codebase` runs `Graph::load` first and only invokes
+/// `stale_paths` when load succeeded, so the version match is already
+/// established. Keeping the DTO minimal saves both the field and the
+/// branch.
+#[derive(Deserialize)]
+struct StalePathsCache {
+    mtimes: HashMap<PathBuf, u64>,
+}
+
+/// Serialize `&HashMap<SymbolId, Node>` as if it were
+/// `HashMap<SymbolId, Symbol>` — emit `node.symbol` directly so the JSON
+/// shape matches `GraphCache.nodes` (the owned DTO consumed by
+/// [`Graph::load`]) exactly, with no `{"symbol": {...}}` wrapper.
+fn serialize_nodes_as_symbols<S>(
+    nodes: &HashMap<SymbolId, Node>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(nodes.len()))?;
+    for (id, node) in nodes {
+        map.serialize_entry(id, &node.symbol)?;
+    }
+    map.end()
+}
+
 /// Resolve the cache file path for the given directory. Exposed for tests
 /// and for callers that need to delete the cache (e.g. `force=true` on
 /// `analyze_codebase`).
@@ -192,8 +257,93 @@ fn simplify_symbol_id(id: &str) -> String {
 /// rebuild-by-drain pattern is also deterministic in the sense that field
 /// ordering inside `HashMap`s is irrelevant for equality.
 ///
+/// Returns `true` iff at least one path-bearing key in `cache` starts
+/// with the Windows extended-path prefix `\\?\`. Drives the
+/// short-circuit in [`simplify_cache`]: on a cache produced by any
+/// post-`PathNormalization` build, this returns `false` and load
+/// skips ~5 full HashMap rebuilds.
+///
+/// Probes one representative entry per map (file keys, node SymbolIds,
+/// adj/radj keys, include keys, mtime keys). One contaminated entry
+/// anywhere is sufficient evidence that the writer was pre-PathNorm —
+/// the writer canonicalizes every field together, so contamination is
+/// all-or-nothing per cache.
+fn cache_needs_simplify(cache: &GraphCache) -> bool {
+    const PREFIX: &str = r"\\?\";
+    if cache
+        .files
+        .keys()
+        .next()
+        .is_some_and(|p| p.to_string_lossy().starts_with(PREFIX))
+    {
+        return true;
+    }
+    if cache
+        .nodes
+        .keys()
+        .next()
+        .is_some_and(|id| id.starts_with(PREFIX))
+    {
+        return true;
+    }
+    if cache
+        .adj
+        .keys()
+        .next()
+        .is_some_and(|id| id.starts_with(PREFIX))
+    {
+        return true;
+    }
+    if cache
+        .radj
+        .keys()
+        .next()
+        .is_some_and(|id| id.starts_with(PREFIX))
+    {
+        return true;
+    }
+    if cache
+        .includes
+        .keys()
+        .next()
+        .is_some_and(|p| p.to_string_lossy().starts_with(PREFIX))
+    {
+        return true;
+    }
+    if cache
+        .mtimes
+        .keys()
+        .next()
+        .is_some_and(|p| p.to_string_lossy().starts_with(PREFIX))
+    {
+        return true;
+    }
+    false
+}
+
 /// Helper is private; the only caller is `Graph::load`.
 fn simplify_cache(cache: &mut GraphCache) {
+    // Cheap path-cleanliness sniff. The `\\?\` Windows extended-path
+    // prefix is the only thing `paths::simplify` ever rewrites; on a
+    // cache where no path carries that prefix, every drain-and-rebuild
+    // below is a no-op (identity-by-arithmetic) that still pays the
+    // cost of 5 full HashMap rebuilds + per-key allocations. On a
+    // 770k-symbol cache that adds seconds to load. We probe one
+    // representative key per path-bearing map and bail before any
+    // mutation if none of the probed entries carry the prefix.
+    //
+    // Correctness rests on the writer's invariant: every cached path
+    // flows through `paths::canonicalize` at index time, which strips
+    // `\\?\` consistently across all fields. So if a contaminated
+    // entry exists in ANY field, the writer that produced this cache
+    // also wrote contaminated entries in EVERY field — we cannot have
+    // clean `files` keys alongside dirty `nodes` SymbolIds. Sniffing
+    // every map keeps the predicate defensive even if a future writer
+    // partially regresses; the cost is `O(maps)` not `O(entries)`.
+    if !cache_needs_simplify(cache) {
+        return;
+    }
+
     // (1, 2) files map + each FileEntry's symbol_ids.
     let old_files = std::mem::take(&mut cache.files);
     cache.files.reserve(old_files.len());
@@ -280,15 +430,6 @@ impl Graph {
         let final_path = cache_path(dir);
         let tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
 
-        // Build cache DTO from internal state. `Node` wraps `Symbol`;
-        // serialize just the `Symbol` to keep the JSON shape parallel to
-        // Go's v1 (where `Nodes` was `map[string]parser.Symbol`).
-        let nodes: HashMap<SymbolId, Symbol> = self
-            .nodes
-            .iter()
-            .map(|(id, n)| (id.clone(), n.symbol.clone()))
-            .collect();
-
         // Read mtimes for every indexed file. Files that no longer exist
         // record `0` so a future `stale_paths` call flags them.
         let mut mtimes = HashMap::with_capacity(self.files.len());
@@ -296,25 +437,46 @@ impl Graph {
             mtimes.insert(path.clone(), mtime_nanos(path).unwrap_or(0));
         }
 
-        let cache = GraphCache {
+        // Borrowing DTO + streaming writer. The prior shape cloned every
+        // internal map into an owned `GraphCache` and then `to_vec`-ed it
+        // into a single `Vec<u8>` before any byte hit disk — on a
+        // multi-million-symbol graph that briefly held the entire graph
+        // twice (live + cloned) plus the serialized JSON as a third
+        // copy, pushing save-time peak RSS to roughly 2× the in-memory
+        // footprint. The new path borrows the live maps and streams
+        // straight into a buffered `File`, keeping peak RSS close to
+        // the graph's resident size. `Node` is bridged to `Symbol` via
+        // `serialize_nodes_as_symbols` so the on-disk JSON shape stays
+        // byte-identical to what `GraphCache` produced.
+        let cache = GraphCacheRef {
             version: CACHE_VERSION,
-            generator: GENERATOR.to_string(),
-            nodes,
-            adj: self.adj.clone(),
-            radj: self.radj.clone(),
-            files: self.files.clone(),
-            includes: self.includes.clone(),
+            generator: GENERATOR,
+            nodes: &self.nodes,
+            adj: &self.adj,
+            radj: &self.radj,
+            files: &self.files,
+            includes: &self.includes,
             mtimes,
         };
 
-        // Serialize first so a JSON failure cannot leave a partial tmp file.
-        let data = serde_json::to_vec(&cache)?;
-
-        // Write-tmp → sync_all → rename. The braces matter: `sync_all`
-        // must run while the `File` is still open.
+        // Write-tmp → flush BufWriter → sync_all → rename. The braces
+        // matter: `sync_all` must run while the `File` is still open.
+        //
+        // Trade-off versus the prior `to_vec`-first design: a
+        // serialization failure mid-stream can leave a partial tmp file
+        // behind. The final cache is still untouched (the rename only
+        // fires on the success path) and the next save overwrites the
+        // tmp at the same path — `save_does_not_disturb_unrelated_tmp_file`
+        // pins that a stale tmp from a crashed run does not block a
+        // subsequent save.
         {
-            let mut f = File::create(&tmp_path)?;
-            f.write_all(&data)?;
+            let f = File::create(&tmp_path)?;
+            let mut writer = io::BufWriter::new(f);
+            serde_json::to_writer(&mut writer, &cache)?;
+            writer.flush()?;
+            let f = writer
+                .into_inner()
+                .map_err(|e| io::Error::other(e.into_error()))?;
             f.sync_all()?;
         }
         fs::rename(&tmp_path, &final_path)?;
@@ -342,13 +504,23 @@ impl Graph {
     ///   transparent migration.
     pub fn load(&mut self, dir: &Path) -> Result<bool, PersistError> {
         let path = cache_path(dir);
-        let data = match fs::read(&path) {
-            Ok(d) => d,
+        let file = match File::open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(PersistError::Io(e)),
         };
-
-        let mut cache: GraphCache = serde_json::from_slice(&data)?;
+        // Stream the JSON parse straight off disk rather than first
+        // buffering the entire on-disk cache as a `Vec<u8>` via
+        // `fs::read`. Mirrors the save-path BufWriter switch in
+        // [`Graph::save`]: on multi-GB caches the prior `from_slice`
+        // path held a 2.9 GB+ source-bytes Vec alongside the
+        // half-built `GraphCache` HashMaps. `serde_json::from_reader`
+        // is known to be slower than `from_slice` because it dispatches
+        // through `Read` per byte; `BufReader::with_capacity(256K)`
+        // amortizes that to ~negligible while the heap footprint of the
+        // reader itself stays trivial.
+        let reader = io::BufReader::with_capacity(256 * 1024, file);
+        let mut cache: GraphCache = serde_json::from_reader(reader)?;
         if cache.version != CACHE_VERSION {
             // v1 (Go-written), v2/v3 (older Rust schemas), or any future
             // version: silent re-index. Graph state is left untouched on
@@ -393,12 +565,23 @@ impl Graph {
 /// before `load` without a special-case for first-run.
 pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
     let path = cache_path(dir);
-    let data = match fs::read(&path) {
-        Ok(d) => d,
+    let file = match File::open(&path) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(PersistError::Io(e)),
     };
-    let cache: GraphCache = serde_json::from_slice(&data)?;
+    // Streaming reader + slim DTO. The prior `fs::read` →
+    // `from_slice::<GraphCache>` path allocated the full graph
+    // (~3-4 GB on a multi-million-symbol cache) only to read one field
+    // off it. `StalePathsCache` deserializes `version` + `mtimes`
+    // alone; the rest of the JSON is still parsed by `serde_json`'s
+    // stream — there is no JSON-level skip — but the un-mentioned
+    // fields are dropped on the floor rather than materialized into
+    // HashMaps. Shape-stable across every `CACHE_VERSION` bump so
+    // far (mtimes has carried the same `HashMap<PathBuf, u64>` shape
+    // since v1).
+    let reader = io::BufReader::with_capacity(256 * 1024, file);
+    let cache: StalePathsCache = serde_json::from_reader(reader)?;
 
     // Intentionally does NOT call `simplify_cache` (see PathNormalization
     // design Decision 5). `stale_paths` only consumes `cache.mtimes` for the

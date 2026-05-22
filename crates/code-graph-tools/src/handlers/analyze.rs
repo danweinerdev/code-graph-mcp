@@ -128,14 +128,70 @@ pub async fn analyze_codebase(
     // sending — otherwise early events get dropped.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
 
+    // Diagnostic: surface whether the client passed a progressToken at
+    // all. Investigated alongside the
+    // `"[Tool result missing due to internal error]"` failure mode on
+    // long analyses — knowing whether the client is asking for progress
+    // is the first datum we need to decide if a notification flood is
+    // implicated. Emitted at start so it lines up with the matching
+    // request in any captured server transcript. Single line per call,
+    // negligible cost, no PII.
+    eprintln!(
+        "[code-graph] analyze_codebase: progress_token_present={}",
+        progress_token.is_some()
+    );
+
     let forwarder = if let (Some(peer), Some(token)) = (peer, progress_token) {
         Some(tokio::spawn(async move {
+            // Throttle outbound notifications to one per
+            // `THROTTLE_INTERVAL`. Without this, the parallelized
+            // resolve phase can fire ~3000 progress events/sec
+            // (72k parse + 72k resolve over ~50s on LLVM), which
+            // floods the Claude Code MCP client and is the leading
+            // suspect for `"[Tool result missing due to internal
+            // error]"` — Claude Code's
+            // `ensureToolResultPairing` injects that synthetic
+            // result when an assistant `tool_use` has no matching
+            // `tool_result`, and a backed-up message queue is one
+            // way the real tool result could be lost or processed
+            // too late to count. The user-perceived progress UX
+            // does not need every event; one update per 100ms is
+            // 10/sec — plenty to feel responsive without
+            // overwhelming the client. Coalesces to the LATEST
+            // event, not the first — the user wants "where are we
+            // now", not "where were we 100ms ago".
+            const THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+            let mut last_sent = std::time::Instant::now()
+                .checked_sub(THROTTLE_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            let mut latest: Option<ProgressEvent> = None;
+
             while let Some(evt) = rx.recv().await {
-                let mut params = ProgressNotificationParam::new(token.clone(), evt.progress as f64);
-                if evt.total > 0 {
-                    params = params.with_total(evt.total as f64);
+                latest = Some(evt);
+                let now = std::time::Instant::now();
+                if now.duration_since(last_sent) >= THROTTLE_INTERVAL {
+                    if let Some(e) = latest.take() {
+                        last_sent = now;
+                        let mut params =
+                            ProgressNotificationParam::new(token.clone(), e.progress as f64);
+                        if e.total > 0 {
+                            params = params.with_total(e.total as f64);
+                        }
+                        params = params.with_message(e.message);
+                        let _ = peer.notify_progress(params).await;
+                    }
                 }
-                params = params.with_message(evt.message);
+            }
+            // Channel closed (indexer is done). Send the most recent
+            // pending event so the client sees the final state
+            // — otherwise the throttle could swallow the
+            // last "100% done" tick if it landed inside the cooldown.
+            if let Some(e) = latest {
+                let mut params = ProgressNotificationParam::new(token.clone(), e.progress as f64);
+                if e.total > 0 {
+                    params = params.with_total(e.total as f64);
+                }
+                params = params.with_message(e.message);
                 let _ = peer.notify_progress(params).await;
             }
         }))
