@@ -7,15 +7,69 @@
 //! return `[]` for a known symbol that just has no callers/callees, and
 //! to return a tool error only when the symbol itself isn't in the graph.
 
-use code_graph_core::{paths, EdgeKind};
+use code_graph_core::{paths, EdgeKind, SymbolKind};
 use code_graph_graph::{CallChain, Graph};
 use parking_lot::RwLock;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content};
 
 use super::{
-    byte_budget_take, edge_kind_str, suggest_symbols, tool_error, tool_success_json,
+    byte_budget_take, edge_kind_str, kind_str, suggest_symbols, tool_error, tool_success_json,
     DependencyEntry, Page,
 };
+
+/// Symbol-ID basename for advisory messages.
+///
+/// Symbol IDs are `file:name` (free) or `file:Parent::name` (method); the
+/// relevant token for a user-facing hint is the rightmost segment. If the
+/// id contains `::`, take everything after the last `::`; otherwise take
+/// everything after the last `:`. Returns the full input when neither
+/// separator is present, so malformed inputs never produce an empty string.
+fn symbol_id_basename(id: &str) -> &str {
+    if let Some(idx) = id.rfind("::") {
+        &id[idx + 2..]
+    } else if let Some(idx) = id.rfind(':') {
+        &id[idx + 1..]
+    } else {
+        id
+    }
+}
+
+/// Whether `kind` is a non-callable [`SymbolKind`] for the `get_callers` /
+/// `get_callees` soft-hint branch. Disjoint from `Function` / `Method` so
+/// the load-bearing "callable with no resolved callers → empty envelope"
+/// contract (3.1) remains intact: only structurally-shaped kinds (types,
+/// type aliases, trait interfaces) trigger the advisory.
+///
+/// Per design Decision 8, the set is `{Struct, Enum, Trait, Typedef,
+/// Interface}` (the design also lists `Field`, but `SymbolKind` has no
+/// `Field` variant today — the `#[non_exhaustive]` enum can grow into it
+/// without changing this predicate's call sites).
+fn is_non_callable_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Typedef
+            | SymbolKind::Interface
+    )
+}
+
+/// Pick the better alternative-tool suggestion for a non-callable kind.
+/// Structural kinds (`Struct`/`Enum`/`Trait`/`Interface`) get a hierarchy
+/// pointer; `Typedef` gets a detail pointer; everything else (defensive
+/// fall-through) gets both so the hint is never empty.
+fn alternative_tool_hint(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait | SymbolKind::Interface => {
+            "Try `get_class_hierarchy` for inheritance or `get_symbol_detail` for a full symbol view."
+        }
+        SymbolKind::Typedef => {
+            "Try `get_symbol_detail` for a full symbol view."
+        }
+        _ => "Try `get_class_hierarchy` or `get_symbol_detail`.",
+    }
+}
 
 /// Direction for [`callers_or_callees`]. Reverse → [`Graph::callers`];
 /// Forward → [`Graph::callees`].
@@ -69,20 +123,48 @@ pub fn callers_or_callees(
 
     if chains.is_empty() {
         // Symbol may not exist at all — surface a did-you-mean error.
-        // If it exists but has no callers/callees, return an empty
-        // envelope (results=[], total=0) below. This preserves the
-        // "wrong symbol" vs "no callers" distinction the Go binary had
-        // (error vs. empty array) — pagination is additive on top.
-        if g.symbol_detail(symbol).is_none() {
-            let suggestions = suggest_symbols(&g, symbol, 5);
-            drop(g);
-            return if suggestions.is_empty() {
-                tool_error(format!("symbol not found: {symbol:?}"))
-            } else {
-                tool_error(format!(
-                    "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
-                ))
-            };
+        // If it exists but is a non-callable kind (struct/enum/trait/
+        // typedef/interface — structurally shaped, no call edges by
+        // design), surface a soft-hint CallToolResult success that names
+        // the kind and points the agent at the right alternative tool
+        // (`get_class_hierarchy` / `get_symbol_detail`). Per Decision 8,
+        // this branch is gated strictly on a kind set disjoint from the
+        // callable kinds (`Function` / `Method`), so callable-with-no-
+        // resolved-callers (including the Phase-3.1 "only-unresolved-
+        // callees" case) still falls through to the empty envelope below
+        // — that "wrong tool" vs "wrong symbol" vs "no callers in scope"
+        // trichotomy is the agent-facing contract this handler implements.
+        //
+        // The advisory is a `CallToolResult` success (not `Err`),
+        // matching the workspace's core invariant that user-visible
+        // errors travel as `CallToolResult { is_error: true }` —
+        // guidance is success, not failure.
+        match g.symbol_detail(symbol) {
+            None => {
+                let suggestions = suggest_symbols(&g, symbol, 5);
+                drop(g);
+                return if suggestions.is_empty() {
+                    tool_error(format!("symbol not found: {symbol:?}"))
+                } else {
+                    tool_error(format!(
+                        "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
+                    ))
+                };
+            }
+            Some(s) if is_non_callable_kind(s.kind) => {
+                let kind_name = kind_str(s.kind);
+                let basename = symbol_id_basename(symbol);
+                let alt = alternative_tool_hint(s.kind);
+                drop(g);
+                let advisory = format!(
+                    "{basename} is a {kind_name}; {kind_name}s don't have call edges. {alt}"
+                );
+                return CallToolResult::success(vec![Content::text(advisory)]);
+            }
+            Some(_) => {
+                // Callable kind (Function/Method/Class) with no resolved
+                // callers/callees — fall through to the empty envelope.
+            }
         }
     }
     drop(g);
@@ -415,6 +497,256 @@ mod tests {
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
+    }
+
+    // --- non-callable soft hint -------------------------------------------
+    //
+    // Querying `get_callers` / `get_callees` against a known symbol whose
+    // `SymbolKind` is non-callable (`Struct`, `Enum`, `Trait`, `Typedef`,
+    // `Interface`) returns a `CallToolResult` SUCCESS carrying a soft-hint
+    // advisory instead of a silent empty `Page<CallChain>` envelope. The
+    // branch is gated strictly on the non-callable kind set, so callable
+    // kinds (`Function`/`Method`/`Class`) with zero resolved callers/callees
+    // still fall through to the empty envelope (matching the Go binary's
+    // "wrong tool" vs "wrong symbol" vs "no callers in scope" trichotomy
+    // — the load-bearing contract the resolved-only BFS filter inherits).
+    //
+    // Build a graph with one Struct/Enum/Trait/whatever symbol — no call
+    // edges needed; the BFS returns empty for non-callable kinds.
+
+    /// Plant a single symbol of the chosen `SymbolKind` at `file:name` with
+    /// no edges, so the BFS produces an empty chain set. The advisory
+    /// branch is the only thing under test here.
+    fn graph_with_kind_only(name: &str, file: &str, kind: SymbolKind) -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: file.to_string(),
+            language: Language::Rust,
+            symbols: vec![Symbol {
+                name: name.to_string(),
+                kind,
+                file: file.to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: String::new(),
+                namespace: String::new(),
+                parent: String::new(),
+                language: Language::Rust,
+            }],
+            edges: vec![],
+        });
+        g
+    }
+
+    #[test]
+    fn get_callers_on_struct_returns_soft_hint_success() {
+        // Foo is a Struct with no callers. The handler must:
+        //  (a) return CallToolResult success (not is_error=true),
+        //  (b) name the kind ("struct") and the symbol basename ("Foo")
+        //      in the advisory text,
+        //  (c) suggest the right alternative tool (get_class_hierarchy
+        //      OR get_symbol_detail),
+        //  (d) NOT return the Page<CallChain> envelope (a client that
+        //      parsed `results: []` from this response would fail).
+        let g = locked(graph_with_kind_only("Foo", "/lib.rs", SymbolKind::Struct));
+        let r = callers_or_callees(
+            &g,
+            "/lib.rs:Foo",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        // Soft-hint is a SUCCESS, not an error — per the core invariant.
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = body_text(&r);
+        assert!(
+            text.contains("Foo is a struct"),
+            "advisory must name the symbol basename + kind: got {text:?}",
+        );
+        assert!(
+            text.contains("get_class_hierarchy") || text.contains("get_symbol_detail"),
+            "advisory must point at an alternative tool: got {text:?}",
+        );
+        // The soft-hint shape is plain text, NOT the Page envelope. Parsing
+        // it as JSON would fail; this pins the shape-distinction contract.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&text).is_err(),
+            "soft-hint body must be plain text, not JSON envelope: got {text:?}",
+        );
+    }
+
+    #[test]
+    fn get_callees_on_enum_returns_soft_hint_success() {
+        // Same shape as the struct test, in the callees direction and
+        // for kind=Enum. Briefer: confirms the kind set is consulted via
+        // the predicate, not hard-coded to Struct.
+        let g = locked(graph_with_kind_only("Color", "/lib.rs", SymbolKind::Enum));
+        let r = callers_or_callees(
+            &g,
+            "/lib.rs:Color",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = body_text(&r);
+        assert!(
+            text.contains("Color is a enum") || text.contains("Color is an enum"),
+            "advisory must name the symbol basename + kind: got {text:?}",
+        );
+        assert!(
+            text.contains("get_class_hierarchy") || text.contains("get_symbol_detail"),
+            "advisory must point at an alternative tool: got {text:?}",
+        );
+    }
+
+    #[test]
+    fn get_callers_on_trait_returns_soft_hint_with_hierarchy_hint() {
+        // For trait specifically, the advisory should suggest
+        // get_class_hierarchy — the natural alternative for an inheritance
+        // walk. (alternative_tool_hint() picks hierarchy for structural
+        // kinds; pinning the trait case keeps the per-kind dispatch from
+        // collapsing to a single string by accident.)
+        let g = locked(graph_with_kind_only(
+            "Lifecycle",
+            "/lib.rs",
+            SymbolKind::Trait,
+        ));
+        let r = callers_or_callees(
+            &g,
+            "/lib.rs:Lifecycle",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let text = body_text(&r);
+        assert!(
+            text.contains("Lifecycle is a trait"),
+            "advisory must name the symbol basename + kind: got {text:?}",
+        );
+        assert!(
+            text.contains("get_class_hierarchy"),
+            "trait advisory must specifically suggest get_class_hierarchy: got {text:?}",
+        );
+    }
+
+    #[test]
+    fn get_callers_on_function_with_no_callers_still_returns_empty_envelope() {
+        // Disjoint-kind-set contract: a `Function` (callable) with zero
+        // callers must STILL return the empty `Page<CallChain>` envelope,
+        // NOT the soft-hint. Mirrors `callers_known_symbol_with_no_callers
+        // _returns_empty_envelope` but stated as the contrapositive of the
+        // soft-hint branch — if a Function ever triggered the hint, the
+        // load-bearing test would break.
+        //
+        // `graph_with_calls()` plants `a`, `b`, `c` as `SymbolKind::Function`
+        // (via `sym`) with edges a→b→c. `/x.cpp:a` has no callers.
+        let g = locked(graph_with_calls());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:a",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        // Must be the Page<CallChain> envelope, not the soft-hint text.
+        // page_parts asserts the body parses as JSON with the envelope
+        // shape; this is byte-identical to the load-bearing
+        // `callers_known_symbol_with_no_callers_returns_empty_envelope`
+        // test above, stated as a soft-hint anti-regression.
+        let (arr, total, _, _) = page_parts(&r);
+        assert!(
+            arr.is_empty(),
+            "callable-no-callers must return empty envelope, not soft hint"
+        );
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn get_callers_on_function_with_only_unresolved_callees_still_returns_empty_envelope() {
+        // The resolved-only BFS filter (`Graph::callers`/`callees` keep only
+        // hops whose target is a key in `Graph::nodes`) makes this case
+        // reachable: a Function whose only outgoing call edges target
+        // unresolved tokens (`Ok`, `tracing::info!`, …) ends up with an
+        // empty chain set after filtering. The kind is still `Function`
+        // (callable), so the non-callable soft-hint branch MUST NOT fire
+        // here — the result is the empty envelope.
+        //
+        // Anti-regression vs. confusing the resolved-only filter (callable
+        // kind, unresolved-only edges → empty envelope) with the soft hint
+        // (non-callable kind, no callers → advisory). Both produce an empty
+        // chain set; only the kind distinguishes them.
+        let mut g = Graph::new();
+        // `caller` is a Function whose only outgoing edge points to
+        // `unresolved_token` — a symbol id that is NOT a key in nodes.
+        // Plant the function symbol but no symbol for the target.
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("caller", "/x.cpp")],
+            edges: vec![call_edge("/x.cpp:caller", "unresolved_token", "/x.cpp", 1)],
+        });
+        let g = locked(g);
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:caller",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        // Must be the empty Page<CallChain> envelope, not a soft hint.
+        let (arr, total, _, _) = page_parts(&r);
+        assert!(
+            arr.is_empty(),
+            "Function with only unresolved callees must return empty envelope, not soft hint",
+        );
+        assert_eq!(total, 0);
+    }
+
+    // --- symbol_id_basename / non-callable predicate unit tests ----------
+
+    #[test]
+    fn symbol_id_basename_handles_free_and_method_shapes() {
+        // Free function: file:name → name.
+        assert_eq!(symbol_id_basename("/x.cpp:foo"), "foo");
+        // Method: file:Parent::name → name (after the LAST `::`).
+        assert_eq!(symbol_id_basename("/x.cpp:Widget::do_thing"), "do_thing");
+        // Nested parent (defensive): file:Outer::Inner::name → name.
+        assert_eq!(symbol_id_basename("/x.cpp:Outer::Inner::m"), "m",);
+        // No separator (degenerate): identity.
+        assert_eq!(symbol_id_basename("foo"), "foo");
+    }
+
+    #[test]
+    fn is_non_callable_kind_is_disjoint_from_callable_kinds() {
+        // The soft-hint kind set MUST NOT contain Function/Method (or
+        // Class — historically callable as constructor in C++/C#/Java).
+        // The empty-envelope contract for callable-with-no-resolved-callers
+        // (the resolved-only BFS filter's natural empty case) depends on
+        // this disjointness.
+        assert!(!is_non_callable_kind(SymbolKind::Function));
+        assert!(!is_non_callable_kind(SymbolKind::Method));
+        assert!(!is_non_callable_kind(SymbolKind::Class));
+        // Structural kinds: hint fires.
+        assert!(is_non_callable_kind(SymbolKind::Struct));
+        assert!(is_non_callable_kind(SymbolKind::Enum));
+        assert!(is_non_callable_kind(SymbolKind::Trait));
+        assert!(is_non_callable_kind(SymbolKind::Typedef));
+        assert!(is_non_callable_kind(SymbolKind::Interface));
     }
 
     // --- pagination invariants --------------------------------------------
