@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 code-graph-core = { path = "../code-graph-core" }
+code-graph-graph = { path = "../code-graph-graph" }
 code-graph-lang = { path = "../code-graph-lang" }
 code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
 code-graph-lang-csharp = { path = "../code-graph-lang-csharp" }

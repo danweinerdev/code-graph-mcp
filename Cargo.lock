@@ -326,6 +326,7 @@ name = "code-graph-parse-test"
 version = "0.1.0"
 dependencies = [
  "code-graph-core",
+ "code-graph-graph",
  "code-graph-lang",
  "code-graph-lang-cpp",
  "code-graph-lang-csharp",
