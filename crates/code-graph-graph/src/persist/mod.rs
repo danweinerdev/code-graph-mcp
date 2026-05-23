@@ -81,11 +81,24 @@ pub const SWEEP_INTERVAL_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 /// Version-mismatch, missing-file, endian-probe-mismatch, and archive
 /// corruption are **not** errors — they surface as `Ok(false)` on
 /// `load` so the caller can silently re-index. Only true IO failures
-/// (permission, disk full, etc.) escape as `Err`.
+/// (permission, disk full, etc.) and writer-bug class inconsistencies
+/// inside an otherwise bytecheck-passing archive escape as `Err`.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// rkyv's bytecheck validated the archive and the version matches,
+    /// but the decoder found an internal inconsistency (PathId / NameId
+    /// out of range against the interner tables, or a stored symbol_id
+    /// that disagrees with the value derived from the symbol's fields).
+    /// All three indicate an **encoder bug** — a bytecheck-passing
+    /// archive cannot legitimately have out-of-range ids, since the
+    /// encoder is the only writer of both the ids and the tables they
+    /// index. Surfaces as a hard error rather than silent re-index so
+    /// the bug is visible instead of getting masked by a re-encode that
+    /// would persist the same bug shape.
+    #[error("packed cache corrupted (encoder bug): {detail}")]
+    CorruptedCache { detail: String },
 }
 
 // v4 DTO machinery (GraphCache / GraphCacheRef / StalePathsCache /
@@ -186,72 +199,162 @@ impl Graph {
     /// - `Err(PersistError::Io)` — read failure other than not-found
     ///   (permission, disk error, etc.).
     pub fn load(&mut self, dir: &Path) -> Result<bool, PersistError> {
-        let path = cache_path(dir);
-
-        // mmap the cache file (read-only, zero-copy). The one unsafe
-        // boundary in this crate; see `mmap::mmap_read_only`'s SAFETY
-        // block.
-        let holder = match mmap::mmap_read_only(&path)? {
-            Some(h) => h,
-            None => return Ok(false), // cache file absent or zero-byte
-        };
-        let bytes = holder.as_bytes();
-
-        // Header: too small → treat as cache-absent.
-        if bytes.len() < packed::HEADER_SIZE {
-            return Ok(false);
-        }
-
-        // Endian probe: a host whose native u32 doesn't match
-        // ENDIAN_PROBE was either written on a different endianness
-        // (rare) or read a corrupted file. Re-index either way.
-        let probe = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if probe != packed::ENDIAN_PROBE {
-            return Ok(false);
-        }
-        let version = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if version != CACHE_VERSION {
-            return Ok(false);
-        }
-
-        // rkyv::access validates the archive (bytecheck pass) and
-        // returns a typed view into the mapped bytes. Bytecheck
-        // failure → corrupt cache → re-index. We then walk the
-        // archived view directly via `packed::decode_archived`,
-        // skipping the intermediate `rkyv::deserialize` pass that
-        // would have allocated a full owned `PackedCacheV6` on the
-        // heap. The direct walk allocates only the live Graph's
-        // HashMaps, saving one O(N) allocation pass on every load.
-        let archive_bytes = &bytes[packed::HEADER_SIZE..];
-        let archived = match rkyv::access::<
-            <packed::PackedCacheV6 as rkyv::Archive>::Archived,
-            rkyv::rancor::Error,
-        >(archive_bytes)
-        {
-            Ok(a) => a,
-            Err(_) => return Ok(false),
-        };
-
-        // Sanity-check the embedded version field (the rkyv version
-        // and the header version should agree; if they don't, treat
-        // as corrupt).
-        if archived.version.to_native() != CACHE_VERSION {
-            return Ok(false);
-        }
-
-        let parts = match packed::decode_archived(archived) {
-            Ok(p) => p,
-            Err(_) => return Ok(false),
-        };
-
-        self.nodes = parts.nodes;
-        self.adj = parts.adj;
-        self.radj = parts.radj;
-        self.files = parts.files;
-        self.includes = parts.includes;
-        self.last_sweep_at = parts.last_sweep_at;
-        Ok(true)
+        // Single-decode entry point. Delegates to `load_and_stale` and
+        // throws the stale-paths list away. Callers in the
+        // `analyze_codebase` fast-path that need BOTH the loaded graph
+        // AND the stale-paths list should call `load_and_stale`
+        // directly — it amortizes the one mmap + bytecheck pass.
+        Ok(self.load_and_stale(dir)?.0)
     }
+
+    /// Combined load + stale-paths in one cache-file open.
+    ///
+    /// `Graph::load` and the top-level [`stale_paths`] both mmap the
+    /// cache file independently and pay a separate bytecheck pass
+    /// (~10–50 ms on a ~25 MB cache). The `analyze_codebase` fast-path
+    /// needs both within microseconds of each other; calling them
+    /// sequentially doubles the bytecheck cost on every cache-hit
+    /// invocation. This entry point does the mmap + header probe +
+    /// bytecheck ONCE, then walks the same archived view for both
+    /// (1) the live graph decode (mutating `self`) and (2) the
+    /// mtime-staleness list.
+    ///
+    /// Returns `(loaded, stale)` where `loaded` mirrors `Graph::load`'s
+    /// bool (true → graph state replaced; false → cache absent or
+    /// stale, graph untouched) and `stale` is the list of cached file
+    /// paths whose on-disk mtime no longer matches (always present
+    /// when `loaded == true`; empty when `loaded == false` since there
+    /// is no archive to walk).
+    pub fn load_and_stale(&mut self, dir: &Path) -> Result<(bool, Vec<PathBuf>), PersistError> {
+        let outcome = with_validated_archive(dir, |archived| {
+            // Walk the archived view directly via
+            // `packed::decode_archived`, skipping the intermediate
+            // `rkyv::deserialize` pass that would have allocated a
+            // full owned `PackedCacheV6` on the heap. The direct walk
+            // allocates only the live Graph's HashMaps, saving one
+            // O(N) allocation pass on every load.
+            let parts = packed::decode_archived(archived)?;
+            let stale = compute_stale_paths(archived);
+            Ok::<_, PersistError>((parts, stale))
+        })?;
+        match outcome {
+            None => Ok((false, Vec::new())),
+            Some((parts, stale)) => {
+                self.nodes = parts.nodes;
+                self.adj = parts.adj;
+                self.radj = parts.radj;
+                self.files = parts.files;
+                self.includes = parts.includes;
+                self.last_sweep_at = parts.last_sweep_at;
+                Ok((true, stale))
+            }
+        }
+    }
+}
+
+/// Internal helper. Mmap the cache file, validate the header (endian
+/// probe and version), run rkyv's bytecheck, and invoke `f` against
+/// the resulting archived view.
+///
+/// Returns `Ok(None)` for every recoverable "cache absent or stale"
+/// condition (missing file, zero-length file, header too small, wrong
+/// endian, wrong version, bytecheck failure) so the caller can route
+/// to silent re-index. Returns `Ok(Some(R))` when `f` ran
+/// successfully. Propagates `Err` for true IO failures and for
+/// errors `f` itself returns.
+///
+/// Emits an `eprintln!` on bytecheck failure so a corrupted cache is
+/// visible in server stderr before the silent re-index happens. Other
+/// "stale" conditions (missing file, version mismatch, etc.) are
+/// expected during normal operation and stay silent.
+fn with_validated_archive<F, R>(dir: &Path, f: F) -> Result<Option<R>, PersistError>
+where
+    F: FnOnce(&<packed::PackedCacheV6 as rkyv::Archive>::Archived) -> Result<R, PersistError>,
+{
+    let path = cache_path(dir);
+
+    // mmap (read-only, zero-copy). The one unsafe boundary in this
+    // crate; see `mmap::mmap_read_only`'s SAFETY block.
+    let holder = match mmap::mmap_read_only(&path)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    let bytes = holder.as_bytes();
+    if bytes.len() < packed::HEADER_SIZE {
+        return Ok(None);
+    }
+
+    // Endian probe: a host whose native u32 doesn't match ENDIAN_PROBE
+    // either read a different-endianness file (rare) or read corrupted
+    // bytes. Re-index either way.
+    let probe = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if probe != packed::ENDIAN_PROBE {
+        return Ok(None);
+    }
+    let version = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != CACHE_VERSION {
+        return Ok(None);
+    }
+
+    let archive_bytes = &bytes[packed::HEADER_SIZE..];
+    let archived = match rkyv::access::<
+        <packed::PackedCacheV6 as rkyv::Archive>::Archived,
+        rkyv::rancor::Error,
+    >(archive_bytes)
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // Bytecheck failure on a header-valid file is a real
+            // corruption signal (disk error, kill-mid-rename,
+            // hand-edit, etc.). Surface to stderr so the operator
+            // can see corruption events before they're papered over
+            // by the silent re-index. The actual re-index still
+            // happens; we just stop the corruption from being
+            // invisible.
+            eprintln!(
+                "[code-graph] packed cache corrupted ({e}); re-indexing {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+
+    // Sanity-check the embedded version field (the rkyv version and
+    // the header version should agree; if they don't, treat as
+    // corrupt).
+    if archived.version.to_native() != CACHE_VERSION {
+        return Ok(None);
+    }
+
+    Ok(Some(f(archived)?))
+}
+
+/// Walk an already-validated archive's `paths` + `mtimes` columns and
+/// return the cached paths whose on-disk mtime no longer matches.
+/// Files that no longer exist (or whose mtime cannot be read) are
+/// included so the indexer treats them as stale.
+fn compute_stale_paths(
+    archived: &<packed::PackedCacheV6 as rkyv::Archive>::Archived,
+) -> Vec<PathBuf> {
+    let mut stale = Vec::new();
+    for (id, cached_nanos) in archived.mtimes.iter() {
+        let id_val: u32 = (*id).into();
+        if id_val == 0 {
+            continue;
+        }
+        let idx = id_val as usize - 1;
+        let Some(archived_path) = archived.paths.get(idx) else {
+            continue;
+        };
+        let path = PathBuf::from(archived_path.as_str());
+        let cached_val: u64 = (*cached_nanos).into();
+        match mtime_nanos(&path) {
+            None => stale.push(path),
+            Some(c) if c != cached_val => stale.push(path),
+            _ => {}
+        }
+    }
+    stale
 }
 
 /// Returns indexed files whose on-disk mtime differs from the cached
@@ -272,58 +375,10 @@ impl Graph {
 /// invoke `stale_paths` before `load` without a special-case for
 /// first-run.
 pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
-    let path = cache_path(dir);
-
-    let holder = match mmap::mmap_read_only(&path)? {
-        Some(h) => h,
-        None => return Ok(Vec::new()),
-    };
-    let bytes = holder.as_bytes();
-    if bytes.len() < packed::HEADER_SIZE {
-        return Ok(Vec::new());
-    }
-    let probe = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if probe != packed::ENDIAN_PROBE {
-        return Ok(Vec::new());
-    }
-    let version = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != CACHE_VERSION {
-        return Ok(Vec::new());
-    }
-
-    let archive_bytes = &bytes[packed::HEADER_SIZE..];
-    let archived = match rkyv::access::<
-        <packed::PackedCacheV6 as rkyv::Archive>::Archived,
-        rkyv::rancor::Error,
-    >(archive_bytes)
-    {
-        Ok(a) => a,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    // Walk the archived view directly for `paths` + `mtimes` — no
-    // owned-`PackedCacheV6` allocation needed. `ArchivedHashMap`
-    // iteration yields `(&u32, &u64)` pairs; we resolve each PathId
-    // against the `ArchivedVec<ArchivedString>` paths table.
-    let mut stale = Vec::new();
-    for (id, cached_nanos) in archived.mtimes.iter() {
-        let id_val: u32 = (*id).into();
-        if id_val == 0 {
-            continue;
-        }
-        let idx = id_val as usize - 1;
-        let Some(archived_path) = archived.paths.get(idx) else {
-            continue;
-        };
-        let path = PathBuf::from(archived_path.as_str());
-        let cached_val: u64 = (*cached_nanos).into();
-        match mtime_nanos(&path) {
-            None => stale.push(path),
-            Some(c) if c != cached_val => stale.push(path),
-            _ => {}
-        }
-    }
-    Ok(stale)
+    Ok(
+        with_validated_archive(dir, |archived| Ok(compute_stale_paths(archived)))?
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -445,24 +500,20 @@ mod tests {
 
     #[test]
     fn load_version_mismatch_returns_false() {
-        // A structurally-valid v6 cache with a wrong version trips the
-        // version-check Ok(false) branch — graph state is untouched
-        // and the caller is expected to silently re-index.
+        // A well-formed v7+ binary header with a wrong version trips
+        // the *version-check* Ok(false) branch — graph state untouched,
+        // caller silently re-indexes. Previously this test wrote JSON
+        // to the .db path, which failed at the *endian probe* gate
+        // before the version check could ever fire; the assertion
+        // passed but the branch it claimed to cover wasn't exercised.
+        // Writing the correct ENDIAN_PROBE + a sentinel-bad version
+        // gets us past the endian gate and into the version-check
+        // arm that this test's name promises.
         let dir = TempDir::new().unwrap();
-        let mismatched = serde_json::json!({
-            "version": 99,
-            "generator": "test",
-            "last_sweep_at": 0,
-            "paths": [],
-            "names": [],
-            "nodes": {},
-            "adj": {},
-            "radj": {},
-            "files": {},
-            "includes": {},
-            "mtimes": {},
-        });
-        std::fs::write(cache_path(dir.path()), mismatched.to_string()).unwrap();
+        let mut bytes = Vec::with_capacity(packed::HEADER_SIZE);
+        bytes.extend_from_slice(&packed::ENDIAN_PROBE.to_ne_bytes());
+        bytes.extend_from_slice(&99u32.to_ne_bytes()); // bogus version
+        std::fs::write(cache_path(dir.path()), &bytes).unwrap();
 
         let mut g = Graph::new();
         let ok = g.load(dir.path()).unwrap();
@@ -470,21 +521,22 @@ mod tests {
     }
 
     #[test]
-    fn load_v4_shape_cache_returns_false() {
-        // A leftover v4-shape cache (full strings, no interner tables)
-        // fails to deserialize into PackedCacheV6 — the load path
-        // converts that into Ok(false) → silent re-index. Confirms the
-        // documented v4→v6 cache-invalidation contract.
+    fn load_legacy_json_cache_returns_false() {
+        // A leftover .code-graph-cache.db file containing the pre-v7
+        // JSON wire (e.g. a v6 file renamed into place, or a hostile
+        // build that wrote JSON to the new path) must route to silent
+        // re-index. The v7+ loader's endian-probe gate catches it
+        // before any rkyv work happens: a JSON file starting with `{`
+        // (0x7B) doesn't match ENDIAN_PROBE (0x01020304 on LE), and
+        // the loader returns `Ok(false)` immediately. Documents the
+        // *path* a leftover-JSON file takes through the loader, not
+        // a version-check exercise (`load_version_mismatch_returns_false`
+        // covers that separately with a real binary header).
         let dir = TempDir::new().unwrap();
         let v4_shape = serde_json::json!({
             "version": 4,
             "generator": "code-graph-graph (rust)",
             "nodes": {},
-            "adj": {},
-            "radj": {},
-            "files": {},
-            "includes": {},
-            "mtimes": {},
         });
         std::fs::write(cache_path(dir.path()), v4_shape.to_string()).unwrap();
 
@@ -492,21 +544,55 @@ mod tests {
         let ok = g.load(dir.path()).unwrap();
         assert!(
             !ok,
-            "v4-shape cache must trip the silent-re-index path (Ok(false)), not error"
+            "legacy JSON content must trip Ok(false) (endian-probe fail), not error"
         );
     }
 
     #[test]
-    fn load_invalid_json_returns_ok_false() {
-        // Pre-v6 behavior was `Err(PersistError::Json)`; v6 silently
-        // re-indexes on every parse failure, matching the design
-        // (Decision 7 — "Bump only" + cache_load returns Ok(false) on
-        // any failure mode short of IO error).
+    fn load_non_binary_garbage_returns_false() {
+        // Arbitrary garbage at the cache path must route to silent
+        // re-index via the endian-probe gate, not surface as an
+        // error. Earlier name `load_invalid_json_returns_ok_false`
+        // mislead readers about which branch was exercised — this
+        // wasn't a JSON-parse test (v7+ never tries to parse JSON);
+        // it's a "non-binary input handled gracefully" test.
         let dir = TempDir::new().unwrap();
-        std::fs::write(cache_path(dir.path()), b"this is not json {[").unwrap();
+        std::fs::write(cache_path(dir.path()), b"this is not a binary cache").unwrap();
         let mut g = Graph::new();
         let ok = g.load(dir.path()).unwrap();
         assert!(!ok);
+    }
+
+    #[test]
+    fn encode_is_deterministic() {
+        // PackedCache design Goal 4: `sha256(encode(g)) ==
+        // sha256(encode(g))` across independent encodes of the same
+        // logical graph. The encoder must sort keys before interning
+        // (so `lasso::Rodeo` assigns Spurs in a stable order) and
+        // walk hash maps via the sorted-key iteration helper. A
+        // future refactor that broke determinism — e.g., by interning
+        // off the raw HashMap iter — would change the byte output
+        // even though the in-memory graph is identical, and that
+        // would silently invalidate every test that compares cache
+        // bytes across runs. Save twice, compare archives.
+        let dir = TempDir::new().unwrap();
+        let g = build_sample_graph();
+        g.save(dir.path()).unwrap();
+        let bytes_a = std::fs::read(cache_path(dir.path())).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        g.save(dir2.path()).unwrap();
+        let bytes_b = std::fs::read(cache_path(dir2.path())).unwrap();
+
+        assert_eq!(
+            bytes_a.len(),
+            bytes_b.len(),
+            "two encodes of the same graph must produce equal-length archives",
+        );
+        assert_eq!(
+            bytes_a, bytes_b,
+            "encode is byte-deterministic on the same input — PackedCache Goal 4",
+        );
     }
 
     #[test]

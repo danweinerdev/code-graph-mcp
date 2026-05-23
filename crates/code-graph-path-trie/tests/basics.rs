@@ -135,3 +135,70 @@ fn relative_and_absolute_are_distinct_keys() {
     assert_eq!(t.get("foo"), Some(&2));
     assert_eq!(t.len(), 2);
 }
+
+// --- `.` / `..` segment behavior pinning -----------------------------
+//
+// `segments_of` walks `Path::components()`, which performs partial
+// std-library normalization on the way out:
+//   - `.` (`Component::CurDir`) IS stripped — `/a/./b` yields the
+//     same components as `/a/b`, so the trie treats them as the same
+//     key. This is std behavior, not trie behavior; documenting it
+//     here so callers aren't surprised.
+//   - `..` (`Component::ParentDir`) is NOT resolved — it's passed
+//     through as a literal segment. `/a/b/../c` is a 5-segment key,
+//     distinct from `/a/c`. Resolving `..` would require knowing
+//     whether intermediate segments are symlinks; std punts on this,
+//     so does the trie.
+//   - Trailing `/` is stripped (`/a/b/` ≡ `/a/b`).
+//   - Repeated `//` is collapsed (`/a//b` ≡ `/a/b`).
+//
+// Production callers in `code-graph-mcp` canonicalize via
+// `dunce::canonicalize` before the trie sees a path, so `..` doesn't
+// reach this layer in practice. The tests below pin the per-segment
+// behavior so a future regression — or a future caller who skips
+// canonicalization — finds out immediately.
+
+#[test]
+fn dot_segment_is_stripped_by_path_components() {
+    // `Path::components()` strips `Component::CurDir`, so `/a/./b`
+    // and `/a/b` map to the same trie key.
+    let mut t: PathTrie<u8> = PathTrie::new();
+    t.insert("/a/b", 1);
+    assert_eq!(t.get("/a/./b"), Some(&1));
+    assert_eq!(t.get("/a/b"), Some(&1));
+    // Inserting via `/a/./b` writes the same key as `/a/b`, so the
+    // trie does NOT grow.
+    t.insert("/a/./b", 2);
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.get("/a/b"), Some(&2), "second insert overwrote in place");
+}
+
+#[test]
+fn dotdot_segment_is_literal_not_resolved() {
+    let mut t: PathTrie<u8> = PathTrie::new();
+    t.insert("/a/c", 1);
+    // `/a/b/../c` keeps `..` as a literal `ParentDir` segment, so
+    // the lookup misses the resolved `/a/c` form.
+    assert_eq!(
+        t.get("/a/b/../c"),
+        None,
+        "the trie does NOT resolve `..` segments — callers must canonicalize first"
+    );
+    assert_eq!(t.get("/a/c"), Some(&1));
+}
+
+#[test]
+fn trailing_slash_is_stripped_by_path_components() {
+    let mut t: PathTrie<u8> = PathTrie::new();
+    t.insert("/a/b", 1);
+    assert_eq!(t.get("/a/b"), Some(&1));
+    assert_eq!(t.get("/a/b/"), Some(&1));
+}
+
+#[test]
+fn double_slash_is_collapsed_by_path_components() {
+    let mut t: PathTrie<u8> = PathTrie::new();
+    t.insert("/a/b", 1);
+    assert_eq!(t.get("/a//b"), Some(&1));
+    assert_eq!(t.get("/a///b"), Some(&1));
+}

@@ -270,8 +270,12 @@ pub fn search_symbols(
 
     let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
-    // Normalize subtree the same way every path-taking tool does;
-    // empty / absent = whole graph.
+    // Normalize subtree the same way every path-taking tool does.
+    // Scope validation lives at the server-dispatch boundary in
+    // `CodeGraphServer::validate_subtree`; by the time this function
+    // is called, `input.subtree` is either absent / empty (no filter)
+    // or an already-canonical path proven to be at or under the
+    // indexed root.
     let resolved_subtree: Option<std::path::PathBuf> = input
         .subtree
         .filter(|s| !s.is_empty())

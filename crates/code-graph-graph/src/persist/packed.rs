@@ -35,7 +35,7 @@ use crate::graph::{EdgeEntry, FileEntry, Graph, IncludeEntry, Node};
 use code_graph_core::{symbol_id, Confidence, EdgeKind, Language, Symbol, SymbolId, SymbolKind};
 use lasso::{Key, Rodeo, Spur};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Current packed cache schema version.
@@ -50,12 +50,23 @@ use std::path::{Path, PathBuf};
 ///   with the field bits aliased over the next edge's storage. Bump
 ///   forces every pre-v8 cache through the documented silent re-index
 ///   path before any decode is attempted.
+/// - v9: every `HashMap<u32, V>` field in [`PackedCacheV6`] (`nodes`,
+///   `adj`, `radj`, `files`, `includes`, `mtimes`) switched to
+///   `BTreeMap<u32, V>` so the rkyv archived wire emits entries in
+///   sorted-by-key order. The HashMap form's archived layout iterates
+///   in std-HashMap insertion order, which is `RandomState`-seeded
+///   per-instance — two encodes of the same in-memory graph produced
+///   different byte sequences (PackedCache Goal 4 violation, caught
+///   by the `encode_is_deterministic` test). The change is wire-shape
+///   incompatible (`ArchivedHashMap` ≠ `ArchivedBTreeMap`), so pre-v9
+///   caches fail bytecheck and route to silent re-index via the
+///   existing version-check path.
 ///
 /// This constant is the single source of truth for the on-disk
 /// version. `super::CACHE_VERSION` is a re-export at the module
 /// boundary so the rest of the crate's call sites don't have to know
 /// which sub-module owns it.
-pub const CACHE_VERSION: u32 = 8;
+pub const CACHE_VERSION: u32 = 9;
 
 /// 4-byte native-endian probe at file offset 0. A reader whose host
 /// endianness disagrees with the writer's reads a different `u32`
@@ -102,25 +113,35 @@ pub(crate) struct PackedCacheV6 {
     /// the full interned `SymbolId` strings used as map keys.
     pub names: Vec<String>,
 
+    // The six maps below are `BTreeMap` rather than `HashMap` so
+    // archived iteration is sorted-by-key. Without this, rkyv emits
+    // `HashMap` entries in std `HashMap`'s randomized iteration order
+    // (per-instance, seeded from `RandomState`), and two encodes of
+    // the same in-memory `Graph` produce different bytes — violating
+    // PackedCache Goal 4 ("deterministic byte output across runs on
+    // the same input"). `BTreeMap` fixes the iteration order without
+    // changing the conceptual schema, only its on-disk representation;
+    // requires a `CACHE_VERSION` bump since archived `HashMap` and
+    // `BTreeMap` have different rkyv wire formats.
     /// `node_id (NameId of full SymbolId)` → `PackedSymbol`.
-    pub nodes: HashMap<u32, PackedSymbol>,
+    pub nodes: BTreeMap<u32, PackedSymbol>,
 
     /// `from_id (NameId)` → outgoing edges.
-    pub adj: HashMap<u32, Vec<PackedEdge>>,
+    pub adj: BTreeMap<u32, Vec<PackedEdge>>,
 
     /// `to_id (NameId)` → incoming edges. May contain `from_id`s that
     /// are not in `nodes` (bare-token unresolved targets).
-    pub radj: HashMap<u32, Vec<PackedEdge>>,
+    pub radj: BTreeMap<u32, Vec<PackedEdge>>,
 
     /// `file_path_id (PathId)` → file metadata.
-    pub files: HashMap<u32, PackedFile>,
+    pub files: BTreeMap<u32, PackedFile>,
 
     /// `file_path_id (PathId)` → include list.
-    pub includes: HashMap<u32, Vec<PackedInclude>>,
+    pub includes: BTreeMap<u32, Vec<PackedInclude>>,
 
     /// `file_path_id (PathId)` → mtime nanos. Files whose mtime can't
     /// be read are recorded as `0` so `stale_paths` re-flags them.
-    pub mtimes: HashMap<u32, u64>,
+    pub mtimes: BTreeMap<u32, u64>,
 }
 
 /// Per-symbol record. Layout mirrors [`Symbol`] but every string is an
@@ -325,7 +346,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     sorted_radj_keys.sort();
 
     // ----- Encode nodes. -----
-    let mut packed_nodes: HashMap<u32, PackedSymbol> = HashMap::with_capacity(graph.nodes.len());
+    let mut packed_nodes: BTreeMap<u32, PackedSymbol> = BTreeMap::new();
     for sid in &sorted_node_ids {
         let node = &graph.nodes[*sid];
         let sym = &node.symbol;
@@ -351,7 +372,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     let packed_radj = encode_edge_map(&sorted_radj_keys, &graph.radj, &mut names, &mut paths);
 
     // ----- Encode files map (and capture per-file SymbolId references). -----
-    let mut packed_files: HashMap<u32, PackedFile> = HashMap::with_capacity(graph.files.len());
+    let mut packed_files: BTreeMap<u32, PackedFile> = BTreeMap::new();
     for path in &sorted_file_paths {
         let fe = graph.files.get(path).expect("path was just iterated");
         let path_id = paths.intern(path);
@@ -368,8 +389,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     }
 
     // ----- Encode includes map. -----
-    let mut packed_includes: HashMap<u32, Vec<PackedInclude>> =
-        HashMap::with_capacity(graph.includes.len());
+    let mut packed_includes: BTreeMap<u32, Vec<PackedInclude>> = BTreeMap::new();
     for path in &sorted_include_keys {
         let entries = graph.includes.get(path).expect("path was just iterated");
         let path_id = paths.intern(path);
@@ -385,7 +405,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     }
 
     // ----- Encode mtimes map. -----
-    let mut packed_mtimes: HashMap<u32, u64> = HashMap::with_capacity(mtimes_raw.len());
+    let mut packed_mtimes: BTreeMap<u32, u64> = BTreeMap::new();
     for (path, nanos) in mtimes_raw {
         let path_id = paths.intern(&path);
         packed_mtimes.insert(path_id, nanos);
@@ -411,8 +431,8 @@ fn encode_edge_map(
     map: &HashMap<SymbolId, Vec<EdgeEntry>>,
     names: &mut EncodingStringInterner,
     paths: &mut EncodingPathInterner,
-) -> HashMap<u32, Vec<PackedEdge>> {
-    let mut out: HashMap<u32, Vec<PackedEdge>> = HashMap::with_capacity(map.len());
+) -> BTreeMap<u32, Vec<PackedEdge>> {
+    let mut out: BTreeMap<u32, Vec<PackedEdge>> = BTreeMap::new();
     for sid in sorted_keys {
         let entries = &map[*sid];
         let key_id = names.intern(sid);
@@ -611,7 +631,7 @@ pub(crate) fn decode_archived(
 }
 
 fn decode_archived_edge_map(
-    map: &<HashMap<u32, Vec<PackedEdge>> as rkyv::Archive>::Archived,
+    map: &<BTreeMap<u32, Vec<PackedEdge>> as rkyv::Archive>::Archived,
     resolver: &ArchivedResolver,
 ) -> Result<HashMap<SymbolId, Vec<EdgeEntry>>, DecodeError> {
     let mut out: HashMap<SymbolId, Vec<EdgeEntry>> = HashMap::with_capacity(map.len());
@@ -679,8 +699,16 @@ impl ArchivedResolver<'_> {
     }
 }
 
-/// Errors raised by [`decode`]. Surfaces to [`Graph::load`] which maps
-/// them to `Ok(false)` (silent re-index).
+/// Errors raised by `decode_archived`. Every variant indicates that
+/// the encoder produced an inconsistency that bytecheck couldn't
+/// catch — the archive structurally validates but a column references
+/// an id that doesn't exist in its interner table, or a stored
+/// `SymbolId` disagrees with the value derived from the symbol's
+/// fields. All three are writer-side bugs by construction (only the
+/// encoder writes both the ids AND the tables they index into), so
+/// `Graph::load` propagates them as hard `PersistError::CorruptedCache`
+/// rather than silent re-index: silently re-encoding the same bug
+/// shape would just persist it.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DecodeError {
     #[error("path id {0} out of range")]
@@ -689,6 +717,14 @@ pub(crate) enum DecodeError {
     NameOutOfRange(u32),
     #[error("stored symbol_id {stored:?} disagrees with derived {derived:?}")]
     InconsistentSymbolId { stored: String, derived: String },
+}
+
+impl From<DecodeError> for super::PersistError {
+    fn from(e: DecodeError) -> Self {
+        super::PersistError::CorruptedCache {
+            detail: e.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

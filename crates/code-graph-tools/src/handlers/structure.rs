@@ -74,6 +74,16 @@ pub fn detect_cycles(
     // itself to a subtree would change the answer (a cycle through a
     // file outside the subtree would never be found, hiding real
     // cyclic dependencies). The subtree filter just narrows reporting.
+    //
+    // **Scope validation lives at the server-dispatch boundary** in
+    // `CodeGraphServer::validate_subtree`, NOT here. By the time
+    // `detect_cycles` is called, `subtree` is either absent / empty
+    // (no filter) or an already-canonical path proven to be at or
+    // under the indexed root — out-of-scope inputs (e.g.
+    // `subtree="../.."` canonicalizing to a project-root ancestor)
+    // have already been rejected with a tool error before this
+    // function ran. `normalize_user_path` here is therefore
+    // idempotent on the server-validated value.
     let subtree_prefix: Option<std::path::PathBuf> = subtree
         .filter(|s| !s.is_empty())
         .map(code_graph_core::paths::normalize_user_path);
@@ -239,12 +249,15 @@ pub fn get_orphans(
         }
     };
 
-    // Subtree filter (Phase E). `subtree` is normalized through the
-    // same path-canonicalization callers expect for every other
-    // path-taking tool. An empty / absent value means "whole graph";
-    // a non-empty value routes through `Graph::orphans_under` which
-    // walks the path-trie's `iter_subtree` instead of scanning every
-    // node — bounded work proportional to the directory subtree.
+    // Subtree filter (Phase E). Scope validation lives at the
+    // server-dispatch boundary in `CodeGraphServer::validate_subtree`;
+    // by the time this function is called, `subtree` is either
+    // absent / empty (no filter) or an already-canonical path proven
+    // to be at or under the indexed root. Empty / absent value means
+    // "whole graph"; a valid non-empty value routes through
+    // `Graph::orphans_under` which walks the path-trie's
+    // `iter_subtree` — bounded work proportional to the directory
+    // subtree.
     let subtree_prefix: Option<std::path::PathBuf> = subtree
         .filter(|s| !s.is_empty())
         .map(code_graph_core::paths::normalize_user_path);

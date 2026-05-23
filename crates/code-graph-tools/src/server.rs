@@ -201,6 +201,48 @@ impl CodeGraphServer {
             )]))
         }
     }
+
+    /// Validate a user-supplied `subtree` argument and return either
+    /// the normalized prefix to pass into the handler or a
+    /// `CallToolResult` error envelope ready to return.
+    ///
+    /// `Ok(None)` ↔ caller passed no subtree (or empty string) — the
+    /// handler should run without a subtree filter.
+    /// `Ok(Some(prefix))` ↔ the prefix canonicalized and is at or
+    /// under the indexed project root.
+    /// `Err(envelope)` ↔ the prefix canonicalized to a path outside
+    /// the indexed root. Without this guard,
+    /// `subtree="../.."` would canonicalize to an ancestor and the
+    /// downstream `starts_with(prefix)` walk would silently leak
+    /// results from outside the user's intended scope. Validating
+    /// here, at the single MCP-dispatch boundary, keeps the three
+    /// `subtree=`-taking handlers (`get_orphans`, `detect_cycles`,
+    /// `search_symbols`) consistent without each handler having to
+    /// thread `root_path` and an error branch through its arg list.
+    ///
+    /// The returned `String` is the normalized prefix; handlers
+    /// re-normalize via `paths::normalize_user_path` (idempotent on
+    /// an already-canonical input), so passing the string form keeps
+    /// the existing handler signatures untouched.
+    pub fn validate_subtree(&self, raw: Option<&str>) -> Result<Option<String>, CallToolResult> {
+        let Some(s) = raw.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let normalized = code_graph_core::paths::normalize_user_path(s);
+        let root_guard = self.inner.root_path.read();
+        if let Some(root) = root_guard.as_deref() {
+            if !normalized.starts_with(root) {
+                return Err(CallToolResult::error(vec![Content::text(format!(
+                    "subtree {:?} resolves to {} which is outside the \
+                     indexed project root {}",
+                    s,
+                    normalized.display(),
+                    root.display(),
+                ))]));
+            }
+        }
+        Ok(Some(normalized.to_string_lossy().into_owned()))
+    }
 }
 
 // Argument structs ---------------------------------------------------------
@@ -722,6 +764,14 @@ impl CodeGraphServer {
             max_distance: args.max_distance,
         };
         let max_bytes = self.inner.config.read().response.max_bytes;
+        let validated_subtree = match self.validate_subtree(input.subtree) {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        };
+        let input = handlers::symbols::SearchSymbolsInput {
+            subtree: validated_subtree.as_deref(),
+            ..input
+        };
         Ok(handlers::symbols::search_symbols(
             &self.inner.graph,
             input,
@@ -1047,9 +1097,13 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        let validated_subtree = match self.validate_subtree(args.subtree.as_deref()) {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        };
         Ok(handlers::structure::detect_cycles(
             &self.inner.graph,
-            args.subtree.as_deref(),
+            validated_subtree.as_deref(),
             args.limit,
             args.offset,
             args.max_cycle_size,
@@ -1085,10 +1139,14 @@ impl CodeGraphServer {
             return Ok(r);
         }
         let max_bytes = self.inner.config.read().response.max_bytes;
+        let validated_subtree = match self.validate_subtree(args.subtree.as_deref()) {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        };
         Ok(handlers::structure::get_orphans(
             &self.inner.graph,
             args.kind.as_deref(),
-            args.subtree.as_deref(),
+            validated_subtree.as_deref(),
             args.limit,
             args.offset,
             args.brief,

@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use code_graph_core::{paths, ConfigError, RootConfig};
-use code_graph_graph::{stale_paths, Graph};
+use code_graph_graph::Graph;
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::RoleServer;
 use rmcp::Peer;
@@ -225,11 +225,17 @@ pub async fn analyze_codebase(
     // of every fast-path hit doing a stat-walk of the scope.
     if !force {
         let mut probe = Graph::new();
-        let load_ok = probe.load(&project_root).unwrap_or(false);
+        // Combined load + staleness check in one mmap+bytecheck pass.
+        // The separate `Graph::load` + `stale_paths` calls would have
+        // mmap'd + bytecheck'd the cache file twice; on a ~25 MB cache
+        // each bytecheck is 10–50 ms, so the fast-path was paying
+        // 20–100 ms of avoidable work per cache-hit invocation.
+        let (load_ok, all_stale) = probe
+            .load_and_stale(&project_root)
+            .unwrap_or((false, Vec::new()));
         if load_ok && probe.files_in_scope_count(&abs_path) > 0 {
-            // `stale_paths` reads all cached mtimes; filter to the
-            // invocation scope to honour lazy/scoped semantics.
-            let all_stale = stale_paths(&project_root).unwrap_or_default();
+            // Filter stale to the invocation scope to honour
+            // lazy/scoped semantics.
             let in_scope_stale: Vec<_> = all_stale
                 .iter()
                 .filter(|p| p.starts_with(&abs_path))

@@ -20,9 +20,14 @@ parking_lot = { workspace = true }
 regex = { workspace = true }
 rkyv = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Test-only: every `serde_json` use in this crate's source lives inside
+# a `#[cfg(test)]` block (verified via grep). Keeping it out of the
+# production `[dependencies]` block trims the crate's apparent
+# dependency surface — workspace consumers that don't pull serde_json
+# elsewhere stay unaffected.
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
