@@ -186,11 +186,12 @@ impl Graph {
 
         // rkyv::access validates the archive (bytecheck pass) and
         // returns a typed view into the mapped bytes. Bytecheck
-        // failure → corrupt cache → re-index. We then deserialize the
-        // archived view into an owned `PackedCacheV6` and feed it to
-        // the existing `decode` path. A direct-archived walk would
-        // avoid the intermediate owned allocation but adds non-trivial
-        // code; defer until benches show it matters.
+        // failure → corrupt cache → re-index. We then walk the
+        // archived view directly via `packed::decode_archived`,
+        // skipping the intermediate `rkyv::deserialize` pass that
+        // would have allocated a full owned `PackedCacheV6` on the
+        // heap. The direct walk allocates only the live Graph's
+        // HashMaps, saving one O(N) allocation pass on every load.
         let archive_bytes = &bytes[packed::HEADER_SIZE..];
         let archived = match rkyv::access::<
             <packed::PackedCacheV6 as rkyv::Archive>::Archived,
@@ -200,20 +201,15 @@ impl Graph {
             Ok(a) => a,
             Err(_) => return Ok(false),
         };
-        let cache: packed::PackedCacheV6 =
-            match rkyv::deserialize::<_, rkyv::rancor::Error>(archived) {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
-            };
 
         // Sanity-check the embedded version field (the rkyv version
         // and the header version should agree; if they don't, treat
         // as corrupt).
-        if cache.version != CACHE_VERSION {
+        if archived.version.to_native() != CACHE_VERSION {
             return Ok(false);
         }
 
-        let parts = match packed::decode(cache) {
+        let parts = match packed::decode_archived(archived) {
             Ok(p) => p,
             Err(_) => return Ok(false),
         };
