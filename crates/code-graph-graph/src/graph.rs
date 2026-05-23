@@ -264,18 +264,16 @@ impl Graph {
     /// contract requires that a `force=true` at a subtree only
     /// invalidates that subtree.
     ///
-    /// Scope membership is `Path::starts_with`-based on the cached file
-    /// path: `/proj/a/b/c.cpp` is in scope `/proj/a` but not in scope
+    /// Scope membership is the path-trie subtree containment relation,
+    /// equivalent to `Path::starts_with` after segment normalization:
+    /// `/proj/a/b/c.cpp` is in scope `/proj/a` but not in scope
     /// `/proj/d`. Both arguments must already be canonicalized; the
     /// indexer guarantees stored paths are absolute and `\\?\`-stripped
-    /// (see CLAUDE.md Core invariants).
+    /// (see CLAUDE.md Core invariants). The trie walk is
+    /// `O(files-in-scope)` rather than the full-map filter the
+    /// pre-Phase-E HashMap shape required.
     pub fn drop_files_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
-        let in_scope: Vec<PathBuf> = self
-            .files
-            .keys()
-            .filter(|p| p.starts_with(scope))
-            .cloned()
-            .collect();
+        let in_scope: Vec<PathBuf> = self.files.iter_subtree(scope).map(|(p, _)| p).collect();
         for path in &in_scope {
             self.remove_file_unsafe(path);
         }
@@ -300,12 +298,7 @@ impl Graph {
     /// to re-parsing but not free. Callers should not invoke this on
     /// the project root unless they intend a full project re-validation.
     pub fn evict_missing_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
-        let candidates: Vec<PathBuf> = self
-            .files
-            .keys()
-            .filter(|p| p.starts_with(scope))
-            .cloned()
-            .collect();
+        let candidates: Vec<PathBuf> = self.files.iter_subtree(scope).map(|(p, _)| p).collect();
         let mut removed = Vec::new();
         for path in candidates {
             if !path.exists() {
@@ -331,13 +324,13 @@ impl Graph {
     /// Cost: one `fs::metadata` per cached file OUTSIDE `scope`. On a
     /// large project this is O(files-out-of-scope) syscalls and is
     /// only done at the configured sweep cadence (default: 24h —
-    /// see persist.rs `LastSweepAt`).
+    /// see persist.rs `LastSweepAt`). Walks the whole trie since the
+    /// query is the complement of a subtree.
     pub fn sweep_missing_out_of_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
         let candidates: Vec<PathBuf> = self
             .files
             .keys()
             .filter(|p| !p.starts_with(scope))
-            .cloned()
             .collect();
         let mut removed = Vec::new();
         for path in candidates {
@@ -347,6 +340,48 @@ impl Graph {
             }
         }
         removed
+    }
+
+    /// Remove every indexed file at or under `prefix`, returning the
+    /// union of symbol IDs that were dropped across all of them.
+    ///
+    /// **Phase E.3 (B) payoff site.** The file-table drop is a single
+    /// `PathTrie::remove_subtree` walk (`O(subtree-size)`) instead of
+    /// the iterate-the-full-files-map-and-filter-by-prefix loop the
+    /// pre-Phase-E HashMap shape would have required. Includes-table
+    /// drop is similarly one trie op. Per-file `adj`/`radj` scrubbing
+    /// still happens linearly across each dropped file's edge sets —
+    /// unavoidable while adj/radj are keyed by `SymbolId`, not by
+    /// path.
+    ///
+    /// Callers (today: the watch handler's directory-remove path)
+    /// must feed the returned `HashSet<SymbolId>` to
+    /// [`Graph::prune_dangling_edges`] to scrub any cross-file edges
+    /// that target the now-removed symbols, mirroring the
+    /// single-file [`Graph::remove_file`] + `prune_dangling_edges`
+    /// dance.
+    ///
+    /// Returns an empty set if `prefix` doesn't match any indexed
+    /// file.
+    pub fn remove_files_under(&mut self, prefix: &Path) -> HashSet<SymbolId> {
+        let mut removed_ids: HashSet<SymbolId> = HashSet::new();
+        // Drop the files-table subtree in one trie op and use the
+        // returned (path, FileEntry) pairs to drive per-file cleanup
+        // of nodes / adj / radj.
+        for (path, entry) in self.files.remove_subtree(prefix) {
+            for id in &entry.symbol_ids {
+                self.nodes.remove(id);
+                removed_ids.insert(id.clone());
+            }
+            Self::retain_edges_not_from(&mut self.adj, &path);
+            Self::retain_edges_not_from(&mut self.radj, &path);
+        }
+        // Includes table: a separate trie op; the dropped entries
+        // need no follow-up since we already scrubbed adj/radj per
+        // file above (and `Includes` edges live in `includes`, not
+        // adj/radj).
+        let _ = self.includes.remove_subtree(prefix);
+        removed_ids
     }
 
     // "unsafe" here means "caller must hold the write lock on the
@@ -804,6 +839,82 @@ mod tests {
         assert!(!g.includes().contains_path(&path_a));
         assert!(!g.files().contains_path(&path_a));
         assert!(g.files().contains_path(PathBuf::from("/b.cpp")));
+    }
+
+    #[test]
+    fn remove_files_under_drops_full_subtree() {
+        // /a/x.cpp and /a/sub/y.cpp both under /a; /b/z.cpp under /b.
+        // remove_files_under("/a") should drop both /a-files and leave
+        // /b alone. Returned symbol-id set must include the dropped
+        // symbols so the caller's prune_dangling_edges pass scrubs
+        // cross-file edges that targeted them.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a/x.cpp",
+            Language::Cpp,
+            vec![sym("foo", SymbolKind::Function, "/a/x.cpp")],
+            vec![include_edge("/a/x.cpp", "/utils.h", "/a/x.cpp")],
+        ));
+        g.merge_file_graph(make_fg(
+            "/a/sub/y.cpp",
+            Language::Cpp,
+            vec![sym("bar", SymbolKind::Function, "/a/sub/y.cpp")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b/z.cpp",
+            Language::Cpp,
+            // /b.cpp's `baz` calls /a/x.cpp's `foo` — gives us a
+            // cross-subtree edge that should be scrubbed.
+            vec![sym("baz", SymbolKind::Function, "/b/z.cpp")],
+            vec![call_edge("/b/z.cpp:baz", "/a/x.cpp:foo", "/b/z.cpp", 1)],
+        ));
+
+        let removed = g.remove_files_under(Path::new("/a"));
+
+        // Both /a-files dropped from the file index.
+        assert!(!g.files().contains_path(PathBuf::from("/a/x.cpp")));
+        assert!(!g.files().contains_path(PathBuf::from("/a/sub/y.cpp")));
+        // /b stays.
+        assert!(g.files().contains_path(PathBuf::from("/b/z.cpp")));
+
+        // Symbols from /a-files are gone from nodes.
+        assert!(!g.nodes().contains_key("/a/x.cpp:foo"));
+        assert!(!g.nodes().contains_key("/a/sub/y.cpp:bar"));
+        // /b's symbol stays.
+        assert!(g.nodes().contains_key("/b/z.cpp:baz"));
+
+        // The returned id set covers both dropped symbols.
+        assert!(removed.contains("/a/x.cpp:foo"));
+        assert!(removed.contains("/a/sub/y.cpp:bar"));
+        assert_eq!(removed.len(), 2);
+
+        // Caller-side step: prune dangling edges. After this, /b's
+        // `baz → /a/x.cpp:foo` edge must be gone too.
+        g.prune_dangling_edges(&removed);
+        let baz_edges = g.adj().get("/b/z.cpp:baz").cloned().unwrap_or_default();
+        assert!(
+            baz_edges.iter().all(|e| e.target != "/a/x.cpp:foo"),
+            "cross-subtree edge to dropped symbol must be pruned"
+        );
+
+        // Includes table also cleaned: `/a/x.cpp` had an include entry.
+        assert!(!g.includes().contains_path(PathBuf::from("/a/x.cpp")));
+    }
+
+    #[test]
+    fn remove_files_under_unknown_prefix_is_noop() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("foo", SymbolKind::Function, "/a.cpp")],
+            vec![],
+        ));
+        let before = g.stats();
+        let removed = g.remove_files_under(Path::new("/nowhere"));
+        assert!(removed.is_empty());
+        assert_eq!(g.stats(), before);
     }
 
     #[test]

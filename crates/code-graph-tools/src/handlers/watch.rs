@@ -529,6 +529,20 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
                 .for_path_with_config(path, &extensions)
                 .is_none()
             {
+                // Not a source file. But on a Remove event the path
+                // may have been a DIRECTORY whose subtree contained
+                // many indexed files (a `git checkout` that drops a
+                // crate, a rebase that nukes a module dir, etc.). The
+                // OS/notify-debouncer surfaces those as a single Remove
+                // event on the parent dir whose extension doesn't
+                // match any plugin. Check the graph: if any indexed
+                // file lives under this path, drop the whole subtree
+                // in one trie op via `Graph::remove_files_under`. This
+                // is Phase E.3 (B)'s `PathTrie::remove_subtree`
+                // payoff site.
+                if is_remove {
+                    try_reindex_subtree_removal(inner, path).await;
+                }
                 continue;
             }
             let outcome = try_reindex_file(inner, path, is_remove).await;
@@ -540,6 +554,31 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
             }
         }
     }
+}
+
+/// Handle a Remove event whose path is NOT a recognized source-file
+/// extension — typically a directory removal that the OS surfaces as a
+/// single event for the parent dir rather than per-child file events.
+/// Uses [`Graph::remove_files_under`] (which uses
+/// [`PathTrie::remove_subtree`]) to drop every indexed file under the
+/// path in one trie operation.
+///
+/// No-op if the path matches no indexed file (e.g. a real non-source
+/// file deletion that we ignored at index time anyway).
+///
+/// [`PathTrie::remove_subtree`]: code_graph_path_trie::PathTrie::remove_subtree
+async fn try_reindex_subtree_removal(inner: &Arc<ServerInner>, path: &Path) {
+    // Same lock + index-guard contract as `try_reindex_file`. Drop on
+    // contention rather than queue or retry.
+    let Ok(_index_guard) = inner.index_lock.try_lock() else {
+        return;
+    };
+    let mut g = inner.graph.write();
+    let removed_ids = g.remove_files_under(path);
+    if removed_ids.is_empty() {
+        return; // Path wasn't a directory containing indexed files.
+    }
+    g.prune_dangling_edges(&removed_ids);
 }
 
 #[cfg(test)]
