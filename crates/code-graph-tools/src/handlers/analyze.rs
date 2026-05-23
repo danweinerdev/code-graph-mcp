@@ -262,13 +262,9 @@ pub async fn analyze_codebase(
                 *inner.root_path.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
-                inner.index_built_at.store(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0),
-                    Ordering::Release,
-                );
+                inner
+                    .index_built_at
+                    .store(now_nanos_u64(), Ordering::Release);
                 inner.index_force_built.store(force, Ordering::Release);
                 // Persist the swept graph so the cadence bump and any
                 // removed entries survive. Skip the save when the
@@ -360,9 +356,8 @@ pub async fn analyze_codebase(
                             params = params.with_total(e.total as f64);
                         }
                         params = params.with_message(e.message);
-                        let _ =
-                            tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params))
-                                .await;
+                        let _ = tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params))
+                            .await;
                     }
                 }
             }
@@ -376,8 +371,7 @@ pub async fn analyze_codebase(
                     params = params.with_total(e.total as f64);
                 }
                 params = params.with_message(e.message);
-                let _ =
-                    tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params)).await;
+                let _ = tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params)).await;
             }
         }))
     } else {
@@ -526,10 +520,7 @@ pub async fn analyze_codebase(
         // ghost entries from subtrees this invocation didn't touch.
         // Cost: O(files-out-of-scope) syscalls, but only on the sweep
         // cadence (default 24h).
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let now_nanos = now_nanos_u64();
         let elapsed_since_sweep = now_nanos.saturating_sub(merged_graph.last_sweep_at());
         if elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS {
             let swept = merged_graph.sweep_missing_out_of_scope(&abs_path_for_pool);
@@ -597,13 +588,9 @@ pub async fn analyze_codebase(
     *inner.root_path.write() = Some(project_root.clone());
     *inner.config.write() = cfg;
     inner.indexed.store(true, Ordering::Release);
-    inner.index_built_at.store(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0),
-        Ordering::Release,
-    );
+    inner
+        .index_built_at
+        .store(now_nanos_u64(), Ordering::Release);
     inner.index_force_built.store(force, Ordering::Release);
 
     // Surface a project-vs-scope size hint when the cache contains
