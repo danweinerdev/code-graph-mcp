@@ -38,10 +38,24 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Current packed cache schema version. Bumped from v6 (Phase B's JSON
-/// wire) — every existing v6 JSON cache fails the version check on
-/// load and triggers the documented silent-re-index path.
-pub const CACHE_VERSION: u32 = 7;
+/// Current packed cache schema version.
+///
+/// History:
+/// - v7: rkyv binary cache (Phase C). Replaces v6's interned JSON wire.
+/// - v8: `PackedEdge` gains a `confidence: Confidence` field so the
+///   resolver-stamped confidence on every cached edge round-trips
+///   through the archive. `confidence` is a non-trivial rkyv-archived
+///   enum, so adding it changes the binary layout — existing v7 caches
+///   would either fail bytecheck (size mismatch) or, worse, decode
+///   with the field bits aliased over the next edge's storage. Bump
+///   forces every pre-v8 cache through the documented silent re-index
+///   path before any decode is attempted.
+///
+/// This constant is the single source of truth for the on-disk
+/// version. `super::CACHE_VERSION` is a re-export at the module
+/// boundary so the rest of the crate's call sites don't have to know
+/// which sub-module owns it.
+pub const CACHE_VERSION: u32 = 8;
 
 /// 4-byte native-endian probe at file offset 0. A reader whose host
 /// endianness disagrees with the writer's reads a different `u32`

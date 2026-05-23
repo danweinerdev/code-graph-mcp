@@ -1,5 +1,5 @@
-//! Versioned cache persistence for the in-memory [`Graph`] (current
-//! schema: `CACHE_VERSION = 7`).
+//! Versioned cache persistence for the in-memory [`Graph`]. See
+//! [`packed::CACHE_VERSION`] for the current version and history.
 //!
 //! The on-disk cache lives at `<dir>/.code-graph-cache.db` — a rkyv
 //! archive prepended by an 8-byte header (endian probe + version).
@@ -58,7 +58,14 @@ const CACHE_FILE_NAME: &str = ".code-graph-cache.db";
 // recognition. The schema change is non-backward-compatible; v6
 // caches (and any prior) trigger silent re-index per the long-standing
 // contract.
-const CACHE_VERSION: u32 = 7;
+//
+// v7 → v8 added `confidence` to PackedEdge. See `packed::CACHE_VERSION`
+// for the up-to-date doc comment and the per-version history. This
+// re-export keeps `CACHE_VERSION` reachable from the original call
+// sites without leaving the value defined in two places — a future
+// schema change only has to bump `packed::CACHE_VERSION` and the
+// header writer / version checks here pick it up automatically.
+use packed::CACHE_VERSION;
 
 /// Out-of-scope sweep cadence: 24 hours in nanoseconds. After a scoped
 /// `analyze_codebase` finishes its in-scope work, if at least this
@@ -95,13 +102,27 @@ pub fn cache_path(dir: &Path) -> PathBuf {
 }
 
 /// Read a file's mtime as nanoseconds since UNIX_EPOCH. Returns `None` if
-/// the file does not exist, is unreadable, or has a pre-epoch mtime.
+/// the file does not exist, is unreadable, has a pre-epoch mtime, or
+/// has a far-future mtime that doesn't fit in `u64` ns (~year 2554).
+///
+/// The `u128 → u64` boundary matters: `Duration::as_nanos()` returns
+/// `u128`, but cache storage is `u64`. A truncating `as u64` cast is
+/// silent and stable — if a file's on-disk mtime is past the `u64::MAX`
+/// ns horizon (build systems stamp output files to fixed far-future
+/// dates, NFS clock skew, etc.), the truncation produces a stable
+/// wrong value. The cache writes that truncated value; every later
+/// `stale_paths` call reads the same on-disk mtime, re-truncates to
+/// the same wrong value, and the equality check matches forever.
+/// The file is never reported stale even after edits. Surfacing the
+/// overflow as `None` instead routes the file through the
+/// "no mtime → treat as stale" path the call sites already handle.
 fn mtime_nanos(path: &Path) -> Option<u64> {
-    fs::metadata(path)
+    let nanos_u128 = fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())?
+        .as_nanos();
+    u64::try_from(nanos_u128).ok()
 }
 
 impl Graph {
