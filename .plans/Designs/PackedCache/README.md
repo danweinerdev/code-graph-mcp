@@ -507,3 +507,234 @@ Pushing `PathId`/`NameId`/`SymbolKey` through the live `Graph`, eliminating the 
 The save path always writes `.code-graph-cache.bin.tmp` and renames atomically. If a hostile build of the v6 binary produces a corrupted cache, the load fails the bytecheck → `Ok(false)` → next invocation re-indexes and overwrites. Recovery is unattended.
 
 To downgrade to the v5 JSON format intentionally (operational rollback if a critical encoder bug ships), revert the commit that landed Phase C — the v5 reader code stays in tree under the legacy-json-cache feature; switching the production load path back is a one-line change. Existing v6 `.bin` files on disk are ignored (different extension); the downgraded binary will silently re-index, writing fresh v5 JSON.
+
+---
+
+## Future Optimizations
+
+This section documents perf-improvement ideas that did **not** ship in
+Phase C and the **profiling evidence each would require** to justify
+the implementation cost. Order is rough payoff-vs-effort, but the
+ranking depends entirely on which scale you're targeting — most of
+these are no-ops at the ~2k-symbol scale we've dogfooded so far.
+
+### Current baseline (commit `16fdb6d`)
+
+Direct-archived decode in place. Load wall-clock measurements:
+
+| Scale | Symbols | Cache | Load (measured) | Load (linear-extrapolated) |
+|---|---|---|---|---|
+| `testdata/` | 406 | 110 KiB | 329 µs | — |
+| `crates/` | 2,271 | 1.2 MiB | 7.1 ms | — |
+| ripgrep-class | ~15k | ~8 MiB | not measured | ~50 ms |
+| efcore-class | ~150k | ~80 MiB | not measured | ~500 ms |
+| LLVM-class | ~770k | ~400 MiB | not measured | ~2.4 s |
+
+The design's stated target was **<100 ms warm load on multi-million
+symbol caches** (Goal 2). The current direct-archived decode meets it
+for codebases up to ~30k symbols on this hardware; closing the gap
+for the 100k-1M-symbol range needs structural work.
+
+### Pursue when
+
+The optimizations below are intentionally **deferred until evidence
+demands them**. Before picking up any of them:
+
+1. Initialize a representative submodule (`make submodules` or
+   `git submodule update --init external/<repo>`).
+2. Run `dogfood_v7` against it; record load wall-clock + the
+   `cargo flamegraph` or `samply` profile of the load path.
+3. Decide which lever the profile points at — they're not all the
+   same kind of win.
+
+If the actual load is already <500 ms on whatever scale matters to
+your workload, skip all of this.
+
+### Candidates
+
+#### A. CSR restructuring of adj / radj
+
+**What it changes.** Replace `HashMap<u32 NameId, Vec<PackedEdge>>` in
+the cache + the live `Graph.adj` / `Graph.radj` with a CSR
+(compressed-sparse-row) layout: a `src_offsets: Vec<u32>` index of
+length `num_symbols + 1` plus parallel `dst` / `file` / `line` /
+`kind` vectors. The archived form drops `ArchivedHashMap` entirely
+from the hot read path in favor of `ArchivedVec` indexing.
+
+**Estimated payoff.** Cuts per-edge HashMap probe cost (currently
+amortized O(1) but with non-trivial constants — bytecheck +
+hash + probe + pointer chase). On edge-heavy graphs (LLVM-class:
+~5M edges expected at full scale) this could be a meaningful
+fraction of decode time. Original PackedCache design's Schema
+section spec'd this; deferred from Phase B and Phase C as
+"not worth the complexity yet."
+
+**Cost.** Large. Bare-token unresolved targets (e.g. `Ok`, `printf` —
+adj/radj keys that aren't in `nodes`) need synthetic PackedSymbol
+entries with `path = 0` to fit into the SymbolIndex space. Touches
+encoder, decoder, both Resolver variants, plus a `(NameId →
+SymbolIndex)` build pass. Estimated 3-5 days for a clean port +
+tests.
+
+**Pursue when.** Flamegraph shows `decode_archived_edge_map` (or its
+HashMap probes inside) taking >25% of total load on a >100k-symbol
+cache. Until then the HashMap overhead is dominated by per-symbol
+String allocation.
+
+#### B. Parallel decode via rayon
+
+**What it changes.** Fan out the per-node walk across CPU cores
+(`rayon::par_iter` over `cache.nodes`). Currently all decode work is
+single-threaded.
+
+**Estimated payoff.** Linear-ish in core count for the per-node loop,
+which is the hottest part of decode. On a 16-core box, a 770k-symbol
+load might drop from ~2.4s → ~400ms.
+
+**Cost.** Moderate. The destination `HashMap<SymbolId, Node>` can't
+be filled from multiple threads without contention; needs either
+sharded HashMaps (build per-thread, merge at the end) or
+`dashmap`/`papaya` (lock-free concurrent maps — extra dep). The
+adj/radj walks have the same problem and need the same treatment.
+Estimated 2-3 days plus dep churn if going the concurrent-map route.
+
+**Pursue when.** Flamegraph shows decode_archived itself (not
+allocation, not bytecheck) as the wall-clock bottleneck, AND the
+machine has cores to spare. On a 2-core build runner there's nothing
+to parallelize against; on a 32-core dev workstation it's
+significant.
+
+#### C. Phase D — in-memory PathId / NameId through the live Graph
+
+**What it changes.** The big refactor that's been called out as
+out-of-scope from the original design. Push interned `PathId(u32)` /
+`NameId(u32)` / packed `SymbolKey(u64)` through `Graph.nodes`,
+`Graph.adj`, etc., and through every handler that returns SymbolIds
+or file paths. The cache decode becomes "rehydrate interners, swap in
+the Graph fields" — near-constant-time on archive size.
+
+**Estimated payoff.** Largest of any item here. Decode collapses to
+~O(num_intern_entries) instead of O(N) per-symbol. Live in-memory
+footprint also drops 3-5× (every `String` SymbolId becomes a `u64`).
+Aligns the load path with the cache shape so there's no impedance
+mismatch.
+
+**Cost.** Largest of any item here. Touches every tool handler in
+`crates/code-graph-tools/src/handlers/` (estimated 1500+ lines of
+churn). Projects back to String at the wire boundary only. Needs
+its own design doc.
+
+**Pursue when.** Sustained operational pain from either (a) load
+times above ~1s on the actual codebases agents are working in OR (b)
+in-memory RSS that's hitting OOM ceilings. Don't start Phase D for
+load wins alone — the in-memory savings are what justify the blast
+radius.
+
+#### D. mmap MADV_SEQUENTIAL hint
+
+**What it changes.** Call `madvise(MADV_SEQUENTIAL)` on the mmap
+right after creation. Tells the kernel to prefetch pages aggressively
+and drop already-read ones from the page cache, optimizing for the
+"read everything once linearly" pattern that decode does.
+
+**Estimated payoff.** Small-to-moderate. Mostly helps on cold-page
+loads where the file isn't already in OS page cache (first analyze
+of the session, after reboot, after high memory pressure). Warm-page
+loads are unaffected. Reasonable win: 10-30% of load time on cold
+runs of large caches.
+
+**Cost.** Trivial. `memmap2::Mmap::advise(memmap2::Advice::Sequential)`
+is a one-line call after the mmap. Cross-platform.
+
+**Pursue when.** Cold-load measurements show page faults dominating
+(`perf stat -e page-faults`). Easy enough to just add speculatively
+if it helps.
+
+#### E. Compression (zstd / lz4) over the rkyv archive
+
+**What it changes.** Wrap the archive in a compression layer. Cache
+file size drops; the on-the-wire rkyv layout still works after
+decompression but the zero-copy mmap property dies — every load
+decompresses into a freshly-allocated `Vec<u8>` before
+`rkyv::access`.
+
+**Estimated payoff.** Disk size: probably 2-4× smaller (rkyv has
+zeroed alignment padding + repeated strings inside `names`; both
+compress well). Load wall-clock: net regression for warm-page
+loads; potential win for cold-page loads on slow disks since the
+file fits in fewer pages.
+
+**Cost.** Moderate. Affects the mmap contract directly — would need
+to drop or rewrite `mmap.rs`. Trades the central design property of
+Phase C for a one-time disk save.
+
+**Pursue when.** Disk size becomes a real problem (e.g. cache files
+being shipped to CI or shared across machines, both currently
+out-of-scope per design Decision 4). Otherwise skip — losing
+zero-copy mmap to save disk bytes that aren't a constraint is a
+regression.
+
+#### F. Per-section bytecheck for `stale_paths`
+
+**What it changes.** Currently `stale_paths` calls `rkyv::access` on
+the whole archive, which runs bytecheck on every byte. The
+mtimes-only access pattern only touches two fields; validating the
+other 95% of the cache is pure overhead.
+
+**Estimated payoff.** Moderate at LLVM-scale. Bytecheck on a 400 MB
+cache is ~50-150 ms; restricting it to the ~3 MB mtimes section
+drops to ~5-10 ms. At smaller scales the difference is negligible.
+
+**Cost.** Significant. rkyv 0.8 doesn't have a built-in
+"bytecheck-just-this-field" API. Either (a) restructure the cache so
+mtimes lives at a known prefix offset accessible via
+`access_unchecked` + manual offset arithmetic (re-opens the
+`unsafe_code` audit at a SECOND site), or (b) implement the sidecar
+mtimes file from Decision 6 Option 1 (clean, but adds a second file
+to the atomic-write contract). Both are bigger changes than the
+current full-archive validate.
+
+**Pursue when.** `stale_paths` exceeds the 200 ms threshold called
+out in Testing Strategy bench #3, AND it's on the hot path of a
+real workflow. Otherwise the current implementation's
+"50-150× cheaper than v4's slim-DTO" remains a great trade.
+
+#### G. HashBrown / FxHashMap on live `Graph`
+
+**What it changes.** Switch `Graph.nodes`, `Graph.adj`, etc. from
+`std::HashMap` (uses SipHash, DoS-resistant) to `FxHashMap`
+(non-cryptographic, ~2× faster for our short-string keys).
+
+**Estimated payoff.** Small-to-moderate on decode (HashMap-insert
+hot path) and small on every subsequent lookup. The decode-time win
+is bounded by ~10-20% since insertions are already O(1) amortized
+and the hash function isn't dominating.
+
+**Cost.** Small. One type-alias change in `Graph` + dep import.
+However, it propagates to every handler that constructs sub-maps
+keyed on `SymbolId` — moderate audit surface, low actual risk.
+
+**Pursue when.** Profile shows `std::collections::hash_map::Map::insert`
+in the top 5 of decode. Probably needs to wait until B is done
+since parallel decode would compound the win.
+
+### Anti-patterns explicitly considered and rejected
+
+- **`access_unchecked` for the main load path.** Skips bytecheck =
+  faster load but trusts the file blindly. The whole point of
+  rkyv-with-bytecheck was to surface corruption as `Ok(false)` →
+  silent re-index. Going unchecked re-opens the audit at the load
+  boundary AND turns a corrupt cache into either a crash or UB.
+  Don't.
+- **JSON debug-dump feature.** Originally on the Phase C plan, never
+  shipped. Adding it back means dual-deriving (rkyv + serde) on
+  every persisted type — maintenance cost outweighs the rare
+  "let me jq the cache" debug session. If you actually need to
+  inspect a v7 cache, write a one-shot `cargo run --bin
+  dump-cache` that calls `rkyv::deserialize` + `serde_json::to_string`
+  on the spot.
+- **Custom hashing in `lasso` for SymbolId-prefix dedup.** Could
+  potentially intern the path prefix and the local-name suffix
+  separately, getting back the Phase C-original SymbolId
+  decomposition. That's basically Phase D's `SymbolKey` packing,
+  which has its own home. Don't half-ship.
