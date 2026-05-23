@@ -1,15 +1,22 @@
 ---
 title: "PackedCache — interned columnar binary cache backed by code-graph-path-trie"
 type: design
-status: review
+status: shipped
 created: 2026-05-22
-updated: 2026-05-22
-revision: 2
+updated: 2026-05-23
+revision: 3
 tags: [cache, persistence, paths, interning, rkyv, performance, mcp-tool-timeout]
 related:
   - Designs/PathNormalization
   - Designs/Pagination
 ---
+
+> **As-shipped deltas vs this design (post-merge):**
+> - File extension is `.code-graph-cache.db` everywhere (this doc originally said `.bin`; rewritten).
+> - `CACHE_VERSION` is `8`, not the `7` this design targeted. v7 shipped the rkyv schema; v8 added `confidence: Confidence` to `PackedEdge` so the v6 in-memory `Confidence` field (added on rust-main during the merge) round-trips through the packed archive.
+> - **`--feature legacy-json-cache` was NOT shipped.** The "JSON reader retained behind a Cargo feature for offline rollback" path in §Interfaces and §Rollback below was not implemented. The v6 JSON reader code is gone from the tree; downgrade requires reverting the Phase C commit AND restoring the JSON serde code from git history. Re-treating this as a real rollback path requires landing the feature first.
+> - Public functions are named `Graph::save`/`Graph::load`/top-level `stale_paths` and `packed::decode_archived` (operating on the rkyv archived view directly). The `packed::save`/`packed::load`/`packed::stale_paths`/`packed::decode` interface this design specified does not exist as such; the behavior matches.
+> - On bytecheck failure the loader returns `Ok(false)` silently without the prescribed `eprintln!("packed cache corrupted: …; re-indexing")` warning, and `PathId`/`NameId`-out-of-range similarly returns `Ok(false)` rather than the prescribed `PersistError::CorruptedCache` hard error. Both deviations are silent-re-index simplifications consistent with the rest of the cache-invalidation contract; operators lose corruption visibility as a result.
 
 # PackedCache — interned columnar binary cache backed by code-graph-path-trie
 
@@ -57,7 +64,7 @@ The current invalidation contract (CLAUDE.md "Cache invalidation": *"a v3 cache 
 graph TD
     LiveGraph["Live Graph (in-memory)<br/>HashMap&lt;SymbolId, Symbol&gt;<br/>HashMap&lt;PathBuf, _&gt;"] -->|save| Encoder
     Encoder["PackedEncoder<br/>(intern + columnize)"] --> Archive["PackedArchive<br/>(rkyv layout)"]
-    Archive -->|write| Disk[(".code-graph-cache.bin")]
+    Archive -->|write| Disk[(".code-graph-cache.db")]
 
     Disk -->|mmap| Reader["PackedReader<br/>(zero-copy view)"]
     Reader -->|load| Decoder["PackedDecoder<br/>(resolve to Strings/PathBufs)"]
@@ -117,7 +124,7 @@ sequenceDiagram
     participant Live as Live Graph
 
     H->>G: load(dir)
-    G->>FS: open .code-graph-cache.bin
+    G->>FS: open .code-graph-cache.db
     FS-->>G: file handle
     G->>R: mmap + access_archived_root
     R-->>G: &ArchivedPackedCache (zero-copy)
@@ -262,7 +269,7 @@ impl Graph {
 }
 ```
 
-The JSON v5 path is dropped from the production binary. A `--feature legacy-json-cache` is provided strictly for offline analysis tooling (and debug inspection of historical caches checked into reproductions). It is **not** wired into the load path; the on-disk file lives at `.code-graph-cache.bin` and the JSON `.code-graph-cache.json` is never read.
+The JSON v5 path is dropped from the production binary. A `--feature legacy-json-cache` is provided strictly for offline analysis tooling (and debug inspection of historical caches checked into reproductions). It is **not** wired into the load path; the on-disk file lives at `.code-graph-cache.db` and the JSON `.code-graph-cache.json` is never read.
 
 ---
 
@@ -360,7 +367,7 @@ let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
 **Options Considered:**
 
-1. **Sidecar mtimes file.** Save writes both `.code-graph-cache.bin` (full archive) and `.code-graph-cache-mtimes.bin` (just a `Vec<(PathBuf, u64)>` or `HashMap<PathBuf, u64>` encoded with postcard or rkyv). `stale_paths` reads only the sidecar. Restores the v5 minimal-DTO performance characteristic.
+1. **Sidecar mtimes file.** Save writes both `.code-graph-cache.db` (full archive) and `.code-graph-cache-mtimes.db` (just a `Vec<(PathBuf, u64)>` or `HashMap<PathBuf, u64>` encoded with postcard or rkyv). `stale_paths` reads only the sidecar. Restores the v5 minimal-DTO performance characteristic.
 2. **Full archive validate.** `stale_paths` does a normal `Graph::load` (mmap + bytecheck + walk to mtimes field). Accept the cost.
 3. **Two-section archive.** Lay out the archive so the mtimes section is at a known prefix and can be bytechecked independently. Possible with `rkyv` but requires hand-rolling the layout (rkyv's derive places fields in declaration order but the *archived* form's relative pointers can land anywhere).
 
@@ -368,7 +375,7 @@ let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
 **Rationale.** The v5 slim-DTO trick exists to avoid an expensive operation (parsing 200 MB of JSON). In v6 the analogous cost — bytecheck over a ~25 MB archive — is roughly a sequential scan at memcpy speed (~3-5 GB/s on modern hardware), or **~10-50 ms** on LLVM-scale. That is **50-150× cheaper** than the v5 slim-DTO path it replaces. The whole reason the slim DTO exists disappears.
 
-The benchmark plan in [Testing Strategy](#testing-strategy) adds an explicit `stale_paths` latency bench. If real-world numbers push past ~200 ms on a million-symbol cache, downshift to Option 1: the sidecar adds ~one extra atomic write at save time (`.code-graph-cache-mtimes.bin.tmp` → rename) and one extra read at `stale_paths` time. It is small, surgical, and the v5 slim-DTO precedent demonstrates that splitting the persistence into two files for the mtimes hot path is a tolerated pattern in this codebase.
+The benchmark plan in [Testing Strategy](#testing-strategy) adds an explicit `stale_paths` latency bench. If real-world numbers push past ~200 ms on a million-symbol cache, downshift to Option 1: the sidecar adds ~one extra atomic write at save time (`.code-graph-cache-mtimes.db.tmp` → rename) and one extra read at `stale_paths` time. It is small, surgical, and the v5 slim-DTO precedent demonstrates that splitting the persistence into two files for the mtimes hot path is a tolerated pattern in this codebase.
 
 Option 3 is rejected: hand-rolling the archive layout fights rkyv's abstractions and would require its own audit; the perf delta over Option 1's sidecar is theoretical at best.
 
@@ -443,7 +450,7 @@ Option 3 is rejected: hand-rolling the archive layout fights rkyv's abstractions
 | Atomic write fails mid-rename | Standard `fs::rename` error | `PersistError::Io` (existing). |
 | Sweep timestamp absent (no `last_sweep_at`) | Default to `0` | Triggers a sweep on next analyze (current behavior). |
 
-Note: the v5→v6 transition surfaces as either "cache file absent" (first-time analyze on a clean checkout) or "version mismatch" (existing v5 user upgrades — the v5 JSON file at `.code-graph-cache.json` is now ignored, since the v6 reader looks at `.code-graph-cache.bin` and a different extension means "not present"). Both route to the silent-re-index path that has shipped successfully through versions 1→2→3→4→5.
+Note: the v5→v6 transition surfaces as either "cache file absent" (first-time analyze on a clean checkout) or "version mismatch" (existing v5 user upgrades — the v5 JSON file at `.code-graph-cache.json` is now ignored, since the v6 reader looks at `.code-graph-cache.db` and a different extension means "not present"). Both route to the silent-re-index path that has shipped successfully through versions 1→2→3→4→5.
 
 ---
 
@@ -493,7 +500,7 @@ This is a Rust workspace with `unsafe_code = "forbid"` enforced workspace-wide. 
 ### Phase C (binary format) — Estimated 2-3 days
 
 1. Add `rkyv = "0.8"` to workspace deps. Wire `Archive`/`Serialize`/`Deserialize` derives.
-2. Switch on-disk format to `.code-graph-cache.bin`. Keep the v6 JSON path behind a `--feature legacy-json-cache` for debug.
+2. Switch on-disk format to `.code-graph-cache.db`. Keep the v6 JSON path behind a `--feature legacy-json-cache` for debug.
 3. Implement `Graph::load` mmap path. Endian sentinel + version check + `bytecheck`.
 4. Implement `stale_paths` against the archived form (avoid full rehydrate — same `StalePathsCache`-style trick the v5 reader uses).
 5. Update CLAUDE.md "Cache invalidation" section with the new format details + the endian-sentinel addition.
@@ -504,7 +511,7 @@ Pushing `PathId`/`NameId`/`SymbolKey` through the live `Graph`, eliminating the 
 
 ### Rollback
 
-The save path always writes `.code-graph-cache.bin.tmp` and renames atomically. If a hostile build of the v6 binary produces a corrupted cache, the load fails the bytecheck → `Ok(false)` → next invocation re-indexes and overwrites. Recovery is unattended.
+The save path always writes `.code-graph-cache.db.tmp` and renames atomically. If a hostile build of the v6 binary produces a corrupted cache, the load fails the bytecheck → `Ok(false)` → next invocation re-indexes and overwrites. Recovery is unattended.
 
 To downgrade to the v5 JSON format intentionally (operational rollback if a critical encoder bug ships), revert the commit that landed Phase C — the v5 reader code stays in tree under the legacy-json-cache feature; switching the production load path back is a one-line change. Existing v6 `.bin` files on disk are ignored (different extension); the downgraded binary will silently re-index, writing fresh v5 JSON.
 

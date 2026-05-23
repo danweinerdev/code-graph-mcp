@@ -45,7 +45,7 @@
 //! |---|---|
 //! | [`PathInterner`] (intern/get/resolve) | `code-graph-graph::persist::packed::encode` — cache writer interns every path once |
 //! | [`PathTrie<V>`] as storage shape | `Graph.files` and `Graph.includes` (Phase E shape swap) |
-//! | [`PathTrie::iter_subtree`] | `Graph::orphans_under` (subtree-scoped `get_orphans`), `Graph::search` (subtree-scoped `search_symbols` via pre-built file set), `detect_cycles` subtree post-filter |
+//! | [`PathTrie::iter_subtree`] | `Graph::orphans_under` (subtree-scoped `get_orphans`), `Graph::search` (subtree-scoped `search_symbols` via pre-built file set), `Graph::drop_files_in_scope` and `Graph::evict_missing_in_scope` (scoped-analyze cache-hygiene paths), `detect_cycles` subtree post-filter |
 //! | [`PathTrie::longest_prefix`] | `code_graph_lang_rust::crate_model` (RCMM owning-crate lookup), `code_graph_lang_go::module_model` (GMM owning-module lookup) |
 //! | [`PathTrie::remove_subtree`] | `Graph::remove_files_under` → watch handler directory-remove path |
 //!

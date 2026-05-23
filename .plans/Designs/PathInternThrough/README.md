@@ -1,15 +1,23 @@
 ---
 title: "PathInternThrough — interned `PathId` / `NameId` / `SymbolKey` through the live Graph"
 type: design
-status: review
+status: deferred
 created: 2026-05-22
-updated: 2026-05-22
-revision: 2
+updated: 2026-05-23
+revision: 3
 tags: [graph, interning, in-memory, performance, mcp-tool-timeout, refactor]
 related:
   - Designs/PackedCache
   - Designs/PathNormalization
 ---
+
+> **NOT IMPLEMENTED — superseded by Phase E.**
+>
+> This design (Phase D of the PackedCache plan) was reviewed and then explicitly NOT shipped. After authoring, the decision was that pushing interned `PathId`/`NameId`/`SymbolKey` through every tool handler did not exercise enough of `code-graph-path-trie`'s distinctive APIs (subtree iteration, longest-prefix lookup) to be worth the breadth of refactor described below.
+>
+> Instead, **Phase E** landed: `Graph.files` and `Graph.includes` swapped from `HashMap<PathBuf, V>` to `PathTrie<V>`, which delivered the subtree-iteration wins without the cross-handler churn. Downstream Phase E.3 features (Rust RCMM, Go GMM, watch directory-remove, `subtree=` MCP args) exercise `PathTrie::longest_prefix` / `iter_subtree` / `remove_subtree` against the new shape. See `crates/code-graph-path-trie/src/lib.rs` rustdoc "Production wiring status" matrix for the full ledger of wired-vs-dormant `PathTrie` features today.
+>
+> The text below is preserved as historical record of an evaluated design path. The performance characterization in §Overview (millions of small allocations on warm `Graph::load`) remains accurate as a description of the v7 cache's behavior — a future revision of this design (or a successor) would still be the right place to attack that, should warm-load latency become a real production concern.
 
 # PathInternThrough — interned ids through the live Graph
 
