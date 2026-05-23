@@ -337,6 +337,8 @@ dependencies = [
  "code-graph-lang-python",
  "code-graph-lang-rust",
  "code-graph-tools",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
