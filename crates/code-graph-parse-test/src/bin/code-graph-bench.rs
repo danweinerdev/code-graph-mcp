@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use code_graph_core::{Language, RootConfig};
+use code_graph_core::{paths, ConfigError, Language, RootConfig};
 use code_graph_graph::{cache_path, stale_paths, Graph, SearchParams};
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_cpp::CppParser;
@@ -292,7 +292,7 @@ struct Verification {
 // ============================================================================
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
@@ -305,6 +305,20 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Canonicalize before discovery so `Path::parent()` walks resolved-target
+    // ancestry (relative paths like `.` under-walk otherwise) and so the
+    // reported target matches what the MCP analyze handler would resolve.
+    match paths::canonicalize(&args.target) {
+        Ok(p) => args.target = p,
+        Err(e) => {
+            eprintln!(
+                "error: failed to canonicalize {}: {e}",
+                args.target.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+
     let registry = match build_registry() {
         Ok(r) => r,
         Err(e) => {
@@ -312,7 +326,47 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut cfg = RootConfig::default();
+
+    // Discover `.code-graph.toml` by walking upward from the target, same as
+    // `analyze_codebase`. Surface the discovery outcome on stderr so JSON-mode
+    // benchmark output stays clean while the user still sees which config
+    // applied — relevant when comparing bench numbers to MCP server output
+    // against the same tree (UE-style C++ classes need `[cpp].macro_strip`
+    // to extract; an unconfigured tree under-reports symbol counts).
+    let (mut cfg, project_root) = match RootConfig::load(&args.target) {
+        Ok(pair) => pair,
+        Err(ConfigError::Toml(e)) => {
+            eprintln!("error: failed to parse .code-graph.toml: {e}");
+            return ExitCode::from(1);
+        }
+        Err(ConfigError::Io(e)) => {
+            eprintln!("error: failed to read .code-graph.toml: {e}");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("error: invalid .code-graph.toml: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let toml_path = project_root.join(".code-graph.toml");
+    if toml_path.exists() {
+        if project_root == args.target {
+            eprintln!("config: loaded {}", toml_path.display());
+        } else {
+            eprintln!(
+                "config: loaded {} (parent of target {})",
+                toml_path.display(),
+                args.target.display()
+            );
+        }
+    } else {
+        eprintln!(
+            "config: no .code-graph.toml found between {} and filesystem root; \
+             using built-in defaults (engine-style C++ classes like `class CORE_API Foo` \
+             will NOT be indexed without [cpp].macro_strip)",
+            args.target.display()
+        );
+    }
     cfg.resolve_concurrency();
 
     // ----- Index pipeline -----
