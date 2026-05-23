@@ -929,6 +929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "limit=0")]
     fn byte_budget_take_panics_on_zero_limit_in_debug() {
         // Caller bug: passing `limit=0` bypasses pagination defaulting
@@ -936,7 +937,9 @@ mod tests {
         // silently return an empty page. The `debug_assert!` makes that
         // mistake visible in test builds. In release builds the assertion
         // is compiled out and the helper still returns cleanly (empty page,
-        // no continuation), so this contract is debug-only by design.
+        // no continuation), so this contract is debug-only by design — the
+        // `#[cfg(debug_assertions)]` on the test matches the gate on the
+        // assertion itself.
         let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
         let _ = byte_budget_take(items, 0, 0, 10_000);
     }
