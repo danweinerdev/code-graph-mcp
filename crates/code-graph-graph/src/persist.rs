@@ -713,6 +713,61 @@ mod tests {
         assert_eq!(stats.files, 2);
     }
 
+    /// `last_sweep_at` (v5 schema field) must survive save/load.
+    ///
+    /// `save_load_round_trip` above uses the default sample graph
+    /// (last_sweep_at = 0) and therefore couldn't tell apart "field
+    /// preserved" from "field dropped on the wire and re-defaulted on
+    /// load". This test plants a distinctive non-zero value, round-trips
+    /// it, and asserts equality. A regression that dropped the field
+    /// from `GraphCacheRef` serialization or from the `Graph::load`
+    /// restore step would slip past `save_load_round_trip` but break
+    /// here.
+    #[test]
+    fn save_load_round_trip_preserves_last_sweep_at() {
+        let dir = TempDir::new().unwrap();
+        let mut original = build_sample_graph();
+        // Pick a distinctive value that's neither 0 (the default) nor
+        // a round number that could be coincidentally produced by some
+        // arithmetic. ~year 2026 timestamp in nanoseconds, +12345 to
+        // make it unmistakable.
+        const SENTINEL_NANOS: u64 = 1_700_000_000_000_000_000 + 12345;
+        original.set_last_sweep_at(SENTINEL_NANOS);
+
+        original.save(dir.path()).unwrap();
+
+        let mut loaded = Graph::new();
+        let ok = loaded.load(dir.path()).unwrap();
+        assert!(ok, "freshly-written cache must load");
+        assert_eq!(
+            loaded.last_sweep_at(),
+            SENTINEL_NANOS,
+            "last_sweep_at must round-trip through save/load — \
+             a regression dropping the field would default it to 0"
+        );
+    }
+
+    /// `last_sweep_at` defaults to 0 on a fresh graph and survives the
+    /// trivial round-trip without spontaneously changing. Pairs with
+    /// the sentinel test above: that proves non-zero survives; this
+    /// proves zero stays zero (no accidental
+    /// "default-when-loaded-then-stamped-with-current-time" drift).
+    #[test]
+    fn save_load_round_trip_preserves_zero_last_sweep_at() {
+        let dir = TempDir::new().unwrap();
+        let original = build_sample_graph();
+        assert_eq!(original.last_sweep_at(), 0, "fresh graph defaults to 0");
+
+        original.save(dir.path()).unwrap();
+        let mut loaded = Graph::new();
+        loaded.load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.last_sweep_at(),
+            0,
+            "zero last_sweep_at must remain zero across round-trip"
+        );
+    }
+
     #[test]
     fn load_missing_file_returns_false() {
         let dir = TempDir::new().unwrap();
