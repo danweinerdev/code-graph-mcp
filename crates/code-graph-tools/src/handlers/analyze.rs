@@ -75,7 +75,11 @@ pub async fn analyze_codebase(
     }
 
     let mut cfg = match RootConfig::load(&abs_path) {
-        Ok(c) => c,
+        // The discovered project-root path is unused in this commit —
+        // subsequent commits wire it through to the cache + scope
+        // semantics. Prefixing with `_` keeps clippy quiet without
+        // adding throwaway bookkeeping.
+        Ok((c, _project_root)) => c,
         Err(ConfigError::Toml(e)) => {
             return tool_error(format!("failed to parse .code-graph.toml: {e}"));
         }

@@ -12,7 +12,7 @@
 
 use crate::Language;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Helper for `#[serde(default = "...")]` on `bool` fields whose documented
 /// default is `true`. Plain `#[serde(default)]` would give `false`.
@@ -345,22 +345,63 @@ pub enum ConfigError {
 }
 
 impl RootConfig {
-    /// Load `<root>/.code-graph.toml`.
+    /// Discover and load the nearest `.code-graph.toml`, walking from
+    /// `start` upward through every ancestor directory until one is
+    /// found or the filesystem root is reached. Returns the loaded
+    /// config alongside the **project root** — the directory containing
+    /// the discovered toml, or `start` itself if no toml exists at any
+    /// ancestor.
     ///
-    /// - File missing → `Ok(RootConfig::default())`.
-    /// - File present and valid TOML → `Ok(parsed)`.
-    /// - File present but malformed → `Err(ConfigError::Toml)` (no fallback).
-    /// - File present but unreadable (permissions, etc.) → `Err(ConfigError::Io)`.
-    pub fn load(root: &Path) -> Result<Self, ConfigError> {
-        let path = root.join(".code-graph.toml");
-        let content = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+    /// The project root is the load-bearing piece of data this method
+    /// surfaces beyond just the config: cache placement, indexing
+    /// scope semantics, and the discovered-config-at-parent warning
+    /// surface all key off it. Callers that don't need the root can
+    /// destructure-and-discard (`let (cfg, _) = …`), but should
+    /// generally surface it through `AnalyzeResult.warnings` so the
+    /// user can see which toml actually applied.
+    ///
+    /// Discovery semantics:
+    /// - **First match wins.** Nested tomls override their ancestors;
+    ///   there is no merging across multiple files.
+    /// - **No toml anywhere up to filesystem root** → returns
+    ///   `(Self::default(), start.to_path_buf())`. The fall-through
+    ///   project-root is the caller's invocation directory.
+    /// - **Malformed toml** → `Err(ConfigError::Toml)` (no fallback;
+    ///   present-but-broken is an explicit user error).
+    /// - **Permission error** on an ancestor → `Err(ConfigError::Io)`.
+    ///   Don't swallow these; a misconfigured ancestor is information
+    ///   the caller needs.
+    ///
+    /// The walk uses `Path::parent()`, which on canonicalized paths
+    /// gives resolved-target ancestry — symlinks behave correctly
+    /// because `analyze_codebase` canonicalizes its input before
+    /// calling this. Matches the convention shared by cargo,
+    /// rustfmt, git, editorconfig, and npm: project-root config files
+    /// are discovered by upward walk, never by exact-dir match.
+    pub fn load(start: &Path) -> Result<(Self, PathBuf), ConfigError> {
+        let mut search = Some(start);
+        while let Some(dir) = search {
+            let path = dir.join(".code-graph.toml");
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let cfg = Self::parse_and_validate(&content)?;
+                    return Ok((cfg, dir.to_path_buf()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    search = dir.parent();
+                }
+                Err(e) => return Err(ConfigError::Io(e)),
             }
-            Err(e) => return Err(ConfigError::Io(e)),
-        };
-        let mut parsed: Self = toml::from_str(&content)?;
+        }
+        Ok((Self::default(), start.to_path_buf()))
+    }
+
+    /// Parse and validate `.code-graph.toml` content. Shared between
+    /// [`load`]'s upward-walk hit path and tests that want to drive
+    /// validation against a synthetic content string without touching
+    /// the filesystem.
+    fn parse_and_validate(content: &str) -> Result<Self, ConfigError> {
+        let mut parsed: Self = toml::from_str(content)?;
         // Drain empty-string entries from `[cpp].macro_strip`. An empty
         // pattern would match every byte position with zero advancement and
         // infinite-loop the substitution scan in release builds — the
@@ -515,10 +556,151 @@ mod tests {
             .unwrap_or(1)
     }
 
+    // --- Upward-walk discovery ------------------------------------------
+
+    /// Walk finds the toml at `start` itself (no walk needed). Sanity
+    /// check that the trivial case still works.
+    #[test]
+    fn discover_returns_start_when_toml_at_start() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"MYLIB_API\"]\n",
+        )
+        .unwrap();
+        let (cfg, root) =
+            RootConfig::load(dir.path()).expect("toml at start dir must load with start as root");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["MYLIB_API".to_string()],
+            "loaded config must reflect the toml at start"
+        );
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            canonical_root, canonical_dir,
+            "project root must equal the start dir when toml is found there"
+        );
+    }
+
+    /// Walk finds the toml at the parent of `start`. The
+    /// regression-bug scenario from `PossibleFix.txt`: user invokes
+    /// at a subdir, toml lives one level up, discovery must locate
+    /// it and return the parent as project root.
+    #[test]
+    fn discover_walks_up_one_level() {
+        let dir = TempDir::new().unwrap();
+        let subdir = dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"PARENT_API\"]\n",
+        )
+        .unwrap();
+
+        let (cfg, root) =
+            RootConfig::load(&subdir).expect("walk-up-one must find the parent's toml");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["PARENT_API".to_string()],
+            "loaded config must come from the parent toml"
+        );
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_parent = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            canonical_root, canonical_parent,
+            "project root must be the directory containing the toml"
+        );
+    }
+
+    /// Walk finds the toml three levels up from `start`. Confirms the
+    /// upward walk is not depth-limited.
+    #[test]
+    fn discover_walks_up_three_levels() {
+        let dir = TempDir::new().unwrap();
+        let deep = dir.path().join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip_with_args = [\"DEEP_REFLECT\"]\n",
+        )
+        .unwrap();
+
+        let (cfg, root) = RootConfig::load(&deep).expect("walk must traverse multiple levels");
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            vec!["DEEP_REFLECT".to_string()]
+        );
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_parent = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(canonical_root, canonical_parent);
+    }
+
+    /// Walk respects first-match-wins: nested toml shadows its ancestor.
+    /// The project boundary lives at the nearest toml, not the highest.
+    #[test]
+    fn discover_first_match_wins_nested_toml_shadows_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let inner = dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"OUTER_API\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            inner.join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = [\"INNER_API\"]\n",
+        )
+        .unwrap();
+
+        let (cfg, root) = RootConfig::load(&inner).expect("nested toml must load");
+        assert_eq!(
+            cfg.cpp.macro_strip,
+            vec!["INNER_API".to_string()],
+            "inner toml's value must win — no merging with the ancestor"
+        );
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_inner = std::fs::canonicalize(&inner).unwrap();
+        assert_eq!(
+            canonical_root, canonical_inner,
+            "project root must be the nearest toml's directory, not the outer one"
+        );
+    }
+
+    /// No toml at start or any ancestor up to filesystem root → defaults
+    /// returned with `start` itself as the project root. The fallback
+    /// case for users who haven't created a `.code-graph.toml`.
+    ///
+    /// Relies on the test environment having no `.code-graph.toml` in
+    /// any ancestor of the tempdir (typically `/tmp/.tmpXYZ/`). On a
+    /// dev machine that happens to have one at `$HOME`, this test
+    /// could surface that — which is precisely the cargo/git contract
+    /// (an ancestor toml IS your project), so the assertion failure
+    /// would be informative rather than a bug.
+    #[test]
+    fn discover_falls_back_to_defaults_when_no_toml_anywhere() {
+        let dir = TempDir::new().unwrap();
+        let (cfg, root) =
+            RootConfig::load(dir.path()).expect("missing toml everywhere must yield default");
+        let default = RootConfig::default();
+        assert_eq!(cfg.cpp.macro_strip, default.cpp.macro_strip);
+        assert_eq!(
+            cfg.cpp.macro_strip_with_args,
+            default.cpp.macro_strip_with_args
+        );
+        assert_eq!(
+            root,
+            dir.path().to_path_buf(),
+            "no-toml fallback must use the start dir as project root"
+        );
+    }
+
     #[test]
     fn missing_file_returns_default() {
         let dir = TempDir::new().unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("missing file should yield default");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("missing file should yield default");
         // Defaults match the documented values.
         assert_eq!(cfg.discovery.max_threads, 0);
         assert!(cfg.discovery.respect_gitignore);
@@ -531,7 +713,7 @@ mod tests {
     fn empty_file_yields_all_defaults() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".code-graph.toml"), "").unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("empty file should parse as default");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("empty file should parse as default");
         let default = RootConfig::default();
         assert_eq!(cfg.discovery.max_threads, default.discovery.max_threads);
         assert_eq!(
@@ -554,7 +736,7 @@ mod tests {
             "[discovery]\n[parsing]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("empty sections should parse");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("empty sections should parse");
         // Values within the empty sections fall back to the per-field defaults.
         assert_eq!(cfg.discovery.max_threads, 0);
         assert!(cfg.discovery.respect_gitignore);
@@ -571,7 +753,7 @@ mod tests {
             "[discovery]\nmax_threads = 0\n[parsing]\nmax_threads = 0\n",
         )
         .unwrap();
-        let mut cfg = RootConfig::load(dir.path()).expect("valid auto config should parse");
+        let (mut cfg, _root) = RootConfig::load(dir.path()).expect("valid auto config should parse");
         let warnings = cfg.resolve_concurrency();
         assert!(
             warnings.is_empty(),
@@ -591,7 +773,7 @@ mod tests {
             "[discovery]\nmax_threads = 1\n[parsing]\nmax_threads = 1\n",
         )
         .unwrap();
-        let mut cfg = RootConfig::load(dir.path()).expect("valid pinned config should parse");
+        let (mut cfg, _root) = RootConfig::load(dir.path()).expect("valid pinned config should parse");
         let warnings = cfg.resolve_concurrency();
         assert!(
             warnings.is_empty(),
@@ -608,7 +790,7 @@ mod tests {
         let huge = usize::MAX / 2;
         let toml = format!("[discovery]\nmax_threads = {huge}\n[parsing]\nmax_threads = {huge}\n");
         fs::write(dir.path().join(".code-graph.toml"), toml).unwrap();
-        let mut cfg = RootConfig::load(dir.path()).expect("over-cap config should parse");
+        let (mut cfg, _root) = RootConfig::load(dir.path()).expect("over-cap config should parse");
         let warnings = cfg.resolve_concurrency();
         assert_eq!(
             warnings.len(),
@@ -665,7 +847,7 @@ mod tests {
         // Discovery over cap, parsing pinned at 1.
         let toml = format!("[discovery]\nmax_threads = {huge}\n[parsing]\nmax_threads = 1\n");
         fs::write(dir.path().join(".code-graph.toml"), toml).unwrap();
-        let mut cfg = RootConfig::load(dir.path()).unwrap();
+        let (mut cfg, _root) = RootConfig::load(dir.path()).unwrap();
         let warnings = cfg.resolve_concurrency();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("discovery.max_threads"));
@@ -713,7 +895,7 @@ mod tests {
             "[discovery]\nmax_threads = 0\n[parsing]\nmax_threads = 0\n",
         )
         .unwrap();
-        let cfg =
+        let (cfg, _root) =
             RootConfig::load(dir.path()).expect("config without [cpp] section must load cleanly");
         assert!(
             cfg.cpp.macro_strip.is_empty(),
@@ -733,7 +915,7 @@ mod tests {
             "[cpp]\nmacro_strip = [\"\", \"CORE_API\", \"\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
         assert_eq!(
             cfg.cpp.macro_strip,
             vec!["CORE_API".to_string()],
@@ -753,7 +935,7 @@ mod tests {
             "[cpp]\nmacro_strip = []\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("[cpp] with empty array must load cleanly");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("[cpp] with empty array must load cleanly");
         assert!(
             cfg.cpp.macro_strip.is_empty(),
             "explicit empty array must yield empty macro_strip"
@@ -780,7 +962,7 @@ mod tests {
         // `[extensions]` section must load cleanly with empty overrides.
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".code-graph.toml"), "[discovery]\n").unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load without [extensions]");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load without [extensions]");
         assert!(cfg.extensions.disabled.is_empty());
         assert!(cfg.extensions.cpp.is_empty());
     }
@@ -797,7 +979,7 @@ python = [".pyx"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load valid additive lists");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load valid additive lists");
         assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
         assert_eq!(
             cfg.extensions.lookup_additional(".inl"),
@@ -823,7 +1005,7 @@ csharp = [".aspx"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load valid csharp additive list");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load valid csharp additive list");
         assert_eq!(
             cfg.extensions.lookup_additional(".aspx"),
             Some(Language::CSharp)
@@ -844,7 +1026,7 @@ java = [".jav"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load valid java additive list");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load valid java additive list");
         assert_eq!(
             cfg.extensions.lookup_additional(".jav"),
             Some(Language::Java)
@@ -895,7 +1077,7 @@ disabled = [".h"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load valid disabled list");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load valid disabled list");
         assert!(cfg.extensions.is_disabled(".h"));
         assert!(!cfg.extensions.is_disabled(".cpp"));
     }
@@ -914,7 +1096,7 @@ disabled = [".PNG"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load mixed-case entries");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load mixed-case entries");
         assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
         assert_eq!(cfg.extensions.disabled, vec![".png".to_string()]);
     }
@@ -984,7 +1166,7 @@ disabled = [".cu"]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("disabled vs additive overlap is allowed");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("disabled vs additive overlap is allowed");
         assert!(cfg.extensions.is_disabled(".cu"));
         assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
     }
@@ -1001,7 +1183,7 @@ disabled = [""]
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
         assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
         assert!(cfg.extensions.disabled.is_empty());
     }
@@ -1031,7 +1213,7 @@ disabled = [""]
             "[discovery]\nmax_threads = 0\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path())
+        let (cfg, _root) = RootConfig::load(dir.path())
             .expect("config without [response] section must load cleanly");
         assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
     }
@@ -1042,7 +1224,7 @@ disabled = [""]
         // yield the default via the `#[serde(default = ...)]` on the field.
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".code-graph.toml"), "[response]\n").unwrap();
-        let cfg = RootConfig::load(dir.path())
+        let (cfg, _root) = RootConfig::load(dir.path())
             .expect("empty [response] section must yield default max_bytes");
         assert_eq!(cfg.response.max_bytes, DEFAULT_RESPONSE_MAX_BYTES);
     }
@@ -1055,7 +1237,7 @@ disabled = [""]
             "[response]\nmax_bytes = 51200\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("explicit override must load");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("explicit override must load");
         assert_eq!(cfg.response.max_bytes, 51_200);
     }
 
@@ -1156,7 +1338,7 @@ max_bytes = 200000
 "#,
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("multi-section config must load");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("multi-section config must load");
         assert_eq!(cfg.discovery.max_threads, 2);
         assert_eq!(cfg.parsing.max_threads, 4);
         assert_eq!(cfg.cpp.macro_strip, vec!["CORE_API".to_string()]);
@@ -1177,7 +1359,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip = [\"B\", \"A\", \"C\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load must succeed");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed");
         assert_eq!(
             cfg.cpp.macro_strip,
             vec!["B".to_string(), "A".to_string(), "C".to_string()],
@@ -1204,7 +1386,7 @@ max_bytes = 200000
             "[discovery]\nmax_threads = 0\n",
         )
         .unwrap();
-        let cfg =
+        let (cfg, _root) =
             RootConfig::load(dir.path()).expect("config without [cpp] section must load cleanly");
         assert!(
             cfg.cpp.macro_strip_with_args.is_empty(),
@@ -1218,7 +1400,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip_with_args = []\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path())
+        let (cfg, _root) = RootConfig::load(dir.path())
             .expect("[cpp] with explicit empty macro_strip_with_args must load cleanly");
         assert!(
             cfg.cpp.macro_strip_with_args.is_empty(),
@@ -1235,7 +1417,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip_with_args = [\"UCLASS\", \"UFUNCTION\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load must succeed");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed");
         assert_eq!(
             cfg.cpp.macro_strip_with_args,
             vec!["UCLASS".to_string(), "UFUNCTION".to_string()],
@@ -1254,7 +1436,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip_with_args = [\"\", \"UCLASS\", \"\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
         assert_eq!(
             cfg.cpp.macro_strip_with_args,
             vec!["UCLASS".to_string()],
@@ -1273,7 +1455,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip_with_args = [\"UCLASS\", \"UCLASS\", \"UFUNCTION\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("load must succeed with duplicates");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed with duplicates");
         assert_eq!(
             cfg.cpp.macro_strip_with_args,
             vec!["UCLASS".to_string(), "UFUNCTION".to_string()],
@@ -1312,7 +1494,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip = [\"ENGINE_API\"]\nmacro_strip_with_args = [\"UCLASS\"]\n",
         )
         .unwrap();
-        let cfg = RootConfig::load(dir.path()).expect("disjoint lists must load cleanly");
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("disjoint lists must load cleanly");
         assert_eq!(cfg.cpp.macro_strip, vec!["ENGINE_API".to_string()]);
         assert_eq!(cfg.cpp.macro_strip_with_args, vec!["UCLASS".to_string()]);
     }
@@ -1330,7 +1512,7 @@ max_bytes = 200000
             "[cpp]\nmacro_strip = [\"UCLASS\"]\nmacro_strip_with_args = [\"uclass\"]\n",
         )
         .unwrap();
-        let cfg =
+        let (cfg, _root) =
             RootConfig::load(dir.path()).expect("case-mismatched tokens must NOT be a conflict");
         assert_eq!(
             cfg.cpp.macro_strip,
