@@ -35,8 +35,21 @@ pub struct Graph {
     pub(crate) nodes: HashMap<SymbolId, Node>,
     pub(crate) adj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub(crate) radj: HashMap<SymbolId, Vec<EdgeEntry>>,
-    pub(crate) files: HashMap<PathBuf, FileEntry>,
-    pub(crate) includes: HashMap<PathBuf, Vec<IncludeEntry>>,
+    /// Per-file metadata, keyed by absolute file path. Backed by a
+    /// segment-keyed Patricia trie (Phase E) so subtree-scoped tools
+    /// can walk all files under a directory prefix in `O(subtree)`
+    /// instead of scanning the full map. The
+    /// `HashMap`-shape-compatible methods (`get`, `insert`, `remove`,
+    /// `contains_path`, `len`, `is_empty`, `clear`, `keys`, `values`,
+    /// `iter`, `entry`) are direct drop-in equivalents to `HashMap`'s
+    /// (note `contains_path` vs the old `contains_key`); subtree
+    /// methods (`iter_subtree`, `count_subtree`, `remove_subtree`,
+    /// `longest_prefix`, `iter_ancestors`) are the new capability
+    /// surface unlocked by Phase E.
+    pub(crate) files: code_graph_path_trie::PathTrie<FileEntry>,
+    /// Per-file include lists. Same trie shape and rationale as
+    /// `files`.
+    pub(crate) includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>>,
     /// Nanoseconds since UNIX_EPOCH when the out-of-scope hygiene
     /// sweep last ran across this graph. Persisted in the cache
     /// (`GraphCache.last_sweep_at`) so the cadence survives process
@@ -160,7 +173,7 @@ impl Graph {
         let path = PathBuf::from(&fg.path);
 
         // Remove stale data if file was previously indexed.
-        if self.files.contains_key(&path) {
+        if self.files.contains_path(&path) {
             self.remove_file_unsafe(&path);
         }
 
@@ -564,12 +577,12 @@ impl Graph {
     }
 
     #[cfg(test)]
-    fn files(&self) -> &HashMap<PathBuf, FileEntry> {
+    fn files(&self) -> &code_graph_path_trie::PathTrie<FileEntry> {
         &self.files
     }
 
     #[cfg(test)]
-    fn includes(&self) -> &HashMap<PathBuf, Vec<IncludeEntry>> {
+    fn includes(&self) -> &code_graph_path_trie::PathTrie<Vec<IncludeEntry>> {
         &self.includes
     }
 }
@@ -627,7 +640,7 @@ mod tests {
         // NOT in adj/radj.
         let key = PathBuf::from("/a.cpp");
         assert_eq!(
-            g.includes()[&key],
+            *g.includes().get(&key).unwrap(),
             vec![IncludeEntry {
                 path: PathBuf::from("/utils.h"),
                 line: 12,
@@ -635,8 +648,8 @@ mod tests {
         );
 
         // Files map records the language.
-        assert!(g.files().contains_key(&key));
-        assert_eq!(g.files()[&key].language, Language::Cpp);
+        assert!(g.files().contains_path(&key));
+        assert_eq!(g.files().get(&key).unwrap().language, Language::Cpp);
     }
 
     #[test]
@@ -788,9 +801,9 @@ mod tests {
         assert_eq!(g.adj()["/b.cpp:bar"][0].target, "/b.cpp:helper");
 
         // Includes for /a.cpp gone; files entry for /a.cpp gone.
-        assert!(!g.includes().contains_key(&path_a));
-        assert!(!g.files().contains_key(&path_a));
-        assert!(g.files().contains_key(&PathBuf::from("/b.cpp")));
+        assert!(!g.includes().contains_path(&path_a));
+        assert!(!g.files().contains_path(&path_a));
+        assert!(g.files().contains_path(PathBuf::from("/b.cpp")));
     }
 
     #[test]
@@ -876,7 +889,7 @@ mod tests {
         // This test pins the *routing* invariant; the `include_edge`
         // fixture carries `line: 0`, which flows through unchanged.
         assert_eq!(
-            g.includes()[&key],
+            *g.includes().get(&key).unwrap(),
             vec![IncludeEntry {
                 path: PathBuf::from("/utils.h"),
                 line: 0,
@@ -896,7 +909,7 @@ mod tests {
             vec![sym("foo", SymbolKind::Function, "/a.cpp")],
             vec![],
         ));
-        let entry = g.files().get(&PathBuf::from("/a.cpp")).unwrap();
+        let entry = g.files().get(PathBuf::from("/a.cpp")).unwrap();
         assert_eq!(entry.language, Language::Cpp);
         assert_eq!(entry.symbol_ids, vec!["/a.cpp:foo".to_string()]);
     }

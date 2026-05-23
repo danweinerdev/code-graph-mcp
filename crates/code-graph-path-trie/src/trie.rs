@@ -38,6 +38,49 @@ pub struct PathTrie<V, N: Normalizer = IdentityNormalizer> {
     pub(crate) normalizer: N,
 }
 
+impl<V: std::fmt::Debug, N: Normalizer> std::fmt::Debug for PathTrie<V, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render as a {path: value} map for parity with HashMap's Debug
+        // output — load-bearing for code that does `eprintln!("{:?}",
+        // graph)` and pretty-asserts.
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+/// `&PathTrie` → `Iter`, so `for (path, value) in &trie {…}` compiles
+/// the same way it does for `&HashMap`. Yields `(PathBuf, &V)` pairs —
+/// the path is reconstructed during iteration (per [`Iter`]'s
+/// design).
+impl<'a, V, N: Normalizer> IntoIterator for &'a PathTrie<V, N> {
+    type Item = (std::path::PathBuf, &'a V);
+    type IntoIter = Iter<'a, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Two tries are equal iff they contain the same `(path, value)` set.
+/// Internal node identity (slotmap key, edge-label compression shape)
+/// is ignored — two tries built from the same insert sequence but
+/// with different intermediate Patricia splits compare equal.
+impl<V: PartialEq, N: Normalizer> PartialEq for PathTrie<V, N> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        // Walk self; every key must exist in other with the same value.
+        for (path, value) in self {
+            match other.get(&path) {
+                Some(o) if o == value => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl<V: Eq, N: Normalizer> Eq for PathTrie<V, N> {}
+
 impl<V> PathTrie<V, IdentityNormalizer> {
     /// New empty trie with the identity normalizer.
     pub fn new() -> Self {
@@ -74,6 +117,21 @@ impl<V, N: Normalizer> PathTrie<V, N> {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Drop every entry and reset the trie to the empty state. The
+    /// normalizer policy is preserved.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.root = self.nodes.insert(Node::root());
+        self.len = 0;
+    }
+
+    /// `HashMap`-compatibility alias for [`paths`](PathTrie::paths). The
+    /// two are byte-identical; this exists so a `HashMap<PathBuf, V>` →
+    /// `PathTrie<V>` shape swap doesn't have to rename every call site.
+    pub fn keys(&self) -> Paths<'_, V> {
+        self.paths()
     }
 
     pub fn contains_path<P: AsRef<Path>>(&self, path: P) -> bool {

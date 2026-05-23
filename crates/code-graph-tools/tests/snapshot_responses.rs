@@ -454,6 +454,7 @@ async fn response_get_orphans_default_callables() {
         None,
         None,
         None,
+        None,
         false,
         None,
         NO_BYTE_BUDGET,
@@ -476,6 +477,7 @@ async fn response_get_orphans_paginated_offset() {
     let r = get_orphans(
         &fx.inner.graph,
         Some("function"),
+        None,
         Some(20),
         Some(20),
         None,
@@ -499,6 +501,7 @@ async fn response_get_orphans_brief_false() {
         None,
         None,
         None,
+        None,
         Some(false),
         false,
         None,
@@ -516,6 +519,7 @@ async fn response_get_orphans_offset_beyond_total() {
     let fx = build_indexed_fixture().await;
     let r = get_orphans(
         &fx.inner.graph,
+        None,
         None,
         None,
         Some(999),
@@ -549,6 +553,7 @@ async fn response_get_orphans_byte_budget_truncated() {
     let r = get_orphans(
         &fx.inner.graph,
         Some("function"),
+        None,
         Some(20),
         Some(0),
         None,
@@ -579,6 +584,7 @@ async fn response_count_only_orphans() {
     let r = get_orphans(
         &fx.inner.graph,
         Some("function"),
+        None,
         None,
         None,
         None,

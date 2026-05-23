@@ -168,6 +168,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
     let r = get_orphans(
         &fx.inner.graph,
         None,
+        None,
         Some(1000),
         Some(0),
         None,
@@ -245,6 +246,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
             cur_next_offset.expect("truncated=true must always come with Some(next_offset)");
         let r = get_orphans(
             &fx.inner.graph,
+            None,
             None,
             Some(1000),
             Some(offset),
@@ -449,6 +451,7 @@ async fn count_only_under_1kb_orphans() {
 
     let r = get_orphans(
         &fx.inner.graph,
+        None,
         None,
         None,
         None,

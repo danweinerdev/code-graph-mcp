@@ -282,17 +282,20 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     // Reads disk, so done first to fail fast if files disappeared.
     let mut mtimes_raw: HashMap<PathBuf, u64> = HashMap::with_capacity(graph.files.len());
     for path in graph.files.keys() {
-        mtimes_raw.insert(path.clone(), super::mtime_nanos(path).unwrap_or(0));
+        let nanos = super::mtime_nanos(&path).unwrap_or(0);
+        mtimes_raw.insert(path, nanos);
     }
 
     // ----- Sort keysets for byte-stable ordering. -----
     let mut sorted_node_ids: Vec<&SymbolId> = graph.nodes.keys().collect();
     sorted_node_ids.sort();
 
-    let mut sorted_file_paths: Vec<&PathBuf> = graph.files.keys().collect();
+    // `PathTrie::keys()` yields owned `PathBuf`s (per the trie's
+    // path-reconstruct-on-yield design); collect to owned and sort.
+    let mut sorted_file_paths: Vec<PathBuf> = graph.files.keys().collect();
     sorted_file_paths.sort();
 
-    let mut sorted_include_keys: Vec<&PathBuf> = graph.includes.keys().collect();
+    let mut sorted_include_keys: Vec<PathBuf> = graph.includes.keys().collect();
     sorted_include_keys.sort();
 
     let mut sorted_adj_keys: Vec<&SymbolId> = graph.adj.keys().collect();
@@ -330,7 +333,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     // ----- Encode files map (and capture per-file SymbolId references). -----
     let mut packed_files: HashMap<u32, PackedFile> = HashMap::with_capacity(graph.files.len());
     for path in &sorted_file_paths {
-        let fe = &graph.files[*path];
+        let fe = graph.files.get(path).expect("path was just iterated");
         let path_id = paths.intern(path);
         // Preserve insertion order: the live graph's `FileEntry.symbol_ids`
         // reflects `merge_file_graph` push order and round-trip tests
@@ -348,7 +351,7 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
     let mut packed_includes: HashMap<u32, Vec<PackedInclude>> =
         HashMap::with_capacity(graph.includes.len());
     for path in &sorted_include_keys {
-        let entries = &graph.includes[*path];
+        let entries = graph.includes.get(path).expect("path was just iterated");
         let path_id = paths.intern(path);
         // Preserve order — round-trip must be a value-identity transform.
         let packed_entries: Vec<PackedInclude> = entries
@@ -420,8 +423,8 @@ pub(crate) struct DecodedParts {
     pub nodes: HashMap<SymbolId, Node>,
     pub adj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub radj: HashMap<SymbolId, Vec<EdgeEntry>>,
-    pub files: HashMap<PathBuf, FileEntry>,
-    pub includes: HashMap<PathBuf, Vec<IncludeEntry>>,
+    pub files: code_graph_path_trie::PathTrie<FileEntry>,
+    pub includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +537,8 @@ pub(crate) fn decode_archived(
     let adj = decode_archived_edge_map(&cache.adj, &resolver)?;
     let radj = decode_archived_edge_map(&cache.radj, &resolver)?;
 
-    let mut files: HashMap<PathBuf, FileEntry> = HashMap::with_capacity(cache.files.len());
+    let mut files: code_graph_path_trie::PathTrie<FileEntry> =
+        code_graph_path_trie::PathTrie::new();
     for (path_id, packed) in cache.files.iter() {
         let path = PathBuf::from(resolver.path(path_id.to_native())?);
         let mut symbol_ids: Vec<SymbolId> = Vec::with_capacity(packed.symbol_ids.len());
@@ -550,8 +554,8 @@ pub(crate) fn decode_archived(
         );
     }
 
-    let mut includes: HashMap<PathBuf, Vec<IncludeEntry>> =
-        HashMap::with_capacity(cache.includes.len());
+    let mut includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>> =
+        code_graph_path_trie::PathTrie::new();
     for (path_id, packed_entries) in cache.includes.iter() {
         let path = PathBuf::from(resolver.path(path_id.to_native())?);
         let mut entries: Vec<IncludeEntry> = Vec::with_capacity(packed_entries.len());

@@ -442,6 +442,14 @@ pub struct GetOrphansArgs {
     #[schemars(description = "Filter by symbol kind: function, method (default: all callables)")]
     #[serde(default)]
     pub kind: Option<String>,
+    #[schemars(
+        description = "Restrict the search to symbols whose file path is at or under this \
+                       directory prefix. Walks the path-trie's subtree iterator — O(symbols \
+                       under prefix), independent of total graph size. Absent / empty value \
+                       searches the whole graph."
+    )]
+    #[serde(default)]
+    pub subtree: Option<String>,
     #[schemars(description = "Maximum results to return (default 20, max 1000)")]
     #[serde(default)]
     pub limit: Option<u32>,
@@ -1061,6 +1069,7 @@ impl CodeGraphServer {
         Ok(handlers::structure::get_orphans(
             &self.inner.graph,
             args.kind.as_deref(),
+            args.subtree.as_deref(),
             args.limit,
             args.offset,
             args.brief,
@@ -1675,6 +1684,7 @@ mod tests {
         let r = server
             .get_orphans(Parameters(GetOrphansArgs {
                 kind: None,
+                subtree: None,
                 limit: None,
                 offset: None,
                 brief: None,

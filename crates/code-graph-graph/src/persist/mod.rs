@@ -656,11 +656,27 @@ mod tests {
         let mut loaded = Graph::new();
         assert!(loaded.load(dir.path()).unwrap());
         assert_eq!(loaded.files.len(), 2);
-        assert!(loaded.files.contains_key(&PathBuf::from(file_a)));
-        assert!(loaded.files.contains_key(&PathBuf::from(file_b)));
+        assert!(loaded.files.contains_path(PathBuf::from(file_a)));
+        assert!(loaded.files.contains_path(PathBuf::from(file_b)));
         // Stronger: each FileEntry has the right symbol count.
-        assert_eq!(loaded.files[&PathBuf::from(file_a)].symbol_ids.len(), 10);
-        assert_eq!(loaded.files[&PathBuf::from(file_b)].symbol_ids.len(), 10);
+        assert_eq!(
+            loaded
+                .files
+                .get(PathBuf::from(file_a))
+                .unwrap()
+                .symbol_ids
+                .len(),
+            10
+        );
+        assert_eq!(
+            loaded
+                .files
+                .get(PathBuf::from(file_b))
+                .unwrap()
+                .symbol_ids
+                .len(),
+            10
+        );
     }
 
     #[test]

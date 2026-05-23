@@ -452,7 +452,7 @@ impl Graph {
         depth: u32,
         max_nodes: u32,
     ) -> Option<DiagramResult> {
-        if !self.files.contains_key(start_path) {
+        if !self.files.contains_path(start_path) {
             return None;
         }
 
@@ -488,11 +488,19 @@ impl Graph {
 
             // Incoming includes: scan every other file's include list
             // for entries pointing at `curr`. Faithful O(N×M) port.
+            //
+            // PathTrie iteration yields owned `PathBuf` for the key
+            // (the path is reconstructed during walk — see
+            // PathTrie::iter doc-comment), unlike the prior HashMap
+            // which yielded `&PathBuf`. We pass `&from` to
+            // `visited.contains` and clone `from` for the inserts
+            // — same shape as the HashMap-era code, just with the
+            // explicit borrow.
             for (from, incs) in &self.includes {
                 for inc in incs {
                     if inc.path == curr {
                         raw_edges.push((from.clone(), curr.clone()));
-                        if !visited.contains(from) && visited.len() < max_nodes {
+                        if !visited.contains(&from) && visited.len() < max_nodes {
                             visited.insert(from.clone());
                             queue.push_back((from.clone(), curr_depth + 1));
                         }

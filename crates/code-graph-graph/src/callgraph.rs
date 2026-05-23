@@ -240,6 +240,50 @@ impl Graph {
         result
     }
 
+    /// Same as [`orphans`] but restricted to symbols whose file is at
+    /// or under `subtree_prefix`. Walks
+    /// [`PathTrie::iter_subtree`](code_graph_path_trie::PathTrie::iter_subtree)
+    /// over `self.files`, so the cost is `O(symbols-under-prefix)` and
+    /// independent of how big the rest of the graph is.
+    ///
+    /// **Phase E payoff site.** Pre-Phase E the same query would have
+    /// scanned `self.nodes` (millions of entries on UE/LLVM-scale)
+    /// and filtered by `Symbol.file.starts_with(prefix)` per
+    /// candidate. The trie's subtree iter gives bounded work, which
+    /// matters once `subtree_prefix` narrows the search to a single
+    /// crate or directory.
+    ///
+    /// [`orphans`]: Graph::orphans
+    pub fn orphans_under(&self, subtree_prefix: &Path, kind: Option<SymbolKind>) -> Vec<Symbol> {
+        let mut result: Vec<Symbol> = Vec::new();
+        for (_path, entry) in self.files.iter_subtree(subtree_prefix) {
+            for sid in &entry.symbol_ids {
+                let Some(node) = self.nodes.get(sid) else {
+                    continue;
+                };
+                match kind {
+                    None => match node.symbol.kind {
+                        SymbolKind::Function | SymbolKind::Method => {}
+                        _ => continue,
+                    },
+                    Some(k) => {
+                        if node.symbol.kind != k {
+                            continue;
+                        }
+                    }
+                }
+                let has_caller = self
+                    .radj
+                    .get(sid)
+                    .is_some_and(|entries| entries.iter().any(|e| e.kind == EdgeKind::Calls));
+                if !has_caller {
+                    result.push(node.symbol.clone());
+                }
+            }
+        }
+        result
+    }
+
     /// Files included by `path` (`#include`-style edges), each paired with
     /// the source line of the include directive. Returns an empty `Vec`
     /// for unknown paths so JSON serializes as `[]`, never `null`. The
