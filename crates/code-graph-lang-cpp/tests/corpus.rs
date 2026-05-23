@@ -655,7 +655,15 @@ fn dogfood_within_ten_percent(repo_name: &str, source_subpath: Option<&str>) {
     if let Some(sub) = source_subpath {
         root.push(sub);
     }
-    if !root.is_dir() {
+    // Also treat an empty dir as "not checked out" — git worktrees inherit
+    // the submodule directory tree but not its contents, so .is_dir() alone
+    // would let an empty-but-present submodule reach the parse loop and
+    // assert 0 symbols against a non-zero baseline.
+    let empty = root
+        .read_dir()
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(true);
+    if !root.is_dir() || empty {
         eprintln!(
             "skipping {repo_name} dogfood baseline test: {root:?} not \
              present — run `git submodule update --init external/{repo_name}` \
