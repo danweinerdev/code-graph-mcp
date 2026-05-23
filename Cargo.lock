@@ -241,6 +241,7 @@ dependencies = [
  "anyhow",
  "code-graph-core",
  "code-graph-lang",
+ "code-graph-path-trie",
  "insta",
  "pretty_assertions",
  "rstest",

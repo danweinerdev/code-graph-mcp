@@ -65,6 +65,7 @@
 //!    scope.
 
 pub(crate) mod helpers;
+pub(crate) mod module_model;
 pub(crate) mod queries;
 
 use std::path::Path;
@@ -507,6 +508,75 @@ impl LanguagePlugin for GoParser {
     /// All three extractors are wired: definitions, calls, and imports.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
+    }
+
+    /// Upgrade `Symbol.namespace` from the bare `package_clause` text
+    /// (set by `parse_file`) to the canonical Go *import path* —
+    /// `<module_name>/<relative_dir>` — by walking each file's
+    /// ancestor chain to find the owning `go.mod`. Mirrors the Rust
+    /// plugin's RCMM post-pass.
+    ///
+    /// File whose ancestor chain has no `go.mod` keep the bare
+    /// `package_clause` namespace they got at parse time (the
+    /// no-module fallback). This is the same additive-not-disruptive
+    /// shape the Rust no-`Cargo.toml` fallback uses.
+    ///
+    /// Discovery is per-pass — `index_directory` does NOT surface
+    /// `go.mod` files (no plugin claims `.mod`), so we walk every
+    /// `.go` file's ancestor directories ourselves, dedup via
+    /// `HashSet`, and stat each candidate. Sub-second on real
+    /// workspaces because directory chains rarely exceed a dozen
+    /// `is_file()` calls.
+    fn post_index(
+        &self,
+        graphs: &mut [code_graph_core::FileGraph],
+        _file_index: &code_graph_lang::FileIndex,
+    ) {
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        let go_paths: Vec<PathBuf> = graphs
+            .iter()
+            .filter(|fg| fg.language == Language::Go)
+            .map(|fg| PathBuf::from(&fg.path))
+            .collect();
+        if go_paths.is_empty() {
+            return;
+        }
+
+        // Walk to disk to find every `go.mod` reachable up each file's
+        // ancestor chain. Same pattern as the Rust plugin's RCMM
+        // discovery.
+        let mut manifest_paths: HashSet<PathBuf> = HashSet::new();
+        for go in &go_paths {
+            let mut ancestor: Option<&Path> = go.parent();
+            while let Some(dir) = ancestor {
+                let candidate = dir.join("go.mod");
+                if candidate.is_file() {
+                    manifest_paths.insert(candidate);
+                }
+                ancestor = dir.parent();
+            }
+        }
+
+        let combined = go_paths.iter().cloned().chain(manifest_paths);
+        let gmm = crate::module_model::GoModuleModel::build(combined, |p| {
+            std::fs::read_to_string(p).ok()
+        });
+
+        for fg in graphs.iter_mut() {
+            if fg.language != Language::Go {
+                continue;
+            }
+            let file_path = PathBuf::from(&fg.path);
+            let Some(import_path) = gmm.namespace_for(&file_path) else {
+                continue; // No go.mod ancestor — preserve bare package name
+            };
+            let import_path = import_path.to_owned();
+            for sym in fg.symbols.iter_mut() {
+                sym.namespace = import_path.clone();
+            }
+        }
     }
 
     // resolve_call and resolve_include intentionally NOT overridden — see the
