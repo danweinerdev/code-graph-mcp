@@ -399,6 +399,24 @@ pub fn resolve_edges_with_indexes(
                 // graph engine resolves them to a concrete class node only
                 // at hierarchy-query time.
                 EdgeKind::Inherits => {}
+                EdgeKind::Overrides => {
+                    // Override edges share `resolve_call`'s lookup
+                    // mechanism: both target a method by
+                    // `Parent::name`-shaped bare token and benefit
+                    // from the same scope-aware resolver. An
+                    // unresolved Override edge survives with its
+                    // bare `to` — `find_overrides` filters via
+                    // `is_resolved_node` so unresolved edges don't
+                    // surface to the agent.
+                    let ctx = CallContext {
+                        caller_id: &edge.from,
+                        caller_file: &path_for_ctx,
+                        language: fg.language,
+                    };
+                    if let Some(id) = plugin.resolve_call(&edge.to, &ctx, symbol_index) {
+                        edge.to = id;
+                    }
+                }
                 _ => {}
             }
             true

@@ -175,7 +175,7 @@ impl Graph {
         for edge in fg.edges {
             let edge_file = PathBuf::from(&edge.file);
             match edge.kind {
-                EdgeKind::Calls | EdgeKind::Inherits => {
+                EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Overrides => {
                     self.adj
                         .entry(edge.from.clone())
                         .or_default()

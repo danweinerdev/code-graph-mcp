@@ -1,0 +1,42 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"find_overrides\")"
+---
+{
+  "name": "find_overrides",
+  "description": "Find every method that overrides the given (virtual or pure-virtual) method. Returns the standard `Page<CallChain>` envelope {results, total, offset, limit, truncated, next_offset}, where each row is `{symbol_id, file, line, depth}`. `depth` is always 1 — override is a single-step language relation by design; for transitive analysis compose `find_overrides` with `get_callers`. Sort is by `symbol_id` ascending. Unknown symbols return the standard 'symbol not found' error with did-you-mean suggestions; a known method with no overrides returns the empty `Page<CallChain>` envelope. Currently only C++ extracts `EdgeKind::Overrides` edges (detection: `virtual` declarator on a method whose parent class has Inherits edges); other languages always return empty until their extractors are extended. `limit` defaults to 100 (max 1000, clamped silently); `offset` defaults to 0. Response capped at `[response].max_bytes` (default 100KB); `truncated`/`next_offset` resume contract identical to the other paginated tools.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "limit": {
+        "default": null,
+        "description": "Maximum overrides to return per page (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N overrides for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "symbol": {
+        "description": "Symbol ID of the virtual or pure-virtual method to find overrides of (format file:Parent::name)",
+        "type": "string"
+      }
+    },
+    "required": [
+      "symbol"
+    ],
+    "title": "FindOverridesArgs",
+    "type": "object"
+  }
+}

@@ -57,6 +57,40 @@ impl Graph {
         self.bfs(id, depth, &self.adj, EdgeKind::Calls)
     }
 
+    /// Methods that override `id`. One-hop only: returns the direct
+    /// overrides recorded as `EdgeKind::Overrides` edges in the
+    /// reverse adjacency list. Each result is a `(symbol_id, file,
+    /// line)` triple of the OVERRIDING method.
+    ///
+    /// Override edges live in `radj` keyed by the BASE method's
+    /// symbol_id (the edge's `to`); the override method is the edge's
+    /// `from`, which surfaces here as the `target` field of the
+    /// `EdgeEntry` (the reverse-adj convention).
+    ///
+    /// Unlike `callers`/`callees` this is NOT a transitive BFS — the
+    /// override relationship is a single-step "this method overrides
+    /// that method" by language semantics; chasing it transitively
+    /// would conflate inheritance depth with override depth in
+    /// confusing ways. A caller wanting "every method that
+    /// transitively reaches an override of X" can compose
+    /// `find_overrides` with `callers`.
+    pub fn find_overrides(&self, id: &str) -> Vec<CallChain> {
+        let mut out = Vec::new();
+        if let Some(entries) = self.radj.get(id) {
+            for entry in entries {
+                if entry.kind == EdgeKind::Overrides && self.is_resolved_node(&entry.target) {
+                    out.push(CallChain {
+                        symbol_id: entry.target.clone(),
+                        file: entry.file.clone(),
+                        line: entry.line,
+                        depth: 1,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Internal BFS shared by `callers` and `callees`. The caller picks
     /// the adjacency map (`adj` for forward, `radj` for reverse) and the
     /// edge kind to follow. Each node is visited at most once via the

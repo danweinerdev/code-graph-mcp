@@ -278,6 +278,75 @@ fn is_virtual_signature(signature: &str) -> bool {
     signature.starts_with("virtual ") || signature.contains(" virtual ")
 }
 
+/// `find_overrides` body. Returns the set of method symbols whose
+/// `EdgeKind::Overrides` edges target `symbol` — i.e. the concrete
+/// implementations of a virtual / pure-virtual method.
+///
+/// Returns the standard `Page<CallChain>` envelope so the wire shape
+/// matches `get_callers` / `get_callees`. `depth` is fixed at 1 by
+/// design: override is a single-step relation per the language
+/// semantics (a method overrides exactly one method per base, not a
+/// transitive chain). A caller wanting "every override of every
+/// override" can iterate `find_overrides` themselves.
+///
+/// Unknown symbols return the standard `symbol not found` tool error
+/// with a did-you-mean suggestion list — same pattern
+/// `callers_or_callees` uses. A known symbol with no overrides
+/// returns an empty `Page<CallChain>` envelope; the
+/// non-callable-soft-hint and `is_virtual_signature` warnings do NOT
+/// apply here because the tool's semantics already imply "I asked
+/// about a method that has overrides" — surfacing those hints would
+/// be noise.
+pub fn find_overrides(
+    graph: &RwLock<Graph>,
+    symbol: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
+    if symbol.is_empty() {
+        return tool_error("'symbol' is required");
+    }
+
+    let g = graph.read();
+    let mut overrides: Vec<CallChain> = g.find_overrides(symbol);
+
+    if overrides.is_empty() && g.symbol_detail(symbol).is_none() {
+        let suggestions = suggest_symbols(&g, symbol, 5);
+        drop(g);
+        return if suggestions.is_empty() {
+            tool_error(format!("symbol not found: {symbol:?}"))
+        } else {
+            tool_error(format!(
+                "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
+            ))
+        };
+    }
+    drop(g);
+
+    // Sort by symbol_id ascending for deterministic pagination.
+    // Depth is always 1 for overrides; secondary sort by symbol_id
+    // suffices.
+    overrides.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
+
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+    let total = overrides.len() as u32;
+
+    let (results, _kept, truncated, next_offset) =
+        super::byte_budget_take(overrides, resolved_offset, resolved_limit, max_bytes);
+
+    let page = Page::<CallChain> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
+    tool_success_json(&page)
+}
+
 /// `get_dependencies` body. Returns the shared [`Page`]`<`[`DependencyEntry`]`>`
 /// envelope: one row per included file carrying the included path, the
 /// edge kind (`"includes"`), and the source line of the `#include`

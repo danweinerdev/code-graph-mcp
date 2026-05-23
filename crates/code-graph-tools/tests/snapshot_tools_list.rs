@@ -120,6 +120,13 @@ fn tools_list_get_status() {
     insta::assert_json_snapshot!(tool_entry("get_status"));
 }
 
+// --- Override navigation --------------------------------------------------
+
+#[test]
+fn tools_list_find_overrides() {
+    insta::assert_json_snapshot!(tool_entry("find_overrides"));
+}
+
 // --- Load-bearing description-substring regressions ------------------------
 //
 // The tool description strings are production behavior — agents pattern-match

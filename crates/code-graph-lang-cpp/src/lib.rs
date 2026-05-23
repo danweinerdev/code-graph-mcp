@@ -165,6 +165,15 @@ impl CppParser {
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_includes(root, content, &path_str, &mut fg);
         self.extract_inheritance(root, content, &path_str, &mut fg);
+        // `extract_overrides` MUST run after both `extract_definitions`
+        // (so we have method Symbols to scan) and `extract_inheritance`
+        // (so we have the parent-class Inherits edges to walk for base
+        // names). The pass produces one `EdgeKind::Overrides` edge per
+        // (override-method, base-class) pair; the resolver later
+        // promotes the bare `BaseClass::methodName` target to a fully
+        // qualified `path:BaseClass::methodName` symbol_id when one
+        // exists in the project's symbol index.
+        self.extract_overrides(&path_str, &mut fg);
 
         Ok(fg)
     }
@@ -456,6 +465,121 @@ impl CppParser {
             }
         }
     }
+
+    /// Emit `EdgeKind::Overrides` edges for methods that declare
+    /// `virtual` or `override` and whose enclosing class has one or
+    /// more `Inherits` edges already extracted into `fg.edges`.
+    ///
+    /// For each (override-method, base-class) pair, emits one edge:
+    /// - `from` = the override method's symbol_id (`file:Parent::name`).
+    /// - `to` = `<base_class>::<method_name>` (bare two-segment form,
+    ///   same shape `Calls` edges use before resolution).
+    /// - `kind` = `EdgeKind::Overrides`.
+    /// - `line` = the override method's declaration line.
+    ///
+    /// The resolver (`code_graph_tools::indexer::resolve_edges_with_indexes`)
+    /// promotes the bare `to` to a fully-qualified symbol_id when a
+    /// matching base method exists in the project's symbol index;
+    /// otherwise the edge survives unresolved (treated as a dangling
+    /// override pointer that `find_overrides` will filter out via
+    /// `is_resolved_node`).
+    ///
+    /// Detection is conservative: a method whose `Symbol.signature`
+    /// starts with `virtual ` or contains `override` (after the
+    /// closing `)`) is considered an override candidate. Pure-virtual
+    /// declarations (`= 0` suffix) are ALSO override candidates —
+    /// they're the base method, not an override, but we don't have
+    /// enough context here to distinguish, and downstream resolution
+    /// drops self-loops naturally (a method's Override edge with
+    /// to=`SameClass::SameMethod` resolves to itself; we skip those
+    /// emitting to begin with).
+    ///
+    /// Signature matching for "is this an override of THAT base
+    /// method" reduces to a name match here: any method in any base
+    /// with the same name is a candidate. Argument-list matching
+    /// would catch the C++-overload edge cases (sibling virtuals with
+    /// different argument lists) but is deferred — the common case is
+    /// the dominant case in engine-style code, and name-match plus
+    /// the resolver's symbol-index lookup catches it.
+    fn extract_overrides(&self, path: &str, fg: &mut FileGraph) {
+        // First, build a quick lookup: parent_class -> [base names].
+        // We can read this from the `Inherits` edges just emitted by
+        // `extract_inheritance`.
+        let mut bases_by_class: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for edge in &fg.edges {
+            if edge.kind == EdgeKind::Inherits {
+                bases_by_class
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(edge.to.clone());
+            }
+        }
+
+        if bases_by_class.is_empty() {
+            // Fast path: a file with no inheritance can't have
+            // overrides. Common in C++ codebases dominated by free
+            // functions or template-heavy code.
+            return;
+        }
+
+        let mut new_edges: Vec<Edge> = Vec::new();
+        for sym in &fg.symbols {
+            // Only methods (not free functions / classes / structs)
+            // can override. Methods carry a non-empty `parent` per
+            // the existing extractor's convention.
+            if !matches!(sym.kind, SymbolKind::Method) || sym.parent.is_empty() {
+                continue;
+            }
+            if !is_override_candidate(&sym.signature) {
+                continue;
+            }
+            let bases = match bases_by_class.get(&sym.parent) {
+                Some(b) => b,
+                None => continue, // parent class has no bases — nothing to override
+            };
+            let from_id = code_graph_core::symbol_id(sym);
+            for base in bases {
+                // Skip the self-loop case (which can happen if the
+                // base name accidentally equals the parent class
+                // name; defensive guard).
+                if base == &sym.parent {
+                    continue;
+                }
+                let to = format!("{}::{}", base, sym.name);
+                new_edges.push(Edge {
+                    from: from_id.clone(),
+                    to,
+                    kind: EdgeKind::Overrides,
+                    file: path.to_owned(),
+                    line: sym.line,
+                });
+            }
+        }
+        fg.edges.extend(new_edges);
+    }
+}
+
+/// Conservative detector for "this method declaration looks like an
+/// override candidate." Matches:
+/// - Signatures starting with `virtual ` (with the trailing space to
+///   avoid identifiers like `virtualize`).
+/// - Signatures containing `override` as a trailing decorator (any
+///   substring match — `override` is a contextual keyword in C++
+///   only valid AFTER the parameter list, so false positives on
+///   identifier names are vanishingly unlikely in well-formed code).
+///
+/// Returns `false` for empty signatures and signatures that contain
+/// neither keyword.
+fn is_override_candidate(signature: &str) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    if signature.starts_with("virtual ") || signature.contains(" virtual ") {
+        return true;
+    }
+    // `override` as a substring is safe enough — see doc-comment.
+    signature.contains("override")
 }
 
 /// `LanguagePlugin` implementation for C++.

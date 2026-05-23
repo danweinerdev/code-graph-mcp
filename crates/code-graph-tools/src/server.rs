@@ -359,6 +359,21 @@ pub struct GetCalleesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindOverridesArgs {
+    #[schemars(
+        description = "Symbol ID of the virtual or pure-virtual method to find overrides of \
+                       (format file:Parent::name)"
+    )]
+    pub symbol: String,
+    #[schemars(description = "Maximum overrides to return per page (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N overrides for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetDependenciesArgs {
     #[schemars(description = "Absolute path to the source file")]
     pub file: String,
@@ -851,6 +866,41 @@ impl CodeGraphServer {
     }
 
     #[tool(
+        description = "Find every method that overrides the given (virtual or pure-virtual) \
+                       method. Returns the standard `Page<CallChain>` envelope \
+                       {results, total, offset, limit, truncated, next_offset}, where each \
+                       row is `{symbol_id, file, line, depth}`. `depth` is always 1 — \
+                       override is a single-step language relation by design; for transitive \
+                       analysis compose `find_overrides` with `get_callers`. Sort is by \
+                       `symbol_id` ascending. Unknown symbols return the standard \
+                       'symbol not found' error with did-you-mean suggestions; a known \
+                       method with no overrides returns the empty `Page<CallChain>` \
+                       envelope. Currently only C++ extracts `EdgeKind::Overrides` edges \
+                       (detection: `virtual` declarator on a method whose parent class has \
+                       Inherits edges); other languages always return empty until their \
+                       extractors are extended. `limit` defaults to 100 (max 1000, clamped \
+                       silently); `offset` defaults to 0. Response capped at \
+                       `[response].max_bytes` (default 100KB); `truncated`/`next_offset` \
+                       resume contract identical to the other paginated tools."
+    )]
+    async fn find_overrides(
+        &self,
+        Parameters(args): Parameters<FindOverridesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let max_bytes = self.inner.config.read().response.max_bytes;
+        Ok(handlers::query::find_overrides(
+            &self.inner.graph,
+            &args.symbol,
+            args.limit,
+            args.offset,
+            max_bytes,
+        ))
+    }
+
+    #[tool(
         description = "List files included/imported by the given file. Path is resolved \
                        against the indexed graph; `\\\\?\\` extended-path prefix is handled \
                        automatically, and relative segments (`.` / `..`) resolve against \
@@ -1216,16 +1266,16 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// `tools/list` must surface exactly 16 tools. If a future change adds
+    /// `tools/list` must surface exactly 17 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_sixteen_tools() {
+    fn tool_router_registers_seventeen_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            16,
-            "expected 16 registered tools, got {}",
+            17,
+            "expected 17 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -1259,6 +1309,7 @@ mod tests {
             "watch_start",
             "watch_stop",
             "get_status",
+            "find_overrides",
         ] {
             assert!(
                 names.contains(expected),

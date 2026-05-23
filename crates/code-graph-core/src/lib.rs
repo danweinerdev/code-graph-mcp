@@ -61,6 +61,16 @@ pub enum EdgeKind {
     Calls,
     Includes,
     Inherits,
+    /// Method override edge. `from` is the overriding method (a
+    /// declaration in a derived class that carries the `override`
+    /// keyword or a `virtual` method matching a base's virtual
+    /// declarator); `to` is the base-class method being overridden.
+    /// Routed into `adj`/`radj` like `Calls` and `Inherits` so the
+    /// `find_overrides(method)` tool can walk the reverse adjacency
+    /// in one lookup. Emitted by language extractors only when they
+    /// can reliably detect the override relationship (currently only
+    /// C++); other languages inherit the trait's no-op default.
+    Overrides,
 }
 
 /// A named code entity (function, class, etc.). The shape mirrors the Go
