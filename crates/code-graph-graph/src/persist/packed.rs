@@ -32,7 +32,7 @@
 //!   "absent" at decode time.
 
 use crate::graph::{EdgeEntry, FileEntry, Graph, IncludeEntry, Node};
-use code_graph_core::{symbol_id, EdgeKind, Language, Symbol, SymbolId, SymbolKind};
+use code_graph_core::{symbol_id, Confidence, EdgeKind, Language, Symbol, SymbolId, SymbolKind};
 use lasso::{Key, Rodeo, Spur};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::HashMap;
@@ -143,6 +143,12 @@ pub(crate) struct PackedEdge {
     pub kind: EdgeKind,
     pub file: u32, // PathId where the edge was declared
     pub line: u32,
+    /// Resolver confidence in the `target`. Round-trips
+    /// [`EdgeEntry::confidence`] verbatim through the archive. The
+    /// CACHE_VERSION bump that introduced this field triggers a
+    /// silent re-index on mismatch, so no migration is needed —
+    /// every freshly-written packed entry carries its real confidence.
+    pub confidence: Confidence,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
@@ -405,6 +411,7 @@ fn encode_edge_map(
                 kind: e.kind,
                 file: paths.intern_str_path(e.file.to_str().unwrap_or("")),
                 line: e.line,
+                confidence: e.confidence,
             })
             .collect();
         out.insert(key_id, packed_entries);
@@ -425,6 +432,7 @@ pub(crate) struct DecodedParts {
     pub radj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub files: code_graph_path_trie::PathTrie<FileEntry>,
     pub includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>>,
+    pub last_sweep_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +484,16 @@ fn unarchive_edge_kind(a: &<EdgeKind as rkyv::Archive>::Archived) -> EdgeKind {
         A::Calls => E::Calls,
         A::Includes => E::Includes,
         A::Inherits => E::Inherits,
+        A::Overrides => E::Overrides,
+    }
+}
+
+fn unarchive_confidence(a: &<Confidence as rkyv::Archive>::Archived) -> Confidence {
+    use code_graph_core::ArchivedConfidence as A;
+    use code_graph_core::Confidence as C;
+    match a {
+        A::Resolved => C::Resolved,
+        A::Heuristic => C::Heuristic,
     }
 }
 
@@ -574,6 +592,7 @@ pub(crate) fn decode_archived(
         radj,
         files,
         includes,
+        last_sweep_at: cache.last_sweep_at.to_native(),
     })
 }
 
@@ -591,6 +610,7 @@ fn decode_archived_edge_map(
                 kind: unarchive_edge_kind(&pe.kind),
                 file: PathBuf::from(resolver.path_to_string(pe.file.to_native())),
                 line: pe.line.to_native(),
+                confidence: unarchive_confidence(&pe.confidence),
             });
         }
         out.insert(key, entries);

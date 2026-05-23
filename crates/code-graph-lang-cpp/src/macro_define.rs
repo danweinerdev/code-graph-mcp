@@ -33,11 +33,8 @@ use crate::preprocess::find_balanced_close;
 /// `macro_name` in `content`. `arg_text_slices` is the per-arg
 /// trimmed text vec (depth-1 split on commas); `line` is the
 /// 1-based source line of the macro identifier.
-pub(crate) fn scan_macro_invocations<F>(
-    content: &[u8],
-    macro_name: &str,
-    mut emit: F,
-) where
+pub(crate) fn scan_macro_invocations<F>(content: &[u8], macro_name: &str, mut emit: F)
+where
     F: FnMut(&[&str], u32),
 {
     let macro_bytes = macro_name.as_bytes();

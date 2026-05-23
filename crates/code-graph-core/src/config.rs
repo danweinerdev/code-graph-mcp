@@ -753,7 +753,8 @@ mod tests {
     fn empty_file_yields_all_defaults() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".code-graph.toml"), "").unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("empty file should parse as default");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("empty file should parse as default");
         let default = RootConfig::default();
         assert_eq!(cfg.discovery.max_threads, default.discovery.max_threads);
         assert_eq!(
@@ -793,7 +794,8 @@ mod tests {
             "[discovery]\nmax_threads = 0\n[parsing]\nmax_threads = 0\n",
         )
         .unwrap();
-        let (mut cfg, _root) = RootConfig::load(dir.path()).expect("valid auto config should parse");
+        let (mut cfg, _root) =
+            RootConfig::load(dir.path()).expect("valid auto config should parse");
         let warnings = cfg.resolve_concurrency();
         assert!(
             warnings.is_empty(),
@@ -813,7 +815,8 @@ mod tests {
             "[discovery]\nmax_threads = 1\n[parsing]\nmax_threads = 1\n",
         )
         .unwrap();
-        let (mut cfg, _root) = RootConfig::load(dir.path()).expect("valid pinned config should parse");
+        let (mut cfg, _root) =
+            RootConfig::load(dir.path()).expect("valid pinned config should parse");
         let warnings = cfg.resolve_concurrency();
         assert!(
             warnings.is_empty(),
@@ -955,7 +958,8 @@ mod tests {
             "[cpp]\nmacro_strip = [\"\", \"CORE_API\", \"\"]\n",
         )
         .unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
         assert_eq!(
             cfg.cpp.macro_strip,
             vec!["CORE_API".to_string()],
@@ -975,7 +979,8 @@ mod tests {
             "[cpp]\nmacro_strip = []\n",
         )
         .unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("[cpp] with empty array must load cleanly");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("[cpp] with empty array must load cleanly");
         assert!(
             cfg.cpp.macro_strip.is_empty(),
             "explicit empty array must yield empty macro_strip"
@@ -1206,7 +1211,8 @@ disabled = [".cu"]
 "#,
         )
         .unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("disabled vs additive overlap is allowed");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("disabled vs additive overlap is allowed");
         assert!(cfg.extensions.is_disabled(".cu"));
         assert_eq!(cfg.extensions.lookup_additional(".cu"), Some(Language::Cpp));
     }
@@ -1223,7 +1229,8 @@ disabled = [""]
 "#,
         )
         .unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
         assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
         assert!(cfg.extensions.disabled.is_empty());
     }
@@ -1476,7 +1483,8 @@ max_bytes = 200000
             "[cpp]\nmacro_strip_with_args = [\"\", \"UCLASS\", \"\"]\n",
         )
         .unwrap();
-        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("load must succeed even with empty entries");
         assert_eq!(
             cfg.cpp.macro_strip_with_args,
             vec!["UCLASS".to_string()],

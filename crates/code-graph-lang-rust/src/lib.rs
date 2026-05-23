@@ -916,11 +916,7 @@ impl LanguagePlugin for RustParser {
     /// direction that produces no false positives: an absolute path
     /// *in* the index points at a real source file, so any Rust edge
     /// whose `to` is that path is by definition resolved.
-    fn resolve_include(
-        &self,
-        raw: &str,
-        file_index: &FileIndex,
-    ) -> Option<(PathBuf, Confidence)> {
+    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<(PathBuf, Confidence)> {
         let candidate = Path::new(raw);
         if !candidate.is_absolute() {
             // `use`/`extern crate` tokens (`"std::io"`, `"alloc"`) are

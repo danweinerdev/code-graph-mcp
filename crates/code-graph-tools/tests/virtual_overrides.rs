@@ -232,7 +232,8 @@ public:
     // is meaningfully scoped to "method exists, just has no
     // overrides").
     assert!(
-        g.symbol_detail(&standalone_foo).is_some_and(|s| s.kind == SymbolKind::Method),
+        g.symbol_detail(&standalone_foo)
+            .is_some_and(|s| s.kind == SymbolKind::Method),
         "Standalone::Foo must index as a Method"
     );
     // Keep `_subject` referenced for the IDE.

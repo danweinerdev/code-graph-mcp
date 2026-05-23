@@ -96,7 +96,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         None,
         None,
         NO_BYTE_BUDGET,
-            None,
+        None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -136,7 +136,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
         None,
         None,
         NO_BYTE_BUDGET,
-            None,
+        None,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

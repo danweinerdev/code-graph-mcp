@@ -53,8 +53,8 @@ fn parse_result(r: &rmcp::model::CallToolResult) -> AnalyzeResult {
         .and_then(|c| c.as_text())
         .map(|t| t.text.to_string())
         .expect("result must carry a text body");
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .expect("AnalyzeResult must serialize as valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("AnalyzeResult must serialize as valid JSON");
     let files = parsed["files"].as_u64().unwrap() as u32;
     let symbols = parsed["symbols"].as_u64().unwrap() as u32;
     let edges = parsed["edges"].as_u64().unwrap() as u32;
@@ -76,11 +76,7 @@ fn parse_result(r: &rmcp::model::CallToolResult) -> AnalyzeResult {
     }
 }
 
-async fn run_analyze(
-    server: &CodeGraphServer,
-    path: &Path,
-    force: bool,
-) -> AnalyzeResult {
+async fn run_analyze(server: &CodeGraphServer, path: &Path, force: bool) -> AnalyzeResult {
     let r = analyze_codebase(
         server.inner.clone(),
         path.to_string_lossy().into_owned(),
@@ -122,18 +118,17 @@ async fn discovery_finds_parent_config_and_caches_at_project_root() {
         "[cpp]\nmacro_strip = [\"MYLIB_API\"]\n",
     )
     .unwrap();
-    std::fs::write(
-        subdir.join("MyClass.h"),
-        "class MYLIB_API MyClass {};\n",
-    )
-    .unwrap();
+    std::fs::write(subdir.join("MyClass.h"), "class MYLIB_API MyClass {};\n").unwrap();
 
     let server = fresh_server();
     let result = run_analyze(&server, &subdir, true).await;
 
     // (1, 2) Class extracted via parent config.
     let g = server.inner.graph.read();
-    let symbols: Vec<_> = g.file_symbols(&subdir.join("MyClass.h")).into_iter().collect();
+    let symbols: Vec<_> = g
+        .file_symbols(&subdir.join("MyClass.h"))
+        .into_iter()
+        .collect();
     let myclass = symbols
         .iter()
         .find(|s| s.name == "MyClass")
@@ -239,7 +234,10 @@ async fn discovery_no_config_anywhere_falls_back_with_warning() {
 
     // Warning must call out the absent-config consequence.
     assert!(
-        result.warnings.iter().any(|w| w.contains("no .code-graph.toml found")),
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("no .code-graph.toml found")),
         "warnings must include the no-config notice; got: {:?}",
         result.warnings
     );
@@ -780,7 +778,10 @@ void b_caller() { a_func(); }
                 .any(|c| c.symbol_id == format!("{a_cpp_str}:a_func")),
             "b_caller's call to a_func MUST resolve via the combined symbol_index \
              (fresh→cached path); got callees: {:?}",
-            b_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+            b_caller_callees
+                .iter()
+                .map(|c| &c.symbol_id)
+                .collect::<Vec<_>>()
         );
 
         // Asymmetric half: A's cached call to b_target STILL does not
@@ -796,7 +797,10 @@ void b_caller() { a_func(); }
             "a_caller's cached call to b_target must NOT spontaneously resolve \
              after B is indexed — documented asymmetric-resolve contract. \
              Got: {:?}",
-            a_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+            a_caller_callees
+                .iter()
+                .map(|c| &c.symbol_id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -814,7 +818,10 @@ void b_caller() { a_func(); }
                 .any(|c| c.symbol_id == format!("{b_cpp_str}:b_target")),
             "after force=true at A, a_caller's call to b_target MUST now resolve \
              — force-reindex closes the asymmetric-resolve gap. Got: {:?}",
-            a_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+            a_caller_callees
+                .iter()
+                .map(|c| &c.symbol_id)
+                .collect::<Vec<_>>()
         );
     }
 }

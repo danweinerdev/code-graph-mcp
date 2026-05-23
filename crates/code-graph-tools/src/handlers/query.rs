@@ -115,6 +115,7 @@ pub enum Direction {
 /// symbol with no callers/callees returns the envelope with `results: []`
 /// and `total: 0` — that distinction lets agents tell "wrong symbol"
 /// apart from "no callers in scope".
+#[allow(clippy::too_many_arguments)]
 pub fn callers_or_callees(
     graph: &RwLock<Graph>,
     symbol: &str,
@@ -687,7 +688,10 @@ mod tests {
         );
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 2, "no filter → both targets reported");
-        let ids: Vec<&str> = arr.iter().map(|h| h["symbol_id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = arr
+            .iter()
+            .map(|h| h["symbol_id"].as_str().unwrap())
+            .collect();
         assert!(ids.contains(&"/x.cpp:res_target"));
         assert!(ids.contains(&"/x.cpp:heur_target"));
     }
@@ -731,7 +735,10 @@ mod tests {
             Some("resolved"),
         );
         let (arr, total, _, _) = page_parts(&r);
-        assert_eq!(total, 0, "Heuristic inbound → invisible under min_confidence=resolved");
+        assert_eq!(
+            total, 0,
+            "Heuristic inbound → invisible under min_confidence=resolved"
+        );
         assert!(arr.is_empty());
 
         let r2 = callers_or_callees(

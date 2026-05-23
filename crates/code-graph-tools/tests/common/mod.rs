@@ -68,14 +68,16 @@ pub fn copy_testdata(dest: &Path) {
 /// to `copy_testdata` — used by mixed-language tests that seed
 /// from `testdata/mixed/` or `testdata/rust/` instead of the C++ corpus.
 ///
-/// Skips `.code-graph-cache.json` at any depth: the cache file is
-/// gitignored but persists between runs of dogfood baseline tests
-/// (which invoke `analyze_codebase` directly against `testdata/<lang>/`).
-/// Copying a stale cache into a fresh TempDir would pollute the next
-/// analyze: the cache's file paths point at a prior TempDir, so the
+/// Skips `.code-graph-cache.json` and `.code-graph-cache.db` at any
+/// depth: the cache file is gitignored but persists between runs of
+/// dogfood baseline tests (which invoke `analyze_codebase` directly
+/// against `testdata/<lang>/`). Copying a stale cache into a fresh
+/// TempDir would pollute the next analyze: the cache's file paths
+/// point at a prior TempDir (or the dogfood source tree), so the
 /// cache-load + merge-with-fresh-parse path produces 2N file entries
 /// instead of N. Easier to filter at the seed boundary than to teach
-/// every test to delete the file after copy.
+/// every test to delete the file after copy. The `.json` form was the
+/// pre-v7 filename; the `.db` form is v7+'s binary packed cache.
 #[allow(dead_code)]
 pub fn copy_testdata_from(src: &Path, dest: &Path) {
     for entry in walkdir::WalkDir::new(src) {
@@ -83,7 +85,8 @@ pub fn copy_testdata_from(src: &Path, dest: &Path) {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.file_name() == ".code-graph-cache.json" {
+        let fname = entry.file_name();
+        if fname == ".code-graph-cache.json" || fname == ".code-graph-cache.db" {
             continue;
         }
         let rel = entry

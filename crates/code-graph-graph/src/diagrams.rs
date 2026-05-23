@@ -1415,7 +1415,13 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:MyClass::doWork", DiagramDirection::Both, 1, 30, None)
+            .diagram_call_graph(
+                "/x.cpp:MyClass::doWork",
+                DiagramDirection::Both,
+                1,
+                30,
+                None,
+            )
             .expect("method is known");
         assert_eq!(result.center, "MyClass::doWork");
         assert_eq!(result.edges.len(), 1);

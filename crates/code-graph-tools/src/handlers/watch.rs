@@ -452,9 +452,7 @@ pub async fn try_reindex_file(
                     caller_file: &path_for_ctx,
                     language: new_fg.language,
                 };
-                if let Some((id, confidence)) =
-                    plugin.resolve_call(&edge.to, &ctx, &symbol_index)
-                {
+                if let Some((id, confidence)) = plugin.resolve_call(&edge.to, &ctx, &symbol_index) {
                     edge.to = id;
                     edge.confidence = confidence;
                 }

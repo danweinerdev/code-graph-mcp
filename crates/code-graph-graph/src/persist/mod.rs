@@ -60,6 +60,15 @@ const CACHE_FILE_NAME: &str = ".code-graph-cache.db";
 // contract.
 const CACHE_VERSION: u32 = 7;
 
+/// Out-of-scope sweep cadence: 24 hours in nanoseconds. After a scoped
+/// `analyze_codebase` finishes its in-scope work, if at least this
+/// many nanoseconds have elapsed since the last sweep, the handler
+/// runs `Graph::sweep_missing_out_of_scope` to stat every cached file
+/// OUTSIDE the invocation scope and drop the ones missing on disk.
+/// Keeps the cache from accumulating ghost entries without paying
+/// full-revalidation cost on every invocation.
+pub const SWEEP_INTERVAL_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
 /// Errors returned by [`Graph::save`], [`Graph::load`], and [`stale_paths`].
 ///
 /// Version-mismatch, missing-file, endian-probe-mismatch, and archive
@@ -118,7 +127,7 @@ impl Graph {
         // strings into compact tables; mtimes are stat'd fresh inside
         // the encoder (files that no longer exist record `0` so
         // `stale_paths` flags them next round).
-        let cache = packed::encode(self, 0);
+        let cache = packed::encode(self, self.last_sweep_at);
 
         // rkyv-serialize to an AlignedVec. The archive is the
         // post-header byte region; the loader will slice off the
@@ -219,6 +228,7 @@ impl Graph {
         self.radj = parts.radj;
         self.files = parts.files;
         self.includes = parts.includes;
+        self.last_sweep_at = parts.last_sweep_at;
         Ok(true)
     }
 }

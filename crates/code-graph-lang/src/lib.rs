@@ -237,10 +237,10 @@ pub(crate) fn default_scope_aware_resolve(
         }
     }
     let _ = caller_ns; // mirror Go's `_ = callerNS` line
-    // ≥ 2 candidates reached the scoring loop: every match here is a
-    // heuristic pick by definition, regardless of how decisive the
-    // winning score was. Agents asking for `min_confidence=resolved`
-    // can filter these out.
+                       // ≥ 2 candidates reached the scoring loop: every match here is a
+                       // heuristic pick by definition, regardless of how decisive the
+                       // winning score was. Agents asking for `min_confidence=resolved`
+                       // can filter these out.
     best.map(|e| (e.id.clone(), Confidence::Heuristic))
 }
 
@@ -417,11 +417,7 @@ pub trait LanguagePlugin: Send + Sync {
     /// structural disambiguator. Overrides that always have a
     /// definitive answer (e.g. Rust's `mod`-decl + `#[path]`
     /// resolver) should return `Resolved` unconditionally.
-    fn resolve_include(
-        &self,
-        raw: &str,
-        file_index: &FileIndex,
-    ) -> Option<(PathBuf, Confidence)> {
+    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<(PathBuf, Confidence)> {
         default_basename_resolve(raw, file_index)
     }
 
@@ -1073,10 +1069,7 @@ mod tests {
         let resolved = default_basename_resolve("foo.h", &idx);
         assert_eq!(
             resolved,
-            Some((
-                PathBuf::from("/proj/include/foo.h"),
-                Confidence::Resolved
-            )),
+            Some((PathBuf::from("/proj/include/foo.h"), Confidence::Resolved)),
             "unique basename → Confidence::Resolved"
         );
     }

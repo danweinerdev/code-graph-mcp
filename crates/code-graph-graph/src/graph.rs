@@ -1236,8 +1236,8 @@ mod tests {
         let stats = g.stats();
         assert_eq!(stats.files, 1, "out-of-scope file survives");
         assert_eq!(stats.nodes, 1, "only the out-of-scope symbol remains");
-        assert!(g.files().contains_key(&PathBuf::from("/proj/other/c.cpp")));
-        assert!(!g.files().contains_key(&PathBuf::from("/proj/sub/a.cpp")));
+        assert!(g.files().contains_path(PathBuf::from("/proj/other/c.cpp")));
+        assert!(!g.files().contains_path(PathBuf::from("/proj/sub/a.cpp")));
     }
 
     /// `drop_files_in_scope` with no in-scope files is a no-op and
@@ -1292,8 +1292,8 @@ mod tests {
 
         let stats = g.stats();
         assert_eq!(stats.files, 1, "kept.cpp survives");
-        assert!(g.files().contains_key(&kept));
-        assert!(!g.files().contains_key(&gone));
+        assert!(g.files().contains_path(&kept));
+        assert!(!g.files().contains_path(&gone));
     }
 
     /// `evict_missing_in_scope` ignores files OUTSIDE the scope, even
@@ -1330,7 +1330,10 @@ mod tests {
         let removed = g.evict_missing_in_scope(&scope);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0], in_scope);
-        assert!(g.files().contains_key(&out_of_scope), "out-of-scope missing file is preserved");
+        assert!(
+            g.files().contains_path(&out_of_scope),
+            "out-of-scope missing file is preserved"
+        );
     }
 
     /// `sweep_missing_out_of_scope` is the mirror of
@@ -1366,8 +1369,15 @@ mod tests {
         ));
 
         let removed = g.sweep_missing_out_of_scope(&scope);
-        assert_eq!(removed.len(), 1, "only the out-of-scope missing file is dropped");
+        assert_eq!(
+            removed.len(),
+            1,
+            "only the out-of-scope missing file is dropped"
+        );
         assert_eq!(removed[0], out_of_scope);
-        assert!(g.files().contains_key(&in_scope), "in-scope missing file is preserved for evict_missing_in_scope");
+        assert!(
+            g.files().contains_path(&in_scope),
+            "in-scope missing file is preserved for evict_missing_in_scope"
+        );
     }
 }

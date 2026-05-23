@@ -218,10 +218,8 @@ pub async fn analyze_codebase(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
-                let elapsed_since_sweep =
-                    now_nanos.saturating_sub(probe.last_sweep_at());
-                let sweep_ran = elapsed_since_sweep
-                    >= code_graph_graph::SWEEP_INTERVAL_NANOS;
+                let elapsed_since_sweep = now_nanos.saturating_sub(probe.last_sweep_at());
+                let sweep_ran = elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS;
                 if sweep_ran {
                     let swept = probe.sweep_missing_out_of_scope(&abs_path);
                     if !swept.is_empty() {
@@ -377,9 +375,7 @@ pub async fn analyze_codebase(
         );
         let phase_start = std::time::Instant::now();
         let mut merged_graph = Graph::new();
-        let cache_loaded = merged_graph
-            .load(&project_root_for_pool)
-            .unwrap_or(false);
+        let cache_loaded = merged_graph.load(&project_root_for_pool).unwrap_or(false);
         eprintln!(
             "[code-graph] phase: cache load {} ({:.1}s, {} cached files)",
             if cache_loaded { "ok" } else { "absent/stale" },
@@ -428,15 +424,11 @@ pub async fn analyze_codebase(
             abs_path_for_pool.display()
         );
         let phase_start = std::time::Instant::now();
-        let (mut fresh_graphs, parse_warnings) = match index_directory(
-            &abs_path_for_pool,
-            &registry.registry,
-            &cfg_for_pool,
-            &sink,
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.to_string()),
-        };
+        let (mut fresh_graphs, parse_warnings) =
+            match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
+                Ok(v) => v,
+                Err(e) => return Err(e.to_string()),
+            };
         blocking_warnings.extend(parse_warnings);
         eprintln!(
             "[code-graph] phase: discover+parse done ({:.1}s, {} files parsed)",

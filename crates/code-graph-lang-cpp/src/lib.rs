@@ -68,7 +68,9 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
-use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind};
+use code_graph_core::{
+    Confidence, Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind,
+};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{

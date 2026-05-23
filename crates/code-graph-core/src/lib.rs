@@ -113,6 +113,10 @@ pub enum EdgeKind {
 ///     the serde default exists purely to keep ad-hoc test fixtures
 ///     readable.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Confidence {

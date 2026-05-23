@@ -508,9 +508,7 @@ pub fn search_symbols(
 /// (`UnicodeXID::is_xid_continue`) but pulls a new dependency for a
 /// low-value case — deferred until a user actually hits it.
 fn is_plain_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Return up to `limit` symbols whose name is within an
@@ -682,12 +680,8 @@ fn near_search(
         .into_iter()
         .map(|(_d, s)| symbol_to_result(&s, brief))
         .collect();
-    let (results, _kept, truncated, next_offset) = super::byte_budget_take(
-        mapped,
-        resolved_offset,
-        resolved_limit,
-        max_bytes,
-    );
+    let (results, _kept, truncated, next_offset) =
+        super::byte_budget_take(mapped, resolved_offset, resolved_limit, max_bytes);
 
     let response = Page::<SymbolResult> {
         results,
@@ -1923,12 +1917,7 @@ mod tests {
         g.merge_file_graph(FileGraph {
             path: "/x.cpp".to_string(),
             language: Language::Cpp,
-            symbols: vec![sym(
-                "FAchievementsClient",
-                SymbolKind::Class,
-                "/x.cpp",
-                "",
-            )],
+            symbols: vec![sym("FAchievementsClient", SymbolKind::Class, "/x.cpp", "")],
             edges: Vec::new(),
         });
         let g = locked(g);
@@ -2170,12 +2159,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| {
-                (
-                    r["name"].as_str().unwrap(),
-                    r["kind"].as_str().unwrap(),
-                )
-            })
+            .map(|r| (r["name"].as_str().unwrap(), r["kind"].as_str().unwrap()))
             .collect();
         assert_eq!(
             results.len(),

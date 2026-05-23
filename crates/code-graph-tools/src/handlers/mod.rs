@@ -454,9 +454,7 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// existing callers — agents that pass `"resolved"` keep getting
 /// resolved-only chains, and additional thresholds are additive new
 /// values.
-pub(super) fn parse_min_confidence(
-    raw: Option<&str>,
-) -> Result<Option<Confidence>, String> {
+pub(super) fn parse_min_confidence(raw: Option<&str>) -> Result<Option<Confidence>, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
         Some("any") => Ok(None),
