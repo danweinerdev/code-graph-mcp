@@ -53,7 +53,7 @@
 //! # Harness
 //!
 //! Each test writes a small generated Rust fixture into a fresh
-//! `TempDir` (so concurrent runs cannot race on `.code-graph-cache.json`),
+//! `TempDir` (so concurrent runs cannot race on `.code-graph-cache.db`),
 //! runs `analyze_codebase(force=true)` through the real indexing
 //! pipeline, then drives the target handler exactly as the MCP server
 //! would. Same shape as `byte_budget_acceptance.rs`; the shared
@@ -98,7 +98,7 @@ struct IndexedFixture {
 /// Write `files` (relative name -> source) into a fresh `TempDir`, index
 /// it with the Rust parser through the real `analyze_codebase` pipeline,
 /// and return the indexed server. Each test gets its own `TempDir` so
-/// concurrent runs cannot race on the shared `.code-graph-cache.json`.
+/// concurrent runs cannot race on the shared `.code-graph-cache.db`.
 async fn build_indexed_fixture(files: &[(&str, String)]) -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for response-shape fixture");
     for (name, src) in files {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Shared types for the code-graph-mcp workspace.
 //!
 //! These mirror the canonical Go types in `internal/parser/types.go` and
@@ -25,6 +27,10 @@ use serde::{Deserialize, Serialize};
 /// Source language identifier. Used to tag every [`Symbol`] and [`FileGraph`]
 /// so cross-language queries can filter by language without parsing paths.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Language {
@@ -40,6 +46,10 @@ pub enum Language {
 /// adds `Interface` and `Trait` up front so future Go/Rust support does not
 /// require a JSON-format bump.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum SymbolKind {
@@ -55,6 +65,10 @@ pub enum SymbolKind {
 
 /// Kind of edge in the code graph.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum EdgeKind {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! MCP tool handlers, discovery walker, indexer, and watcher.
 //!
 //! This crate wires the language parsers and the graph engine into a

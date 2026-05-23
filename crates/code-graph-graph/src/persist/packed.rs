@@ -1,18 +1,27 @@
-//! v6 cache: path-and-name interned, still JSON on the wire.
+//! v7 cache: path-and-name interned, **rkyv binary format with
+//! zero-copy mmap load**.
 //!
-//! Replaces v5's full-strings-everywhere [`GraphCache`](super::GraphCache)
-//! with a shape that stores each path and each name **once** in an
-//! interner table, then references them by `u32` everywhere else. On
-//! UE/LLVM-scale codebases path strings repeat tens of millions of times
-//! across `nodes`/`adj`/`radj`/`files`/`includes`/`mtimes` plus inside
-//! every embedded `SymbolId` (`<path>:<name>`); the interning alone is
-//! expected to shrink the on-disk cache by ~3-5×.
+//! Phase C of the PackedCache plan. Same interning shape as v6 (Phase
+//! B's JSON wire), but the on-disk format is now a rkyv archive
+//! prepended by an 8-byte header (4-byte endian probe + 4-byte
+//! version). Loading mmaps the file, validates the header, runs
+//! `rkyv::access` (bytecheck), and walks the resulting
+//! `Archived<PackedCacheV6>` directly to rebuild the live graph's
+//! `HashMap`s — no allocation per byte the way JSON parse required.
+//!
+//! Why "V6" not "V7" in the type name: the SCHEMA is unchanged from
+//! Phase B (still `paths` + `names` + the same interned map shapes);
+//! only the FORMAT (rkyv vs JSON) bumped. The `CACHE_VERSION`
+//! constant moved 6 → 7 because the format change is wire-breaking,
+//! but the in-code type name stays stable for ergonomics.
 //!
 //! Per the PackedCache design's Phase B/C split (see
 //! `.plans/Designs/PackedCache/README.md`), the full columnar CSR
-//! layout from the design's Schema section is **not** part of Phase B
-//! — it moves to Phase C alongside rkyv, where the binary format's
-//! native vector layout makes CSR structurally cheaper.
+//! restructuring deferred from Phase B is also deferred from this
+//! Phase C: HashMap-shaped maps work with rkyv's `ArchivedHashMap` and
+//! the dedup win is already captured by interning. CSR would only pay
+//! off if benches show HashMap-archive build cost is too slow on
+//! UE/LLVM-scale graphs — measure first, restructure later.
 //!
 //! # Reserved sentinels
 //!
@@ -20,44 +29,59 @@
 //!   targets like `Ok`, `printf`).
 //! - `NameId(0)`: reserved; the encoder never assigns it. `0` in any
 //!   `Option<u32>` field (`namespace`, `parent`) is interpreted as
-//!   "absent" at decode time — equivalent to the wire-form `None`.
+//!   "absent" at decode time.
 
 use crate::graph::{EdgeEntry, FileEntry, Graph, IncludeEntry, Node};
 use code_graph_core::{symbol_id, EdgeKind, Language, Symbol, SymbolId, SymbolKind};
 use lasso::{Key, Rodeo, Spur};
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Current packed cache schema version. Bumped from v5 (`5`) — every
-/// existing v5 JSON cache fails the version check on load and triggers
-/// the documented silent-re-index path.
-pub const CACHE_VERSION: u32 = 6;
+/// Current packed cache schema version. Bumped from v6 (Phase B's JSON
+/// wire) — every existing v6 JSON cache fails the version check on
+/// load and triggers the documented silent-re-index path.
+pub const CACHE_VERSION: u32 = 7;
+
+/// 4-byte native-endian probe at file offset 0. A reader whose host
+/// endianness disagrees with the writer's reads a different `u32`
+/// value here and trips the silent-re-index branch — handling the
+/// rare-but-real case of an Apple ARM Mac cache being mmap'd by an
+/// Intel Linux container with the same checkout volume-mounted.
+/// `0x01020304` was chosen so the on-disk bytes (e.g. `04 03 02 01`
+/// on LE, `01 02 03 04` on BE) are self-describing in a hex-dump.
+pub const ENDIAN_PROBE: u32 = 0x0102_0304;
+
+/// Combined size of the header (probe + version), bytes.
+pub const HEADER_SIZE: usize = 8;
 
 /// Generator stamp written into the cache for diagnostic visibility.
-const GENERATOR: &str = "code-graph-graph (rust, v6 interned)";
+const GENERATOR: &str = "code-graph-graph (rust, v7 packed rkyv)";
 
 // ---------------------------------------------------------------------------
-// Wire-form DTO
+// Wire-form DTO (rkyv-archived)
 // ---------------------------------------------------------------------------
 
 /// On-disk shape. Keys in every map are `u32` ids resolved via
 /// [`paths`](Self::paths) / [`names`](Self::names).
 ///
-/// **Wire key encoding.** `serde_json` requires map keys to be strings.
-/// We accept the serialization of `u32` keys as their decimal-digit
-/// strings — natively supported by serde — keeping the v6 file
-/// trivially inspectable with `jq`. The `u32` round-trips losslessly.
-#[derive(Serialize, Deserialize)]
+/// `Vec<PathBuf>` would be the natural type for `paths` but rkyv has
+/// no built-in `Path`/`PathBuf` impl (path semantics are OS-specific).
+/// We store `String` instead; encode/decode convert at the boundary
+/// via [`Path::to_string_lossy`]. Non-UTF-8 paths on Windows / Unix
+/// would round-trip lossily, but every path in this codebase is
+/// dunce-canonicalized at index time (see `code_graph_core::paths`)
+/// and the canonical form is UTF-8 on every supported platform.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedCacheV6 {
     pub version: u32,
     pub generator: String,
-    #[serde(default)]
     pub last_sweep_at: u64,
 
     /// Path interner table. `paths[i]` is the path whose `PathId` is
     /// `i as u32 + 1` (since `PathId(0)` is the "no path" sentinel).
-    pub paths: Vec<PathBuf>,
+    /// Stored as `String` (see type-level doc-comment).
+    pub paths: Vec<String>,
 
     /// Name interner table. `names[i]` is the string whose `NameId` is
     /// `i as u32 + 1`. Holds: symbol names, namespaces, parents, AND
@@ -86,9 +110,11 @@ pub(crate) struct PackedCacheV6 {
 }
 
 /// Per-symbol record. Layout mirrors [`Symbol`] but every string is an
-/// interner reference. Reserved-zero convention used for `namespace` /
-/// `parent` (absent → omitted from wire via `skip_serializing_if`).
-#[derive(Serialize, Deserialize)]
+/// interner reference. `0` in `namespace` / `parent` means "absent"
+/// (replaces v6 JSON's `Option<u32>` + `skip_serializing_if`; rkyv
+/// archives `Option` cheaply but the zero-sentinel keeps the on-disk
+/// size constant per-symbol).
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedSymbol {
     pub name: u32,
     pub kind: SymbolKind,
@@ -103,16 +129,15 @@ pub(crate) struct PackedSymbol {
     /// Inline per [Decision 9](../../.plans/Designs/PackedCache/README.md#decision-9-symbolsignature-handling)
     /// — signatures rarely repeat verbatim, so interning hurts more than
     /// it helps.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<u32>,
+    /// NameId; `0` means absent.
+    pub namespace: u32,
+    /// NameId; `0` means absent.
+    pub parent: u32,
     pub language: Language,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedEdge {
     pub target: u32, // NameId — the OTHER endpoint's interned SymbolId
     pub kind: EdgeKind,
@@ -120,13 +145,13 @@ pub(crate) struct PackedEdge {
     pub line: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedFile {
     pub language: Language,
     pub symbol_ids: Vec<u32>, // NameId values
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedInclude {
     pub path: u32, // PathId of the included file
     pub line: u32,
@@ -168,12 +193,14 @@ impl EncodingStringInterner {
         Self::spur_to_id(spur)
     }
 
-    /// Same as [`intern`](Self::intern) but returns `None` for empty input.
-    fn intern_opt(&mut self, s: &str) -> Option<u32> {
+    /// Same as [`intern`](Self::intern) but returns `0` for empty input
+    /// (the absent-name sentinel for v7's `PackedSymbol.namespace` /
+    /// `parent` u32 fields).
+    fn intern_or_zero(&mut self, s: &str) -> u32 {
         if s.is_empty() {
-            None
+            0
         } else {
-            Some(self.intern(s))
+            self.intern(s)
         }
     }
 
@@ -200,8 +227,10 @@ impl EncodingStringInterner {
 /// finalizer that returns paths in id-assignment order.
 struct EncodingPathInterner {
     inner: code_graph_path_trie::PathInterner,
-    /// Insertion-ordered Vec of paths; index = `PathId - 1`.
-    order: Vec<PathBuf>,
+    /// Insertion-ordered Vec of paths-as-strings; index = `PathId - 1`.
+    /// Stored as `String` to match the rkyv-archivable PackedCacheV6.paths
+    /// field type (rkyv has no Path impl — see PackedCacheV6 doc-comment).
+    order: Vec<String>,
 }
 
 impl EncodingPathInterner {
@@ -216,7 +245,7 @@ impl EncodingPathInterner {
         let len_before = self.inner.len();
         let id = self.inner.intern(p);
         if self.inner.len() != len_before {
-            self.order.push(p.to_path_buf());
+            self.order.push(p.to_string_lossy().into_owned());
         }
         id.get()
     }
@@ -230,7 +259,7 @@ impl EncodingPathInterner {
         }
     }
 
-    fn into_vec(self) -> Vec<PathBuf> {
+    fn into_vec(self) -> Vec<String> {
         self.order
     }
 }
@@ -287,8 +316,8 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
             column: sym.column,
             end_line: sym.end_line,
             signature: sym.signature.clone(),
-            namespace: names.intern_opt(&sym.namespace),
-            parent: names.intern_opt(&sym.parent),
+            namespace: names.intern_or_zero(&sym.namespace),
+            parent: names.intern_or_zero(&sym.parent),
             language: sym.language,
         };
         packed_nodes.insert(id, packed);
@@ -415,16 +444,8 @@ pub(crate) fn decode(cache: PackedCacheV6) -> Result<DecodedParts, DecodeError> 
             column: packed.column,
             end_line: packed.end_line,
             signature: packed.signature.clone(),
-            namespace: packed
-                .namespace
-                .map(|id| resolver.name(id).map(str::to_string))
-                .transpose()?
-                .unwrap_or_default(),
-            parent: packed
-                .parent
-                .map(|id| resolver.name(id).map(str::to_string))
-                .transpose()?
-                .unwrap_or_default(),
+            namespace: resolver.name_or_empty(packed.namespace)?.to_string(),
+            parent: resolver.name_or_empty(packed.parent)?.to_string(),
             language: packed.language,
         };
         // Sanity check: derived symbol_id matches what was stored. If
@@ -446,7 +467,7 @@ pub(crate) fn decode(cache: PackedCacheV6) -> Result<DecodedParts, DecodeError> 
     // Rebuild files map.
     let mut files: HashMap<PathBuf, FileEntry> = HashMap::with_capacity(cache.files.len());
     for (path_id, packed) in &cache.files {
-        let path = resolver.path(*path_id)?.to_path_buf();
+        let path = PathBuf::from(resolver.path(*path_id)?);
         let symbol_ids: Result<Vec<SymbolId>, DecodeError> = packed
             .symbol_ids
             .iter()
@@ -465,12 +486,12 @@ pub(crate) fn decode(cache: PackedCacheV6) -> Result<DecodedParts, DecodeError> 
     let mut includes: HashMap<PathBuf, Vec<IncludeEntry>> =
         HashMap::with_capacity(cache.includes.len());
     for (path_id, packed_entries) in &cache.includes {
-        let path = resolver.path(*path_id)?.to_path_buf();
+        let path = PathBuf::from(resolver.path(*path_id)?);
         let entries: Result<Vec<IncludeEntry>, DecodeError> = packed_entries
             .iter()
             .map(|pe| {
                 Ok(IncludeEntry {
-                    path: resolver.path(pe.path)?.to_path_buf(),
+                    path: PathBuf::from(resolver.path(pe.path)?),
                     line: pe.line,
                 })
             })
@@ -526,7 +547,7 @@ pub(crate) enum DecodeError {
 /// O(1) (Vec indexing); the `Resolver` exists so error reporting is
 /// uniform.
 struct Resolver<'a> {
-    paths: &'a [PathBuf],
+    paths: &'a [String],
     names: &'a [String],
 }
 
@@ -540,16 +561,16 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    /// Resolve `PathId` to `&Path`. `0` is invalid in this context —
+    /// Resolve `PathId` to `&str`. `0` is invalid in this context —
     /// callers that allow the sentinel use [`path_to_string`] which
     /// returns `""`.
-    fn path(&self, id: u32) -> Result<&Path, DecodeError> {
+    fn path(&self, id: u32) -> Result<&str, DecodeError> {
         if id == 0 {
             return Err(DecodeError::PathOutOfRange(0));
         }
         self.paths
             .get(id as usize - 1)
-            .map(PathBuf::as_path)
+            .map(String::as_str)
             .ok_or(DecodeError::PathOutOfRange(id))
     }
 
@@ -559,10 +580,7 @@ impl<'a> Resolver<'a> {
         if id == 0 {
             return String::new();
         }
-        self.paths
-            .get(id as usize - 1)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        self.paths.get(id as usize - 1).cloned().unwrap_or_default()
     }
 
     fn name(&self, id: u32) -> Result<&str, DecodeError> {
@@ -574,39 +592,26 @@ impl<'a> Resolver<'a> {
             .map(String::as_str)
             .ok_or(DecodeError::NameOutOfRange(id))
     }
+
+    /// Resolve `NameId` to `&str`, with `0` meaning "no name" (returns
+    /// `""`). Matches the encoder's `intern_or_zero` sentinel used for
+    /// `PackedSymbol.namespace` / `parent`.
+    fn name_or_empty(&self, id: u32) -> Result<&str, DecodeError> {
+        if id == 0 {
+            Ok("")
+        } else {
+            self.name(id)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // stale_paths slim DTO
 // ---------------------------------------------------------------------------
 
-/// Minimal-deserialization DTO for [`super::stale_paths`] under v6.
-///
-/// Mirrors the v5 [`StalePathsCache`](super::StalePathsCache) trick:
-/// serde silently skips every field NOT named here, so loading this
-/// type costs only `paths` + `mtimes` heap rather than the full graph
-/// (which on multi-million-symbol caches is the difference between
-/// tens of MB and several GB of allocations for one query).
-///
-/// Returns paths by re-resolving each `u32` PathId against the `paths`
-/// vec. See [`super::stale_paths`] for the call site.
-#[derive(Deserialize)]
-pub(crate) struct StalePathsCacheV6 {
-    pub paths: Vec<PathBuf>,
-    pub mtimes: HashMap<u32, u64>,
-}
-
-impl StalePathsCacheV6 {
-    /// Yield `(path, mtime_nanos)` pairs by joining the two fields.
-    /// Out-of-range PathIds are silently dropped (corrupt cache).
-    pub fn iter_resolved(&self) -> impl Iterator<Item = (PathBuf, u64)> + '_ {
-        self.mtimes.iter().filter_map(|(id, nanos)| {
-            if *id == 0 {
-                return None;
-            }
-            self.paths
-                .get(*id as usize - 1)
-                .map(|p| (p.clone(), *nanos))
-        })
-    }
-}
+// v7 stale_paths reads `paths` + `mtimes` directly off the archived
+// view (`<PackedCacheV6 as Archive>::Archived`) in
+// [`super::stale_paths`]. No dedicated DTO needed — the archived
+// HashMap iterates as `(&Archived<u32>, &Archived<u64>)` pairs, and
+// `Archived<u32>` converts back to `u32` cheaply. See PackedCache
+// design Decision 6 for the rationale.

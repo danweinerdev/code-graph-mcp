@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! C++ language plugin for code-graph-mcp.
 //!
 //! This crate ports the Go `internal/lang/cpp` package to Rust. It uses

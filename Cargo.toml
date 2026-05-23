@@ -23,7 +23,13 @@ repository = "https://github.com/danweinerdev/code-graph-mcp"
 rust-version = "1.84"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Workspace default: `deny` (not `forbid`) so a single audited crate
+# (`code-graph-graph`) can opt into `#![allow(unsafe_code)]` for the
+# v7 cache's mmap boundary. Every OTHER crate restores `forbid` via an
+# explicit `#![forbid(unsafe_code)]` at its `lib.rs` top, so the
+# safety wall stays load-bearing where it should. See lib.rs of each
+# crate + .plans/Designs/PackedCache/README.md Decision 5.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -59,6 +65,8 @@ anyhow = "1"
 schemars = "1"
 insta = { version = "1", features = ["json", "redactions", "filters"] }
 lasso = { version = "0.7", features = ["serialize"] }
+rkyv = { version = "0.8", features = ["bytecheck"] }
+memmap2 = "0.9"
 
 # Release profile: strip symbols and apply thin LTO so `make release` ships
 # a small, optimized binary. `codegen-units = 1` trades build time for size.

@@ -11,12 +11,14 @@ description = "In-memory code graph engine, algorithms, and persistence"
 workspace = true
 
 [dependencies]
-code-graph-core = { path = "../code-graph-core" }
+code-graph-core = { path = "../code-graph-core", features = ["rkyv"] }
 code-graph-path-trie = { path = "../code-graph-path-trie" }
 indexmap = { workspace = true }
 lasso = { workspace = true }
+memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
+rkyv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

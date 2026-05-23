@@ -25,7 +25,7 @@
 //! Each test:
 //! 1. Writes the [`large_orphan_set`] fixture (1500 orphan-eligible C++
 //!    functions) into a fresh `TempDir` so concurrent test runs cannot
-//!    race on `.code-graph-cache.json`.
+//!    race on `.code-graph-cache.db`.
 //! 2. Runs `analyze_codebase` to populate the in-memory graph.
 //! 3. Calls the target tool with `limit=1000` and `max_bytes =
 //!    DEFAULT_RESPONSE_MAX_BYTES` (the production default, 102_400).
@@ -100,7 +100,7 @@ struct IndexedFixture {
 /// Build the fixture: a fresh `TempDir`, the 1500-orphan C++ file
 /// written into it, the C++ parser registered, `analyze_codebase` run,
 /// and the resulting `ServerInner` returned. Each test gets its own
-/// `TempDir` so concurrent runs cannot race on `.code-graph-cache.json`.
+/// `TempDir` so concurrent runs cannot race on `.code-graph-cache.db`.
 async fn build_indexed_fixture() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for large_orphan_set fixture");
     large_orphan_set::write_fixture_to(dir.path());

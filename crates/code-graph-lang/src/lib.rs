@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Language plugin trait and registry.
 //!
 //! [`LanguagePlugin`] is the per-language interface — the Rust analogue of

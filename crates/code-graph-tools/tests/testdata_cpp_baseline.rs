@@ -55,7 +55,7 @@ async fn analyze_testdata_cpp_locks_in_baseline_counts() {
     );
 
     let server = server_with_cpp_parser();
-    // `force = true` so any stale `.code-graph-cache.json` left over from a
+    // `force = true` so any stale `.code-graph-cache.db` left over from a
     // manual run never masks a real regression.
     let r = analyze_codebase(
         server.inner.clone(),

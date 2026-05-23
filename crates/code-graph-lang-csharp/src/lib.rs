@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! C# language plugin for code-graph-mcp.
 //!
 //! Uses tree-sitter (via the `tree-sitter` and `tree-sitter-c-sharp`

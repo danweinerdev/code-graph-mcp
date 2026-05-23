@@ -3,7 +3,7 @@
 //! Each test copies `testdata/cpp/` into a fresh `TempDir`, runs
 //! `analyze_codebase` against that copy, then invokes the target tool
 //! and snapshots the parsed JSON body. Using a per-test directory
-//! avoids races on the shared cache file (`.code-graph-cache.json`)
+//! avoids races on the shared cache file (`.code-graph-cache.db`)
 //! when tokio runs tests in parallel — without this isolation, two
 //! concurrent saves can clobber each other and surface a `cache save
 //! failed` warning that shows up in only some snapshot runs.

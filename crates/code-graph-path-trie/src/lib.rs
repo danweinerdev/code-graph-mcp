@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Segment-keyed Patricia path trie.
 //!
 //! `PathTrie<V>` stores values keyed by [`std::path::Path`]. Internally,

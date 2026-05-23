@@ -118,7 +118,7 @@ pub fn generate_large_orphan_source(n: usize) -> String {
 ///
 /// `dir` must already exist; callers typically pass a `TempDir::path()` so
 /// each test gets its own isolated copy and concurrent `analyze_codebase`
-/// runs don't race on the shared `.code-graph-cache.json` write.
+/// runs don't race on the shared `.code-graph-cache.db` write.
 pub fn write_fixture_to(dir: &Path) -> std::path::PathBuf {
     let path = dir.join(FIXTURE_FILENAME);
     let source = generate_large_orphan_source(ORPHAN_COUNT);

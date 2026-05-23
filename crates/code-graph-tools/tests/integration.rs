@@ -246,7 +246,7 @@ async fn cache_hit_on_second_analyze_no_force() {
 
     // First call: full re-index (cache absent); writes the cache file.
     let _ = analyze_codebase(server.inner.clone(), path.clone(), false, None, None).await;
-    let cache = dir.path().join(".code-graph-cache.json");
+    let cache = dir.path().join(".code-graph-cache.db");
     assert!(cache.exists(), "first analyze must write the cache");
     let mtime_after_first = std::fs::metadata(&cache).unwrap().modified().unwrap();
 

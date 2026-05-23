@@ -8,6 +8,20 @@
 //! `FileEntry`, `GraphStats`) and the merge / remove / clear mutators,
 //! plus queries, BFS algorithms, Tarjan SCC, the diamond-safe class
 //! hierarchy, coupling, and the Mermaid renderer.
+//!
+//! # Unsafe code allowance
+//!
+//! The workspace lint `unsafe_code = "forbid"` is overridden here at
+//! crate scope to allow exactly one boundary: `memmap2::Mmap::map` in
+//! `persist::packed::mmap`. Mmap is unavoidable for the v7 cache's
+//! zero-copy load path — no safe mmap wrapper exists in the Rust
+//! ecosystem because the OS can invalidate the mapping under
+//! concurrent file modification. The site is isolated to a single
+//! function with a documented `// SAFETY:` block covering the
+//! atomic-rename write contract that keeps the mapped inode stable
+//! for the mmap's lifetime. See `.plans/Designs/PackedCache/README.md`
+//! Decision 5 for the full rationale.
+#![allow(unsafe_code)]
 
 mod algorithms;
 mod callgraph;

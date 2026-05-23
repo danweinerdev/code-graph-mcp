@@ -625,7 +625,7 @@ pub async fn analyze_codebase(
     tool_success_json(&result)
 }
 
-/// Save the graph to `<dir>/.code-graph-cache.json`. Lifted to a helper so
+/// Save the graph to `<dir>/.code-graph-cache.db`. Lifted to a helper so
 /// the lock is held for the minimum span needed to serialize the cache —
 /// a long save under the write lock would block all queries.
 fn save_cache(

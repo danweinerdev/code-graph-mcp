@@ -93,7 +93,7 @@ async fn build_indexed(override_toml: Option<&str>) -> Indexed {
     let dir = TempDir::new().expect("TempDir for UE fixture");
 
     // Stage the fixture into a fresh tempdir so concurrent tests don't
-    // race on the shared `.code-graph-cache.json` write — same isolation
+    // race on the shared `.code-graph-cache.db` write — same isolation
     // pattern as `tests/path_normalization.rs`.
     copy_fixture_files(dir.path());
 

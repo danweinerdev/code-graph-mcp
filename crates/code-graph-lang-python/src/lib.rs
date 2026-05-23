@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Python language plugin for code-graph-mcp.
 //!
 //! Uses tree-sitter (via the `tree-sitter` and `tree-sitter-python` crates)

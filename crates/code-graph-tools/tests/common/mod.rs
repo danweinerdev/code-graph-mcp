@@ -58,7 +58,7 @@ fn testdata_subdir(name: &str) -> PathBuf {
 
 /// Recursively copy every file in `testdata_cpp_path()` into `dest`. Each
 /// test using this gets its own TempDir so concurrent `analyze_codebase`
-/// calls don't race on the shared `.code-graph-cache.json` write.
+/// calls don't race on the shared `.code-graph-cache.db` write.
 #[allow(dead_code)]
 pub fn copy_testdata(dest: &Path) {
     copy_testdata_from(&testdata_cpp_path(), dest);
