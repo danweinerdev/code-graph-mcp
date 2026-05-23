@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use code_graph_core::{paths, symbol_id};
+use code_graph_core::{paths, symbol_id, Symbol};
 use code_graph_graph::{Graph, SearchParams};
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
@@ -391,13 +391,33 @@ pub fn search_symbols(
         if inner.is_empty() {
             Vec::new()
         } else {
-            graph
+            // First try the existing substring matcher — it handles the
+            // common "user typed half the name" case cheaply.
+            let substring_hits: Vec<String> = graph
                 .read()
                 .search_symbols(inner, None)
                 .iter()
                 .take(5)
                 .map(symbol_id)
-                .collect()
+                .collect();
+            if !substring_hits.is_empty() {
+                substring_hits
+            } else {
+                // Substring matcher came up empty: the user likely typed
+                // a typo (off by an edit or two) rather than a half-name.
+                // Run an edit-distance pass over symbol names and return
+                // the closest hits. Threshold scales with name length so
+                // single-char queries don't match every short name.
+                //
+                // Only fire on plain-identifier inner patterns —
+                // anything containing regex metacharacters is presumed
+                // to be an intentional regex, not a name to fuzzy-match.
+                if is_plain_identifier(inner) {
+                    levenshtein_suggestions(&graph.read(), inner, 5)
+                } else {
+                    Vec::new()
+                }
+            }
         }
     } else {
         Vec::new()
@@ -405,6 +425,117 @@ pub fn search_symbols(
 
     let response = SearchSymbolsResponse { page, suggestions };
     tool_success_json(&response)
+}
+
+/// Whether `s` consists of identifier-safe bytes only — ASCII letters,
+/// digits, and `_`. Used to gate the Levenshtein fallback so we don't
+/// fuzzy-match patterns that contain regex metacharacters (the user
+/// presumably wrote a regex intentionally, not a typo).
+///
+/// Unicode identifiers (e.g. CJK) currently fall outside the
+/// fast-path; they go through the standard substring matcher. Adding
+/// Unicode identifier support here is straightforward
+/// (`UnicodeXID::is_xid_continue`) but pulls a new dependency for a
+/// low-value case — deferred until a user actually hits it.
+fn is_plain_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Return up to `limit` symbols whose name is within an
+/// length-adaptive Levenshtein distance of `inner`. Sorted by
+/// ascending distance, then alphabetically.
+///
+/// The distance threshold scales with name length: 1 edit at lengths
+/// 2-11, 2 edits at 12-17, 3 edits at 18+. This avoids "every short
+/// name matches every 1-char query" while still giving meaningful
+/// hits on long identifiers (`FAchievmentsClient` → `FAchievementsClient`
+/// is a 1-edit fix at length 19).
+///
+/// Cost: O(N × len²) where N is the symbol name count (~700k on
+/// Engine-scale codebases) and `len` is `inner.len()`. The standard
+/// two-row Wagner-Fischer DP is fast enough at typical query lengths
+/// (~50ms on Engine) for the failure-path-only fallback. A BK-tree or
+/// min-hash index would amortize this if benchmarks ever justify it;
+/// the unconditional N-scan keeps the implementation slim until then.
+fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<String> {
+    let max_distance = max_distance_for_query(inner.len());
+    let mut candidates: Vec<(usize, &Symbol)> = Vec::new();
+    let inner_chars: Vec<char> = inner.chars().collect();
+    for sym in graph.all_symbols() {
+        let name_chars: Vec<char> = sym.name.chars().collect();
+        // Length-difference quick-reject: two strings whose lengths
+        // differ by more than `max_distance` cannot be within
+        // `max_distance` edits of each other.
+        if name_chars.len().abs_diff(inner_chars.len()) > max_distance {
+            continue;
+        }
+        let d = levenshtein(&inner_chars, &name_chars, max_distance);
+        if d <= max_distance {
+            candidates.push((d, sym));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, s)| symbol_id(s))
+        .collect()
+}
+
+/// Length-adaptive max-edit-distance gate. Documented in the
+/// [`levenshtein_suggestions`] doc-comment.
+fn max_distance_for_query(len: usize) -> usize {
+    match len {
+        0..=1 => 0,
+        2..=11 => 1,
+        12..=17 => 2,
+        _ => 3,
+    }
+}
+
+/// Wagner-Fischer two-row Levenshtein with early-exit when the
+/// minimum value in the current row exceeds `cap`. Returns the true
+/// distance if it is `<= cap`, otherwise any value `> cap` (the
+/// caller only uses the `<= cap` comparison).
+///
+/// `a` and `b` are passed as char slices so multi-byte code points
+/// count as one edit (e.g. accented characters), not one per byte.
+fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    // Two-row DP. `prev` holds row i-1; `curr` is row i.
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr: Vec<usize> = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        let mut row_min = curr[0];
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = std::cmp::min(
+                std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
+                prev[j - 1] + cost,
+            );
+            if curr[j] < row_min {
+                row_min = curr[j];
+            }
+        }
+        // Early-exit: if no cell in the current row is within `cap`,
+        // every subsequent row can only stay the same or grow, so the
+        // final value will also exceed `cap`.
+        if row_min > cap {
+            return cap + 1;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
 }
 
 /// `get_symbol_detail` body. Returns full detail (brief=false) on hit; on
@@ -1474,6 +1605,164 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // limit=0 normalized to 20.
         assert_eq!(parsed["limit"], serde_json::json!(20));
+    }
+
+    /// Anchored exact-match query that's one edit off a real symbol
+    /// must surface a Levenshtein suggestion. The substring matcher
+    /// alone cannot find this (the typo doesn't contain a substring
+    /// of any real symbol) — only the edit-distance fallback can.
+    ///
+    /// Note: the typo MUST be within the length-adaptive distance gate.
+    /// `^Actr$` (len 4) → `AActor` (len 6) has |len_diff|=2, which
+    /// exceeds the max_distance=1 threshold for length-4 queries — so
+    /// the gate quick-rejects it before computing the edit distance.
+    /// `^AActr$` (len 5, distance 1 from `AActor`) is the right shape.
+    #[test]
+    fn search_symbols_anchored_typo_falls_back_to_levenshtein() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("AActor", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^AActr$"), // 1 edit from "AActor" (insert 'o' between 't' and 'r')
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0), "no exact match");
+        let suggestions: Vec<String> = parsed["suggestions"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            suggestions.iter().any(|s| s.ends_with(":AActor")),
+            "Levenshtein fallback must suggest AActor for the 1-edit typo; got {suggestions:?}"
+        );
+    }
+
+    /// Long-name typo (2 edits at length 19) must still match through
+    /// the length-adaptive distance gate.
+    #[test]
+    fn search_symbols_anchored_long_typo_two_edits_returns_suggestion() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym(
+                "FAchievementsClient",
+                SymbolKind::Class,
+                "/x.cpp",
+                "",
+            )],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        // Missing 'e' AND wrong case on 'c' = 2 edits.
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^FAchievmentsClient$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        let suggestions: Vec<String> = parsed["suggestions"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.ends_with(":FAchievementsClient")),
+            "long-typo Levenshtein must suggest FAchievementsClient; got {suggestions:?}"
+        );
+    }
+
+    /// A query containing regex metacharacters must NOT trigger the
+    /// Levenshtein fallback — the user wrote a regex intentionally.
+    #[test]
+    fn search_symbols_regex_query_does_not_fuzzy_match() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("AActor", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        // The inner pattern contains `.*` — a regex, not an identifier.
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^.*ZZZNoSuchSymbol.*$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        // No suggestions key emitted because nothing matched.
+        assert!(
+            parsed.get("suggestions").is_none()
+                || parsed["suggestions"].as_array().unwrap().is_empty(),
+            "regex query must not trigger fuzzy fallback"
+        );
+    }
+
+    #[test]
+    fn levenshtein_distance_matches_known_pairs() {
+        let a: Vec<char> = "kitten".chars().collect();
+        let b: Vec<char> = "sitting".chars().collect();
+        assert_eq!(levenshtein(&a, &b, 5), 3);
+    }
+
+    #[test]
+    fn levenshtein_early_exit_returns_over_cap_value() {
+        let a: Vec<char> = "abcdef".chars().collect();
+        let b: Vec<char> = "zzzzzz".chars().collect();
+        // True distance is 6; cap of 2 forces early-exit.
+        let d = levenshtein(&a, &b, 2);
+        assert!(d > 2, "early-exit must return a value > cap; got {d}");
+    }
+
+    #[test]
+    fn max_distance_for_query_length_adaptive() {
+        assert_eq!(max_distance_for_query(0), 0);
+        assert_eq!(max_distance_for_query(1), 0);
+        assert_eq!(max_distance_for_query(5), 1);
+        assert_eq!(max_distance_for_query(11), 1);
+        assert_eq!(max_distance_for_query(12), 2);
+        assert_eq!(max_distance_for_query(17), 2);
+        assert_eq!(max_distance_for_query(100), 3);
+    }
+
+    #[test]
+    fn is_plain_identifier_basic_cases() {
+        assert!(is_plain_identifier("AActor"));
+        assert!(is_plain_identifier("snake_case_name"));
+        assert!(is_plain_identifier("CamelCase123"));
+        assert!(!is_plain_identifier(""));
+        assert!(!is_plain_identifier("foo.bar"));
+        assert!(!is_plain_identifier("foo*"));
+        assert!(!is_plain_identifier("foo bar"));
+        assert!(!is_plain_identifier(".*"));
     }
 
     #[test]

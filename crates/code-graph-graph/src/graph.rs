@@ -427,6 +427,19 @@ impl Graph {
         self.files.keys().filter(|p| p.starts_with(scope)).count()
     }
 
+    /// Iterate every indexed [`Symbol`] in the graph. Used by the
+    /// `search_symbols` Levenshtein fallback (`handlers/symbols.rs`)
+    /// when substring search returns zero hits and the user's query
+    /// is plausibly a typo: an N-way scan over symbol names looking
+    /// for ones within an edit-distance threshold.
+    ///
+    /// Order is HashMap-defined; callers that need a deterministic
+    /// ordering must sort the output themselves. No allocation beyond
+    /// the iterator state.
+    pub fn all_symbols(&self) -> impl Iterator<Item = &Symbol> {
+        self.nodes.values().map(|n| &n.symbol)
+    }
+
     /// Set the sweep timestamp. The handler calls this immediately
     /// after running `sweep_missing_out_of_scope` so the value
     /// persists to the cache via the next [`Graph::save`].
