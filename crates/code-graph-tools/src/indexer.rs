@@ -158,9 +158,17 @@ pub fn index_directory(
                 let content = std::fs::read(&df.path)
                     .map_err(|e| format!("{}: read error: {e}", df.path.display()))?;
                 let cleaned = plugin.preprocess(&content, cfg);
-                let fg = plugin
+                let mut fg = plugin
                     .parse_file(&df.path, &cleaned)
                     .map_err(|e| format!("{}: parse error: {e}", df.path.display()))?;
+                // Per-file post-parse synthesis hook. Sees the ORIGINAL
+                // bytes (NOT the preprocessed `cleaned`) so language
+                // plugins running secondary extractors over source
+                // structure that the preprocess pass would have rewritten
+                // (e.g. `[cpp].macro_define_function` invocations that
+                // `macro_strip` could otherwise blank) can append the
+                // synthesized symbols.
+                plugin.synthesize_symbols(&df.path, &content, cfg, &mut fg);
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 progress.report(n, total, &format!("Parsing: {}", df.path.display()));
                 Ok(fg)

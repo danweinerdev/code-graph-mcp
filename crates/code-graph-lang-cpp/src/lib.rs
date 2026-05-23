@@ -56,6 +56,7 @@
 //!    `parenthesized_declarator > pointer_declarator > type_identifier`).
 
 pub(crate) mod helpers;
+pub(crate) mod macro_define;
 pub(crate) mod preprocess;
 pub(crate) mod queries;
 
@@ -176,6 +177,60 @@ impl CppParser {
         self.extract_overrides(&path_str, &mut fg);
 
         Ok(fg)
+    }
+
+    /// Synthesize `Function` symbols for `[cpp].macro_define_function`
+    /// matches in `content`. For each configured macro, scan the
+    /// source for invocations and produce one Symbol per match named
+    /// `<captured_arg><suffix>`.
+    ///
+    /// Called from [`CppParser::preprocess`] which already gets the
+    /// `RootConfig` reference. Done as a byte-level scan rather than
+    /// a tree-sitter query because tree-sitter cannot expand `##`
+    /// token-pasting — the source still shows the macro INVOCATION,
+    /// not the produced function definition, so the parser would
+    /// only see the macro identifier itself. The byte scanner mirrors
+    /// the patterns `macro_strip_with_args` uses for the same reason.
+    pub(crate) fn synthesize_macro_define_function_symbols(
+        &self,
+        content: &[u8],
+        path: &str,
+        cfg: &RootConfig,
+        fg: &mut FileGraph,
+    ) {
+        for entry in &cfg.cpp.macro_define_function {
+            if entry.name.is_empty() {
+                continue;
+            }
+            crate::macro_define::scan_macro_invocations(content, &entry.name, |arg_text, line| {
+                // Pick the requested arg index; skip silently if the
+                // invocation has too few args. Match by `entry.arg`
+                // 0-based.
+                let arg = match arg_text.get(entry.arg) {
+                    Some(a) => a.trim(),
+                    None => return,
+                };
+                if arg.is_empty() {
+                    return;
+                }
+                let name = format!("{}{}", arg, entry.suffix);
+                fg.symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    file: path.to_string(),
+                    line,
+                    column: 0,
+                    end_line: line,
+                    signature: format!(
+                        "/* synthesized by [cpp].macro_define_function: {} */",
+                        entry.name
+                    ),
+                    namespace: String::new(),
+                    parent: String::new(),
+                    language: Language::Cpp,
+                });
+            });
+        }
     }
 
     /// Run the definition query and produce symbols. Mirrors the Go
@@ -599,6 +654,24 @@ impl LanguagePlugin for CppParser {
 
     fn extensions(&self) -> &'static [&'static str] {
         EXTENSIONS
+    }
+
+    fn synthesize_symbols(
+        &self,
+        path: &Path,
+        content: &[u8],
+        cfg: &RootConfig,
+        fg: &mut FileGraph,
+    ) {
+        // Run macro-defined function synthesis on the ORIGINAL bytes
+        // (NOT the post-preprocess bytes). Token-pasting macros that
+        // `macro_strip` would otherwise blank still get a chance to
+        // produce their symbols here.
+        if cfg.cpp.macro_define_function.is_empty() {
+            return;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        self.synthesize_macro_define_function_symbols(content, &path_str, cfg, fg);
     }
 
     fn preprocess<'a>(&self, content: &'a [u8], cfg: &RootConfig) -> Cow<'a, [u8]> {

@@ -155,6 +155,46 @@ pub struct CppConfig {
     /// [`ConfigError::MacroStripConflict`] (see [`RootConfig::load`]).
     #[serde(default)]
     pub macro_strip_with_args: Vec<String>,
+    /// Macros that DEFINE a top-level function via token-pasting.
+    /// Each entry tells the C++ parser to synthesize a `Function`
+    /// Symbol whenever it sees the macro invoked at namespace scope:
+    /// `MACRO(NameToken)` → synthesize `<NameToken><suffix>` as a
+    /// function with `Symbol.line` at the macro invocation. Common
+    /// pattern in engine / SDK codebases that hide `_Release` /
+    /// `_Get` / `_Set` function families behind a single macro for
+    /// boilerplate elimination.
+    ///
+    /// Each entry carries:
+    /// - `name` — the macro identifier (e.g. `"DECLARE_RELEASE_FN"`)
+    /// - `arg` — zero-based index of the macro argument that names
+    ///   the function (e.g. `0` for `DECLARE_RELEASE_FN(MyType)`)
+    /// - `suffix` — optional string appended to the captured
+    ///   identifier when forming the synthesized function name (e.g.
+    ///   `"_Release"` for the canonical `<Type>_Release` pattern).
+    ///   Empty / absent = no suffix.
+    ///
+    /// Opt-in: empty list is the default and produces no synthesis.
+    /// Within-list duplicates are silently deduplicated by `name`
+    /// (first-occurrence wins; the duplicate handling is separate
+    /// from `macro_strip_with_args`'s `Vec<String>` dedup because
+    /// here the dedup key is the `name` field of a struct).
+    #[serde(default)]
+    pub macro_define_function: Vec<MacroDefineFunction>,
+}
+
+/// One entry in `[cpp].macro_define_function`. See [`CppConfig::macro_define_function`].
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct MacroDefineFunction {
+    /// Macro identifier to watch for at namespace-scope invocations.
+    pub name: String,
+    /// Zero-based index of the macro argument that names the
+    /// synthesized function.
+    #[serde(default)]
+    pub arg: usize,
+    /// Optional suffix appended to the captured argument when
+    /// forming the synthesized function name.
+    #[serde(default)]
+    pub suffix: String,
 }
 
 /// Per-language file-extension overrides.

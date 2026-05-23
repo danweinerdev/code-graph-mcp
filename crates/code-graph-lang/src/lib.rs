@@ -329,6 +329,44 @@ pub trait LanguagePlugin: Send + Sync {
     /// IDs; `content` is the raw file bytes.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError>;
 
+    /// Optional per-file post-parse symbol synthesis. Called by the
+    /// indexer immediately after [`Self::parse_file`] returns Ok, with
+    /// the **original** raw file bytes (NOT the post-preprocess
+    /// bytes) so language plugins can run secondary extractors that
+    /// need to see the source as the user wrote it.
+    ///
+    /// Use case: macro-defined function synthesis. Tree-sitter cannot
+    /// expand `##` token-pasting, so macros like
+    /// `IMPLEMENT_RELEASE_FN(MyType)` that produce `MyType_Release`
+    /// are invisible to `parse_file`. The C++ plugin's hook scans
+    /// the original bytes for invocations of the macros configured
+    /// in `[cpp].macro_define_function` and appends synthesized
+    /// `Function` symbols to `fg.symbols`. Plugins that don't need
+    /// post-parse synthesis inherit the no-op default.
+    ///
+    /// Why a SEPARATE hook from `parse_file` + `preprocess`:
+    /// - `parse_file` doesn't carry `RootConfig` — the trait
+    ///   contract keeps it decoupled from per-root config so the
+    ///   parse path stays cheap.
+    /// - `preprocess` operates on bytes-in / bytes-out and can't
+    ///   touch the FileGraph — its job is byte rewriting, not
+    ///   symbol emission.
+    /// - This hook gets BOTH the cfg AND the (already-populated)
+    ///   FileGraph by mutable reference, so it can append symbols
+    ///   that need cfg-derived semantics.
+    ///
+    /// **Contract: `fg.path` is immutable through this hook.** Same
+    /// as `post_index` — the indexer relies on stable paths between
+    /// parse and merge.
+    fn synthesize_symbols(
+        &self,
+        _path: &Path,
+        _content: &[u8],
+        _cfg: &RootConfig,
+        _fg: &mut FileGraph,
+    ) {
+    }
+
     /// Language-specific call resolution. The default mirrors the Go scope
     /// heuristic (same file > same parent > same namespace > global) and
     /// scopes the lookup to candidates from the same [`Language`] as the
