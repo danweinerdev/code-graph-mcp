@@ -443,21 +443,14 @@ struct MYLIB_API MyStruct
 // Category B — inheritance graph gaps
 // =========================================================================
 
-/// TC-B1 — template-instantiation base classes are dropped from the
-/// inheritance graph. CRTP and mixin templates are pervasive in
-/// engine-style codebases; the original report flagged this against
-/// real service-client interfaces deriving from
-/// `TBaseTemplate<IClientInterface>`-shaped bases.
-///
-/// Minimal form: FAILS today (verified — see ignore message). The
-/// expected behaviour is that the bare template name surfaces as the
-/// inheritance target with template arguments dropped, matching the
-/// accepted limitation on generic parents documented in CLAUDE.md.
+/// TC-B1 — template-instantiation base classes. The original report
+/// flagged that `class Foo : public TBaseTemplate<IBar>` produced no
+/// Inherits edge. After the inheritance-query extension for
+/// `template_type` nodes (commit pinning this test), the bare
+/// template name DOES surface as the inheritance target — template
+/// arguments are dropped to match the bare-name convention the
+/// hierarchy walker keys on. Regression guard going forward.
 #[test]
-#[ignore = "TC-B1: template-instantiation base classes \
-            (`public TBaseTemplate<IClientInterface>`) emit no Inherits edge. \
-            Verified failing in minimal form. Flip on when template-instantiation \
-            inheritance is supported."]
 fn tc_b1_template_instantiation_base_emits_inherits_edge() {
     let src = "\
 template <typename T>

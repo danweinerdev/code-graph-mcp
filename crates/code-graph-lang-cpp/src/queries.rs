@@ -86,9 +86,30 @@ pub(crate) const INCLUDE_QUERIES: &str = r#"
 "#;
 
 /// Inheritance queries: base classes for class_specifier and struct_specifier.
-/// Handles simple (Base) and qualified (ns::Base) base names.
+/// Handles simple (`Base`), qualified (`ns::Base`), and template-instantiation
+/// (`TBase<T>`) base names. For the template form, the captured `@base.name`
+/// is the bare template identifier (`TBase`), dropping the template
+/// arguments — matching the accepted convention for generic parents
+/// documented in CLAUDE.md (hierarchy walk keys on bare class names; the
+/// generics-in-parent gap is a known cross-language limitation tracked
+/// separately).
+///
+/// The four patterns are explicit (rather than nested in a single
+/// alternation) because tree-sitter's query language treats captures
+/// inside `[...]` alternations conservatively across versions — keeping
+/// each pattern self-contained avoids version-specific surprises.
 pub(crate) const INHERITANCE_QUERIES: &str = r#"
 (class_specifier
+  name: (type_identifier) @derived.name
+  (base_class_clause
+    [(type_identifier) (qualified_identifier)] @base.name))
+
+(class_specifier
+  name: (type_identifier) @derived.name
+  (base_class_clause
+    (template_type name: (type_identifier) @base.name)))
+
+(struct_specifier
   name: (type_identifier) @derived.name
   (base_class_clause
     [(type_identifier) (qualified_identifier)] @base.name))
@@ -96,5 +117,5 @@ pub(crate) const INHERITANCE_QUERIES: &str = r#"
 (struct_specifier
   name: (type_identifier) @derived.name
   (base_class_clause
-    [(type_identifier) (qualified_identifier)] @base.name))
+    (template_type name: (type_identifier) @base.name)))
 "#;
