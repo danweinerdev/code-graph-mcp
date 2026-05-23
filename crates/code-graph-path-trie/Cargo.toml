@@ -1,0 +1,24 @@
+[package]
+name = "code-graph-path-trie"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Segment-keyed Patricia path trie. Subtree iteration, longest-prefix queries, and path interning over OsString components."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+slotmap = "1"
+smallvec = "1"
+rustc-hash = "2"
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

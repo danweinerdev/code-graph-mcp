@@ -13,6 +13,7 @@ members = [
     "crates/code-graph-lang-python",
     "crates/code-graph-lang-rust",
     "crates/code-graph-parse-test",
+    "crates/code-graph-path-trie",
 ]
 
 [workspace.package]
