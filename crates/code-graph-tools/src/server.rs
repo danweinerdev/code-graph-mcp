@@ -284,6 +284,22 @@ pub struct SearchSymbolsArgs {
     )]
     #[serde(default)]
     pub count_only: Option<bool>,
+    #[schemars(
+        description = "Edit-distance (fuzzy) search mode. When true, `query` is matched by \
+                       Levenshtein distance against symbol names rather than regex/substring. \
+                       `query` must be a plain identifier (no regex metacharacters). \
+                       `max_distance` controls the threshold (or length-adaptive default). \
+                       Results sorted by closest match first. Incompatible with count_only."
+    )]
+    #[serde(default)]
+    pub near: Option<bool>,
+    #[schemars(
+        description = "Max edit distance for near=true mode (default: length-adaptive — 1 edit \
+                       at length 2-11, 2 at 12-17, 3 at 18+). Clamped to 8. Ignored when \
+                       near=false."
+    )]
+    #[serde(default)]
+    pub max_distance: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -608,6 +624,8 @@ impl CodeGraphServer {
             offset: args.offset,
             brief: args.brief.unwrap_or(true),
             count_only: args.count_only.unwrap_or(false),
+            near: args.near.unwrap_or(false),
+            max_distance: args.max_distance,
         };
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::symbols::search_symbols(
@@ -1328,6 +1346,8 @@ mod tests {
                 offset: None,
                 brief: None,
                 count_only: None,
+                near: None,
+                max_distance: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

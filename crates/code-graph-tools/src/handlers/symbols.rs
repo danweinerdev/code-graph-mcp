@@ -184,6 +184,26 @@ pub struct SearchSymbolsInput<'a> {
     /// heap short-circuit (`SearchParams.count_only`) ensures the
     /// BinaryHeap<TopEntry> is never constructed on this path.
     pub count_only: bool,
+    /// When `true`, search by edit distance instead of regex/substring.
+    /// `query` must be a plain identifier (`^[A-Za-z0-9_]+$`); regex
+    /// metacharacters are rejected with a tool error. `max_distance`
+    /// controls the threshold (or falls back to the length-adaptive
+    /// default used by the suggestion path). Results are sorted by
+    /// `(edit_distance asc, name asc)` so the closest matches paginate
+    /// first.
+    ///
+    /// Pairs with the zero-result Levenshtein fallback the
+    /// `search_symbols` happy path already runs: `near=true` exposes
+    /// the same fuzzy machinery as the primary mode rather than a
+    /// failure-only suggestion.
+    pub near: bool,
+    /// Max edit distance for `near=true` mode. When `None`, falls back
+    /// to the length-adaptive default (0 for length 0-1, 1 for 2-11,
+    /// 2 for 12-17, 3 for 18+). Ignored when `near=false`.
+    /// Clamped to 8 — a higher cap doesn't meaningfully discriminate
+    /// "fuzzy hit" from "totally different identifier" and the DP
+    /// cost grows with the cap.
+    pub max_distance: Option<u32>,
 }
 
 /// `search_symbols` body. Validates that at least one filter was supplied,
@@ -282,6 +302,45 @@ pub fn search_symbols(
             next_offset: None,
         };
         return tool_success_json(&response);
+    }
+
+    // Near mode (fuzzy / edit-distance) dispatch. Branches BEFORE the
+    // regex/substring path. `query` is required and must be a plain
+    // identifier (no regex metacharacters) — the edit-distance pass
+    // operates over the symbol-name dictionary, not over regex
+    // matches. `count_only` is incompatible with near mode: a
+    // count-only fuzzy search would still have to do the full N-scan
+    // (no heap short-circuit makes sense here), so we reject the
+    // combination rather than silently incurring the cost. Kind /
+    // language / namespace filters compose normally as a
+    // post-distance filter pass.
+    if input.near {
+        if query_str.is_empty() {
+            return tool_error("near mode requires a non-empty 'query'");
+        }
+        if !is_plain_identifier(query_str) {
+            return tool_error(
+                "near mode requires a plain identifier query (no regex metacharacters); \
+                 use the default mode if you need regex matching",
+            );
+        }
+        // Clamp + length-adapt the distance threshold.
+        let max_distance = input
+            .max_distance
+            .map(|d| (d as usize).min(8))
+            .unwrap_or_else(|| max_distance_for_query(query_str.len()));
+        return near_search(
+            graph,
+            query_str,
+            max_distance,
+            parsed_kind,
+            parsed_language,
+            namespace_str,
+            resolved_limit,
+            resolved_offset,
+            input.brief,
+            max_bytes,
+        );
     }
 
     let sr = graph.read().search(SearchParams {
@@ -536,6 +595,98 @@ fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[m]
+}
+
+/// `search_symbols(near=true, …)` body. Edit-distance scan over the
+/// whole symbol-name dictionary, post-filtered by kind / language /
+/// namespace, sorted `(distance asc, name asc)`, paginated, then
+/// byte-budgeted via the same envelope-overhead accounting the
+/// regex/substring path uses. Returns the standard `Page<SymbolResult>`
+/// envelope so consumers can switch between modes without reshaping
+/// their deserializer.
+///
+/// Compared with the failure-only Levenshtein in the suggestion path:
+/// this version (a) is opt-in, (b) returns full SymbolResult records
+/// instead of bare symbol-id strings, (c) honors `total` /
+/// `truncated` / `next_offset` for pagination, and (d) composes with
+/// kind/language/namespace filters.
+#[allow(clippy::too_many_arguments)]
+fn near_search(
+    graph: &RwLock<Graph>,
+    query: &str,
+    max_distance: usize,
+    kind: Option<code_graph_core::SymbolKind>,
+    language: Option<code_graph_core::Language>,
+    namespace: &str,
+    resolved_limit: u32,
+    resolved_offset: u32,
+    brief: bool,
+    max_bytes: usize,
+) -> CallToolResult {
+    let query_chars: Vec<char> = query.chars().collect();
+    let lower_ns = namespace.to_lowercase();
+
+    // Phase 1: scan all symbols, keep those within `max_distance`. The
+    // length-difference quick-reject prunes most candidates without
+    // entering the DP. Apply kind/language/namespace post-filters
+    // alongside so we never compute distance for a symbol that would
+    // have been dropped anyway.
+    let g = graph.read();
+    let mut hits: Vec<(usize, Symbol)> = Vec::new();
+    for sym in g.all_symbols() {
+        if let Some(k) = kind {
+            if sym.kind != k {
+                continue;
+            }
+        }
+        if let Some(l) = language {
+            if sym.language != l {
+                continue;
+            }
+        }
+        if !lower_ns.is_empty() && !sym.namespace.to_lowercase().contains(&lower_ns) {
+            continue;
+        }
+        let name_chars: Vec<char> = sym.name.chars().collect();
+        if name_chars.len().abs_diff(query_chars.len()) > max_distance {
+            continue;
+        }
+        let d = levenshtein(&query_chars, &name_chars, max_distance);
+        if d <= max_distance {
+            hits.push((d, sym.clone()));
+        }
+    }
+    drop(g);
+
+    let total = hits.len() as u32;
+
+    // Phase 2: sort by (distance asc, name asc) so the closest matches
+    // paginate first and ties resolve deterministically.
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+    // Phase 3: paginate via byte_budget_take on the SymbolResult-mapped
+    // form. The mapping happens before the cut so each candidate is
+    // sized against the budget as JSON, not as Rust.
+    let mapped: Vec<SymbolResult> = hits
+        .into_iter()
+        .map(|(_d, s)| symbol_to_result(&s, brief))
+        .collect();
+    let (results, _kept, truncated, next_offset) = super::byte_budget_take(
+        mapped,
+        resolved_offset,
+        resolved_limit,
+        max_bytes,
+    );
+
+    let response = Page::<SymbolResult> {
+        results,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
+    tool_success_json(&response)
 }
 
 /// `get_symbol_detail` body. Returns full detail (brief=false) on hit; on
@@ -1763,6 +1914,190 @@ mod tests {
         assert!(!is_plain_identifier("foo*"));
         assert!(!is_plain_identifier("foo bar"));
         assert!(!is_plain_identifier(".*"));
+    }
+
+    /// `near=true` returns symbols within edit distance, sorted by
+    /// closest match first. Edit-distance arithmetic (manually
+    /// verified):
+    /// - `Actor` → `Actor`   = 0
+    /// - `Actor` → `AActor`  = 1 (insert leading `A`)
+    /// - `Actor` → `Actr`    = 1 (delete `o`)
+    /// - `Actor` → `Vector`  = 2 (substitute `A`→`V`, insert `e`)
+    /// - `Actor` → `Reactor` = 3 (insert `R`, insert `e`, substitute
+    ///   `A`→`a`-style case shift) — verified by the algorithm; out of
+    ///   range at `max_distance=2`.
+    #[test]
+    fn search_symbols_near_mode_returns_within_distance_sorted_by_closest() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""),   // d=0
+                sym("AActor", SymbolKind::Class, "/x.cpp", ""),  // d=1
+                sym("Actr", SymbolKind::Class, "/x.cpp", ""),    // d=1
+                sym("Vector", SymbolKind::Class, "/x.cpp", ""),  // d=2
+                sym("Reactor", SymbolKind::Class, "/x.cpp", ""), // d=3 (excluded)
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actor"),
+                near: true,
+                max_distance: Some(2),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(results.contains(&"Actor"), "d=0 present; got {results:?}");
+        assert!(results.contains(&"AActor"), "d=1 present; got {results:?}");
+        assert!(results.contains(&"Actr"), "d=1 present; got {results:?}");
+        assert!(results.contains(&"Vector"), "d=2 present; got {results:?}");
+        assert!(
+            !results.contains(&"Reactor"),
+            "d=3 must be excluded at max_distance=2; got {results:?}"
+        );
+        // First result must be the exact match (distance 0).
+        assert_eq!(
+            results.first(),
+            Some(&"Actor"),
+            "sort must put closest-match first; got {results:?}"
+        );
+    }
+
+    /// `near=true` with regex metacharacters in query is rejected as
+    /// a tool error — near mode is for plain identifiers only.
+    #[test]
+    fn search_symbols_near_mode_rejects_regex_query() {
+        let g = locked(small_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^Foo.*$"),
+                near: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(
+            body.contains("plain identifier"),
+            "rejection must name the plain-identifier requirement; got: {body}"
+        );
+    }
+
+    /// `near=true` with empty query is rejected — fuzzy match needs
+    /// something to compare against.
+    #[test]
+    fn search_symbols_near_mode_rejects_empty_query() {
+        let g = locked(small_graph());
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some(""),
+                kind: Some("function"), // satisfy the at-least-one-filter check
+                near: true,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(
+            body.contains("non-empty 'query'"),
+            "rejection must mention non-empty query requirement; got: {body}"
+        );
+    }
+
+    /// `near=true` composes with kind/language filters: only symbols
+    /// matching BOTH the distance AND the filters appear. Two symbols
+    /// named `Actor` in different files (so they get distinct symbol
+    /// IDs and both survive the merge) — one a Class, one a Function.
+    /// Filter to `kind="class"` and only the Class entry should appear.
+    #[test]
+    fn search_symbols_near_mode_composes_with_kind_filter() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Actor", SymbolKind::Class, "/a.cpp", "")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Actor", SymbolKind::Function, "/b.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actor"),
+                kind: Some("class"),
+                near: true,
+                max_distance: Some(0),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<(&str, &str)> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap(),
+                    r["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "kind filter must drop the Function entry; got {results:?}"
+        );
+        assert_eq!(results[0], ("Actor", "class"));
+    }
+
+    /// `near=true` with no `max_distance` uses the length-adaptive
+    /// default — same threshold table as the suggestion fallback.
+    #[test]
+    fn search_symbols_near_mode_default_distance_is_length_adaptive() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("AActor", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        // "AActr" → "AActor" is distance 1; default max_distance for
+        // length 5 is 1, so this should match.
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("AActr"),
+                near: true,
+                max_distance: None,
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(1));
     }
 
     #[test]

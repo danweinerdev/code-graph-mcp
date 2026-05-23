@@ -50,11 +50,29 @@ expression: "tool_entry(\"search_symbols\")"
           "null"
         ]
       },
+      "max_distance": {
+        "default": null,
+        "description": "Max edit distance for near=true mode (default: length-adaptive — 1 edit at length 2-11, 2 at 12-17, 3 at 18+). Clamped to 8. Ignored when near=false.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "namespace": {
         "default": null,
         "description": "Filter by namespace (substring match, e.g., 'Nfs' matches 'Ark::Nfs::V4')",
         "type": [
           "string",
+          "null"
+        ]
+      },
+      "near": {
+        "default": null,
+        "description": "Edit-distance (fuzzy) search mode. When true, `query` is matched by Levenshtein distance against symbol names rather than regex/substring. `query` must be a plain identifier (no regex metacharacters). `max_distance` controls the threshold (or length-adaptive default). Results sorted by closest match first. Incompatible with count_only.",
+        "type": [
+          "boolean",
           "null"
         ]
       },
