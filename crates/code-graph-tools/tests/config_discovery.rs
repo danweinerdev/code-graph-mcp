@@ -498,3 +498,323 @@ async fn scoped_force_invalidates_only_in_scope_entries() {
          scope-limited invalidation contract"
     );
 }
+
+// =========================================================================
+// mtime-driven incremental re-index (force=false common path)
+// =========================================================================
+
+/// The most common production path: user edits one file in a scope
+/// they previously indexed, then re-runs `analyze_codebase` on the
+/// same scope without `force=true`. The cache load + mtime check must
+/// pick up the edited file, re-parse it, and replace its old graph
+/// entries — old symbols gone, new symbols present, no orphan symbol
+/// leaks.
+///
+/// The unit-level `re_merge_replaces_edges_not_just_nodes` in
+/// `graph.rs` covers this at the storage layer; here we drive it
+/// through the full handler so the mtime detection + scoped re-parse +
+/// merge wiring is exercised end-to-end.
+#[tokio::test]
+async fn mtime_driven_incremental_replaces_stale_symbols_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+
+    let header = root.join("Subject.h");
+    std::fs::write(&header, "class Original {};\n").unwrap();
+
+    let server = fresh_server();
+
+    // First invocation: index Original.
+    run_analyze(&server, &root, false).await;
+    {
+        let g = server.inner.graph.read();
+        let syms = g.file_symbols(&header);
+        assert!(
+            syms.iter().any(|s| s.name == "Original"),
+            "Original must be indexed after first invocation"
+        );
+        assert!(
+            !syms.iter().any(|s| s.name == "Replaced"),
+            "Replaced must NOT exist yet"
+        );
+    }
+
+    // Edit the file. Sleep briefly so the mtime is observably newer —
+    // some filesystems have second-resolution mtimes and a write
+    // immediately after another can land on the same value.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&header, "class Replaced {};\n").unwrap();
+
+    // Second invocation, NO force. The mtime check must detect
+    // Subject.h as stale, re-parse it, and replace the cached entries.
+    let result = run_analyze(&server, &root, false).await;
+    assert_eq!(
+        result.files, 1,
+        "still one file after re-index — re-merge, not duplicate"
+    );
+
+    let g = server.inner.graph.read();
+    let syms = g.file_symbols(&header);
+    assert!(
+        syms.iter().any(|s| s.name == "Replaced"),
+        "Replaced must be indexed after mtime-driven re-parse; got: {:?}",
+        syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !syms.iter().any(|s| s.name == "Original"),
+        "Original must NOT survive — the re-merge must replace per-file entries; got: {:?}",
+        syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    // Total node count must reflect the replacement: 1 file × 1 class
+    // = 1 node. A regression that double-merged would show 2 nodes.
+    assert_eq!(
+        g.stats().nodes,
+        1,
+        "exactly one node after re-merge; double-merge would show 2"
+    );
+}
+
+// =========================================================================
+// Out-of-scope sweep cadence
+// =========================================================================
+
+/// The opportunistic sweep should run when at least 24h has elapsed
+/// since `last_sweep_at`. The simplest way to drive both branches
+/// without a clock-mocking facility: manipulate `Graph::last_sweep_at`
+/// directly between invocations via the public setter.
+///
+/// Setup:
+/// 1. Index subtree A (a.cpp), then subtree B (b.cpp). Both in cache.
+/// 2. Delete b.cpp from disk. Cache still has its entry.
+/// 3. Set `last_sweep_at` to "right now" — the next invocation must
+///    SKIP the sweep (cadence not elapsed).
+/// 4. Invoke analyze on A. b.cpp entry must SURVIVE.
+/// 5. Reset `last_sweep_at` to 0 (never-swept). Next invocation must
+///    RUN the sweep.
+/// 6. Invoke analyze on A again. b.cpp entry must be GONE.
+#[tokio::test]
+async fn sweep_cadence_skips_when_recent_runs_when_elapsed() {
+    let dir = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let subtree_a = root.join("a");
+    let subtree_b = root.join("b");
+    std::fs::create_dir_all(&subtree_a).unwrap();
+    std::fs::create_dir_all(&subtree_b).unwrap();
+
+    std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+    std::fs::write(subtree_a.join("a.cpp"), "void a() {}\n").unwrap();
+    let b_path = subtree_b.join("b.cpp");
+    std::fs::write(&b_path, "void b() {}\n").unwrap();
+
+    let server = fresh_server();
+
+    // Seed both subtrees into the cache.
+    run_analyze(&server, &subtree_a, true).await;
+    run_analyze(&server, &subtree_b, true).await;
+    {
+        let g = server.inner.graph.read();
+        assert_eq!(g.stats().files, 2, "both subtrees seeded");
+        assert!(
+            !g.file_symbols(&b_path).is_empty(),
+            "b.cpp's symbols must be present after seeding"
+        );
+    }
+
+    // Delete b.cpp from disk. Cache entry still references it.
+    std::fs::remove_file(&b_path).unwrap();
+
+    // Skip-sweep branch: stamp last_sweep_at to a value such that the
+    // handler computes a delta SMALLER than SWEEP_INTERVAL_NANOS. We
+    // use "now minus a tiny amount" (1 second's worth of nanos) so the
+    // delta is essentially zero — well below the 24h threshold.
+    //
+    // The fast-path inside `analyze_codebase` reloads the graph from
+    // disk via `probe.load(&project_root)`, so the in-memory mutation
+    // must be persisted before the next invocation observes it.
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let recent = now_nanos.saturating_sub(1_000_000_000); // 1s ago
+    {
+        let mut g = server.inner.graph.write();
+        g.set_last_sweep_at(recent);
+    }
+    server.inner.graph.read().save(&root).unwrap();
+
+    // Invoke analyze on subtree A. Sweep should NOT run; b.cpp's
+    // cache entry survives.
+    run_analyze(&server, &subtree_a, false).await;
+    {
+        let g = server.inner.graph.read();
+        assert_eq!(
+            g.files_in_scope_count(&subtree_b),
+            1,
+            "b.cpp's cache entry must SURVIVE — sweep was within cadence"
+        );
+    }
+
+    // Run-sweep branch: reset last_sweep_at to 0 (never-swept). The
+    // handler computes delta = now - 0 = ages ago, far above
+    // SWEEP_INTERVAL_NANOS → sweep runs. Same disk-persist dance as
+    // above: the fast-path's `probe.load` reads from disk, not from
+    // the in-memory state.
+    {
+        let mut g = server.inner.graph.write();
+        g.set_last_sweep_at(0);
+    }
+    server.inner.graph.read().save(&root).unwrap();
+
+    run_analyze(&server, &subtree_a, false).await;
+    {
+        let g = server.inner.graph.read();
+        assert_eq!(
+            g.files_in_scope_count(&subtree_b),
+            0,
+            "b.cpp's cache entry must be DROPPED — sweep ran and stat'd missing"
+        );
+        // a.cpp (in scope this invocation) is untouched by the sweep
+        // (sweep only checks OUT-of-scope files). Survives.
+        assert_eq!(
+            g.files_in_scope_count(&subtree_a),
+            1,
+            "a.cpp (in scope) must survive — sweep only walks out-of-scope"
+        );
+    }
+
+    // After running the sweep, last_sweep_at must have been advanced
+    // away from 0. We don't pin a specific value (it's a wall-clock
+    // timestamp), only that it changed.
+    let after_sweep = server.inner.graph.read().last_sweep_at();
+    assert!(
+        after_sweep > 0,
+        "last_sweep_at must advance past 0 once a sweep runs"
+    );
+}
+
+// =========================================================================
+// Cross-scope edge resolution asymmetry
+// =========================================================================
+
+/// Documented contract from `resolve_edges_with_indexes`:
+/// - **Fresh → cached resolves.** A fresh edge whose target is a
+///   symbol added by an earlier invocation can resolve, because the
+///   combined symbol_index used during this invocation's resolve
+///   includes cached symbols.
+/// - **Cached → fresh does NOT spontaneously resolve.** A cached edge
+///   from an earlier invocation pointing at a symbol now in the cache
+///   (added by this invocation) stays unresolved, because cached
+///   edges are not re-resolved on subsequent invocations. The user
+///   must `force=true` at the originating subtree to re-parse and
+///   re-resolve.
+///
+/// This test pins both halves so a future change that "improves" or
+/// breaks the asymmetry gets caught immediately.
+#[tokio::test]
+async fn cross_scope_edge_resolution_is_asymmetric() {
+    let dir = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let subtree_a = root.join("a");
+    let subtree_b = root.join("b");
+    std::fs::create_dir_all(&subtree_a).unwrap();
+    std::fs::create_dir_all(&subtree_b).unwrap();
+
+    std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+
+    // A defines a_func() and a_caller() which calls b_target().
+    // b_target lives in B and will not exist when we first index A.
+    let a_cpp = subtree_a.join("a.cpp");
+    std::fs::write(
+        &a_cpp,
+        "\
+void a_func() {}
+void b_target();
+void a_caller() { b_target(); }
+",
+    )
+    .unwrap();
+
+    // B defines b_target() and b_caller() which calls a_func().
+    let b_cpp = subtree_b.join("b.cpp");
+    std::fs::write(
+        &b_cpp,
+        "\
+void a_func();
+void b_target() {}
+void b_caller() { a_func(); }
+",
+    )
+    .unwrap();
+
+    let server = fresh_server();
+
+    // Phase 1: index A only. A's call to b_target stays unresolved
+    // (B not yet indexed → no candidate in the symbol_index).
+    run_analyze(&server, &subtree_a, false).await;
+    let a_cpp_str = a_cpp.to_string_lossy().to_string();
+    let b_cpp_str = b_cpp.to_string_lossy().to_string();
+    {
+        let g = server.inner.graph.read();
+        let a_caller_id = format!("{a_cpp_str}:a_caller");
+        let unresolved_after_phase1 = g
+            .callees(&a_caller_id, 1)
+            .into_iter()
+            .any(|c| c.symbol_id.contains(&b_cpp_str));
+        assert!(
+            !unresolved_after_phase1,
+            "a_caller's call to b_target must NOT resolve before B is indexed"
+        );
+    }
+
+    // Phase 2: index B. Fresh→cached path activates: b_caller's call
+    // to a_func resolves against A's cached symbol_index entry.
+    run_analyze(&server, &subtree_b, false).await;
+    {
+        let g = server.inner.graph.read();
+        let b_caller_id = format!("{b_cpp_str}:b_caller");
+        let b_caller_callees = g.callees(&b_caller_id, 1);
+        assert!(
+            b_caller_callees
+                .iter()
+                .any(|c| c.symbol_id == format!("{a_cpp_str}:a_func")),
+            "b_caller's call to a_func MUST resolve via the combined symbol_index \
+             (fresh→cached path); got callees: {:?}",
+            b_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+        );
+
+        // Asymmetric half: A's cached call to b_target STILL does not
+        // resolve. The cached edge was emitted when B wasn't indexed
+        // and it is not re-resolved on subsequent invocations.
+        let a_caller_id = format!("{a_cpp_str}:a_caller");
+        let a_caller_callees = g.callees(&a_caller_id, 1);
+        let resolved_to_b = a_caller_callees
+            .iter()
+            .any(|c| c.symbol_id == format!("{b_cpp_str}:b_target"));
+        assert!(
+            !resolved_to_b,
+            "a_caller's cached call to b_target must NOT spontaneously resolve \
+             after B is indexed — documented asymmetric-resolve contract. \
+             Got: {:?}",
+            a_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+        );
+    }
+
+    // Phase 3: force=true at A re-parses A and re-resolves its edges
+    // against the now-larger symbol_index (which includes B's
+    // symbols). The cached-edge asymmetry is resolved by the force.
+    run_analyze(&server, &subtree_a, true).await;
+    {
+        let g = server.inner.graph.read();
+        let a_caller_id = format!("{a_cpp_str}:a_caller");
+        let a_caller_callees = g.callees(&a_caller_id, 1);
+        assert!(
+            a_caller_callees
+                .iter()
+                .any(|c| c.symbol_id == format!("{b_cpp_str}:b_target")),
+            "after force=true at A, a_caller's call to b_target MUST now resolve \
+             — force-reindex closes the asymmetric-resolve gap. Got: {:?}",
+            a_caller_callees.iter().map(|c| &c.symbol_id).collect::<Vec<_>>()
+        );
+    }
+}

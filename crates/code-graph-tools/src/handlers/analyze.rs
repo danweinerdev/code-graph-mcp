@@ -175,13 +175,32 @@ pub async fn analyze_codebase(
     }
 
     // Cache fast-path: when not forced, attempt cache load + scoped
-    // stale check at the project root. We only short-circuit if every
-    // in-scope file is fresh; out-of-scope files might be stale but
-    // that's the lazy/scoped contract — the sweep handles them.
+    // stale check at the project root. We only short-circuit if:
+    //   (a) the cache contains AT LEAST ONE file in the invocation
+    //       scope (otherwise the user is indexing a new subtree —
+    //       a fast-path return would yield an empty-scope graph that
+    //       hides whatever's actually under their cwd);
+    //   (b) every in-scope cached file is mtime-fresh. Out-of-scope
+    //       files might be stale but that's the lazy/scoped contract
+    //       — the sweep below handles them.
+    //
+    // Even on the fast-path we still run the opportunistic
+    // out-of-scope hygiene sweep if its cadence has elapsed: cache
+    // ghost entries from deleted out-of-scope files should be cleaned
+    // up regardless of whether the parse pipeline ran.
+    //
+    // Known limitation: this fast-path does NOT detect NEW files
+    // added to an already-indexed scope. The cached mtimes only
+    // include previously-indexed files, so a brand-new file in the
+    // scope is invisible to the staleness check and the fast-path
+    // returns without picking it up. Workaround: re-run with
+    // `force=true` after adding files to a scope. A full discovery
+    // walk inside the fast-path would close this gap but at the cost
+    // of every fast-path hit doing a stat-walk of the scope.
     if !force {
         let mut probe = Graph::new();
         let load_ok = probe.load(&project_root).unwrap_or(false);
-        if load_ok {
+        if load_ok && probe.files_in_scope_count(&abs_path) > 0 {
             // `stale_paths` reads all cached mtimes; filter to the
             // invocation scope to honour lazy/scoped semantics.
             let all_stale = stale_paths(&project_root).unwrap_or_default();
@@ -190,6 +209,30 @@ pub async fn analyze_codebase(
                 .filter(|p| p.starts_with(&abs_path))
                 .collect();
             if in_scope_stale.is_empty() {
+                // Run the opportunistic out-of-scope sweep if cadence
+                // elapsed. Even in the fast-path the sweep is the
+                // right thing: deleted out-of-scope files should be
+                // cleaned up regardless of whether parsing happened.
+                let mut fast_path_warnings: Vec<String> = Vec::new();
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let elapsed_since_sweep =
+                    now_nanos.saturating_sub(probe.last_sweep_at());
+                let sweep_ran = elapsed_since_sweep
+                    >= code_graph_graph::SWEEP_INTERVAL_NANOS;
+                if sweep_ran {
+                    let swept = probe.sweep_missing_out_of_scope(&abs_path);
+                    if !swept.is_empty() {
+                        fast_path_warnings.push(format!(
+                            "out-of-scope sweep removed {} stale cache entry(ies) \
+                             (files deleted in subtrees not touched by this invocation)",
+                            swept.len()
+                        ));
+                    }
+                    probe.set_last_sweep_at(now_nanos);
+                }
                 let stats = probe.stats();
                 {
                     let mut g = inner.graph.write();
@@ -198,6 +241,16 @@ pub async fn analyze_codebase(
                 *inner.root_path.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
+                // Persist the swept graph so the cadence bump and any
+                // removed entries survive. Skip the save when the
+                // sweep was a no-op (cadence not elapsed AND nothing
+                // changed); saving an unchanged cache is wasted I/O.
+                if sweep_ran {
+                    if let Err(e) = save_cache(&inner.graph, &project_root) {
+                        fast_path_warnings.push(format!("cache save failed: {e}"));
+                    }
+                }
+                warnings.extend(fast_path_warnings);
                 let result = AnalyzeResult {
                     files: stats.files,
                     symbols: stats.nodes,
