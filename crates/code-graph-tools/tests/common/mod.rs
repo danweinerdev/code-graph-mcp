@@ -67,11 +67,23 @@ pub fn copy_testdata(dest: &Path) {
 /// Recursively copy every file under `src` into `dest`. Generic counterpart
 /// to `copy_testdata` — used by mixed-language tests that seed
 /// from `testdata/mixed/` or `testdata/rust/` instead of the C++ corpus.
+///
+/// Skips `.code-graph-cache.json` at any depth: the cache file is
+/// gitignored but persists between runs of dogfood baseline tests
+/// (which invoke `analyze_codebase` directly against `testdata/<lang>/`).
+/// Copying a stale cache into a fresh TempDir would pollute the next
+/// analyze: the cache's file paths point at a prior TempDir, so the
+/// cache-load + merge-with-fresh-parse path produces 2N file entries
+/// instead of N. Easier to filter at the seed boundary than to teach
+/// every test to delete the file after copy.
 #[allow(dead_code)]
 pub fn copy_testdata_from(src: &Path, dest: &Path) {
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry.expect("walk testdata");
         if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name() == ".code-graph-cache.json" {
             continue;
         }
         let rel = entry
