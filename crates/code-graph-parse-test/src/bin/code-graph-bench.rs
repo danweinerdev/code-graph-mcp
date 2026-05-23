@@ -407,18 +407,24 @@ fn main() -> ExitCode {
     resolve_all_edges(&mut graphs, &registry, progress);
     let resolve_d = t.elapsed();
 
+    // Per-language + top-N stats (from `graphs` — pre-merge — because
+    // it carries language alongside symbols). Computed BEFORE the merge
+    // loop so the loop can consume `graphs` by value and skip the
+    // FileGraph clone — on LLVM-scale (~770k symbols, millions of edges)
+    // the clone burned multi-second wall time for no benefit.
+    let (languages, top_dirs, top_files) = aggregate_breakdowns(&graphs, args.top_n);
+
+    if !args.json {
+        eprintln!("[   Merge] merging {} file graphs", graphs.len());
+    }
     let t = Instant::now();
     let mut graph = Graph::new();
-    for fg in &graphs {
-        graph.merge_file_graph(fg.clone());
+    for fg in graphs {
+        graph.merge_file_graph(fg);
     }
     let merge_d = t.elapsed();
 
     let counts = graph.stats();
-
-    // Per-language + top-N stats (from `graphs` — pre-merge — because
-    // it carries language alongside symbols).
-    let (languages, top_dirs, top_files) = aggregate_breakdowns(&graphs, args.top_n);
 
     // ----- Cache: save + load loop -----
     let cache_dir = match prepare_cache_dir(&args) {
@@ -435,7 +441,13 @@ fn main() -> ExitCode {
     let mut round_trip_ok = true;
     let mut cache_bytes: u64 = 0;
 
-    for _ in 0..args.iterations {
+    if !args.json {
+        eprintln!("[   Cache] save + load round-trip + stale check");
+    }
+    for i in 0..args.iterations {
+        if !args.json && args.iterations > 1 {
+            eprintln!("[   Cache] iteration {}/{}", i + 1, args.iterations);
+        }
         let t = Instant::now();
         if let Err(e) = graph.save(cache_dir.path()) {
             eprintln!("graph.save: {e}");
@@ -482,12 +494,23 @@ fn main() -> ExitCode {
     };
 
     // ----- Subtree benchmarks -----
-    let subtree_report = resolve_subtree(&args, &graph).map(|prefix| run_subtree(&graph, &prefix));
+    let subtree_report = resolve_subtree(&args, &graph).map(|prefix| {
+        if !args.json {
+            eprintln!(
+                "[ Subtree] orphans + cycles + search under {}",
+                prefix.display()
+            );
+        }
+        run_subtree(&graph, &prefix)
+    });
 
     // ----- Phase E verification -----
     let verification = if args.skip_verify {
         None
     } else {
+        if !args.json {
+            eprintln!("[  Verify] sampling Rust + Go namespaces");
+        }
         Some(run_verification(&graph))
     };
 
