@@ -56,7 +56,28 @@ const CACHE_FILE_NAME: &str = ".code-graph-cache.json";
 // version-check branch in `Graph::load` returns `Ok(false)` on mismatch
 // → silent re-index, no `force=true` required, no transparent migration
 // attempted (mirrors the v2→v3 precedent).
-const CACHE_VERSION: u32 = 4;
+//
+// v5: cache adds `last_sweep_at` (nanoseconds since UNIX_EPOCH) tracking
+// when the out-of-scope hygiene sweep last ran. The sweep runs on a
+// time-based cadence (see `SWEEP_INTERVAL_NANOS`) inside
+// `analyze_codebase` to drop ghost cache entries for files that were
+// deleted in subtrees the current invocation doesn't touch. The field
+// is `u64` with `#[serde(default)]` so the absence on a v4 cache
+// would deserialize as `0` — but the version bump means v4 caches
+// fail the version check before deserialization can recover the
+// missing field anyway. Same invalidation contract as the v3→v4 bump:
+// version mismatch → `Ok(false)` from `Graph::load` → caller silently
+// re-indexes.
+const CACHE_VERSION: u32 = 5;
+
+/// Out-of-scope sweep cadence: 24 hours in nanoseconds. After a scoped
+/// `analyze_codebase` finishes its in-scope work, if at least this
+/// many nanoseconds have elapsed since the last sweep, the handler
+/// runs `Graph::sweep_missing_out_of_scope` to stat every cached file
+/// OUTSIDE the invocation scope and drop the ones missing on disk.
+/// Keeps the cache from accumulating ghost entries without paying
+/// full-revalidation cost on every invocation.
+pub const SWEEP_INTERVAL_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const GENERATOR: &str = "code-graph-graph (rust)";
 
 /// Errors returned by [`Graph::save`], [`Graph::load`], and [`stale_paths`].
@@ -89,6 +110,15 @@ struct GraphCache {
     /// are not real on any filesystem we support. Files whose mtime cannot
     /// be read are recorded as `0` so they look stale on the next check.
     mtimes: HashMap<PathBuf, u64>,
+    /// Nanoseconds since UNIX_EPOCH when the project-wide
+    /// out-of-scope hygiene sweep last ran. `0` means "never swept"
+    /// (or pre-v5 cache that was migrated forward, though we don't
+    /// migrate so this only ever happens on a freshly-built cache
+    /// before the first sweep). The handler compares this against the
+    /// current clock + [`SWEEP_INTERVAL_NANOS`] to decide whether the
+    /// current invocation should run a sweep before saving.
+    #[serde(default)]
+    last_sweep_at: u64,
 }
 
 /// Borrowing variant of [`GraphCache`] used only on the save path.
@@ -115,6 +145,7 @@ struct GraphCacheRef<'a> {
     files: &'a HashMap<PathBuf, FileEntry>,
     includes: &'a HashMap<PathBuf, Vec<IncludeEntry>>,
     mtimes: HashMap<PathBuf, u64>,
+    last_sweep_at: u64,
 }
 
 /// Slim DTO consumed only by [`stale_paths`]. Materializes only
@@ -457,6 +488,7 @@ impl Graph {
             files: &self.files,
             includes: &self.includes,
             mtimes,
+            last_sweep_at: self.last_sweep_at,
         };
 
         // Write-tmp → flush BufWriter → sync_all → rename. The braces
@@ -547,6 +579,12 @@ impl Graph {
         self.radj = cache.radj;
         self.files = cache.files;
         self.includes = cache.includes;
+        // Restore the sweep timestamp so the cadence survives process
+        // restarts. A pre-v5 cache (which fails the version check
+        // above) never reaches this line; a v5 cache always has the
+        // field, defaulting to `0` for a freshly-built cache that has
+        // not yet had a sweep run.
+        self.last_sweep_at = cache.last_sweep_at;
         Ok(true)
     }
 }
@@ -807,21 +845,21 @@ mod tests {
         let original = build_sample_graph();
         original.save(dir_v4.path()).unwrap();
 
-        // On-disk version must be 4 — pin the literal so a future
-        // accidental revert of the bump fires this assert before any
-        // round-trip equality check could mask it.
+        // On-disk version must equal the current `CACHE_VERSION` — pin
+        // the literal so a future accidental revert of any bump fires
+        // this assert before any round-trip equality check could mask it.
         let bytes = fs::read(cache_path(dir_v4.path())).unwrap();
         let cache_on_disk: GraphCache = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            cache_on_disk.version, 4,
-            "freshly-written cache must carry version=4 (the current schema)",
+            cache_on_disk.version, CACHE_VERSION,
+            "freshly-written cache must carry version={CACHE_VERSION} (the current schema)",
         );
 
         let mut loaded = Graph::new();
         let ok = loaded.load(dir_v4.path()).unwrap();
         assert!(
             ok,
-            "freshly-written v4 cache must load successfully (Ok(true))",
+            "freshly-written current-version cache must load successfully (Ok(true))",
         );
         // `mtimes` is intentionally absent from this equality block: it
         // lives in `GraphCache`, not `Graph`, and `load` never assigns it
@@ -1229,6 +1267,7 @@ mod tests {
             files,
             includes,
             mtimes,
+            last_sweep_at: 0,
         }
     }
 

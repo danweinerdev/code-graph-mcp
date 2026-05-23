@@ -23,7 +23,7 @@ pub use algorithms::HierarchyNode;
 pub use callgraph::CallChain;
 pub use diagrams::{DiagramDirection, DiagramEdge, DiagramResult, EdgeDirection};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, IncludeEntry, Node};
-pub use persist::{cache_path, stale_paths, PersistError};
+pub use persist::{cache_path, stale_paths, PersistError, SWEEP_INTERVAL_NANOS};
 pub use queries::{SearchParams, SearchResult};
 
 /// Re-export of [`parking_lot::RwLock`] so downstream callers (e.g. the

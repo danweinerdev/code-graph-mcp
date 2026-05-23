@@ -37,6 +37,14 @@ pub struct Graph {
     pub(crate) radj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub(crate) files: HashMap<PathBuf, FileEntry>,
     pub(crate) includes: HashMap<PathBuf, Vec<IncludeEntry>>,
+    /// Nanoseconds since UNIX_EPOCH when the out-of-scope hygiene
+    /// sweep last ran across this graph. Persisted in the cache
+    /// (`GraphCache.last_sweep_at`) so the cadence survives process
+    /// restarts. `0` means "never swept" — true for a freshly-built
+    /// graph that has not yet had a sweep run against it. Updated by
+    /// [`Graph::set_last_sweep_at`] from the `analyze_codebase`
+    /// handler immediately after a sweep, before the save.
+    pub(crate) last_sweep_at: u64,
 }
 
 /// Wrapper around a [`Symbol`] stored in the graph. Mirrors Go's `Node`.
@@ -214,6 +222,104 @@ impl Graph {
         self.remove_file_unsafe(path);
     }
 
+    /// Drop every cached file whose path lies inside `scope`. Returns the
+    /// paths that were removed (useful for warning surfaces and
+    /// telemetry).
+    ///
+    /// Use case: `analyze_codebase(scope, force=true)` on a subtree of
+    /// a configured project. The project-wide cache may contain prior
+    /// entries from inside `scope` whose state is about to be
+    /// re-parsed from disk. Wiping them first ensures the rebuild
+    /// starts from a known-empty slate within the scope. Entries
+    /// OUTSIDE `scope` are untouched — the "lazy / scoped indexing"
+    /// contract requires that a `force=true` at a subtree only
+    /// invalidates that subtree.
+    ///
+    /// Scope membership is `Path::starts_with`-based on the cached file
+    /// path: `/proj/a/b/c.cpp` is in scope `/proj/a` but not in scope
+    /// `/proj/d`. Both arguments must already be canonicalized; the
+    /// indexer guarantees stored paths are absolute and `\\?\`-stripped
+    /// (see CLAUDE.md Core invariants).
+    pub fn drop_files_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
+        let in_scope: Vec<PathBuf> = self
+            .files
+            .keys()
+            .filter(|p| p.starts_with(scope))
+            .cloned()
+            .collect();
+        for path in &in_scope {
+            self.remove_file_unsafe(path);
+        }
+        in_scope
+    }
+
+    /// Stat every cached file whose path lies inside `scope` and drop
+    /// the ones that no longer exist on disk. Returns the removed
+    /// paths.
+    ///
+    /// Use case: lazy / scoped `analyze_codebase(scope)` without
+    /// `force=true`. The cache may have entries for files that were
+    /// deleted on disk since the last invocation; on a scoped analyze
+    /// the parser would never observe them as missing (it only walks
+    /// what's there now), so eviction needs an explicit pass. Entries
+    /// outside `scope` are NOT stat-checked here — that's the
+    /// opportunistic out-of-scope sweep's job, run on a separate
+    /// cadence by [`Graph::sweep_missing_out_of_scope`].
+    ///
+    /// Cost: one `fs::metadata` per cached file under `scope`. On a
+    /// large subtree this is O(files-in-scope) syscalls; cheap relative
+    /// to re-parsing but not free. Callers should not invoke this on
+    /// the project root unless they intend a full project re-validation.
+    pub fn evict_missing_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
+        let candidates: Vec<PathBuf> = self
+            .files
+            .keys()
+            .filter(|p| p.starts_with(scope))
+            .cloned()
+            .collect();
+        let mut removed = Vec::new();
+        for path in candidates {
+            if !path.exists() {
+                self.remove_file_unsafe(&path);
+                removed.push(path);
+            }
+        }
+        removed
+    }
+
+    /// Stat every cached file whose path lies OUTSIDE `scope` and drop
+    /// the ones that no longer exist on disk. Returns the removed
+    /// paths.
+    ///
+    /// Use case: the opportunistic project-wide hygiene sweep run
+    /// every N hours since the last sweep. A scoped
+    /// `analyze_codebase(scope)` doesn't touch out-of-scope entries by
+    /// design, so files that were moved or deleted in other parts of
+    /// the project would otherwise accumulate as cache ghosts.
+    /// Periodic sweep keeps the cache consistent without paying full
+    /// re-validation cost on every invocation.
+    ///
+    /// Cost: one `fs::metadata` per cached file OUTSIDE `scope`. On a
+    /// large project this is O(files-out-of-scope) syscalls and is
+    /// only done at the configured sweep cadence (default: 24h —
+    /// see persist.rs `LastSweepAt`).
+    pub fn sweep_missing_out_of_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
+        let candidates: Vec<PathBuf> = self
+            .files
+            .keys()
+            .filter(|p| !p.starts_with(scope))
+            .cloned()
+            .collect();
+        let mut removed = Vec::new();
+        for path in candidates {
+            if !path.exists() {
+                self.remove_file_unsafe(&path);
+                removed.push(path);
+            }
+        }
+        removed
+    }
+
     // "unsafe" here means "caller must hold the write lock on the
     // `parking_lot::RwLock` that wraps the server-side Graph". No Rust
     // `unsafe` code is involved.
@@ -291,13 +397,41 @@ impl Graph {
         });
     }
 
-    /// Reset the graph to empty. All five maps are cleared.
+    /// Reset the graph to empty. All five maps are cleared and the
+    /// sweep timestamp is reset to `0` (never-swept). After a
+    /// `clear()` the graph is structurally equivalent to a fresh
+    /// [`Graph::new`].
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.adj.clear();
         self.radj.clear();
         self.files.clear();
         self.includes.clear();
+        self.last_sweep_at = 0;
+    }
+
+    /// Nanoseconds since UNIX_EPOCH of the most recent out-of-scope
+    /// hygiene sweep. `0` means "never swept" — the
+    /// `analyze_codebase` handler treats this as "run a sweep now"
+    /// on the first invocation after a load.
+    pub fn last_sweep_at(&self) -> u64 {
+        self.last_sweep_at
+    }
+
+    /// Count of cached files whose path lies inside `scope`. Used by
+    /// the `analyze_codebase` handler to surface a "project cache
+    /// contains N files outside the current scope" warning so users
+    /// running scoped analyses can see the breakdown of accumulated
+    /// vs. just-refreshed state.
+    pub fn files_in_scope_count(&self, scope: &Path) -> usize {
+        self.files.keys().filter(|p| p.starts_with(scope)).count()
+    }
+
+    /// Set the sweep timestamp. The handler calls this immediately
+    /// after running `sweep_missing_out_of_scope` so the value
+    /// persists to the cache via the next [`Graph::save`].
+    pub fn set_last_sweep_at(&mut self, nanos: u64) {
+        self.last_sweep_at = nanos;
     }
 
     /// Reconstruct a `Vec<FileGraph>` from internal storage with the
@@ -874,5 +1008,179 @@ mod tests {
         assert_eq!(entries[0].target, "/a.cpp:kept_fn");
         assert!(g.radj().contains_key("/a.cpp:kept_fn"));
         assert!(!g.radj().contains_key("/a.cpp:old_fn"));
+    }
+
+    // --- Scope-aware methods: drop_files_in_scope / evict_missing_in_scope /
+    // sweep_missing_out_of_scope --------------------------------------------
+
+    /// `drop_files_in_scope` removes every file whose path starts with the
+    /// scope path, returns the removed list, and leaves out-of-scope
+    /// files intact. The canonical use is the scoped-`force=true` case:
+    /// invalidate a subtree without touching the rest of the project.
+    #[test]
+    fn drop_files_in_scope_removes_only_in_scope_files() {
+        let mut g = Graph::new();
+        // Two files inside scope, one outside.
+        g.merge_file_graph(make_fg(
+            "/proj/sub/a.cpp",
+            Language::Cpp,
+            vec![sym("a", SymbolKind::Function, "/proj/sub/a.cpp")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/proj/sub/b.cpp",
+            Language::Cpp,
+            vec![sym("b", SymbolKind::Function, "/proj/sub/b.cpp")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/proj/other/c.cpp",
+            Language::Cpp,
+            vec![sym("c", SymbolKind::Function, "/proj/other/c.cpp")],
+            vec![],
+        ));
+        assert_eq!(g.stats().files, 3);
+
+        let removed = g.drop_files_in_scope(Path::new("/proj/sub"));
+        assert_eq!(removed.len(), 2, "exactly the two in-scope files removed");
+        assert!(removed.iter().any(|p| p == Path::new("/proj/sub/a.cpp")));
+        assert!(removed.iter().any(|p| p == Path::new("/proj/sub/b.cpp")));
+
+        let stats = g.stats();
+        assert_eq!(stats.files, 1, "out-of-scope file survives");
+        assert_eq!(stats.nodes, 1, "only the out-of-scope symbol remains");
+        assert!(g.files().contains_key(&PathBuf::from("/proj/other/c.cpp")));
+        assert!(!g.files().contains_key(&PathBuf::from("/proj/sub/a.cpp")));
+    }
+
+    /// `drop_files_in_scope` with no in-scope files is a no-op and
+    /// returns an empty Vec.
+    #[test]
+    fn drop_files_in_scope_no_matches_is_noop() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/proj/other/c.cpp",
+            Language::Cpp,
+            vec![sym("c", SymbolKind::Function, "/proj/other/c.cpp")],
+            vec![],
+        ));
+        let before = g.stats();
+        let removed = g.drop_files_in_scope(Path::new("/proj/sub"));
+        assert!(removed.is_empty(), "nothing in scope, nothing removed");
+        assert_eq!(g.stats(), before, "graph unchanged");
+    }
+
+    /// `evict_missing_in_scope` stats each in-scope cached path; drops
+    /// the ones that aren't on disk; leaves the ones that are. Uses a
+    /// real tempdir + tempfile so the `Path::exists()` calls are
+    /// against a known filesystem state.
+    #[test]
+    fn evict_missing_in_scope_drops_only_disappeared_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kept = dir.path().join("kept.cpp");
+        let gone = dir.path().join("gone.cpp");
+        std::fs::write(&kept, b"// kept\n").unwrap();
+        // Deliberately do NOT create `gone` on disk.
+
+        let mut g = Graph::new();
+        let kept_str = kept.to_string_lossy().into_owned();
+        let gone_str = gone.to_string_lossy().into_owned();
+        g.merge_file_graph(make_fg(
+            &kept_str,
+            Language::Cpp,
+            vec![sym("k", SymbolKind::Function, &kept_str)],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            &gone_str,
+            Language::Cpp,
+            vec![sym("g", SymbolKind::Function, &gone_str)],
+            vec![],
+        ));
+        assert_eq!(g.stats().files, 2);
+
+        let removed = g.evict_missing_in_scope(dir.path());
+        assert_eq!(removed.len(), 1, "exactly the missing file removed");
+        assert_eq!(removed[0], gone);
+
+        let stats = g.stats();
+        assert_eq!(stats.files, 1, "kept.cpp survives");
+        assert!(g.files().contains_key(&kept));
+        assert!(!g.files().contains_key(&gone));
+    }
+
+    /// `evict_missing_in_scope` ignores files OUTSIDE the scope, even
+    /// when they're also missing on disk. Out-of-scope hygiene is the
+    /// sweep's job, not this method's.
+    #[test]
+    fn evict_missing_in_scope_ignores_out_of_scope_missing_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scope = dir.path().join("scope");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&scope).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        // Both files cached but neither on disk; only the in-scope one
+        // should be dropped.
+        let in_scope = scope.join("a.cpp");
+        let out_of_scope = other.join("b.cpp");
+
+        let mut g = Graph::new();
+        let in_str = in_scope.to_string_lossy().into_owned();
+        let out_str = out_of_scope.to_string_lossy().into_owned();
+        g.merge_file_graph(make_fg(
+            &in_str,
+            Language::Cpp,
+            vec![sym("a", SymbolKind::Function, &in_str)],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            &out_str,
+            Language::Cpp,
+            vec![sym("b", SymbolKind::Function, &out_str)],
+            vec![],
+        ));
+
+        let removed = g.evict_missing_in_scope(&scope);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], in_scope);
+        assert!(g.files().contains_key(&out_of_scope), "out-of-scope missing file is preserved");
+    }
+
+    /// `sweep_missing_out_of_scope` is the mirror of
+    /// `evict_missing_in_scope`: stats every OUT-of-scope cached path
+    /// and drops the ones that aren't on disk. In-scope files are
+    /// untouched even if they're missing — the eviction pass handles
+    /// those.
+    #[test]
+    fn sweep_missing_out_of_scope_drops_only_out_of_scope_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scope = dir.path().join("scope");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&scope).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        // In-scope file missing, out-of-scope file also missing.
+        let in_scope = scope.join("a.cpp");
+        let out_of_scope = other.join("b.cpp");
+
+        let mut g = Graph::new();
+        let in_str = in_scope.to_string_lossy().into_owned();
+        let out_str = out_of_scope.to_string_lossy().into_owned();
+        g.merge_file_graph(make_fg(
+            &in_str,
+            Language::Cpp,
+            vec![sym("a", SymbolKind::Function, &in_str)],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            &out_str,
+            Language::Cpp,
+            vec![sym("b", SymbolKind::Function, &out_str)],
+            vec![],
+        ));
+
+        let removed = g.sweep_missing_out_of_scope(&scope);
+        assert_eq!(removed.len(), 1, "only the out-of-scope missing file is dropped");
+        assert_eq!(removed[0], out_of_scope);
+        assert!(g.files().contains_key(&in_scope), "in-scope missing file is preserved for evict_missing_in_scope");
     }
 }
