@@ -371,10 +371,21 @@ pub async fn analyze_codebase(
         // state. The merge model treats the cache as a project-wide
         // accumulator: prior scoped invocations contributed entries
         // that survive this invocation unless we explicitly evict them.
+        eprintln!(
+            "[code-graph] phase: loading cache from {}",
+            project_root_for_pool.display()
+        );
+        let phase_start = std::time::Instant::now();
         let mut merged_graph = Graph::new();
         let cache_loaded = merged_graph
             .load(&project_root_for_pool)
             .unwrap_or(false);
+        eprintln!(
+            "[code-graph] phase: cache load {} ({:.1}s, {} cached files)",
+            if cache_loaded { "ok" } else { "absent/stale" },
+            phase_start.elapsed().as_secs_f64(),
+            merged_graph.stats().files
+        );
 
         // Phase B: apply scope policy. Three cases:
         //  - force=true at project root → full clobber (today's
@@ -412,6 +423,11 @@ pub async fn analyze_codebase(
         // walks `abs_path_for_pool` (the invocation path), not the
         // project root — scope follows the user's invocation, even
         // though the cache lives at the project root.
+        eprintln!(
+            "[code-graph] phase: discovering + parsing under {}",
+            abs_path_for_pool.display()
+        );
+        let phase_start = std::time::Instant::now();
         let (mut fresh_graphs, parse_warnings) = match index_directory(
             &abs_path_for_pool,
             &registry.registry,
@@ -422,6 +438,11 @@ pub async fn analyze_codebase(
             Err(e) => return Err(e.to_string()),
         };
         blocking_warnings.extend(parse_warnings);
+        eprintln!(
+            "[code-graph] phase: discover+parse done ({:.1}s, {} files parsed)",
+            phase_start.elapsed().as_secs_f64(),
+            fresh_graphs.len()
+        );
 
         // Phase D: build cross-scope indexes. Fresh edges resolve
         // against the union of cached symbols/files (from prior
@@ -431,6 +452,8 @@ pub async fn analyze_codebase(
         // invocations stay unresolved even when their would-be target
         // is now in the cache. The user can `force=true` at the
         // originating subtree to re-resolve.
+        eprintln!("[code-graph] phase: resolving edges");
+        let phase_start = std::time::Instant::now();
         let cached_snapshot = merged_graph.file_graphs_snapshot();
         let mut symbol_index = build_symbol_index(&cached_snapshot);
         extend_symbol_index(&mut symbol_index, &fresh_graphs);
@@ -445,15 +468,29 @@ pub async fn analyze_codebase(
             &registry.registry,
             &sink,
         );
+        eprintln!(
+            "[code-graph] phase: resolve done ({:.1}s)",
+            phase_start.elapsed().as_secs_f64()
+        );
 
         // Phase F: merge fresh FileGraphs into the project graph.
         // `merge_file_graph` is idempotent per-path: if a file was
         // already in the cache and we just re-parsed it (the
         // incremental-stale or force-scoped case), the merge replaces
         // its prior entries cleanly.
+        eprintln!(
+            "[code-graph] phase: merging {} fresh file(s) into project graph",
+            fresh_graphs.len()
+        );
+        let phase_start = std::time::Instant::now();
         for fg in fresh_graphs {
             merged_graph.merge_file_graph(fg);
         }
+        eprintln!(
+            "[code-graph] phase: merge done ({:.1}s, total {} files in graph)",
+            phase_start.elapsed().as_secs_f64(),
+            merged_graph.stats().files
+        );
 
         // Phase G: opportunistic out-of-scope sweep. If at least
         // SWEEP_INTERVAL_NANOS has elapsed since the last sweep, stat
@@ -560,8 +597,22 @@ pub async fn analyze_codebase(
     // a fatal). The cache co-locates with the project root, NOT the
     // invocation path. Subsequent scoped invocations under the same
     // project hit the same cache file and accumulate into it.
+    eprintln!(
+        "[code-graph] phase: saving cache to {}",
+        project_root.display()
+    );
+    let save_start = std::time::Instant::now();
     if let Err(e) = save_cache(&inner.graph, &project_root) {
         warnings.push(format!("cache save failed: {e}"));
+        eprintln!(
+            "[code-graph] phase: save FAILED ({:.1}s)",
+            save_start.elapsed().as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[code-graph] phase: save done ({:.1}s)",
+            save_start.elapsed().as_secs_f64()
+        );
     }
 
     let result = AnalyzeResult {
