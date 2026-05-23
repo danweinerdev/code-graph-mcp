@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{symbol_id, EdgeKind, FileGraph, Language, Symbol, SymbolId};
+use code_graph_core::{symbol_id, Confidence, EdgeKind, FileGraph, Language, Symbol, SymbolId};
 use serde::{Deserialize, Serialize};
 
 /// In-memory directed graph of code symbols.
@@ -71,6 +71,14 @@ pub struct EdgeEntry {
     pub kind: EdgeKind,
     pub file: PathBuf,
     pub line: u32,
+    /// Resolver confidence in `target`. Copied verbatim from the source
+    /// [`code_graph_core::Edge::confidence`] at merge time. Defaults to
+    /// [`Confidence::Resolved`] for older cached entries written before
+    /// the field existed; in practice the CACHE_VERSION bump that
+    /// added this field also triggers a silent re-index, so the default
+    /// is rarely exercised in production.
+    #[serde(default)]
+    pub confidence: Confidence,
 }
 
 /// Per-file metadata recorded at merge time. The Go reference stores only
@@ -171,7 +179,13 @@ impl Graph {
             },
         );
 
-        // Add edges, routing by kind.
+        // Add edges, routing by kind. Confidence rides into both adj and
+        // radj entries so the per-tool `min_confidence` filter can apply
+        // uniformly regardless of which direction the query walks.
+        // Include edges do not carry confidence today because the
+        // include-target path is the resolver's verbatim output, not a
+        // pick-one-of-many — multi-candidate include resolution still
+        // returns a single path via the suffix-disambiguation rule.
         for edge in fg.edges {
             let edge_file = PathBuf::from(&edge.file);
             match edge.kind {
@@ -184,12 +198,14 @@ impl Graph {
                             kind: edge.kind,
                             file: edge_file.clone(),
                             line: edge.line,
+                            confidence: edge.confidence,
                         });
                     self.radj.entry(edge.to).or_default().push(EdgeEntry {
                         target: edge.from,
                         kind: edge.kind,
                         file: edge_file,
                         line: edge.line,
+                        confidence: edge.confidence,
                     });
                 }
                 EdgeKind::Includes => {
@@ -586,6 +602,7 @@ mod tests {
                     kind: EdgeKind::Includes,
                     file: "/a.cpp".to_string(),
                     line: 12,
+                    confidence: Confidence::Resolved,
                 },
             ],
         );

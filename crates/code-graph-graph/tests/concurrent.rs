@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_graph::{Graph, RwLock, SearchParams};
 
 /// Build a [`Symbol`] with sensible defaults — local copy of the
@@ -68,6 +68,7 @@ fn call_edge(from: &str, to: &str, file: &str) -> Edge {
         kind: EdgeKind::Calls,
         file: file.to_string(),
         line: 1,
+        confidence: Confidence::Resolved,
     }
 }
 
@@ -79,6 +80,7 @@ fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
         kind: EdgeKind::Inherits,
         file: file.to_string(),
         line: 0,
+        confidence: Confidence::Resolved,
     }
 }
 
@@ -91,6 +93,7 @@ fn include_edge(from: &str, to: &str) -> Edge {
         kind: EdgeKind::Includes,
         file: from.to_string(),
         line: 0,
+        confidence: Confidence::Resolved,
     }
 }
 

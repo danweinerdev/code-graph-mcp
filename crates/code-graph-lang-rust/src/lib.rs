@@ -59,7 +59,7 @@ pub(crate) mod queries;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::{FileIndex, LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -434,6 +434,7 @@ impl RustParser {
                                 kind: EdgeKind::Includes,
                                 file: path.to_owned(),
                                 line,
+                                confidence: Confidence::Resolved,
                             });
                         }
                     }
@@ -452,6 +453,7 @@ impl RustParser {
                             kind: EdgeKind::Includes,
                             file: path.to_owned(),
                             line,
+                            confidence: Confidence::Resolved,
                         });
                     }
 
@@ -562,6 +564,7 @@ impl RustParser {
                 kind: EdgeKind::Includes,
                 file: path.to_owned(),
                 line,
+                confidence: Confidence::Resolved,
             });
         }
     }
@@ -627,6 +630,7 @@ impl RustParser {
                     kind: EdgeKind::Calls,
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -738,6 +742,7 @@ impl RustParser {
                 kind: EdgeKind::Inherits,
                 file: path.to_owned(),
                 line,
+                confidence: Confidence::Resolved,
             });
         }
 
@@ -785,6 +790,7 @@ impl RustParser {
                 kind: EdgeKind::Inherits,
                 file: path.to_owned(),
                 line: bound.start_position().row as u32 + 1,
+                confidence: Confidence::Resolved,
             });
         }
     }

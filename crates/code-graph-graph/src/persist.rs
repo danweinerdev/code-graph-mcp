@@ -68,7 +68,19 @@ const CACHE_FILE_NAME: &str = ".code-graph-cache.json";
 // missing field anyway. Same invalidation contract as the v3→v4 bump:
 // version mismatch → `Ok(false)` from `Graph::load` → caller silently
 // re-indexes.
-const CACHE_VERSION: u32 = 5;
+//
+// v6: every `EdgeEntry` (and the parser-side `Edge` it descends from)
+// gains a `confidence: Confidence` field tagging whether the resolver
+// had a single-candidate match (`Resolved`) or had to pick among
+// multiple same-name candidates via the scope heuristic (`Heuristic`).
+// Powers the new `min_confidence` filter on the read tools so agents
+// can ask for resolved-only chains. The field is `#[serde(default)]`
+// for defense in depth (any pre-v6 cache that slipped through deserializes
+// as `Resolved`), but the version bump means a v5 cache fails the
+// version check on `Graph::load` first and the caller silently
+// re-indexes — same invalidation contract as every prior bump, no
+// transparent migration, no `force=true` required.
+const CACHE_VERSION: u32 = 6;
 
 /// Out-of-scope sweep cadence: 24 hours in nanoseconds. After a scoped
 /// `analyze_codebase` finishes its in-scope work, if at least this
@@ -654,7 +666,7 @@ pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
 mod tests {
     use super::*;
     use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
-    use code_graph_core::{EdgeKind, Language, SymbolKind};
+    use code_graph_core::{symbol_id, Confidence, Edge, EdgeKind, Language, SymbolKind};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
     use tempfile::TempDir;
@@ -744,6 +756,75 @@ mod tests {
             SENTINEL_NANOS,
             "last_sweep_at must round-trip through save/load — \
              a regression dropping the field would default it to 0"
+        );
+    }
+
+    /// Per-edge `confidence` (v6 schema field) must round-trip through
+    /// save/load on BOTH variants. The default-Resolved sample graph
+    /// would only cover the dominant variant; `Heuristic` carried
+    /// implicitly by the default would be invisible to a regression
+    /// that dropped the field — so this test plants both kinds on
+    /// adjacent edges and asserts each one survives by reading the
+    /// loaded `EdgeEntry` back from `adj`/`radj`.
+    #[test]
+    fn save_load_round_trip_preserves_per_edge_confidence() {
+        let dir = TempDir::new().unwrap();
+        let mut original = Graph::new();
+        let caller = sym("caller", SymbolKind::Function, "/a.cpp");
+        let resolved_target = sym("res_target", SymbolKind::Function, "/a.cpp");
+        let heuristic_target = sym("heur_target", SymbolKind::Function, "/b.cpp");
+        let caller_id = symbol_id(&caller);
+        let resolved_id = symbol_id(&resolved_target);
+        let heuristic_id = symbol_id(&heuristic_target);
+        original.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![caller.clone(), resolved_target],
+            vec![Edge {
+                from: caller_id.clone(),
+                to: resolved_id.clone(),
+                kind: EdgeKind::Calls,
+                file: "/a.cpp".to_string(),
+                line: 10,
+                confidence: Confidence::Resolved,
+            }],
+        ));
+        original.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![heuristic_target],
+            vec![Edge {
+                from: caller_id.clone(),
+                to: heuristic_id.clone(),
+                kind: EdgeKind::Calls,
+                file: "/a.cpp".to_string(),
+                line: 11,
+                confidence: Confidence::Heuristic,
+            }],
+        ));
+
+        original.save(dir.path()).unwrap();
+        let mut loaded = Graph::new();
+        loaded.load(dir.path()).unwrap();
+
+        let adj = loaded
+            .adj
+            .get(&caller_id)
+            .expect("caller must have outgoing edges");
+        let by_target: HashMap<_, _> = adj
+            .iter()
+            .map(|e| (e.target.clone(), e.confidence))
+            .collect();
+        assert_eq!(
+            by_target.get(&resolved_id).copied(),
+            Some(Confidence::Resolved),
+            "Resolved edge must survive save/load"
+        );
+        assert_eq!(
+            by_target.get(&heuristic_id).copied(),
+            Some(Confidence::Heuristic),
+            "Heuristic edge must survive save/load — \
+             a regression dropping the field would default it to Resolved"
         );
     }
 
@@ -1276,6 +1357,7 @@ mod tests {
             kind: EdgeKind::Calls,
             file: path_buf.clone(),
             line: 2,
+            confidence: Confidence::Resolved,
         };
         let mut adj = HashMap::new();
         adj.insert(free_id.clone(), vec![edge_entry.clone()]);

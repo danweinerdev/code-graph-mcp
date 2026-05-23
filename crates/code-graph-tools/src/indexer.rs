@@ -436,7 +436,8 @@ pub fn resolve_edges_with_indexes(
 mod tests {
     use super::*;
     use code_graph_core::{
-        DiscoveryConfig, Edge, FileGraph, Language, ParsingConfig, RootConfig, Symbol, SymbolKind,
+        Confidence, DiscoveryConfig, Edge, FileGraph, Language, ParsingConfig, RootConfig, Symbol,
+        SymbolKind,
     };
     use code_graph_lang::{LanguagePlugin, LanguageRegistry, ParseError};
     use std::fs;
@@ -729,6 +730,7 @@ mod tests {
                     kind: EdgeKind::Includes,
                     file: main_path.clone(),
                     line: 1,
+                    confidence: Confidence::Resolved,
                 },
                 Edge {
                     from: format!("{main_path}:main"),
@@ -737,6 +739,7 @@ mod tests {
                     kind: EdgeKind::Calls,
                     file: main_path.clone(),
                     line: 6,
+                    confidence: Confidence::Resolved,
                 },
             ],
         };
@@ -821,6 +824,7 @@ mod tests {
                     kind: EdgeKind::Includes,
                     file: main_path.clone(),
                     line: 1,
+                    confidence: Confidence::Resolved,
                 },
                 Edge {
                     from: main_path.clone(),
@@ -829,6 +833,7 @@ mod tests {
                     kind: EdgeKind::Includes,
                     file: main_path.clone(),
                     line: 2,
+                    confidence: Confidence::Resolved,
                 },
             ],
         };

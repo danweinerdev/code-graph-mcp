@@ -841,7 +841,7 @@ mod tests {
     use super::super::test_helpers::{body_text, page_parts};
     use super::super::NO_BYTE_BUDGET;
     use super::*;
-    use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+    use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
     fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
         sym_full(name, kind, file, "")
@@ -869,6 +869,7 @@ mod tests {
             kind: EdgeKind::Calls,
             file: file.to_string(),
             line: 1,
+            confidence: Confidence::Resolved,
         }
     }
 
@@ -879,6 +880,7 @@ mod tests {
             kind: EdgeKind::Includes,
             file: from.to_string(),
             line: 1,
+            confidence: Confidence::Resolved,
         }
     }
 
@@ -889,6 +891,7 @@ mod tests {
             kind: EdgeKind::Inherits,
             file: file.to_string(),
             line: 0,
+            confidence: Confidence::Resolved,
         }
     }
 

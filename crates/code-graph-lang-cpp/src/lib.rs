@@ -66,7 +66,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, RootConfig, Symbol, SymbolKind};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -443,6 +443,7 @@ impl CppParser {
                     kind: EdgeKind::Calls,
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -475,6 +476,7 @@ impl CppParser {
                     kind: EdgeKind::Includes,
                     file: path.to_owned(),
                     line: cap_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -516,6 +518,7 @@ impl CppParser {
                     kind: EdgeKind::Inherits,
                     file: path.to_owned(),
                     line: 0,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -608,6 +611,7 @@ impl CppParser {
                     kind: EdgeKind::Overrides,
                     file: path.to_owned(),
                     line: sym.line,
+                    confidence: Confidence::Resolved,
                 });
             }
         }

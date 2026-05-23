@@ -120,7 +120,7 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
 
@@ -602,6 +602,7 @@ impl CSharpParser {
                     kind: EdgeKind::Calls,
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -686,6 +687,7 @@ impl CSharpParser {
                     kind: EdgeKind::Includes,
                     file: path.to_owned(),
                     line: cap_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -791,6 +793,7 @@ impl CSharpParser {
                 kind: EdgeKind::Inherits,
                 file: path.to_owned(),
                 line: def.start_position().row as u32 + 1,
+                confidence: Confidence::Resolved,
             });
         }
     }

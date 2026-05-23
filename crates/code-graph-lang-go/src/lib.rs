@@ -67,7 +67,7 @@ pub(crate) mod queries;
 
 use std::path::Path;
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::find_enclosing_kind;
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
@@ -402,6 +402,7 @@ impl GoParser {
                     kind: EdgeKind::Calls,
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
+                    confidence: Confidence::Resolved,
                 });
             }
         }
@@ -483,6 +484,7 @@ impl GoParser {
                     kind: EdgeKind::Includes,
                     file: path.to_owned(),
                     line,
+                    confidence: Confidence::Resolved,
                 });
             }
         }

@@ -73,6 +73,49 @@ pub enum EdgeKind {
     Overrides,
 }
 
+/// How confident the indexer is that an edge points at the correct target.
+///
+/// All edges start life as [`Confidence::Resolved`] at construction. The
+/// resolve pass downgrades to [`Confidence::Heuristic`] when the resolver
+/// had to pick one of several same-name candidates via the scope-aware
+/// heuristic (same file > same parent > same namespace > global). Tools
+/// expose a `min_confidence` filter so agents can ask for
+/// resolved-only chains when they need to avoid noisy heuristic hits
+/// (e.g. when the same method name lives on several unrelated classes).
+///
+/// The two-variant design is deliberately minimal: the binary
+/// "definitive vs. picked" distinction is the only one the indexer can
+/// stake out without per-language type inference. Future variants
+/// (e.g. `Template`, `DynamicDispatch`) would require type-system work
+/// the resolver does not do today.
+///
+/// Default is [`Confidence::Resolved`] so:
+///   - Edges constructed by parsers (Inherits / Overrides / mod-resolved
+///     Includes) get the optimistic mark for free — those emission sites
+///     are declarative and don't go through the multi-candidate resolver.
+///   - Caches written before this field existed deserialize without
+///     errors via `#[serde(default)]`; in practice the CACHE_VERSION
+///     bump that lands alongside this field forces a silent re-index, so
+///     the serde default exists purely to keep ad-hoc test fixtures
+///     readable.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Confidence {
+    /// Unambiguous match: exactly one candidate symbol/file for the
+    /// edge's target, OR the edge is declarative (Inherits, Overrides,
+    /// mod-resolved Includes) and the parser had a known target at
+    /// emission time. The default.
+    #[default]
+    Resolved,
+    /// Multi-candidate match: the resolver had ≥ 2 same-name candidates
+    /// and picked one via the scope heuristic (same file > same parent >
+    /// same namespace > global). The chosen target may or may not be
+    /// the semantically correct one — agents that need precision
+    /// should filter heuristic edges out via `min_confidence`.
+    Heuristic,
+}
+
 /// A named code entity (function, class, etc.). The shape mirrors the Go
 /// `parser.Symbol` exactly (snake_case JSON field names, `namespace`/`parent`
 /// elided when empty) and adds the `language` tag.
@@ -92,7 +135,10 @@ pub struct Symbol {
     pub language: Language,
 }
 
-/// A relationship between symbols or files. Mirrors the Go `parser.Edge`.
+/// A relationship between symbols or files. Mirrors the Go `parser.Edge`
+/// and adds [`Confidence`] so the resolver can mark whether the `to`
+/// target was a single-candidate match or a multi-candidate heuristic
+/// pick.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
@@ -100,6 +146,15 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub file: String,
     pub line: u32,
+    /// Resolver-stamped confidence in the `to` target. Defaults to
+    /// [`Confidence::Resolved`]; the resolve pass overwrites with
+    /// [`Confidence::Heuristic`] for multi-candidate picks. Old caches
+    /// missing this field deserialize as `Resolved` via
+    /// `#[serde(default)]` (defensive — the cache version bump that
+    /// landed with this field also triggers a silent re-index, so the
+    /// default is rarely exercised in production).
+    #[serde(default)]
+    pub confidence: Confidence,
 }
 
 /// Result of parsing a single source file. Mirrors the Go `parser.FileGraph`
@@ -360,11 +415,63 @@ mod tests {
                 kind,
                 file: "src/a.cpp".to_string(),
                 line: 42,
+                confidence: Confidence::Resolved,
             };
             let v = serde_json::to_value(&e).unwrap();
             let back: Edge = serde_json::from_value(v).unwrap();
             assert_eq!(back, e);
         }
+    }
+
+    #[test]
+    fn edge_round_trip_every_confidence() {
+        for confidence in [Confidence::Resolved, Confidence::Heuristic] {
+            let e = Edge {
+                from: "src/a.cpp:foo".to_string(),
+                to: "src/b.cpp:bar".to_string(),
+                kind: EdgeKind::Calls,
+                file: "src/a.cpp".to_string(),
+                line: 42,
+                confidence,
+            };
+            let v = serde_json::to_value(&e).unwrap();
+            let back: Edge = serde_json::from_value(v).unwrap();
+            assert_eq!(back, e);
+        }
+    }
+
+    /// Edge deserialization on JSON missing the `confidence` field falls
+    /// back to [`Confidence::Resolved`] via `#[serde(default)]`. The
+    /// CACHE_VERSION bump shipped alongside the field means a pre-v6
+    /// cache fails the version check before this default ever fires
+    /// in production, but the serde default is defense-in-depth for
+    /// hand-written fixtures and ad-hoc JSON.
+    #[test]
+    fn edge_missing_confidence_defaults_to_resolved() {
+        let v = json!({
+            "from": "src/a.cpp:foo",
+            "to": "src/b.cpp:bar",
+            "kind": "calls",
+            "file": "src/a.cpp",
+            "line": 42,
+        });
+        let back: Edge = serde_json::from_value(v).unwrap();
+        assert_eq!(back.confidence, Confidence::Resolved);
+    }
+
+    /// Confidence variants serialize as their lowercase names — the
+    /// wire-format contract for `min_confidence` query params and
+    /// for any downstream agent that introspects edge records.
+    #[test]
+    fn confidence_serializes_as_lowercase_string() {
+        assert_eq!(
+            serde_json::to_value(Confidence::Resolved).unwrap(),
+            json!("resolved")
+        );
+        assert_eq!(
+            serde_json::to_value(Confidence::Heuristic).unwrap(),
+            json!("heuristic")
+        );
     }
 
     #[test]
@@ -398,6 +505,7 @@ mod tests {
             kind: EdgeKind::Calls,
             file: "src/main.cpp".to_string(),
             line: 7,
+            confidence: Confidence::Resolved,
         };
         let fg = FileGraph {
             path: "src/main.cpp".to_string(),

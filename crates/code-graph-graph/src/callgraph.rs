@@ -221,7 +221,7 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::test_fixtures::{call_edge, inherit_edge, make_fg, sym};
-    use code_graph_core::{Edge, Language};
+    use code_graph_core::{Confidence, Edge, Language};
 
     /// Linear chain `a -> b -> c -> d` all in `/x.cpp`.
     fn linear_chain() -> Graph {
@@ -732,6 +732,7 @@ mod tests {
             kind: EdgeKind::Includes,
             file: "/a.cpp".to_string(),
             line,
+            confidence: Confidence::Resolved,
         };
         g.merge_file_graph(make_fg(
             "/a.cpp",

@@ -12,7 +12,7 @@
 //! `pub(crate)` so they remain invisible to downstream crates and to the
 //! release build.
 
-use code_graph_core::{Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
 /// Build a [`Symbol`] with sensible defaults for fields the test does not
 /// care about (line/column = 1/0, empty namespace/parent, language = Cpp).
@@ -57,6 +57,7 @@ pub(crate) fn call_edge(from: &str, to: &str, file: &str, line: u32) -> Edge {
         kind: EdgeKind::Calls,
         file: file.to_string(),
         line,
+        confidence: Confidence::Resolved,
     }
 }
 
@@ -70,6 +71,7 @@ pub(crate) fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
         kind: EdgeKind::Inherits,
         file: file.to_string(),
         line: 0,
+        confidence: Confidence::Resolved,
     }
 }
 
@@ -83,6 +85,7 @@ pub(crate) fn include_edge(from: &str, to: &str, file: &str) -> Edge {
         kind: EdgeKind::Includes,
         file: file.to_string(),
         line: 0,
+        confidence: Confidence::Resolved,
     }
 }
 
