@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 code-graph-core = { path = "../code-graph-core" }
 code-graph-lang = { path = "../code-graph-lang" }
+code-graph-path-trie = { path = "../code-graph-path-trie" }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 streaming-iterator = { workspace = true }

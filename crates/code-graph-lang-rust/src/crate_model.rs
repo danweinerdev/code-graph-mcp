@@ -176,11 +176,17 @@ impl CrateModuleModel {
             }
         }
 
-        // Pass 2: parse every manifest, build the crate table.
+        // Pass 2: parse every manifest, build the crate table — a
+        // `PathTrie<CrateInfo>` keyed by each crate's `src/` directory
+        // so the per-file owning-crate lookup in pass 3 is a single
+        // `longest_prefix` walk (O(file_depth)) instead of the prior
+        // sorted-Vec linear scan (O(num_crates) per file). On
+        // UE/LLVM-scale workspaces with hundreds of crates this turns
+        // a quadratic build pass into a roughly-linear one.
         let crates = build_crates(&manifest_paths, &read_manifest);
 
-        // Pass 3: for each .rs file, find its owning crate (longest
-        // matching crate root prefix) and derive the module path.
+        // Pass 3: for each .rs file, find its owning crate and derive
+        // the module path.
         let mut paths: HashMap<PathBuf, String> = HashMap::new();
         for rs in &rs_files {
             if let Some(module_path) = derive_module_path(rs, &crates) {
@@ -243,21 +249,28 @@ impl CrateModuleModel {
     }
 }
 
-/// Parse every manifest path and return the crate table, ordered so that
-/// deeper crate roots come first. The longest-prefix lookup in
-/// [`derive_module_path`] iterates this slice and picks the first crate
-/// whose `src/` directory is an ancestor of the file.
+/// Parse every manifest path and return the crate table as a
+/// [`PathTrie`] keyed by the crate's `src/` directory. The per-file
+/// lookup in [`derive_module_path`] uses
+/// [`PathTrie::longest_prefix`](code_graph_path_trie::PathTrie::longest_prefix)
+/// to find the deepest-matching ancestor `src/` in `O(file_depth)`,
+/// replacing the prior sorted-`Vec` + linear-scan approach
+/// (`O(num_crates)` per file).
 ///
-/// Ordering rationale: in a workspace with nested members
-/// (`workspace/Cargo.toml` plus `workspace/crates/a/Cargo.toml`), a file
-/// `workspace/crates/a/src/foo.rs` must resolve against the inner
-/// member, not the workspace. Sorting by descending `src` depth makes
-/// the first ancestor-match the right one.
+/// `longest_prefix` correctly handles nested-workspace members
+/// (`workspace/Cargo.toml` plus `workspace/crates/a/Cargo.toml`):
+/// a file at `workspace/crates/a/src/foo.rs` matches the longer
+/// `workspace/crates/a/src` prefix over the shorter
+/// `workspace/src` (if one existed), so the inner member wins by
+/// trie structure alone — no separate depth sort needed.
+///
+/// [`PathTrie`]: code_graph_path_trie::PathTrie
 fn build_crates(
     manifest_paths: &[PathBuf],
     read_manifest: &impl Fn(&Path) -> Option<String>,
-) -> Vec<CrateInfo> {
-    let mut crates: Vec<CrateInfo> = Vec::new();
+) -> code_graph_path_trie::PathTrie<CrateInfo> {
+    let mut crates: code_graph_path_trie::PathTrie<CrateInfo> =
+        code_graph_path_trie::PathTrie::new();
 
     for manifest in manifest_paths {
         let Some(content) = read_manifest(manifest) else {
@@ -304,37 +317,19 @@ fn build_crates(
         // `Cargo.toml` but `_` in Rust identifiers and module paths.
         let name = raw_name.replace('-', "_");
         let src = root.join("src");
-        crates.push(CrateInfo {
+        let info = CrateInfo {
             root: root.to_path_buf(),
-            src,
+            src: src.clone(),
             name,
-        });
-    }
-
-    // Sort by descending depth of `src` so the longest matching ancestor
-    // is found first by `derive_module_path`. Tiebreak by lexicographic
-    // path so the order is deterministic across runs.
-    crates.sort_by(|a, b| {
-        let depth_a = a.src.components().count();
-        let depth_b = b.src.components().count();
-        depth_b.cmp(&depth_a).then_with(|| a.src.cmp(&b.src))
-    });
-
-    // Construction invariant: `src` is always built as `root.join("src")`
-    // (see the `CrateInfo` push above), so `src` must be a descendant of
-    // `root` for every crate we emit. This `debug_assert` pins that
-    // invariant — if a future refactor changes how `src` is derived
-    // (e.g. honoring a custom `[lib].path` or non-canonical layouts),
-    // debug builds and tests will trip here rather than silently
-    // producing crates whose `src` is unrelated to their `root`. This is
-    // the *only* reader of `CrateInfo.root`; release-build clippy still
-    // sees the field as unread, hence the narrow `#[allow(dead_code, …)]`
-    // on the field itself (this is the only release-build reader of
-    // `CrateInfo.root`, so no module-wide `dead_code` suppression is
-    // required).
-    #[cfg(debug_assertions)]
-    for c in &crates {
-        debug_assert!(c.src.starts_with(&c.root));
+        };
+        // Construction invariant: `src` is always `root.join("src")`,
+        // so `src` is necessarily a descendant of `root`. Pinned here
+        // as a debug-only check — if a future refactor changes how
+        // `src` is derived (e.g. honoring `[lib].path` or non-canonical
+        // layouts), debug builds + tests trip here rather than silently
+        // emitting crates whose `src` and `root` disagree.
+        debug_assert!(info.src.starts_with(&info.root));
+        crates.insert(src, info);
     }
 
     crates
@@ -343,18 +338,23 @@ fn build_crates(
 /// For one `.rs` file, find its owning crate and derive the canonical
 /// module path. Returns `None` if no crate's `src/` is an ancestor of
 /// the file.
-fn derive_module_path(file: &Path, crates: &[CrateInfo]) -> Option<String> {
-    // Crates are pre-sorted by descending `src` depth; the first
-    // ancestor match is the deepest-nesting crate, which is the right
-    // owner for files inside workspaces with nested members.
-    let owner = crates.iter().find(|c| file.starts_with(&c.src))?;
+fn derive_module_path(
+    file: &Path,
+    crates: &code_graph_path_trie::PathTrie<CrateInfo>,
+) -> Option<String> {
+    // `longest_prefix` returns the deepest `src/` directory in the
+    // trie that's an ancestor of `file`. In a nested workspace this
+    // is the innermost owning crate. O(file_depth), independent of
+    // num_crates.
+    let (src_prefix, owner) = crates.longest_prefix(file)?;
 
     // Path of the file relative to the crate's `src/` directory. This
     // is what the module-path rules operate on. `strip_prefix` cannot
-    // fail because `starts_with` succeeded above, but we handle the
-    // `Err` defensively rather than `expect`-ing — defensive against
-    // future refactors that change one side without the other.
-    let rel = file.strip_prefix(&owner.src).ok()?;
+    // fail because `longest_prefix` only matches genuine ancestors,
+    // but we handle the `Err` defensively rather than `expect`-ing —
+    // defensive against future refactors that change one side without
+    // the other.
+    let rel = file.strip_prefix(&src_prefix).ok()?;
 
     // Decompose the relative path into its OS-agnostic components. Each
     // component is a directory or the final filename. We work in
