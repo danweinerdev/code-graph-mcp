@@ -484,9 +484,11 @@ This is a Rust workspace with `unsafe_code = "forbid"` enforced workspace-wide. 
 
 1. Land `code-graph-path-trie` v0.1 (already stubbed in this worktree).
 2. Add `lasso` to workspace deps.
-3. Implement `PathInterner` + `StringInterner` integration in a new `code-graph-graph::interned` module. **Cache format still JSON in this phase** — emit a v6 JSON cache whose schema is the columnar layout but encoded as JSON. Sanity check the schema shape independently of the binary serializer choice.
+3. Implement `PathInterner` + `StringInterner` integration in a new `code-graph-graph::persist::packed` module. **Cache format still JSON in this phase** — emit a v6 JSON cache.
 4. Bump `CACHE_VERSION` to 6. Existing v5 caches silently re-index per the contract.
 5. Ship and dogfood — observe disk-size improvement (should already be ~3-5× from interning alone).
+
+**Scope deviation from the Schema section above.** The Schema section spec'd full columnar CSR + `PackedSymbol` table + `SymbolKey` packing for v6. Phase B as actually implemented ships the **interning-only variant**: keep `HashMap`-shaped adj/radj/files/includes (keyed by interned `u32` NameId or PathId instead of `String`/`PathBuf`), but skip the columnar restructuring. Rationale: at the JSON wire format the CSR layout adds substantial implementation complexity (synthetic PackedSymbol entries for bare-token unresolved targets, src_offsets construction, dst-column resolution) without proportionate space savings — interning alone is what does the heavy lifting in the design's own "~3-5× from interning alone" estimate. The full columnar layout is structurally cleaner alongside rkyv's native vector layout in Phase C, so it moves there. This means Phase C is now "columnar + binary format" rather than just "binary format." No downstream impact: the JSON-wire v6 cache is a private intermediate; nothing external pins on the on-disk schema beyond `CACHE_VERSION`.
 
 ### Phase C (binary format) — Estimated 2-3 days
 

@@ -12,7 +12,9 @@ workspace = true
 
 [dependencies]
 code-graph-core = { path = "../code-graph-core" }
+code-graph-path-trie = { path = "../code-graph-path-trie" }
 indexmap = { workspace = true }
+lasso = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
