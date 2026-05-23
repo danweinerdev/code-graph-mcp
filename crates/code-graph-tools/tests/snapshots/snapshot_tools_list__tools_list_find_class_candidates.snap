@@ -1,0 +1,22 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"find_class_candidates\")"
+---
+{
+  "name": "find_class_candidates",
+  "description": "Disambiguation tool: list every class-like symbol (Class / Struct / Interface / Trait) whose short name exactly matches `name`. Returns a JSON array of `SymbolResult` records sorted by (file, line). Used to answer the question raised by `get_class_hierarchy`'s ambiguity error: 'this name has N candidates, here are their fully-qualified symbol_ids — pick one and use get_symbol_detail / get_callers on it instead of the bare name.' Empty result is `[]`, not an error: zero candidates is meaningful (the name doesn't exist as a class-like symbol) and lets clients building UI on top treat it as 'nothing to disambiguate' without special-casing.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "name": {
+        "description": "Short class name to look up (exact match, case-sensitive). E.g. 'UObject' or 'Base'. Returns every class-like symbol with this name across the indexed graph.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "title": "FindClassCandidatesArgs",
+    "type": "object"
+  }
+}

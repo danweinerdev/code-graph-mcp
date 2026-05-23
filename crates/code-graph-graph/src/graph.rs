@@ -440,6 +440,39 @@ impl Graph {
         self.nodes.values().map(|n| &n.symbol)
     }
 
+    /// Return every class-like symbol whose `name` exactly equals
+    /// `name`. "Class-like" means
+    /// `Class | Struct | Interface | Trait` — the same set
+    /// `Graph::class_hierarchy` treats as a hierarchy entry-point.
+    ///
+    /// Used by `get_class_hierarchy`'s ambiguity gate: when more
+    /// than one class-like symbol shares a bare name (e.g. UE's
+    /// `UObject` and ICU's `UObject`), the hierarchy walker would
+    /// silently merge them under a single bare-key node — surfacing
+    /// the ambiguity as an explicit error with the candidate list
+    /// (drawn from this function) lets the agent disambiguate by
+    /// fully-qualified symbol_id instead.
+    ///
+    /// Match is case-sensitive (matches the existing
+    /// `class_hierarchy` behaviour). Order is HashMap-defined;
+    /// callers should sort if they need stable output.
+    pub fn find_classes_named<'a>(&'a self, name: &str) -> Vec<&'a Symbol> {
+        self.nodes
+            .values()
+            .filter(|node| {
+                node.symbol.name == name
+                    && matches!(
+                        node.symbol.kind,
+                        code_graph_core::SymbolKind::Class
+                            | code_graph_core::SymbolKind::Struct
+                            | code_graph_core::SymbolKind::Interface
+                            | code_graph_core::SymbolKind::Trait
+                    )
+            })
+            .map(|n| &n.symbol)
+            .collect()
+    }
+
     /// Set the sweep timestamp. The handler calls this immediately
     /// after running `sweep_missing_out_of_scope` so the value
     /// persists to the cache via the next [`Graph::save`].

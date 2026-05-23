@@ -310,6 +310,35 @@ pub fn get_class_hierarchy(
     let resolved_max_nodes = max_nodes.filter(|&n| n != 0).unwrap_or(250).min(1000);
 
     let g = graph.read();
+
+    // Ambiguity gate: when multiple class-like symbols share this
+    // bare name (e.g. UE's `UObject` and ICU's `UObject` both
+    // indexed), the hierarchy walker would silently merge them
+    // under one node — every class deriving from EITHER ends up in
+    // the same flat list. Surface the ambiguity explicitly so the
+    // agent disambiguates via fully-qualified symbol_id instead of
+    // unknowingly consuming polluted results.
+    let candidates = g.find_classes_named(class);
+    if candidates.len() > 1 {
+        let mut listed: Vec<String> = candidates
+            .iter()
+            .map(|s| code_graph_core::symbol_id(s))
+            .collect();
+        listed.sort();
+        let bullet_list = listed
+            .iter()
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(g);
+        return tool_error(format!(
+            "ambiguous class name {class:?} ({n} candidates):\n{bullet_list}\nUse \
+             find_class_candidates to discover candidates or pass the fully-qualified \
+             symbol_id to get_symbol_detail.",
+            n = listed.len()
+        ));
+    }
+
     if let Some((hierarchy, total_nodes_seen, truncated)) =
         g.class_hierarchy(class, depth, resolved_max_nodes)
     {
@@ -332,6 +361,35 @@ pub fn get_class_hierarchy(
             "class not found: {class:?}. Did you mean: {suggestions}?"
         ))
     }
+}
+
+/// `find_class_candidates` body. Returns every class-like symbol
+/// whose `name` exactly equals the requested `name`, as a JSON array
+/// of `SymbolResult`s. Used to disambiguate when
+/// `get_class_hierarchy` reports the name as ambiguous, or as a
+/// general discovery tool for "how many classes share this
+/// short name?"
+///
+/// Sorted by `(file, line)` ascending for deterministic output.
+/// Empty result for unknown names is returned as `[]` (NOT an
+/// error) so clients building UI on top can treat zero hits as
+/// "nothing to disambiguate" rather than special-casing an error.
+pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResult {
+    if name.is_empty() {
+        return tool_error("'name' is required");
+    }
+    let g = graph.read();
+    let mut candidates: Vec<_> = g.find_classes_named(name).into_iter().cloned().collect();
+    candidates.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    drop(g);
+    // Map to the standard SymbolResult shape (brief=false to include
+    // signature/column/end_line — discovery is the use case here, and
+    // full fidelity helps the agent decide which candidate it wants).
+    let results: Vec<_> = candidates
+        .iter()
+        .map(|s| super::symbol_to_result(s, false))
+        .collect();
+    tool_success_json(&results)
 }
 
 /// Did-you-mean helper for class-like lookups. Filters the candidate pool
@@ -1572,6 +1630,122 @@ mod tests {
         let r = get_class_hierarchy(&g, "", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'class' is required");
+    }
+
+    /// When two class-like symbols share a bare name (e.g. UE's
+    /// `UObject` and ICU's `UObject` both indexed), `get_class_hierarchy`
+    /// must refuse to walk and instead error listing the candidates'
+    /// fully-qualified symbol_ids. Otherwise the hierarchy walker
+    /// silently merges them under one bare-key node and the response
+    /// pools derived classes from BOTH unrelated trees.
+    #[test]
+    fn class_hierarchy_ambiguous_name_errors_listing_candidates() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/lib_a/object.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("SharedName", SymbolKind::Class, "/lib_a/object.h")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/lib_b/object.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("SharedName", SymbolKind::Class, "/lib_b/object.h")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = get_class_hierarchy(&g, "SharedName", Some(1), None);
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(body.contains("ambiguous"), "must say 'ambiguous': {body}");
+        assert!(body.contains("/lib_a/object.h:SharedName"));
+        assert!(body.contains("/lib_b/object.h:SharedName"));
+        assert!(body.contains("find_class_candidates"));
+    }
+
+    /// Single-class name (no ambiguity) must NOT trigger the
+    /// ambiguity error — proceeds to walk the hierarchy as before.
+    /// Anti-regression for the gate.
+    #[test]
+    fn class_hierarchy_single_class_unambiguous_walks_as_before() {
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "Base", Some(1), None);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+    }
+
+    /// `find_class_candidates` returns each class-like symbol with
+    /// the requested name, sorted by (file, line). The handler-level
+    /// behaviour pinned here mirrors the storage-layer
+    /// `Graph::find_classes_named`.
+    #[test]
+    fn find_class_candidates_returns_each_match_sorted() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/b.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Foo", SymbolKind::Class, "/b.h")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/a.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Foo", SymbolKind::Struct, "/a.h")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = find_class_candidates(&g, "Foo");
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Sorted by file ascending: /a.h before /b.h.
+        assert_eq!(arr[0]["id"].as_str().unwrap(), "/a.h:Foo");
+        assert_eq!(arr[1]["id"].as_str().unwrap(), "/b.h:Foo");
+        // Both class-like kinds (Struct, Class) surface.
+        assert_eq!(arr[0]["kind"].as_str().unwrap(), "struct");
+        assert_eq!(arr[1]["kind"].as_str().unwrap(), "class");
+    }
+
+    /// Empty name argument is rejected. Empty result for a known-no-match
+    /// name returns `[]`, not an error (preserving the
+    /// "nothing to disambiguate" semantics for UI consumers).
+    #[test]
+    fn find_class_candidates_empty_name_errors_unknown_name_returns_empty_array() {
+        let g = locked(class_graph());
+        let r = find_class_candidates(&g, "");
+        assert_eq!(r.is_error, Some(true));
+
+        let r = find_class_candidates(&g, "NoSuchClass");
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        assert_eq!(body_text(&r), "[]");
+    }
+
+    /// `find_class_candidates` matches only class-LIKE kinds —
+    /// Functions sharing the name are ignored even when the bare
+    /// name matches. The Function lives in a different file so its
+    /// distinct symbol_id survives the merge (otherwise the second
+    /// merge would shadow the Class on the same `/path:Widget` ID).
+    #[test]
+    fn find_class_candidates_filters_to_class_like_kinds() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Widget", SymbolKind::Class, "/a.cpp")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Widget", SymbolKind::Function, "/b.cpp")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = find_class_candidates(&g, "Widget");
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "function must not surface as class candidate");
+        assert_eq!(arr[0]["kind"].as_str().unwrap(), "class");
     }
 
     #[test]

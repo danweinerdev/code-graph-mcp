@@ -127,6 +127,13 @@ fn tools_list_find_overrides() {
     insta::assert_json_snapshot!(tool_entry("find_overrides"));
 }
 
+// --- Class-name disambiguation --------------------------------------------
+
+#[test]
+fn tools_list_find_class_candidates() {
+    insta::assert_json_snapshot!(tool_entry("find_class_candidates"));
+}
+
 // --- Load-bearing description-substring regressions ------------------------
 //
 // The tool description strings are production behavior — agents pattern-match

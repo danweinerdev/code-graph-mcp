@@ -359,6 +359,16 @@ pub struct GetCalleesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindClassCandidatesArgs {
+    #[schemars(
+        description = "Short class name to look up (exact match, case-sensitive). E.g. \
+                       'UObject' or 'Base'. Returns every class-like symbol with this \
+                       name across the indexed graph."
+    )]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindOverridesArgs {
     #[schemars(
         description = "Symbol ID of the virtual or pure-virtual method to find overrides of \
@@ -1065,6 +1075,31 @@ impl CodeGraphServer {
     }
 
     #[tool(
+        description = "Disambiguation tool: list every class-like symbol (Class / Struct / \
+                       Interface / Trait) whose short name exactly matches `name`. Returns a \
+                       JSON array of `SymbolResult` records sorted by (file, line). Used to \
+                       answer the question raised by `get_class_hierarchy`'s ambiguity \
+                       error: 'this name has N candidates, here are their fully-qualified \
+                       symbol_ids — pick one and use get_symbol_detail / get_callers on it \
+                       instead of the bare name.' Empty result is `[]`, not an error: zero \
+                       candidates is meaningful (the name doesn't exist as a class-like \
+                       symbol) and lets clients building UI on top treat it as 'nothing to \
+                       disambiguate' without special-casing."
+    )]
+    async fn find_class_candidates(
+        &self,
+        Parameters(args): Parameters<FindClassCandidatesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::structure::find_class_candidates(
+            &self.inner.graph,
+            &args.name,
+        ))
+    }
+
+    #[tool(
         description = "Cross-file coupling counts for a file: how many call+include \
                        edges connect it to each other indexed source file. `direction` \
                        selects the response SHAPE: `\"outgoing\"` (DEFAULT — edges \
@@ -1266,16 +1301,16 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// `tools/list` must surface exactly 17 tools. If a future change adds
+    /// `tools/list` must surface exactly 18 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_seventeen_tools() {
+    fn tool_router_registers_eighteen_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            17,
-            "expected 17 registered tools, got {}",
+            18,
+            "expected 18 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -1310,6 +1345,7 @@ mod tests {
             "watch_stop",
             "get_status",
             "find_overrides",
+            "find_class_candidates",
         ] {
             assert!(
                 names.contains(expected),
