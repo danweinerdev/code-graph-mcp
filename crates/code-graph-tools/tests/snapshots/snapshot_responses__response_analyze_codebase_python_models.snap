@@ -1,11 +1,13 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
-assertion_line: 1715
 expression: parsed
 ---
 {
   "edges": 1,
   "files": 1,
   "root_path": "[testdata]",
-  "symbols": 5
+  "symbols": 5,
+  "warnings": [
+    "no .code-graph.toml found between [testdata] and filesystem root; using built-in defaults. C++ classes prefixed with API-export macros (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml with [cpp].macro_strip at your project root to enable engine-style support."
+  ]
 }

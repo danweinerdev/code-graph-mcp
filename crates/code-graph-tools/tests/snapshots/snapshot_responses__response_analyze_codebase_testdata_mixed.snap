@@ -6,5 +6,8 @@ expression: parsed
   "edges": 0,
   "files": 4,
   "root_path": "[testdata]",
-  "symbols": 4
+  "symbols": 4,
+  "warnings": [
+    "no .code-graph.toml found between [testdata] and filesystem root; using built-in defaults. C++ classes prefixed with API-export macros (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml with [cpp].macro_strip at your project root to enable engine-style support."
+  ]
 }

@@ -25,7 +25,10 @@ use rmcp::service::RoleServer;
 use rmcp::Peer;
 use serde::Serialize;
 
-use crate::indexer::{index_directory, resolve_all_edges, ChannelProgressSink, ProgressEvent};
+use crate::indexer::{
+    build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
+    resolve_edges_with_indexes, ChannelProgressSink, ProgressEvent,
+};
 use crate::server::ServerInner;
 
 use super::{tool_error, tool_success_json};
@@ -74,12 +77,16 @@ pub async fn analyze_codebase(
         return tool_error(format!("path is not a directory: {}", abs_path.display()));
     }
 
-    let mut cfg = match RootConfig::load(&abs_path) {
-        // The discovered project-root path is unused in this commit —
-        // subsequent commits wire it through to the cache + scope
-        // semantics. Prefixing with `_` keeps clippy quiet without
-        // adding throwaway bookkeeping.
-        Ok((c, _project_root)) => c,
+    // `RootConfig::load` walks from `abs_path` upward looking for the
+    // nearest `.code-graph.toml`. The returned `project_root` is the
+    // directory containing the discovered toml, or `abs_path` itself
+    // when no toml was found at any ancestor. Cache lookup,
+    // indexing-scope warnings, and the AnalyzeResult key off this
+    // `project_root`; the indexing SCOPE itself remains `abs_path`
+    // (the user's invocation path), so a deep-subtree analyze does not
+    // expand to cover the full project.
+    let (mut cfg, project_root) = match RootConfig::load(&abs_path) {
+        Ok((c, root)) => (c, root),
         Err(ConfigError::Toml(e)) => {
             return tool_error(format!("failed to parse .code-graph.toml: {e}"));
         }
@@ -96,34 +103,114 @@ pub async fn analyze_codebase(
     };
     let mut warnings = cfg.resolve_concurrency();
 
-    // Cache fast-path: when not forced, attempt cache load + stale check.
+    // Surface discovery state to the user via warnings. Three cases:
+    // - Config discovered at a parent (invocation_path is inside the
+    //   project) → informational; the user should know which toml
+    //   applied and that the project lives upstream of their cwd.
+    // - No toml found anywhere up to filesystem root → the
+    //   project-root falls back to the invocation path, and the user
+    //   loses macro_strip / extensions / etc. defaults. Loudly call
+    //   out the likely consequence (UE-style `class CORE_API Foo` not
+    //   indexed) so the user can act.
+    // - Toml at the invocation path itself → silent (the common case).
+    if project_root != abs_path {
+        // Discovery succeeded but at an ancestor. Distinguish by checking
+        // whether the toml file exists at project_root (it does — that's
+        // how we found it).
+        let toml_at_root = project_root.join(".code-graph.toml");
+        if toml_at_root.exists() {
+            warnings.push(format!(
+                "using .code-graph.toml found at {} (parent of indexed root {}); \
+                 cache lives at the project root, indexing scope stays at the invocation path",
+                project_root.display(),
+                abs_path.display()
+            ));
+        } else {
+            // project_root walked all the way to filesystem root without
+            // finding a toml. `RootConfig::load` returns
+            // `start.to_path_buf()` in this case, so `project_root ==
+            // abs_path` and we shouldn't hit this branch — but guard
+            // explicitly so a future change to the fallback semantics
+            // doesn't silently produce confusing warnings.
+            warnings.push(format!(
+                "no .code-graph.toml found between {} and filesystem root; \
+                 using built-in defaults. C++ classes prefixed with API-export macros \
+                 (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml \
+                 with [cpp].macro_strip at your project root to enable engine-style support.",
+                abs_path.display()
+            ));
+        }
+    } else {
+        // No upward walk happened OR walk found toml right at abs_path.
+        // Distinguish by checking if a toml file actually exists at the
+        // location — absence means "no config anywhere" (the warn-loudly
+        // case), presence means "toml right at invocation root" (silent).
+        let toml_at_invocation = abs_path.join(".code-graph.toml");
+        if !toml_at_invocation.exists() {
+            warnings.push(format!(
+                "no .code-graph.toml found between {} and filesystem root; \
+                 using built-in defaults. C++ classes prefixed with API-export macros \
+                 (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml \
+                 with [cpp].macro_strip at your project root to enable engine-style support.",
+                abs_path.display()
+            ));
+        }
+    }
+
+    // Orphan-cache detection: a pre-fix cache sitting at the invocation
+    // path (where the old behaviour wrote it) is now orphaned by the
+    // move to project-root co-location. Warn so the user can reclaim
+    // disk. Only fires when invocation_path differs from project_root —
+    // otherwise the two are the same location and there's no orphan.
+    if abs_path != project_root {
+        let invocation_cache = code_graph_graph::cache_path(&abs_path);
+        if invocation_cache.exists() {
+            warnings.push(format!(
+                "orphan cache detected at {} — the indexer now caches at the project root ({}). \
+                 The orphan is not used and can be deleted to reclaim disk.",
+                invocation_cache.display(),
+                project_root.display()
+            ));
+        }
+    }
+
+    // Cache fast-path: when not forced, attempt cache load + scoped
+    // stale check at the project root. We only short-circuit if every
+    // in-scope file is fresh; out-of-scope files might be stale but
+    // that's the lazy/scoped contract — the sweep handles them.
     if !force {
         let mut probe = Graph::new();
-        let load_ok = probe.load(&abs_path).unwrap_or(false);
+        let load_ok = probe.load(&project_root).unwrap_or(false);
         if load_ok {
-            // `stale_paths` fails loud only on JSON corruption — a
-            // structurally-valid cache will succeed.
-            let stale = stale_paths(&abs_path).unwrap_or_default();
-            if stale.is_empty() {
+            // `stale_paths` reads all cached mtimes; filter to the
+            // invocation scope to honour lazy/scoped semantics.
+            let all_stale = stale_paths(&project_root).unwrap_or_default();
+            let in_scope_stale: Vec<_> = all_stale
+                .iter()
+                .filter(|p| p.starts_with(&abs_path))
+                .collect();
+            if in_scope_stale.is_empty() {
                 let stats = probe.stats();
                 {
                     let mut g = inner.graph.write();
                     *g = probe;
                 }
-                *inner.root_path.write() = Some(abs_path.clone());
+                *inner.root_path.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
                 let result = AnalyzeResult {
                     files: stats.files,
                     symbols: stats.nodes,
                     edges: stats.edges,
-                    root_path: abs_path.to_string_lossy().into_owned(),
+                    root_path: project_root.to_string_lossy().into_owned(),
                     warnings,
                 };
                 return tool_success_json(&result);
             }
-            // Stale paths present: drop the partially-loaded cache, fall
-            // through to a full re-index.
+            // In-scope stale files present: fall through to scoped
+            // re-index. The probe we just loaded is the starting state;
+            // we'll re-use it during the merge phase below rather than
+            // re-loading from disk.
         }
     }
 
@@ -213,17 +300,127 @@ pub async fn analyze_codebase(
     let registry = Arc::clone(&inner);
     let cfg_for_pool = cfg.clone();
     let abs_path_for_pool = abs_path.clone();
+    let project_root_for_pool = project_root.clone();
+    let scope_is_project_root = abs_path == project_root;
     let blocking_handle = tokio::task::spawn_blocking(move || {
         let sink = ChannelProgressSink(tx);
-        let (mut graphs, blocking_warnings) =
-            match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
-                Ok(v) => v,
-                Err(e) => return Err(e.to_string()),
-            };
-        resolve_all_edges(&mut graphs, &registry.registry, &sink);
+        let mut blocking_warnings: Vec<String> = Vec::new();
+
+        // Phase A: load any existing project-root cache as the starting
+        // state. The merge model treats the cache as a project-wide
+        // accumulator: prior scoped invocations contributed entries
+        // that survive this invocation unless we explicitly evict them.
+        let mut merged_graph = Graph::new();
+        let cache_loaded = merged_graph
+            .load(&project_root_for_pool)
+            .unwrap_or(false);
+
+        // Phase B: apply scope policy. Three cases:
+        //  - force=true at project root → full clobber (today's
+        //    behavior — clear everything and rebuild).
+        //  - force=true at a subdir → drop in-scope entries only; the
+        //    rest of the project cache survives.
+        //  - !force → evict in-scope files that no longer exist on
+        //    disk so the upcoming merge starts from a known state for
+        //    the scope being re-parsed.
+        if force {
+            if scope_is_project_root {
+                merged_graph.clear();
+            } else if cache_loaded {
+                let dropped = merged_graph.drop_files_in_scope(&abs_path_for_pool);
+                if !dropped.is_empty() {
+                    blocking_warnings.push(format!(
+                        "force=true dropped {} cached file(s) under {} before re-index",
+                        dropped.len(),
+                        abs_path_for_pool.display()
+                    ));
+                }
+            }
+        } else if cache_loaded {
+            let evicted = merged_graph.evict_missing_in_scope(&abs_path_for_pool);
+            if !evicted.is_empty() {
+                blocking_warnings.push(format!(
+                    "evicted {} cached file(s) under {} (no longer present on disk)",
+                    evicted.len(),
+                    abs_path_for_pool.display()
+                ));
+            }
+        }
+
+        // Phase C: discover + parse files in scope. `index_directory`
+        // walks `abs_path_for_pool` (the invocation path), not the
+        // project root — scope follows the user's invocation, even
+        // though the cache lives at the project root.
+        let (mut fresh_graphs, parse_warnings) = match index_directory(
+            &abs_path_for_pool,
+            &registry.registry,
+            &cfg_for_pool,
+            &sink,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(e.to_string()),
+        };
+        blocking_warnings.extend(parse_warnings);
+
+        // Phase D: build cross-scope indexes. Fresh edges resolve
+        // against the union of cached symbols/files (from prior
+        // scoped invocations) and freshly-parsed symbols/files (from
+        // this invocation). Documented asymmetry: cached EDGES are
+        // not re-resolved here, so old "unresolved" edges from prior
+        // invocations stay unresolved even when their would-be target
+        // is now in the cache. The user can `force=true` at the
+        // originating subtree to re-resolve.
+        let cached_snapshot = merged_graph.file_graphs_snapshot();
+        let mut symbol_index = build_symbol_index(&cached_snapshot);
+        extend_symbol_index(&mut symbol_index, &fresh_graphs);
+        let mut file_index = build_file_index(&cached_snapshot);
+        extend_file_index(&mut file_index, &fresh_graphs);
+
+        // Phase E: resolve fresh edges against the combined indexes.
+        resolve_edges_with_indexes(
+            &mut fresh_graphs,
+            &symbol_index,
+            &file_index,
+            &registry.registry,
+            &sink,
+        );
+
+        // Phase F: merge fresh FileGraphs into the project graph.
+        // `merge_file_graph` is idempotent per-path: if a file was
+        // already in the cache and we just re-parsed it (the
+        // incremental-stale or force-scoped case), the merge replaces
+        // its prior entries cleanly.
+        for fg in fresh_graphs {
+            merged_graph.merge_file_graph(fg);
+        }
+
+        // Phase G: opportunistic out-of-scope sweep. If at least
+        // SWEEP_INTERVAL_NANOS has elapsed since the last sweep, stat
+        // every cached file OUTSIDE the invocation scope and drop the
+        // ones missing on disk. Keeps the cache from accumulating
+        // ghost entries from subtrees this invocation didn't touch.
+        // Cost: O(files-out-of-scope) syscalls, but only on the sweep
+        // cadence (default 24h).
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let elapsed_since_sweep = now_nanos.saturating_sub(merged_graph.last_sweep_at());
+        if elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS {
+            let swept = merged_graph.sweep_missing_out_of_scope(&abs_path_for_pool);
+            if !swept.is_empty() {
+                blocking_warnings.push(format!(
+                    "out-of-scope sweep removed {} stale cache entry(ies) \
+                     (files deleted in subtrees not touched by this invocation)",
+                    swept.len()
+                ));
+            }
+            merged_graph.set_last_sweep_at(now_nanos);
+        }
+
         // Drop the sink (sender) so the forwarder task exits cleanly.
         drop(sink);
-        Ok::<_, String>((graphs, blocking_warnings))
+        Ok::<_, String>((merged_graph, blocking_warnings))
     });
 
     let blocking_result = blocking_handle.await;
@@ -235,7 +432,7 @@ pub async fn analyze_codebase(
         let _ = handle.await;
     }
 
-    let (graphs, blocking_warnings) = match blocking_result {
+    let (merged_graph, blocking_warnings) = match blocking_result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             return tool_error(format!("indexing failed: {e}"));
@@ -247,33 +444,54 @@ pub async fn analyze_codebase(
 
     warnings.extend(blocking_warnings);
 
-    if graphs.is_empty() {
+    if merged_graph.stats().files == 0 {
         return tool_error(format!(
             "no supported source files found in {}",
             abs_path.display()
         ));
     }
 
-    // Merge under the graph write lock — held only for the merge phase, not
-    // for parsing or resolution.
+    // Install the merged graph under the write lock. Held briefly:
+    // assignment-by-value moves the graph in; no further work happens
+    // under the lock.
     let stats = {
         let mut g = inner.graph.write();
-        g.clear();
-        for fg in graphs {
-            g.merge_file_graph(fg);
-        }
+        *g = merged_graph;
         g.stats()
     };
 
-    *inner.root_path.write() = Some(abs_path.clone());
+    *inner.root_path.write() = Some(project_root.clone());
     *inner.config.write() = cfg;
     inner.indexed.store(true, Ordering::Release);
 
+    // Surface a project-vs-scope size hint when the cache contains
+    // entries outside the invocation scope. Users running scoped
+    // analyses occasionally lose track of how much of the project is
+    // already cached vs. how much they just refreshed; one line in
+    // warnings keeps it visible without spamming queries.
+    if abs_path != project_root {
+        let in_scope_count = {
+            let g = inner.graph.read();
+            g.files_in_scope_count(&abs_path)
+        };
+        let out_of_scope_count = stats.files.saturating_sub(in_scope_count as u32);
+        if out_of_scope_count > 0 {
+            warnings.push(format!(
+                "project cache contains {} file(s) outside the current scope ({}); \
+                 they are preserved across this invocation. Run analyze_codebase at {} \
+                 to refresh them, or force=true at any subtree to invalidate it.",
+                out_of_scope_count,
+                abs_path.display(),
+                project_root.display()
+            ));
+        }
+    }
+
     // Persist to cache (best-effort: a save failure becomes a warning, not
-    // a fatal). We snapshot the graph *after* setting `indexed=true` so an
-    // immediate query against the now-indexed graph isn't blocked by the
-    // cache write.
-    if let Err(e) = save_cache(&inner.graph, &abs_path) {
+    // a fatal). The cache co-locates with the project root, NOT the
+    // invocation path. Subsequent scoped invocations under the same
+    // project hit the same cache file and accumulate into it.
+    if let Err(e) = save_cache(&inner.graph, &project_root) {
         warnings.push(format!("cache save failed: {e}"));
     }
 
@@ -281,7 +499,7 @@ pub async fn analyze_codebase(
         files: stats.files,
         symbols: stats.nodes,
         edges: stats.edges,
-        root_path: abs_path.to_string_lossy().into_owned(),
+        root_path: project_root.to_string_lossy().into_owned(),
         warnings,
     };
     tool_success_json(&result)
