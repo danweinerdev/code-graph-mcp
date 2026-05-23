@@ -243,6 +243,28 @@ pub(super) struct SearchSymbolsResponse {
     pub suggestions: Vec<String>,
 }
 
+/// Wire shape for `get_callers` / `get_callees` responses that need to
+/// surface accuracy-affecting limitations the agent should know
+/// about. Same `#[serde(flatten)]` + `skip_serializing_if = is_empty`
+/// pattern as [`SearchSymbolsResponse`]: when `warnings` is empty,
+/// the field is absent from the JSON and the wire shape is
+/// byte-identical to a bare `Page<code_graph_graph::CallChain>` —
+/// every existing client deserializer keeps working unchanged.
+///
+/// Currently populated when the target symbol carries `virtual` in
+/// its signature: static-dispatch callers are correctly enumerated
+/// in `results`, but dynamic-dispatch callers (call sites that
+/// invoke through a base-class pointer/reference) are NOT tracked
+/// by the current resolver. The warning makes that point-of-use
+/// limitation visible without forcing the agent to read docs.
+#[derive(Debug, Serialize)]
+pub(super) struct CallChainResponse {
+    #[serde(flatten)]
+    pub page: Page<code_graph_graph::CallChain>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Convert a [`Symbol`] to a [`SymbolResult`]. In `brief` mode, `column`,
 /// `end_line`, and `signature` are reset to defaults so they drop out of
 /// the JSON output via `skip_serializing_if`. Mirrors Go's `symbolToResult`.

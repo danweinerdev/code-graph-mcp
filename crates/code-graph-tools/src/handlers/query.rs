@@ -136,6 +136,41 @@ pub fn callers_or_callees(
         Direction::Callees => g.callees(symbol, depth),
     };
 
+    // Accuracy-warning probe: when the target symbol carries `virtual`
+    // in its signature, we know the resolver doesn't track
+    // dynamic-dispatch call sites. The result page is correct for
+    // static dispatch; surface the limitation as a warning so the
+    // agent doesn't treat "0 callers" as authoritative on a virtual.
+    //
+    // Detection is a substring check on the signature text the parser
+    // captured from source. The C++ parser preserves `virtual void
+    // Foo()` verbatim in `Symbol.signature` — a substring search for
+    // `"virtual "` (with the trailing space to avoid matching names
+    // like `virtualize`) catches every virtual-method declaration.
+    // The check fires for both `Direction::Callers` and
+    // `Direction::Callees` because dynamic dispatch is the resolver
+    // gap in BOTH directions.
+    //
+    // The lookup is `symbol_detail` (cheap HashMap hit). On a symbol
+    // we can't find we silently skip — the no-result path below
+    // surfaces the proper "symbol not found" error with its own
+    // diagnostics.
+    let mut response_warnings: Vec<String> = Vec::new();
+    if let Some(s) = g.symbol_detail(symbol) {
+        if is_virtual_signature(&s.signature) {
+            response_warnings.push(
+                "target is a virtual method; the resolver currently tracks \
+                 STATIC-dispatch call sites only. Callers that dispatch \
+                 through a base-class pointer or reference (e.g. \
+                 `base_ptr->Foo()`) will not appear here even when they \
+                 invoke this override at runtime. A `find_overrides` / \
+                 `EdgeKind::Overrides` tool to bridge dynamic dispatch \
+                 is on the roadmap."
+                    .to_string(),
+            );
+        }
+    }
+
     if chains.is_empty() {
         // Symbol may not exist at all — surface a did-you-mean error.
         // If it exists but is a non-callable kind (struct/enum/trait/
@@ -214,7 +249,7 @@ pub fn callers_or_callees(
     let (results, _total_kept, truncated, next_offset) =
         byte_budget_take(chains, resolved_offset, resolved_limit, max_bytes);
 
-    let response = Page::<CallChain> {
+    let page = Page::<CallChain> {
         results,
         total,
         offset: resolved_offset,
@@ -222,7 +257,25 @@ pub fn callers_or_callees(
         truncated,
         next_offset,
     };
+    let response = super::CallChainResponse {
+        page,
+        warnings: response_warnings,
+    };
     tool_success_json(&response)
+}
+
+/// Detect whether a captured signature string begins with or contains
+/// the C++ `virtual` keyword. Used by `callers_or_callees` to surface
+/// the dynamic-dispatch limitation as a per-tool warning.
+///
+/// The substring search includes the trailing space so identifiers
+/// like `virtualize` or `do_virtual_thing` don't false-positive.
+/// Pure-virtual signatures (`= 0` suffix) ARE caught because they
+/// still start with `virtual`. Late-in-signature `override` /
+/// `final` specifiers don't affect detection — we key on the
+/// declarator, not the trailing decorators.
+fn is_virtual_signature(signature: &str) -> bool {
+    signature.starts_with("virtual ") || signature.contains(" virtual ")
 }
 
 /// `get_dependencies` body. Returns the shared [`Page`]`<`[`DependencyEntry`]`>`
@@ -722,6 +775,110 @@ mod tests {
         assert!(
             text.contains("get_class_hierarchy"),
             "interface advisory must specifically suggest get_class_hierarchy: got {text:?}",
+        );
+    }
+
+    /// `is_virtual_signature` must catch the canonical declarator
+    /// forms ("virtual void Foo()", "virtual ~Foo()") and avoid
+    /// false-positives on identifiers like `virtualize`.
+    #[test]
+    fn is_virtual_signature_recognises_declarators() {
+        assert!(is_virtual_signature("virtual void Foo()"));
+        assert!(is_virtual_signature("virtual ~Foo()"));
+        assert!(is_virtual_signature("virtual void Foo() const"));
+        assert!(is_virtual_signature("virtual int Bar(int x) override"));
+        assert!(is_virtual_signature("virtual int Baz(int) = 0"));
+        // `virtual` after `inline`/`explicit` (rare but valid C++) —
+        // catches via the trailing-space substring branch.
+        assert!(is_virtual_signature("inline virtual void Foo()"));
+
+        // Negatives
+        assert!(!is_virtual_signature("void Foo()"));
+        assert!(!is_virtual_signature("void virtualize()"));
+        assert!(!is_virtual_signature("void do_virtual_thing()"));
+        assert!(!is_virtual_signature(""));
+    }
+
+    /// `get_callers` on a virtual-method symbol must surface the
+    /// "dynamic-dispatch limitation" warning in the response. Static
+    /// callers (if any) still appear in `results`; the warning sits
+    /// alongside.
+    #[test]
+    fn get_callers_on_virtual_method_emits_dispatch_warning() {
+        let mut g = Graph::new();
+        // Construct a Symbol whose signature includes `virtual`.
+        let mut virt = sym("Tick", "/engine/UEngine.h");
+        virt.kind = SymbolKind::Method;
+        virt.parent = "UEngine".to_string();
+        virt.signature = "virtual void Tick(float DeltaSeconds)".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/engine/UEngine.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![virt],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = callers_or_callees(
+            &g,
+            "/engine/UEngine.h:UEngine::Tick",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let warnings: Vec<&str> = parsed["warnings"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| w.contains("virtual method")),
+            "virtual target must surface dispatch-limitation warning; got {warnings:?}"
+        );
+        // Same warning fires for the `Callees` direction.
+        let r2 = callers_or_callees(
+            &g,
+            "/engine/UEngine.h:UEngine::Tick",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        let parsed2: serde_json::Value = serde_json::from_str(&body_text(&r2)).unwrap();
+        let warnings2: Vec<&str> = parsed2["warnings"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            warnings2.iter().any(|w| w.contains("virtual method")),
+            "callees direction must also surface the warning; got {warnings2:?}"
+        );
+    }
+
+    /// Non-virtual targets must NOT carry the warning — `warnings`
+    /// is absent from the JSON entirely (per the `skip_serializing_if`
+    /// on `CallChainResponse.warnings`), preserving wire-byte-identity
+    /// with the legacy bare `Page<CallChain>` envelope for the common
+    /// case.
+    #[test]
+    fn get_callers_on_non_virtual_omits_warnings_field() {
+        let g = locked(graph_with_calls());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:a",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert!(
+            parsed.get("warnings").is_none(),
+            "non-virtual target must NOT include `warnings` field; got: {parsed:?}"
         );
     }
 
