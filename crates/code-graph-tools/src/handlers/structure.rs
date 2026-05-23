@@ -174,6 +174,10 @@ pub fn detect_cycles(
 /// kind filter. `count_only` callers opt out of paging, so `limit: 0` is a
 /// deliberate exception to the "envelope echoes resolved limit" contract
 /// (see CLAUDE.md).
+#[allow(clippy::too_many_arguments)] // Mirrors `search_symbols` shape; the
+                                     // unified Input-struct pattern is a
+                                     // follow-up refactor across all paginated
+                                     // handlers.
 pub fn get_orphans(
     graph: &RwLock<Graph>,
     kind: Option<&str>,
@@ -181,6 +185,7 @@ pub fn get_orphans(
     offset: Option<u32>,
     brief: Option<bool>,
     count_only: bool,
+    reliability: Option<&str>,
     max_bytes: usize,
 ) -> CallToolResult {
     let parsed_kind: Option<SymbolKind> =
@@ -192,13 +197,39 @@ pub fn get_orphans(
             },
         };
 
+    // Reliability filter. Default `all` (or
+    // unspecified) preserves the legacy behaviour: every
+    // Graph::orphans result surfaces, including symbols that are
+    // almost-certainly false positives. `high` drops two
+    // false-positive classes:
+    //   - Virtual methods (callers may go through dynamic dispatch
+    //     which the static resolver doesn't track — see the
+    //     virtual-method warning surfaced by get_callers).
+    //   - Synthesized macro-defined functions (the macro_define_function
+    //     hook tags these with a distinctive `/* synthesized by … */`
+    //     signature prefix — the macro IS the call site by intent).
+    let reliability_high = match reliability {
+        None | Some("") | Some("all") => false,
+        Some("high") => true,
+        Some(other) => {
+            return tool_error(format!(
+                "invalid reliability: {other:?} (expected \"all\" or \"high\")"
+            ))
+        }
+    };
+
     // Count-only short-circuit: compute `total` via the cheap path
     // (filter + count) and emit the
     // sentinel envelope WITHOUT materializing SymbolResults or invoking
     // `byte_budget_take`. Order is load-bearing — must precede the
     // materialization step below so the byte-budget cost is never paid.
     if count_only {
-        let total = graph.read().orphans(parsed_kind).len() as u32;
+        let raw = graph.read().orphans(parsed_kind);
+        let total = if reliability_high {
+            raw.iter().filter(|s| !is_unreliable_orphan(s)).count() as u32
+        } else {
+            raw.len() as u32
+        };
         // `limit: 0` is a deliberate exception to the
         // "envelope echoes resolved limit" contract. count_only callers
         // opted out of paging; echoing a would-have-been limit would
@@ -222,6 +253,9 @@ pub fn get_orphans(
     let resolved_brief = brief.unwrap_or(true);
 
     let mut matches = graph.read().orphans(parsed_kind);
+    if reliability_high {
+        matches.retain(|s| !is_unreliable_orphan(s));
+    }
     let total = matches.len() as u32;
 
     // Sort by symbol_id ascending so page 1 + page 2 partition the result
@@ -390,6 +424,31 @@ pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResul
         .map(|s| super::symbol_to_result(s, false))
         .collect();
     tool_success_json(&results)
+}
+
+/// Predicate for `get_orphans(reliability="high")` — drop symbols
+/// the resolver almost certainly false-positived as orphans.
+///
+/// Two classes are dropped:
+/// 1. **Virtual methods** — callers may go through dynamic dispatch
+///    which the static resolver doesn't track.
+/// 2. **Macro-synthesized symbols** — the C++ plugin's
+///    `synthesize_symbols` hook tags these with a distinctive
+///    `/* synthesized by [cpp].macro_define_function: NAME */`
+///    signature prefix.
+///
+/// Template-instantiated methods (the third class) aren't
+/// detected here — that requires deferred edge-confidence work
+/// which would tag template-instantiation symbols at extraction time.
+fn is_unreliable_orphan(sym: &code_graph_core::Symbol) -> bool {
+    let sig = sym.signature.as_str();
+    if sig.starts_with("virtual ") || sig.contains(" virtual ") {
+        return true;
+    }
+    if sig.starts_with("/* synthesized by [cpp].macro_define_function") {
+        return true;
+    }
+    false
 }
 
 /// Did-you-mean helper for class-like lookups. Filters the candidate pool
@@ -1204,10 +1263,124 @@ mod tests {
         g
     }
 
+    /// Build a graph that mixes a plain orphan, a virtual orphan
+    /// (callers via dynamic dispatch — known false positive), and
+    /// a macro-synthesized orphan (the macro IS the call site by
+    /// construction — known false positive).
+    /// `reliability=high` must drop the latter two; `reliability=all`
+    /// (or unspecified) must return all three.
+    fn graph_with_reliable_and_unreliable_orphans() -> Graph {
+        let mut g = Graph::new();
+        let mut sym_plain = sym("plain_orphan", SymbolKind::Function, "/x.cpp");
+        sym_plain.signature = "void plain_orphan()".to_string();
+        let mut sym_virtual = sym("virtual_orphan", SymbolKind::Method, "/x.cpp");
+        sym_virtual.parent = "Base".to_string();
+        sym_virtual.signature = "virtual void virtual_orphan()".to_string();
+        let mut sym_synth = sym("synth_orphan", SymbolKind::Function, "/x.cpp");
+        sym_synth.signature =
+            "/* synthesized by [cpp].macro_define_function: MAKE_FN */".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym_plain, sym_virtual, sym_synth],
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    /// `reliability="high"` drops the virtual + synth false positives.
+    #[test]
+    fn orphans_reliability_high_drops_virtual_and_synth() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(&g, None, None, None, None, false, Some("high"), NO_BYTE_BUDGET);
+        let (arr, total, _, _) = page_parts(&r);
+        let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(total, 1, "only the plain orphan must survive; got {names:?}");
+        assert_eq!(names, vec!["plain_orphan"]);
+    }
+
+    /// `reliability="all"` (or unspecified) returns every orphan
+    /// including the false positives — preserves the legacy
+    /// behaviour.
+    #[test]
+    fn orphans_reliability_all_returns_every_orphan() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(&g, None, None, None, None, false, Some("all"), NO_BYTE_BUDGET);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 3, "all three orphans must surface");
+        assert_eq!(total, 3);
+    }
+
+    /// Unspecified reliability behaves like "all".
+    #[test]
+    fn orphans_reliability_default_matches_all() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(&g, None, None, None, None, false, None, NO_BYTE_BUDGET);
+        let (_, total, _, _) = page_parts(&r);
+        assert_eq!(total, 3);
+    }
+
+    /// Invalid reliability strings produce a tool error.
+    #[test]
+    fn orphans_reliability_invalid_errors() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("approximate"),
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(
+            body.contains("invalid reliability") && body.contains("approximate"),
+            "error must name the bad value; got: {body}"
+        );
+    }
+
+    /// `count_only` honors the reliability filter — `total` is the
+    /// post-filter count, NOT the raw count.
+    #[test]
+    fn orphans_count_only_with_reliability_high_returns_filtered_count() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(&g, None, None, None, None, true, Some("high"), NO_BYTE_BUDGET);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(1));
+        assert_eq!(parsed["limit"], serde_json::json!(0)); // count_only sentinel
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
+    }
+
+    /// `is_unreliable_orphan` predicate behaves correctly on each
+    /// distinct signature class.
+    #[test]
+    fn is_unreliable_orphan_predicate_table() {
+        let plain = sym("f", SymbolKind::Function, "/x.cpp");
+        let mut virt = sym("g", SymbolKind::Method, "/x.cpp");
+        virt.signature = "virtual void g()".to_string();
+        let mut virt_inline = sym("h", SymbolKind::Method, "/x.cpp");
+        virt_inline.signature = "inline virtual void h() const".to_string();
+        let mut synth = sym("i", SymbolKind::Function, "/x.cpp");
+        synth.signature =
+            "/* synthesized by [cpp].macro_define_function: FOO */".to_string();
+        let mut decoy = sym("j", SymbolKind::Function, "/x.cpp");
+        decoy.signature = "void virtualize()".to_string(); // not a virtual
+
+        assert!(!is_unreliable_orphan(&plain));
+        assert!(is_unreliable_orphan(&virt));
+        assert!(is_unreliable_orphan(&virt_inline));
+        assert!(is_unreliable_orphan(&synth));
+        assert!(!is_unreliable_orphan(&decoy));
+    }
+
     #[test]
     fn orphans_default_returns_callables() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         // foo and baz have no callers; bar is called by foo. cls is a Class
         // and is excluded by the default callable-only filter.
@@ -1225,7 +1398,7 @@ mod tests {
     #[test]
     fn orphans_kind_class_returns_only_classes() {
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some("class"), None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("class"), None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], serde_json::json!("cls"));
@@ -1236,7 +1409,7 @@ mod tests {
     #[test]
     fn orphans_invalid_kind_errors() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, Some("widget"), None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("widget"), None, None, None, false, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
     }
@@ -1244,7 +1417,7 @@ mod tests {
     #[test]
     fn orphans_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -1258,7 +1431,7 @@ mod tests {
         // kind — Go's `req.GetArguments()["kind"].(string)` ignores empty
         // strings via the `&& k != ""` check.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, Some(""), None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some(""), None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2, "empty kind => default callables-only");
     }
@@ -1269,7 +1442,7 @@ mod tests {
         // the serialized form even though our test fixture has a non-empty
         // signature on each symbol.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         for entry in arr {
             assert!(
@@ -1309,7 +1482,7 @@ mod tests {
     fn orphans_default_limit_is_20() {
         // 25 orphans: default limit (20) returns the first 20; total = 25.
         let g = locked(graph_with_n_orphan_functions(25));
-        let r = get_orphans(&g, None, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, false, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -1323,9 +1496,9 @@ mod tests {
         // covers all 30 with no overlap.
         let g = locked(graph_with_n_orphan_functions(30));
 
-        let p1 = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
+        let p1 = get_orphans(&g, None, Some(20), Some(0), None, false, None, NO_BYTE_BUDGET);
         let (a1, t1, _, _) = page_parts(&p1);
-        let p2 = get_orphans(&g, None, Some(20), Some(20), None, false, NO_BYTE_BUDGET);
+        let p2 = get_orphans(&g, None, Some(20), Some(20), None, false, None, NO_BYTE_BUDGET);
         let (a2, t2, _, _) = page_parts(&p2);
 
         assert_eq!(a1.len(), 20);
@@ -1348,9 +1521,9 @@ mod tests {
     fn orphans_total_is_pre_pagination_count() {
         // Same fixture, three different pages — total is identical across all.
         let g = locked(graph_with_n_orphan_functions(30));
-        let r1 = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
-        let r2 = get_orphans(&g, None, Some(20), Some(20), None, false, NO_BYTE_BUDGET);
-        let r3 = get_orphans(&g, None, Some(5), Some(10), None, false, NO_BYTE_BUDGET);
+        let r1 = get_orphans(&g, None, Some(20), Some(0), None, false, None, NO_BYTE_BUDGET);
+        let r2 = get_orphans(&g, None, Some(20), Some(20), None, false, None, NO_BYTE_BUDGET);
+        let r3 = get_orphans(&g, None, Some(5), Some(10), None, false, None, NO_BYTE_BUDGET);
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
         let (_, t3, _, _) = page_parts(&r3);
@@ -1366,7 +1539,7 @@ mod tests {
         // 5-item fixture also verifies all 5 results return — confirming
         // take(1000) doesn't accidentally drop entries on a small set.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(999_999), None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(999_999), None, None, false, None, NO_BYTE_BUDGET);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
         assert_eq!(arr.len(), 5);
@@ -1376,7 +1549,7 @@ mod tests {
     fn orphans_zero_limit_uses_default() {
         // limit = 0 is treated as "unset"; resolves to default 20.
         let g = locked(graph_with_n_orphan_functions(5));
-        let r = get_orphans(&g, None, Some(0), None, None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(0), None, None, false, None, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -1385,7 +1558,7 @@ mod tests {
     fn orphans_offset_beyond_total_returns_empty() {
         // offset >= total returns empty results with the correct total.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, Some(999), None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, Some(999), None, false, None, NO_BYTE_BUDGET);
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 2);
@@ -1420,6 +1593,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             NO_BYTE_BUDGET,
         );
         let (arr, total, _, _) = page_parts(&r);
@@ -1434,7 +1608,7 @@ mod tests {
     fn orphans_brief_false_includes_signature() {
         // brief=false surfaces signature/column/end_line on each row.
         let g = locked(graph_with_orphans());
-        let r = get_orphans(&g, None, None, None, Some(false), false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, Some(false), false, None, NO_BYTE_BUDGET);
         let (arr, _, _, _) = page_parts(&r);
         assert!(!arr.is_empty());
         for entry in &arr {
@@ -1470,7 +1644,7 @@ mod tests {
         use super::super::ENVELOPE_OVERHEAD_BYTES;
         let g = locked(graph_with_n_orphan_functions(30));
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
-        let r = get_orphans(&g, None, Some(20), Some(0), None, false, max_bytes);
+        let r = get_orphans(&g, None, Some(20), Some(0), None, false, None, max_bytes);
 
         let (arr, total, offset, limit) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
@@ -1509,7 +1683,7 @@ mod tests {
         // no next_offset. Locks the contract that the byte-budget wiring
         // does not affect callers that opt out.
         let g = locked(graph_with_n_orphan_functions(30));
-        let r = get_orphans(&g, None, Some(20), Some(0), None, false, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, Some(20), Some(0), None, false, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
         assert_eq!(arr.len(), 20);
@@ -1535,7 +1709,7 @@ mod tests {
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         let g = locked(graph_with_n_orphan_functions(1000));
-        let r = get_orphans(&g, None, None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, None, None, None, None, true, None, NO_BYTE_BUDGET);
 
         let body = body_text(&r);
         assert!(
@@ -1576,13 +1750,13 @@ mod tests {
         let g = locked(graph_with_orphans());
 
         // kind=function => 2 orphans (foo, baz).
-        let r = get_orphans(&g, Some("function"), None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("function"), None, None, None, true, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["total"].as_u64().unwrap(), 2);
         assert!(parsed["results"].as_array().unwrap().is_empty());
 
         // kind=class => 1 orphan (cls).
-        let r = get_orphans(&g, Some("class"), None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("class"), None, None, None, true, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["total"].as_u64().unwrap(), 1);
         assert!(parsed["results"].as_array().unwrap().is_empty());
@@ -1593,7 +1767,7 @@ mod tests {
         // The count_only check runs AFTER kind validation; bad kinds still
         // surface the canonical "invalid kind: <s>" tool error.
         let g = locked(Graph::new());
-        let r = get_orphans(&g, Some("widget"), None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_orphans(&g, Some("widget"), None, None, None, true, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "invalid kind: widget");
     }

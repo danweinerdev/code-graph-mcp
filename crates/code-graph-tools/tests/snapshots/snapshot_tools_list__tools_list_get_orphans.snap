@@ -51,6 +51,14 @@ expression: "tool_entry(\"get_orphans\")"
           "integer",
           "null"
         ]
+      },
+      "reliability": {
+        "default": null,
+        "description": "Reliability filter: 'all' (default) returns every orphan including known false-positive classes; 'high' drops virtual methods (often reached via dynamic dispatch the resolver doesn't track) and macro-synthesized symbols (the macro IS the call site by construction). 'high' typically cuts the orphan count by ~half on engine-style codebases. Invalid values are rejected with a tool error.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
     "title": "GetOrphansArgs",

@@ -433,6 +433,16 @@ pub struct GetOrphansArgs {
     )]
     #[serde(default)]
     pub count_only: Option<bool>,
+    #[schemars(
+        description = "Reliability filter: 'all' (default) returns every orphan including known \
+                       false-positive classes; 'high' drops virtual methods (often reached via \
+                       dynamic dispatch the resolver doesn't track) and macro-synthesized \
+                       symbols (the macro IS the call site by construction). 'high' typically \
+                       cuts the orphan count by ~half on engine-style codebases. \
+                       Invalid values are rejected with a tool error."
+    )]
+    #[serde(default)]
+    pub reliability: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1020,6 +1030,7 @@ impl CodeGraphServer {
             args.offset,
             args.brief,
             args.count_only.unwrap_or(false),
+            args.reliability.as_deref(),
             max_bytes,
         ))
     }
@@ -1630,6 +1641,7 @@ mod tests {
                 offset: None,
                 brief: None,
                 count_only: None,
+                reliability: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

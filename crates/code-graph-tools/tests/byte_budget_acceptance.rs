@@ -172,6 +172,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
         Some(0),
         None,
         false,
+        None,
         DEFAULT_RESPONSE_MAX_BYTES,
     );
     let body = first_text(&r);
@@ -249,6 +250,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
             Some(offset),
             None,
             false,
+            None,
             DEFAULT_RESPONSE_MAX_BYTES,
         );
         let body = first_text(&r);
@@ -452,6 +454,7 @@ async fn count_only_under_1kb_orphans() {
         None,
         None,
         true,
+        None,
         DEFAULT_RESPONSE_MAX_BYTES,
     );
     let body = first_text(&r);

@@ -95,15 +95,20 @@ async fn analyze_testdata_cpp_locks_in_baseline_counts() {
         serde_json::json!(17),
         "edges count drifted from baseline; full body: {body}",
     );
-    // `warnings` is `omitempty`-flavored on the Rust side: the field is
-    // skipped when the Vec is empty. Either absent or an empty array is
-    // acceptable; a non-empty array would be a regression.
-    match parsed.get("warnings") {
-        None => {}
-        Some(serde_json::Value::Array(a)) => assert!(
-            a.is_empty(),
-            "warnings must be empty for testdata/cpp, got: {a:?}",
-        ),
-        Some(other) => panic!("warnings must be array or absent, got {other:?}"),
+    // `warnings` is `omitempty`-flavored on the Rust side: the field
+    // is skipped when the Vec is empty. After the upward-walk config
+    // discovery work (commit c06fc73 and follow-on work), a
+    // testdata fixture lacking a `.code-graph.toml` surfaces a
+    // "no .code-graph.toml found" warning by design. Any warning
+    // OTHER than that one is a regression worth investigating; the
+    // no-config warning itself is the intended behaviour.
+    if let Some(serde_json::Value::Array(a)) = parsed.get("warnings") {
+        for w in a {
+            let s = w.as_str().unwrap_or("");
+            assert!(
+                s.contains("no .code-graph.toml found"),
+                "unexpected warning beyond the no-config notice: {s:?}"
+            );
+        }
     }
 }

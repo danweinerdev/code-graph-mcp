@@ -453,6 +453,7 @@ async fn response_get_orphans_default_callables() {
         None,
         None,
         false,
+        None,
         NO_BYTE_BUDGET,
     );
     // The handler now sorts by `symbol_id` ascending and wraps in the
@@ -477,6 +478,7 @@ async fn response_get_orphans_paginated_offset() {
         Some(20),
         None,
         false,
+        None,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -497,6 +499,7 @@ async fn response_get_orphans_brief_false() {
         None,
         Some(false),
         false,
+        None,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -516,6 +519,7 @@ async fn response_get_orphans_offset_beyond_total() {
         Some(999),
         None,
         false,
+        None,
         NO_BYTE_BUDGET,
     );
     let parsed = parsed_sorted(&r);
@@ -547,6 +551,7 @@ async fn response_get_orphans_byte_budget_truncated() {
         Some(0),
         None,
         false,
+        None,
         max_bytes,
     );
     let parsed = parsed_sorted(&r);
@@ -576,6 +581,7 @@ async fn response_count_only_orphans() {
         None,
         None,
         true,
+        None,
         NO_BYTE_BUDGET,
     );
     // Size contract: serialized response < 1KB regardless of input scale.
