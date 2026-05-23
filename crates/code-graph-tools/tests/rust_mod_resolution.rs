@@ -225,7 +225,7 @@ async fn detect_cycles_finds_mod_a_mod_b_mod_a_cycle() {
     let server = rust_only_server();
     analyze(&server, &root).await;
 
-    let cycles = detect_cycles(&server.inner.graph, None, None, None);
+    let cycles = detect_cycles(&server.inner.graph, None, None, None, None);
     let parsed: serde_json::Value =
         serde_json::from_str(&first_text(&cycles)).expect("detect_cycles JSON");
     let results = parsed["results"]

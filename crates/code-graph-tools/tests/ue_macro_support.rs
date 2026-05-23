@@ -138,6 +138,7 @@ fn search_for(inner: &Arc<ServerInner>, pattern: &str) -> serde_json::Value {
     let r = search_symbols(
         &inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some(pattern),
             // Compact records keep `line` populated for the byte-offset
             // preservation assertion below.
@@ -458,6 +459,7 @@ macro_strip_with_args = [\"UCLASS\", \"GENERATED_BODY\"]
     let envelope = serde_json::from_str::<serde_json::Value>(&first_text(&search_symbols(
         &inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("^CleanClass$"),
             brief: true,
             ..Default::default()
@@ -477,6 +479,7 @@ macro_strip_with_args = [\"UCLASS\", \"GENERATED_BODY\"]
     let envelope = serde_json::from_str::<serde_json::Value>(&first_text(&search_symbols(
         &inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("^CleanClass::DoSomething$"),
             brief: true,
             ..Default::default()

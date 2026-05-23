@@ -113,6 +113,7 @@ fn all_symbol_names(inner: &Arc<ServerInner>) -> HashSet<String> {
     let r = search_symbols(
         &inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             language: Some("cpp"),
             brief: true,
             limit: Some(10_000),
@@ -136,6 +137,7 @@ fn count_exact(inner: &Arc<ServerInner>, name: &str) -> u64 {
     let r = search_symbols(
         &inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some(&format!("^{name}$")),
             brief: true,
             ..Default::default()

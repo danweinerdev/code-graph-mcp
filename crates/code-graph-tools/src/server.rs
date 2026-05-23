@@ -270,6 +270,14 @@ pub struct SearchSymbolsArgs {
     #[schemars(description = "Filter by source language: cpp, rust, go, python, csharp, or java")]
     #[serde(default)]
     pub language: Option<String>,
+    #[schemars(
+        description = "Restrict matches to symbols whose file path is at or under this \
+                       directory prefix. Uses the path-trie's subtree iterator so the \
+                       file-set build cost is proportional to the subtree, NOT the whole \
+                       graph. Absent / empty value matches across the whole graph."
+    )]
+    #[serde(default)]
+    pub subtree: Option<String>,
     #[schemars(description = "Maximum results to return (default 20)")]
     #[serde(default)]
     pub limit: Option<u32>,
@@ -420,6 +428,15 @@ pub struct GetDependenciesArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct DetectCyclesArgs {
+    #[schemars(
+        description = "Restrict reported cycles to those whose every file is at or under \
+                       this directory prefix. Cycles touching files outside the prefix \
+                       are dropped from the response (cycle DETECTION is still global — \
+                       a cycle passing through an outside file is still detected, just \
+                       not reported). Absent / empty value reports all cycles."
+    )]
+    #[serde(default)]
+    pub subtree: Option<String>,
     #[schemars(description = "Maximum cycles to return (default 20, max 1000)")]
     #[serde(default)]
     pub limit: Option<u32>,
@@ -696,6 +713,7 @@ impl CodeGraphServer {
             kind: args.kind.as_deref(),
             namespace: args.namespace.as_deref(),
             language: args.language.as_deref(),
+            subtree: args.subtree.as_deref(),
             limit: args.limit,
             offset: args.offset,
             brief: args.brief.unwrap_or(true),
@@ -1031,6 +1049,7 @@ impl CodeGraphServer {
         }
         Ok(handlers::structure::detect_cycles(
             &self.inner.graph,
+            args.subtree.as_deref(),
             args.limit,
             args.offset,
             args.max_cycle_size,
@@ -1481,6 +1500,7 @@ mod tests {
         let server = empty_server();
         let r = server
             .search_symbols(Parameters(SearchSymbolsArgs {
+                subtree: None,
                 query: Some("foo".to_string()),
                 kind: None,
                 namespace: None,

@@ -183,7 +183,7 @@ async fn envelope_honesty_mid_page() {
     analyze(&server, &canonical).await;
 
     // Mid-stream page: offset 30, limit 10.
-    let r1 = detect_cycles(&server.inner.graph, Some(10), Some(30), None);
+    let r1 = detect_cycles(&server.inner.graph, None, Some(10), Some(30), None);
     let b1 = ok_json(&r1);
     let (arr1, total1, offset1, limit1) = page_parts(&b1);
 
@@ -218,7 +218,7 @@ async fn envelope_honesty_mid_page() {
     );
 
     // Resume exactly at next_offset.
-    let r2 = detect_cycles(&server.inner.graph, Some(10), Some(40), None);
+    let r2 = detect_cycles(&server.inner.graph, None, Some(10), Some(40), None);
     let b2 = ok_json(&r2);
     let (arr2, total2, offset2, _) = page_parts(&b2);
     assert_eq!(total2, 100, "total is invariant across pages; body: {b2}");
@@ -239,6 +239,7 @@ async fn envelope_honesty_mid_page() {
     // [30..50), then compare against page1 ++ page2 by identity.
     let full = ok_json(&detect_cycles(
         &server.inner.graph,
+        None,
         Some(1000),
         Some(0),
         None,
@@ -263,7 +264,7 @@ async fn envelope_honesty_mid_page() {
 
     // Walk to the natural tail: offset 95, only 5 cycles remain (< limit),
     // so 95+5 == 100 == total -> truncated=false / next_offset=None.
-    let r_tail = detect_cycles(&server.inner.graph, Some(10), Some(95), None);
+    let r_tail = detect_cycles(&server.inner.graph, None, Some(10), Some(95), None);
     let b_tail = ok_json(&r_tail);
     let (arr_tail, total_tail, _, _) = page_parts(&b_tail);
     assert_eq!(total_tail, 100);
@@ -302,7 +303,7 @@ async fn per_cycle_cap_truncates_large_scc() {
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
-    let r = detect_cycles(&server.inner.graph, None, None, Some(50));
+    let r = detect_cycles(&server.inner.graph, None, None, None, Some(50));
     let body = ok_json(&r);
     let (arr, total, _, _) = page_parts(&body);
 
@@ -374,7 +375,7 @@ async fn per_cycle_cap_default_50() {
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
-    let r = detect_cycles(&server.inner.graph, None, None, None);
+    let r = detect_cycles(&server.inner.graph, None, None, None, None);
     let body = ok_json(&r);
     let (arr, total, _, _) = page_parts(&body);
 

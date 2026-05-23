@@ -217,6 +217,7 @@ async fn response_search_symbols_query_engine() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("Engine"),
             brief: true,
             ..Default::default()
@@ -255,6 +256,7 @@ async fn response_search_symbols_byte_budget_truncated() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("func"),
             limit: Some(1000),
             offset: Some(0),
@@ -291,6 +293,7 @@ async fn response_count_only_search_symbols() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("func"),
             count_only: true,
             ..Default::default()
@@ -429,7 +432,7 @@ async fn response_get_dependencies_engine_cpp() {
 #[tokio::test]
 async fn response_detect_cycles() {
     let fx = build_indexed_fixture().await;
-    let r = detect_cycles(&fx.inner.graph, None, None, None);
+    let r = detect_cycles(&fx.inner.graph, None, None, None, None);
     // The handler now sorts each cycle's inner paths in canonical order
     // and sorts the outer cycle list by first path, then wraps in the
     // shared Page<Cycle> envelope (each cycle is {files, truncated,
@@ -1448,6 +1451,7 @@ async fn response_search_symbols_helper_language_rust() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("rust"),
             brief: true,
@@ -1520,6 +1524,7 @@ async fn response_search_symbols_helper_language_go() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("go"),
             brief: true,
@@ -1743,6 +1748,7 @@ async fn response_search_symbols_helper_language_python() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("python"),
             brief: true,

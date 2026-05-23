@@ -318,6 +318,7 @@ async fn search_symbols_under_budget_at_limit_1000() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some(query),
             limit: Some(1000),
             offset: Some(0),
@@ -378,6 +379,7 @@ async fn search_symbols_under_budget_at_limit_1000() {
         let r = search_symbols(
             &fx.inner.graph,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some(query),
                 limit: Some(1000),
                 offset: Some(offset),
@@ -495,6 +497,7 @@ async fn count_only_under_1kb_search_symbols() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("orphan"),
             count_only: true,
             ..SearchSymbolsInput::default()

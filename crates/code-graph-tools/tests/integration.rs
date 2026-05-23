@@ -113,7 +113,7 @@ async fn analyze_then_query_pipeline() {
     // detect_cycles surfaces the circular_a/circular_b cycle. Wrapped in
     // the Page<Vec<String>> envelope — the cycle is in `results[0]`,
     // count in `total`.
-    let cycles = detect_cycles(&server.inner.graph, None, None, None);
+    let cycles = detect_cycles(&server.inner.graph, None, None, None, None);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&cycles)).unwrap();
     let arr = parsed["results"].as_array().expect("results array");
     assert_eq!(

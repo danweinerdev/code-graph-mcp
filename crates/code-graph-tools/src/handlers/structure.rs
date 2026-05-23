@@ -57,6 +57,7 @@ use super::{
 /// cap keep `truncated: false` / `original_len: None`.
 pub fn detect_cycles(
     graph: &RwLock<Graph>,
+    subtree: Option<&str>,
     limit: Option<u32>,
     offset: Option<u32>,
     max_cycle_size: Option<u32>,
@@ -65,7 +66,26 @@ pub fn detect_cycles(
     let resolved_offset = offset.unwrap_or(0);
     let resolved_max = max_cycle_size.filter(|&n| n != 0).unwrap_or(50).min(500);
 
-    let cycles: Vec<Vec<PathBuf>> = graph.read().detect_cycles();
+    // Subtree filter (Phase E.3 C). Empty / absent value keeps the
+    // whole-graph behavior. A non-empty value drops every cycle that
+    // includes a file OUTSIDE the prefix — semantics match
+    // "cycles confined to this subtree." Filter happens post-detection
+    // because cycle membership is global; restricting cycle detection
+    // itself to a subtree would change the answer (a cycle through a
+    // file outside the subtree would never be found, hiding real
+    // cyclic dependencies). The subtree filter just narrows reporting.
+    let subtree_prefix: Option<std::path::PathBuf> = subtree
+        .filter(|s| !s.is_empty())
+        .map(code_graph_core::paths::normalize_user_path);
+
+    let raw_cycles: Vec<Vec<PathBuf>> = graph.read().detect_cycles();
+    let cycles: Vec<Vec<PathBuf>> = match subtree_prefix.as_deref() {
+        Some(p) => raw_cycles
+            .into_iter()
+            .filter(|cycle| cycle.iter().all(|file| file.starts_with(p)))
+            .collect(),
+        None => raw_cycles,
+    };
 
     // Convert PathBuf -> String for stable JSON output. PathBuf serializes
     // through serde as `String` on Unix, but going through to_string_lossy
@@ -963,7 +983,7 @@ mod tests {
     #[test]
     fn detect_cycles_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -988,7 +1008,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -1010,7 +1030,7 @@ mod tests {
             edges: vec![include_edge("/b.h", "/a.h")],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1, "exactly one cycle in results");
         assert_eq!(total, 1, "total reports the full cycle count");
@@ -1029,9 +1049,80 @@ mod tests {
     }
 
     #[test]
+    fn detect_cycles_subtree_filter_drops_cycles_outside_prefix() {
+        // Two cycles: one entirely under /a, one entirely under /b.
+        // subtree="/a" should report only the /a cycle.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a/x.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/a/x.h", "/a/y.h")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/a/y.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/a/y.h", "/a/x.h")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b/p.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/b/p.h", "/b/q.h")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b/q.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/b/q.h", "/b/p.h")],
+        });
+        let g = locked(g);
+
+        let r = detect_cycles(&g, Some("/a"), None, None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(total, 1);
+        let cycle = arr[0]["files"].as_array().unwrap();
+        let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(names, vec!["/a/x.h", "/a/y.h"]);
+
+        let r_all = detect_cycles(&g, None, None, None, None);
+        let (arr_all, total_all, _, _) = page_parts(&r_all);
+        assert_eq!(arr_all.len(), 2);
+        assert_eq!(total_all, 2);
+    }
+
+    #[test]
+    fn detect_cycles_subtree_filter_drops_cross_subtree_cycle() {
+        // One cycle that crosses the prefix boundary: /a/x → /b/y → /a/x.
+        // subtree="/a" should report zero cycles (every cycle must be
+        // ENTIRELY under the prefix to qualify).
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a/x.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/a/x.h", "/b/y.h")],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b/y.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![],
+            edges: vec![include_edge("/b/y.h", "/a/x.h")],
+        });
+        let g = locked(g);
+
+        let r = detect_cycles(&g, Some("/a"), None, None, None);
+        let (arr, total, _, _) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn detect_cycles_default_limit_is_20() {
         let g = locked(graph_with_n_cycles(25));
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         let (arr, total, _, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -1046,9 +1137,9 @@ mod tests {
     #[test]
     fn detect_cycles_page_1_and_page_2_cover_full_set_no_overlap() {
         let g = locked(graph_with_n_cycles(30));
-        let r1 = detect_cycles(&g, Some(20), Some(0), None);
+        let r1 = detect_cycles(&g, None, Some(20), Some(0), None);
         let (arr1, total1, _, _) = page_parts(&r1);
-        let r2 = detect_cycles(&g, Some(20), Some(20), None);
+        let r2 = detect_cycles(&g, None, Some(20), Some(20), None);
         let (arr2, total2, _, _) = page_parts(&r2);
         assert_eq!(total1, 30);
         assert_eq!(total2, 30, "total invariant across pages");
@@ -1094,7 +1185,7 @@ mod tests {
         // the full set, so the envelope must advertise that more cycles
         // exist (truncated=true) and where to resume (next_offset=10).
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, Some(10), Some(0), None);
+        let r = detect_cycles(&g, None, Some(10), Some(0), None);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 10, "limit caps the page at 10 cycles");
         assert_eq!(total, 100, "total is the pre-pagination cycle count");
@@ -1111,7 +1202,7 @@ mod tests {
         // than the limit. offset(95) + emitted(5) == total(100), so this
         // is the natural tail — truncated=false, next_offset=None.
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, Some(10), Some(95), None);
+        let r = detect_cycles(&g, None, Some(10), Some(95), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert_eq!(arr.len(), 5, "only the trailing 5 cycles remain");
         assert_eq!(total, 100);
@@ -1124,7 +1215,7 @@ mod tests {
     #[test]
     fn detect_cycles_offset_beyond_total_returns_empty_envelope() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, None, Some(999), None);
+        let r = detect_cycles(&g, None, None, Some(999), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 3, "total still reports full cycle count");
@@ -1139,7 +1230,7 @@ mod tests {
     #[test]
     fn detect_cycles_limit_clamps_at_1000() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, Some(999_999), None, None);
+        let r = detect_cycles(&g, None, Some(999_999), None, None);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000, "echo the clamped limit");
         assert_eq!(arr.len(), 3, "all 3 cycles returned when data < cap");
@@ -1148,7 +1239,7 @@ mod tests {
     #[test]
     fn detect_cycles_zero_limit_uses_default() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, Some(0), None, None);
+        let r = detect_cycles(&g, None, Some(0), None, None);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -1195,7 +1286,7 @@ mod tests {
         // cycle on the page is clipped to 50 paths and self-reports the
         // truncation via truncated:true + original_len:Some(100).
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, None, None, Some(50));
+        let r = detect_cycles(&g, None, None, None, Some(50));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1, "still exactly one cycle");
         assert_eq!(arr.len(), 1);
@@ -1219,7 +1310,7 @@ mod tests {
         // must apply, producing the identical clip/flag/original_len as
         // the explicit-50 case above. Pins the default resolution.
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         let files = arr[0]["files"].as_array().unwrap();
@@ -1235,7 +1326,7 @@ mod tests {
         // original_len ABSENT (skipped when None). Pins the not-truncated
         // path and the orthogonality of the two truncation axes.
         let g = locked(graph_with_one_cycle_of_n_files(10));
-        let r = detect_cycles(&g, None, None, None);
+        let r = detect_cycles(&g, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1);
         assert_eq!(arr.len(), 1);
@@ -1261,7 +1352,7 @@ mod tests {
         // axes are orthogonal: a non-truncated envelope can carry a
         // per-cycle-truncated cycle.
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, Some(1000), Some(0), Some(50));
+        let r = detect_cycles(&g, None, Some(1000), Some(0), Some(50));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1);
         assert_eq!(arr.len(), 1);

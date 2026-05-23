@@ -224,6 +224,7 @@ async fn search_helper_no_filter_returns_all_four_languages() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             brief: true,
             ..Default::default()
@@ -261,6 +262,7 @@ async fn search_helper_language_cpp_returns_only_cpp() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("cpp"),
             brief: true,
@@ -283,6 +285,7 @@ async fn search_helper_language_rust_returns_only_rust() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("rust"),
             brief: true,
@@ -305,6 +308,7 @@ async fn search_helper_language_go_returns_only_go() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("go"),
             brief: true,
@@ -327,6 +331,7 @@ async fn search_helper_language_python_returns_only_python() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("helper"),
             language: Some("python"),
             brief: true,
@@ -626,6 +631,7 @@ async fn search_init_returns_all_five_languages() {
     let r = search_symbols(
         &fx.inner.graph,
         SearchSymbolsInput {
+            subtree: None,
             query: Some("init"),
             brief: true,
             ..Default::default()

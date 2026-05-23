@@ -12,7 +12,7 @@
 //! identical envelopes.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use code_graph_core::{symbol_id, Language, Symbol, SymbolKind};
@@ -128,6 +128,15 @@ pub struct SearchParams {
     /// for search-symbols-specific count-only — orphans / file_symbols
     /// compute `total` directly from their filtered Vec, no heap involved).
     pub count_only: bool,
+    /// Optional subtree filter: drop any symbol whose `file` is not at
+    /// or under this prefix. `None` keeps every file. Used by the
+    /// MCP `search_symbols(subtree=...)` argument; implemented via
+    /// [`PathTrie::iter_subtree`] over `Graph.files` so the file-set
+    /// build cost is proportional to the subtree, not the whole
+    /// graph.
+    ///
+    /// [`PathTrie::iter_subtree`]: code_graph_path_trie::PathTrie::iter_subtree
+    pub subtree: Option<std::path::PathBuf>,
 }
 
 /// Paginated search response.
@@ -201,6 +210,20 @@ impl Graph {
         };
         let lower_ns = params.namespace.to_lowercase();
 
+        // Subtree filter (Phase E.3 C): walk `files.iter_subtree(prefix)`
+        // once to build a `HashSet<String>` of files under the prefix,
+        // then per-node check membership. Build cost is proportional to
+        // the subtree (`O(files_under_prefix)`), NOT to the whole file
+        // index — the path-trie ROI for `search_symbols`. Per-node
+        // lookup is `O(1)` HashSet hit. `None` skips the build entirely
+        // so the whole-graph search path stays zero-cost.
+        let subtree_files: Option<HashSet<String>> = params.subtree.as_ref().map(|prefix| {
+            self.files
+                .iter_subtree(prefix)
+                .map(|(p, _)| p.to_string_lossy().into_owned())
+                .collect()
+        });
+
         // count_only short-circuit: walk the match predicate exactly as
         // the materializing path does,
         // but skip the BinaryHeap allocation, the per-match `symbol_id`
@@ -214,6 +237,12 @@ impl Graph {
             let mut total: u32 = 0;
             for node in self.nodes.values() {
                 let s = &node.symbol;
+
+                if let Some(ref set) = subtree_files {
+                    if !set.contains(&s.file) {
+                        continue;
+                    }
+                }
 
                 if let Some(k) = params.kind {
                     if s.kind != k {
@@ -274,6 +303,12 @@ impl Graph {
 
         for node in self.nodes.values() {
             let s = &node.symbol;
+
+            if let Some(ref set) = subtree_files {
+                if !set.contains(&s.file) {
+                    continue;
+                }
+            }
 
             if let Some(k) = params.kind {
                 if s.kind != k {

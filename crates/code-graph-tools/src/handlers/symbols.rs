@@ -174,6 +174,9 @@ pub struct SearchSymbolsInput<'a> {
     pub kind: Option<&'a str>,
     pub namespace: Option<&'a str>,
     pub language: Option<&'a str>,
+    /// Phase E.3 (C): restrict matches to symbols whose file is at or
+    /// under this directory prefix. Empty / absent = whole graph.
+    pub subtree: Option<&'a str>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub brief: bool,
@@ -267,6 +270,12 @@ pub fn search_symbols(
 
     let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
     let resolved_offset = input.offset.unwrap_or(0);
+    // Normalize subtree the same way every path-taking tool does;
+    // empty / absent = whole graph.
+    let resolved_subtree: Option<std::path::PathBuf> = input
+        .subtree
+        .filter(|s| !s.is_empty())
+        .map(code_graph_core::paths::normalize_user_path);
 
     // Count-only short-circuit: delegate to `Graph::search` with
     // `count_only=true` so the
@@ -286,6 +295,7 @@ pub fn search_symbols(
             limit: 0,
             offset: 0,
             count_only: true,
+            subtree: resolved_subtree.clone(),
         });
         // `limit: 0` is a deliberate exception to the
         // "envelope echoes resolved limit" contract. count_only callers
@@ -351,6 +361,7 @@ pub fn search_symbols(
         limit: resolved_limit,
         offset: resolved_offset,
         count_only: false,
+        subtree: resolved_subtree,
     });
 
     // `sr.symbols` is the already-sliced page (length <= resolved_limit).
@@ -1532,9 +1543,106 @@ mod tests {
 
     fn search_input<'a>() -> SearchSymbolsInput<'a> {
         SearchSymbolsInput {
+            subtree: None,
             brief: true,
             ..SearchSymbolsInput::default()
         }
+    }
+
+    /// Two-file graph for subtree-filter tests: one symbol under /a,
+    /// one under /b. Both match `query="foo"`. Subtree filter should
+    /// narrow to whichever subtree the test selects.
+    fn graph_with_foos_in_two_subtrees() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym_in("foo", SymbolKind::Function, "/a/x.cpp")],
+            edges: vec![],
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b/y.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym_in("foo", SymbolKind::Function, "/b/y.cpp")],
+            edges: vec![],
+        });
+        g
+    }
+
+    /// Local sym constructor to avoid pulling in another helper module.
+    fn sym_in(name: &str, kind: SymbolKind, file: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            file: file.to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: String::new(),
+            namespace: String::new(),
+            parent: String::new(),
+            language: Language::Cpp,
+        }
+    }
+
+    #[test]
+    fn search_symbols_subtree_filter_narrows_via_trie_iter_subtree() {
+        // Phase E.3 (C) payoff site for search_symbols: a `subtree="/a"`
+        // query routes through `Graph::search`'s `subtree_files`
+        // pre-walk (which uses `PathTrie::iter_subtree`) and matches
+        // ONLY the /a symbol, not the /b one — even though both match
+        // the regex.
+        let g = locked(graph_with_foos_in_two_subtrees());
+        let input = SearchSymbolsInput {
+            query: Some("foo"),
+            subtree: Some("/a"),
+            ..search_input()
+        };
+        let r = search_symbols(&g, input, NO_BYTE_BUDGET);
+        let body: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "subtree=/a should drop the /b match; body={body}"
+        );
+        // SymbolId carries the file path as a prefix — check that the
+        // returned record is the /a one, regardless of which optional
+        // brief/full fields the wire shape happens to expose.
+        let sid = results[0]["id"].as_str().unwrap();
+        assert!(
+            sid.starts_with("/a/x.cpp"),
+            "expected symbol from /a/x.cpp; got id={sid}"
+        );
+        assert_eq!(body["total"].as_u64().unwrap(), 1);
+
+        // No subtree → both match.
+        let input_all = SearchSymbolsInput {
+            query: Some("foo"),
+            ..search_input()
+        };
+        let r_all = search_symbols(&g, input_all, NO_BYTE_BUDGET);
+        let body_all: serde_json::Value = serde_json::from_str(&body_text(&r_all)).unwrap();
+        assert_eq!(body_all["results"].as_array().unwrap().len(), 2);
+        assert_eq!(body_all["total"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn search_symbols_subtree_count_only_uses_subtree() {
+        // count_only path must respect the subtree filter — otherwise
+        // count_only would report graph-wide totals where the
+        // materializing path reports subtree-scoped results.
+        let g = locked(graph_with_foos_in_two_subtrees());
+        let input = SearchSymbolsInput {
+            query: Some("foo"),
+            subtree: Some("/a"),
+            count_only: true,
+            ..search_input()
+        };
+        let r = search_symbols(&g, input, NO_BYTE_BUDGET);
+        let body: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(body["total"].as_u64().unwrap(), 1);
+        assert!(body["results"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1679,6 +1787,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some(""),
                 kind: Some(""),
                 namespace: Some(""),
@@ -1696,6 +1805,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 kind: Some("widget"),
                 ..search_input()
             },
@@ -1711,6 +1821,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 language: Some("ruby"),
                 ..search_input()
             },
@@ -1726,6 +1837,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("foo"),
                 limit: Some(10),
                 offset: Some(0),
@@ -1747,6 +1859,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("foo"),
                 limit: Some(0),
                 ..search_input()
@@ -2106,6 +2219,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 kind: Some("function"),
                 ..search_input()
             },
@@ -2122,6 +2236,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 language: Some("cpp"),
                 ..search_input()
             },
@@ -2181,6 +2296,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(50),
                 offset: Some(0),
@@ -2232,6 +2348,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(50),
                 offset: Some(0),
@@ -2280,6 +2397,7 @@ mod tests {
         let r1 = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(50),
                 offset: Some(0),
@@ -2304,6 +2422,7 @@ mod tests {
         let r2 = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(50),
                 offset: Some(next_offset1),
@@ -2361,6 +2480,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(50),
                 offset: Some(0),
@@ -2405,6 +2525,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(20),
                 offset: Some(0),
@@ -2437,6 +2558,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(20),
                 offset: Some(0),
@@ -2480,6 +2602,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 count_only: true,
                 ..search_input()
@@ -2528,6 +2651,7 @@ mod tests {
         let r_count = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 count_only: true,
                 ..search_input()
@@ -2540,6 +2664,7 @@ mod tests {
         let r_full = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("match"),
                 limit: Some(1),
                 ..search_input()
@@ -2566,6 +2691,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 count_only: true,
                 ..search_input()
             },
@@ -2581,6 +2707,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 kind: Some("widget"),
                 count_only: true,
                 ..search_input()
@@ -2626,6 +2753,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("^NotFoundClass$"),
                 ..search_input()
             },
@@ -2664,6 +2792,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("Zzz_absent_Zzz"),
                 ..search_input()
             },
@@ -2694,6 +2823,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("^ExistingClass$"),
                 ..search_input()
             },
@@ -2729,6 +2859,7 @@ mod tests {
         let r = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("^$"),
                 ..search_input()
             },
@@ -3308,6 +3439,7 @@ mod tests {
         let r_search = search_symbols(
             &g,
             SearchSymbolsInput {
+                subtree: None,
                 query: Some("foo"),
                 namespace: Some(""),
                 brief: true,
