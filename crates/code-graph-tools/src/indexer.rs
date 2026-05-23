@@ -200,6 +200,24 @@ pub fn index_directory(
 /// than `name` alone, so cross-language collisions are impossible.
 pub fn build_symbol_index(graphs: &[FileGraph]) -> SymbolIndex {
     let mut index = SymbolIndex::new();
+    extend_symbol_index(&mut index, graphs);
+    index
+}
+
+/// Layer additional `graphs` onto an existing [`SymbolIndex`] without
+/// rebuilding from scratch. Used by the project-wide-merge path to
+/// build a single resolver index spanning both the cached project
+/// graph and the freshly-parsed in-scope graphs: the handler first
+/// calls [`build_symbol_index`] against the cache snapshot, then
+/// extends with the fresh `FileGraph`s.
+///
+/// Entries are pushed under the same four keys as `build_symbol_index`
+/// (bare name; `Parent::Name`; `Namespace::Name`;
+/// `Namespace::Parent::Name`). Duplicate keys accumulate in the
+/// `Vec<SymbolEntry>` value — the resolver's scope-aware heuristic
+/// disambiguates at lookup time, so layering does not need to
+/// distinguish "cached" from "fresh" at index-build time.
+pub fn extend_symbol_index(index: &mut SymbolIndex, graphs: &[FileGraph]) {
     for fg in graphs {
         for s in &fg.symbols {
             let id = symbol_id(s);
@@ -211,26 +229,25 @@ pub fn build_symbol_index(graphs: &[FileGraph]) -> SymbolIndex {
             };
 
             // Bare name.
-            push(&mut index, fg.language, &s.name, entry.clone());
+            push(index, fg.language, &s.name, entry.clone());
 
             // Parent::Name for methods.
             if !s.parent.is_empty() {
                 let qualified = format!("{}::{}", s.parent, s.name);
-                push(&mut index, fg.language, &qualified, entry.clone());
+                push(index, fg.language, &qualified, entry.clone());
             }
 
             // Namespace::Name and Namespace::Parent::Name.
             if !s.namespace.is_empty() {
                 let ns_qualified = format!("{}::{}", s.namespace, s.name);
-                push(&mut index, fg.language, &ns_qualified, entry.clone());
+                push(index, fg.language, &ns_qualified, entry.clone());
                 if !s.parent.is_empty() {
                     let full = format!("{}::{}::{}", s.namespace, s.parent, s.name);
-                    push(&mut index, fg.language, &full, entry.clone());
+                    push(index, fg.language, &full, entry.clone());
                 }
             }
         }
     }
-    index
 }
 
 /// Build the basename → absolute-path file index used by the include
@@ -241,6 +258,14 @@ pub fn build_symbol_index(graphs: &[FileGraph]) -> SymbolIndex {
 /// time via suffix matching.
 pub fn build_file_index(graphs: &[FileGraph]) -> FileIndex {
     let mut index = FileIndex::new();
+    extend_file_index(&mut index, graphs);
+    index
+}
+
+/// Layer additional `graphs` onto an existing [`FileIndex`] without
+/// rebuilding from scratch. Counterpart to [`extend_symbol_index`]
+/// used by the project-wide-merge path.
+pub fn extend_file_index(index: &mut FileIndex, graphs: &[FileGraph]) {
     for fg in graphs {
         let path = PathBuf::from(&fg.path);
         if let Some(base) = path.file_name().and_then(|s| s.to_str()) {
@@ -251,7 +276,6 @@ pub fn build_file_index(graphs: &[FileGraph]) -> FileIndex {
                 .push(path);
         }
     }
-    index
 }
 
 fn push(index: &mut SymbolIndex, lang: code_graph_core::Language, key: &str, entry: SymbolEntry) {
@@ -287,7 +311,39 @@ pub fn resolve_all_edges(
 ) {
     let symbol_index = build_symbol_index(graphs);
     let file_index = build_file_index(graphs);
+    resolve_edges_with_indexes(graphs, &symbol_index, &file_index, registry, progress);
+}
 
+/// Resolve edges using PRE-BUILT `symbol_index` / `file_index` instead
+/// of indexes derived from `graphs` alone.
+///
+/// Used by the project-wide-merge path in `analyze_codebase`: the
+/// handler builds the indexes from the union of cached symbols (from a
+/// prior invocation that touched a sibling subtree) and freshly-parsed
+/// symbols (from the current invocation's scope), then resolves only
+/// the FRESH edges against that combined index. Net effect: an edge
+/// from a fresh file to a symbol cached during an earlier invocation
+/// resolves correctly even though the cached symbol's source was not
+/// re-parsed this time.
+///
+/// **Asymmetry by design.** Cached EDGES (from prior invocations) are
+/// not re-resolved here — only their endpoints contribute to the
+/// indexes. A cached edge from a previously-indexed file that
+/// originally failed to resolve (because the target subtree wasn't
+/// indexed yet) does NOT spontaneously resolve when the target subtree
+/// later becomes part of the cache; the user would need
+/// `force=true` at the originating subtree to re-parse and re-resolve.
+/// This asymmetry keeps the resolve phase's cost bounded by the size
+/// of `graphs` (the fresh set), not the size of the full project, and
+/// matches the lazy/scoped indexing contract — out-of-scope state
+/// updates lazily, never in the background.
+pub fn resolve_edges_with_indexes(
+    graphs: &mut [FileGraph],
+    symbol_index: &SymbolIndex,
+    file_index: &FileIndex,
+    registry: &LanguageRegistry,
+    progress: &dyn ProgressSink,
+) {
     let total = graphs.len() as u32;
     let counter = AtomicU32::new(0);
 
@@ -314,7 +370,7 @@ pub fn resolve_all_edges(
         fg.edges.retain_mut(|edge| {
             match edge.kind {
                 EdgeKind::Includes => {
-                    match plugin.resolve_include(&edge.to, &file_index) {
+                    match plugin.resolve_include(&edge.to, file_index) {
                         Some(resolved) if registry.language_for_path(&resolved).is_some() => {
                             edge.to = resolved.to_string_lossy().into_owned();
                         }
@@ -335,7 +391,7 @@ pub fn resolve_all_edges(
                         caller_file: &path_for_ctx,
                         language: fg.language,
                     };
-                    if let Some(id) = plugin.resolve_call(&edge.to, &ctx, &symbol_index) {
+                    if let Some(id) = plugin.resolve_call(&edge.to, &ctx, symbol_index) {
                         edge.to = id;
                     }
                 }
