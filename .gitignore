@@ -1,5 +1,9 @@
 bin/
+# Cargo's `src/bin/<name>.rs` convention for additional bins must not be
+# caught by the top-level `bin/` rule above. Exception is per-crate scoped.
+!crates/*/src/bin/
 .code-graph-cache.json
+.code-graph-cache.db
 
 # Rust workspace
 target/
