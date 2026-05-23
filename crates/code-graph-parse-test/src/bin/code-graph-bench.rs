@@ -45,8 +45,10 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use code_graph_core::{paths, ConfigError, Language, RootConfig};
@@ -59,7 +61,7 @@ use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::discovery::discover;
-use code_graph_tools::indexer::{index_directory, resolve_all_edges, NoopProgressSink};
+use code_graph_tools::indexer::{index_directory, resolve_all_edges, NoopProgressSink, ProgressSink};
 use serde::Serialize;
 
 // ============================================================================
@@ -370,24 +372,39 @@ fn main() -> ExitCode {
     cfg.resolve_concurrency();
 
     // ----- Index pipeline -----
+    // JSON mode stays silent on stderr (apart from config diagnostics emitted
+    // above) so machine consumers don't have to filter progress noise out of
+    // captured logs. Human mode routes through a throttled stderr sink that
+    // overwrites a single line via `\r\x1b[2K`.
+    let sink: Box<dyn ProgressSink> = if args.json {
+        Box::new(NoopProgressSink)
+    } else {
+        Box::new(StderrProgressSink::new())
+    };
+    let progress: &dyn ProgressSink = sink.as_ref();
+
+    // Standalone discover walk is here purely for the stage-timing report;
+    // `index_directory` below walks again internally and is the one that
+    // drives the visible "Discover" phase. Routing this call to NoopSink
+    // suppresses the duplicate "Discovered N files" tick the user would
+    // otherwise see for the same logical phase.
     let t = Instant::now();
     let discovered = discover(&args.target, &registry, &cfg, &NoopProgressSink);
     let discover_d = t.elapsed();
     let files_discovered = discovered.files.len();
 
     let t = Instant::now();
-    let (mut graphs, warnings) =
-        match index_directory(&args.target, &registry, &cfg, &NoopProgressSink) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("index_directory: {e}");
-                return ExitCode::from(1);
-            }
-        };
+    let (mut graphs, warnings) = match index_directory(&args.target, &registry, &cfg, progress) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("index_directory: {e}");
+            return ExitCode::from(1);
+        }
+    };
     let parse_d = t.elapsed();
 
     let t = Instant::now();
-    resolve_all_edges(&mut graphs, &registry, &NoopProgressSink);
+    resolve_all_edges(&mut graphs, &registry, progress);
     let resolve_d = t.elapsed();
 
     let t = Instant::now();
@@ -893,6 +910,170 @@ fn print_human_report(r: &Report) {
             ),
         }
     }
+}
+
+// ============================================================================
+// Progress sink (human mode only)
+// ============================================================================
+
+const PHASE_DISCOVER: u8 = 1;
+const PHASE_PARSE: u8 = 2;
+const PHASE_RESOLVE: u8 = 3;
+
+/// Total line width target. Sized for a 100-col+ terminal. Narrower terminals
+/// will wrap, which defeats `\r\x1b[2K` and leaves debris — accepted tradeoff
+/// vs. pulling in a terminal-size dep.
+const LINE_WIDTH: usize = 100;
+
+/// Stderr-bound progress sink with a lock-free 100ms throttle.
+///
+/// Indexer pipelines fire ~3000 events/sec on LLVM-scale trees; emitting each
+/// one would dominate wall time. The hot path is: load `last_emit_ns`, compare
+/// against the interval, return without IO if we're inside the window. Only
+/// the worker that wins a CAS for the current 100ms slot performs the write.
+///
+/// Phase boundaries (discover → parse → resolve) and the final `(N, N)` tick
+/// of each phase bypass the throttle so the user sees clean phase transitions
+/// and a terminal "done" line.
+struct StderrProgressSink {
+    start: Instant,
+    last_emit_ns: AtomicU64,
+    /// 0 = uninitialized, 1 = discover, 2 = parse, 3 = resolve.
+    phase: AtomicU8,
+    interval_ns: u64,
+    is_tty: bool,
+}
+
+impl StderrProgressSink {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_emit_ns: AtomicU64::new(0),
+            phase: AtomicU8::new(0),
+            interval_ns: 100_000_000, // 100ms
+            is_tty: std::io::stderr().is_terminal(),
+        }
+    }
+}
+
+/// Classify a progress message: `(phase, fixed-width label, optional path)`.
+///
+/// The path is split off the prefix so the renderer can truncate it at a `/`
+/// boundary instead of cutting mid-segment. Non-path messages
+/// (`"Discovering files..."`, `"Discovered N files"`) flow through verbatim.
+fn classify(msg: &str) -> (u8, &'static str, Option<&str>) {
+    if let Some(rest) = msg.strip_prefix("Parsing: ") {
+        (PHASE_PARSE, "Parse", Some(rest))
+    } else if let Some(rest) = msg.strip_prefix("Resolving edges: ") {
+        (PHASE_RESOLVE, "Resolve", Some(rest))
+    } else {
+        (PHASE_DISCOVER, "Discover", None)
+    }
+}
+
+impl ProgressSink for StderrProgressSink {
+    fn report(&self, progress: u32, total: u32, message: &str) {
+        let (phase, label, path) = classify(message);
+        let prev_phase = self.phase.swap(phase, Ordering::Relaxed);
+        let phase_changed = prev_phase != phase;
+        // Always emit on phase transitions, the discover-start indeterminate
+        // marker, and the final `(N, N)` tick of each phase. Each phase's
+        // final tick terminates its `\r`-overwritten line with `\n`, so the
+        // next phase's first tick starts on a fresh row — no extra newline
+        // needed at the boundary (an earlier version emitted one and the
+        // output ended up with blank lines between phases).
+        let force = phase_changed || (progress == total && total > 0);
+
+        if !force {
+            let now_ns = self.start.elapsed().as_nanos() as u64;
+            let last = self.last_emit_ns.load(Ordering::Relaxed);
+            if now_ns.saturating_sub(last) < self.interval_ns {
+                return;
+            }
+            // CAS-lose means a concurrent worker is about to emit a fresher
+            // tick — bail without touching IO.
+            if self
+                .last_emit_ns
+                .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return;
+            }
+        } else {
+            // Reset the throttle window so the first throttled tick after a
+            // forced emit lands 100ms later, not immediately.
+            let now_ns = self.start.elapsed().as_nanos() as u64;
+            self.last_emit_ns.store(now_ns, Ordering::Relaxed);
+        }
+
+        // Header: `[Parse     72242/ 72242 100.0%] ` or `[Discover] ` for the
+        // indeterminate-phase start marker. Label width matches the longest
+        // label ("Discover" = 8) so phase ticks align column-wise.
+        let header = if total > 0 {
+            let pct = (progress as f64 / total as f64) * 100.0;
+            format!("[{label:>8} {progress:>6}/{total:>6} {pct:>5.1}%] ")
+        } else {
+            format!("[{label:>8}] ")
+        };
+        let budget = LINE_WIDTH.saturating_sub(header.len());
+
+        let mut out = std::io::stderr().lock();
+        if self.is_tty {
+            // \r returns to col 1; \x1b[2K clears the line so a shorter
+            // message doesn't leave the prior line's tail.
+            let _ = write!(out, "\r\x1b[2K{header}");
+        } else {
+            let _ = write!(out, "{header}");
+        }
+        match path {
+            Some(p) => write_truncated_path(&mut out, p, budget),
+            None => write_truncated(&mut out, message, budget),
+        }
+        if !self.is_tty || (progress == total && total > 0) {
+            let _ = writeln!(out);
+        }
+        let _ = out.flush();
+    }
+}
+
+/// Truncate a path on the left, snapping to the next `/` after the cut so we
+/// don't slice through a path segment like `rnal/llvm/...`. Prepends `…` as
+/// a truncation marker.
+fn write_truncated_path(out: &mut impl Write, path: &str, max: usize) {
+    if path.len() <= max {
+        let _ = write!(out, "{path}");
+        return;
+    }
+    // Reserve 1 char for the leading ellipsis.
+    let target = max.saturating_sub(1);
+    if target == 0 {
+        return;
+    }
+    let cut = path.len() - target;
+    // Snap forward to the next path separator so the rendered segment starts
+    // at a directory boundary. Fall back to a char-boundary-safe slice if no
+    // separator follows (rare for absolute paths).
+    let mut start = path[cut..]
+        .find('/')
+        .map(|i| cut + i)
+        .unwrap_or(cut);
+    while start < path.len() && !path.is_char_boundary(start) {
+        start += 1;
+    }
+    let _ = write!(out, "…{}", &path[start..]);
+}
+
+/// Char-boundary-safe left truncation for non-path messages.
+fn write_truncated(out: &mut impl Write, s: &str, max: usize) {
+    if s.len() <= max {
+        let _ = write!(out, "{s}");
+        return;
+    }
+    let mut i = s.len() - max;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    let _ = write!(out, "{}", &s[i..]);
 }
 
 fn print_timing(label: &str, t: &TimingStats) {
