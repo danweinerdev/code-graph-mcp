@@ -379,8 +379,11 @@ pub fn resolve_edges_with_indexes(
             match edge.kind {
                 EdgeKind::Includes => {
                     match plugin.resolve_include(&edge.to, file_index) {
-                        Some(resolved) if registry.language_for_path(&resolved).is_some() => {
+                        Some((resolved, confidence))
+                            if registry.language_for_path(&resolved).is_some() =>
+                        {
                             edge.to = resolved.to_string_lossy().into_owned();
+                            edge.confidence = confidence;
                         }
                         // Unresolved, or resolved to a non-source target: this
                         // include does not point at an indexed source file
@@ -399,9 +402,17 @@ pub fn resolve_edges_with_indexes(
                         caller_file: &path_for_ctx,
                         language: fg.language,
                     };
-                    if let Some(id) = plugin.resolve_call(&edge.to, &ctx, symbol_index) {
+                    if let Some((id, confidence)) =
+                        plugin.resolve_call(&edge.to, &ctx, symbol_index)
+                    {
                         edge.to = id;
+                        edge.confidence = confidence;
                     }
+                    // Unresolved bare-token calls keep their pre-resolve
+                    // `Confidence::Resolved` mark; they're filtered at
+                    // BFS time via `is_resolved_node` and never surface
+                    // to agent queries, so the confidence on them is
+                    // observable only through cache introspection.
                 }
                 // Bare derived class names are the canonical form; the
                 // graph engine resolves them to a concrete class node only
@@ -421,8 +432,11 @@ pub fn resolve_edges_with_indexes(
                         caller_file: &path_for_ctx,
                         language: fg.language,
                     };
-                    if let Some(id) = plugin.resolve_call(&edge.to, &ctx, symbol_index) {
+                    if let Some((id, confidence)) =
+                        plugin.resolve_call(&edge.to, &ctx, symbol_index)
+                    {
                         edge.to = id;
+                        edge.confidence = confidence;
                     }
                 }
                 _ => {}
@@ -768,6 +782,88 @@ mod tests {
             call_edge.to,
             format!("{header_path}:do_thing"),
             "call must resolve to symbol ID"
+        );
+        // Both edges had a sole candidate (one `foo.h`, one `do_thing`)
+        // — the resolver must mark them Resolved, not Heuristic. A
+        // regression that flipped the resolver to "always Heuristic
+        // when downgrading from raw token" would show up here.
+        assert_eq!(
+            include_edge.confidence,
+            Confidence::Resolved,
+            "sole-candidate include must stay Resolved"
+        );
+        assert_eq!(
+            call_edge.confidence,
+            Confidence::Resolved,
+            "sole-candidate call must stay Resolved"
+        );
+    }
+
+    /// Multi-candidate call resolution downgrades the edge to
+    /// [`Confidence::Heuristic`]. The fixture stages two C++ functions
+    /// named `helper` in separate files and a `caller` that invokes
+    /// `helper`; the scope rule picks the same-file one, but the
+    /// confidence ride-along must mark it Heuristic regardless.
+    /// This is the end-to-end through-the-resolve-loop counterpart
+    /// of the unit-level
+    /// `default_scope_aware_resolve_picks_same_file_over_global`
+    /// assertion in `code-graph-lang`.
+    #[test]
+    fn resolve_all_edges_marks_multi_candidate_call_heuristic() {
+        fn func_sym(name: &str, file: &str) -> Symbol {
+            Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                file: file.to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: format!("void {name}()"),
+                namespace: String::new(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }
+        }
+        let path_a = "/proj/a.cpp".to_string();
+        let path_b = "/proj/b.cpp".to_string();
+        let a = FileGraph {
+            path: path_a.clone(),
+            language: Language::Cpp,
+            symbols: vec![func_sym("helper", &path_a), func_sym("caller", &path_a)],
+            edges: vec![Edge {
+                from: format!("{path_a}:caller"),
+                to: "helper".to_string(),
+                kind: EdgeKind::Calls,
+                file: path_a.clone(),
+                line: 2,
+                confidence: Confidence::Resolved,
+            }],
+        };
+        let b = FileGraph {
+            path: path_b.clone(),
+            language: Language::Cpp,
+            symbols: vec![func_sym("helper", &path_b)],
+            edges: Vec::new(),
+        };
+        let mut graphs = vec![a, b];
+        let reg = cpp_only_registry();
+        resolve_all_edges(&mut graphs, &reg, &NoopProgressSink);
+
+        let call_edge = graphs
+            .iter()
+            .find(|g| g.path == path_a)
+            .and_then(|g| g.edges.iter().find(|e| matches!(e.kind, EdgeKind::Calls)))
+            .expect("caller's Calls edge must survive resolve");
+        assert_eq!(
+            call_edge.to,
+            format!("{path_a}:helper"),
+            "scope rule picks same-file candidate"
+        );
+        assert_eq!(
+            call_edge.confidence,
+            Confidence::Heuristic,
+            "multi-candidate match must be marked Heuristic — the per-tool \
+             min_confidence filter relies on this"
         );
     }
 

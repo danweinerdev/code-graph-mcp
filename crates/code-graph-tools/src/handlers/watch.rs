@@ -429,8 +429,11 @@ pub async fn try_reindex_file(
         match edge.kind {
             EdgeKind::Includes => {
                 match plugin.resolve_include(&edge.to, &file_index) {
-                    Some(resolved) if inner.registry.language_for_path(&resolved).is_some() => {
+                    Some((resolved, confidence))
+                        if inner.registry.language_for_path(&resolved).is_some() =>
+                    {
                         edge.to = resolved.to_string_lossy().into_owned();
+                        edge.confidence = confidence;
                     }
                     // Unresolved, or resolved to a non-source target: this
                     // include does not point at an indexed source file
@@ -449,8 +452,11 @@ pub async fn try_reindex_file(
                     caller_file: &path_for_ctx,
                     language: new_fg.language,
                 };
-                if let Some(id) = plugin.resolve_call(&edge.to, &ctx, &symbol_index) {
+                if let Some((id, confidence)) =
+                    plugin.resolve_call(&edge.to, &ctx, &symbol_index)
+                {
                     edge.to = id;
+                    edge.confidence = confidence;
                 }
             }
             // Bare derived class names are the canonical form for inherits

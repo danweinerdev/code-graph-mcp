@@ -914,7 +914,11 @@ impl LanguagePlugin for RustParser {
     /// direction that produces no false positives: an absolute path
     /// *in* the index points at a real source file, so any Rust edge
     /// whose `to` is that path is by definition resolved.
-    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
+    fn resolve_include(
+        &self,
+        raw: &str,
+        file_index: &FileIndex,
+    ) -> Option<(PathBuf, Confidence)> {
         let candidate = Path::new(raw);
         if !candidate.is_absolute() {
             // `use`/`extern crate` tokens (`"std::io"`, `"alloc"`) are
@@ -924,7 +928,12 @@ impl LanguagePlugin for RustParser {
             return None;
         }
         if file_index.contains_path(candidate) {
-            Some(candidate.to_path_buf())
+            // `mod`-decl resolution + `#[path]` overrides produce
+            // absolute paths against a known file set, so a hit here
+            // is always definitive — never the multi-candidate
+            // basename-collision shape that produces Heuristic in
+            // the default resolver.
+            Some((candidate.to_path_buf(), Confidence::Resolved))
         } else {
             None
         }
@@ -3305,7 +3314,7 @@ mod tests {
             .filter_map(|e| {
                 parser
                     .resolve_include(&e.to, &file_index)
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|(p, _confidence)| p.to_string_lossy().into_owned())
             })
             .collect();
         assert_eq!(
@@ -3329,9 +3338,11 @@ mod tests {
 
         let resolved = parser.resolve_include("/proj/src/foo.rs", &file_index);
         assert_eq!(
-            resolved.as_deref(),
-            Some(Path::new("/proj/src/foo.rs")),
-            "indexed absolute path must resolve to itself"
+            resolved,
+            Some((PathBuf::from("/proj/src/foo.rs"), Confidence::Resolved)),
+            "indexed absolute path must resolve to itself with Resolved confidence — \
+             the Rust override never produces Heuristic (mod-decl + #[path] are \
+             definitive, not basename guesses)"
         );
     }
 

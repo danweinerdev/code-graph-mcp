@@ -16,7 +16,7 @@
 
 pub mod helpers;
 
-use code_graph_core::{ExtensionsConfig, FileGraph, Language, RootConfig, SymbolId};
+use code_graph_core::{Confidence, ExtensionsConfig, FileGraph, Language, RootConfig, SymbolId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -200,13 +200,14 @@ pub(crate) fn default_scope_aware_resolve(
     callee: &str,
     ctx: &CallContext,
     index: &SymbolIndex,
-) -> Option<SymbolId> {
+) -> Option<(SymbolId, Confidence)> {
     let candidates = index.by_name.get(&(language, callee.to_string()))?;
     if candidates.is_empty() {
         return None;
     }
     if candidates.len() == 1 {
-        return Some(candidates[0].id.clone());
+        // Sole candidate — no ambiguity, no heuristic involved.
+        return Some((candidates[0].id.clone(), Confidence::Resolved));
     }
 
     let caller_parent = caller_id_parent(ctx.caller_id);
@@ -234,7 +235,11 @@ pub(crate) fn default_scope_aware_resolve(
         }
     }
     let _ = caller_ns; // mirror Go's `_ = callerNS` line
-    best.map(|e| e.id.clone())
+    // ≥ 2 candidates reached the scoring loop: every match here is a
+    // heuristic pick by definition, regardless of how decisive the
+    // winning score was. Agents asking for `min_confidence=resolved`
+    // can filter these out.
+    best.map(|e| (e.id.clone(), Confidence::Heuristic))
 }
 
 /// Extract the parent class name from a caller's symbol ID.
@@ -277,26 +282,33 @@ fn caller_id_parent(caller_id: &str) -> String {
 /// `internal/tools/analyze.go::resolveInclude` byte-for-byte.
 ///
 /// 1. Look up candidates by `file_name()` of the raw include path.
-/// 2. If exactly one candidate matches, return it.
+/// 2. If exactly one candidate matches, return it ([`Confidence::Resolved`]).
 /// 3. If multiple candidates share the basename, prefer the one whose
 ///    full path ends with `/raw` or `\raw` (suffix disambiguation for
 ///    cases like `#include "foo/bar.h"` matching `.../foo/bar.h` over
-///    `.../baz/bar.h`).
-/// 4. Otherwise return the first candidate (ambiguous).
-pub(crate) fn default_basename_resolve(raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
+///    `.../baz/bar.h`). Suffix-disambiguated matches are
+///    [`Confidence::Resolved`] — the suffix rule is a definitive
+///    structural match, not a guess.
+/// 4. Otherwise return the first candidate ([`Confidence::Heuristic`]) —
+///    the ambiguity case where the resolver picked one of N
+///    same-basename headers without a structural disambiguator.
+pub(crate) fn default_basename_resolve(
+    raw: &str,
+    file_index: &FileIndex,
+) -> Option<(PathBuf, Confidence)> {
     let base = std::path::Path::new(raw).file_name()?.to_str()?;
     let candidates = file_index.by_basename.get(base)?;
     if candidates.len() == 1 {
-        return Some(candidates[0].clone());
+        return Some((candidates[0].clone(), Confidence::Resolved));
     }
     if candidates.len() > 1 {
         for c in candidates {
             let cs = c.to_string_lossy();
             if cs.ends_with(&format!("/{raw}")) || cs.ends_with(&format!("\\{raw}")) {
-                return Some(c.clone());
+                return Some((c.clone(), Confidence::Resolved));
             }
         }
-        return Some(candidates[0].clone());
+        return Some((candidates[0].clone(), Confidence::Heuristic));
     }
     None
 }
@@ -372,12 +384,21 @@ pub trait LanguagePlugin: Send + Sync {
     /// scopes the lookup to candidates from the same [`Language`] as the
     /// caller. Languages override to add language-specific scoping (e.g.
     /// Python prefers same-module).
+    ///
+    /// Returns the resolved [`SymbolId`] paired with a [`Confidence`]
+    /// tag: [`Confidence::Resolved`] when the lookup had a sole
+    /// candidate (no ambiguity), [`Confidence::Heuristic`] when the
+    /// resolver picked from ≥ 2 same-name candidates via the scope
+    /// rule. Plugins that override and have their own ambiguity model
+    /// must produce the same distinction; an override returning
+    /// `Resolved` for an ambiguous match would defeat the per-tool
+    /// `min_confidence` filter.
     fn resolve_call(
         &self,
         callee: &str,
         ctx: &CallContext,
         index: &SymbolIndex,
-    ) -> Option<SymbolId> {
+    ) -> Option<(SymbolId, Confidence)> {
         default_scope_aware_resolve(self.id(), callee, ctx, index)
     }
 
@@ -385,7 +406,20 @@ pub trait LanguagePlugin: Send + Sync {
     /// basename-based path matching with a suffix-disambiguation pass.
     /// Languages with package systems (Go modules, Python dotted imports)
     /// should override.
-    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<PathBuf> {
+    ///
+    /// Returns the resolved [`PathBuf`] paired with a [`Confidence`]
+    /// tag: [`Confidence::Resolved`] for a sole-candidate match OR a
+    /// suffix-disambiguated multi-candidate match (the suffix rule is
+    /// structural, not heuristic); [`Confidence::Heuristic`] when the
+    /// resolver picked the first of N same-basename headers without a
+    /// structural disambiguator. Overrides that always have a
+    /// definitive answer (e.g. Rust's `mod`-decl + `#[path]`
+    /// resolver) should return `Resolved` unconditionally.
+    fn resolve_include(
+        &self,
+        raw: &str,
+        file_index: &FileIndex,
+    ) -> Option<(PathBuf, Confidence)> {
         default_basename_resolve(raw, file_index)
     }
 
@@ -916,7 +950,13 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "helper", &ctx, &idx);
-        assert_eq!(resolved.as_deref(), Some("/proj/a.cpp:helper"));
+        let (id, confidence) = resolved.expect("must resolve");
+        assert_eq!(id, "/proj/a.cpp:helper");
+        assert_eq!(
+            confidence,
+            Confidence::Heuristic,
+            "multi-candidate pick is Heuristic by definition"
+        );
     }
 
     #[test]
@@ -940,7 +980,13 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "tick", &ctx, &idx);
-        assert_eq!(resolved.as_deref(), Some("/proj/b.cpp:Engine::tick"));
+        let (id, confidence) = resolved.expect("must resolve");
+        assert_eq!(id, "/proj/b.cpp:Engine::tick");
+        assert_eq!(
+            confidence,
+            Confidence::Heuristic,
+            "multi-candidate pick is Heuristic even when the scope rule was decisive"
+        );
     }
 
     #[test]
@@ -975,7 +1021,11 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "init", &ctx, &idx);
-        assert_eq!(resolved.as_deref(), Some("/proj/m.cpp:init"));
+        // Single C++ candidate after language scoping: Resolved.
+        assert_eq!(
+            resolved,
+            Some(("/proj/m.cpp:init".to_string(), Confidence::Resolved))
+        );
 
         // And the Python lookup returns the Python entry.
         let py_caller_file = PathBuf::from("/proj/other.py");
@@ -985,7 +1035,10 @@ mod tests {
             language: Language::Python,
         };
         let resolved_py = default_scope_aware_resolve(Language::Python, "init", &py_ctx, &idx);
-        assert_eq!(resolved_py.as_deref(), Some("/proj/m.py:init"));
+        assert_eq!(
+            resolved_py,
+            Some(("/proj/m.py:init".to_string(), Confidence::Resolved))
+        );
     }
 
     #[test]
@@ -1001,7 +1054,11 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "only_one", &ctx, &idx);
-        assert_eq!(resolved.as_deref(), Some("/proj/x.cpp:only_one"));
+        assert_eq!(
+            resolved,
+            Some(("/proj/x.cpp:only_one".to_string(), Confidence::Resolved)),
+            "single-candidate match is unambiguous → Confidence::Resolved"
+        );
     }
 
     #[test]
@@ -1012,7 +1069,14 @@ mod tests {
             .or_default()
             .push(PathBuf::from("/proj/include/foo.h"));
         let resolved = default_basename_resolve("foo.h", &idx);
-        assert_eq!(resolved.as_deref(), Some(Path::new("/proj/include/foo.h")));
+        assert_eq!(
+            resolved,
+            Some((
+                PathBuf::from("/proj/include/foo.h"),
+                Confidence::Resolved
+            )),
+            "unique basename → Confidence::Resolved"
+        );
     }
 
     #[test]
@@ -1030,7 +1094,11 @@ mod tests {
             .or_default()
             .push(PathBuf::from("/proj/foo/bar.h"));
         let resolved = default_basename_resolve("foo/bar.h", &idx);
-        assert_eq!(resolved.as_deref(), Some(Path::new("/proj/foo/bar.h")));
+        assert_eq!(
+            resolved,
+            Some((PathBuf::from("/proj/foo/bar.h"), Confidence::Resolved)),
+            "suffix disambiguation is a structural match, not heuristic → Resolved"
+        );
     }
 
     #[test]
