@@ -1,6 +1,5 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
-assertion_line: 81
 expression: "tool_entry(\"detect_cycles\")"
 ---
 {
@@ -36,6 +35,14 @@ expression: "tool_entry(\"detect_cycles\")"
         "minimum": 0,
         "type": [
           "integer",
+          "null"
+        ]
+      },
+      "subtree": {
+        "default": null,
+        "description": "Restrict reported cycles to those whose every file is at or under this directory prefix. Cycles touching files outside the prefix are dropped from the response (cycle DETECTION is still global — a cycle passing through an outside file is still detected, just not reported). Absent / empty value reports all cycles.",
+        "type": [
+          "string",
           "null"
         ]
       }

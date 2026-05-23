@@ -93,6 +93,14 @@ expression: "tool_entry(\"search_symbols\")"
           "string",
           "null"
         ]
+      },
+      "subtree": {
+        "default": null,
+        "description": "Restrict matches to symbols whose file path is at or under this directory prefix. Uses the path-trie's subtree iterator so the file-set build cost is proportional to the subtree, NOT the whole graph. Absent / empty value matches across the whole graph.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
     "title": "SearchSymbolsArgs",
