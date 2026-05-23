@@ -61,7 +61,7 @@ For Claude Code, add the equivalent block to your project's `.claude/settings.js
 
 ## Configuration
 
-Each indexed root may contain a `.code-graph.toml` file controlling discovery and parsing knobs. See [`.code-graph.toml.example`](.code-graph.toml.example) at the repo root for the documented schema.
+Place a `.code-graph.toml` at your project root. `analyze_codebase` walks upward from the path you invoke it with, looking for the nearest `.code-graph.toml` — the same convention cargo, git, rustfmt, and editorconfig use. Whichever directory contains that file becomes the **project root**: the discovered config applies, the project-wide cache lives there, and scoped invocations (`analyze_codebase` against a subdirectory) accumulate into the same cache. See [`.code-graph.toml.example`](.code-graph.toml.example) at the repo root for the documented schema.
 
 Schema (all keys optional; defaults shown):
 
@@ -76,7 +76,7 @@ extra_ignore = []         # additional gitignore-style globs to exclude
 max_threads = 0           # 0 = auto; same clamping rule as discovery
 ```
 
-The file is read once per `analyze_codebase` call from `<root>/.code-graph.toml` and cached on the server for subsequent watch events. Missing file → defaults. Malformed TOML → `analyze_codebase` fails with a parse error (no silent fallback).
+The discovery walk stops at the first `.code-graph.toml` it finds (no merging across nested files — a `.code-graph.toml` inside a subdir of a configured project marks that subdir as its own project). If no toml exists between the invocation path and the filesystem root, built-in defaults apply and `analyze_codebase` surfaces a warning naming the consequence (engine-style classes prefixed with API-export macros will not extract — see the `[cpp].macro_strip` section of the example config). Malformed TOML → `analyze_codebase` fails with a parse error (no silent fallback).
 
 ## Tools
 
