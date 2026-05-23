@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{EdgeKind, Symbol, SymbolId, SymbolKind};
+use code_graph_core::{Confidence, EdgeKind, Symbol, SymbolId, SymbolKind};
 
 use crate::{EdgeEntry, Graph, IncludeEntry};
 
@@ -46,15 +46,36 @@ impl Graph {
     /// reverse adjacency list filtered by `EdgeKind::Calls`. `depth = 0`
     /// is normalized to 1 to match the Go behavior — an agent passing
     /// `0` would otherwise get an empty result, which is confusing.
-    pub fn callers(&self, id: &str, depth: u32) -> Vec<CallChain> {
-        self.bfs(id, depth, &self.radj, EdgeKind::Calls)
+    ///
+    /// `min_confidence` filters edges by their resolver confidence
+    /// (see [`Confidence`]): `None` admits every edge,
+    /// `Some(Confidence::Resolved)` drops `Heuristic` (multi-candidate)
+    /// edges at BFS time so the resulting chain only contains hops the
+    /// resolver was sure about. The threshold is applied at each hop, so
+    /// a depth-2 walk via a Heuristic intermediate is pruned entirely
+    /// (the intermediate's own depth-1 row never enters `visited`).
+    /// Passing `Some(Confidence::Heuristic)` is a no-op (every
+    /// confidence value satisfies it).
+    pub fn callers(
+        &self,
+        id: &str,
+        depth: u32,
+        min_confidence: Option<Confidence>,
+    ) -> Vec<CallChain> {
+        self.bfs(id, depth, &self.radj, EdgeKind::Calls, min_confidence)
     }
 
     /// Symbols called by `id`, up to `depth` hops away. BFS over the
     /// forward adjacency list filtered by `EdgeKind::Calls`. `depth = 0`
-    /// is normalized to 1 (see [`Graph::callers`]).
-    pub fn callees(&self, id: &str, depth: u32) -> Vec<CallChain> {
-        self.bfs(id, depth, &self.adj, EdgeKind::Calls)
+    /// is normalized to 1 (see [`Graph::callers`]). `min_confidence` has
+    /// the same semantics as on [`Graph::callers`].
+    pub fn callees(
+        &self,
+        id: &str,
+        depth: u32,
+        min_confidence: Option<Confidence>,
+    ) -> Vec<CallChain> {
+        self.bfs(id, depth, &self.adj, EdgeKind::Calls, min_confidence)
     }
 
     /// Methods that override `id`. One-hop only: returns the direct
@@ -118,6 +139,7 @@ impl Graph {
         depth: u32,
         adjacency: &HashMap<SymbolId, Vec<EdgeEntry>>,
         kind: EdgeKind,
+        min_confidence: Option<Confidence>,
     ) -> Vec<CallChain> {
         let depth = if depth == 0 { 1 } else { depth };
 
@@ -142,6 +164,20 @@ impl Graph {
                     continue;
                 }
                 if visited.contains(&entry.target) {
+                    continue;
+                }
+                // Confidence filter (Phase 3 of #27). Heuristic edges
+                // are dropped at the same point as unresolved targets,
+                // so a multi-candidate intermediate at depth 1 NEVER
+                // enters `visited` — and `get_callers`/`get_callees`
+                // with `min_confidence=resolved` returns chains that
+                // are end-to-end Resolved. The threshold is `==` not
+                // `<=` because `Confidence` has no Ord impl: only
+                // `Some(Resolved)` and `None` are useful (Heuristic as
+                // a threshold passes everything).
+                if min_confidence == Some(Confidence::Resolved)
+                    && entry.confidence != Confidence::Resolved
+                {
                     continue;
                 }
                 // Resolved-only filter (design Decision 7). Unresolved
@@ -256,16 +292,16 @@ mod tests {
     fn callers_linear_chain() {
         let g = linear_chain();
 
-        let one = g.callers("/x.cpp:d", 1);
+        let one = g.callers("/x.cpp:d", 1, None);
         assert_eq!(ids(&one), vec!["/x.cpp:c".to_string()]);
 
-        let two = g.callers("/x.cpp:d", 2);
+        let two = g.callers("/x.cpp:d", 2, None);
         assert_eq!(
             ids(&two),
             vec!["/x.cpp:b".to_string(), "/x.cpp:c".to_string()],
         );
 
-        let three = g.callers("/x.cpp:d", 3);
+        let three = g.callers("/x.cpp:d", 3, None);
         assert_eq!(
             ids(&three),
             vec![
@@ -280,10 +316,10 @@ mod tests {
     fn callees_linear_chain() {
         let g = linear_chain();
 
-        let one = g.callees("/x.cpp:a", 1);
+        let one = g.callees("/x.cpp:a", 1, None);
         assert_eq!(ids(&one), vec!["/x.cpp:b".to_string()]);
 
-        let three = g.callees("/x.cpp:a", 3);
+        let three = g.callees("/x.cpp:a", 3, None);
         assert_eq!(
             ids(&three),
             vec![
@@ -317,7 +353,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callees("/x.cpp:a", 2);
+        let chain = g.callees("/x.cpp:a", 2, None);
         assert_eq!(chain.len(), 3, "d visited only once: {chain:?}");
         assert_eq!(
             ids(&chain),
@@ -352,7 +388,7 @@ mod tests {
 
         // depth=10 is far higher than the cycle length; if the BFS
         // looped, this would never return.
-        let chain = g.callees("/x.cpp:a", 10);
+        let chain = g.callees("/x.cpp:a", 10, None);
         assert_eq!(chain.len(), 2, "exactly b and c, never a again: {chain:?}");
         assert_eq!(
             ids(&chain),
@@ -365,8 +401,8 @@ mod tests {
     #[test]
     fn bfs_depth_zero_normalized_to_one() {
         let g = linear_chain();
-        let zero = g.callees("/x.cpp:a", 0);
-        let one = g.callees("/x.cpp:a", 1);
+        let zero = g.callees("/x.cpp:a", 0, None);
+        let one = g.callees("/x.cpp:a", 1, None);
         assert_eq!(zero, one, "depth=0 must behave like depth=1");
         assert_eq!(zero.len(), 1);
         assert_eq!(zero[0].symbol_id, "/x.cpp:b");
@@ -377,8 +413,8 @@ mod tests {
     #[test]
     fn bfs_unknown_symbol_returns_empty() {
         let g = linear_chain();
-        assert!(g.callers("nonexistent", 5).is_empty());
-        assert!(g.callees("nonexistent", 5).is_empty());
+        assert!(g.callers("nonexistent", 5, None).is_empty());
+        assert!(g.callees("nonexistent", 5, None).is_empty());
     }
 
     // --- CallChain payload ---
@@ -396,7 +432,7 @@ mod tests {
             vec![call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp", 42)],
         ));
 
-        let chain = g.callees("/x.cpp:a", 1);
+        let chain = g.callees("/x.cpp:a", 1, None);
         assert_eq!(chain.len(), 1);
         let hop = &chain[0];
         assert_eq!(hop.symbol_id, "/x.cpp:b");
@@ -429,7 +465,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callers("/x.cpp:b", 5);
+        let chain = g.callers("/x.cpp:b", 5, None);
         let names = ids(&chain);
         assert_eq!(
             names,
@@ -462,7 +498,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callees("/x.rs:A", 1);
+        let chain = g.callees("/x.rs:A", 1, None);
         assert_eq!(
             ids(&chain),
             vec!["/x.rs:B".to_string()],
@@ -527,7 +563,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callees("/x.rs:Entry", 3);
+        let chain = g.callees("/x.rs:Entry", 3, None);
         let resolved_ids = ids(&chain);
         assert_eq!(
             resolved_ids,
@@ -597,7 +633,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callees("/x.rs:F", 2);
+        let chain = g.callees("/x.rs:F", 2, None);
         assert!(
             chain.is_empty(),
             "every callee is unresolved -> empty BFS result: {chain:?}",
@@ -629,7 +665,7 @@ mod tests {
             ],
         ));
 
-        let chain = g.callers("/x.rs:S", 1);
+        let chain = g.callers("/x.rs:S", 1, None);
         assert_eq!(
             ids(&chain),
             vec!["/x.rs:R1".to_string(), "/x.rs:R2".to_string()],

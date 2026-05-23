@@ -743,6 +743,7 @@ async fn cross_language_init_callers_stay_isolated() {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&first_text(&resp)).expect("get_callers response is JSON");

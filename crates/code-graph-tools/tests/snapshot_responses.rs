@@ -366,6 +366,7 @@ async fn response_get_callers_engine_update() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     // No further normalization needed; the envelope itself is deterministic.
@@ -390,6 +391,7 @@ async fn response_get_callees_engine_update() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     // Handler now sorts by (depth, symbol_id) and wraps in Page<CallChain>.
     let parsed = parsed_sorted(&r);
@@ -858,6 +860,7 @@ async fn response_get_callers_paginated_offset() {
         Some(50),
         Some(50),
         NO_BYTE_BUDGET,
+            None,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -893,6 +896,7 @@ async fn response_get_callers_byte_budget_truncated() {
         Some(50),
         Some(0),
         max_bytes,
+        None,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -916,6 +920,7 @@ async fn response_get_callees_paginated_offset() {
         Some(50),
         Some(50),
         NO_BYTE_BUDGET,
+        None,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
@@ -952,6 +957,7 @@ async fn response_get_callees_byte_budget_truncated() {
         Some(50),
         Some(0),
         max_bytes,
+        None,
     );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {

@@ -1,6 +1,5 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
-assertion_line: 101
 expression: "tool_entry(\"generate_diagram\")"
 ---
 {
@@ -58,6 +57,14 @@ expression: "tool_entry(\"generate_diagram\")"
         "minimum": 0,
         "type": [
           "integer",
+          "null"
+        ]
+      },
+      "min_confidence": {
+        "default": null,
+        "description": "Minimum resolver confidence required for an edge to appear (symbol mode only): \"any\" (default) admits Heuristic edges, \"resolved\" drops edges the resolver picked from N same-name candidates. Same wire spelling and semantics as on `get_callers`/`get_callees`. Ignored by file and class modes — file dependencies and inheritance edges don't carry confidence today.",
+        "type": [
+          "string",
           "null"
         ]
       },

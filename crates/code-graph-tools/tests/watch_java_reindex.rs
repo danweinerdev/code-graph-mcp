@@ -278,6 +278,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -401,6 +402,7 @@ class Gamma extends Alpha { public void m() { } }\n",
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     if r.is_error == Some(true) {
         let body = first_text(&r);
@@ -568,6 +570,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -659,6 +662,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert_eq!(
         r.is_error,

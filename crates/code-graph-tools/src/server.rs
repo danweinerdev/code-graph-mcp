@@ -341,6 +341,20 @@ pub struct GetCallersArgs {
     #[schemars(description = "Skip first N callers for pagination (default 0)")]
     #[serde(default)]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "Minimum resolver confidence required for a hop to appear. \"any\" \
+                       (default) includes every resolved edge; \"resolved\" drops edges \
+                       the resolver picked from N same-name candidates (Heuristic) and \
+                       returns only chains the resolver was sure about. Heuristic edges \
+                       arise when ≥ 2 symbols share a callee name and the scope rule \
+                       (same file > same parent > same namespace > global) picked one \
+                       — useful filter when several unrelated classes have a method \
+                       with the same name (e.g. `init`). Filter applies at each hop, \
+                       so a depth-2 walk through a Heuristic intermediate is pruned \
+                       entirely."
+    )]
+    #[serde(default)]
+    pub min_confidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -356,6 +370,15 @@ pub struct GetCalleesArgs {
     #[schemars(description = "Skip first N callees for pagination (default 0)")]
     #[serde(default)]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "Minimum resolver confidence required for a hop to appear. \"any\" \
+                       (default) includes every resolved edge; \"resolved\" drops edges \
+                       the resolver picked from N same-name candidates (Heuristic) and \
+                       returns only chains the resolver was sure about. Same semantics \
+                       as on `get_callers`."
+    )]
+    #[serde(default)]
+    pub min_confidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -509,6 +532,16 @@ pub struct GenerateDiagramArgs {
     )]
     #[serde(default)]
     pub direction: Option<String>,
+    #[schemars(
+        description = "Minimum resolver confidence required for an edge to appear (symbol \
+                       mode only): \"any\" (default) admits Heuristic edges, \"resolved\" \
+                       drops edges the resolver picked from N same-name candidates. Same \
+                       wire spelling and semantics as on `get_callers`/`get_callees`. \
+                       Ignored by file and class modes — file dependencies and \
+                       inheritance edges don't carry confidence today."
+    )]
+    #[serde(default)]
+    pub min_confidence: Option<String>,
     #[schemars(
         description = "When format=mermaid, add CSS styling and center node highlighting (default false)"
     )]
@@ -804,6 +837,7 @@ impl CodeGraphServer {
             args.limit,
             args.offset,
             max_bytes,
+            args.min_confidence.as_deref(),
         ))
     }
 
@@ -882,6 +916,7 @@ impl CodeGraphServer {
             args.limit,
             args.offset,
             max_bytes,
+            args.min_confidence.as_deref(),
         ))
     }
 
@@ -1248,6 +1283,7 @@ impl CodeGraphServer {
                 format: args.format.as_deref(),
                 styled: args.styled.unwrap_or(false),
                 direction: args.direction.as_deref(),
+                min_confidence: args.min_confidence.as_deref(),
             };
             handlers::structure::generate_diagram(&inner.graph, input)
         })
@@ -1509,6 +1545,7 @@ mod tests {
                 depth: None,
                 limit: None,
                 offset: None,
+                min_confidence: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -1524,6 +1561,7 @@ mod tests {
                 depth: None,
                 limit: None,
                 offset: None,
+                min_confidence: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");
@@ -1711,6 +1749,7 @@ mod tests {
                 format: None,
                 styled: None,
                 direction: None,
+                min_confidence: None,
             }))
             .await
             .expect("Ok envelope on require_indexed failure");

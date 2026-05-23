@@ -693,6 +693,13 @@ pub struct GenerateDiagramInput<'a> {
     /// filter keep the original behavior. An unrecognized spelling is a
     /// handler-level error. Ignored by the `file` and `class` modes.
     pub direction: Option<&'a str>,
+    /// Minimum resolver confidence required for an edge to appear in the
+    /// `symbol=` (call-graph) diagram. Wire spelling matches
+    /// `get_callers`/`get_callees`'s `min_confidence`: `"any"`
+    /// (default) admits Heuristic edges, `"resolved"` drops them.
+    /// Ignored by `file=` and `class=` modes — file dependencies and
+    /// inheritance edges don't carry confidence today.
+    pub min_confidence: Option<&'a str>,
 }
 
 /// `generate_diagram` body. Dispatches on the exclusive parameter
@@ -767,9 +774,19 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
         ));
     }
 
+    // Confidence threshold only applies to `symbol=` mode (call-graph
+    // walks). Parsed up front so an invalid spelling is caught before
+    // the lock is taken even if symbol mode wasn't requested — the
+    // alternative is silently ignoring a typo in non-symbol modes, which
+    // is the bug the per-direction validation already prevents.
+    let min_confidence_filter = match super::parse_min_confidence(input.min_confidence) {
+        Ok(v) => v,
+        Err(e) => return tool_error(e),
+    };
+
     let g = graph.read();
     let dr_opt = if let Some(id) = symbol {
-        g.diagram_call_graph(id, direction, depth, max_nodes)
+        g.diagram_call_graph(id, direction, depth, max_nodes, min_confidence_filter)
     } else if let Some(path) = file {
         // Same normalize wrap as `get_coupling` and `get_file_symbols`.
         // Only the file-mode branch needs it — the
@@ -2634,6 +2651,97 @@ mod tests {
             ],
         });
         g
+    }
+
+    /// Builds `directional_call_graph` with the `a -> b` edge marked
+    /// Heuristic and `c -> a` left Resolved. The two
+    /// `generate_diagram_min_confidence_*` tests below pivot on this
+    /// distinction.
+    fn directional_call_graph_with_heuristic_outbound() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("c", SymbolKind::Function, "/x.cpp"),
+            ],
+            edges: vec![
+                Edge {
+                    from: "/x.cpp:a".to_string(),
+                    to: "/x.cpp:b".to_string(),
+                    kind: EdgeKind::Calls,
+                    file: "/x.cpp".to_string(),
+                    line: 1,
+                    confidence: Confidence::Heuristic,
+                },
+                call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp"),
+            ],
+        });
+        g
+    }
+
+    #[test]
+    fn generate_diagram_min_confidence_any_includes_heuristic_outbound() {
+        // Sanity: with no filter (None) and direction=both, both edges
+        // surface — proves the fixture is sound before we apply the
+        // filter.
+        let g = locked(directional_call_graph_with_heuristic_outbound());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                direction: Some("both"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "no filter → both edges: {arr:?}");
+    }
+
+    #[test]
+    fn generate_diagram_min_confidence_resolved_drops_heuristic_outbound() {
+        // Same fixture + filter: the Heuristic a -> b edge drops; only
+        // the Resolved c -> a survives.
+        let g = locked(directional_call_graph_with_heuristic_outbound());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                direction: Some("both"),
+                min_confidence: Some("resolved"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "Heuristic edge must drop: {arr:?}");
+        assert_eq!(arr[0]["from"], serde_json::json!("c"));
+        assert_eq!(arr[0]["to"], serde_json::json!("a"));
+    }
+
+    #[test]
+    fn generate_diagram_min_confidence_invalid_value_errors() {
+        // Invalid spelling → tool error mentioning the offender.
+        // Validated even when symbol mode wasn't requested, so a typo
+        // on a file=/class= call still surfaces.
+        let g = locked(directional_call_graph_with_heuristic_outbound());
+        let r = generate_diagram(
+            &g,
+            GenerateDiagramInput {
+                symbol: Some("/x.cpp:a"),
+                min_confidence: Some("low"),
+                ..GenerateDiagramInput::default()
+            },
+        );
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(
+            text.contains("invalid min_confidence") && text.contains("\"low\""),
+            "got: {text}"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub mod structure;
 pub mod symbols;
 pub mod watch;
 
-use code_graph_core::{symbol_id, EdgeKind, Language, Symbol, SymbolKind};
+use code_graph_core::{symbol_id, Confidence, EdgeKind, Language, Symbol, SymbolKind};
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
@@ -438,6 +438,35 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// Return tuple is `(kept_records, total_kept, truncated, next_offset)`
 /// where `total_kept == kept_records.len() as u32`.
 ///
+/// Parse the wire-level `min_confidence` argument shared by
+/// `get_callers`, `get_callees`, and `generate_diagram` (`symbol=`
+/// mode). Returns `Ok(None)` when the agent didn't pass a value or
+/// passed the explicit no-op `"any"`, `Ok(Some(Confidence::Resolved))`
+/// when the agent asked for resolved-only chains, and `Err(message)`
+/// for anything else (invalid spelling, including the no-op
+/// `"heuristic"` which is technically valid as a threshold but would
+/// be confusing — every confidence value passes it, so we reject
+/// rather than silently no-op).
+///
+/// The wire vocabulary is intentionally small (`any` | `resolved`) so
+/// future variants of [`Confidence`] (e.g. `Template`,
+/// `DynamicDispatch`) can extend the predicate without breaking
+/// existing callers — agents that pass `"resolved"` keep getting
+/// resolved-only chains, and additional thresholds are additive new
+/// values.
+pub(super) fn parse_min_confidence(
+    raw: Option<&str>,
+) -> Result<Option<Confidence>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some("any") => Ok(None),
+        Some("resolved") => Ok(Some(Confidence::Resolved)),
+        Some(other) => Err(format!(
+            "invalid min_confidence value {other:?}; expected \"any\" or \"resolved\""
+        )),
+    }
+}
+
 /// Note on `total_kept` vs `Page<T>.total`: the second tuple element is the
 /// count of records actually emitted on THIS page (`results.len() as u32`),
 /// NOT the pre-pagination match count. The handler is responsible for

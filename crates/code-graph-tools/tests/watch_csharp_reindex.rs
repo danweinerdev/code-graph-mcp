@@ -259,6 +259,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -382,6 +383,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     if r.is_error == Some(true) {
         let body = first_text(&r);

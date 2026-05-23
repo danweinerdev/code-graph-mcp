@@ -43,7 +43,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{EdgeKind, SymbolId, SymbolKind};
+use code_graph_core::{Confidence, EdgeKind, SymbolId, SymbolKind};
 use indexmap::IndexMap;
 
 use crate::graph::Node;
@@ -248,6 +248,7 @@ impl Graph {
         direction: DiagramDirection,
         depth: u32,
         max_nodes: u32,
+        min_confidence: Option<Confidence>,
     ) -> Option<DiagramResult> {
         if !self.nodes.contains_key(start_id) {
             return None;
@@ -287,6 +288,17 @@ impl Graph {
                         if entry.kind != EdgeKind::Calls {
                             continue;
                         }
+                        // Confidence filter (parity with `Graph::bfs` in
+                        // callgraph.rs). Heuristic edges drop BEFORE the
+                        // raw_edges push so the rendered diagram, the
+                        // visited set, AND the BFS frontier all agree on
+                        // what counts as a hop. A depth-2 walk via a
+                        // Heuristic intermediate is pruned in full.
+                        if min_confidence == Some(Confidence::Resolved)
+                            && entry.confidence != Confidence::Resolved
+                        {
+                            continue;
+                        }
                         raw_edges.push((
                             curr_id.clone(),
                             entry.target.clone(),
@@ -321,6 +333,12 @@ impl Graph {
                 if let Some(entries) = self.radj.get(&curr_id) {
                     for entry in entries {
                         if entry.kind != EdgeKind::Calls {
+                            continue;
+                        }
+                        // Same confidence filter as the forward arm.
+                        if min_confidence == Some(Confidence::Resolved)
+                            && entry.confidence != Confidence::Resolved
+                        {
                             continue;
                         }
                         // radj's `target` is the SOURCE of the original
@@ -889,7 +907,7 @@ mod tests {
     fn diagram_call_graph_unknown_returns_none() {
         let g = Graph::new();
         assert!(g
-            .diagram_call_graph("nonexistent", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("nonexistent", DiagramDirection::Both, 1, 30, None)
             .is_none());
     }
 
@@ -912,7 +930,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 2, 30)
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 2, 30, None)
             .expect("a is known");
         assert_eq!(result.center, "a");
         // Under `Both` at depth 2 a single underlying call is reachable
@@ -964,7 +982,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 10, 3)
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 10, 3, None)
             .expect("a is known");
         // The truncation guard is the invariant under test: with a
         // 3-node visit budget, only a/b/c are reachable, so EVERY
@@ -1015,7 +1033,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30, None)
             .expect("target is known");
         assert_eq!(result.center, "target");
         assert_eq!(result.edges.len(), 1);
@@ -1046,7 +1064,7 @@ mod tests {
         ));
 
         let pairs = |dir| {
-            g.diagram_call_graph("/x.cpp:a", dir, 1, 30)
+            g.diagram_call_graph("/x.cpp:a", dir, 1, 30, None)
                 .expect("a is known")
                 .edges
                 .iter()
@@ -1083,7 +1101,7 @@ mod tests {
         // direction tag: the forward (callees) arm yields only `Calls`
         // edges, the reverse (callers) arm only `CalledBy`.
         let dirs = |dir| {
-            g.diagram_call_graph("/x.cpp:a", dir, 1, 30)
+            g.diagram_call_graph("/x.cpp:a", dir, 1, 30, None)
                 .expect("a is known")
                 .edges
                 .iter()
@@ -1124,7 +1142,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 5, 30)
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 5, 30, None)
             .expect("a is known");
         let pairs: Vec<(String, String)> = result
             .edges
@@ -1181,7 +1199,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/shared.cpp:Update", DiagramDirection::Callers, 1, 30)
+            .diagram_call_graph("/shared.cpp:Update", DiagramDirection::Callers, 1, 30, None)
             .expect("Update is known");
 
         let tick_update = result
@@ -1227,7 +1245,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:B", DiagramDirection::Both, 2, 30)
+            .diagram_call_graph("/x.cpp:B", DiagramDirection::Both, 2, 30, None)
             .expect("B is known");
 
         let ab = result
@@ -1286,7 +1304,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:A", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:A", DiagramDirection::Both, 1, 30, None)
             .expect("A is known");
 
         let ab = result
@@ -1340,10 +1358,10 @@ mod tests {
         ));
 
         let zero = g
-            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 0, 30)
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 0, 30, None)
             .expect("a is known");
         let one = g
-            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:a", DiagramDirection::Both, 1, 30, None)
             .expect("a is known");
         assert_eq!(
             zero.edges, one.edges,
@@ -1389,7 +1407,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:MyClass::doWork", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:MyClass::doWork", DiagramDirection::Both, 1, 30, None)
             .expect("method is known");
         assert_eq!(result.center, "MyClass::doWork");
         assert_eq!(result.edges.len(), 1);
@@ -1423,7 +1441,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:caller", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:caller", DiagramDirection::Both, 1, 30, None)
             .expect("caller is known");
 
         assert_eq!(result.center, "caller");
@@ -1510,7 +1528,7 @@ mod tests {
         // makes visited-pollution observable in the rendered edge set
         // (see comment above for the trace).
         let result = g
-            .diagram_call_graph("/x.rs:Entry", DiagramDirection::Callees, 3, 5)
+            .diagram_call_graph("/x.rs:Entry", DiagramDirection::Callees, 3, 5, None)
             .expect("Entry is known");
         assert_eq!(result.center, "Entry");
 
@@ -2027,7 +2045,7 @@ mod tests {
         ));
 
         let result = g
-            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30)
+            .diagram_call_graph("/x.cpp:target", DiagramDirection::Both, 1, 30, None)
             .expect("target is known");
 
         let outgoing = result

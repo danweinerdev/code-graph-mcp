@@ -196,6 +196,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -326,6 +327,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     if r.is_error == Some(true) {
         // Canonical post-fix shape: Delta::use_beta itself was deleted

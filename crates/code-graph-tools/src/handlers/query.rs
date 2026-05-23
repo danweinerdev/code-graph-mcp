@@ -13,8 +13,8 @@ use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, Content};
 
 use super::{
-    byte_budget_take, edge_kind_str, kind_str, suggest_symbols, tool_error, tool_success_json,
-    DependencyEntry, Page,
+    byte_budget_take, edge_kind_str, kind_str, parse_min_confidence, suggest_symbols, tool_error,
+    tool_success_json, DependencyEntry, Page,
 };
 
 /// Symbol-ID basename for advisory messages.
@@ -123,6 +123,7 @@ pub fn callers_or_callees(
     limit: Option<u32>,
     offset: Option<u32>,
     max_bytes: usize,
+    min_confidence: Option<&str>,
 ) -> CallToolResult {
     if symbol.is_empty() {
         return tool_error("'symbol' is required");
@@ -130,10 +131,15 @@ pub fn callers_or_callees(
 
     let depth = depth.filter(|&d| d > 0).unwrap_or(1);
 
+    let min_confidence_filter = match parse_min_confidence(min_confidence) {
+        Ok(v) => v,
+        Err(e) => return tool_error(e),
+    };
+
     let g = graph.read();
     let mut chains: Vec<CallChain> = match direction {
-        Direction::Callers => g.callers(symbol, depth),
-        Direction::Callees => g.callees(symbol, depth),
+        Direction::Callers => g.callers(symbol, depth, min_confidence_filter),
+        Direction::Callees => g.callees(symbol, depth, min_confidence_filter),
     };
 
     // Accuracy-warning probe: when the target symbol carries `virtual`
@@ -496,7 +502,16 @@ mod tests {
     #[test]
     fn callers_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callers, None, None, NO_BYTE_BUDGET);
+        let r = callers_or_callees(
+            &g,
+            "",
+            None,
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            None,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -504,7 +519,16 @@ mod tests {
     #[test]
     fn callees_missing_symbol_param_errors() {
         let g = locked(Graph::new());
-        let r = callers_or_callees(&g, "", None, Direction::Callees, None, None, NO_BYTE_BUDGET);
+        let r = callers_or_callees(
+            &g,
+            "",
+            None,
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            None,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -520,6 +544,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
@@ -537,6 +562,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
@@ -553,6 +579,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2);
@@ -577,6 +604,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
@@ -598,11 +626,166 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
+    }
+
+    /// Build a small graph for the `min_confidence` filter tests.
+    /// `caller` invokes `target` via TWO call edges:
+    ///   - a Resolved edge (sole-candidate match the resolver was sure of)
+    ///   - a Heuristic edge (multi-candidate pick the resolver guessed at)
+    ///
+    /// Single physical edge per direction in the underlying adjacency
+    /// suffices because the BFS deduplicates by `target`; to model the
+    /// two-edge scenario we need TWO distinct targets, one Resolved and
+    /// one Heuristic. Layout:
+    ///   /x.cpp:caller → /x.cpp:res_target   [Resolved]
+    ///   /x.cpp:caller → /x.cpp:heur_target  [Heuristic]
+    fn graph_with_mixed_confidence_callees() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("caller", "/x.cpp"),
+                sym("res_target", "/x.cpp"),
+                sym("heur_target", "/x.cpp"),
+            ],
+            edges: vec![
+                call_edge("/x.cpp:caller", "/x.cpp:res_target", "/x.cpp", 10),
+                Edge {
+                    from: "/x.cpp:caller".to_string(),
+                    to: "/x.cpp:heur_target".to_string(),
+                    kind: EdgeKind::Calls,
+                    file: "/x.cpp".to_string(),
+                    line: 11,
+                    confidence: Confidence::Heuristic,
+                },
+            ],
+        });
+        g
+    }
+
+    #[test]
+    fn callees_min_confidence_any_returns_all_targets() {
+        // Default (None) is equivalent to "any" — both Resolved and
+        // Heuristic targets surface.
+        let g = locked(graph_with_mixed_confidence_callees());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:caller",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            None,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 2, "no filter → both targets reported");
+        let ids: Vec<&str> = arr.iter().map(|h| h["symbol_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"/x.cpp:res_target"));
+        assert!(ids.contains(&"/x.cpp:heur_target"));
+    }
+
+    #[test]
+    fn callees_min_confidence_resolved_drops_heuristic_hop() {
+        let g = locked(graph_with_mixed_confidence_callees());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:caller",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            Some("resolved"),
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 1, "Heuristic edge must be filtered out");
+        assert_eq!(
+            arr[0]["symbol_id"], "/x.cpp:res_target",
+            "only the Resolved target survives"
+        );
+    }
+
+    #[test]
+    fn callers_min_confidence_resolved_drops_heuristic_inbound() {
+        // Same fixture, opposite direction: `res_target` has one Resolved
+        // inbound caller; `heur_target` has one Heuristic inbound caller.
+        // `min_confidence=resolved` makes `heur_target` look like it has
+        // ZERO callers and `res_target` look like it has ONE.
+        let g = locked(graph_with_mixed_confidence_callees());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:heur_target",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            Some("resolved"),
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 0, "Heuristic inbound → invisible under min_confidence=resolved");
+        assert!(arr.is_empty());
+
+        let r2 = callers_or_callees(
+            &g,
+            "/x.cpp:res_target",
+            Some(1),
+            Direction::Callers,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            Some("resolved"),
+        );
+        let (arr2, total2, _, _) = page_parts(&r2);
+        assert_eq!(total2, 1, "Resolved inbound survives");
+        assert_eq!(arr2[0]["symbol_id"], "/x.cpp:caller");
+    }
+
+    #[test]
+    fn callees_min_confidence_invalid_value_errors() {
+        let g = locked(graph_with_calls());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:a",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            Some("low"),
+        );
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(
+            text.contains("invalid min_confidence") && text.contains("\"low\""),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn callees_min_confidence_any_is_explicit_default() {
+        // "any" is the explicit form of None — admits Heuristic edges.
+        let g = locked(graph_with_mixed_confidence_callees());
+        let r = callers_or_callees(
+            &g,
+            "/x.cpp:caller",
+            Some(1),
+            Direction::Callees,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+            Some("any"),
+        );
+        let (_, total, _, _) = page_parts(&r);
+        assert_eq!(total, 2, "\"any\" admits both Resolved and Heuristic edges");
     }
 
     #[test]
@@ -618,6 +801,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
@@ -636,6 +820,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
@@ -700,6 +885,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         // Soft-hint is a SUCCESS, not an error — per the core invariant.
         assert!(r.is_error.is_none() || r.is_error == Some(false));
@@ -734,6 +920,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let text = body_text(&r);
@@ -767,6 +954,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let text = body_text(&r);
@@ -800,6 +988,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let text = body_text(&r);
@@ -836,6 +1025,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let text = body_text(&r);
@@ -897,6 +1087,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
@@ -917,6 +1108,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let parsed2: serde_json::Value = serde_json::from_str(&body_text(&r2)).unwrap();
         let warnings2: Vec<&str> = parsed2["warnings"]
@@ -945,6 +1137,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert!(
@@ -973,6 +1166,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         // Must be the Page<CallChain> envelope, not the soft-hint text.
@@ -1021,6 +1215,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         // Must be the empty Page<CallChain> envelope, not a soft hint.
@@ -1144,6 +1339,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -1165,6 +1361,7 @@ mod tests {
             Some(100),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let p2 = callers_or_callees(
             &g,
@@ -1174,6 +1371,7 @@ mod tests {
             Some(100),
             Some(100),
             NO_BYTE_BUDGET,
+            None,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -1207,6 +1405,7 @@ mod tests {
             Some(50),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let r2 = callers_or_callees(
             &g,
@@ -1216,6 +1415,7 @@ mod tests {
             Some(50),
             Some(50),
             NO_BYTE_BUDGET,
+            None,
         );
         let r3 = callers_or_callees(
             &g,
@@ -1225,6 +1425,7 @@ mod tests {
             Some(10),
             Some(140),
             NO_BYTE_BUDGET,
+            None,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -1245,6 +1446,7 @@ mod tests {
             Some(999_999),
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -1262,6 +1464,7 @@ mod tests {
             Some(0),
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -1278,6 +1481,7 @@ mod tests {
             None,
             Some(999),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -1324,6 +1528,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
@@ -1430,6 +1635,7 @@ mod tests {
             Some(100),
             Some(0),
             max_bytes,
+            None,
         );
 
         let (arr, total, offset, _limit) = page_parts(&r);
@@ -1501,6 +1707,7 @@ mod tests {
             Some(1),
             Some(n),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr_next, _, _, _) = page_parts(&r_next);
         assert_eq!(arr_next.len(), 1, "fixture guarantees a next record exists");
@@ -1526,6 +1733,7 @@ mod tests {
             Some(100),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, _, _) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
@@ -1548,6 +1756,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 100);
@@ -1567,6 +1776,7 @@ mod tests {
             Some(100),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let p2 = callers_or_callees(
             &g,
@@ -1576,6 +1786,7 @@ mod tests {
             Some(100),
             Some(100),
             NO_BYTE_BUDGET,
+            None,
         );
         let (a1, t1, _, _) = page_parts(&p1);
         let (a2, t2, _, _) = page_parts(&p2);
@@ -1605,6 +1816,7 @@ mod tests {
             Some(50),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let r2 = callers_or_callees(
             &g,
@@ -1614,6 +1826,7 @@ mod tests {
             Some(50),
             Some(50),
             NO_BYTE_BUDGET,
+            None,
         );
         let r3 = callers_or_callees(
             &g,
@@ -1623,6 +1836,7 @@ mod tests {
             Some(10),
             Some(140),
             NO_BYTE_BUDGET,
+            None,
         );
         let (_, t1, _, _) = page_parts(&r1);
         let (_, t2, _, _) = page_parts(&r2);
@@ -1643,6 +1857,7 @@ mod tests {
             Some(999_999),
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000);
@@ -1660,6 +1875,7 @@ mod tests {
             Some(0),
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 100);
@@ -1676,6 +1892,7 @@ mod tests {
             None,
             Some(999),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -1787,6 +2004,7 @@ mod tests {
             Some(100),
             Some(0),
             max_bytes,
+            None,
         );
 
         let (arr, total, offset, _limit) = page_parts(&r);
@@ -1858,6 +2076,7 @@ mod tests {
             Some(1),
             Some(n),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr_next, _, _, _) = page_parts(&r_next);
         assert_eq!(arr_next.len(), 1, "fixture guarantees a next record exists");
@@ -1884,6 +2103,7 @@ mod tests {
             Some(100),
             Some(0),
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, total, _, _) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
@@ -1925,6 +2145,7 @@ mod tests {
             None,
             None,
             NO_BYTE_BUDGET,
+            None,
         );
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);

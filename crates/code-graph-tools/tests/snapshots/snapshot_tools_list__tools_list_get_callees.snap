@@ -28,6 +28,14 @@ expression: "tool_entry(\"get_callees\")"
           "null"
         ]
       },
+      "min_confidence": {
+        "default": null,
+        "description": "Minimum resolver confidence required for a hop to appear. \"any\" (default) includes every resolved edge; \"resolved\" drops edges the resolver picked from N same-name candidates (Heuristic) and returns only chains the resolver was sure about. Same semantics as on `get_callers`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "offset": {
         "default": null,
         "description": "Skip first N callees for pagination (default 0)",

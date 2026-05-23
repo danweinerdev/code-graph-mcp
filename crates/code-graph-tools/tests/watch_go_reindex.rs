@@ -155,6 +155,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
@@ -233,6 +234,7 @@ async fn watch_go_reindex_drops_removed_method_and_no_dangling_edge() {
         None,
         None,
         NO_BYTE_BUDGET,
+            None,
     );
     let post_text = first_text(&r);
     if r.is_error.is_none() || r.is_error == Some(false) {

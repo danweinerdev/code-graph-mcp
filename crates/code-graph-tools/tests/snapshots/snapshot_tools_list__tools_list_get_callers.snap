@@ -28,6 +28,14 @@ expression: "tool_entry(\"get_callers\")"
           "null"
         ]
       },
+      "min_confidence": {
+        "default": null,
+        "description": "Minimum resolver confidence required for a hop to appear. \"any\" (default) includes every resolved edge; \"resolved\" drops edges the resolver picked from N same-name candidates (Heuristic) and returns only chains the resolver was sure about. Heuristic edges arise when ≥ 2 symbols share a callee name and the scope rule (same file > same parent > same namespace > global) picked one — useful filter when several unrelated classes have a method with the same name (e.g. `init`). Filter applies at each hop, so a depth-2 walk through a Heuristic intermediate is pruned entirely.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "offset": {
         "default": null,
         "description": "Skip first N callers for pagination (default 0)",

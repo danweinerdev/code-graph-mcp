@@ -758,7 +758,7 @@ void b_caller() { a_func(); }
         let g = server.inner.graph.read();
         let a_caller_id = format!("{a_cpp_str}:a_caller");
         let unresolved_after_phase1 = g
-            .callees(&a_caller_id, 1)
+            .callees(&a_caller_id, 1, None)
             .into_iter()
             .any(|c| c.symbol_id.contains(&b_cpp_str));
         assert!(
@@ -773,7 +773,7 @@ void b_caller() { a_func(); }
     {
         let g = server.inner.graph.read();
         let b_caller_id = format!("{b_cpp_str}:b_caller");
-        let b_caller_callees = g.callees(&b_caller_id, 1);
+        let b_caller_callees = g.callees(&b_caller_id, 1, None);
         assert!(
             b_caller_callees
                 .iter()
@@ -787,7 +787,7 @@ void b_caller() { a_func(); }
         // resolve. The cached edge was emitted when B wasn't indexed
         // and it is not re-resolved on subsequent invocations.
         let a_caller_id = format!("{a_cpp_str}:a_caller");
-        let a_caller_callees = g.callees(&a_caller_id, 1);
+        let a_caller_callees = g.callees(&a_caller_id, 1, None);
         let resolved_to_b = a_caller_callees
             .iter()
             .any(|c| c.symbol_id == format!("{b_cpp_str}:b_target"));
@@ -807,7 +807,7 @@ void b_caller() { a_func(); }
     {
         let g = server.inner.graph.read();
         let a_caller_id = format!("{a_cpp_str}:a_caller");
-        let a_caller_callees = g.callees(&a_caller_id, 1);
+        let a_caller_callees = g.callees(&a_caller_id, 1, None);
         assert!(
             a_caller_callees
                 .iter()

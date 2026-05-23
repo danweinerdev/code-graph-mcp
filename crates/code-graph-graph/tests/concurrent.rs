@@ -192,7 +192,7 @@ fn rwlock_concurrent_readers_and_writers() {
                     // callers: every returned hop's depth must respect the
                     // requested bound.
                     let depth_limit = 3;
-                    let chains = snapshot.callers("/seed.cpp:callee_0", depth_limit);
+                    let chains = snapshot.callers("/seed.cpp:callee_0", depth_limit, None);
                     for chain in &chains {
                         if chain.depth > depth_limit {
                             consistency_violation.store(true, Ordering::Relaxed);
