@@ -22,7 +22,7 @@
 //! divergence triggers `cargo insta review`.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use code_graph_core::RootConfig;
@@ -97,6 +97,18 @@ pub struct ServerInner {
     /// Last-loaded `<root>/.code-graph.toml`. Defaults to
     /// [`RootConfig::default`] until `analyze_codebase` reads it from disk.
     pub config: PlRwLock<RootConfig>,
+    /// Nanoseconds since UNIX_EPOCH when the most recent
+    /// `analyze_codebase` completed (whether via full re-index or the
+    /// cache fast-path). `0` means "never indexed". Read by the
+    /// `get_status` tool to expose operational visibility into when
+    /// the in-memory graph state was established. AtomicU64 so reads
+    /// are lock-free.
+    pub index_built_at: AtomicU64,
+    /// Whether the most recent `analyze_codebase` was called with
+    /// `force=true`. Read by `get_status` so the user can tell
+    /// "this index is the result of a force-rebuild" vs "this is the
+    /// incremental result". `false` until the first analyze completes.
+    pub index_force_built: AtomicBool,
 }
 
 /// MCP server exposing the code graph through 15 tools.
@@ -130,6 +142,8 @@ impl CodeGraphServer {
                 root_path: PlRwLock::new(None),
                 watch: PlRwLock::new(None),
                 config: PlRwLock::new(RootConfig::default()),
+                index_built_at: AtomicU64::new(0),
+                index_force_built: AtomicBool::new(false),
             }),
             tool_router: Self::tool_router(),
         }
@@ -1153,6 +1167,24 @@ impl CodeGraphServer {
         }
         Ok(handlers::watch::watch_stop(&self.inner))
     }
+
+    #[tool(
+        description = "Operational diagnostic — returns a JSON object describing the running server: \
+                       binary git SHA (with `-dirty` suffix for working-tree builds), package version, \
+                       release-vs-debug build flag, discovered `.code-graph.toml` path (or null), \
+                       active `[cpp].macro_strip` / `[cpp].macro_strip_with_args` counts, indexed project root, \
+                       graph stats (files/symbols/edges), and the timestamp of the most recent \
+                       analyze_codebase + whether it was force-rebuilt. No side effects, no locks held across \
+                       I/O — safe to call from any client at any time. Use this to verify which build is \
+                       actually running before debugging behaviour, and to confirm config discovery picked \
+                       up the toml you expected."
+    )]
+    async fn get_status(
+        &self,
+        Parameters(_args): Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(handlers::status::get_status(self.inner.clone()))
+    }
 }
 
 #[tool_handler]
@@ -1166,16 +1198,16 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// `tools/list` must surface exactly 15 tools. If a future change adds
+    /// `tools/list` must surface exactly 16 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_fifteen_tools() {
+    fn tool_router_registers_sixteen_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            15,
-            "expected 15 registered tools, got {}",
+            16,
+            "expected 16 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -1208,6 +1240,7 @@ mod tests {
             "generate_diagram",
             "watch_start",
             "watch_stop",
+            "get_status",
         ] {
             assert!(
                 names.contains(expected),

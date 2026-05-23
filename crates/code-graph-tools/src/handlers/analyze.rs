@@ -241,6 +241,14 @@ pub async fn analyze_codebase(
                 *inner.root_path.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
+                inner.index_built_at.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                    Ordering::Release,
+                );
+                inner.index_force_built.store(force, Ordering::Release);
                 // Persist the swept graph so the cadence bump and any
                 // removed entries survive. Skip the save when the
                 // sweep was a no-op (cadence not elapsed AND nothing
@@ -516,6 +524,14 @@ pub async fn analyze_codebase(
     *inner.root_path.write() = Some(project_root.clone());
     *inner.config.write() = cfg;
     inner.indexed.store(true, Ordering::Release);
+    inner.index_built_at.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+        Ordering::Release,
+    );
+    inner.index_force_built.store(force, Ordering::Release);
 
     // Surface a project-vs-scope size hint when the cache contains
     // entries outside the invocation scope. Users running scoped

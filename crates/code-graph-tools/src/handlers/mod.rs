@@ -24,6 +24,7 @@
 
 pub mod analyze;
 pub mod query;
+pub mod status;
 pub mod structure;
 pub mod symbols;
 pub mod watch;

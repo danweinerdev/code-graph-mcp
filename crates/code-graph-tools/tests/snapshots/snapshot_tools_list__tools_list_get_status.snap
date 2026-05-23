@@ -1,0 +1,14 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"get_status\")"
+---
+{
+  "name": "get_status",
+  "description": "Operational diagnostic — returns a JSON object describing the running server: binary git SHA (with `-dirty` suffix for working-tree builds), package version, release-vs-debug build flag, discovered `.code-graph.toml` path (or null), active `[cpp].macro_strip` / `[cpp].macro_strip_with_args` counts, indexed project root, graph stats (files/symbols/edges), and the timestamp of the most recent analyze_codebase + whether it was force-rebuilt. No side effects, no locks held across I/O — safe to call from any client at any time. Use this to verify which build is actually running before debugging behaviour, and to confirm config discovery picked up the toml you expected.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Empty parameter struct for tools that take no arguments\n(`detect_cycles`, `watch_start`, `watch_stop`). The empty `{}` JSON\nobject deserializes into this without error.",
+    "title": "EmptyParams",
+    "type": "object"
+  }
+}

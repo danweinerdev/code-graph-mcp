@@ -113,6 +113,13 @@ fn tools_list_watch_stop() {
     insta::assert_json_snapshot!(tool_entry("watch_stop"));
 }
 
+// --- Operational diagnostics ----------------------------------------------
+
+#[test]
+fn tools_list_get_status() {
+    insta::assert_json_snapshot!(tool_entry("get_status"));
+}
+
 // --- Load-bearing description-substring regressions ------------------------
 //
 // The tool description strings are production behavior — agents pattern-match
