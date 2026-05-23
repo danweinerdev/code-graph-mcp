@@ -45,6 +45,32 @@ pub struct AnalyzeResult {
     pub warnings: Vec<String>,
 }
 
+/// Wall-clock nanoseconds since UNIX_EPOCH, suitable for cache mtimes
+/// and sweep cadence math. Encodes the two failure modes explicitly so
+/// they don't silently produce garbage:
+///
+/// - Clock before UNIX_EPOCH (pre-1970 system clock): `duration_since`
+///   returns `Err`. Fall back to `0` — matches the `last_sweep_at`
+///   "never swept" sentinel.
+/// - `Duration::as_nanos()` (u128) overflows `u64` (~year 2554):
+///   saturate to `u64::MAX` instead of the silent `as u64` truncation
+///   the predecessor pattern used. Saturating up keeps `now > prior`
+///   for any sane previously-stored value, so `elapsed_since_sweep`
+///   evaluates large and the sweep runs (conservative). A truncating
+///   cast would wrap to a small value and the cadence check would
+///   skip the sweep indefinitely.
+///
+/// Every `analyze_codebase` time read goes through this so the
+/// failure semantics stay uniform. Direct
+/// `SystemTime::now().as_nanos() as u64` is the silent-truncation
+/// footgun this helper exists to forbid.
+fn now_nanos_u64() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Err(_) => 0,
+        Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+    }
+}
+
 /// `analyze_codebase` body. See the module docstring for the full pipeline.
 pub async fn analyze_codebase(
     inner: Arc<ServerInner>,
@@ -214,10 +240,7 @@ pub async fn analyze_codebase(
                 // right thing: deleted out-of-scope files should be
                 // cleaned up regardless of whether parsing happened.
                 let mut fast_path_warnings: Vec<String> = Vec::new();
-                let now_nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
+                let now_nanos = now_nanos_u64();
                 let elapsed_since_sweep = now_nanos.saturating_sub(probe.last_sweep_at());
                 let sweep_ran = elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS;
                 if sweep_ran {
@@ -316,6 +339,15 @@ pub async fn analyze_codebase(
                 .unwrap_or_else(std::time::Instant::now);
             let mut latest: Option<ProgressEvent> = None;
 
+            // Per-call timeout for `notify_progress`. The MCP client (e.g.
+            // Claude Code hitting MCP_TOOL_TIMEOUT) may stop servicing the
+            // stdio stream mid-analyze; the rmcp transport then stalls and
+            // `peer.notify_progress(...).await` hangs on its responder
+            // oneshot. Without this bound the forwarder would never drain,
+            // and the parent's `handle.await` below would never resolve —
+            // wedging `index_lock` for the lifetime of the process.
+            const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
             while let Some(evt) = rx.recv().await {
                 latest = Some(evt);
                 let now = std::time::Instant::now();
@@ -328,7 +360,9 @@ pub async fn analyze_codebase(
                             params = params.with_total(e.total as f64);
                         }
                         params = params.with_message(e.message);
-                        let _ = peer.notify_progress(params).await;
+                        let _ =
+                            tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params))
+                                .await;
                     }
                 }
             }
@@ -342,7 +376,8 @@ pub async fn analyze_codebase(
                     params = params.with_total(e.total as f64);
                 }
                 params = params.with_message(e.message);
-                let _ = peer.notify_progress(params).await;
+                let _ =
+                    tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params)).await;
             }
         }))
     } else {
@@ -518,8 +553,17 @@ pub async fn analyze_codebase(
     // Wait for the forwarder to finish draining the channel (the sink was
     // dropped at the end of the blocking task). Best-effort: a panic in the
     // forwarder is non-fatal because progress notifications are advisory.
+    //
+    // The wait is bounded so `index_lock` cannot be wedged by a stalled MCP
+    // transport (the per-call timeout inside the forwarder is the primary
+    // bound; this outer cap is defense-in-depth in case a future change
+    // introduces a new unbounded await in the forwarder body). If the
+    // deadline fires the JoinHandle is dropped, detaching the spawned task:
+    // it stays alive in the background and is harmless because it holds no
+    // server state, while the parent function continues to save the cache
+    // and release `_guard`.
     if let Some(handle) = forwarder {
-        let _ = handle.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 
     let (merged_graph, blocking_warnings) = match blocking_result {
