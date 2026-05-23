@@ -202,3 +202,62 @@ fn double_slash_is_collapsed_by_path_components() {
     assert_eq!(t.get("/a//b"), Some(&1));
     assert_eq!(t.get("/a///b"), Some(&1));
 }
+
+// --- Windows path-shape pinning ---------------------------------------
+//
+// On Windows, `Path::components()` produces a `Prefix` component for
+// the drive letter (and an `\\?\` extended prefix is its own Prefix
+// kind). The trie's `segments_of` walks `components()` and emits each
+// as a literal `OsString` segment. Reconstruction via `PathBuf::push`
+// must round-trip the prefix without splitting it further or losing
+// the separator. The two tests below pin that contract.
+//
+// They are `#[cfg(windows)]`-gated because on Linux/macOS `Path` does
+// not recognize drive prefixes (`C:\foo` is a single `Normal`
+// component containing the literal string `C:\foo`), so the
+// assertions would test the wrong thing. The CI matrix does not
+// currently include a Windows runner; these tests pin the contract
+// for the next manual Windows verification and for any future Windows
+// runner.
+
+/// Drive-letter prefix round-trips via PathTrie insert→iterate.
+/// Catches regressions where a future trie refactor segments
+/// `C:\proj\foo.cpp` differently from what `PathBuf::push` of those
+/// segments reconstructs back to.
+#[cfg(windows)]
+#[test]
+fn windows_drive_letter_path_round_trips_via_keys() {
+    let mut t: PathTrie<u8> = PathTrie::new();
+    let original = PathBuf::from(r"C:\proj\foo.cpp");
+    t.insert(&original, 1);
+    let keys: Vec<PathBuf> = t.keys().collect();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0], original);
+    assert_eq!(t.get(&original), Some(&1));
+}
+
+/// Verbatim `\\?\D:\…` and short `D:\…` are distinct trie keys.
+/// This is the production hazard the watch handler's
+/// `canonicalize_event_path` exists to defuse — if the watcher
+/// delivered the verbatim form and the indexer stored the stripped
+/// form, the two would collide here. The watch handler dispatches
+/// raw event paths through `paths::simplify` BEFORE they reach this
+/// layer, so in production both forms collapse to the stripped key.
+/// This test pins that without the strip, the trie does NOT
+/// transparently unify them.
+#[cfg(windows)]
+#[test]
+fn windows_verbatim_disk_prefix_is_a_distinct_trie_key() {
+    let mut t: PathTrie<u8> = PathTrie::new();
+    let stripped = PathBuf::from(r"D:\proj\foo.cpp");
+    let verbatim = PathBuf::from(r"\\?\D:\proj\foo.cpp");
+    t.insert(&stripped, 1);
+    assert_eq!(t.get(&stripped), Some(&1));
+    assert_eq!(
+        t.get(&verbatim),
+        None,
+        "trie does NOT collapse \\\\?\\D:\\ and D:\\ — callers must pre-strip via paths::simplify"
+    );
+    t.insert(&verbatim, 2);
+    assert_eq!(t.len(), 2, "two distinct keys → two entries in the trie");
+}

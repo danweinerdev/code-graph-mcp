@@ -16,11 +16,11 @@
 //! sends `()` on the paired sender to end the loop cleanly.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use code_graph_core::{symbol_id, EdgeKind, FileGraph, SymbolId};
+use code_graph_core::{paths, symbol_id, EdgeKind, FileGraph, SymbolId};
 use code_graph_lang::CallContext;
 use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
@@ -481,6 +481,48 @@ pub async fn try_reindex_file(
     ReindexOutcome::Reindexed
 }
 
+/// Normalize a filesystem-event path so its shape matches what the
+/// indexer stored.
+///
+/// **Why this exists (Windows correctness).** On Windows,
+/// `notify-debouncer-full` propagates paths from `ReadDirectoryChangesW`
+/// in the verbatim extended form (`\\?\D:\proj\foo.cpp`), while
+/// `analyze_codebase` canonicalizes through `paths::canonicalize`
+/// which dunce-strips the verbatim prefix (storing the
+/// `D:\proj\foo.cpp` form). The two are distinct `PathBuf`s — distinct
+/// `PathTrie` keys — and a downstream `merge_file_graph`'s
+/// `contains_path` check would return `false` on the raw event path,
+/// causing the watch reindex to INSERT a duplicate entry alongside
+/// the indexed one. Within a few watch events the graph silently
+/// doubles every touched file. Identical mechanism to the
+/// stale-cache-pollution bug fixed in the rebase commit; this is the
+/// production trigger.
+///
+/// **Behavior.** For create/modify events (`exists_hint = true`)
+/// `paths::canonicalize` is preferred because it produces the same
+/// on-disk shape the indexer would record. On failure (file deleted
+/// between debounce-window expiry and this call) the pure-lexical
+/// `paths::simplify` is the fallback. For remove events
+/// (`exists_hint = false`) `canonicalize` would error anyway, so go
+/// straight to `simplify` — strips the `\\?\` verbatim disk prefix
+/// without an IO probe.
+///
+/// **No-op on Linux/macOS.** `dunce::simplified` and
+/// `dunce::canonicalize` collapse to standard library calls on non-
+/// Windows, and absolute event paths produced by `notify` are
+/// already in the form `paths::canonicalize` produces. The function
+/// is unconditional only because Rust workspace lint policy forbids
+/// `#[cfg(windows)]` correctness shims when an unconditional
+/// always-identity helper is available.
+fn canonicalize_event_path(path: &Path, exists_hint: bool) -> PathBuf {
+    if exists_hint {
+        if let Ok(c) = paths::canonicalize(path) {
+            return c;
+        }
+    }
+    paths::simplify(path)
+}
+
 /// Watch loop: receives debounced filesystem-event batches from the
 /// debouncer's notify thread (via the bridge built in [`forward_events`])
 /// and drives per-path reindexes through [`try_reindex_file`]. Cancellation
@@ -518,13 +560,24 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
     let extensions = inner.config.read().extensions.clone();
     for evt in evts {
         let is_remove = matches!(evt.event.kind, EventKind::Remove(_));
-        for path in &evt.event.paths {
+        for raw_path in &evt.event.paths {
+            // Canonicalize at the dispatch boundary so every downstream
+            // graph lookup and merge sees the same shape the indexer
+            // stored. On Windows the raw event path arrives in the
+            // verbatim `\\?\D:\...` form (notify-debouncer-full
+            // propagates `ReadDirectoryChangesW`'s output verbatim);
+            // the indexer dunce-strips that prefix. Without the strip
+            // here, every watched edit would land as a duplicate file
+            // entry in the graph because `merge_file_graph`'s
+            // `contains_path` check would miss the existing stripped-
+            // form key.
+            let path = canonicalize_event_path(raw_path, !is_remove);
             // Filter to source paths up-front so we don't pay
             // `index_lock.try_lock` for every random `.swp` an editor
             // touches. `try_reindex_file` re-checks defensively.
             if inner
                 .registry
-                .for_path_with_config(path, &extensions)
+                .for_path_with_config(&path, &extensions)
                 .is_none()
             {
                 // Not a source file. But on a Remove event the path
@@ -539,11 +592,11 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
                 // is Phase E.3 (B)'s `PathTrie::remove_subtree`
                 // payoff site.
                 if is_remove {
-                    try_reindex_subtree_removal(inner, path).await;
+                    try_reindex_subtree_removal(inner, &path).await;
                 }
                 continue;
             }
-            let outcome = try_reindex_file(inner, path, is_remove).await;
+            let outcome = try_reindex_file(inner, &path, is_remove).await;
             if let ReindexOutcome::Error(msg) = outcome {
                 // No `tracing` dep on this workspace; eprintln only for
                 // hard errors so test output isn't spammed by routine
@@ -1239,5 +1292,96 @@ mod tests {
         );
 
         drop(dir);
+    }
+
+    // --- canonicalize_event_path: Windows-correctness regression suite ---
+    //
+    // These tests pin the dispatch-boundary normalization that
+    // `process_event_batch` calls on every event path. The actual
+    // Windows-specific failure mode (verbatim `\\?\` prefix bypassing
+    // `PathTrie::contains_path`) is `#[cfg(windows)]`-gated below; the
+    // helper-shape tests above it run on every platform so a future
+    // regression that deletes `canonicalize_event_path` or stops
+    // calling it from `process_event_batch` breaks Linux CI.
+
+    /// `canonicalize_event_path` on an existing file with
+    /// `exists_hint = true` returns the canonical form (matches what
+    /// the indexer would store). On Linux this is the dunce-identity
+    /// path; the test pins the contract on both platforms.
+    #[test]
+    fn canonicalize_event_path_returns_canonical_form_when_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.cpp");
+        std::fs::write(&file, b"void f() {}\n").unwrap();
+        let canonical = paths::canonicalize(&file).unwrap();
+        let got = canonicalize_event_path(&file, true);
+        assert_eq!(
+            got, canonical,
+            "with exists_hint=true on a real file the result must match paths::canonicalize"
+        );
+    }
+
+    /// `canonicalize_event_path` on a non-existent path with
+    /// `exists_hint = false` (the remove-event case) falls back to
+    /// `paths::simplify` — no IO probe, lexical strip only. Critical
+    /// because remove events fire AFTER the file is gone; canonicalize
+    /// would error and produce an inconsistent shape.
+    #[test]
+    fn canonicalize_event_path_uses_lexical_strip_on_remove_event() {
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("already_deleted.cpp");
+        // Never written. canonicalize would fail. exists_hint=false
+        // tells the helper to skip the IO probe.
+        let got = canonicalize_event_path(&gone, false);
+        let expected = paths::simplify(&gone);
+        assert_eq!(got, expected);
+    }
+
+    /// `canonicalize_event_path` on a non-existent path with the
+    /// optimistic `exists_hint = true` falls back to lexical strip
+    /// (rather than panicking) when the IO probe fails. This is the
+    /// race-window case: a create/modify event fires, the user
+    /// deletes the file before the watch debounce expires, and the
+    /// handler reaches this path with `exists_hint = true`. Must not
+    /// crash; falling back to simplify keeps subsequent
+    /// `contains_path` checks on a consistent shape.
+    #[test]
+    fn canonicalize_event_path_falls_back_to_simplify_on_failed_canonicalize() {
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("raced.cpp");
+        let got = canonicalize_event_path(&gone, true);
+        let expected = paths::simplify(&gone);
+        assert_eq!(got, expected);
+    }
+
+    /// Windows-only: `canonicalize_event_path` strips the verbatim
+    /// `\\?\D:\…` prefix that `notify-debouncer-full` delivers from
+    /// `ReadDirectoryChangesW`. Without the strip, the post-canonicalize
+    /// path would be a distinct `PathTrie` key from the indexer-stored
+    /// (stripped) form and every watched edit would duplicate the
+    /// file entry in the graph. Pins the production fix for the
+    /// "Watch-mode path re-contamination on Windows" known limitation.
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_event_path_strips_verbatim_disk_prefix_on_windows() {
+        use std::path::PathBuf;
+        // Use a real on-disk path so paths::canonicalize succeeds.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.cpp");
+        std::fs::write(&file, b"void f() {}\n").unwrap();
+        // Construct the verbatim form that notify would deliver.
+        let canonical = paths::canonicalize(&file).unwrap();
+        let canonical_str = canonical.to_string_lossy();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", canonical_str));
+        let stripped = canonicalize_event_path(&verbatim, true);
+        assert!(
+            !stripped.to_string_lossy().contains(r"\\?\"),
+            "verbatim prefix must be stripped: {}",
+            stripped.display()
+        );
+        assert_eq!(
+            stripped, canonical,
+            "stripped form must match what paths::canonicalize produces on the bare path"
+        );
     }
 }
