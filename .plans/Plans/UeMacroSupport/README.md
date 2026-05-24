@@ -8,8 +8,8 @@ tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 related:
   - Designs/UeMacroSupport
   - Designs/CppMacroStrip
-  - Plans/Complete/CppMacroStrip
-  - Plans/Ready/PathNormalization
+  - Plans/CppMacroStrip
+  - Plans/PathNormalization
 phases:
   - id: 1
     title: "Config field + validation (no behavior change)"

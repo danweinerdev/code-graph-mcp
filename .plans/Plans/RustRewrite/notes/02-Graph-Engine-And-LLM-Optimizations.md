@@ -6,6 +6,8 @@ phase: 2
 phase_title: "Graph Engine & LLM Optimizations"
 status: complete
 created: 2026-04-28
+updated: 2026-04-28
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 2 Debrief: Graph Engine & LLM Optimizations

@@ -6,6 +6,8 @@ phase: 4
 phase_title: "Tree-shaped get_class_hierarchy + cutover"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 4 Debrief: Tree-shaped get_class_hierarchy + cutover
@@ -70,4 +72,4 @@ created: 2026-05-07
 - **What you did repeatedly:** Wrote per-phase commit messages by hand following the same conventions: `[PlanName/Phase N] <subject>` + body explaining what + why + tests + snapshot delta. Did this 4 times in the same session.
   **Where it belongs:** A `/planner:commit-phase` slash command, or a `make commit-phase PHASE=N` Makefile target that templates the commit message from the phase doc's frontmatter and acceptance criteria.
   **Why a skill:** Each commit took ~5 minutes to draft and was structurally identical. The phase frontmatter has the title, deliverable, and acceptance criteria already; the commit message is mostly a templated rendering of those + the snapshot delta. Automating the boilerplate frees attention for the parts that genuinely vary (the "what surprised us" lines).
-  **Rough shape:** Reads `Plans/Active/<Plan>/<NN>-<Phase>.md` frontmatter and acceptance criteria, opens an editor with a pre-filled commit message, runs `git commit -F <tmpfile>` after edits.
+  **Rough shape:** Reads `Plans/<Plan>/<NN>-<Phase>.md` frontmatter and acceptance criteria, opens an editor with a pre-filled commit message, runs `git commit -F <tmpfile>` after edits.

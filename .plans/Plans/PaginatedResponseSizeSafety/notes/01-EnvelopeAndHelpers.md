@@ -6,6 +6,8 @@ phase: 1
 phase_title: "Envelope additions, byte-budget helper, config plumbing"
 status: complete
 created: 2026-05-12
+updated: 2026-05-12
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 1 Debrief: Envelope additions, byte-budget helper, config plumbing

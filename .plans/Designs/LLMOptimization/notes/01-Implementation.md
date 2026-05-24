@@ -6,6 +6,8 @@ phase: 1
 phase_title: "Implementation"
 status: complete
 created: 2026-04-28
+updated: 2026-04-28
+tags: [llm-optimization, token-efficiency, usability]
 ---
 
 # LLMOptimization Implementation Debrief
@@ -55,7 +57,7 @@ created: 2026-04-28
 
 No subsequent phases — this design is implemented and complete. Carry-overs for related future work:
 
-- **Other languages adopting the parser interface** (Go, Python, Rust per `Plans/Active/{GoParser,PythonParser,RustParser}/`) inherit `truncateSignature` semantics. The byte-fallback path is now UTF-8 safe, but each language parser may have additional signature shapes that benefit from earlier truncation hooks.
+- **Other languages adopting the parser interface** (Go, Python, Rust per `Plans/{GoParser,PythonParser,RustParser}/`) inherit `truncateSignature` semantics. The byte-fallback path is now UTF-8 safe, but each language parser may have additional signature shapes that benefit from earlier truncation hooks.
 - **`generate_diagram` already has a `max_nodes` cap;** `get_class_hierarchy` does not. If users start passing very large `depth` values this becomes a real concern. Tracked as an open question, not blocking.
 - **`Search` materializes all matches before sorting/slicing.** Fine for current graph sizes; if a 100K-symbol codebase becomes a hot path through search, an early-exit approach may be needed.
 
@@ -78,5 +80,5 @@ No subsequent phases — this design is implemented and complete. Carry-overs fo
 
 - **What:** Adapting `/code-review` (and `/debrief`) to design-only workflows where there's no formal Plan with phases.
   **Where:** Documentation update in the `planner` skills, or a small fork: `/planner:design-review` and `/planner:design-debrief` that take a Design path instead of a Plan path.
-  **Why:** Both skills hard-code "Plans/Active/<PlanName>" assumptions. We adapted by treating the design as the plan and the diff as the phase, but it required orchestrator-level interpretation. Other small features will hit the same friction.
-  **Rough shape:** the existing skills accept a `--design <path>` flag (or auto-detect a Design vs Plan input); debrief output lands at `Designs/<Name>/notes/<NN>-Implementation.md` instead of `Plans/Active/<Name>/notes/`.
+  **Why:** Both skills hard-code "Plans/<PlanName>" assumptions. We adapted by treating the design as the plan and the diff as the phase, but it required orchestrator-level interpretation. Other small features will hit the same friction.
+  **Rough shape:** the existing skills accept a `--design <path>` flag (or auto-detect a Design vs Plan input); debrief output lands at `Designs/<Name>/notes/<NN>-Implementation.md` instead of `Plans/<Name>/notes/`.

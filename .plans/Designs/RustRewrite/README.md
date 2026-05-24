@@ -1,9 +1,9 @@
 ---
 title: "Rust Rewrite of code-graph-mcp"
 type: design
-status: review
+status: implemented
 created: 2026-04-28
-updated: 2026-04-28
+updated: 2026-05-24
 tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 related:
   - Designs/CodeGraphMCP

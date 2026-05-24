@@ -6,6 +6,8 @@ phase: 5
 phase_title: "Rust Language Parser"
 status: complete
 created: 2026-04-30
+updated: 2026-04-30
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 5 Debrief: Rust Language Parser

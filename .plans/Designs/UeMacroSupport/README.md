@@ -1,9 +1,9 @@
 ---
 title: "UE Macro Support — parameterized macro stripping for UCLASS/UFUNCTION/UPROPERTY"
 type: design
-status: approved
+status: implemented
 created: 2026-05-13
-updated: 2026-05-13
+updated: 2026-05-24
 tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 related:
   - Designs/CppMacroStrip

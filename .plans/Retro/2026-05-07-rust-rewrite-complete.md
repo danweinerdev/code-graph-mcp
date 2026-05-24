@@ -4,16 +4,16 @@ type: retro
 status: complete
 created: 2026-05-07
 updated: 2026-05-07
-tags: [rust-rewrite, multi-phase, plugin-architecture, tree-sitter]
+tags: [rewrite, rust, multi-phase, plugin-architecture, tree-sitter]
 related:
-  - Plans/Complete/RustRewrite/README.md
-  - Plans/Complete/RustRewrite/notes/01-Foundation-And-Cpp-Parser.md
-  - Plans/Complete/RustRewrite/notes/02-Graph-Engine-And-LLM-Optimizations.md
-  - Plans/Complete/RustRewrite/notes/03-MCP-Server-Tools-And-Discovery.md
-  - Plans/Complete/RustRewrite/notes/04-Watch-Cross-Compile-Cutover.md
-  - Plans/Complete/RustRewrite/notes/05-Rust-Parser.md
-  - Plans/Complete/RustRewrite/notes/06-Go-Parser.md
-  - Plans/Complete/RustRewrite/notes/07-Python-Parser.md
+  - Plans/RustRewrite/README.md
+  - Plans/RustRewrite/notes/01-Foundation-And-Cpp-Parser.md
+  - Plans/RustRewrite/notes/02-Graph-Engine-And-LLM-Optimizations.md
+  - Plans/RustRewrite/notes/03-MCP-Server-Tools-And-Discovery.md
+  - Plans/RustRewrite/notes/04-Watch-Cross-Compile-Cutover.md
+  - Plans/RustRewrite/notes/05-Rust-Parser.md
+  - Plans/RustRewrite/notes/06-Go-Parser.md
+  - Plans/RustRewrite/notes/07-Python-Parser.md
   - Designs/SharedDaemon/
 ---
 
@@ -23,7 +23,7 @@ related:
 
 ## What Went Well
 
-- **The plan shipped, all phases complete, no rollbacks.** Phase 1 → Phase 7 spanned roughly six weeks of dispatch work; every phase landed within its acceptance criteria. The plan moved from `Plans/Active/` to `Plans/Complete/` cleanly.
+- **The plan shipped, all phases complete, no rollbacks.** Phase 1 → Phase 7 spanned roughly six weeks of dispatch work; every phase landed within its acceptance criteria. The plan moved from `Plans/` to `Plans/` cleanly.
 - **Phase 5/6/7 plugin phases each shipped with zero cross-cutting fixes.** Each plugin phase received a plan-reviewer brief refresh against shipped state before implementer dispatch. The brief refresh paid back three consecutive times — Rust, Go, Python all shipped without "the brief said X but the codebase needs Y" stalls. This cadence is the highest-leverage process change the plan produced.
 - **Carry-forward of quality findings across task boundaries produced zero rework at close-out.** Phase 7 alone carried scanner findings forward five times (7.4 → 7.5 → 7.6 → 7.7 → 7.8); by the close-out commit only two trivial comment-text fixes remained. Compare to a "scan once at the end" pattern that typically surfaces 20+ findings nobody addresses because the phase is "done."
 - **Two helper consolidations eliminated 8 byte-identical copies across the workspace.** `truncate_signature` (Phase 7.1: 3 → 1 copy, prevented a 4th) and `find_enclosing_kind` (Phase 7.7: 5 → 1 copy). Both consolidations had been deferred from Phase 5 and Phase 6 and only landed when Phase 7's brief made each a hard subtask.
@@ -64,7 +64,7 @@ related:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Phases shipped | 7 | All complete; plan moved to `Plans/Complete/` |
+| Phases shipped | 7 | All complete; plan moved to `Plans/` |
 | Languages supported | 1 → 4 | Started with Go (legacy); shipped C++ / Rust / Go / Python |
 | Workspace tests | 0 → 683 | Plus 4 `#[ignore]`-gated dogfood tests |
 | MCP tools | 15 | analyze_codebase, get_file_symbols, search_symbols, get_symbol_detail, get_symbol_summary, get_callers, get_callees, get_dependencies, detect_cycles, get_orphans, get_class_hierarchy, get_coupling, generate_mermaid, watch_start, watch_stop |

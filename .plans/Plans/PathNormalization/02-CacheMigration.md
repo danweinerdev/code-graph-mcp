@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test -p code-graph-graph` green; all pre-existing `code-graph-graph` cache tests continue to pass (the migration is a no-op on already-clean caches and existing tests use already-clean fixtures). `make snapshot-clean` passes — Phase 2 touches no snapshot-generating handler."
     depends_on: ["2.4"]
+tags: [paths, windows, cross-platform, mcp, ue, unreal-engine, ergonomics]
 ---
 
 # Phase 2: Cache migration across all GraphCache path-bearing fields

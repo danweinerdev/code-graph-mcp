@@ -57,6 +57,7 @@ tasks:
     status: complete
     verification: "go vet clean, go test -race passes, make build produces binary."
     depends_on: ["5.9"]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 5: MCP Server & P0 Tools

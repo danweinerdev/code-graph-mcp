@@ -1,10 +1,10 @@
 ---
 title: "Code Graph MCP Server Architecture"
 type: brainstorm
-status: draft
+status: archived
 created: 2026-03-22
-updated: 2026-03-22
-tags: [architecture, mcp, code-graph, tree-sitter, golang]
+updated: 2026-05-24
+tags: [architecture, mcp, code-graph, tree-sitter, go]
 related: []
 ---
 

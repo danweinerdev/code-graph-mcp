@@ -6,6 +6,8 @@ phase: 1
 phase_title: "Foundation — CppConfig + strip_macros algorithm"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 1 Debrief: Foundation — CppConfig + strip_macros algorithm

@@ -6,6 +6,8 @@ phase: 2
 phase_title: "Wire-through — preprocess hook + call sites + integration"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 2 Debrief: Wire-through — preprocess hook + call sites + integration

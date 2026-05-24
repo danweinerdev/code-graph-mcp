@@ -6,10 +6,10 @@ created: 2026-05-07
 updated: 2026-05-07
 tags: [cpp, ue, unreal-engine, parser, single-session, plan-retro, tree-sitter]
 related:
-  - Plans/Complete/CppMacroStrip/README.md
-  - Plans/Complete/CppMacroStrip/notes/01-Foundation.md
-  - Plans/Complete/CppMacroStrip/notes/02-Wire-Through.md
-  - Plans/Complete/CppMacroStrip/notes/03-Fixture-And-Docs.md
+  - Plans/CppMacroStrip/README.md
+  - Plans/CppMacroStrip/notes/01-Foundation.md
+  - Plans/CppMacroStrip/notes/02-Wire-Through.md
+  - Plans/CppMacroStrip/notes/03-Fixture-And-Docs.md
   - Designs/CppMacroStrip/README.md
   - Retro/2026-05-07-pagination-overhaul.md
 ---

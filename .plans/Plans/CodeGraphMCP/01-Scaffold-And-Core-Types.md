@@ -42,6 +42,7 @@ tasks:
     status: complete
     verification: "`go vet ./...` passes; `go test -race ./...` passes; no compilation warnings"
     depends_on: ["1.3", "1.4", "1.5", "1.6"]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 1: Scaffold & Core Types

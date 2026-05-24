@@ -26,12 +26,13 @@ tasks:
     title: "Go cutover commit"
     status: complete
     depends_on: ["4.3"]
-    verification: "Single commit removes: cmd/, internal/, go.mod, go.sum, original Makefile; root CLAUDE.md rewritten to describe Rust build commands (cargo build / cargo test / cargo clippy) and remove all Go references; .plans/Plans/CodeGraphMCP/ marked status: superseded with related forward-link to Plans/Active/RustRewrite (or current location after move-to-Ready); .plans/Plans/{GoParser, PythonParser, RustParser}/ marked status: superseded — their content is preserved for historical reference but they no longer drive work; .plans/Designs/CodeGraphMCP/ and Designs/LLMOptimization/ marked status: superseded with forward-link to Designs/RustRewrite; testdata/cpp preserved unchanged; commit message references this phase doc and lists every removed top-level path; post-commit: `find . -name '*.go' -not -path './.git/*'` returns no results; `cargo build --release` from a fresh clone succeeds without any Go toolchain installed"
+    verification: "Single commit removes: cmd/, internal/, go.mod, go.sum, original Makefile; root CLAUDE.md rewritten to describe Rust build commands (cargo build / cargo test / cargo clippy) and remove all Go references; .plans/Plans/CodeGraphMCP/ marked status: superseded with related forward-link to Plans/RustRewrite (or current location after move-to-Ready); .plans/Plans/{GoParser, PythonParser, RustParser}/ marked status: superseded — their content is preserved for historical reference but they no longer drive work; .plans/Designs/CodeGraphMCP/ and Designs/LLMOptimization/ marked status: superseded with forward-link to Designs/RustRewrite; testdata/cpp preserved unchanged; commit message references this phase doc and lists every removed top-level path; post-commit: `find . -name '*.go' -not -path './.git/*'` returns no results; `cargo build --release` from a fresh clone succeeds without any Go toolchain installed"
   - id: "4.5"
     title: "Structural verification + release readiness"
     status: complete
     depends_on: ["4.4"]
     verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green (all phase 1-4 tests pass); `cargo audit` (or equivalent) shows no known vulnerabilities in dependencies; release build for the host platform completes without warnings; new top-level README.md (or updated existing) describes installation via `cargo install --path crates/code-graph-mcp` or `make release` (no prebuilt binaries — build natively per platform); manual end-to-end smoke test against an MCP client confirms watch mode works in practice (modify a file, observe reindex, query reflects the change)"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 4: Watch Mode, Cross-Compile & Go Cutover
@@ -101,8 +102,8 @@ The "drop the event when index_lock is held" rule (rather than queue) is a delib
   - `.plans/Plans/{GoParser, PythonParser, RustParser}/` READMEs and phase docs (all were `status: planned`/`draft` — superseded)
   - `.plans/Designs/CodeGraphMCP/README.md` (was `status: review` — superseded)
   - ~~`.plans/Designs/LLMOptimization/README.md`~~ — left unchanged (status: `implemented`, completed work)
-  - Each superseded artifact gets a one-line note at the top: `**Superseded by [Plans/Active/RustRewrite](...)**`
-- [x] Plan currently lives in `Plans/Active/RustRewrite/`; README `status: active` confirmed (no change needed)
+  - Each superseded artifact gets a one-line note at the top: `**Superseded by [Plans/RustRewrite](...)**`
+- [x] Plan currently lives in `Plans/RustRewrite/`; README `status: active` confirmed (no change needed)
 - [x] `testdata/cpp/` preserved unchanged
 - [x] Commit message lists every removed path and references this phase doc
 - [x] Post-commit verification: `find . -name '*.go' -not -path './.git/*' -not -path './.plans/*'` returns no results; `cargo build --release` succeeds without Go toolchain

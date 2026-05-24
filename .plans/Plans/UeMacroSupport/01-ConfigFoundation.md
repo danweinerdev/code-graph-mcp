@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test -p code-graph-core config` green (the 7 new tests pass); existing `cpp_macro_strip_*` tests stay green (no regression); `make snapshot-clean` passes (Phase 1 touches no handler so no snapshots regenerate)."
     depends_on: ["1.4"]
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 ---
 
 # Phase 1: Config field + validation (no behavior change)

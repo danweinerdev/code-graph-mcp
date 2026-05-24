@@ -40,6 +40,7 @@ tasks:
     title: "Structural verification"
     status: complete
     verification: "go vet clean, go test -race passes (15 tool tests + 28 graph + 24 cpp + 3 parser = 70 total), make build produces binary."
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 6: P1 Tools & Polish

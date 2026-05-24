@@ -17,6 +17,7 @@ tasks:
     status: complete
     depends_on: ["1.1"]
     verification: "`ExtensionsConfig` in `crates/code-graph-core/src/config.rs` has `csharp: Vec<String>` and `java: Vec<String>` fields with `#[serde(default)]`. `lookup_additional` (currently 4 language arms) returns `Some(Language::CSharp)` for matches in `self.csharp` and `Some(Language::Java)` for matches in `self.java`. `lists_mut` returns a `[(&'static str, &mut Vec<String>); 7]` (was `; 5`) including `(\"csharp\", &mut self.csharp)` and `(\"java\", &mut self.java)`. `additive_lists` returns `[(&'static str, &Vec<String>); 6]` (was `; 4`) with the corresponding entries. `RootConfig::load` normalization (the loop at config.rs:281 that drains empties and validates leading-dot) compiles unchanged because it iterates `lists_mut()` uniformly. `.code-graph.toml.example` documents the new lists alongside cpp/rust/go/python with the same example-comment style. `CLAUDE.md`'s `[extensions]` table comment grows from 4 → 6 language defaults (`csharp = [.cs]`, `java = [.java]` added). New tests in `crates/code-graph-core/src/config.rs`: a `[extensions].csharp = [\".aspx\"]` round-trip lookup test, and a cross-additive collision test asserting `[extensions].csharp = [\".x\"]` and `[extensions].java = [\".x\"]` returns `Err(ExtensionConflict)`. `cargo build --workspace` and `cargo test -p code-graph-core` pass."
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 1: Pre-Work — Workspace Plumbing

@@ -1,9 +1,9 @@
 ---
 title: "PathInternThrough — interned `PathId` / `NameId` / `SymbolKey` through the live Graph"
 type: design
-status: deferred
+status: archived
 created: 2026-05-22
-updated: 2026-05-23
+updated: 2026-05-24
 revision: 3
 tags: [graph, interning, in-memory, performance, mcp-tool-timeout, refactor]
 related:

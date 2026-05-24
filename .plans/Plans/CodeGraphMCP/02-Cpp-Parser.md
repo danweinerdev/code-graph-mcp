@@ -47,6 +47,7 @@ tasks:
     status: complete
     verification: "23 tests covering: free functions, methods, classes, structs, enums, typedefs, nested namespaces, multiple inheritance, 4 call site patterns, both include forms, forward declarations excluded, top-level calls, anonymous namespaces, signature truncation, helper functions. go vet and -race pass."
     depends_on: ["2.3", "2.4", "2.5", "2.6", "2.7"]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 2: C++ Parser

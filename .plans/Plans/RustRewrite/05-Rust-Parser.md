@@ -42,6 +42,7 @@ tasks:
     status: planned
     depends_on: ["5.6"]
     verification: "`make release` (host-target only — cross-compile was removed in Phase 4) produces a binary that includes the Rust plugin; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including the new codegraph-lang-rust; `cargo test --workspace` green — every Phase 1-5 test passes (398 tests from Phase 4 baseline plus the new Rust-plugin tests); no new `unsafe` introduced (workspace `unsafe_code = \"forbid\"`); no `#[allow(clippy::...)]` attributes added to suppress findings; `cargo audit` clean"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 5: Rust Language Parser

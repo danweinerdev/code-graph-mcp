@@ -6,6 +6,8 @@ phase: 1
 phase_title: "Pre-Work — Workspace Plumbing"
 status: complete
 created: 2026-05-08
+updated: 2026-05-08
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 1 Debrief: Pre-Work — Workspace Plumbing

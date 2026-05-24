@@ -62,6 +62,7 @@ tasks:
     status: complete
     depends_on: ["4.10"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` passes (683+ tests, no regressions). `cargo insta pending-snapshots` zero. UE-scale manual smoke (optional but recommended): index a public Unreal-style codebase, exercise `get_orphans { kind: function }` (confirm one-page response under MCP token ceiling, `total` reflects full count); `get_class_hierarchy { class: UObject, depth: 2, max_nodes: 250 }` (confirm `truncated: true` if the hierarchy exceeds 250, well-formed partial tree); `get_callers { symbol: <hot UE symbol>, depth: 1 }` (confirm pagination engages on high fan-in)."
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 4: Tree-shaped get_class_hierarchy + cutover

@@ -21,6 +21,7 @@ tasks:
     status: complete
     depends_on: ["1.1", "1.2"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean (no `#[allow]` to suppress findings on the new `CppConfig`, the empty-string filter, or `strip_macros`). `cargo test --workspace` passes — the new tests pass; the existing 49 C++ corpus tests remain unchanged (they don't exercise macro-prefixed classes, so adding `strip_macros` as a callable-but-uncalled function should not affect them). No snapshot files regenerate in this phase (nothing wired through to the parse pipeline yet)."
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 1: Foundation — CppConfig + strip_macros algorithm

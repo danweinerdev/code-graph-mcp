@@ -37,6 +37,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test --workspace` green (the Phase 4.2 and 4.3 integration tests pass); existing 49 corpus tests + fmt/curl/abseil-cpp baselines stay within ±10%; `make snapshot-clean` passes; any new fixture-related snapshots regenerated via `cargo insta review` deliberately, not blanket-accepted. CLAUDE.md grep checks: `grep -c 'macro_strip_with_args' CLAUDE.md >= 3` AND no orphan reference to the old single-field name in the cache-invalidation sentence."
     depends_on: ["4.5"]
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 ---
 
 # Phase 4: UE integration tests + docs + .code-graph.toml.example preset

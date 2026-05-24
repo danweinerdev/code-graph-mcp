@@ -6,6 +6,8 @@ phase: 4
 phase_title: "Tool descriptions, CLAUDE.md, design addendum"
 status: complete
 created: 2026-05-12
+updated: 2026-05-12
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 4 Debrief: Tool descriptions, CLAUDE.md, design addendum

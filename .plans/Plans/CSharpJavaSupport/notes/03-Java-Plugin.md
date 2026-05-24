@@ -6,6 +6,8 @@ phase: 3
 phase_title: "Java Plugin"
 status: complete
 created: 2026-05-11
+updated: 2026-05-11
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 3 Debrief: Java Plugin

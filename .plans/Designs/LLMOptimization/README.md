@@ -4,7 +4,7 @@ type: design
 status: implemented
 created: 2026-03-23
 updated: 2026-04-28
-tags: [optimization, llm, token-efficiency, usability]
+tags: [llm-optimization, token-efficiency, usability]
 related: [Designs/CodeGraphMCP]
 ---
 

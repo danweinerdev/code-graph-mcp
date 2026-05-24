@@ -1,15 +1,15 @@
 ---
 title: "Pagination & Output-Size Caps for UE-Scale Codebases"
 type: design
-status: review
+status: implemented
 created: 2026-05-07
-updated: 2026-05-12
+updated: 2026-05-24
 tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 related:
   - Designs/RustRewrite
   - Designs/LLMOptimization
-  - Plans/Complete/RustRewrite
-  - Plans/Active/PaginatedResponseSizeSafety
+  - Plans/RustRewrite
+  - Plans/PaginatedResponseSizeSafety
   - Retro/2026-05-07-rust-rewrite-complete
 ---
 
@@ -335,7 +335,7 @@ Mitigation: the design ships in a single PR with a clearly named "wire-format ch
 
 **Decision:** Byte cap default 100 KB, configurable via `[response].max_bytes`. Picked over tokenizer-based budgeting for determinism and zero added dependencies. `.code-graph.toml` exposure means teams running on Unreal-scale indexes can raise it without a rebuild; default is conservative enough that Claude Code's harness accepts every response. Truncation surfaces via `truncated: bool` + `next_offset: Option<u32>` on the envelope.
 
-**Rationale:** This decision was driven by direct user feedback from `Plans/Active/PaginatedResponseSizeSafety` — a `get_orphans(limit=1000)` call against a real 71-file / 1,759-symbol Rust repo on `rust-main` returned 1,031 records as a 297,266-character single-line JSON payload (~74K tokens), which Claude Code's harness rejected and spilled to disk. The original Decision 7 ceiling (1000 records) was tuned to a record count that no longer correlates with the actual failure mode (bytes / tokens). A byte budget is the natural backstop because it directly measures the dimension that broke. Tokenizer-aware budgeting was considered and rejected — it would couple the server to a particular model's tokenizer and add a dependency, while a static byte cap reliably underestimates token cost for any reasonable JSON payload. Surfacing truncation explicitly via `truncated` + `next_offset` (rather than silently dropping records) is the same trade-off as Decision 7's echoed `limit`: tell the agent what happened so it can resume paging without round-trips.
+**Rationale:** This decision was driven by direct user feedback from `Plans/PaginatedResponseSizeSafety` — a `get_orphans(limit=1000)` call against a real 71-file / 1,759-symbol Rust repo on `rust-main` returned 1,031 records as a 297,266-character single-line JSON payload (~74K tokens), which Claude Code's harness rejected and spilled to disk. The original Decision 7 ceiling (1000 records) was tuned to a record count that no longer correlates with the actual failure mode (bytes / tokens). A byte budget is the natural backstop because it directly measures the dimension that broke. Tokenizer-aware budgeting was considered and rejected — it would couple the server to a particular model's tokenizer and add a dependency, while a static byte cap reliably underestimates token cost for any reasonable JSON payload. Surfacing truncation explicitly via `truncated` + `next_offset` (rather than silently dropping records) is the same trade-off as Decision 7's echoed `limit`: tell the agent what happened so it can resume paging without round-trips.
 
 ### Decision 9: `count_only: bool` on the three `SymbolResult`-emitting tools
 

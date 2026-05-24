@@ -6,6 +6,8 @@ phase: 1
 phase_title: "Foundation & C++ Parser"
 status: complete
 created: 2026-04-28
+updated: 2026-04-28
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 1 Debrief: Foundation & C++ Parser

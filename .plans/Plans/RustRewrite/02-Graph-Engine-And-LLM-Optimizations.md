@@ -42,6 +42,7 @@ tasks:
     status: complete
     depends_on: ["2.6"]
     verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates added in this phase; `cargo test --workspace` green including all graph engine tests, LLM-optimization tests, diamond hierarchy regression test, Tarjan SCC tests, concurrent reader/writer test; no new unsafe blocks; no #[allow] attributes suppressing clippy findings"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 2: Graph Engine & LLM Optimizations

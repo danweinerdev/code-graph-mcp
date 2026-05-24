@@ -47,6 +47,7 @@ tasks:
     status: complete
     depends_on: ["2.7"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` passes. `cargo insta pending-snapshots` reports zero pending."
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 2: get_orphans P0 fix

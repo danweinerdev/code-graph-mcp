@@ -7,7 +7,7 @@ updated: 2026-05-07
 tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 related:
   - Designs/CppMacroStrip
-  - Plans/Complete/RustRewrite/01-Foundation-And-Cpp-Parser.md
+  - Plans/RustRewrite/01-Foundation-And-Cpp-Parser.md
 phases:
   - id: 1
     title: "Foundation — CppConfig + strip_macros algorithm"

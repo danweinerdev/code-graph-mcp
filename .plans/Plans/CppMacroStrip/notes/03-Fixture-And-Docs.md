@@ -6,6 +6,8 @@ phase: 3
 phase_title: "Fixture, snapshot, docs, cutover"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 3 Debrief: Fixture, snapshot, docs, cutover

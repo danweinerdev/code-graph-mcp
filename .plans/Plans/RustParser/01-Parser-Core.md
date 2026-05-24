@@ -3,7 +3,7 @@ title: "Rust Parser Core"
 type: phase
 plan: RustParser
 phase: 1
-status: superseded
+status: archived
 created: 2026-03-22
 updated: 2026-04-29
 deliverable: "KindTrait in types.go, RustParser with all extraction methods"
@@ -52,11 +52,12 @@ tasks:
     status: planned
     verification: "`go vet ./...` passes. `go test -race ./internal/lang/rust/` passes. All existing tests still pass."
     depends_on: ["1.5", "1.6", "1.7", "1.8"]
+tags: [parser, rust, tree-sitter]
 ---
 
 # Phase 1: Rust Parser Core
 
-**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
+**Superseded by [Plans/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

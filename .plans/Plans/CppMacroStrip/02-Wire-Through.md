@@ -32,6 +32,7 @@ tasks:
     status: complete
     depends_on: ["2.4"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` passes — full suite. **Existing 49 C++ corpus tests pass byte-identical.** **`cargo insta pending-snapshots` reports zero AND `git diff --stat tests/snapshots/` shows zero churn** — no existing snapshot regenerates because all current C++ fixtures use empty `macro_strip` (no `[cpp]` section in any current `.code-graph.toml`). If the engine.cpp hierarchy snapshot or any other existing snapshot regenerates, that's a sign the default `preprocess` impl isn't actually no-op for non-C++ files, which is a bug — investigate before approving any snapshot change. **Manual smoke**: run `codegraph-parse-test` against `testdata/cpp/` (no `.code-graph.toml` there, so default empty `macro_strip` applies); confirm output matches the historical **18 symbols / 21 edges** baseline (corrected from the original Phase 1 plan's typo of 17, per the RustRewrite Phase 1 retro)."
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 2: Wire-through — preprocess hook + call sites + integration

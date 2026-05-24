@@ -1,9 +1,9 @@
 ---
 title: "Adding Go, Python, and Rust Parsers"
 type: research
-status: active
+status: archived
 created: 2026-03-22
-updated: 2026-03-22
+updated: 2026-05-24
 tags: [parser, go, python, rust, tree-sitter]
 related: [Designs/CodeGraphMCP, Brainstorm/code-graph-mcp-architecture]
 ---

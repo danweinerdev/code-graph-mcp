@@ -6,12 +6,12 @@ created: 2026-05-11
 updated: 2026-05-11
 tags: [language-plugin, c-sharp, java, multi-language, planner-improvements]
 related:
-  - Plans/Complete/CSharpJavaSupport
-  - Plans/Complete/CSharpJavaSupport/notes/01-Pre-Work.md
-  - Plans/Complete/CSharpJavaSupport/notes/02-CSharp-Plugin.md
-  - Plans/Complete/CSharpJavaSupport/notes/03-Java-Plugin.md
-  - Plans/Complete/CSharpJavaSupport/notes/04-Integration-And-Cutover.md
-  - Plans/Complete/RustRewrite
+  - Plans/CSharpJavaSupport
+  - Plans/CSharpJavaSupport/notes/01-Pre-Work.md
+  - Plans/CSharpJavaSupport/notes/02-CSharp-Plugin.md
+  - Plans/CSharpJavaSupport/notes/03-Java-Plugin.md
+  - Plans/CSharpJavaSupport/notes/04-Integration-And-Cutover.md
+  - Plans/RustRewrite
   - Retro/2026-05-07-rust-rewrite-complete.md
 ---
 
@@ -88,7 +88,7 @@ Four phases, 21 tasks, 31 commits, ~4 calendar days, ~395 net new tests. The MCP
 **Why a skill:** Eliminates the most common review-fix-cycle class. The 5-minute cost of refreshing a brief against shipped state saves ~30-60 minutes per affected task in re-review + fix cycles.
 
 **Rough shape:**
-- **Inputs:** `<plan-path>/<phase-doc-path>` (e.g., `Plans/Active/CSharpJavaSupport/02-CSharp-Plugin.md`)
+- **Inputs:** `<plan-path>/<phase-doc-path>` (e.g., `Plans/CSharpJavaSupport/02-CSharp-Plugin.md`)
 - **Reads:** the phase doc + the prior phase's debrief (if any) + the plan README + any related design doc in `Designs/`
 - **Process:** invokes `planner:plan-reviewer` against the phase doc with the prior debrief as additional context AND the codebase as reality reference
 - **Output:** Approve/Revise verdict. If Revise, lists the specific phase-doc subsections that need updating (with line numbers) and *why* (e.g., "Task 2.2's verification field references `DEFINITION_QUERY` singular; shipped convention uses `DEFINITION_QUERIES` plural — see `crates/code-graph-lang-python/src/queries.rs`")

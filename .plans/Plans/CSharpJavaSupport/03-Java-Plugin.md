@@ -42,6 +42,7 @@ tasks:
     status: complete
     depends_on: ["3.6"]
     verification: "All four structural gates pass against the Java crate: `cargo test -p code-graph-lang-java`, `cargo clippy -p code-graph-lang-java --all-targets -- -D warnings` (zero warnings), `cargo fmt --all --check` (clean), `cargo audit` (no new advisories from the tree-sitter-java dep). Workspace `unsafe_code = \"forbid\"` lint holds. No `.snap.new` pending snapshots in the working tree (`make snapshot-clean` passes). Phase 3 close-out: write the debrief at `notes/03-Java-Plugin.md` capturing actual baseline numbers from 3.6, any tree-sitter-java grammar surprises encountered, and any quality-scanner findings carried-forward to Phase 4."
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 3: Java Plugin

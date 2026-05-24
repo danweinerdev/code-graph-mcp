@@ -7,7 +7,7 @@ updated: 2026-05-12
 tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 related:
   - Designs/Pagination
-  - Plans/Complete/PaginationOverhaul
+  - Plans/PaginationOverhaul
 phases:
   - id: 1
     title: "Envelope additions, byte-budget helper, config plumbing"

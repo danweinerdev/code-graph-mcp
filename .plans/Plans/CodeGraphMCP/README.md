@@ -4,7 +4,7 @@ type: plan
 status: complete
 created: 2026-03-22
 updated: 2026-03-22
-tags: [mcp, code-graph, tree-sitter, golang, cpp]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 related: [Designs/CodeGraphMCP, Brainstorm/code-graph-mcp-architecture]
 phases:
   - id: 1

@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "page_parts (test_helpers in crates/code-graph-tools/src/handlers/mod.rs under cfg(test)) returns the existing (results, total, offset, limit) tuple AND a sibling accessor (page_extras or extension) exposing (truncated, next_offset); all existing call sites compile; one new snapshot consumer test asserts both accessors return matching values"
     depends_on: ["1.3"]
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 1: Envelope additions, byte-budget helper, config plumbing

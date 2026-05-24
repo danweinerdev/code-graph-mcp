@@ -6,7 +6,7 @@ phase: 7
 status: complete
 created: 2026-04-28
 updated: 2026-05-07
-deliverable: "codegraph-lang-python crate parsing .py and .pyi files with class/method/decorator handling, both import forms, multi-base inheritance, and the Python-specific call node type; registered in the main binary; testdata/python/ + real-world validation; the four-language MCP is complete and the RustRewrite plan moves to Plans/Complete/"
+deliverable: "codegraph-lang-python crate parsing .py and .pyi files with class/method/decorator handling, both import forms, multi-base inheritance, and the Python-specific call node type; registered in the main binary; testdata/python/ + real-world validation; the four-language MCP is complete and the RustRewrite plan moves to Plans/"
 tasks:
   - id: "7.1"
     title: "codegraph-lang-python crate scaffold + queries.rs + Cargo.toml dependencies"
@@ -46,7 +46,8 @@ tasks:
     title: "Structural verification + plan close-out"
     status: complete
     depends_on: ["7.7"]
-    verification: "`make release` (host-target only) succeeds and produces a four-language-capable binary; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including codegraph-lang-python; `cargo test --workspace` green — every Phase 1-7 test passes; `cargo audit` clean; no new `unsafe` (workspace `unsafe_code = \"forbid\"`); no `#[allow(clippy::...)]` suppressions; **plan close-out (in this exact order)**: (1) write Phase 7 debrief to `notes/07-Python-Parser.md` while the plan is still in `Plans/Active/` (so the debrief captures the actual implementation experience, not a retrospective); (2) update plan README `phases[7].status` to `complete` and the README top-level `status` to `complete`; (3) `git mv .plans/Plans/Active/RustRewrite .plans/Plans/Complete/RustRewrite`; (4) commit with subject `[RustRewrite/Phase 7] plan close-out — RustRewrite complete`; the four-language MCP is shipped and the SharedDaemon plan (in `Designs/SharedDaemon/`, status `draft`) is unblocked and ready for `/planner:plan`"
+    verification: "`make release` (host-target only) succeeds and produces a four-language-capable binary; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including codegraph-lang-python; `cargo test --workspace` green — every Phase 1-7 test passes; `cargo audit` clean; no new `unsafe` (workspace `unsafe_code = \"forbid\"`); no `#[allow(clippy::...)]` suppressions; **plan close-out (in this exact order)**: (1) write Phase 7 debrief to `notes/07-Python-Parser.md` while the plan is still in `Plans/` (so the debrief captures the actual implementation experience, not a retrospective); (2) update plan README `phases[7].status` to `complete` and the README top-level `status` to `complete`; (3) `git mv .plans/Plans/RustRewrite .plans/Plans/RustRewrite`; (4) commit with subject `[RustRewrite/Phase 7] plan close-out — RustRewrite complete`; the four-language MCP is shipped and the SharedDaemon plan (in `Designs/SharedDaemon/`, status `draft`) is unblocked and ready for `/planner:plan`"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 7: Python Language Parser
@@ -55,7 +56,7 @@ tasks:
 
 Add Python language support — priority 4 per the user's ordering, completing the four-language MCP. Python's grammar is simple but has two distinctive challenges: (1) call nodes are `call`, not `call_expression`; (2) imports come in two forms (`import` and `from ... import`), and the dependency edge points at the *module*, not the imported symbol. This phase replaces the original `Plans/PythonParser/` (status: superseded).
 
-After this phase ships green, `code-graph-mcp` is feature-complete for the user's stated four-language scope. The plan moves from `Plans/Active/` → `Plans/Complete/` and the next planned body of work is the `SharedDaemon` design (in `Designs/SharedDaemon/`, status `draft`, deferred — replaces the per-session stdio model with a long-running multi-tenant daemon).
+After this phase ships green, `code-graph-mcp` is feature-complete for the user's stated four-language scope. The plan moves from `Plans/` → `Plans/` and the next planned body of work is the `SharedDaemon` design (in `Designs/SharedDaemon/`, status `draft`, deferred — replaces the per-session stdio model with a long-running multi-tenant daemon).
 
 This doc was reviewed against the as-shipped state of phases 1-4 on 2026-04-30 and re-reviewed after task-split refactoring (see `notes/04-Watch-Cross-Compile-Cutover.md`). Updates incorporate: the actual `LanguageRegistry::register(Box<dyn LanguagePlugin>)` signature with anyhow `.context(...)` wrappers, the `Graph::prune_dangling_edges` invariant established in Phase 4.2, the no-cross-compile build path from Phase 4.3, the explicit `id() → Language::Python` registration requirement, the `#[test]` form of the object-safety check (avoids the `-D warnings` clippy gate), `.pyi` stub-file coverage, async-method coverage inside classes, `from __future__ import annotations` handling, and a 7.6/7.7/7.8 task split that lifts the plan close-out into a standalone final task.
 
@@ -214,12 +215,12 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 - [x] `cargo test --workspace` green — every Phase 1-7 test passes
 - [x] `cargo audit` clean (no new advisories)
 - [x] No new `unsafe` blocks; no `#[allow(clippy::...)]` suppressions
-- [x] **Plan close-out (in this exact order — debrief MUST be written while the plan is still in `Plans/Active/`):**
+- [x] **Plan close-out (in this exact order — debrief MUST be written while the plan is still in `Plans/`):**
   1. Write Phase 7 debrief to `notes/07-Python-Parser.md` — captures the actual implementation experience, decisions made, deviations, lessons learned, and the SharedDaemon handoff context
-  2. Update `Plans/Active/RustRewrite/README.md`:
+  2. Update `Plans/RustRewrite/README.md`:
      - `phases[7].status` → `complete`
      - top-level `status:` → `complete`
-  3. `git mv .plans/Plans/Active/RustRewrite .plans/Plans/Complete/RustRewrite`
+  3. `git mv .plans/Plans/RustRewrite .plans/Plans/RustRewrite`
   4. Commit with subject `[RustRewrite/Phase 7] plan close-out — RustRewrite complete` and a body listing all four newly-supported languages and pointing at SharedDaemon as the next planned work
 - [x] **The rewrite is complete.** SharedDaemon plan (`Designs/SharedDaemon/`, status `draft`) is unblocked; next step is `/planner:plan` against that design
 
@@ -234,5 +235,5 @@ are wrapped in `if_statement > block` rather than appearing at module scope as `
 - [x] All Phase 1-7 tests pass; lint, format, audit gates clean
 - [x] Documentation lists all four languages; conditional-imports limitation documented
 - [x] Phase 7 debrief written
-- [x] Plan moved from `Plans/Active/` to `Plans/Complete/` via `git mv`; plan README status flipped to `complete`
+- [x] Plan moved from `Plans/` to `Plans/` via `git mv`; plan README status flipped to `complete`
 - [x] SharedDaemon plan is unblocked and ready for `/planner:plan`

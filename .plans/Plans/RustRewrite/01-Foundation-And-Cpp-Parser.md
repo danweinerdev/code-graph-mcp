@@ -42,6 +42,7 @@ tasks:
     status: complete
     depends_on: ["1.6"]
     verification: "`cargo fmt --check` clean across workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean (no allow attributes added to suppress findings); `cargo test --workspace` passes including all C++ corpus tests, RootConfig tests, registry tests, and core type tests; codegraph-parse-test bin compiles and runs end-to-end; no `unsafe` blocks introduced (FFI to tree-sitter is encapsulated in the upstream crate)"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 1: Foundation & C++ Parser

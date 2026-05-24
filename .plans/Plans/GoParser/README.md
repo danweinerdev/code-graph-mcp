@@ -1,9 +1,9 @@
 ---
 title: "Go Language Parser"
 type: plan
-status: superseded
+status: archived
 created: 2026-03-22
-updated: 2026-04-29
+updated: 2026-05-24
 tags: [parser, go, tree-sitter]
 related: [Research/multi-language-parsers, Plans/CodeGraphMCP]
 phases:
@@ -25,7 +25,7 @@ phases:
 
 # Go Language Parser
 
-**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
+**Superseded by [Plans/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

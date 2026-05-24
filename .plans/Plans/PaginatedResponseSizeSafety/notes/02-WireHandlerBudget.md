@@ -6,6 +6,8 @@ phase: 2
 phase_title: "Wire byte budget into the 5 paginated handlers"
 status: complete
 created: 2026-05-12
+updated: 2026-05-12
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 2 Debrief: Wire byte budget into the 5 paginated handlers

@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test --workspace` green on Linux (the Windows-gated test in 1.3 is silently skipped); existing 49 corpus tests + fmt/ripgrep/logrus/requests/efcore/commons-lang baselines all within ±10%."
     depends_on: ["1.4"]
+tags: [paths, windows, cross-platform, mcp, ue, unreal-engine, ergonomics]
 ---
 
 # Phase 1: paths module, dunce dependency, analyze.rs swap

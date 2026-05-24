@@ -6,11 +6,11 @@ created: 2026-05-07
 updated: 2026-05-07
 tags: [pagination, mcp, llm-optimization, ue, single-session, plan-retro]
 related:
-  - Plans/Complete/PaginationOverhaul/README.md
-  - Plans/Complete/PaginationOverhaul/notes/01-Shared-Envelope.md
-  - Plans/Complete/PaginationOverhaul/notes/02-Get-Orphans-P0-Fix.md
-  - Plans/Complete/PaginationOverhaul/notes/03-List-Shaped-Tools.md
-  - Plans/Complete/PaginationOverhaul/notes/04-Tree-Shaped-And-Cutover.md
+  - Plans/PaginationOverhaul/README.md
+  - Plans/PaginationOverhaul/notes/01-Shared-Envelope.md
+  - Plans/PaginationOverhaul/notes/02-Get-Orphans-P0-Fix.md
+  - Plans/PaginationOverhaul/notes/03-List-Shaped-Tools.md
+  - Plans/PaginationOverhaul/notes/04-Tree-Shaped-And-Cutover.md
   - Designs/Pagination/README.md
 ---
 

@@ -1,9 +1,9 @@
 ---
 title: "PackedCache — interned columnar binary cache backed by code-graph-path-trie"
 type: design
-status: shipped
+status: implemented
 created: 2026-05-22
-updated: 2026-05-23
+updated: 2026-05-24
 revision: 3
 tags: [cache, persistence, paths, interning, rkyv, performance, mcp-tool-timeout]
 related:

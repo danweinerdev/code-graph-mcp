@@ -37,6 +37,7 @@ tasks:
     status: complete
     verification: "Existing snapshots (helper_language_go, helper_language_rust, helper_language_python, query_engine) regenerate; the trim path is exercised by a new snapshot search_symbols_byte_budget_truncated that calls with limit=1000 against a synthetic broad-match fixture and demonstrates truncated=true with next_offset=Some(n) where n < limit; total stays as the Graph::search-reported pre-pagination match count; unit test asserts a recursive get_symbol_detail(records[last].id) still resolves (records aren't corrupted by trim); re-paging correctness test: a second call to search_symbols with offset=next_offset returns records whose first entry equals the (k+1)-th record from the first call (no overlap or gap at the trim boundary)"
     depends_on: ["1.3", "2.0"]
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 2: Wire byte budget into the 5 paginated handlers

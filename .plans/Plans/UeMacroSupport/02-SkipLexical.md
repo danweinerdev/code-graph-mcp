@@ -37,6 +37,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test -p code-graph-lang-cpp` green (existing tests + the new `skip_lexical_*` tests). Existing `strip_macros` tests (the whole-word pass from CppMacroStrip) stay byte-identical green; `skip_lexical` is a new pure function that doesn't touch them yet."
     depends_on: ["2.5"]
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 ---
 
 # Phase 2: skip_lexical lexer state machine

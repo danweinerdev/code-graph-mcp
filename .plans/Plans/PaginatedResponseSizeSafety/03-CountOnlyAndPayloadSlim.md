@@ -27,6 +27,7 @@ tasks:
     status: complete
     verification: "SymbolResult no longer has a file field; symbol_to_result no longer populates it; all existing response snapshots regenerate without 'file' keys on records; one new unit test demonstrates round-trip: a sampled response record id is fed through code_graph_core::id_to_file and produces the absolute path the snapshot would previously have had in the file field; CallChain (used by get_callers/get_callees) is unchanged (its file is the call-site, not redundant); two NON-snapshot test consumers are explicitly migrated: (i) crates/code-graph-tools/tests/mixed_language.rs:203 (.expect(\"each result has a file field\") panics if not migrated — switch language inference to use id_to_file(&record.id)), (ii) crates/code-graph-tools/src/handlers/symbols.rs:341 (asserts entry.get(\"file\").is_some() — flip to is_none() or remove); workspace-wide rg --type rust '\"file\"' under crates/code-graph-tools/ has zero remaining matches on SymbolResult-shaped JSON"
     depends_on: ["3.2"]
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 3: count_only flag + SymbolResult.file drop

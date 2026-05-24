@@ -42,6 +42,7 @@ tasks:
     status: complete
     depends_on: ["6.6"]
     verification: "`make release` (host-target only; cross-compile was removed in Phase 4) succeeds and produces a binary that includes the Go plugin; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean across all crates including the new codegraph-lang-go; `cargo test --workspace` green — every Phase 1-6 test passes; `cargo audit` clean; no new unsafe (workspace `unsafe_code = \"forbid\"`); no allow attributes suppressing findings"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 6: Go Language Parser

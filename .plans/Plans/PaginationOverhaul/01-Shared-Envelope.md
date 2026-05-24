@@ -27,6 +27,7 @@ tasks:
     status: complete
     depends_on: ["1.3"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean (no allow attributes added to suppress findings on the new generic). `cargo test --workspace` passes — no behavioral regression in any tool, language, or integration test."
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 1: Shared Page<T> envelope + search_symbols migration

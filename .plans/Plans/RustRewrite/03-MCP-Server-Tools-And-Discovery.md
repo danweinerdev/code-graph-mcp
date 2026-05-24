@@ -47,6 +47,7 @@ tasks:
     status: complete
     depends_on: ["3.7"]
     verification: "`cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green including all snapshot tests, integration tests, and per-tool unit tests; release build (`cargo build --release`) produces a working binary; binary smoke-tests via a real MCP client (Claude Desktop or scripted JSON-RPC over stdio) exposing all 15 tools; no new unsafe; no allow attributes added to suppress findings"
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 3: MCP Server, Tools, Persistence & Parallel Discovery

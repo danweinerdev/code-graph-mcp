@@ -6,6 +6,8 @@ phase: 4
 phase_title: "Integration and Cutover"
 status: complete
 created: 2026-05-11
+updated: 2026-05-11
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 4 Debrief: Integration and Cutover
@@ -32,7 +34,7 @@ Four tasks (4.1–4.4), 5 commits, ~3 review-fix-cycle interventions. Phase 4 br
 | `## C# Parser Limitations` and `## Java Parser Limitations` CLAUDE.md sections written | Met | Commit `59e06c7`; ~50 lines each, mirroring existing four sections' shape |
 | Workspace structural gates all pass | Met | `cargo build --release` ✓, `cargo test --workspace` 995 tests ✓, clippy clean ✓, fmt clean ✓ (post-sweep), `cargo audit` ✓, `make snapshot-clean` ✓, `make submodules` ✓ |
 | Phase 4 debrief at `notes/04-Integration-And-Cutover.md` | Met | This document |
-| Plan status `active` → `complete`; folder moved to `Plans/Complete/CSharpJavaSupport` | (orchestrator handles after this debrief) | Pending |
+| Plan status `active` → `complete`; folder moved to `Plans/CSharpJavaSupport` | (orchestrator handles after this debrief) | Pending |
 | `make dashboard` regenerated if `dashboard: true` | N/A | `planning-config.json` has `dashboard: false`; nothing to regenerate |
 
 ## Deviations

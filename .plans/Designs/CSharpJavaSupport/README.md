@@ -1,14 +1,14 @@
 ---
 title: "C# and Java Language Plugins"
 type: design
-status: review
+status: implemented
 created: 2026-05-07
-updated: 2026-05-07
+updated: 2026-05-24
 tags: [language-plugin, c-sharp, java, tree-sitter, multi-language, vnext]
 related:
   - Designs/RustRewrite
-  - Plans/Complete/RustRewrite
-  - Plans/Complete/RustRewrite/notes/07-Python-Parser.md
+  - Plans/RustRewrite
+  - Plans/RustRewrite/notes/07-Python-Parser.md
   - Designs/SharedDaemon
 ---
 

@@ -6,6 +6,8 @@ phase: 6
 phase_title: "Go Language Parser"
 status: complete
 created: 2026-05-05
+updated: 2026-05-05
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 6 Debrief: Go Language Parser

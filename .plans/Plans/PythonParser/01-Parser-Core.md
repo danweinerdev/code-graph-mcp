@@ -3,7 +3,7 @@ title: "Python Parser Core"
 type: phase
 plan: PythonParser
 phase: 1
-status: superseded
+status: archived
 created: 2026-03-22
 updated: 2026-04-29
 deliverable: "PythonParser with all extraction methods"
@@ -47,11 +47,12 @@ tasks:
     status: planned
     verification: "`go vet ./...` passes. `go test -race ./internal/lang/python/` passes. All existing tests still pass."
     depends_on: ["1.4", "1.5", "1.6", "1.7"]
+tags: [parser, python, tree-sitter]
 ---
 
 # Phase 1: Python Parser Core
 
-**Superseded by [Plans/Active/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
+**Superseded by [Plans/RustRewrite](../Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

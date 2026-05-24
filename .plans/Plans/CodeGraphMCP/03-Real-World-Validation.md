@@ -42,6 +42,7 @@ tasks:
     status: complete
     verification: "go vet ./... passes; go test -race ./... passes (24 tests)"
     depends_on: ["3.5"]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 3: Real-World Validation

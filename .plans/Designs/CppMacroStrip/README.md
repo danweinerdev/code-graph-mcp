@@ -1,13 +1,13 @@
 ---
 title: "C++ Macro-Strip — recover class extraction from API-export macros"
 type: design
-status: review
+status: implemented
 created: 2026-05-07
-updated: 2026-05-07
+updated: 2026-05-24
 tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 related:
   - Designs/RustRewrite
-  - Plans/Complete/RustRewrite/01-Foundation-And-Cpp-Parser.md
+  - Plans/RustRewrite/01-Foundation-And-Cpp-Parser.md
 ---
 
 # C++ Macro-Strip — recover class extraction from API-export macros

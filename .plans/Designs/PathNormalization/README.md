@@ -1,9 +1,9 @@
 ---
 title: "Path Normalization — Windows extended-path leak and incoming-path canonicalization"
 type: design
-status: approved
+status: implemented
 created: 2026-05-13
-updated: 2026-05-13
+updated: 2026-05-24
 tags: [paths, windows, cross-platform, mcp, ue, unreal-engine, ergonomics]
 related:
   - Designs/CppMacroStrip

@@ -4,13 +4,13 @@ type: design
 status: superseded
 created: 2026-03-22
 updated: 2026-04-29
-tags: [architecture, mcp, code-graph, tree-sitter, golang, cpp]
+tags: [architecture, mcp, code-graph, tree-sitter, go, cpp]
 related: [Brainstorm/code-graph-mcp-architecture]
 ---
 
 # Code Graph MCP Server — Technical Design
 
-**Superseded by [Plans/Active/RustRewrite](../../Plans/Active/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
+**Superseded by [Plans/RustRewrite](../../Plans/RustRewrite/README.md)** — see that plan for the unified rewrite that replaced this draft.
 
 ## Overview
 

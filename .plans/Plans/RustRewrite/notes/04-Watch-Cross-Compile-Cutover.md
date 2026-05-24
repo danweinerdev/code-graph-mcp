@@ -6,6 +6,8 @@ phase: 4
 phase_title: "Watch Mode, Cross-Compile & Go Cutover"
 status: complete
 created: 2026-04-30
+updated: 2026-04-30
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 4 Debrief: Watch Mode, Cross-Compile & Go Cutover
@@ -83,5 +85,5 @@ created: 2026-04-30
 - **Per-task quality-scanner agent dispatch on concurrency-heavy code.** Phase 4.1 and 4.2 both surfaced Major findings via quality-scanner. The pattern is: any task that touches a lock, an `await` boundary, or an event-loop should auto-dispatch quality-scanner before the commit lands. The `/implement` skill already supports this for per-task review; documenting "concurrency tasks always get quality-scanner" as a project convention would reduce the chance of a TOCTOU/dangling-state bug shipping.
 - **Race regression test pattern (`std::sync::Barrier` for deterministic concurrent entry).** Used in Phase 4.1's `watch_start` race fix. The pattern: spawn N threads, each blocks on a barrier, then proceed concurrently — making the race deterministic instead of probabilistic. Worth elevating as a project-wide convention for any "two callers race on shared state" test. Could be a tiny helper in a future `crates/codegraph-test-utils` crate.
 - **Deferred end-of-phase verification pass.** The "ship infrastructure now, run the destructive validation last" pattern from 4.3 is generally useful when a verification step requires authorization (sudo install, paid API call, network access, etc.) that the implementer can't grant unilaterally. Could be a `/planner:defer-verification` slash command that the implementer dispatches when they hit a permission wall, rather than blocking the task. Output: an item in the phase's "Acceptance Criteria" with `[deferred]` plus a documented prerequisite list.
-- **Plan-doc / README sync check.** The plan README's `phases[].status` and the phase doc's frontmatter `status` drifted out of sync (4.3 fixup) more than once during Phase 4. Could be a `/planner:lint` or `make plan-lint` that walks `Plans/Active/*/README.md` and diffs against each phase doc. Belongs in the planner plugin (currently has no equivalent). Useful at the end of every phase before debrief.
+- **Plan-doc / README sync check.** The plan README's `phases[].status` and the phase doc's frontmatter `status` drifted out of sync (4.3 fixup) more than once during Phase 4. Could be a `/planner:lint` or `make plan-lint` that walks `Plans/*/README.md` and diffs against each phase doc. Belongs in the planner plugin (currently has no equivalent). Useful at the end of every phase before debrief.
 - **Sample-config / actual-struct sync check.** `.code-graph.toml.example` was almost shipped with the wrong field names because the brief drafted them from memory rather than from `RootConfig`. Could be a derive macro on `RootConfig` that emits the example file at build time, or a `cargo test` that round-trips `.code-graph.toml.example` through `toml::from_str::<RootConfig>` and asserts no unknown keys. The latter is probably the right shape — minimal new code, fails loudly on drift.

@@ -42,6 +42,7 @@ tasks:
     status: complete
     depends_on: ["2.6"]
     verification: "All four structural gates pass against the C# crate: `cargo test -p code-graph-lang-csharp`, `cargo clippy -p code-graph-lang-csharp --all-targets -- -D warnings` (zero warnings), `cargo fmt --all --check` (clean), `cargo audit` (no new advisories from the tree-sitter-c-sharp dep). Workspace `unsafe_code = \"forbid\"` lint holds (zero `unsafe` blocks introduced — same as the four shipped plugins). No `.snap.new` pending snapshots in the working tree (`make snapshot-clean` passes — relevant if any inline snapshots were added during 2.2–2.6). Phase 2 close-out: write the debrief at `notes/02-CSharp-Plugin.md` capturing actual baseline numbers from 2.6, any tree-sitter-c-sharp grammar surprises encountered (matches the broken.py discovery from Phase 7), and any quality-scanner findings carried-forward to Phase 4."
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 2: C# Plugin

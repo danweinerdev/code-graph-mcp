@@ -6,6 +6,8 @@ phase: 3
 phase_title: "MCP Server, Tools, Persistence & Parallel Discovery"
 status: complete
 created: 2026-04-29
+updated: 2026-04-29
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 3 Debrief: MCP Server, Tools, Persistence & Parallel Discovery

@@ -52,6 +52,7 @@ tasks:
     status: complete
     depends_on: ["3.8"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` passes. `cargo insta pending-snapshots` reports zero."
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 3: List-shaped tools

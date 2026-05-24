@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test -p code-graph-lang-cpp` green; `cargo test --workspace` green (the 13 new scanner tests + Phase 2's `skip_lexical` tests + Phase 1's config tests all pass); existing 49 corpus tests + `fmt`/`curl`/`abseil-cpp` C++ dogfood baselines stay within ±10% (Phase 3 default behavior is byte-identical to today on configs with empty `macro_strip_with_args`); `make snapshot-clean` passes."
     depends_on: ["3.4"]
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 ---
 
 # Phase 3: strip_macros_with_args + two-pass preprocess

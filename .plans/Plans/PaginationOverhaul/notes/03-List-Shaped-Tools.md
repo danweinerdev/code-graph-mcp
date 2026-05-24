@@ -6,6 +6,8 @@ phase: 3
 phase_title: "List-shaped tools: get_file_symbols, get_callers, get_callees"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [pagination, mcp, llm-optimization, scale, ue, unreal-engine]
 ---
 
 # Phase 3 Debrief: List-shaped tools

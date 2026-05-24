@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "After Phases 1–4 are merged: `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test --workspace` green on Linux; `make snapshot-clean` passes; `make snapshot-audit` if run shows only the deliberate Phase 3 tools-list regenerations; pre-existing 49 corpus tests + fmt/ripgrep/logrus/requests/efcore/commons-lang baselines all within ±10%. The 5 anti-regression tests from Phases 1–3 (Phase 1's `#[cfg(windows)]` strip tests; Phase 2's `cache_migration_strips_all_path_locations` and `cache_migration_preserves_cross_field_consistency`; Phase 3's `tests/path_normalization.rs` integration test) all pass on Linux, with the two Windows-gated ones skipped invisibly."
     depends_on: ["4.4"]
+tags: [paths, windows, cross-platform, mcp, ue, unreal-engine, ergonomics]
 ---
 
 # Phase 4: Documentation, tool-description sweep, CI honesty

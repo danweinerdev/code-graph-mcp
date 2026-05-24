@@ -22,6 +22,7 @@ tasks:
     status: complete
     verification: "Three smoke tests (one each for get_orphans, search_symbols, get_file_symbols) call the tool with count_only=true against the fixture, assert serde_json::to_string(&response).len() < 1024, assert total > 0, assert results == [], assert truncated == false, assert next_offset == None"
     depends_on: ["5.1"]
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 5: Acceptance regression test

@@ -7,8 +7,8 @@ updated: 2026-05-11
 tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 related:
   - Designs/CSharpJavaSupport
-  - Plans/Complete/RustRewrite
-  - Plans/Complete/RustRewrite/notes/07-Python-Parser.md
+  - Plans/RustRewrite
+  - Plans/RustRewrite/notes/07-Python-Parser.md
 phases:
   - id: 1
     title: "Pre-Work — Workspace Plumbing"

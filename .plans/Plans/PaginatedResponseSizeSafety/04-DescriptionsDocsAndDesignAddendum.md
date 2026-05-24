@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "Designs/Pagination/README.md gains a Decisions 8 through 13 section matching the plan README's K Decisions verbatim (byte cap + config, count_only, file-drop, CallChain.file retained, search_symbols handler-layer trim, limit ceiling unchanged); updated: frontmatter bumped to today; design status stays at review (not flipped to approved here — separate workflow); rationale paragraphs cite the user report and acceptance criteria from this plan"
     depends_on: ["4.4"]
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 4: Tool descriptions, CLAUDE.md, design addendum

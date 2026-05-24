@@ -27,6 +27,7 @@ tasks:
     status: complete
     depends_on: ["3.3"]
     verification: "`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` passes — full suite, no regressions. `cargo insta pending-snapshots` zero. `git diff --stat tests/snapshots/` shows the expected churn: the 2 new UE hierarchy snapshots created in 3.2 plus zero modifications to any existing snapshot. If any existing snapshot regenerated unexpectedly (especially `engine.cpp` hierarchy), investigate — that signals an accidental cross-effect. **Cache-invalidation note grep check (load-bearing per user requirement):** `grep -l 'force=true' CLAUDE.md` and `grep -l 'force=true' .code-graph.toml` (or wherever the sample TOML lives in the repo root) must BOTH return a hit. The exact phrase 'force=true' must appear in both files. This catches accidental removal during reformat or last-minute doc edits — the cache-invalidation nuance is the user-flagged must-have for this plan and any commit lacking it does not satisfy Phase 3. **Optional manual smoke**: index a public C++ codebase with no UE macros (e.g., a small open-source project) — confirm parse output unchanged from pre-plan baseline. **Optional UE smoke**: if a UE-licensed user is available, point them at a real UE module with the suggested `macro_strip` list and confirm `get_class_hierarchy { class: \"AActor\" }` returns a populated tree."
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config]
 ---
 
 # Phase 3: Fixture, snapshot, docs, cutover

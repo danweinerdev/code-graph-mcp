@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test --workspace` green on Linux; `make snapshot-clean` passes after deliberate snapshot regenerations from 3.3. The 4 tools-list snapshots (one per affected tool: `get_file_symbols`, `get_coupling`, `get_dependencies`, `generate_diagram`) regenerate (description strings change); no other snapshots regenerate (handler bodies behaviorally unchanged on Linux)."
     depends_on: ["3.4"]
+tags: [paths, windows, cross-platform, mcp, ue, unreal-engine, ergonomics]
 ---
 
 # Phase 3: Query-handler normalization for file-taking tools

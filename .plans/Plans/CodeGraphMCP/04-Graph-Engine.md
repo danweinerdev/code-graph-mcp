@@ -67,6 +67,7 @@ tasks:
     status: complete
     verification: "go vet ./... passes; go test -race ./internal/graph/ passes (28 tests)"
     depends_on: ["4.11"]
+tags: [mcp, code-graph, tree-sitter, go, cpp]
 ---
 
 # Phase 4: Graph Engine

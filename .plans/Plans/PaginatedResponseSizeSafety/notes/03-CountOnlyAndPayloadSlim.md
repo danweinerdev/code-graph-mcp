@@ -6,6 +6,8 @@ phase: 3
 phase_title: "count_only flag + SymbolResult.file drop"
 status: complete
 created: 2026-05-12
+updated: 2026-05-12
+tags: [pagination, mcp, llm-optimization, byte-budget, regression-fix]
 ---
 
 # Phase 3 Debrief: count_only flag + SymbolResult.file drop

@@ -6,6 +6,8 @@ phase: 2
 phase_title: "C# Plugin"
 status: complete
 created: 2026-05-11
+updated: 2026-05-11
+tags: [language-plugin, c-sharp, java, tree-sitter, multi-language]
 ---
 
 # Phase 2 Debrief: C# Plugin

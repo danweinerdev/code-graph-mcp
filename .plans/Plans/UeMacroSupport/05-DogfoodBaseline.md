@@ -32,6 +32,7 @@ tasks:
     status: complete
     verification: "`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `cargo test --workspace` green with submodule UNINITIALIZED (the new test auto-skips); `cargo test --workspace` green with submodule INITIALIZED (the new test passes within ±10% of baseline); existing 49 corpus tests + fmt/curl/abseil-cpp baselines stay within ±10% (the new pass is gated on `macro_strip_with_args` and doesn't affect these non-UE baselines); `make snapshot-clean` passes; `make submodules` works for the new entry."
     depends_on: ["5.4"]
+tags: [cpp, tree-sitter, ue, unreal-engine, parser, config, macros]
 ---
 
 # Phase 5: Dogfood baseline (UE plugin submodule)

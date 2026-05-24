@@ -6,6 +6,8 @@ phase: 7
 phase_title: "Python Language Parser"
 status: complete
 created: 2026-05-07
+updated: 2026-05-07
+tags: [rewrite, rust, mcp, code-graph, tree-sitter, cpp, multi-language]
 ---
 
 # Phase 7 Debrief: Python Language Parser
@@ -41,7 +43,7 @@ created: 2026-05-07
 | All Phase 1-7 tests pass; lint, format, audit gates clean | Met | 683 workspace tests passing (491 baseline post-Phase 5 + 82 in Phase 6 + 110 in Phase 7); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo audit` 0 advisories across 191 dependencies; `make release` produces 11 MB host-target binary |
 | Documentation lists all four languages; conditional-imports limitation documented | Met | README + CLAUDE.md updated in 7.7 with all four languages and Python-specific limitations including the conditional-imports note |
 | Phase 7 debrief written | Met | This document |
-| Plan moved from `Plans/Active/` to `Plans/Complete/` via `git mv`; plan README status flipped to `complete` | Met | Done as part of this close-out commit |
+| Plan moved from `Plans/` to `Plans/` via `git mv`; plan README status flipped to `complete` | Met | Done as part of this close-out commit |
 | SharedDaemon plan unblocked and ready for `/planner:plan` | Met | `Designs/SharedDaemon/` is `status: draft`; the four-language Rust binary is its starting point; no pending dependencies |
 
 ## Deviations
