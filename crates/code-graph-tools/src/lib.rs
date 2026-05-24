@@ -11,7 +11,7 @@
 //! - [`indexer`] — per-job rayon parsing pool, edge resolution, progress
 //!   reporting trait, and the tokio bridge sink.
 
-pub mod analyze_job;
+pub(crate) mod analyze_job;
 pub mod discovery;
 pub mod handlers;
 pub mod indexer;

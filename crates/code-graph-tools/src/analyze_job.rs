@@ -1,13 +1,17 @@
+// Scaffolding-only: 1.2 lifts the worker into this module and consumes
+// these types, at which point the `allow` comes off.
+#![allow(dead_code)]
+
 //! Slot + job types for the single-flight analyze model.
 //!
-//! See `Designs/AnalyzeCodebaseAsync/README.md` for the full design.
-//! Shape summary:
 //! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds at
 //!   most one `Running` job (`current`) plus at most one terminal job
 //!   from the previous run (`previous_terminal`).
 //! - `AnalyzeJob` is immutable in shape after construction; only its
-//!   inner `state` (a single `PlRwLock<JobMutableState>`, per Design
-//!   Decision 7) mutates. Held only via `Arc<AnalyzeJob>` — no Clone.
+//!   inner `state` (a single `PlRwLock<JobMutableState>`) mutates. All
+//!   mutable state lives behind that one lock — no atomics. Held only
+//!   via `Arc<AnalyzeJob>`; `pub(crate)` fields + no `Clone` derive
+//!   keep the Arc-only invariant compiler-enforced.
 //! - `JobStatus` tags the state machine: Running → Completed(result)
 //!   or Failed(msg).
 
@@ -18,30 +22,30 @@ use parking_lot::RwLock as PlRwLock;
 use crate::handlers::analyze::AnalyzeResult;
 
 #[derive(Default)]
-pub struct AnalyzeSlot {
-    pub current: Option<Arc<AnalyzeJob>>,
-    pub previous_terminal: Option<Arc<AnalyzeJob>>,
+pub(crate) struct AnalyzeSlot {
+    pub(crate) current: Option<Arc<AnalyzeJob>>,
+    pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
 }
 
-pub struct AnalyzeJob {
-    pub job_id: String,
-    pub path: String,
-    pub force: bool,
-    pub started_at: u64,
-    pub state: PlRwLock<JobMutableState>,
-}
-
-#[derive(Default)]
-pub struct JobMutableState {
-    pub status: JobStatus,
-    pub finished_at: Option<u64>,
-    pub progress: u32,
-    pub progress_total: u32,
-    pub progress_message: String,
+pub(crate) struct AnalyzeJob {
+    pub(crate) job_id: String,
+    pub(crate) path: String,
+    pub(crate) force: bool,
+    pub(crate) started_at: u64,
+    pub(crate) state: PlRwLock<JobMutableState>,
 }
 
 #[derive(Default)]
-pub enum JobStatus {
+pub(crate) struct JobMutableState {
+    pub(crate) status: JobStatus,
+    pub(crate) finished_at: Option<u64>,
+    pub(crate) progress: u32,
+    pub(crate) progress_total: u32,
+    pub(crate) progress_message: String,
+}
+
+#[derive(Default)]
+pub(crate) enum JobStatus {
     #[default]
     Running,
     Completed(AnalyzeResult),
@@ -49,7 +53,12 @@ pub enum JobStatus {
 }
 
 impl AnalyzeJob {
-    pub fn new_running(job_id: String, path: String, force: bool, started_at: u64) -> Arc<Self> {
+    pub(crate) fn new_running(
+        job_id: String,
+        path: String,
+        force: bool,
+        started_at: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
             path,
@@ -58,8 +67,10 @@ impl AnalyzeJob {
             state: PlRwLock::new(JobMutableState::default()),
         })
     }
+}
 
-    pub fn is_terminal_status(state: &JobMutableState) -> bool {
-        matches!(state.status, JobStatus::Completed(_) | JobStatus::Failed(_))
+impl JobMutableState {
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self.status, JobStatus::Completed(_) | JobStatus::Failed(_))
     }
 }

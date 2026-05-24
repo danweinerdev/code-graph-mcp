@@ -112,8 +112,9 @@ pub struct ServerInner {
     pub index_force_built: AtomicBool,
     /// Single-flight slot for analyze jobs (sync + async). Holds at
     /// most one `Running` job plus the previous terminal job for the
-    /// grace-window read pattern. See `Designs/AnalyzeCodebaseAsync`.
-    pub analyze_slot: PlRwLock<AnalyzeSlot>,
+    /// grace-window read pattern. Read by 1.2's worker (next commit).
+    #[allow(dead_code)]
+    pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
 /// MCP server exposing the code graph through 15 tools.
