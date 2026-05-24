@@ -35,7 +35,7 @@ use super::{tool_error, tool_success_json};
 
 /// JSON-shape mirror of Go's `analyzeResult` in `internal/tools/analyze.go`.
 /// Field order, names, and `omitempty` semantics match the Go struct exactly.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct AnalyzeResult {
     pub files: u32,
     pub symbols: u32,
@@ -64,7 +64,7 @@ pub struct AnalyzeResult {
 /// failure semantics stay uniform. Direct
 /// `SystemTime::now().as_nanos() as u64` is the silent-truncation
 /// footgun this helper exists to forbid.
-fn now_nanos_u64() -> u64 {
+pub(crate) fn now_nanos_u64() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Err(_) => 0,
         Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),

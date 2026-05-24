@@ -165,7 +165,7 @@ pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
 /// `date` reference (CC0): `civil_from_days` accepts the day count
 /// since 1970-01-01 and returns `(year, month, day)`. Handles every
 /// leap-year case correctly through year 9999.
-fn format_unix_nanos_rfc3339(nanos: u64) -> String {
+pub(crate) fn format_unix_nanos_rfc3339(nanos: u64) -> String {
     let total_seconds = nanos / 1_000_000_000;
     let days = (total_seconds / 86_400) as i64;
     let seconds_in_day = total_seconds % 86_400;

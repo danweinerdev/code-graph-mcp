@@ -41,6 +41,7 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::analyze_job::AnalyzeSlot;
 use crate::handlers;
 
 /// Active filesystem-watcher state stored on [`ServerInner::watch`].
@@ -109,6 +110,10 @@ pub struct ServerInner {
     /// "this index is the result of a force-rebuild" vs "this is the
     /// incremental result". `false` until the first analyze completes.
     pub index_force_built: AtomicBool,
+    /// Single-flight slot for analyze jobs (sync + async). Holds at
+    /// most one `Running` job plus the previous terminal job for the
+    /// grace-window read pattern. See `Designs/AnalyzeCodebaseAsync`.
+    pub analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
 /// MCP server exposing the code graph through 15 tools.
@@ -144,6 +149,7 @@ impl CodeGraphServer {
                 config: PlRwLock::new(RootConfig::default()),
                 index_built_at: AtomicU64::new(0),
                 index_force_built: AtomicBool::new(false),
+                analyze_slot: PlRwLock::new(AnalyzeSlot::default()),
             }),
             tool_router: Self::tool_router(),
         }
