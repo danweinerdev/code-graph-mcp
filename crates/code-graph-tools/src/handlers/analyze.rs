@@ -25,9 +25,10 @@ use rmcp::service::RoleServer;
 use rmcp::Peer;
 use serde::Serialize;
 
+use crate::analyze_job::{AnalyzeJob, JobStatus};
 use crate::indexer::{
     build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
-    resolve_edges_with_indexes, ChannelProgressSink, ProgressEvent,
+    resolve_edges_with_indexes, ChannelProgressSink, ProgressEvent, ProgressSink,
 };
 use crate::server::ServerInner;
 
@@ -69,6 +70,462 @@ pub(crate) fn now_nanos_u64() -> u64 {
         Err(_) => 0,
         Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
     }
+}
+
+/// Wraps a [`ChannelProgressSink`] so each `report()` ALSO writes the
+/// latest progress triple into the owning [`AnalyzeJob`]'s mutable state.
+/// Fan-out per Design Decision 8: the mpsc keeps the existing throttled
+/// peer-notification path intact for sync mode, while the slot write makes
+/// progress observable to `get_status` for both sync and async callers.
+struct JobAwareProgressSink {
+    inner: ChannelProgressSink,
+    job: Arc<AnalyzeJob>,
+}
+
+impl ProgressSink for JobAwareProgressSink {
+    fn report(&self, progress: u32, total: u32, message: &str) {
+        // Order matters: keep the existing mpsc try_send first so the
+        // forwarder's throttle window observes the same arrival pattern
+        // it has always seen — slot mutation is the new side effect, not
+        // a replacement.
+        self.inner.report(progress, total, message);
+        let mut s = self.job.state.write();
+        s.progress = progress;
+        s.progress_total = total;
+        s.progress_message = message.to_string();
+    }
+}
+
+/// Run the analyze pipeline to terminal state on a shared `AnalyzeJob`.
+///
+/// Writes `JobStatus::Completed(AnalyzeResult)` or `JobStatus::Failed(msg)`
+/// into `job.state` before returning; the return type is `()` because all
+/// outcomes flow through the slot. `peer`/`progress_token` are `Some` only
+/// for sync callers — async kickoff omits them, falling through to the
+/// drain-only forwarder branch.
+///
+/// Acquires `inner.index_lock` with `lock().await` (NOT `try_lock`): the
+/// slot is the single-flight gate now; `index_lock` only serializes worker
+/// vs. watch reindex (Design Decision 1).
+// 1.3 wires this into the sync handler.
+#[allow(dead_code)]
+pub(crate) async fn run_analyze_job(
+    inner: Arc<ServerInner>,
+    job: Arc<AnalyzeJob>,
+    peer: Option<Peer<RoleServer>>,
+    progress_token: Option<ProgressToken>,
+) {
+    let path_raw = job.path.clone();
+    let force = job.force;
+
+    let abs_path = match paths::canonicalize(std::path::Path::new(&path_raw)) {
+        Ok(p) => p,
+        Err(_) => {
+            finish_failed(&job, format!("directory does not exist: {path_raw}"));
+            return;
+        }
+    };
+    if !abs_path.is_dir() {
+        finish_failed(
+            &job,
+            format!("path is not a directory: {}", abs_path.display()),
+        );
+        return;
+    }
+
+    let (mut cfg, project_root) = match RootConfig::load(&abs_path) {
+        Ok((c, root)) => (c, root),
+        Err(ConfigError::Toml(e)) => {
+            finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
+            return;
+        }
+        Err(ConfigError::Io(e)) => {
+            finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
+            return;
+        }
+        Err(e @ ConfigError::ExtensionMissingDot { .. })
+        | Err(e @ ConfigError::ExtensionConflict { .. })
+        | Err(e @ ConfigError::MacroStripConflict { .. }) => {
+            finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
+            return;
+        }
+    };
+    let mut warnings = cfg.resolve_concurrency();
+
+    // Serialize against the watch reindex path; the slot already gates
+    // analyze-vs-analyze, so this lock has no analyze contention.
+    let _guard = inner.index_lock.lock().await;
+
+    if project_root != abs_path {
+        let toml_at_root = project_root.join(".code-graph.toml");
+        if toml_at_root.exists() {
+            warnings.push(format!(
+                "using .code-graph.toml found at {} (parent of indexed root {}); \
+                 cache lives at the project root, indexing scope stays at the invocation path",
+                project_root.display(),
+                abs_path.display()
+            ));
+        } else {
+            warnings.push(format!(
+                "no .code-graph.toml found between {} and filesystem root; \
+                 using built-in defaults. C++ classes prefixed with API-export macros \
+                 (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml \
+                 with [cpp].macro_strip at your project root to enable engine-style support.",
+                abs_path.display()
+            ));
+        }
+    } else {
+        let toml_at_invocation = abs_path.join(".code-graph.toml");
+        if !toml_at_invocation.exists() {
+            warnings.push(format!(
+                "no .code-graph.toml found between {} and filesystem root; \
+                 using built-in defaults. C++ classes prefixed with API-export macros \
+                 (e.g. `class CORE_API Foo`) will NOT be indexed. Place a .code-graph.toml \
+                 with [cpp].macro_strip at your project root to enable engine-style support.",
+                abs_path.display()
+            ));
+        }
+    }
+
+    if abs_path != project_root {
+        let invocation_cache = code_graph_graph::cache_path(&abs_path);
+        if invocation_cache.exists() {
+            warnings.push(format!(
+                "orphan cache detected at {} — the indexer now caches at the project root ({}). \
+                 The orphan is not used and can be deleted to reclaim disk.",
+                invocation_cache.display(),
+                project_root.display()
+            ));
+        }
+    }
+
+    if !force {
+        let mut probe = Graph::new();
+        let (load_ok, all_stale) = probe
+            .load_and_stale(&project_root)
+            .unwrap_or((false, Vec::new()));
+        if load_ok && probe.files_in_scope_count(&abs_path) > 0 {
+            let in_scope_stale: Vec<_> = all_stale
+                .iter()
+                .filter(|p| p.starts_with(&abs_path))
+                .collect();
+            if in_scope_stale.is_empty() {
+                let mut fast_path_warnings: Vec<String> = Vec::new();
+                let now_nanos = now_nanos_u64();
+                let elapsed_since_sweep = now_nanos.saturating_sub(probe.last_sweep_at());
+                let sweep_ran = elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS;
+                if sweep_ran {
+                    let swept = probe.sweep_missing_out_of_scope(&abs_path);
+                    if !swept.is_empty() {
+                        fast_path_warnings.push(format!(
+                            "out-of-scope sweep removed {} stale cache entry(ies) \
+                             (files deleted in subtrees not touched by this invocation)",
+                            swept.len()
+                        ));
+                    }
+                    probe.set_last_sweep_at(now_nanos);
+                }
+                let stats = probe.stats();
+                {
+                    let mut g = inner.graph.write();
+                    *g = probe;
+                }
+                *inner.root_path.write() = Some(project_root.clone());
+                *inner.config.write() = cfg;
+                inner.indexed.store(true, Ordering::Release);
+                inner
+                    .index_built_at
+                    .store(now_nanos_u64(), Ordering::Release);
+                inner.index_force_built.store(force, Ordering::Release);
+                if sweep_ran {
+                    if let Err(e) = save_cache(&inner.graph, &project_root) {
+                        fast_path_warnings.push(format!("cache save failed: {e}"));
+                    }
+                }
+                warnings.extend(fast_path_warnings);
+                let result = AnalyzeResult {
+                    files: stats.files,
+                    symbols: stats.nodes,
+                    edges: stats.edges,
+                    root_path: project_root.to_string_lossy().into_owned(),
+                    warnings,
+                };
+                finish_completed(&job, result);
+                return;
+            }
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+
+    eprintln!(
+        "[code-graph] analyze_codebase: progress_token_present={}",
+        progress_token.is_some()
+    );
+
+    let forwarder = if let (Some(peer), Some(token)) = (peer, progress_token) {
+        Some(tokio::spawn(async move {
+            const THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+            let mut last_sent = std::time::Instant::now()
+                .checked_sub(THROTTLE_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            let mut latest: Option<ProgressEvent> = None;
+
+            const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+            while let Some(evt) = rx.recv().await {
+                latest = Some(evt);
+                let now = std::time::Instant::now();
+                if now.duration_since(last_sent) >= THROTTLE_INTERVAL {
+                    if let Some(e) = latest.take() {
+                        last_sent = now;
+                        let mut params =
+                            ProgressNotificationParam::new(token.clone(), e.progress as f64);
+                        if e.total > 0 {
+                            params = params.with_total(e.total as f64);
+                        }
+                        params = params.with_message(e.message);
+                        let _ = tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params))
+                            .await;
+                    }
+                }
+            }
+            if let Some(e) = latest {
+                let mut params = ProgressNotificationParam::new(token.clone(), e.progress as f64);
+                if e.total > 0 {
+                    params = params.with_total(e.total as f64);
+                }
+                params = params.with_message(e.message);
+                let _ = tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_progress(params)).await;
+            }
+        }))
+    } else {
+        Some(tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        }))
+    };
+
+    let registry = Arc::clone(&inner);
+    let cfg_for_pool = cfg.clone();
+    let abs_path_for_pool = abs_path.clone();
+    let project_root_for_pool = project_root.clone();
+    let scope_is_project_root = abs_path == project_root;
+    let job_for_pool = Arc::clone(&job);
+    let blocking_handle = tokio::task::spawn_blocking(move || {
+        let sink = JobAwareProgressSink {
+            inner: ChannelProgressSink(tx),
+            job: job_for_pool,
+        };
+        let mut blocking_warnings: Vec<String> = Vec::new();
+
+        eprintln!(
+            "[code-graph] phase: loading cache from {}",
+            project_root_for_pool.display()
+        );
+        let phase_start = std::time::Instant::now();
+        let mut merged_graph = Graph::new();
+        let cache_loaded = merged_graph.load(&project_root_for_pool).unwrap_or(false);
+        eprintln!(
+            "[code-graph] phase: cache load {} ({:.1}s, {} cached files)",
+            if cache_loaded { "ok" } else { "absent/stale" },
+            phase_start.elapsed().as_secs_f64(),
+            merged_graph.stats().files
+        );
+
+        if force {
+            if scope_is_project_root {
+                merged_graph.clear();
+            } else if cache_loaded {
+                let dropped = merged_graph.drop_files_in_scope(&abs_path_for_pool);
+                if !dropped.is_empty() {
+                    blocking_warnings.push(format!(
+                        "force=true dropped {} cached file(s) under {} before re-index",
+                        dropped.len(),
+                        abs_path_for_pool.display()
+                    ));
+                }
+            }
+        } else if cache_loaded {
+            let evicted = merged_graph.evict_missing_in_scope(&abs_path_for_pool);
+            if !evicted.is_empty() {
+                blocking_warnings.push(format!(
+                    "evicted {} cached file(s) under {} (no longer present on disk)",
+                    evicted.len(),
+                    abs_path_for_pool.display()
+                ));
+            }
+        }
+
+        eprintln!(
+            "[code-graph] phase: discovering + parsing under {}",
+            abs_path_for_pool.display()
+        );
+        let phase_start = std::time::Instant::now();
+        let (mut fresh_graphs, parse_warnings) =
+            match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
+                Ok(v) => v,
+                Err(e) => return Err(e.to_string()),
+            };
+        blocking_warnings.extend(parse_warnings);
+        eprintln!(
+            "[code-graph] phase: discover+parse done ({:.1}s, {} files parsed)",
+            phase_start.elapsed().as_secs_f64(),
+            fresh_graphs.len()
+        );
+
+        eprintln!("[code-graph] phase: resolving edges");
+        let phase_start = std::time::Instant::now();
+        let cached_snapshot = merged_graph.file_graphs_snapshot();
+        let mut symbol_index = build_symbol_index(&cached_snapshot);
+        extend_symbol_index(&mut symbol_index, &fresh_graphs);
+        let mut file_index = build_file_index(&cached_snapshot);
+        extend_file_index(&mut file_index, &fresh_graphs);
+
+        resolve_edges_with_indexes(
+            &mut fresh_graphs,
+            &symbol_index,
+            &file_index,
+            &registry.registry,
+            &sink,
+        );
+        eprintln!(
+            "[code-graph] phase: resolve done ({:.1}s)",
+            phase_start.elapsed().as_secs_f64()
+        );
+
+        eprintln!(
+            "[code-graph] phase: merging {} fresh file(s) into project graph",
+            fresh_graphs.len()
+        );
+        let phase_start = std::time::Instant::now();
+        for fg in fresh_graphs {
+            merged_graph.merge_file_graph(fg);
+        }
+        eprintln!(
+            "[code-graph] phase: merge done ({:.1}s, total {} files in graph)",
+            phase_start.elapsed().as_secs_f64(),
+            merged_graph.stats().files
+        );
+
+        let now_nanos = now_nanos_u64();
+        let elapsed_since_sweep = now_nanos.saturating_sub(merged_graph.last_sweep_at());
+        if elapsed_since_sweep >= code_graph_graph::SWEEP_INTERVAL_NANOS {
+            let swept = merged_graph.sweep_missing_out_of_scope(&abs_path_for_pool);
+            if !swept.is_empty() {
+                blocking_warnings.push(format!(
+                    "out-of-scope sweep removed {} stale cache entry(ies) \
+                     (files deleted in subtrees not touched by this invocation)",
+                    swept.len()
+                ));
+            }
+            merged_graph.set_last_sweep_at(now_nanos);
+        }
+
+        drop(sink);
+        Ok::<_, String>((merged_graph, blocking_warnings))
+    });
+
+    let blocking_result = blocking_handle.await;
+
+    if let Some(handle) = forwarder {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    let (merged_graph, blocking_warnings) = match blocking_result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            finish_failed(&job, format!("indexing failed: {e}"));
+            return;
+        }
+        Err(join_err) => {
+            finish_failed(&job, format!("indexing task panicked: {join_err}"));
+            return;
+        }
+    };
+
+    warnings.extend(blocking_warnings);
+
+    if merged_graph.stats().files == 0 {
+        finish_failed(
+            &job,
+            format!("no supported source files found in {}", abs_path.display()),
+        );
+        return;
+    }
+
+    let stats = {
+        let mut g = inner.graph.write();
+        *g = merged_graph;
+        g.stats()
+    };
+
+    *inner.root_path.write() = Some(project_root.clone());
+    *inner.config.write() = cfg;
+    inner.indexed.store(true, Ordering::Release);
+    inner
+        .index_built_at
+        .store(now_nanos_u64(), Ordering::Release);
+    inner.index_force_built.store(force, Ordering::Release);
+
+    if abs_path != project_root {
+        let in_scope_count = {
+            let g = inner.graph.read();
+            g.files_in_scope_count(&abs_path)
+        };
+        let out_of_scope_count = stats.files.saturating_sub(in_scope_count as u32);
+        if out_of_scope_count > 0 {
+            warnings.push(format!(
+                "project cache contains {} file(s) outside the current scope ({}); \
+                 they are preserved across this invocation. Run analyze_codebase at {} \
+                 to refresh them, or force=true at any subtree to invalidate it.",
+                out_of_scope_count,
+                abs_path.display(),
+                project_root.display()
+            ));
+        }
+    }
+
+    eprintln!(
+        "[code-graph] phase: saving cache to {}",
+        project_root.display()
+    );
+    let save_start = std::time::Instant::now();
+    if let Err(e) = save_cache(&inner.graph, &project_root) {
+        warnings.push(format!("cache save failed: {e}"));
+        eprintln!(
+            "[code-graph] phase: save FAILED ({:.1}s)",
+            save_start.elapsed().as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[code-graph] phase: save done ({:.1}s)",
+            save_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let result = AnalyzeResult {
+        files: stats.files,
+        symbols: stats.nodes,
+        edges: stats.edges,
+        root_path: project_root.to_string_lossy().into_owned(),
+        warnings,
+    };
+    finish_completed(&job, result);
+}
+
+/// Stamp terminal state under a single `state.write()` so an observer
+/// (1.3's sync handler reading after `await`, or 1.4's polled `get_status`)
+/// sees status+finished_at consistently — never a half-written transition.
+fn finish_completed(job: &AnalyzeJob, result: AnalyzeResult) {
+    let mut s = job.state.write();
+    s.status = JobStatus::Completed(result);
+    s.finished_at = Some(now_nanos_u64());
+}
+
+fn finish_failed(job: &AnalyzeJob, msg: String) {
+    let mut s = job.state.write();
+    s.status = JobStatus::Failed(msg);
+    s.finished_at = Some(now_nanos_u64());
 }
 
 /// `analyze_codebase` body. See the module docstring for the full pipeline.

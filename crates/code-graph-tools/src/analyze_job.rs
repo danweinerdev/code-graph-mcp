@@ -1,7 +1,3 @@
-// Scaffolding-only: 1.2 lifts the worker into this module and consumes
-// these types, at which point the `allow` comes off.
-#![allow(dead_code)]
-
 //! Slot + job types for the single-flight analyze model.
 //!
 //! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds at
@@ -21,16 +17,25 @@ use parking_lot::RwLock as PlRwLock;
 
 use crate::handlers::analyze::AnalyzeResult;
 
+// Slot field reads, the constructor, the terminal-status helper, and the
+// terminal-variant payload reads land in 1.3 (sync handler) and 1.4 (async
+// handler + get_status view). Narrow allows here keep the rest of the
+// module under full dead-code lint coverage as the worker (1.2) already
+// reads `path`, `force`, `state`, `status` (via write), and matches the
+// `JobStatus` variants in `finish_*`.
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
 }
 
 pub(crate) struct AnalyzeJob {
+    #[allow(dead_code)]
     pub(crate) job_id: String,
     pub(crate) path: String,
     pub(crate) force: bool,
+    #[allow(dead_code)]
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
 }
@@ -45,6 +50,7 @@ pub(crate) struct JobMutableState {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) enum JobStatus {
     #[default]
     Running,
@@ -53,6 +59,7 @@ pub(crate) enum JobStatus {
 }
 
 impl AnalyzeJob {
+    #[allow(dead_code)]
     pub(crate) fn new_running(
         job_id: String,
         path: String,
@@ -70,6 +77,7 @@ impl AnalyzeJob {
 }
 
 impl JobMutableState {
+    #[allow(dead_code)]
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self.status, JobStatus::Completed(_) | JobStatus::Failed(_))
     }
