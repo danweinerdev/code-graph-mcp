@@ -1242,17 +1242,35 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    /// Serializes the three tests that set `SLEEP_PER_PARSE_MS`: with Cargo's
+    /// default parallel test execution, two tests entering [`ParseSleepGuard::set`]
+    /// at once would race on the static, and the first to finish would
+    /// `store(0)` while the other was still relying on its sleep value. The
+    /// guard takes the lock on construction and releases it on drop, so at
+    /// most one knob-using test holds the knob at a time.
+    static SLEEP_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard that sets the recording plugin's per-`parse_file` sleep
     /// knob on construction and resets it to `0` on drop. The Drop reset is
     /// load-bearing: tests in this binary run concurrently by default, so a
     /// leaked non-zero value would silently stretch every concurrent test's
     /// indexing wall time and turn deterministic synchronization into
-    /// timing-dependent flake.
-    struct ParseSleepGuard;
+    /// timing-dependent flake. The guard ALSO holds [`SLEEP_KNOB_LOCK`] for
+    /// its lifetime so concurrent knob-using tests cannot interleave their
+    /// set/reset cycles and clobber each other's values.
+    struct ParseSleepGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
     impl ParseSleepGuard {
         fn set(ms: u64) -> Self {
+            // Unwrap-or-into: a poisoned mutex from a panicking test is fine
+            // for us — we're going to overwrite the value anyway, and the
+            // next reset on Drop is the same operation either way.
+            let lock = SLEEP_KNOB_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             SLEEP_PER_PARSE_MS.store(ms, AtomicOrdering::Relaxed);
-            Self
+            Self { _lock: lock }
         }
     }
     impl Drop for ParseSleepGuard {
@@ -1492,5 +1510,372 @@ mod tests {
         // runtime — avoids the worker future being dropped mid-flight when
         // the test's runtime tears down.
         let _ = sync_handle.await.expect("sync handler task panicked");
+    }
+
+    // ----- Task 2.3: slot rotation, failure-path, and progress tests --------
+    //
+    // These tests pin the rotation rules (Decision 2 — two-slot grace window;
+    // Decision 4 — failed counts as terminal for rotation), the failure
+    // surface (the async/failed path returns byte-identical error wording to
+    // the sync handler), and the deterministic progress fan-out (Decision 8).
+    //
+    // Knob hygiene: only `progress_increments_during_indexing` touches
+    // `SLEEP_PER_PARSE_MS`. The other four use bounded-poll loops and never
+    // stretch indexing time.
+
+    /// Write a tempdir containing one trivial `.cpp` source plus the exact
+    /// malformed `.code-graph.toml` that drives `RootConfig::load` into
+    /// `ConfigError::Toml` — same fixture the sync
+    /// `analyze_malformed_toml_reports_parse_error` test uses, so failed-async
+    /// and failed-sync exercise byte-identical error wording.
+    fn tempdir_with_malformed_toml() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.cpp"), b"void f() {}\n").unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[discovery\nmax_threads = nope\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Poll `get_status` at 50ms cadence and return the `analyze_job` view
+    /// once `status` reaches `"completed"` or `"failed"`. The 5s wall-clock
+    /// bound is a hang catcher: every fixture used in Task 2.3 indexes (or
+    /// fails) in milliseconds, so reaching the bound means the worker hung,
+    /// the slot never transitioned, or the terminal write missed.
+    async fn poll_until_terminal(
+        inner: Arc<ServerInner>,
+        max: std::time::Duration,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + max;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "analyze job did not reach terminal within {max:?} — \
+                     worker hung, slot not transitioning, or terminal write missed"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let status = get_status(inner.clone());
+            let parsed: serde_json::Value = serde_json::from_str(&body_text(&status)).unwrap();
+            let job = &parsed["analyze_job"];
+            let s = job["status"].as_str().unwrap_or("");
+            if s == "completed" || s == "failed" {
+                return job.clone();
+            }
+        }
+    }
+
+    /// (Task 2.3 / a) After a terminal job, the next kickoff rotates the
+    /// previous `current` into `previous_terminal` and installs a fresh
+    /// `Running` job in `current`. This is the load-bearing behavior of the
+    /// two-slot grace window (Decision 2): one terminal's result survives
+    /// exactly one more kickoff.
+    ///
+    /// The slot read happens immediately after the second kickoff returns,
+    /// so `current` is observed in its installed-Running state before the
+    /// 1-file worker has time to complete. Job-id identity is the load-
+    /// bearing assertion; the `Running` discriminant is the wire-level
+    /// pin the design's verification text calls out.
+    #[tokio::test]
+    async fn terminal_job_rotates_to_previous_on_next_kickoff() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let t1_kickoff = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let t1_parsed: serde_json::Value = serde_json::from_str(&body_text(&t1_kickoff)).unwrap();
+        let t1_job_id = t1_parsed["job_id"].as_str().unwrap().to_string();
+
+        let t1_terminal = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+        assert_eq!(
+            t1_terminal["status"],
+            serde_json::json!("completed"),
+            "T1 must reach Completed before T2 kickoff; got: {t1_terminal}"
+        );
+
+        let t2_kickoff = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let t2_parsed: serde_json::Value = serde_json::from_str(&body_text(&t2_kickoff)).unwrap();
+        let t2_job_id = t2_parsed["job_id"].as_str().unwrap().to_string();
+        assert_ne!(
+            t1_job_id, t2_job_id,
+            "T2 kickoff after T1 terminal must mint a fresh job_id; rotation requires distinct ids"
+        );
+
+        let slot = inner.analyze_slot.read();
+        let previous = slot
+            .previous_terminal
+            .as_ref()
+            .expect("previous_terminal must carry T1 after T2 kickoff");
+        assert_eq!(
+            previous.job_id, t1_job_id,
+            "previous_terminal must hold T1's job_id post-rotation"
+        );
+        let current = slot
+            .current
+            .as_ref()
+            .expect("current must carry T2 after kickoff");
+        assert_eq!(
+            current.job_id, t2_job_id,
+            "current must hold T2's job_id post-rotation"
+        );
+        assert!(
+            matches!(current.state.read().status, JobStatus::Running),
+            "current (T2) must be Running immediately after kickoff — read happens before worker terminal"
+        );
+    }
+
+    /// (Task 2.3 / b) The grace window is bounded at one terminal. T1 →
+    /// Completed → T2 → Completed → T3 leaves `previous_terminal = T2` and
+    /// loses T1 entirely. Confirms the slot is two-deep, not unbounded.
+    #[tokio::test]
+    async fn two_back_to_back_analyses_lose_oldest_terminal() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let t1 = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let t1_parsed: serde_json::Value = serde_json::from_str(&body_text(&t1)).unwrap();
+        let t1_job_id = t1_parsed["job_id"].as_str().unwrap().to_string();
+        let _ = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+
+        let t2 = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let t2_parsed: serde_json::Value = serde_json::from_str(&body_text(&t2)).unwrap();
+        let t2_job_id = t2_parsed["job_id"].as_str().unwrap().to_string();
+        let _ = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+
+        let t3 = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let t3_parsed: serde_json::Value = serde_json::from_str(&body_text(&t3)).unwrap();
+        let t3_job_id = t3_parsed["job_id"].as_str().unwrap().to_string();
+
+        let slot = inner.analyze_slot.read();
+        let previous_id = slot
+            .previous_terminal
+            .as_ref()
+            .expect("previous_terminal must hold T2 after T3 kickoff")
+            .job_id
+            .clone();
+        let current_id = slot
+            .current
+            .as_ref()
+            .expect("current must hold T3 after kickoff")
+            .job_id
+            .clone();
+        assert_eq!(
+            previous_id, t2_job_id,
+            "previous_terminal must rotate to T2 after T3 kickoff (T1 falls off the back)"
+        );
+        assert_eq!(
+            current_id, t3_job_id,
+            "current must hold T3's job_id post-rotation"
+        );
+        assert_ne!(
+            previous_id, t1_job_id,
+            "T1's job_id must no longer appear in previous_terminal"
+        );
+        assert_ne!(
+            current_id, t1_job_id,
+            "T1's job_id must no longer appear in current"
+        );
+    }
+
+    /// (Task 2.3 / c) A malformed `.code-graph.toml` drives the worker into
+    /// `JobStatus::Failed`. `get_status` surfaces the failure with the SAME
+    /// byte-identical error prefix the existing sync handler produces
+    /// (`"failed to parse .code-graph.toml"`), preserving the design's
+    /// contract that failed-async and failed-sync expose the same wire text.
+    #[tokio::test]
+    async fn failed_job_surfaces_error_in_get_status() {
+        let dir = tempdir_with_malformed_toml();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+
+        let _ = analyze_codebase_async(
+            inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+
+        let terminal = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+        assert_eq!(
+            terminal["status"],
+            serde_json::json!("failed"),
+            "malformed toml must drive the job to Failed; got: {terminal}"
+        );
+        let err = terminal["error"]
+            .as_str()
+            .expect("error must be populated when status is failed");
+        assert!(
+            err.starts_with("failed to parse .code-graph.toml"),
+            "failed-async error must start with the same prefix the sync handler emits; got: {err:?}"
+        );
+    }
+
+    /// (Task 2.3 / d) Failed counts as terminal for rotation purposes
+    /// (Decision 4). A failed T1 rotates into `previous_terminal` exactly
+    /// like a completed one would, and the original error message is
+    /// preserved through the rotation (the slot stores `Arc<AnalyzeJob>`,
+    /// so the inner state is shared, not copied).
+    #[tokio::test]
+    async fn failed_job_rotates_to_previous_terminal() {
+        let bad_dir = tempdir_with_malformed_toml();
+        let good_dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+
+        let t1 = analyze_codebase_async(
+            inner.clone(),
+            bad_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let t1_parsed: serde_json::Value = serde_json::from_str(&body_text(&t1)).unwrap();
+        let t1_job_id = t1_parsed["job_id"].as_str().unwrap().to_string();
+        let t1_terminal = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+        assert_eq!(
+            t1_terminal["status"],
+            serde_json::json!("failed"),
+            "T1 must reach Failed before T2 kickoff; got: {t1_terminal}"
+        );
+
+        let t2 = analyze_codebase_async(
+            inner.clone(),
+            good_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let t2_parsed: serde_json::Value = serde_json::from_str(&body_text(&t2)).unwrap();
+        let t2_job_id = t2_parsed["job_id"].as_str().unwrap().to_string();
+
+        let slot = inner.analyze_slot.read();
+        let previous = slot
+            .previous_terminal
+            .as_ref()
+            .expect("previous_terminal must carry the failed T1 after T2 kickoff");
+        assert_eq!(
+            previous.job_id, t1_job_id,
+            "previous_terminal must hold T1's job_id even when T1 ended Failed"
+        );
+        match &previous.state.read().status {
+            JobStatus::Failed(msg) => assert!(
+                msg.starts_with("failed to parse .code-graph.toml"),
+                "Failed message must survive rotation byte-identically; got: {msg:?}"
+            ),
+            other => panic!(
+                "previous_terminal status must be Failed(_) after rotating a failed T1; got: {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+        let current = slot
+            .current
+            .as_ref()
+            .expect("current must hold T2 after kickoff");
+        assert_eq!(
+            current.job_id, t2_job_id,
+            "current must hold T2's job_id post-rotation"
+        );
+    }
+
+    /// (Task 2.3 / e) Progress is fan-out (Decision 8) — the inner-lock
+    /// write happens on every `report()` call, NOT just on terminal
+    /// transition. With 10ms-per-file × 20 files indexed SEQUENTIALLY
+    /// (`parsing.max_threads = 1` written into a project `.code-graph.toml`),
+    /// the parse phase spends ~200ms in `report()`. 30ms polls give ≥ 6
+    /// mid-run samples; ≥ 3 distinct values leaves headroom for scheduler
+    /// jitter while catching the "atomic flushed only on completion"
+    /// failure mode, which would surface as `{0, final}` — 2 distinct
+    /// values.
+    ///
+    /// **Sequential parse is load-bearing.** Without it, the rayon pool
+    /// defaults to `num_cpus`; with 20 files and 16+ cores the entire
+    /// parse window collapses to one `SLEEP_PER_PARSE_MS` (~10ms) — far
+    /// shorter than the 30ms cadence, and the test routinely sees < 3
+    /// samples regardless of how the production code behaves.
+    ///
+    /// **Sampling is filtered to the parse phase.** Production reports
+    /// progress per-phase (parse counts to `total`, then resolve resets
+    /// and counts to `total` again). Crossing a phase boundary mid-poll
+    /// would surface as a downward step on a monotonic-across-all-samples
+    /// check — a real implementation/design ambiguity (the design's
+    /// `progress` doc-comment says "monotonic, files processed", which
+    /// reads as a global count) but orthogonal to what this test pins.
+    /// We filter to `progress_message` carrying the `"Parsing: "` prefix
+    /// the parse-phase `report()` call emits so the assertion targets the
+    /// fan-out behavior cleanly.
+    #[tokio::test]
+    async fn progress_increments_during_indexing() {
+        let _guard = ParseSleepGuard::set(10);
+        let dir = tempdir_with_n_rec(20);
+        // Force serial parse so the 20 × 10ms sleep yields a deterministic
+        // ~200ms parse window regardless of host CPU count. The toml lands
+        // at the indexed root, so RootConfig::load picks it up.
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[parsing]\nmax_threads = 1\n",
+        )
+        .unwrap();
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let _ = analyze_codebase_async(inner.clone(), path, false).await;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut parse_values: Vec<u32> = Vec::new();
+        let mut all_samples: Vec<(u32, String)> = Vec::new();
+        let final_status: String;
+        loop {
+            if Instant::now() >= deadline {
+                panic!(
+                    "progress test never reached terminal within 1s — \
+                     20 × 10ms sequential parse should finish well inside this bound \
+                     (parse samples observed: {} = {:?}; all samples: {:?})",
+                    parse_values.len(),
+                    parse_values,
+                    all_samples
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let status = get_status(inner.clone());
+            let parsed: serde_json::Value = serde_json::from_str(&body_text(&status)).unwrap();
+            let job = &parsed["analyze_job"];
+            let s = job["status"].as_str().unwrap_or("").to_string();
+            let progress = job["progress"].as_u64().unwrap_or(0) as u32;
+            let message = job["progress_message"].as_str().unwrap_or("").to_string();
+            all_samples.push((progress, message.clone()));
+            if message.starts_with("Parsing: ") {
+                parse_values.push(progress);
+            }
+            if s == "completed" || s == "failed" {
+                final_status = s;
+                break;
+            }
+        }
+
+        assert_eq!(
+            final_status, "completed",
+            "20 trivial .rec files must index cleanly through the recording plugin; \
+             got terminal status: {final_status:?}"
+        );
+
+        assert!(
+            parse_values.windows(2).all(|w| w[0] <= w[1]),
+            "parse-phase progress must be monotonic non-decreasing; \
+             parse samples = {parse_values:?}; all samples = {all_samples:?}"
+        );
+
+        let distinct: std::collections::HashSet<u32> = parse_values.iter().copied().collect();
+        assert!(
+            distinct.len() >= 3,
+            "expected ≥ 3 distinct parse-phase progress values (NOT just 0 → final); \
+             parse samples = {parse_values:?}, distinct count = {}, all samples = {all_samples:?}. \
+             A '2 distinct values' failure means progress is only flushed on terminal \
+             transition — a production bug in the fan-out sink.",
+            distinct.len()
+        );
     }
 }

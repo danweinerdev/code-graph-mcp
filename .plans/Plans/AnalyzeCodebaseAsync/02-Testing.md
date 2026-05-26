@@ -20,7 +20,7 @@ tasks:
     depends_on: ["2.1"]
   - id: "2.3"
     title: "Slot rotation, failure-path, and deterministic progress tests"
-    status: planned
+    status: complete
     verification: "Five tests covering the rotation rules and failure surfacing: (a) `terminal_job_rotates_to_previous_on_next_kickoff` — kickoff (T1), poll to Completed, kickoff (T2), assert `previous_terminal == T1` and `current == T2` Running. (b) `two_back_to_back_analyses_lose_oldest_terminal` — kickoff (T1) → Completed → kickoff (T2) → Completed → kickoff (T3), assert `previous_terminal == T2` and T1's `job_id` no longer appears in the slot. (c) `failed_job_surfaces_error_in_get_status` — point analyze at a tempdir with a malformed `.code-graph.toml` (`[discovery\\nmax_threads = nope\\n`), kickoff async, poll until `status: \"failed\"`, assert `error` contains `\"failed to parse .code-graph.toml\"` byte-identical to the existing sync error wording. (d) `failed_job_rotates_to_previous_terminal` — Failed counts as terminal: kickoff failed (T1), kickoff (T2), assert `previous_terminal == T1` (Failed) and `current == T2`. (e) `progress_increments_during_indexing` — generate 20 small fixture files using a custom `LanguagePlugin` wrapping `CppParser` that sleeps 10ms per `parse_file` call (or use `test_recording_plugin` parameterized with a sleep). Kickoff async. In a polling loop, sample `analyze_job.progress` every 30ms while `status == \"running\"`, recording values. Assert: sequence is monotonically non-decreasing AND ≥ 3 distinct values observed (NOT just 0 → final). Determinism comes from the controlled per-file sleep, not from runtime timing — the loop has 20 × 10ms = 200ms of guaranteed in-progress window, easily long enough for several 30ms polls to land mid-run. `cargo test` shows all five passing."
     depends_on: ["2.1"]
   - id: "2.4"
@@ -71,12 +71,12 @@ The `test_recording_plugin` extension is the most fragile part. If it doesn't al
 ## 2.3: Slot rotation, failure-path, and deterministic progress tests
 
 ### Subtasks
-- [ ] `terminal_job_rotates_to_previous_on_next_kickoff` — kickoff (capture T1.job_id), poll to Completed, kickoff (T2). Assert `analyze_slot.read().previous_terminal.as_ref().unwrap().job_id == T1.job_id` and `current.as_ref().unwrap().job_id == T2.job_id`.
-- [ ] `two_back_to_back_analyses_lose_oldest_terminal` — T1 → Completed → T2 → Completed → T3. Assert `previous_terminal.job_id == T2.job_id`; assert no slot reference holds T1's job_id anymore.
-- [ ] `failed_job_surfaces_error_in_get_status` — tempdir with `.code-graph.toml` content `[discovery\nmax_threads = nope\n`. Kickoff async. Poll until `status == "failed"`. Assert `analyze_job.error` starts with `"failed to parse .code-graph.toml"` byte-identical to today's sync error.
-- [ ] `failed_job_rotates_to_previous_terminal` — Failed counts as terminal for rotation. Kickoff failed T1, kickoff T2, assert `previous_terminal == T1` (status Failed, error preserved) and `current == T2`.
-- [ ] `progress_increments_during_indexing` — generate 20 trivial `.cpp` files in a tempdir, configure the test plugin with `SLEEP_PER_PARSE=10ms`. Kickoff async. In a loop with 30ms cadence, sample `analyze_job.progress` while `status == "running"`; record values into a `Vec<u32>`. Loop bound: 1s (200ms expected indexing duration × 5 safety margin). Assert: `values.windows(2).all(|w| w[0] <= w[1])` (monotonic non-decreasing) AND `values.iter().collect::<HashSet<_>>().len() >= 3` (≥ 3 distinct intermediate values, NOT just 0 → final).
-- [ ] All 5 tests pass. Run 10 consecutive times to confirm no flake.
+- [x] `terminal_job_rotates_to_previous_on_next_kickoff` — kickoff (capture T1.job_id), poll to Completed, kickoff (T2). Assert `analyze_slot.read().previous_terminal.as_ref().unwrap().job_id == T1.job_id` and `current.as_ref().unwrap().job_id == T2.job_id`.
+- [x] `two_back_to_back_analyses_lose_oldest_terminal` — T1 → Completed → T2 → Completed → T3. Assert `previous_terminal.job_id == T2.job_id`; assert no slot reference holds T1's job_id anymore.
+- [x] `failed_job_surfaces_error_in_get_status` — tempdir with `.code-graph.toml` content `[discovery\nmax_threads = nope\n`. Kickoff async. Poll until `status == "failed"`. Assert `analyze_job.error` starts with `"failed to parse .code-graph.toml"` byte-identical to today's sync error.
+- [x] `failed_job_rotates_to_previous_terminal` — Failed counts as terminal for rotation. Kickoff failed T1, kickoff T2, assert `previous_terminal == T1` (status Failed, error preserved) and `current == T2`.
+- [x] `progress_increments_during_indexing` — generate 20 trivial `.cpp` files in a tempdir, configure the test plugin with `SLEEP_PER_PARSE=10ms`. Kickoff async. In a loop with 30ms cadence, sample `analyze_job.progress` while `status == "running"`; record values into a `Vec<u32>`. Loop bound: 1s (200ms expected indexing duration × 5 safety margin). Assert: `values.windows(2).all(|w| w[0] <= w[1])` (monotonic non-decreasing) AND `values.iter().collect::<HashSet<_>>().len() >= 3` (≥ 3 distinct intermediate values, NOT just 0 → final).
+- [x] All 5 tests pass. Run 10 consecutive times to confirm no flake.
 
 ### Notes
 The progress test's 30ms cadence × 10ms per-file sleep × 20 files gives a deliberate ≥6 polls landing mid-run on average. The "≥ 3 distinct intermediate values" threshold leaves comfortable headroom for scheduler jitter while still catching the failure mode where the atomic isn't flushed until completion.
