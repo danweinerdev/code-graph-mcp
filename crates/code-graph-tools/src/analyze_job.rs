@@ -100,6 +100,18 @@ pub enum AnalyzePhase {
     /// Cache serialization (rkyv archive + binary write). One-shot at
     /// the end of a successful analyze; no per-file progress.
     Persisting,
+    /// Terminal "done" indicator stamped by `finish_completed`
+    /// atomically with `JobStatus::Completed`. A polling client
+    /// observing `current_phase == "completed"` can treat the
+    /// analyze as finished without separately consulting `status` —
+    /// removes the ambiguity where `current_phase == "persisting"`
+    /// alone couldn't distinguish "still persisting" from "already
+    /// done." **Failed jobs intentionally retain their last
+    /// in-flight phase** (e.g. `"parsing"` if parsing died) so
+    /// `current_phase + error` together tell the agent where the
+    /// failure happened; `Completed` is reserved for successful
+    /// terminals.
+    Completed,
 }
 
 impl AnalyzeJob {
@@ -161,6 +173,16 @@ impl AnalyzeJob {
             AnalyzePhase::Persisting => {
                 s.progress_total = 1;
                 "Persisting cache to disk".to_string()
+            }
+            AnalyzePhase::Completed => {
+                // Terminal stamp. Set both numerator and denominator
+                // to 1 so a progress-bar UI renders 100%; the message
+                // names the terminal explicitly so clients reading
+                // only `progress_message` (without `status`) still
+                // see "done."
+                s.progress = 1;
+                s.progress_total = 1;
+                "Analyze complete".to_string()
             }
         };
     }

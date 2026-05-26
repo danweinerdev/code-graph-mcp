@@ -1522,7 +1522,12 @@ impl CodeGraphServer {
                        multi-GB caches; skipped when `force=true` and the invocation scope is \
                        the entire project root), `\"discovering\"` (file-walk), `\"parsing\"` \
                        (per-file tree-sitter parse + extract — the dominant phase), \
-                       `\"resolving\"` (cross-file edge resolution), `\"persisting\"` (cache write). It is independent of `status` and stays as a \
+                       `\"resolving\"` (cross-file edge resolution), `\"persisting\"` (cache write), \
+                       `\"completed\"` (terminal indicator stamped atomically with \
+                       `status: \"completed\"` — a polling client can read either field alone \
+                       to detect successful terminal). Failed jobs intentionally retain their \
+                       last in-flight phase so `current_phase + error` together localize where \
+                       the failure happened. It is independent of `status` and stays as a \
                        historical value on terminal jobs (the phase that was active when the worker \
                        reached terminal); for terminal liveness use `status` not `current_phase`. \
                        Emits explicit `null` until the worker enters its first phase. \

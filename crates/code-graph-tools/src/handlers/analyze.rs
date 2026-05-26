@@ -662,14 +662,31 @@ pub(crate) async fn run_analyze_job(
 
 /// Stamp terminal state under a single `state.write()` so an observer
 /// (1.3's sync handler reading after `await`, or 1.4's polled `get_status`)
-/// sees status+finished_at consistently — never a half-written transition.
+/// sees status+finished_at+phase consistently — never a half-written
+/// transition.
+///
+/// Also stamps `current_phase = Completed`, `progress = 1/1`, and
+/// message `"Analyze complete"` atomically with the status flip so a
+/// polling client observing `current_phase == "completed"` can treat
+/// the analyze as finished without separately consulting `status`.
+/// Removes the prior ambiguity where `current_phase == "persisting"`
+/// alone couldn't distinguish "still persisting" from "already done."
 fn finish_completed(job: &AnalyzeJob, result: AnalyzeResult) {
     let mut s = job.state.write();
+    s.current_phase = Some(crate::analyze_job::AnalyzePhase::Completed);
+    s.progress = 1;
+    s.progress_total = 1;
+    s.progress_message = "Analyze complete".to_string();
     s.status = JobStatus::Completed(result);
     s.finished_at = Some(now_nanos_u64());
 }
 
 fn finish_failed(job: &AnalyzeJob, msg: String) {
+    // Intentionally do NOT touch `current_phase` — leave it at the
+    // last in-flight phase so polling clients see WHERE the failure
+    // happened (e.g. `current_phase: "parsing"` + `error: "..."`
+    // tells the agent the failure was during parsing, not resolve
+    // or persist). `Completed` is reserved for successful terminals.
     let mut s = job.state.write();
     s.status = JobStatus::Failed(msg);
     s.finished_at = Some(now_nanos_u64());
@@ -1201,14 +1218,14 @@ mod tests {
             "second analyze should complete via fast path: {:?}",
             std::any::type_name_of_val(&state.status)
         );
-        // The regression: `current_phase` was `None`. After the fix,
-        // the top-of-worker `set_phase(Discovering)` runs before the
-        // fast-path probe so the terminal carries a non-null phase.
-        assert!(
-            state.current_phase.is_some(),
-            "fast-path terminal must carry a non-null current_phase \
-             (regression: was None before the top-of-worker set_phase \
-             stamp); got {:?}",
+        // The regression: `current_phase` was `None`. After the
+        // top-of-worker set_phase stamp + finish_completed's explicit
+        // `Completed` indicator, the terminal carries
+        // `current_phase: Completed`.
+        assert_eq!(
+            state.current_phase,
+            Some(crate::analyze_job::AnalyzePhase::Completed),
+            "successful terminal must carry the explicit Completed indicator; got {:?}",
             state.current_phase
         );
     }
@@ -1279,16 +1296,77 @@ mod tests {
             .as_ref()
             .expect("force analyze must install a slot.current entry");
         let state = current.state.read();
-        // current_phase must be non-null (already pinned by other
-        // tests but worth re-asserting here).
-        assert!(state.current_phase.is_some());
-        // Terminal should be Persisting (the typical end-state for a
-        // force run that writes a cache).
+        // Terminal should land on the explicit Completed indicator
+        // stamped by `finish_completed`. `Completed` is the
+        // "successful terminal" signal — polling clients can read
+        // current_phase alone without consulting `status` to know
+        // the analyze is done.
         assert_eq!(
             state.current_phase,
-            Some(AnalyzePhase::Persisting),
-            "force=true terminal should land on Persisting; got {:?}",
+            Some(AnalyzePhase::Completed),
+            "successful terminal must land on Completed; got {:?}",
             state.current_phase
+        );
+        assert_eq!(state.progress_message, "Analyze complete");
+    }
+
+    /// `finish_completed` stamps `current_phase = Completed`,
+    /// `progress = 1/1`, `progress_message = "Analyze complete"`,
+    /// `status = Completed`, and `finished_at` all under a single
+    /// `state.write()`. A polling observer can read any one of these
+    /// fields alone and reach the correct "done" conclusion — no
+    /// cross-field coherence check needed.
+    #[test]
+    fn finish_completed_atomically_stamps_completed_phase() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        // Seed mid-flight state to verify finish_completed overrides
+        // everything cleanly.
+        job.set_phase(AnalyzePhase::Persisting);
+        {
+            let mut s = job.state.write();
+            s.progress = 0;
+            s.progress_message = "Persisting cache to disk".to_string();
+        }
+
+        let dummy_result = AnalyzeResult {
+            files: 5,
+            symbols: 10,
+            edges: 20,
+            root_path: "/x".to_string(),
+            warnings: Vec::new(),
+        };
+        finish_completed(&job, dummy_result.clone());
+
+        let s = job.state.read();
+        assert!(matches!(s.status, JobStatus::Completed(_)));
+        assert_eq!(s.current_phase, Some(AnalyzePhase::Completed));
+        assert_eq!(s.progress, 1);
+        assert_eq!(s.progress_total, 1);
+        assert_eq!(s.progress_message, "Analyze complete");
+        assert!(s.finished_at.is_some());
+    }
+
+    /// `finish_failed` does NOT stamp `Completed` — the failed
+    /// terminal retains its last in-flight phase so the agent sees
+    /// where the failure happened. `current_phase + error` together
+    /// localize the failure to its originating phase.
+    #[test]
+    fn finish_failed_preserves_in_flight_phase() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(AnalyzePhase::Parsing);
+
+        finish_failed(&job, "boom".to_string());
+
+        let s = job.state.read();
+        assert!(matches!(s.status, JobStatus::Failed(_)));
+        assert_eq!(
+            s.current_phase,
+            Some(AnalyzePhase::Parsing),
+            "failed terminal must NOT stamp Completed; should retain Parsing"
         );
     }
 

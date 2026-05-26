@@ -135,11 +135,12 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
     );
 
     // `current_phase` must be present (explicit `null` or a phase
-    // string — never absent). On a completed terminal the worker has
-    // walked all four phases; the last set value is `persisting`. The
-    // assertion accepts any indexing phase name to stay robust against
-    // future re-ordering, but rejects `null` and absent values — a
-    // completed job MUST have moved through at least one set_phase.
+    // string — never absent). On a completed terminal,
+    // `finish_completed` atomically stamps `current_phase = "completed"`
+    // along with `status = "completed"`, so the terminal phase is
+    // the explicit `"completed"` indicator — NOT the last in-flight
+    // phase. Polling clients can use either signal alone to detect
+    // terminal success without consulting the other field.
     assert!(
         terminal
             .as_object()
@@ -147,15 +148,12 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
             .unwrap_or(false),
         "terminal AnalyzeJobView must carry a current_phase key (possibly null); got: {terminal}"
     );
-    let phase = terminal["current_phase"].as_str().expect(
-        "completed job must have observed at least one set_phase; current_phase must be a string",
-    );
-    assert!(
-        matches!(
-            phase,
-            "discovering" | "parsing" | "resolving" | "persisting"
-        ),
-        "current_phase must be one of the indexing phases; got {phase:?}"
+    let phase = terminal["current_phase"]
+        .as_str()
+        .expect("completed job must carry a string current_phase (the Completed indicator)");
+    assert_eq!(
+        phase, "completed",
+        "successful terminal must land on the explicit `completed` phase; got {phase:?}"
     );
     assert_eq!(
         terminal["job_id"].as_str(),

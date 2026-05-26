@@ -462,6 +462,7 @@ mod tests {
             (AnalyzePhase::Parsing, "Parsing source files"),
             (AnalyzePhase::Resolving, "Resolving cross-file edges"),
             (AnalyzePhase::Persisting, "Persisting cache to disk"),
+            (AnalyzePhase::Completed, "Analyze complete"),
         ] {
             job.set_phase(phase);
             let view = AnalyzeJobView::from_job(&job);
@@ -508,6 +509,7 @@ mod tests {
             (AnalyzePhase::Parsing, "parsing"),
             (AnalyzePhase::Resolving, "resolving"),
             (AnalyzePhase::Persisting, "persisting"),
+            (AnalyzePhase::Completed, "completed"),
         ];
         for (variant, expected) in cases {
             let s = serde_json::to_value(variant).unwrap();
