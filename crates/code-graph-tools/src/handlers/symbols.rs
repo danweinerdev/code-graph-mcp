@@ -464,34 +464,42 @@ pub fn search_symbols(
         let inner = &query_str[1..query_str.len() - 1];
         if inner.is_empty() {
             Vec::new()
+        } else if is_plain_identifier(inner) {
+            // Plain identifier — user likely typed a name that's close
+            // to a real symbol. Prefer Levenshtein over substring because
+            // substring matching routinely hits incidental matches inside
+            // long compound names (e.g. "Actr" appearing inside
+            // "ExtractRelativePath"), so the substring hits aren't
+            // actually close to what the user typed.
+            //
+            // Substring stays as the fallback when Levenshtein finds
+            // nothing within the length-adaptive threshold — better-
+            // than-nothing for very-short queries (`^A$` has threshold
+            // 0, so only exact matches pass Levenshtein) and for queries
+            // far from any real symbol.
+            let near_hits = levenshtein_suggestions(&graph.read(), inner, 5);
+            if !near_hits.is_empty() {
+                near_hits
+            } else {
+                graph
+                    .read()
+                    .search_symbols(inner, None)
+                    .iter()
+                    .take(5)
+                    .map(symbol_id)
+                    .collect()
+            }
         } else {
-            // First try the existing substring matcher — it handles the
-            // common "user typed half the name" case cheaply.
-            let substring_hits: Vec<String> = graph
+            // Regex pattern — Levenshtein doesn't semantically apply
+            // (the user wrote metacharacters intentionally, not a typo).
+            // Fall back to substring.
+            graph
                 .read()
                 .search_symbols(inner, None)
                 .iter()
                 .take(5)
                 .map(symbol_id)
-                .collect();
-            if !substring_hits.is_empty() {
-                substring_hits
-            } else {
-                // Substring matcher came up empty: the user likely typed
-                // a typo (off by an edit or two) rather than a half-name.
-                // Run an edit-distance pass over symbol names and return
-                // the closest hits. Threshold scales with name length so
-                // single-char queries don't match every short name.
-                //
-                // Only fire on plain-identifier inner patterns —
-                // anything containing regex metacharacters is presumed
-                // to be an intentional regex, not a name to fuzzy-match.
-                if is_plain_identifier(inner) {
-                    levenshtein_suggestions(&graph.read(), inner, 5)
-                } else {
-                    Vec::new()
-                }
-            }
+                .collect()
         }
     } else {
         Vec::new()
@@ -535,12 +543,13 @@ fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<Stri
     let max_distance = max_distance_for_query(inner.len());
     let mut candidates: Vec<(usize, &Symbol)> = Vec::new();
     let inner_chars: Vec<char> = inner.chars().collect();
+    let inner_char_len = inner_chars.len();
     for sym in graph.all_symbols() {
         let name_chars: Vec<char> = sym.name.chars().collect();
         // Length-difference quick-reject: two strings whose lengths
         // differ by more than `max_distance` cannot be within
         // `max_distance` edits of each other.
-        if name_chars.len().abs_diff(inner_chars.len()) > max_distance {
+        if name_chars.len().abs_diff(inner_char_len) > max_distance {
             continue;
         }
         let d = levenshtein(&inner_chars, &name_chars, max_distance);
@@ -548,7 +557,21 @@ fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<Stri
             candidates.push((d, sym));
         }
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    // Sort: (distance asc, length-closeness asc, name asc).
+    // Length-closeness as a secondary key captures the intuition that
+    // typing a 4-char "Actr" makes the user more likely to mean a
+    // 5-char/6-char name than a 3-char name. Without it, lexicographic
+    // name order would rank `Act` (3) above `Actor` (5) at the same
+    // edit distance.
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                let a_diff = (a.1.name.chars().count() as i64 - inner_char_len as i64).abs();
+                let b_diff = (b.1.name.chars().count() as i64 - inner_char_len as i64).abs();
+                a_diff.cmp(&b_diff)
+            })
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
     candidates
         .into_iter()
         .take(limit)
@@ -673,9 +696,21 @@ fn near_search(
 
     let total = hits.len() as u32;
 
-    // Phase 2: sort by (distance asc, name asc) so the closest matches
-    // paginate first and ties resolve deterministically.
-    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    // Phase 2: sort by (distance asc, length-closeness asc, name asc).
+    // Length-closeness as the secondary key prevents short identifiers
+    // from dominating ranking when many symbols tie on edit distance
+    // (e.g. `Act` vs `Actor` at distance 1 from query "Actr"). Without
+    // it, lexicographic name order would rank the 3-char `Act` first.
+    let query_char_len = query_chars.len();
+    hits.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                let a_diff = (a.1.name.chars().count() as i64 - query_char_len as i64).abs();
+                let b_diff = (b.1.name.chars().count() as i64 - query_char_len as i64).abs();
+                a_diff.cmp(&b_diff)
+            })
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
 
     // Phase 3: paginate via byte_budget_take on the SymbolResult-mapped
     // form. The mapping happens before the cut so each candidate is
@@ -2201,6 +2236,136 @@ mod tests {
         assert_eq!(parsed["total"], serde_json::json!(1));
     }
 
+    /// Near-mode tiebreaker: when two candidates tie on edit distance,
+    /// the one whose char-length is closer to the query length ranks
+    /// first. Without the length-closeness key, lexicographic name
+    /// order would put `Act` (3 chars) above `Actor` (5 chars) for
+    /// query `Actr` (4 chars); the length-closeness key flips that
+    /// because |5-4| < |3-4| is false — both diff 1, so this case
+    /// alone wouldn't differ. Use a more discriminating fixture: a
+    /// short name (`Ac`, diff 2) vs a close-length name (`Actr`, diff
+    /// 0) vs a long name (`Actor`, diff 1). All within distance 2
+    /// from `Actr`. Expected order: `Actr` (0), `Actor` (1), `Ac` (2).
+    #[test]
+    fn near_mode_prefers_length_closer_tiebreak() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Ac", SymbolKind::Class, "/x.cpp", ""),   // d=2, len 2
+                sym("Actr", SymbolKind::Class, "/x.cpp", ""), // d=0, len 4
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""), // d=1, len 5
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actr"),
+                near: true,
+                max_distance: Some(2),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            results,
+            vec!["Actr", "Actor", "Ac"],
+            "distance ascends first; on ties, length-closeness asc"
+        );
+    }
+
+    /// Near-mode same-distance length-closeness: at distance 1 from
+    /// query `Actr` (4 chars), `Act` (3 chars, diff 1) and `Actor`
+    /// (5 chars, diff 1) tie on length-closeness. The tertiary
+    /// alphabetical sort then puts `Act` above `Actor`. This pins
+    /// the deterministic ordering when both primary AND secondary
+    /// keys tie.
+    #[test]
+    fn near_mode_alphabetical_when_distance_and_length_tie() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Act", SymbolKind::Class, "/x.cpp", ""), // d=1, len 3, diff 1
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""), // d=1, len 5, diff 1
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actr"),
+                near: true,
+                max_distance: Some(1),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(results, vec!["Act", "Actor"], "alphabetical tertiary key");
+    }
+
+    /// Near-mode primary-key dominance: a distance-0 exact match
+    /// outranks a closer-length candidate at a worse distance.
+    /// Query `Actr` (4 chars) matches exact `Actr` at distance 0
+    /// and `ActrXY` (length 6, diff 2) at distance 2. Even though
+    /// `ActrXY` is much longer (length-closeness diff 2 vs 0), the
+    /// distance key dominates — `Actr` must rank first.
+    #[test]
+    fn near_mode_distance_dominates_length() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Actr", SymbolKind::Class, "/x.cpp", ""),
+                sym("ActrXY", SymbolKind::Class, "/x.cpp", ""),
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actr"),
+                near: true,
+                max_distance: Some(2),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            results.first(),
+            Some(&"Actr"),
+            "distance-0 must rank above any non-zero candidate"
+        );
+    }
+
     #[test]
     fn search_symbols_kind_only_filter_accepted() {
         let g = locked(small_graph());
@@ -2867,6 +3032,176 @@ mod tests {
         assert!(
             !body_text(&r).contains("suggestions"),
             "empty inner pattern: the `suggestions` key must be wholly absent from the wire JSON: {parsed}"
+        );
+    }
+
+    /// Anchored zero-result for a plain identifier prefers Levenshtein
+    /// over substring. Fixture: `AActor` (1 edit from `Actr` —
+    /// insertion of `A` then deletion of `r`; actually distance 3 —
+    /// use a fixture with a guaranteed-near name). Use query `Actr`,
+    /// add candidate names `Actor` (1 edit, plain delete of `o`) and
+    /// `ExtractRelativePath` (no edit-distance match but substring
+    /// match). The new code must surface `Actor` even though
+    /// substring would have surfaced `ExtractRelativePath` first.
+    #[test]
+    fn anchored_plain_identifier_prefers_levenshtein_over_substring() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""),
+                sym("ExtractRelativePath", SymbolKind::Function, "/x.cpp", ""),
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("^Actr$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        let arr = parsed["suggestions"].as_array().expect("suggestions key");
+        let ids: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            ids.iter().any(|id| id.ends_with(":Actor")),
+            "Actor (1 edit from Actr) must surface; got {ids:?}"
+        );
+        // ExtractRelativePath is a substring incidental match. With
+        // the new priority, it must NOT outrank Actor.
+        if let (Some(actor_pos), Some(extract_pos)) = (
+            ids.iter().position(|id| id.ends_with(":Actor")),
+            ids.iter()
+                .position(|id| id.ends_with(":ExtractRelativePath")),
+        ) {
+            assert!(
+                actor_pos < extract_pos,
+                "Levenshtein hit must rank above incidental substring hit: {ids:?}"
+            );
+        }
+    }
+
+    /// Levenshtein-empty falls through to substring. Query is a plain
+    /// identifier far from any indexed name (so Levenshtein returns
+    /// nothing) but happens to substring-match an existing symbol.
+    /// Fixture: `OnlyDistantName` in the graph; query `^DistantName$`.
+    /// `DistantName` is 4 edits from `OnlyDistantName` (length diff
+    /// 4); threshold at length 11 is 1. Levenshtein returns empty —
+    /// fall through to substring, which finds `OnlyDistantName` by
+    /// substring of `DistantName`.
+    #[test]
+    fn anchored_plain_identifier_falls_through_to_substring_when_levenshtein_empty() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("OnlyDistantName", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("^DistantName$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        let arr = parsed["suggestions"].as_array().expect("suggestions key");
+        let ids: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            ids.iter().any(|id| id.ends_with(":OnlyDistantName")),
+            "substring fallback must surface OnlyDistantName; got {ids:?}"
+        );
+    }
+
+    /// Anchored zero-result with a regex inner pattern (metacharacters
+    /// present) continues to use the broad search path, NOT
+    /// Levenshtein. The user wrote metacharacters intentionally, so
+    /// fuzzy-matching them as if they were a typo would be wrong.
+    ///
+    /// Fixture: `FooBarBaz` in the graph; query `^Foo.*Bar$` matches
+    /// nothing under the anchored exact regex (the trailing `Baz`
+    /// breaks the `$` anchor) but the broad search uses
+    /// `Graph::search_symbols(inner, None)`, which matches `Foo.*Bar`
+    /// against `FooBarBaz` via the same regex engine. The broad-hit
+    /// surface is the OLD behavior and the new code preserves it for
+    /// inner patterns containing regex metacharacters. Levenshtein is
+    /// never invoked on this path.
+    #[test]
+    fn anchored_regex_pattern_uses_broad_search_not_levenshtein() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("FooBarBaz", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("^Foo.*Bar$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        let arr = parsed["suggestions"].as_array().expect("suggestions key");
+        let ids: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        // Broad search matches FooBarBaz via the same regex engine the
+        // anchored top-level query used.
+        assert!(
+            ids.iter().any(|id| id.ends_with(":FooBarBaz")),
+            "regex inner pattern's broad search must surface the matching symbol; got {ids:?}"
+        );
+    }
+
+    /// Long-name typo: Levenshtein must surface a 1-edit fix on a long
+    /// identifier where substring would also match. Fixture:
+    /// `FAchievementsClient` in the graph; query
+    /// `^FAchievmentsClient$` (missing `e`, length 18 → threshold 3).
+    /// Distance is 1 (insertion of `e`). Substring `FAchievmentsClient`
+    /// matches nothing because the missing-`e` form isn't in any
+    /// symbol — only Levenshtein can reach it. The new behavior must
+    /// surface `FAchievementsClient` via the Levenshtein primary.
+    #[test]
+    fn anchored_long_name_typo_surfaces_via_levenshtein() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("FAchievementsClient", SymbolKind::Class, "/x.cpp", "")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("^FAchievmentsClient$"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(0));
+        let arr = parsed["suggestions"].as_array().expect("suggestions key");
+        let ids: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            ids.iter().any(|id| id.ends_with(":FAchievementsClient")),
+            "Levenshtein must surface long-name 1-edit fix; got {ids:?}"
         );
     }
 

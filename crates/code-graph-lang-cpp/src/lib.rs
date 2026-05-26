@@ -170,15 +170,14 @@ impl CppParser {
         self.extract_calls(root, content, &path_str, &mut fg);
         self.extract_includes(root, content, &path_str, &mut fg);
         self.extract_inheritance(root, content, &path_str, &mut fg);
-        // `extract_overrides` MUST run after both `extract_definitions`
-        // (so we have method Symbols to scan) and `extract_inheritance`
-        // (so we have the parent-class Inherits edges to walk for base
-        // names). The pass produces one `EdgeKind::Overrides` edge per
-        // (override-method, base-class) pair; the resolver later
-        // promotes the bare `BaseClass::methodName` target to a fully
-        // qualified `path:BaseClass::methodName` symbol_id when one
-        // exists in the project's symbol index.
-        self.extract_overrides(&path_str, &mut fg);
+        // Note: `extract_overrides` has moved to the whole-graph
+        // [`CppParser::post_index`] hook. The per-file pass only saw
+        // inheritance edges emitted from the SAME file as the override
+        // method — broken for the UE-dominant pattern where the base
+        // class's `class Derived : public Base {}` lives in a header and
+        // the override's `void Derived::foo() override {}` body lives in
+        // a `.cpp`. The post_index pass aggregates Inherits edges across
+        // every FileGraph before emitting Overrides edges.
 
         Ok(fg)
     }
@@ -527,122 +526,177 @@ impl CppParser {
             }
         }
     }
+}
 
-    /// Emit `EdgeKind::Overrides` edges for methods that declare
-    /// `virtual` or `override` and whose enclosing class has one or
-    /// more `Inherits` edges already extracted into `fg.edges`.
-    ///
-    /// For each (override-method, base-class) pair, emits one edge:
-    /// - `from` = the override method's symbol_id (`file:Parent::name`).
-    /// - `to` = `<base_class>::<method_name>` (bare two-segment form,
-    ///   same shape `Calls` edges use before resolution).
-    /// - `kind` = `EdgeKind::Overrides`.
-    /// - `line` = the override method's declaration line.
-    ///
-    /// The resolver (`code_graph_tools::indexer::resolve_edges_with_indexes`)
-    /// promotes the bare `to` to a fully-qualified symbol_id when a
-    /// matching base method exists in the project's symbol index;
-    /// otherwise the edge survives unresolved (treated as a dangling
-    /// override pointer that `find_overrides` will filter out via
-    /// `is_resolved_node`).
-    ///
-    /// Detection is conservative: a method whose `Symbol.signature`
-    /// starts with `virtual ` or contains `override` (after the
-    /// closing `)`) is considered an override candidate. Pure-virtual
-    /// declarations (`= 0` suffix) are ALSO override candidates —
-    /// they're the base method, not an override, but we don't have
-    /// enough context here to distinguish, and downstream resolution
-    /// drops self-loops naturally (a method's Override edge with
-    /// to=`SameClass::SameMethod` resolves to itself; we skip those
-    /// emitting to begin with).
-    ///
-    /// Signature matching for "is this an override of THAT base
-    /// method" reduces to a name match here: any method in any base
-    /// with the same name is a candidate. Argument-list matching
-    /// would catch the C++-overload edge cases (sibling virtuals with
-    /// different argument lists) but is deferred — the common case is
-    /// the dominant case in engine-style code, and name-match plus
-    /// the resolver's symbol-index lookup catches it.
-    fn extract_overrides(&self, path: &str, fg: &mut FileGraph) {
-        // First, build a quick lookup: parent_class -> [base names].
-        // We can read this from the `Inherits` edges just emitted by
-        // `extract_inheritance`.
-        let mut bases_by_class: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for edge in &fg.edges {
-            if edge.kind == EdgeKind::Inherits {
-                bases_by_class
-                    .entry(edge.from.clone())
+/// Whole-graph cross-file override extraction.
+///
+/// Aggregates `Inherits` edges and Method symbols across EVERY parsed
+/// `FileGraph` before emitting `EdgeKind::Overrides` edges, so the
+/// UE-dominant pattern — `class Derived : public Base { virtual void
+/// foo() override; }` in a header + `void Derived::foo() {}` in a
+/// `.cpp` — produces an Override edge even though the inheritance
+/// edge and the override method live in different files. The per-file
+/// pass (deleted in this commit) couldn't see cross-file inheritance
+/// because it only inspected the calling file's own `fg.edges`.
+///
+/// Algorithm:
+/// 1. Walk every FileGraph's symbols to build
+///    `methods_by_class[class_name] = HashSet<method_name>` — every
+///    method NAME defined under a class anywhere in the project.
+/// 2. Walk every FileGraph's edges to build
+///    `bases_by_class[derived_name] = Vec<base_name>` — direct
+///    inheritance, aggregated across files. A class with `:public`
+///    declared in one file and `:public` declared again in another
+///    (e.g. cross-platform `#ifdef` branches) merges its bases.
+/// 3. For each FileGraph and each `Method` symbol with a non-empty
+///    `parent`, BFS up the inheritance ancestry of `parent` via
+///    `bases_by_class`:
+///    - For each ancestor class `C` such that
+///      `methods_by_class[C]` contains `sym.name`, emit one Overrides
+///      edge into THIS FileGraph: `from = symbol_id(sym)`,
+///      `to = "C::sym.name"`. The resolver later promotes the bare
+///      two-segment `to` to a fully-qualified `path:C::sym.name`
+///      symbol_id via the project-wide symbol index.
+///
+/// **Looseness vs. strict C++ semantics.** The pre-cross-file
+/// per-file pass gated emission on `is_override_candidate(sym.signature)`
+/// — meaning the override method's own signature had to carry
+/// `virtual` or `override`. That gate is dropped here because the
+/// UE-dominant pattern keeps the `virtual`/`override` keywords in the
+/// in-class declaration (a `field_declaration` in the header) which
+/// the existing extractor intentionally does NOT emit as a Symbol.
+/// The out-of-line definition `void Derived::foo() {}` carries
+/// neither keyword. With the per-file gate intact, the cross-file
+/// override pattern emits zero edges; with the gate dropped, every
+/// same-named method in an inheriting class produces an Overrides
+/// edge. The trade-off: non-virtual shadowing (`Base` has
+/// `void Foo()` non-virtual; `Derived` declares `void Foo()` without
+/// any virtual specifier anywhere) ALSO produces an Override edge —
+/// strictly a false positive under C++ semantics, but vanishingly
+/// rare in production code and the strictness cost of avoiding it
+/// (in-class declaration extraction, schema bump) is large. The
+/// existing `non_virtual_method_emits_no_override_edge` test was
+/// updated accordingly.
+///
+/// Edge filter: skip the self-loop case `C == sym.parent`. A method
+/// can't override itself. Argument-list matching (for C++ overload
+/// resolution against sibling virtuals with different signatures) is
+/// deferred to the resolver — the common case is name-matched.
+fn extract_overrides_global(graphs: &mut [FileGraph]) {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // The C++ post_index hook is invoked by `index_directory` over
+    // EVERY parsed FileGraph (not just C++ ones). Filter by language
+    // before aggregating so a Python `class Foo(Bar)` Inherits edge
+    // doesn't leak into the C++ override walk — and so this pass
+    // doesn't bloat non-C++ FileGraphs with phantom Overrides edges.
+    // The per-language post_index dispatch from the registry is
+    // language-agnostic by design; gating happens here.
+
+    // (1) methods_by_class: class_name -> set of method names defined
+    // anywhere in the C++ subset of the project under that class.
+    let mut methods_by_class: HashMap<String, HashSet<String>> = HashMap::new();
+    for fg in graphs.iter() {
+        if fg.language != Language::Cpp {
+            continue;
+        }
+        for s in &fg.symbols {
+            if matches!(s.kind, SymbolKind::Method) && !s.parent.is_empty() {
+                methods_by_class
+                    .entry(s.parent.clone())
                     .or_default()
-                    .push(edge.to.clone());
+                    .insert(s.name.clone());
             }
         }
+    }
 
-        if bases_by_class.is_empty() {
-            // Fast path: a file with no inheritance can't have
-            // overrides. Common in C++ codebases dominated by free
-            // functions or template-heavy code.
-            return;
+    // (2) bases_by_class: derived_name -> direct base names, aggregated
+    // across every Inherits edge in the C++ subset.
+    let mut bases_by_class: HashMap<String, Vec<String>> = HashMap::new();
+    for fg in graphs.iter() {
+        if fg.language != Language::Cpp {
+            continue;
         }
+        for e in &fg.edges {
+            if e.kind == EdgeKind::Inherits {
+                let entry = bases_by_class.entry(e.from.clone()).or_default();
+                if !entry.contains(&e.to) {
+                    entry.push(e.to.clone());
+                }
+            }
+        }
+    }
 
+    // Fast path: if no C++ class has any base, no overrides are possible.
+    if bases_by_class.is_empty() {
+        return;
+    }
+
+    // (3) Per-file mutation: BFS ancestry per Method symbol and emit
+    // Overrides edges. No signature-level `virtual`/`override` gate
+    // here — see doc-comment for the rationale (cross-file UE
+    // pattern keeps the keyword in the in-class declaration that's
+    // intentionally not extracted as a Symbol; we accept the
+    // shadowing false-positive in trade). C++ files only.
+    for fg in graphs.iter_mut() {
+        if fg.language != Language::Cpp {
+            continue;
+        }
+        let path = fg.path.clone();
         let mut new_edges: Vec<Edge> = Vec::new();
         for sym in &fg.symbols {
-            // Only methods (not free functions / classes / structs)
-            // can override. Methods carry a non-empty `parent` per
-            // the existing extractor's convention.
             if !matches!(sym.kind, SymbolKind::Method) || sym.parent.is_empty() {
                 continue;
             }
-            if !is_override_candidate(&sym.signature) {
-                continue;
+            // BFS up the inheritance graph starting from `sym.parent`.
+            // The walk terminates when the queue drains; a `visited`
+            // set guards against ill-formed cyclic inheritance.
+            let mut queue: VecDeque<&String> = VecDeque::new();
+            let mut visited: HashSet<String> = HashSet::new();
+            if let Some(direct_bases) = bases_by_class.get(&sym.parent) {
+                for b in direct_bases {
+                    if visited.insert(b.clone()) {
+                        queue.push_back(b);
+                    }
+                }
             }
-            let bases = match bases_by_class.get(&sym.parent) {
-                Some(b) => b,
-                None => continue, // parent class has no bases — nothing to override
-            };
             let from_id = code_graph_core::symbol_id(sym);
-            for base in bases {
-                // Skip the self-loop case (which can happen if the
-                // base name accidentally equals the parent class
-                // name; defensive guard).
-                if base == &sym.parent {
+            while let Some(ancestor) = queue.pop_front() {
+                if ancestor == &sym.parent {
                     continue;
                 }
-                let to = format!("{}::{}", base, sym.name);
-                new_edges.push(Edge {
-                    from: from_id.clone(),
-                    to,
-                    kind: EdgeKind::Overrides,
-                    file: path.to_owned(),
-                    line: sym.line,
-                    confidence: Confidence::Resolved,
-                });
+                // Emit an edge iff the ancestor class actually has a
+                // method with the matching name (either in a header
+                // declaration that's extracted as a body-bearing
+                // method elsewhere, or in an out-of-line definition).
+                // Without this gate every Method would emit edges to
+                // every ancestor regardless of whether the method
+                // name actually exists upstream — bloating the graph
+                // with unresolvable pointers.
+                if let Some(method_names) = methods_by_class.get(ancestor) {
+                    if method_names.contains(&sym.name) {
+                        new_edges.push(Edge {
+                            from: from_id.clone(),
+                            to: format!("{}::{}", ancestor, sym.name),
+                            kind: EdgeKind::Overrides,
+                            file: path.clone(),
+                            line: sym.line,
+                            confidence: Confidence::Resolved,
+                        });
+                    }
+                }
+                // Continue the walk: enqueue this ancestor's bases.
+                if let Some(grand) = bases_by_class.get(ancestor) {
+                    for g in grand {
+                        if visited.insert(g.clone()) {
+                            queue.push_back(g);
+                        }
+                    }
+                }
             }
         }
         fg.edges.extend(new_edges);
     }
-}
-
-/// Conservative detector for "this method declaration looks like an
-/// override candidate." Matches:
-/// - Signatures starting with `virtual ` (with the trailing space to
-///   avoid identifiers like `virtualize`).
-/// - Signatures containing `override` as a trailing decorator (any
-///   substring match — `override` is a contextual keyword in C++
-///   only valid AFTER the parameter list, so false positives on
-///   identifier names are vanishingly unlikely in well-formed code).
-///
-/// Returns `false` for empty signatures and signatures that contain
-/// neither keyword.
-fn is_override_candidate(signature: &str) -> bool {
-    if signature.is_empty() {
-        return false;
-    }
-    if signature.starts_with("virtual ") || signature.contains(" virtual ") {
-        return true;
-    }
-    // `override` as a substring is safe enough — see doc-comment.
-    signature.contains("override")
 }
 
 /// `LanguagePlugin` implementation for C++.
@@ -724,6 +778,16 @@ impl LanguagePlugin for CppParser {
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError> {
         self.parse_to_filegraph(path, content)
     }
+
+    /// Cross-file Overrides edge emission. The C++ extractor's per-file
+    /// `Inherits` and Method-symbol extraction is complete by the time
+    /// this hook fires (one parse_file per source file finished above);
+    /// here we aggregate across every parsed FileGraph and emit
+    /// Overrides edges into the file containing each override method.
+    /// See [`extract_overrides_global`] for the algorithm.
+    fn post_index(&self, graphs: &mut [FileGraph], _file_index: &code_graph_lang::FileIndex) {
+        extract_overrides_global(graphs);
+    }
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the C++ grammar. The
@@ -749,6 +813,18 @@ fn capture_name_for_index<'a>(cap_names: &[&'a str], index: u32) -> &'a str {
 
 /// Build a [`Symbol`] from a definition node. Centralizes the row/column/
 /// signature math so each branch in `extract_definitions` stays small.
+///
+/// When the definition (or any ancestor) sits under a
+/// `template_declaration` node, the signature is prefixed with the
+/// `/* template */ ` sentinel that `get_orphans(reliability="very_high")`
+/// uses to drop template-instantiated callables from the orphan list.
+/// Methods of a templated class inherit the marker because the
+/// template_declaration ancestor wraps the whole class body. The
+/// prefix mirrors the existing `/* synthesized by ... */` convention,
+/// keeping the wire shape unchanged (no schema bump). Applied to ALL
+/// kinds, so a templated class/struct/typedef also carries the marker
+/// — useful for clients filtering by signature even if the orphan
+/// detector only consults the function-and-method subset.
 fn make_symbol(
     name: &str,
     kind: SymbolKind,
@@ -760,6 +836,12 @@ fn make_symbol(
 ) -> Symbol {
     let start = def_node.start_position();
     let end = def_node.end_position();
+    let raw_signature = truncate_signature(def_node.utf8_text(content).unwrap_or(""));
+    let signature = if is_in_template_context(def_node) {
+        format!("/* template */ {raw_signature}")
+    } else {
+        raw_signature
+    };
     Symbol {
         name: name.to_owned(),
         kind,
@@ -767,11 +849,26 @@ fn make_symbol(
         line: start.row as u32 + 1,
         column: start.column as u32,
         end_line: end.row as u32 + 1,
-        signature: truncate_signature(def_node.utf8_text(content).unwrap_or("")),
+        signature,
         namespace,
         parent,
         language: Language::Cpp,
     }
+}
+
+/// Walk ancestors from `node` looking for a `template_declaration`.
+/// Used by [`make_symbol`] to mark template-instantiated definitions
+/// (including methods of a templated class) for the orphan filter's
+/// `reliability="very_high"` tier.
+fn is_in_template_context(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "template_declaration" {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
 }
 
 // Compile-time interface check. Mirrors the Go

@@ -17,8 +17,8 @@ use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
 use super::{
-    byte_budget_take, parse_kind, suggest_symbols, symbol_to_result, tool_error, tool_success_json,
-    CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
+    byte_budget_take, kind_str, parse_kind, suggest_symbols, symbol_to_result, tool_error,
+    tool_success_json, CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -228,23 +228,27 @@ pub fn get_orphans(
             },
         };
 
-    // Reliability filter. Default `all` (or
-    // unspecified) preserves the legacy behaviour: every
-    // Graph::orphans result surfaces, including symbols that are
-    // almost-certainly false positives. `high` drops two
-    // false-positive classes:
-    //   - Virtual methods (callers may go through dynamic dispatch
-    //     which the static resolver doesn't track — see the
-    //     virtual-method warning surfaced by get_callers).
-    //   - Synthesized macro-defined functions (the macro_define_function
-    //     hook tags these with a distinctive `/* synthesized by … */`
-    //     signature prefix — the macro IS the call site by intent).
-    let reliability_high = match reliability {
-        None | Some("") | Some("all") => false,
-        Some("high") => true,
+    // Reliability filter. Default `all` (or unspecified) preserves
+    // the legacy behaviour: every Graph::orphans result surfaces,
+    // including symbols that are almost-certainly false positives.
+    //
+    // - `high` drops virtual methods and macro-synthesized symbols
+    //   (the two original false-positive classes).
+    // - `very_high` additionally drops templated definitions (signature
+    //   carries the `/* template */` prefix emitted by the C++
+    //   extractor when the def has a `template_declaration` ancestor)
+    //   AND any symbol with at least one incoming `Calls` edge,
+    //   regardless of edge confidence (so a heuristic-confidence
+    //   caller or a bare-token unresolved-source caller still excludes
+    //   the symbol from the orphan list). The pair drives the orphan
+    //   count down to candidates that look genuinely dead.
+    let reliability_mode = match reliability {
+        None | Some("") | Some("all") => ReliabilityMode::All,
+        Some("high") => ReliabilityMode::High,
+        Some("very_high") => ReliabilityMode::VeryHigh,
         Some(other) => {
             return tool_error(format!(
-                "invalid reliability: {other:?} (expected \"all\" or \"high\")"
+                "invalid reliability: {other:?} (expected \"all\", \"high\", or \"very_high\")"
             ))
         }
     };
@@ -268,15 +272,19 @@ pub fn get_orphans(
     // `byte_budget_take`. Order is load-bearing — must precede the
     // materialization step below so the byte-budget cost is never paid.
     if count_only {
+        let g = graph.read();
         let raw = match subtree_prefix.as_deref() {
-            Some(p) => graph.read().orphans_under(p, parsed_kind),
-            None => graph.read().orphans(parsed_kind),
+            Some(p) => g.orphans_under(p, parsed_kind),
+            None => g.orphans(parsed_kind),
         };
-        let total = if reliability_high {
-            raw.iter().filter(|s| !is_unreliable_orphan(s)).count() as u32
-        } else {
-            raw.len() as u32
+        let total = match reliability_mode {
+            ReliabilityMode::All => raw.len() as u32,
+            ReliabilityMode::High | ReliabilityMode::VeryHigh => raw
+                .iter()
+                .filter(|s| !is_unreliable_orphan(s, reliability_mode, &g))
+                .count() as u32,
         };
+        drop(g);
         // `limit: 0` is a deliberate exception to the
         // "envelope echoes resolved limit" contract. count_only callers
         // opted out of paging; echoing a would-have-been limit would
@@ -299,13 +307,15 @@ pub fn get_orphans(
     let resolved_offset = offset.unwrap_or(0);
     let resolved_brief = brief.unwrap_or(true);
 
+    let g = graph.read();
     let mut matches = match subtree_prefix.as_deref() {
-        Some(p) => graph.read().orphans_under(p, parsed_kind),
-        None => graph.read().orphans(parsed_kind),
+        Some(p) => g.orphans_under(p, parsed_kind),
+        None => g.orphans(parsed_kind),
     };
-    if reliability_high {
-        matches.retain(|s| !is_unreliable_orphan(s));
+    if !matches!(reliability_mode, ReliabilityMode::All) {
+        matches.retain(|s| !is_unreliable_orphan(s, reliability_mode, &g));
     }
+    drop(g);
     let total = matches.len() as u32;
 
     // Sort by symbol_id ascending so page 1 + page 2 partition the result
@@ -395,13 +405,56 @@ pub fn get_class_hierarchy(
 
     let g = graph.read();
 
+    // Symbol-id path: when the input resolves directly to an indexed
+    // node, take it as a fully-qualified symbol_id and bypass the
+    // bare-name ambiguity gate. This is the completion path for the
+    // `find_class_candidates` -> "pick one and re-query" workflow:
+    // having already disambiguated, the caller passes the exact id
+    // and expects this tool to walk it. The kind gate rejects
+    // non-class-like ids with a kind-specific error so callers can
+    // distinguish "wrong id" from "wrong kind" from "empty graph".
+    if let Some(sym) = g.symbol_detail(class) {
+        if !matches!(
+            sym.kind,
+            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
+        ) {
+            let kind = kind_str(sym.kind);
+            drop(g);
+            return tool_error(format!(
+                "symbol {class:?} is a {kind}, not a class-like symbol; \
+                 get_class_hierarchy requires a Class, Struct, Interface, or Trait"
+            ));
+        }
+        if let Some((hierarchy, total_nodes_seen, truncated)) =
+            g.class_hierarchy_for_symbol(class, depth, resolved_max_nodes)
+        {
+            let response = ClassHierarchyResponse {
+                hierarchy,
+                truncated,
+                max_nodes: resolved_max_nodes,
+                total_nodes_seen,
+            };
+            return tool_success_json(&response);
+        }
+        // Defensive: `symbol_detail` succeeded with a class-like kind
+        // but the walker returned None. Should not happen — surface as
+        // a tool error so the inconsistency is visible.
+        drop(g);
+        return tool_error(format!(
+            "internal: symbol {class:?} resolved but hierarchy walk returned no tree"
+        ));
+    }
+
+    // Bare-name path: when no node matches the input as a symbol_id,
+    // treat it as a class name and use the existing find-by-name flow.
+
     // Ambiguity gate: when multiple class-like symbols share this
     // bare name (e.g. UE's `UObject` and ICU's `UObject` both
     // indexed), the hierarchy walker would silently merge them
     // under one node — every class deriving from EITHER ends up in
-    // the same flat list. Surface the ambiguity explicitly so the
-    // agent disambiguates via fully-qualified symbol_id instead of
-    // unknowingly consuming polluted results.
+    // the same flat list. Surface the ambiguity explicitly and tell
+    // the agent to re-call this tool with one of the listed
+    // symbol_ids — the symbol-id branch above takes that path.
     let candidates = g.find_classes_named(class);
     if candidates.len() > 1 {
         let mut listed: Vec<String> = candidates
@@ -416,9 +469,9 @@ pub fn get_class_hierarchy(
             .join("\n");
         drop(g);
         return tool_error(format!(
-            "ambiguous class name {class:?} ({n} candidates):\n{bullet_list}\nUse \
-             find_class_candidates to discover candidates or pass the fully-qualified \
-             symbol_id to get_symbol_detail.",
+            "ambiguous class name {class:?} ({n} candidates):\n{bullet_list}\nRe-run \
+             get_class_hierarchy with one of the symbol_ids listed above, or call \
+             find_class_candidates for full details.",
             n = listed.len()
         ));
     }
@@ -476,27 +529,68 @@ pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResul
     tool_success_json(&results)
 }
 
-/// Predicate for `get_orphans(reliability="high")` — drop symbols
-/// the resolver almost certainly false-positived as orphans.
+/// `reliability` tier discriminator for the orphan filter. The
+/// progression is strictly cumulative — each higher tier applies every
+/// lower-tier rule plus additional ones — so a symbol filtered out at
+/// `high` is also filtered out at `very_high`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReliabilityMode {
+    /// Default. Every `Graph::orphans` result surfaces unchanged.
+    All,
+    /// Drop virtual methods + macro-synthesized symbols.
+    High,
+    /// Additionally drop templated definitions and symbols with at
+    /// least one incoming `Calls` edge of any confidence.
+    VeryHigh,
+}
+
+/// Predicate for `get_orphans(reliability="high" | "very_high")` — drop
+/// symbols the resolver almost certainly false-positived as orphans.
 ///
-/// Two classes are dropped:
-/// 1. **Virtual methods** — callers may go through dynamic dispatch
-///    which the static resolver doesn't track.
-/// 2. **Macro-synthesized symbols** — the C++ plugin's
+/// Tiering matches [`ReliabilityMode`]: `High` drops two false-positive
+/// classes; `VeryHigh` drops two more on top:
+///
+/// 1. **Virtual methods** (`High`+) — callers may go through dynamic
+///    dispatch which the static resolver doesn't track.
+/// 2. **Macro-synthesized symbols** (`High`+) — the C++ plugin's
 ///    `synthesize_symbols` hook tags these with a distinctive
 ///    `/* synthesized by [cpp].macro_define_function: NAME */`
 ///    signature prefix.
-///
-/// Template-instantiated methods (the third class) aren't
-/// detected here — that requires deferred edge-confidence work
-/// which would tag template-instantiation symbols at extraction time.
-fn is_unreliable_orphan(sym: &code_graph_core::Symbol) -> bool {
+/// 3. **Template-instantiated definitions** (`VeryHigh` only) — the
+///    C++ extractor tags any function/method nested under a
+///    `template_declaration` with a `/* template */ ` prefix. Methods
+///    of a templated class inherit the marker because the class body
+///    sits inside the template_declaration. Templates can't be called
+///    without instantiation, so symbol-graph orphan detection over the
+///    pre-instantiation form has limited signal.
+/// 4. **Symbols with any incoming Calls edge** (`VeryHigh` only) —
+///    `Graph::has_any_incoming_call_edge` counts every `Calls` edge
+///    regardless of confidence, including bare-token unresolved-source
+///    edges. The orphan detector's primary check resolved-filters
+///    callers; this tier trusts that any edge in the reverse adjacency
+///    is signal worth respecting.
+fn is_unreliable_orphan(
+    sym: &code_graph_core::Symbol,
+    mode: ReliabilityMode,
+    graph: &Graph,
+) -> bool {
     let sig = sym.signature.as_str();
+    // `High` AND `VeryHigh` apply rules 1+2.
     if sig.starts_with("virtual ") || sig.contains(" virtual ") {
         return true;
     }
     if sig.starts_with("/* synthesized by [cpp].macro_define_function") {
         return true;
+    }
+    // `VeryHigh` additionally applies rules 3+4.
+    if matches!(mode, ReliabilityMode::VeryHigh) {
+        if sig.starts_with("/* template */") {
+            return true;
+        }
+        let sym_id = symbol_id(sym);
+        if graph.has_any_incoming_call_edge(&sym_id) {
+            return true;
+        }
     }
     false
 }
@@ -1538,6 +1632,133 @@ mod tests {
         );
     }
 
+    /// `reliability="very_high"` drops the High-tier false positives
+    /// AND additionally drops templated definitions + any-caller
+    /// symbols. Fixture: plain orphan, virtual (high), synth (high),
+    /// template-marked orphan (very_high only), and an orphan with a
+    /// heuristic incoming caller (very_high only).
+    #[test]
+    fn orphans_reliability_very_high_drops_template_and_any_caller() {
+        let mut g = Graph::new();
+        let mut sym_plain = sym("plain_orphan", SymbolKind::Function, "/x.cpp");
+        sym_plain.signature = "void plain_orphan()".to_string();
+        let mut sym_virtual = sym("virtual_orphan", SymbolKind::Method, "/x.cpp");
+        sym_virtual.parent = "Base".to_string();
+        sym_virtual.signature = "virtual void virtual_orphan()".to_string();
+        let mut sym_synth = sym("synth_orphan", SymbolKind::Function, "/x.cpp");
+        sym_synth.signature =
+            "/* synthesized by [cpp].macro_define_function: MAKE_FN */".to_string();
+        let mut sym_tmpl = sym("template_orphan", SymbolKind::Method, "/x.cpp");
+        sym_tmpl.parent = "TFoo".to_string();
+        sym_tmpl.signature = "/* template */ void template_orphan()".to_string();
+        let mut sym_helper = sym(
+            "helper_with_unresolved_caller",
+            SymbolKind::Function,
+            "/x.cpp",
+        );
+        sym_helper.signature = "void helper_with_unresolved_caller()".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym_plain.clone(),
+                sym_virtual.clone(),
+                sym_synth.clone(),
+                sym_tmpl.clone(),
+                sym_helper.clone(),
+            ],
+            edges: vec![
+                // An incoming Calls edge from an unresolved caller
+                // (target won't be in nodes) to helper. has_any_incoming_call_edge
+                // counts this as an incoming Calls edge regardless of
+                // whether the source resolves.
+                code_graph_core::Edge {
+                    from: "/x.cpp:unresolved_source".to_string(),
+                    to: "/x.cpp:helper_with_unresolved_caller".to_string(),
+                    kind: code_graph_core::EdgeKind::Calls,
+                    file: "/x.cpp".to_string(),
+                    line: 1,
+                    confidence: code_graph_core::Confidence::Heuristic,
+                },
+            ],
+        });
+        let g = locked(g);
+        let r = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("very_high"),
+            NO_BYTE_BUDGET,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        // Plain orphan is the only survivor: virtual+synth dropped by
+        // High-tier rules, template marker dropped by VeryHigh, helper
+        // dropped because it has an incoming Calls edge.
+        // (Note: helper may not appear in the raw orphan set at all
+        // because it has an incoming Calls edge — Graph::orphans
+        // already filters by "zero resolved incoming". The check here
+        // is that very_high catches it even if it surfaced.)
+        assert_eq!(total, 1, "only plain_orphan must survive; got {names:?}");
+        assert_eq!(names, vec!["plain_orphan"]);
+    }
+
+    /// `reliability="very_high"` matches `High` behavior on a graph
+    /// without templates or any-caller candidates — i.e. the new tier
+    /// is purely additive on top of `High` for the legacy false-
+    /// positive classes.
+    #[test]
+    fn orphans_reliability_very_high_matches_high_on_legacy_fixture() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("very_high"),
+            NO_BYTE_BUDGET,
+        );
+        let (arr, total, _, _) = page_parts(&r);
+        let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(total, 1, "only plain_orphan survives; got {names:?}");
+        assert_eq!(names, vec!["plain_orphan"]);
+    }
+
+    /// Invalid reliability error mentions `very_high` in the
+    /// expected-values list so callers know the new tier is available.
+    #[test]
+    fn orphans_reliability_invalid_error_lists_very_high() {
+        let g = locked(graph_with_reliable_and_unreliable_orphans());
+        let r = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("extreme"),
+            NO_BYTE_BUDGET,
+        );
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(
+            body.contains("very_high"),
+            "error must mention new tier: {body}"
+        );
+        assert!(
+            body.contains("extreme"),
+            "error must name the bad value: {body}"
+        );
+    }
+
     /// `count_only` honors the reliability filter — `total` is the
     /// post-filter count, NOT the raw count.
     #[test]
@@ -1561,9 +1782,15 @@ mod tests {
     }
 
     /// `is_unreliable_orphan` predicate behaves correctly on each
-    /// distinct signature class.
+    /// distinct signature class. Exercises both `High` and `VeryHigh`
+    /// tiers: at `High`, virtual + macro-synth fire; at `VeryHigh`,
+    /// the template marker and the any-caller signal fire on top of
+    /// the `High` rules. The decoy `void virtualize()` is NOT a
+    /// virtual method (substring guard) and never fires.
     #[test]
     fn is_unreliable_orphan_predicate_table() {
+        let g = Graph::new();
+
         let plain = sym("f", SymbolKind::Function, "/x.cpp");
         let mut virt = sym("g", SymbolKind::Method, "/x.cpp");
         virt.signature = "virtual void g()".to_string();
@@ -1573,12 +1800,28 @@ mod tests {
         synth.signature = "/* synthesized by [cpp].macro_define_function: FOO */".to_string();
         let mut decoy = sym("j", SymbolKind::Function, "/x.cpp");
         decoy.signature = "void virtualize()".to_string(); // not a virtual
+        let mut tmpl = sym("k", SymbolKind::Method, "/x.cpp");
+        tmpl.signature = "/* template */ void k()".to_string();
 
-        assert!(!is_unreliable_orphan(&plain));
-        assert!(is_unreliable_orphan(&virt));
-        assert!(is_unreliable_orphan(&virt_inline));
-        assert!(is_unreliable_orphan(&synth));
-        assert!(!is_unreliable_orphan(&decoy));
+        // High-tier rules.
+        assert!(!is_unreliable_orphan(&plain, ReliabilityMode::High, &g));
+        assert!(is_unreliable_orphan(&virt, ReliabilityMode::High, &g));
+        assert!(is_unreliable_orphan(
+            &virt_inline,
+            ReliabilityMode::High,
+            &g
+        ));
+        assert!(is_unreliable_orphan(&synth, ReliabilityMode::High, &g));
+        assert!(!is_unreliable_orphan(&decoy, ReliabilityMode::High, &g));
+        // Template marker does NOT fire at `High` — only at `VeryHigh`.
+        assert!(!is_unreliable_orphan(&tmpl, ReliabilityMode::High, &g));
+
+        // VeryHigh-tier rules. High-tier rules still apply (cumulative).
+        assert!(!is_unreliable_orphan(&plain, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(&virt, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(&synth, ReliabilityMode::VeryHigh, &g));
+        assert!(!is_unreliable_orphan(&decoy, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(&tmpl, ReliabilityMode::VeryHigh, &g));
     }
 
     #[test]
@@ -2531,6 +2774,146 @@ mod tests {
         let r = get_class_hierarchy(&g, "Mid", Some(1), Some(999_999));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["max_nodes"], serde_json::json!(1000));
+    }
+
+    /// Symbol-id round-trip: passing the fully-qualified
+    /// `file:Class` as `class` walks the inheritance graph as if the
+    /// caller had named the class. The disambiguation completion path:
+    /// `find_class_candidates` returns symbol_ids in this shape, so
+    /// `get_class_hierarchy` must accept the same string verbatim.
+    #[test]
+    fn class_hierarchy_accepts_symbol_id() {
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "/cls.cpp:Base", Some(1), None);
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "symbol_id input must walk the hierarchy: {r:?}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let derived: Vec<&str> = parsed["hierarchy"]["derived"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        // Mid derives from Base in the fixture.
+        assert!(derived.contains(&"Mid"));
+    }
+
+    /// Symbol-id bypasses the ambiguity gate: when two classes share
+    /// a bare name across files, passing the full `file:Class`
+    /// symbol_id must succeed and walk that specific class's
+    /// hierarchy. The bare-name lookup would have errored with the
+    /// ambiguity message.
+    #[test]
+    fn class_hierarchy_symbol_id_bypasses_ambiguity_gate() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/lib_a/object.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("SharedName", SymbolKind::Class, "/lib_a/object.h")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/lib_b/object.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("SharedName", SymbolKind::Class, "/lib_b/object.h")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        // Bare-name still errors as ambiguous.
+        let bare = get_class_hierarchy(&g, "SharedName", Some(1), None);
+        assert_eq!(bare.is_error, Some(true));
+
+        // Fully-qualified symbol_id walks successfully.
+        let r = get_class_hierarchy(&g, "/lib_a/object.h:SharedName", Some(1), None);
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "symbol_id input must bypass the ambiguity gate: {r:?}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["hierarchy"]["name"], serde_json::json!("SharedName"));
+    }
+
+    /// A symbol_id that resolves to a non-class kind (e.g. a free
+    /// function) errors with a kind-specific message rather than the
+    /// generic "class not found" — so the caller can distinguish
+    /// "wrong id" from "wrong kind". Pinned wording: contains the
+    /// symbol_id quoted, the lowercase kind, and a pointer to the
+    /// class-like requirement.
+    #[test]
+    fn class_hierarchy_symbol_id_non_class_kind_errors_clearly() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Helper", SymbolKind::Function, "/x.cpp")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = get_class_hierarchy(&g, "/x.cpp:Helper", Some(1), None);
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(body.contains("\"/x.cpp:Helper\""), "names id: {body}");
+        assert!(body.contains("function"), "names the kind: {body}");
+        assert!(
+            body.contains("class-like"),
+            "states the requirement: {body}"
+        );
+    }
+
+    /// A symbol_id that doesn't resolve to any indexed node falls
+    /// through to the bare-name path. With nothing matching the bare
+    /// name either, the standard "class not found" error fires —
+    /// proving the symbol-id branch doesn't break the existing
+    /// not-found surface for unknown inputs.
+    #[test]
+    fn class_hierarchy_unknown_symbol_id_falls_through_to_not_found() {
+        let g = locked(class_graph());
+        let r = get_class_hierarchy(&g, "/does/not/exist.cpp:Foo", Some(1), None);
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(
+            body.starts_with("class not found:"),
+            "must surface the not-found error: {body}"
+        );
+    }
+
+    /// Anti-regression: the ambiguity error wording recommends
+    /// re-running `get_class_hierarchy` (the symbol-id branch is now
+    /// available), not routing away to `get_symbol_detail`. The
+    /// candidates' symbol_ids are listed so the agent can pick one
+    /// without an extra tool call.
+    #[test]
+    fn class_hierarchy_ambiguity_error_routes_back_to_this_tool() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Foo", SymbolKind::Class, "/a.h")],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/b.h".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("Foo", SymbolKind::Class, "/b.h")],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = get_class_hierarchy(&g, "Foo", Some(1), None);
+        assert_eq!(r.is_error, Some(true));
+        let body = body_text(&r);
+        assert!(body.contains("ambiguous"));
+        // The error must point the caller back to this tool, not away
+        // to `get_symbol_detail`.
+        assert!(
+            body.contains("Re-run get_class_hierarchy"),
+            "must route back to get_class_hierarchy: {body}"
+        );
+        assert!(
+            !body.contains("get_symbol_detail"),
+            "must NOT route to get_symbol_detail anymore: {body}"
+        );
     }
 
     #[test]

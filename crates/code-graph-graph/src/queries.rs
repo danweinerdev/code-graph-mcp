@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
-use code_graph_core::{symbol_id, Language, Symbol, SymbolKind};
+use code_graph_core::{symbol_id, EdgeKind, Language, Symbol, SymbolKind};
 use regex::Regex;
 
 use crate::Graph;
@@ -173,6 +173,33 @@ impl Graph {
     /// suggestion via [`Graph::search_symbols`].
     pub fn symbol_detail(&self, id: &str) -> Option<Symbol> {
         self.nodes.get(id).map(|n| n.symbol.clone())
+    }
+
+    /// Whether `id` has at least one incoming `EdgeKind::Calls` edge
+    /// in the reverse adjacency, regardless of confidence
+    /// (`Resolved` or `Heuristic`).
+    ///
+    /// The standard caller-query path filters by
+    /// `Confidence::Resolved` when the caller passes
+    /// `min_confidence="resolved"` and drops un-resolvable edges via
+    /// `is_resolved_node` at BFS time. This method does NEITHER —
+    /// every `Calls` entry stored in `radj[id]` counts, including
+    /// edges with `Confidence::Heuristic` and edges whose `target` is
+    /// a bare token that never resolved to a project symbol.
+    ///
+    /// Used by `get_orphans(reliability="very_high")` to drop
+    /// candidates that LOOK orphaned under the resolved-only filter
+    /// but in fact have at least one (possibly heuristic or
+    /// unresolved-source) caller in the graph. The intent is "any
+    /// signal of usage trumps the orphan classification" — pairs with
+    /// the template-marker filter to cut the orphan list down from
+    /// "almost everything is a false positive" to "candidates worth
+    /// reviewing".
+    pub fn has_any_incoming_call_edge(&self, id: &str) -> bool {
+        self.radj
+            .get(id)
+            .map(|entries| entries.iter().any(|e| e.kind == EdgeKind::Calls))
+            .unwrap_or(false)
     }
 
     /// Filtered, paginated symbol search.

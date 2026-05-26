@@ -133,6 +133,30 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
         serde_json::json!("completed"),
         "expected Completed terminal; got: {terminal}"
     );
+
+    // `current_phase` must be present (explicit `null` or a phase
+    // string — never absent). On a completed terminal the worker has
+    // walked all four phases; the last set value is `persisting`. The
+    // assertion accepts any indexing phase name to stay robust against
+    // future re-ordering, but rejects `null` and absent values — a
+    // completed job MUST have moved through at least one set_phase.
+    assert!(
+        terminal
+            .as_object()
+            .map(|o| o.contains_key("current_phase"))
+            .unwrap_or(false),
+        "terminal AnalyzeJobView must carry a current_phase key (possibly null); got: {terminal}"
+    );
+    let phase = terminal["current_phase"].as_str().expect(
+        "completed job must have observed at least one set_phase; current_phase must be a string",
+    );
+    assert!(
+        matches!(
+            phase,
+            "discovering" | "parsing" | "resolving" | "persisting"
+        ),
+        "current_phase must be one of the indexing phases; got {phase:?}"
+    );
     assert_eq!(
         terminal["job_id"].as_str(),
         Some(job_id.as_str()),

@@ -546,8 +546,15 @@ pub struct GetOrphansArgs {
         description = "Reliability filter: 'all' (default) returns every orphan including known \
                        false-positive classes; 'high' drops virtual methods (often reached via \
                        dynamic dispatch the resolver doesn't track) and macro-synthesized \
-                       symbols (the macro IS the call site by construction). 'high' typically \
-                       cuts the orphan count by ~half on engine-style codebases. \
+                       symbols (the macro IS the call site by construction); 'very_high' \
+                       additionally drops templated definitions (C++ functions/methods nested \
+                       under a `template_declaration` ancestor, including methods of a templated \
+                       class — the symbol carries a `/* template */` signature prefix) and any \
+                       symbol with at least one incoming Calls edge of any confidence (catches \
+                       candidates whose only callers are heuristic-resolution or bare-token \
+                       unresolved-source edges). 'high' typically cuts the orphan count by \
+                       ~half on engine-style codebases; 'very_high' commonly cuts by 80-95%. \
+                       Use 'very_high' for dead-code investigations on UE-scale codebases. \
                        Invalid values are rejected with a tool error."
     )]
     #[serde(default)]
@@ -801,9 +808,15 @@ impl CodeGraphServer {
                        (did-you-mean field):** included in the response ONLY when (a) \
                        `query` is anchored as `^…$` with length ≥ 2 (and the inner \
                        pattern is non-empty), AND (b) `total == 0` (no matches under \
-                       the anchored query). Holds up to 5 candidate symbol-id strings \
-                       drawn from a broad substring match on the anchors-stripped \
-                       inner pattern. **Absent from the wire entirely when empty** (no \
+                       the anchored query). Holds up to 5 candidate symbol-id strings. \
+                       When the inner pattern is a plain identifier (no regex \
+                       metacharacters), candidates are sorted by ascending Levenshtein \
+                       distance to the inner pattern (length-adaptive threshold: 1 edit \
+                       at length 2-11, 2 at 12-17, 3 at 18+), then by length-closeness \
+                       and name; falls back to a broad substring match when no symbols \
+                       are within the edit-distance threshold. When the inner pattern \
+                       contains regex metacharacters, candidates come from the broad \
+                       substring match alone. **Absent from the wire entirely when empty** (no \
                        `\"suggestions\": []` key — serialization skips empty lists), \
                        so a present `suggestions` field is itself a signal that the \
                        anchored query missed. **Never emitted on `count_only=true`** \
@@ -1493,7 +1506,15 @@ impl CodeGraphServer {
                        \
                        When an analyze is in flight or recently terminated, `analyze_job` carries \
                        `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
-                       progress_message, error?, result? }`. Poll this tool while `analyze_job.status == \
+                       progress_message, error?, result?, current_phase }`. \
+                       `current_phase` names the indexing phase the worker is currently in: \
+                       `\"discovering\"` (file-walk), `\"parsing\"` (per-file tree-sitter parse + \
+                       extract — the dominant phase), `\"resolving\"` (cross-file edge resolution), \
+                       `\"persisting\"` (cache write). It is independent of `status` and stays as a \
+                       historical value on terminal jobs (the phase that was active when the worker \
+                       reached terminal); for terminal liveness use `status` not `current_phase`. \
+                       Emits explicit `null` until the worker enters its first phase. \
+                       Poll this tool while `analyze_job.status == \
                        \"running\"` (a 250-1000ms cadence is reasonable — poll locks are constant-time); \
                        read `analyze_job.result` once `status` flips to `\"completed\"` (shape: \
                        `{ files, symbols, edges, root_path, warnings }`, byte-identical to \

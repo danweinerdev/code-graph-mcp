@@ -22,7 +22,7 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 
-use crate::analyze_job::{AnalyzeJob, JobStatus};
+use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
 use crate::handlers::analyze::AnalyzeResult;
 use crate::server::ServerInner;
 
@@ -150,6 +150,17 @@ pub struct AnalyzeJobView {
     /// "completed"`. Byte-identical shape to `analyze_codebase`'s
     /// success body.
     pub result: Option<AnalyzeResult>,
+    /// Active indexing phase: `"discovering"` | `"parsing"` |
+    /// `"resolving"` | `"persisting"`. Independent of `status` —
+    /// `status` tags the Running/Completed/Failed state machine while
+    /// this field names which of the indexing phases the worker was
+    /// last working in. `None` until the worker enters its first phase
+    /// (typically a sub-second window after kickoff). On terminal
+    /// jobs, holds whatever phase was active when the worker reached
+    /// `finish_completed` / `finish_failed`, treated as historical.
+    /// Serializes as an explicit `null` when `None` so clients can
+    /// distinguish "no phase yet" from "missing field on an old server".
+    pub current_phase: Option<AnalyzePhase>,
 }
 
 impl AnalyzeJobView {
@@ -178,6 +189,7 @@ impl AnalyzeJobView {
             progress_message: state.progress_message.clone(),
             error,
             result,
+            current_phase: state.current_phase,
         }
     }
 }
@@ -338,6 +350,92 @@ mod tests {
         // The release_build field must be a bool — value depends on
         // how the test was compiled, so we only check the type.
         assert!(parsed["release_build"].as_bool().is_some());
+    }
+
+    /// `AnalyzeJobView::from_job` projects `current_phase` from the
+    /// job's mutable state. A freshly-constructed `AnalyzeJob` has
+    /// `current_phase: None`; calling `set_phase` swaps it in. Both
+    /// states must survive projection (`None` -> `null` on the wire,
+    /// `Some(phase)` -> the snake_case phase string).
+    #[test]
+    fn analyze_job_view_propagates_current_phase() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let view = AnalyzeJobView::from_job(&job);
+        // No phase set yet → `None` (serializes as explicit `null`).
+        assert!(
+            view.current_phase.is_none(),
+            "fresh job has no phase: {view:?}"
+        );
+        let s = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            s["current_phase"],
+            serde_json::Value::Null,
+            "absent phase serializes as null"
+        );
+
+        // After set_phase, the view picks up the new value AND the
+        // counter reset.
+        {
+            let mut st = job.state.write();
+            st.progress = 42;
+            st.progress_total = 100;
+        }
+        job.set_phase(AnalyzePhase::Resolving);
+        let view = AnalyzeJobView::from_job(&job);
+        assert_eq!(view.current_phase, Some(AnalyzePhase::Resolving));
+        assert_eq!(view.progress, 0, "set_phase resets progress");
+        assert_eq!(view.progress_total, 0, "set_phase resets progress_total");
+        let s = serde_json::to_value(&view).unwrap();
+        assert_eq!(s["current_phase"], serde_json::json!("resolving"));
+    }
+
+    /// `AnalyzePhase`'s wire spelling is snake_case for every variant.
+    /// Pinned so future variants pick up the correct serialization
+    /// rule without re-deriving the test from the JSON each time.
+    #[test]
+    fn analyze_phase_serializes_as_snake_case() {
+        use crate::analyze_job::AnalyzePhase;
+        let cases = [
+            (AnalyzePhase::Discovering, "discovering"),
+            (AnalyzePhase::Parsing, "parsing"),
+            (AnalyzePhase::Resolving, "resolving"),
+            (AnalyzePhase::Persisting, "persisting"),
+        ];
+        for (variant, expected) in cases {
+            let s = serde_json::to_value(variant).unwrap();
+            assert_eq!(
+                s,
+                serde_json::Value::String(expected.to_string()),
+                "variant {variant:?} must serialize as {expected:?}"
+            );
+        }
+    }
+
+    /// A `Failed` job carries the failure phase that was last set
+    /// before the worker called `finish_failed` — the historical
+    /// phase value is preserved on terminal. Constructed manually
+    /// (not via the worker) so the test stays unit-level.
+    #[test]
+    fn analyze_job_view_retains_phase_on_failed_terminal() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(AnalyzePhase::Parsing);
+        {
+            let mut s = job.state.write();
+            s.status = JobStatus::Failed("simulated failure".to_string());
+            s.finished_at = Some(123);
+        }
+        let view = AnalyzeJobView::from_job(&job);
+        assert_eq!(view.status, "failed");
+        assert_eq!(
+            view.current_phase,
+            Some(AnalyzePhase::Parsing),
+            "failed terminal must retain the last in-flight phase as historical"
+        );
+        assert_eq!(view.error.as_deref(), Some("simulated failure"));
     }
 
     #[test]

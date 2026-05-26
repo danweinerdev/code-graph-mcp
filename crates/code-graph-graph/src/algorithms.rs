@@ -173,6 +173,55 @@ impl Graph {
     /// was charged on first visit). See the
     /// `class_hierarchy_diamond_4_level_fixture` and
     /// `class_hierarchy_diamond_counts_unique_names` tests.
+    /// Walk inheritance from a specific symbol identified by its
+    /// fully-qualified `symbol_id` (e.g. `"D:\\path\\Object.h:UObject"`).
+    /// Unlike [`Self::class_hierarchy`] which resolves a bare class name
+    /// and the handler layer rejects with an ambiguity error when more
+    /// than one class shares it, this entry point starts from exactly
+    /// one node — the caller has already disambiguated.
+    ///
+    /// **Precision contract.** The recursive walker is the same bare-name
+    /// walker used by `class_hierarchy`. The starting `symbol_id` resolves
+    /// the ROOT identity unambiguously, so the immediate `{bases, derived}`
+    /// at depth 1 reflect edges scoped to the starting symbol's file (the
+    /// edge-emission file is the source class's file for the bases side;
+    /// the radj side at level 1 still includes all derived edges whose
+    /// targets match the bare class name because `Inherits` edges carry
+    /// bare-name targets at the data layer — no symbol_id at the edge
+    /// level means deep disambiguation is not currently possible). Beyond
+    /// level 1 the walk follows bare-name resolution, so two same-bare-
+    /// name siblings in the indexed project may merge their subtrees as
+    /// they would under `class_hierarchy`. Clients requiring per-file
+    /// fidelity beyond depth 1 must call `find_class_candidates` +
+    /// `get_symbol_detail` per candidate.
+    ///
+    /// Returns `None` when the symbol_id doesn't resolve to a node, OR
+    /// when the resolved symbol is not class-like (`Class` / `Struct`
+    /// / `Interface` / `Trait`). The handler renders this as a tool error
+    /// with kind-specific wording so callers can tell "wrong id" apart
+    /// from "wrong kind" apart from "empty inheritance graph".
+    pub fn class_hierarchy_for_symbol(
+        &self,
+        symbol_id: &str,
+        depth: u32,
+        max_nodes: u32,
+    ) -> Option<(HierarchyNode, u32, bool)> {
+        let node = self.nodes.get(symbol_id)?;
+        if !matches!(
+            node.symbol.kind,
+            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
+        ) {
+            return None;
+        }
+        // Delegate to the bare-name walker. The starting `symbol_id`
+        // unambiguously identifies the root; the walker's bare-name
+        // lookup against `adj`/`radj` is identical to what
+        // `class_hierarchy(name, …)` would do once the handler-layer
+        // ambiguity gate is bypassed. The precision limit beyond depth 1
+        // is documented above.
+        self.class_hierarchy(&node.symbol.name, depth, max_nodes)
+    }
+
     pub fn class_hierarchy(
         &self,
         name: &str,

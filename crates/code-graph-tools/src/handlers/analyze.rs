@@ -27,7 +27,7 @@ use rmcp::service::RoleServer;
 use rmcp::Peer;
 use serde::Serialize;
 
-use crate::analyze_job::{AnalyzeJob, JobStatus};
+use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
 use crate::indexer::{
     build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
     resolve_edges_with_indexes, ChannelProgressSink, ProgressEvent, ProgressSink,
@@ -361,7 +361,22 @@ pub(crate) async fn run_analyze_job(
             "[code-graph] phase: discovering + parsing under {}",
             abs_path_for_pool.display()
         );
+        sink.job.set_phase(AnalyzePhase::Discovering);
         let phase_start = std::time::Instant::now();
+        // `index_directory` starts with a file-walk (Discovering) and
+        // then runs the rayon parse pool (Parsing). The first
+        // `ProgressSink::report` from the parse loop will overwrite
+        // progress/total/message with a Parsing snapshot; the only
+        // observable Discovering window is between this `set_phase` and
+        // the first parse report. We flip to Parsing right before
+        // entering `index_directory` so the dominant in-flight phase
+        // for polling clients is `parsing`, with `discovering` reserved
+        // for the briefly observable file-walk if the parse pool hasn't
+        // reported yet on a fast project. Doing both here keeps the
+        // worker code linear at the cost of overlapping the two flags;
+        // clients should treat both as "indexing in flight, dominant
+        // cost will be Parsing".
+        sink.job.set_phase(AnalyzePhase::Parsing);
         let (mut fresh_graphs, parse_warnings) =
             match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
                 Ok(v) => v,
@@ -375,6 +390,7 @@ pub(crate) async fn run_analyze_job(
         );
 
         eprintln!("[code-graph] phase: resolving edges");
+        sink.job.set_phase(AnalyzePhase::Resolving);
         let phase_start = std::time::Instant::now();
         let cached_snapshot = merged_graph.file_graphs_snapshot();
         let mut symbol_index = build_symbol_index(&cached_snapshot);
@@ -490,6 +506,7 @@ pub(crate) async fn run_analyze_job(
         "[code-graph] phase: saving cache to {}",
         project_root.display()
     );
+    job.set_phase(AnalyzePhase::Persisting);
     let save_start = std::time::Instant::now();
     if let Err(e) = save_cache(&inner.graph, &project_root) {
         warnings.push(format!("cache save failed: {e}"));

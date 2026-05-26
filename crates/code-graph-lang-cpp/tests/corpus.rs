@@ -165,6 +165,69 @@ fn template_call() {
     );
 }
 
+/// A free function defined directly inside a `template_declaration`
+/// gets the `/* template */ ` signature prefix used by
+/// `get_orphans(reliability="very_high")` to drop template-instantiated
+/// definitions from the orphan list.
+#[test]
+fn template_function_signature_is_marked() {
+    let src = "template <typename T> T identity(T x) { return x; }";
+    let fg = parse(src);
+    let s = find_symbol(&fg, "identity").expect("expected symbol 'identity'");
+    assert!(
+        s.signature.starts_with("/* template */ "),
+        "expected `/* template */` prefix on templated function signature; got: {:?}",
+        s.signature
+    );
+}
+
+/// A method of a templated CLASS inherits the marker — the class body
+/// sits under the `template_declaration` ancestor, so every method
+/// defined inside the class picks up the prefix. The class symbol
+/// itself also carries the marker (the class definition node is a
+/// child of the template_declaration).
+#[test]
+fn templated_class_method_signature_is_marked() {
+    let src = r#"
+template <typename T>
+class TFoo {
+public:
+    void Bar() {}
+};
+"#;
+    let fg = parse(src);
+    let bar = find_symbol(&fg, "Bar").expect("expected method 'Bar'");
+    assert!(
+        bar.signature.starts_with("/* template */ "),
+        "expected method of templated class to carry `/* template */` prefix; got: {:?}",
+        bar.signature
+    );
+    // Class also carries the prefix because the `class_specifier`
+    // sits inside the same template_declaration ancestor.
+    let foo = find_symbol(&fg, "TFoo").expect("expected class 'TFoo'");
+    assert!(
+        foo.signature.starts_with("/* template */ "),
+        "expected templated class itself to carry `/* template */` prefix; got: {:?}",
+        foo.signature
+    );
+}
+
+/// A non-templated function in the same file does NOT carry the
+/// marker — the prefix MUST be load-bearing for the orphan filter
+/// (every non-template definition would otherwise get falsely
+/// filtered out at `very_high`).
+#[test]
+fn non_template_function_signature_is_unmarked() {
+    let src = "void plain() {}";
+    let fg = parse(src);
+    let s = find_symbol(&fg, "plain").expect("expected symbol 'plain'");
+    assert!(
+        !s.signature.starts_with("/* template */"),
+        "non-template function must not carry the template prefix; got: {:?}",
+        s.signature
+    );
+}
+
 /// Mirrors Go `TestCppCastsFiltered`. All four cast keywords parse as
 /// `call_expression` in tree-sitter-cpp; the cast filter must drop them.
 #[test]

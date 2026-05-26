@@ -61,12 +61,18 @@ use std::path::{Path, PathBuf};
 ///   incompatible (`ArchivedHashMap` ≠ `ArchivedBTreeMap`), so pre-v9
 ///   caches fail bytecheck and route to silent re-index via the
 ///   existing version-check path.
+/// - v10: C++ extractor now prefixes templated definitions with the
+///   `/* template */ ` sentinel in `Symbol.signature`. Pre-v10 caches
+///   carry the un-prefixed signature, so any orphan query running with
+///   `reliability="very_high"` would under-filter against a stale
+///   cache. Bumping invalidates pre-v10 caches and forces a silent
+///   re-index on next analyze.
 ///
 /// This constant is the single source of truth for the on-disk
 /// version. `super::CACHE_VERSION` is a re-export at the module
 /// boundary so the rest of the crate's call sites don't have to know
 /// which sub-module owns it.
-pub const CACHE_VERSION: u32 = 9;
+pub const CACHE_VERSION: u32 = 10;
 
 /// 4-byte native-endian probe at file offset 0. A reader whose host
 /// endianness disagrees with the writer's reads a different `u32`
