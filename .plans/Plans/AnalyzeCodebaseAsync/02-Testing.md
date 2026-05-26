@@ -3,14 +3,14 @@ title: "Testing"
 type: phase
 plan: AnalyzeCodebaseAsync
 phase: 2
-status: planned
+status: in-progress
 created: 2026-05-23
-updated: 2026-05-23
+updated: 2026-05-25
 deliverable: "Race-tight unit coverage for the slot protocol (concurrent kickoffs, sync+async exclusion, rotation, terminal preservation, failure paths), a deterministic progress-reporting test, an end-to-end integration test for the agent's full kickoff→poll→query flow, rebaselined `get_status` snapshots, and a clean `make lint` / `make snapshot-clean` / full-workspace test pass. After this phase, the feature is shippable."
 tasks:
   - id: "2.1"
     title: "Lifecycle + shape unit tests"
-    status: planned
+    status: complete
     verification: "Five tests added to `crates/code-graph-tools/src/handlers/analyze.rs` test module: (a) `async_kickoff_returns_immediately_with_running_job` — call returns in < 100ms on a small dir; response carries `status: \"running\"`, `existing: false`, a non-empty `job_id`. (b) `async_kickoff_then_poll_completes` — kickoff async, loop on `get_status` with 50ms `tokio::time::sleep` cadence (bounded to 5s total to catch hangs), assert eventual `status: \"completed\"` with `result.files == expected`. (c) `sync_analyze_populates_slot_with_completed` — after sync `analyze_codebase` returns, assert `inner.analyze_slot.read().current.as_ref().unwrap().state.read()` has `JobStatus::Completed(_)` with matching counts. (d) `get_status_with_no_analyze_returns_null_job_fields` — fresh server, `analyze_job` and `analyze_job_previous_terminal` both serialize as `null`. (e) `get_status_completed_carries_full_analyze_result` — kickoff, poll to Completed, assert `analyze_job.result` has `files`, `symbols`, `edges`, `root_path`, `warnings`. All five tests use small synthetic fixtures (1–3 files); none take > 1s wall time. `cargo test -p code-graph-tools --lib handlers::analyze` shows the 9 existing + 5 new tests passing."
     depends_on: []
   - id: "2.2"
@@ -45,12 +45,12 @@ Race-tight unit coverage for the slot protocol, deterministic progress test via 
 ## 2.1: Lifecycle + shape unit tests
 
 ### Subtasks
-- [ ] `async_kickoff_returns_immediately_with_running_job` — measure handler return time with `std::time::Instant::now()` before/after the call; assert elapsed < 100ms. Fixture: tempdir with 1 `.cpp` file. Assert response JSON has `status == "running"`, `existing == false`, `job_id.is_empty() == false`.
-- [ ] `async_kickoff_then_poll_completes` — kickoff, then in a `loop { tokio::time::sleep(50ms); read get_status; break on terminal; bail after 5s }` pattern. Assert eventual `status == "completed"`, `result.files == 1`.
-- [ ] `sync_analyze_populates_slot_with_completed` — call sync handler, after await read `inner.analyze_slot.read().current.as_ref().unwrap().state.read().status`, match for `JobStatus::Completed(result)`, assert `result.files == 1`.
-- [ ] `get_status_with_no_analyze_returns_null_job_fields` — fresh server (no analyze ever), call `get_status`, parse the JSON, assert both `analyze_job` and `analyze_job_previous_terminal` deserialize as JSON null.
-- [ ] `get_status_completed_carries_full_analyze_result` — kickoff async, poll to Completed, read `get_status`, assert `analyze_job.result` deserializes into the same `AnalyzeResult` shape that sync `analyze_codebase` returns (compare against a parallel sync run on the same fixture).
-- [ ] Run `cargo test -p code-graph-tools --lib handlers::analyze`. Expected: 14 tests pass (9 existing + 5 new).
+- [x] `async_kickoff_returns_immediately_with_running_job` — measure handler return time with `std::time::Instant::now()` before/after the call; assert elapsed < 100ms. Fixture: tempdir with 1 `.cpp` file. Assert response JSON has `status == "running"`, `existing == false`, `job_id.is_empty() == false`.
+- [x] `async_kickoff_then_poll_completes` — kickoff, then in a `loop { tokio::time::sleep(50ms); read get_status; break on terminal; bail after 5s }` pattern. Assert eventual `status == "completed"`, `result.files == 1`.
+- [x] `sync_analyze_populates_slot_with_completed` — call sync handler, after await read `inner.analyze_slot.read().current.as_ref().unwrap().state.read().status`, match for `JobStatus::Completed(result)`, assert `result.files == 1`.
+- [x] `get_status_with_no_analyze_returns_null_job_fields` — fresh server (no analyze ever), call `get_status`, parse the JSON, assert both `analyze_job` and `analyze_job_previous_terminal` deserialize as JSON null.
+- [x] `get_status_completed_carries_full_analyze_result` — kickoff async, poll to Completed, read `get_status`, assert `analyze_job.result` deserializes into the same `AnalyzeResult` shape that sync `analyze_codebase` returns (compare against a parallel sync run on the same fixture).
+- [x] Run `cargo test -p code-graph-tools --lib handlers::analyze`. Expected: 14 tests pass (9 existing + 5 new).
 
 ### Notes
 The 5-second poll bound on test (b) is a hang-catcher, not a real budget — a small 1-file fixture indexes in milliseconds. If the test ever hits the 5s bound, something is wrong (worker hung, slot not transitioning, atomic not flushed).

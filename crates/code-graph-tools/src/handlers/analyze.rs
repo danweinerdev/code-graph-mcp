@@ -726,6 +726,8 @@ fn save_cache(
 
 #[cfg(test)]
 mod tests {
+    use super::super::status::get_status;
+    use super::super::test_helpers::body_text;
     use super::*;
     use crate::server::CodeGraphServer;
     use code_graph_lang::LanguageRegistry;
@@ -738,6 +740,16 @@ mod tests {
         reg.register(Box::new(CppParser::new().expect("CppParser::new")))
             .unwrap();
         CodeGraphServer::new(reg)
+    }
+
+    /// Write a single trivial `.cpp` file into a fresh tempdir. Shared by
+    /// the lifecycle/shape tests below — the slot protocol's behavior is
+    /// orthogonal to corpus shape, so a one-file fixture is the smallest
+    /// thing that exercises end-to-end indexing in under a millisecond.
+    fn tempdir_with_one_cpp() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.cpp"), b"void f() {}\n").unwrap();
+        dir
     }
 
     #[tokio::test]
@@ -974,5 +986,234 @@ mod tests {
             body.starts_with("failed to parse .code-graph.toml:"),
             "got: {body}"
         );
+    }
+
+    /// (Task 2.1 / a) Async kickoff returns in the kickoff window — not
+    /// blocking on the indexing pipeline. The 100ms ceiling is a generous
+    /// budget on the kickoff path (slot write + tokio::spawn); a regression
+    /// that turns kickoff into a synchronous-await would blow it.
+    #[tokio::test]
+    async fn async_kickoff_returns_immediately_with_running_job() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+
+        let start = std::time::Instant::now();
+        let r = analyze_codebase_async(
+            server.inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "kickoff took {elapsed:?}, expected < 100ms — kickoff should not block on indexing"
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "got: {r:?}"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["status"], serde_json::json!("running"));
+        assert_eq!(parsed["existing"], serde_json::json!(false));
+        assert!(
+            !parsed["job_id"].as_str().unwrap().is_empty(),
+            "job_id must be non-empty"
+        );
+    }
+
+    /// (Task 2.1 / b) After async kickoff, polling `get_status` eventually
+    /// observes a Completed terminal carrying the indexed `result.files`
+    /// count. The 5s poll bound is a hang catcher per the plan's note —
+    /// a 1-file fixture indexes in milliseconds; if we hit the bound,
+    /// something is wrong (worker hung, slot not transitioning).
+    #[tokio::test]
+    async fn async_kickoff_then_poll_completes() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+
+        let kickoff = analyze_codebase_async(
+            inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let kickoff_parsed: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+        let job_id = kickoff_parsed["job_id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let terminal: serde_json::Value = loop {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "async job {job_id} did not reach terminal within 5s — \
+                     worker hung, slot not transitioning, or progress state not flushed"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let status = get_status(inner.clone());
+            let parsed: serde_json::Value = serde_json::from_str(&body_text(&status)).unwrap();
+            let job = &parsed["analyze_job"];
+            let s = job["status"].as_str().unwrap_or("");
+            if s == "completed" || s == "failed" {
+                break job.clone();
+            }
+        };
+
+        assert_eq!(
+            terminal["status"],
+            serde_json::json!("completed"),
+            "expected Completed terminal; got: {terminal}"
+        );
+        assert_eq!(
+            terminal["result"]["files"],
+            serde_json::json!(1),
+            "result.files should be 1 for the 1-file fixture"
+        );
+    }
+
+    /// (Task 2.1 / c) The sync `analyze_codebase` handler installs a
+    /// `Completed(_)` slot entry before returning — the worker always
+    /// writes a terminal state, even on the inline-await path. Pinning
+    /// this is the contract that lets `get_status` snapshot sync runs
+    /// without ambiguity.
+    #[tokio::test]
+    async fn sync_analyze_populates_slot_with_completed() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+
+        let _ = analyze_codebase(
+            inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        let slot = inner.analyze_slot.read();
+        let current = slot
+            .current
+            .as_ref()
+            .expect("sync analyze must install a slot.current entry");
+        let state = current.state.read();
+        match &state.status {
+            JobStatus::Completed(result) => {
+                assert_eq!(
+                    result.files, 1,
+                    "Completed result.files should match the 1-file fixture"
+                );
+            }
+            JobStatus::Running => {
+                panic!("sync analyze returned with slot still Running — terminal write missed")
+            }
+            JobStatus::Failed(msg) => {
+                panic!("sync analyze ended Failed unexpectedly: {msg}")
+            }
+        }
+    }
+
+    /// (Task 2.1 / d) On a fresh server with no analyze ever invoked, the
+    /// two job fields serialize as explicit JSON `null` — NOT missing
+    /// keys. The explicit-null contract (Task 1.5) lets clients
+    /// distinguish "no analyze ever" from "old server without the field".
+    #[tokio::test]
+    async fn get_status_with_no_analyze_returns_null_job_fields() {
+        let server = server_with_cpp_parser();
+        let r = get_status(server.inner.clone());
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let obj = parsed
+            .as_object()
+            .expect("get_status returns a JSON object");
+
+        assert!(
+            obj.contains_key("analyze_job"),
+            "analyze_job key must be present even when null"
+        );
+        assert!(
+            obj.contains_key("analyze_job_previous_terminal"),
+            "analyze_job_previous_terminal key must be present even when null"
+        );
+        assert!(
+            obj["analyze_job"].is_null(),
+            "analyze_job should be JSON null on a fresh server"
+        );
+        assert!(
+            obj["analyze_job_previous_terminal"].is_null(),
+            "analyze_job_previous_terminal should be JSON null on a fresh server"
+        );
+    }
+
+    /// (Task 2.1 / e) `get_status` exposes the same `AnalyzeResult` shape
+    /// that sync `analyze_codebase` returns on its wire response. Cross-
+    /// checked by running a parallel sync analyze on a fresh server over
+    /// the same fixture and comparing `files` / `symbols` / `edges`.
+    #[tokio::test]
+    async fn get_status_completed_carries_full_analyze_result() {
+        let dir = tempdir_with_one_cpp();
+
+        // Server A — async kickoff + poll to Completed; read shape off get_status.
+        let server_a = server_with_cpp_parser();
+        let inner_a = server_a.inner.clone();
+        let kickoff = analyze_codebase_async(
+            inner_a.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let kickoff_parsed: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+        let job_id = kickoff_parsed["job_id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let job_view: serde_json::Value = loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("async job {job_id} did not reach terminal within 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let status = get_status(inner_a.clone());
+            let parsed: serde_json::Value = serde_json::from_str(&body_text(&status)).unwrap();
+            let job = &parsed["analyze_job"];
+            if job["status"].as_str() == Some("completed") {
+                break job.clone();
+            }
+            if job["status"].as_str() == Some("failed") {
+                panic!("async job ended Failed: {}", job["error"]);
+            }
+        };
+
+        // Server B — parallel sync analyze on the same fixture. Use a
+        // separate server so cache state from the first run can't leak
+        // into the second's counts.
+        let server_b = server_with_cpp_parser();
+        let sync_r = analyze_codebase(
+            server_b.inner.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+            None,
+            None,
+        )
+        .await;
+        let sync_parsed: serde_json::Value = serde_json::from_str(&body_text(&sync_r)).unwrap();
+
+        let async_result = &job_view["result"];
+        assert!(
+            async_result.is_object(),
+            "analyze_job.result must be populated on Completed; got: {job_view}"
+        );
+
+        // Cross-check: every numeric stat the sync wire response carries
+        // must match the get_status snapshot byte-for-byte. If these
+        // diverge, the two code paths are producing different AnalyzeResult
+        // values for identical input — a bug worth pinning.
+        assert_eq!(async_result["files"], sync_parsed["files"]);
+        assert_eq!(async_result["symbols"], sync_parsed["symbols"]);
+        assert_eq!(async_result["edges"], sync_parsed["edges"]);
+        assert_eq!(async_result["root_path"], sync_parsed["root_path"]);
+        // Sanity floor — the fixture has a function, so symbols can't be 0.
+        assert_eq!(async_result["files"], serde_json::json!(1));
+        assert!(async_result["symbols"].as_u64().unwrap() >= 1);
     }
 }
