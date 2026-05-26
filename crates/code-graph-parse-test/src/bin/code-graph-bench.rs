@@ -61,7 +61,9 @@ use code_graph_lang_java::JavaParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::discovery::discover;
-use code_graph_tools::indexer::{index_directory, resolve_all_edges, NoopProgressSink, ProgressSink};
+use code_graph_tools::indexer::{
+    index_directory, resolve_all_edges, NoopProgressSink, ProgressSink,
+};
 use serde::Serialize;
 
 // ============================================================================
@@ -1076,10 +1078,7 @@ fn write_truncated_path(out: &mut impl Write, path: &str, max: usize) {
     // Snap forward to the next path separator so the rendered segment starts
     // at a directory boundary. Fall back to a char-boundary-safe slice if no
     // separator follows (rare for absolute paths).
-    let mut start = path[cut..]
-        .find('/')
-        .map(|i| cut + i)
-        .unwrap_or(cut);
+    let mut start = path[cut..].find('/').map(|i| cut + i).unwrap_or(cut);
     while start < path.len() && !path.is_char_boundary(start) {
         start += 1;
     }

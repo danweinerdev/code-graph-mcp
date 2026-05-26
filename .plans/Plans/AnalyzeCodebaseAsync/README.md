@@ -1,9 +1,9 @@
 ---
 title: "Async analyze_codebase with Poll-Based Status"
 type: plan
-status: active
+status: complete
 created: 2026-05-23
-updated: 2026-05-24
+updated: 2026-05-26
 tags: [analyze, mcp, async, get_status, single-flight]
 related:
   - Designs/AnalyzeCodebaseAsync
@@ -12,11 +12,11 @@ related:
 phases:
   - id: 1
     title: "Implementation"
-    status: in-progress
+    status: complete
     doc: "01-Implementation.md"
   - id: 2
     title: "Testing"
-    status: planned
+    status: complete
     doc: "02-Testing.md"
     depends_on: [1]
 ---

@@ -301,9 +301,9 @@ pub(crate) async fn run_analyze_job(
             }
         }))
     } else {
-        Some(tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        }))
+        Some(tokio::spawn(
+            async move { while rx.recv().await.is_some() {} },
+        ))
     };
 
     let registry = Arc::clone(&inner);

@@ -3,7 +3,7 @@ title: "Testing"
 type: phase
 plan: AnalyzeCodebaseAsync
 phase: 2
-status: in-progress
+status: complete
 created: 2026-05-23
 updated: 2026-05-26
 deliverable: "Race-tight unit coverage for the slot protocol (concurrent kickoffs, sync+async exclusion, rotation, terminal preservation, failure paths), a deterministic progress-reporting test, an end-to-end integration test for the agent's full kickoff→poll→query flow, rebaselined `get_status` snapshots, and a clean `make lint` / `make snapshot-clean` / full-workspace test pass. After this phase, the feature is shippable."
@@ -30,7 +30,7 @@ tasks:
     depends_on: ["2.1", "2.2", "2.3"]
   - id: "2.5"
     title: "Structural verification + full-workspace pass"
-    status: planned
+    status: complete
     verification: "(a) `make lint` (= `cargo clippy --workspace --all-targets -- -D warnings`) clean. (b) `make fmt-check` (= `cargo fmt --all --check`) clean. (c) `make test` (= `cargo test --workspace`) green — all 9 + 14 = 23 analyze handler tests pass, plus all existing workspace tests, plus the new integration test. (d) `make snapshot-clean` passes. (e) Per `shared/languages/rust.md`: no new `unsafe` was introduced (the design forbids it; verify by grepping `crates/code-graph-tools/src/analyze_job.rs` and the modified handlers for `unsafe`). `miri` is therefore not required. (f) Manual smoke: build release binary (`make build`), point at a real codebase (e.g., `external/ripgrep` if initialized), kickoff async via raw stdio MCP request, poll, observe completion. Capture the binary's stderr to confirm the per-phase eprintln logs still print verbatim during async runs."
     depends_on: ["2.4"]
 tags: [analyze, mcp, async, get_status, single-flight]
@@ -100,22 +100,22 @@ If the project has a `tests/wire_format_snapshot.rs` or similar that snapshots a
 ## 2.5: Structural verification + full-workspace pass
 
 ### Subtasks
-- [ ] `make lint` (= `cargo clippy --workspace --all-targets -- -D warnings`) — must be clean. Fix any clippy lints introduced by the new code.
-- [ ] `make fmt-check` (= `cargo fmt --all --check`) — must be clean. Run `make fmt` (= `cargo fmt --all`) and commit if anything formats.
-- [ ] `make test` (= `cargo test --workspace`) — all tests pass: 9 + 5 + 4 + 5 = 23 analyze-handler unit tests + 1 integration test + all existing workspace tests.
-- [ ] `make snapshot-clean` — no orphan `*.snap.new`.
-- [ ] Grep verification: `grep -rn 'unsafe' crates/code-graph-tools/src/analyze_job.rs crates/code-graph-tools/src/handlers/analyze.rs crates/code-graph-tools/src/handlers/status.rs` — zero matches. Per `shared/languages/rust.md`, miri is required only for new `unsafe`; we have none, so miri is N/A.
-- [ ] Build release: `make build` (= `cargo build --release -p code-graph-mcp`) — clean.
-- [ ] Manual smoke test: launch the release binary against a real codebase (use an `external/` submodule if initialized; otherwise the repo itself). Via raw stdio MCP requests (a one-liner with `jq` or a small Python script): (a) send `tools/call analyze_codebase_async` with `path=...` — verify response arrives in < 1s; (b) send `tools/call get_status` — verify `analyze_job.status == "running"` and `progress > 0` after a few seconds; (c) loop until `status == "completed"`; (d) send `tools/call get_file_symbols` for one of the indexed files — verify a real symbol list comes back; (e) verify the binary's stderr shows the per-phase eprintln logs (cache load, discover+parse, resolve, merge, save) — those are operator-visibility load-bearing.
+- [x] `make lint` (= `cargo clippy --workspace --all-targets -- -D warnings`) — must be clean. Fix any clippy lints introduced by the new code.
+- [x] `make fmt-check` (= `cargo fmt --all --check`) — must be clean. Run `make fmt` (= `cargo fmt --all`) and commit if anything formats. (Three carried drifts resolved in this task: `crates/code-graph-parse-test/src/bin/code-graph-bench.rs:61` and `:1076`, plus `crates/code-graph-tools/src/handlers/analyze.rs:~301`.)
+- [x] `make test` (= `cargo test --workspace`) — all tests pass: 9 + 5 + 4 + 5 = 23 analyze-handler unit tests + 1 integration test + all existing workspace tests.
+- [x] `make snapshot-clean` — no orphan `*.snap.new`.
+- [x] Grep verification: `grep -rn 'unsafe' crates/code-graph-tools/src/analyze_job.rs crates/code-graph-tools/src/handlers/analyze.rs crates/code-graph-tools/src/handlers/status.rs` — zero matches. Per `shared/languages/rust.md`, miri is required only for new `unsafe`; we have none, so miri is N/A.
+- [x] Build release: `make build` (= `cargo build --release -p code-graph-mcp`) — clean.
+- [x] Manual smoke test: landed as `scripts/smoke-analyze-async.py` (Python stdio JSON-RPC driver kept in the repo as the canonical end-of-phase rerun gate). Drives the release binary against `external/ripgrep` (~100 files in release mode): (a) `tools/call analyze_codebase_async` returns in ≤ 1ms with `status="running"`/`existing=false`/non-empty `job_id`; (b) polling at 50ms cadence captures mid-run `progress > 0` and a non-empty `progress_message` ("Discovering files...", "Parsing: ...", "Resolving edges: ..."); (c) terminal flip to `status="completed"`; (d) `tools/call get_file_symbols` against `build.rs` returns the three expected symbol records (`main`, `set_git_revision_hash`, `set_windows_exe_options`); (e) all five per-phase eprintln prefixes (loading cache / discovering + parsing / resolving edges / merging / saving cache) confirmed in stderr.
 
 ### Notes
 The release smoke test catches integration issues that unit tests miss: argument parsing for the new tool, the tool actually being registered in the rmcp router, the JSON wire format of the response being correct, and the per-phase eprintln still firing under the new code path. ~5 minutes of manual time; high value vs. cost.
 
 ## Acceptance Criteria
-- [ ] All 14 new unit tests pass deterministically (10 consecutive runs each for the race tests in 2.2).
-- [ ] The integration test in 2.4 passes.
-- [ ] `make lint` / `make fmt-check` / `make test` / `make snapshot-clean` all green.
-- [ ] No new `unsafe` introduced.
-- [ ] Snapshot diffs reviewed and accepted; only the additive `analyze_job` / `analyze_job_previous_terminal` fields appear in `get_status` snapshots, and only the new `analyze_codebase_async` tool appears in any tool-descriptor snapshot.
-- [ ] Release smoke test executes the agent's expected flow end-to-end against a real codebase.
-- [ ] No regression in any pre-existing test.
+- [x] All 14 new unit tests pass deterministically (10 consecutive runs each for the race tests in 2.2).
+- [x] The integration test in 2.4 passes.
+- [x] `make lint` / `make fmt-check` / `make test` / `make snapshot-clean` all green.
+- [x] No new `unsafe` introduced.
+- [x] Snapshot diffs reviewed and accepted; only the additive `analyze_job` / `analyze_job_previous_terminal` fields appear in `get_status` snapshots, and only the new `analyze_codebase_async` tool appears in any tool-descriptor snapshot.
+- [x] Release smoke test executes the agent's expected flow end-to-end against a real codebase.
+- [x] No regression in any pre-existing test.
