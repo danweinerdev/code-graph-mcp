@@ -1518,9 +1518,11 @@ impl CodeGraphServer {
                        `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
                        progress_message, error?, result?, current_phase }`. \
                        `current_phase` names the indexing phase the worker is currently in: \
-                       `\"discovering\"` (file-walk), `\"parsing\"` (per-file tree-sitter parse + \
-                       extract — the dominant phase), `\"resolving\"` (cross-file edge resolution), \
-                       `\"persisting\"` (cache write). It is independent of `status` and stays as a \
+                       `\"loading_cache\"` (rkyv archive deserialize — can take minutes on \
+                       multi-GB caches; skipped when `force=true` and the invocation scope is \
+                       the entire project root), `\"discovering\"` (file-walk), `\"parsing\"` \
+                       (per-file tree-sitter parse + extract — the dominant phase), \
+                       `\"resolving\"` (cross-file edge resolution), `\"persisting\"` (cache write). It is independent of `status` and stays as a \
                        historical value on terminal jobs (the phase that was active when the worker \
                        reached terminal); for terminal liveness use `status` not `current_phase`. \
                        Emits explicit `null` until the worker enters its first phase. \

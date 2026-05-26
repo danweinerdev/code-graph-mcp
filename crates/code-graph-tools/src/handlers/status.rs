@@ -457,6 +457,7 @@ mod tests {
         }
 
         for (phase, expected) in [
+            (AnalyzePhase::LoadingCache, "Loading cache from disk"),
             (AnalyzePhase::Discovering, "Discovering source files"),
             (AnalyzePhase::Parsing, "Parsing source files"),
             (AnalyzePhase::Resolving, "Resolving cross-file edges"),
@@ -471,6 +472,30 @@ mod tests {
         }
     }
 
+    /// `set_phase(LoadingCache)` overrides `progress_total` to the
+    /// synthetic `1` (mirroring `Persisting`) — cache deserialization
+    /// has no per-step progress, so `(0, 1)` is the closest analog to
+    /// "one task in flight, not yet done." Without the override the
+    /// stale total from the previous phase would mislead clients
+    /// rendering a progress bar.
+    #[test]
+    fn set_phase_loading_cache_overrides_total_to_one() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        {
+            let mut s = job.state.write();
+            s.progress = 100;
+            s.progress_total = 100;
+            s.progress_message = "stale".to_string();
+        }
+        job.set_phase(AnalyzePhase::LoadingCache);
+        let view = AnalyzeJobView::from_job(&job);
+        assert_eq!(view.current_phase, Some(AnalyzePhase::LoadingCache));
+        assert_eq!(view.progress, 0);
+        assert_eq!(view.progress_total, 1);
+        assert_eq!(view.progress_message, "Loading cache from disk");
+    }
+
     /// `AnalyzePhase`'s wire spelling is snake_case for every variant.
     /// Pinned so future variants pick up the correct serialization
     /// rule without re-deriving the test from the JSON each time.
@@ -478,6 +503,7 @@ mod tests {
     fn analyze_phase_serializes_as_snake_case() {
         use crate::analyze_job::AnalyzePhase;
         let cases = [
+            (AnalyzePhase::LoadingCache, "loading_cache"),
             (AnalyzePhase::Discovering, "discovering"),
             (AnalyzePhase::Parsing, "parsing"),
             (AnalyzePhase::Resolving, "resolving"),

@@ -80,6 +80,14 @@ pub(crate) enum JobStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyzePhase {
+    /// rkyv cache file is being deserialized from disk before the
+    /// real work begins. On UE-scale projects the cache is multi-GB
+    /// and this can take minutes; without a distinct phase polling
+    /// clients would see `discovering` with `progress: 0/0` and
+    /// assume the indexer is hung. Skipped when `force=true` AND the
+    /// invocation scope equals the project root — the cache is about
+    /// to be discarded so loading it is wasted I/O.
+    LoadingCache,
     /// Walking the file tree and assembling the discover-list. Fast on
     /// most projects; may be invisible to a single client poll.
     Discovering,
@@ -137,6 +145,16 @@ impl AnalyzeJob {
         s.current_phase = Some(phase);
         s.progress = 0;
         s.progress_message = match phase {
+            AnalyzePhase::LoadingCache => {
+                // No per-step report fires during rkyv deserialization,
+                // so this is the only message the client sees for the
+                // duration of the load. Synthetic `(0, 1)` totals
+                // communicate "one load task in flight" — matches the
+                // Persisting convention for the analogous "single
+                // serialized op with no granular progress" case.
+                s.progress_total = 1;
+                "Loading cache from disk".to_string()
+            }
             AnalyzePhase::Discovering => "Discovering source files".to_string(),
             AnalyzePhase::Parsing => "Parsing source files".to_string(),
             AnalyzePhase::Resolving => "Resolving cross-file edges".to_string(),
