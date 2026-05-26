@@ -110,18 +110,41 @@ impl AnalyzeJob {
         })
     }
 
-    /// Transition the job into a new indexing phase. Resets per-phase
-    /// counters (`progress` / `progress_total`) so observers polling
-    /// between `set_phase` and the new phase's first
-    /// `ProgressSink::report` see a clean zeroed page rather than the
-    /// previous phase's stale totals. `progress_message` is left alone
-    /// — the next sink event will overwrite it; clearing it would create
-    /// an empty-string snapshot that's harder to interpret.
+    /// Transition the job into a new indexing phase atomically with
+    /// progress reset and a phase-specific message.
+    ///
+    /// `progress` resets to 0 (each phase starts counting fresh).
+    /// `progress_total` is intentionally NOT reset for `Discovering` /
+    /// `Parsing` / `Resolving`: the value carried over from the
+    /// previous phase is a sensible denominator (Parsing→Resolving
+    /// both walk the same file set, so file_count is the right total
+    /// for both), and the new phase's first
+    /// [`ProgressSink::report`](crate::indexer::ProgressSink::report)
+    /// will overwrite it anyway. This prevents the polling client
+    /// from observing a `(progress=0, progress_total=0)` snapshot
+    /// during the moment between `set_phase` and the new phase's
+    /// first report fire.
+    ///
+    /// `Persisting` is special-cased: there's no per-step sink.report
+    /// during cache serialization, so this is the ONLY message the
+    /// client sees for the duration of the persist write. Synthetic
+    /// `(0, 1)` totals communicate "one persist task in flight".
+    /// Without this special-case, the client would see the stale
+    /// `"Resolving edges: <last file>"` message and the resolving
+    /// counter for the entire persist window.
     pub(crate) fn set_phase(&self, phase: AnalyzePhase) {
         let mut s = self.state.write();
         s.current_phase = Some(phase);
         s.progress = 0;
-        s.progress_total = 0;
+        s.progress_message = match phase {
+            AnalyzePhase::Discovering => "Discovering source files".to_string(),
+            AnalyzePhase::Parsing => "Parsing source files".to_string(),
+            AnalyzePhase::Resolving => "Resolving cross-file edges".to_string(),
+            AnalyzePhase::Persisting => {
+                s.progress_total = 1;
+                "Persisting cache to disk".to_string()
+            }
+        };
     }
 }
 

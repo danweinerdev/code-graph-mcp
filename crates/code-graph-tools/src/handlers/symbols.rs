@@ -557,14 +557,29 @@ fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<Stri
             candidates.push((d, sym));
         }
     }
-    // Sort: (distance asc, length-closeness asc, name asc).
-    // Length-closeness as a secondary key captures the intuition that
-    // typing a 4-char "Actr" makes the user more likely to mean a
-    // 5-char/6-char name than a 3-char name. Without it, lexicographic
-    // name order would rank `Act` (3) above `Actor` (5) at the same
-    // edit distance.
+    // Sort: (distance asc, common-prefix DESC, length-closeness asc,
+    // name asc).
+    //
+    // - Distance dominates: closer matches win.
+    // - Common-prefix length DESC as the secondary key captures
+    //   "the user got the prefix right and typoed the end" — the
+    //   dominant typo pattern in code identifiers. Without it,
+    //   length-diff wins and the diff=0 bucket fills the top slots
+    //   with same-length-but-unrelated names (e.g. for `^Actr$`,
+    //   prefix-1 names like `Attr` rank ahead of prefix-3 `Actor`
+    //   solely because Actor is a length off). Common-prefix as the
+    //   secondary key surfaces obvious-intent names (`Actor`,
+    //   `AActor`) regardless of small length differences.
+    // - Length-closeness asc as the tertiary key: when two candidates
+    //   share the same prefix length, prefer the one closer in size
+    //   to the query.
+    // - Name asc as the final stable key keeps results deterministic.
     candidates.sort_by(|a, b| {
         a.0.cmp(&b.0)
+            .then_with(|| {
+                // DESC: larger prefix-overlap comes first.
+                common_prefix_chars(&b.1.name, inner).cmp(&common_prefix_chars(&a.1.name, inner))
+            })
             .then_with(|| {
                 let a_diff = (a.1.name.chars().count() as i64 - inner_char_len as i64).abs();
                 let b_diff = (b.1.name.chars().count() as i64 - inner_char_len as i64).abs();
@@ -577,6 +592,14 @@ fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<Stri
         .take(limit)
         .map(|(_, s)| symbol_id(s))
         .collect()
+}
+
+/// Count leading characters `a` and `b` share. UTF-8-safe (counts
+/// `char`s, not bytes) so multi-byte identifiers don't desync the
+/// comparison. Used as the tertiary sort key in
+/// [`levenshtein_suggestions`] and [`near_search`].
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// Length-adaptive max-edit-distance gate. Documented in the
@@ -696,14 +719,17 @@ fn near_search(
 
     let total = hits.len() as u32;
 
-    // Phase 2: sort by (distance asc, length-closeness asc, name asc).
-    // Length-closeness as the secondary key prevents short identifiers
-    // from dominating ranking when many symbols tie on edit distance
-    // (e.g. `Act` vs `Actor` at distance 1 from query "Actr"). Without
-    // it, lexicographic name order would rank the 3-char `Act` first.
+    // Phase 2: sort by (distance asc, common-prefix DESC,
+    // length-closeness asc, name asc). Matches the suggestion-path
+    // sort in `levenshtein_suggestions` — see that doc-comment for
+    // the rationale. Prefix-overlap as secondary key surfaces
+    // obvious-intent names ahead of same-length-but-unrelated ties.
     let query_char_len = query_chars.len();
     hits.sort_by(|a, b| {
         a.0.cmp(&b.0)
+            .then_with(|| {
+                common_prefix_chars(&b.1.name, query).cmp(&common_prefix_chars(&a.1.name, query))
+            })
             .then_with(|| {
                 let a_diff = (a.1.name.chars().count() as i64 - query_char_len as i64).abs();
                 let b_diff = (b.1.name.chars().count() as i64 - query_char_len as i64).abs();
@@ -2321,6 +2347,88 @@ mod tests {
             .map(|r| r["name"].as_str().unwrap())
             .collect();
         assert_eq!(results, vec!["Act", "Actor"], "alphabetical tertiary key");
+    }
+
+    /// Near-mode prefix-overlap tiebreaker: when many candidates tie
+    /// on edit distance, prefer those sharing more leading characters
+    /// with the query. Without this, length-diff dominates and the
+    /// same-length bucket fills the top slots with unrelated names.
+    ///
+    /// Fixture replicates the Engine pattern that motivated the fix:
+    /// many alphabetically-early 4-char distance-1 candidates with
+    /// low prefix overlap, plus the obvious-intent 5-char name. The
+    /// prefix-overlap tiebreaker pulls the 3-char-prefix `Actor`
+    /// (length_diff=1) ahead of the 1-char-prefix 4-char distractors
+    /// (length_diff=0) inside the same distance=1 bucket.
+    ///
+    /// Query: `Actr` (length 4).
+    /// Sort key: `(distance asc, prefix DESC, length-diff asc, name asc)`.
+    #[test]
+    fn near_mode_prefix_overlap_surfaces_obvious_intent() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                // 4-char distance-1 candidates with prefix 1 (only "A"):
+                sym("Aaaa", SymbolKind::Class, "/x.cpp", ""),
+                sym("Abbb", SymbolKind::Class, "/x.cpp", ""),
+                sym("Attn", SymbolKind::Class, "/x.cpp", ""),
+                sym("Attr", SymbolKind::Class, "/x.cpp", ""),
+                // 4-char distance-1 candidate with prefix 3 ("Act"):
+                sym("ActN", SymbolKind::Class, "/x.cpp", ""),
+                // The obvious-intent name. 5-char (length_diff=1) but
+                // prefix=3 — must surface near the top under the
+                // prefix-overlap tiebreaker.
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""),
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actr"),
+                near: true,
+                max_distance: Some(1),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        // ActN (prefix=3, diff=0) and Actor (prefix=3, diff=1) BOTH
+        // outrank the prefix=1 distractors because prefix dominates.
+        // Within prefix=3, length-diff splits them: ActN first.
+        assert!(
+            !results.is_empty(),
+            "fixture must produce hits; got: {results:?}"
+        );
+        assert_eq!(
+            results[0], "ActN",
+            "ActN (prefix=3, diff=0) must rank first; got {results:?}"
+        );
+        assert_eq!(
+            results[1], "Actor",
+            "Actor (prefix=3, diff=1) must outrank prefix=1 distractors; got {results:?}"
+        );
+        // Critically: Actor must appear, NOT be buried after the
+        // prefix=1 4-char distractors.
+        let actor_pos = results.iter().position(|n| *n == "Actor").unwrap();
+        for distractor in ["Aaaa", "Abbb", "Attn", "Attr"] {
+            if let Some(distractor_pos) = results.iter().position(|n| *n == distractor) {
+                assert!(
+                    actor_pos < distractor_pos,
+                    "Actor must rank above prefix=1 distractor {distractor:?}; \
+                     got {results:?}"
+                );
+            }
+        }
     }
 
     /// Near-mode primary-key dominance: a distance-0 exact match

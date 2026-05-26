@@ -357,6 +357,12 @@ mod tests {
     /// `current_phase: None`; calling `set_phase` swaps it in. Both
     /// states must survive projection (`None` -> `null` on the wire,
     /// `Some(phase)` -> the snake_case phase string).
+    ///
+    /// `set_phase` resets `progress` to 0 (each phase starts counting
+    /// fresh) but PRESERVES `progress_total` for the file-walking
+    /// phases (Parsing → Resolving share the file_count denominator).
+    /// This prevents polling clients from observing a `(0, 0)`
+    /// snapshot during phase transitions.
     #[test]
     fn analyze_job_view_propagates_current_phase() {
         use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
@@ -375,20 +381,94 @@ mod tests {
             "absent phase serializes as null"
         );
 
-        // After set_phase, the view picks up the new value AND the
-        // counter reset.
+        // After set_phase(Resolving), the view picks up the new phase,
+        // progress resets to 0, progress_total is PRESERVED from the
+        // previous phase, and the message is replaced with a
+        // phase-specific default.
         {
             let mut st = job.state.write();
             st.progress = 42;
             st.progress_total = 100;
+            st.progress_message = "Parsing: foo.cpp".to_string();
         }
         job.set_phase(AnalyzePhase::Resolving);
         let view = AnalyzeJobView::from_job(&job);
         assert_eq!(view.current_phase, Some(AnalyzePhase::Resolving));
-        assert_eq!(view.progress, 0, "set_phase resets progress");
-        assert_eq!(view.progress_total, 0, "set_phase resets progress_total");
+        assert_eq!(view.progress, 0, "set_phase resets progress to 0");
+        assert_eq!(
+            view.progress_total, 100,
+            "set_phase preserves progress_total across Parsing → Resolving \
+             so polling clients never see a (0, 0) snapshot"
+        );
+        assert_eq!(view.progress_message, "Resolving cross-file edges");
         let s = serde_json::to_value(&view).unwrap();
         assert_eq!(s["current_phase"], serde_json::json!("resolving"));
+    }
+
+    /// Persisting phase is the one transition that overwrites
+    /// `progress_total` (set to `1`, a synthetic single-task counter)
+    /// and `progress_message` (set to `"Persisting cache to disk"`).
+    /// Without this special-case, the client would observe the stale
+    /// `"Resolving edges: <last file>"` message and the Resolving
+    /// counter for the entire persist window (since there's no
+    /// `ProgressSink::report` during cache serialization).
+    #[test]
+    fn set_phase_persisting_overrides_message_and_total() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        // Simulate the tail state of the Resolving phase.
+        {
+            let mut st = job.state.write();
+            st.progress = 63784;
+            st.progress_total = 63784;
+            st.progress_message = "Resolving edges: foo.cpp".to_string();
+        }
+        job.set_phase(AnalyzePhase::Persisting);
+        let view = AnalyzeJobView::from_job(&job);
+        assert_eq!(view.current_phase, Some(AnalyzePhase::Persisting));
+        assert_eq!(view.progress, 0, "persisting starts at 0");
+        assert_eq!(
+            view.progress_total, 1,
+            "persisting overrides progress_total to synthetic 1"
+        );
+        assert!(
+            view.progress_message.contains("Persisting"),
+            "persisting message must NOT carry the stale Resolving text: {:?}",
+            view.progress_message
+        );
+        // Pin the exact wording so clients can pattern-match if they
+        // want (though they should prefer current_phase).
+        assert_eq!(view.progress_message, "Persisting cache to disk");
+    }
+
+    /// `set_phase` for Discovering/Parsing/Resolving sets a
+    /// phase-specific default message that replaces any stale text
+    /// carried over from the previous phase. Pins the message strings
+    /// per phase.
+    #[test]
+    fn set_phase_sets_default_message_per_phase() {
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        {
+            let mut st = job.state.write();
+            st.progress_message = "stale".to_string();
+        }
+
+        for (phase, expected) in [
+            (AnalyzePhase::Discovering, "Discovering source files"),
+            (AnalyzePhase::Parsing, "Parsing source files"),
+            (AnalyzePhase::Resolving, "Resolving cross-file edges"),
+            (AnalyzePhase::Persisting, "Persisting cache to disk"),
+        ] {
+            job.set_phase(phase);
+            let view = AnalyzeJobView::from_job(&job);
+            assert_eq!(
+                view.progress_message, expected,
+                "phase {phase:?} must set its default message"
+            );
+        }
     }
 
     /// `AnalyzePhase`'s wire spelling is snake_case for every variant.

@@ -548,8 +548,9 @@ enum ReliabilityMode {
 /// symbols the resolver almost certainly false-positived as orphans.
 ///
 /// Tiering matches [`ReliabilityMode`]: `High` drops two false-positive
-/// classes; `VeryHigh` drops two more on top:
+/// classes; `VeryHigh` drops four more on top.
 ///
+/// All-language rules:
 /// 1. **Virtual methods** (`High`+) — callers may go through dynamic
 ///    dispatch which the static resolver doesn't track.
 /// 2. **Macro-synthesized symbols** (`High`+) — the C++ plugin's
@@ -569,6 +570,33 @@ enum ReliabilityMode {
 ///    edges. The orphan detector's primary check resolved-filters
 ///    callers; this tier trusts that any edge in the reverse adjacency
 ///    is signal worth respecting.
+///
+/// C++-specific rules (gated on `sym.language == Language::Cpp` so a
+/// Python module named `operator` or a Rust identifier `operator` never
+/// trips them):
+///
+/// 5. **C++ operator overloads** (`VeryHigh` only) — invoked implicitly
+///    by STL containers, language built-ins, and comparison/arithmetic
+///    contexts that the static call-graph never sees. Detected by the
+///    unambiguous naming convention: `name` starts with `operator` and
+///    the next character is NOT an identifier-continue character
+///    (`[A-Za-z0-9_]`). Covers `operator<`, `operator==`, `operator()`,
+///    `operator+`, etc.; excludes legal user identifiers that happen
+///    to start with `operator` (e.g. `operator_helper`).
+///
+/// Constructor-convention rule (gated on languages whose constructors
+/// share their enclosing class's name — currently C++, Java, C#; Rust
+/// uses `new()` by convention without enforcement; Python uses
+/// `__init__`; Go has no class concept):
+///
+/// 6. **Constructors** (`VeryHigh` only) — invoked implicitly via
+///    `new T(...)`, container insertion, copy elision, aggregate
+///    initialization, etc. C++/C#/Java syntactically require a
+///    constructor's name to equal its enclosing class name, so
+///    `name == parent` (with non-empty `parent`) is a safe detector
+///    in those languages. Destructors have name `~ClassName` (C++)
+///    so they're naturally excluded — orphan destructors are rare
+///    and worth surfacing.
 fn is_unreliable_orphan(
     sym: &code_graph_core::Symbol,
     mode: ReliabilityMode,
@@ -582,13 +610,50 @@ fn is_unreliable_orphan(
     if sig.starts_with("/* synthesized by [cpp].macro_define_function") {
         return true;
     }
-    // `VeryHigh` additionally applies rules 3+4.
+    // `VeryHigh` additionally applies rules 3-6.
     if matches!(mode, ReliabilityMode::VeryHigh) {
         if sig.starts_with("/* template */") {
             return true;
         }
         let sym_id = symbol_id(sym);
         if graph.has_any_incoming_call_edge(&sym_id) {
+            return true;
+        }
+        // Rule 5: C++-only operator overloads. Gated on language so a
+        // Python `operator` module or a Rust identifier `operator`
+        // never trips it. `strip_prefix` returns `Some(rest)` only
+        // when `name` begins with the literal `operator`; we then
+        // distinguish `operator<` / `operator==` / etc. (rest's first
+        // char is non-identifier) from `operator_helper` / `operatorFoo`
+        // (rest continues with an identifier-continue char and is a
+        // legal user identifier).
+        if sym.language == code_graph_core::Language::Cpp {
+            if let Some(rest) = sym.name.strip_prefix("operator") {
+                let first_is_ident_continue = rest
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .unwrap_or(false);
+                if !first_is_ident_continue {
+                    return true;
+                }
+            }
+        }
+        // Rule 6: constructor convention. Gated on the language set
+        // whose syntactic constructor naming equals the class name.
+        // Python's `__init__` and Rust's `new()` don't match, and Go
+        // has no class concept — including those languages here
+        // would false-positive on every method whose name happens to
+        // equal its parent class (e.g. a Rust method named after its
+        // struct, unusual but legal).
+        if matches!(
+            sym.language,
+            code_graph_core::Language::Cpp
+                | code_graph_core::Language::Java
+                | code_graph_core::Language::CSharp
+        ) && !sym.parent.is_empty()
+            && sym.name == sym.parent
+        {
             return true;
         }
     }
@@ -1707,6 +1772,177 @@ mod tests {
         assert_eq!(names, vec!["plain_orphan"]);
     }
 
+    /// `reliability="very_high"` drops C++ operator overloads
+    /// (`operator<`, `operator==`, `operator()`) which are invoked
+    /// implicitly by STL/language built-ins. `reliability="high"`
+    /// keeps them — operator filtering is exclusively a `very_high`
+    /// rule. A non-C++ symbol named `operator` is NOT dropped under
+    /// either tier (the C++ language gate stops it).
+    #[test]
+    fn orphans_reliability_very_high_drops_cpp_operator_overloads() {
+        let mut g = Graph::new();
+        let op_lt = sym_full("operator<", SymbolKind::Method, "/x.cpp", "Foo");
+        let op_eq = sym_full("operator==", SymbolKind::Method, "/x.cpp", "Foo");
+        let op_call = sym_full("operator()", SymbolKind::Method, "/x.cpp", "Foo");
+        let plain = sym_full("doWork", SymbolKind::Method, "/x.cpp", "Foo");
+        // Python `operator` function — language gate must prevent the
+        // C++ operator rule from dropping it.
+        let py_op = Symbol {
+            name: "operator".to_string(),
+            kind: SymbolKind::Function,
+            file: "/x.py".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "def operator():".to_string(),
+            namespace: String::new(),
+            parent: String::new(),
+            language: Language::Python,
+        };
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![op_lt, op_eq, op_call, plain],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/x.py".to_string(),
+            language: Language::Python,
+            symbols: vec![py_op],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+
+        let r_high = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("high"),
+            NO_BYTE_BUDGET,
+        );
+        let (arr_high, _, _, _) = page_parts(&r_high);
+        let names_high: Vec<&str> = arr_high
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names_high.contains(&"operator<"),
+            "operator< must survive at `high`; got {names_high:?}"
+        );
+
+        let r_vh = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("very_high"),
+            NO_BYTE_BUDGET,
+        );
+        let (arr_vh, _, _, _) = page_parts(&r_vh);
+        let names_vh: Vec<&str> = arr_vh.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(
+            !names_vh.contains(&"operator<"),
+            "operator< must NOT survive at `very_high`; got {names_vh:?}"
+        );
+        assert!(
+            !names_vh.contains(&"operator=="),
+            "operator== must NOT survive at `very_high`; got {names_vh:?}"
+        );
+        assert!(
+            !names_vh.contains(&"operator()"),
+            "operator() must NOT survive at `very_high`; got {names_vh:?}"
+        );
+        // Language gate: Python `operator` MUST survive — only the
+        // C++ language is subject to the operator rule.
+        assert!(
+            names_vh.contains(&"operator"),
+            "Python `operator` must survive at `very_high` (C++-gated rule); got {names_vh:?}"
+        );
+    }
+
+    /// `reliability="very_high"` drops C++/Java/C# constructors via
+    /// the `name == parent` convention. `reliability="high"` keeps
+    /// them. Rust methods whose name happens to equal their parent
+    /// (legal but rare) are NOT dropped — the rule is gated on
+    /// languages that syntactically require ctor-name == class-name.
+    #[test]
+    fn orphans_reliability_very_high_drops_constructors_by_language() {
+        let mut g = Graph::new();
+        // C++ ctor: name == parent.
+        let cpp_ctor = sym_full("Foo", SymbolKind::Method, "/x.cpp", "Foo");
+        // Regular method on Foo — survives.
+        let cpp_method = sym_full("doWork", SymbolKind::Method, "/x.cpp", "Foo");
+        // Rust method whose name happens to match the struct name
+        // (legal Rust; not a constructor). Must NOT be dropped.
+        let rust_self_named = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Method,
+            file: "/x.rs".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "fn Foo(&self)".to_string(),
+            namespace: String::new(),
+            parent: "Foo".to_string(),
+            language: Language::Rust,
+        };
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![cpp_ctor, cpp_method],
+            edges: Vec::new(),
+        });
+        g.merge_file_graph(FileGraph {
+            path: "/x.rs".to_string(),
+            language: Language::Rust,
+            symbols: vec![rust_self_named],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+
+        let r_vh = get_orphans(
+            &g,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("very_high"),
+            NO_BYTE_BUDGET,
+        );
+        let (arr_vh, _, _, _) = page_parts(&r_vh);
+        // (name, file) pairs because two symbols share name "Foo".
+        let entries: Vec<(&str, &str)> = arr_vh
+            .iter()
+            .map(|e| (e["name"].as_str().unwrap(), e["id"].as_str().unwrap()))
+            .collect();
+        // The C++ ctor (/x.cpp:Foo::Foo) must NOT survive.
+        assert!(
+            !entries.iter().any(|(_, id)| *id == "/x.cpp:Foo::Foo"),
+            "C++ constructor must NOT survive at `very_high`; got {entries:?}"
+        );
+        // The Rust `Foo` method (/x.rs:Foo::Foo) MUST survive — Rust
+        // is not in the constructor-language set.
+        assert!(
+            entries.iter().any(|(_, id)| *id == "/x.rs:Foo::Foo"),
+            "Rust method named after its struct must survive at \
+             `very_high` (language-gated rule); got {entries:?}"
+        );
+        // Regular C++ method survives.
+        assert!(
+            entries.iter().any(|(n, _)| *n == "doWork"),
+            "regular C++ method must survive; got {entries:?}"
+        );
+    }
+
     /// `reliability="very_high"` matches `High` behavior on a graph
     /// without templates or any-caller candidates — i.e. the new tier
     /// is purely additive on top of `High` for the legacy false-
@@ -1784,9 +2020,10 @@ mod tests {
     /// `is_unreliable_orphan` predicate behaves correctly on each
     /// distinct signature class. Exercises both `High` and `VeryHigh`
     /// tiers: at `High`, virtual + macro-synth fire; at `VeryHigh`,
-    /// the template marker and the any-caller signal fire on top of
-    /// the `High` rules. The decoy `void virtualize()` is NOT a
-    /// virtual method (substring guard) and never fires.
+    /// the template marker, any-caller signal, C++ operator overloads,
+    /// and constructor convention fire on top of the `High` rules.
+    /// The decoy `void virtualize()` is NOT a virtual method
+    /// (substring guard) and never fires.
     #[test]
     fn is_unreliable_orphan_predicate_table() {
         let g = Graph::new();
@@ -1802,6 +2039,15 @@ mod tests {
         decoy.signature = "void virtualize()".to_string(); // not a virtual
         let mut tmpl = sym("k", SymbolKind::Method, "/x.cpp");
         tmpl.signature = "/* template */ void k()".to_string();
+        let op_lt = sym_full("operator<", SymbolKind::Method, "/x.cpp", "Foo");
+        let op_eq = sym_full("operator==", SymbolKind::Method, "/x.cpp", "Foo");
+        let op_call = sym_full("operator()", SymbolKind::Method, "/x.cpp", "Foo");
+        // `operator_helper` is a legal C++ user identifier; the
+        // `name == "operator"` + non-identifier-next check must NOT
+        // misfire on it (`_` is identifier-continue).
+        let op_user = sym_full("operator_helper", SymbolKind::Function, "/x.cpp", "");
+        let ctor = sym_full("Foo", SymbolKind::Method, "/x.cpp", "Foo");
+        let copy_ctor = sym_full("Foo", SymbolKind::Method, "/x.cpp", "Foo");
 
         // High-tier rules.
         assert!(!is_unreliable_orphan(&plain, ReliabilityMode::High, &g));
@@ -1813,8 +2059,11 @@ mod tests {
         ));
         assert!(is_unreliable_orphan(&synth, ReliabilityMode::High, &g));
         assert!(!is_unreliable_orphan(&decoy, ReliabilityMode::High, &g));
-        // Template marker does NOT fire at `High` — only at `VeryHigh`.
+        // Template marker, operators, and constructors do NOT fire at
+        // `High` — only at `VeryHigh`.
         assert!(!is_unreliable_orphan(&tmpl, ReliabilityMode::High, &g));
+        assert!(!is_unreliable_orphan(&op_lt, ReliabilityMode::High, &g));
+        assert!(!is_unreliable_orphan(&ctor, ReliabilityMode::High, &g));
 
         // VeryHigh-tier rules. High-tier rules still apply (cumulative).
         assert!(!is_unreliable_orphan(&plain, ReliabilityMode::VeryHigh, &g));
@@ -1822,6 +2071,124 @@ mod tests {
         assert!(is_unreliable_orphan(&synth, ReliabilityMode::VeryHigh, &g));
         assert!(!is_unreliable_orphan(&decoy, ReliabilityMode::VeryHigh, &g));
         assert!(is_unreliable_orphan(&tmpl, ReliabilityMode::VeryHigh, &g));
+        // Operators.
+        assert!(is_unreliable_orphan(&op_lt, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(&op_eq, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(
+            &op_call,
+            ReliabilityMode::VeryHigh,
+            &g
+        ));
+        // Decoy: a legal user identifier starting with `operator` must
+        // NOT trip — `_` is identifier-continue, so the next char
+        // disqualifies the operator detection.
+        assert!(!is_unreliable_orphan(
+            &op_user,
+            ReliabilityMode::VeryHigh,
+            &g
+        ));
+        // Constructors.
+        assert!(is_unreliable_orphan(&ctor, ReliabilityMode::VeryHigh, &g));
+        assert!(is_unreliable_orphan(
+            &copy_ctor,
+            ReliabilityMode::VeryHigh,
+            &g
+        ));
+    }
+
+    /// Language gating: the C++-specific `operator` and the
+    /// C++/Java/C#-specific `name == parent` rules must NOT fire on
+    /// other languages. A Python symbol named `operator` (e.g. an
+    /// imported `operator` module wrapper) and a Rust symbol whose
+    /// name happens to equal its parent (legal but unusual) stay in
+    /// the orphan list under `very_high`.
+    #[test]
+    fn is_unreliable_orphan_language_gates() {
+        let g = Graph::new();
+
+        // Python: a function literally named `operator<` is impossible
+        // in Python syntax, but the closer case is a Python identifier
+        // named `operator` followed by ASCII letter — covered by the
+        // identifier-continue guard already. Adversarial case: a
+        // Python function literally named `operator` (legal as a
+        // variable/function name in Python). The operator rule would
+        // strip "operator" and get an empty rest, which is_op marks
+        // as true under the C++ rule. The language gate must stop it.
+        let py_op = Symbol {
+            name: "operator".to_string(),
+            kind: SymbolKind::Function,
+            file: "/x.py".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "def operator():".to_string(),
+            namespace: String::new(),
+            parent: String::new(),
+            language: Language::Python,
+        };
+        assert!(
+            !is_unreliable_orphan(&py_op, ReliabilityMode::VeryHigh, &g),
+            "Python `operator` must NOT trip the C++ operator rule"
+        );
+
+        // Rust: a struct method whose name matches the struct name is
+        // legal Rust (not a constructor — Rust has no ctors). The
+        // language gate must stop the C++/Java/C# `name==parent` rule
+        // from misfiring here.
+        let rust_self_named = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Method,
+            file: "/x.rs".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "fn Foo(&self)".to_string(),
+            namespace: String::new(),
+            parent: "Foo".to_string(),
+            language: Language::Rust,
+        };
+        assert!(
+            !is_unreliable_orphan(&rust_self_named, ReliabilityMode::VeryHigh, &g),
+            "Rust method named after its struct must NOT trip the constructor rule"
+        );
+
+        // Java: name==parent IS the constructor convention → must
+        // trip. Pins the language gate as a positive list, not a
+        // C++-only check.
+        let java_ctor = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Method,
+            file: "/x.java".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "Foo()".to_string(),
+            namespace: String::new(),
+            parent: "Foo".to_string(),
+            language: Language::Java,
+        };
+        assert!(
+            is_unreliable_orphan(&java_ctor, ReliabilityMode::VeryHigh, &g),
+            "Java constructor (name==parent) must trip the rule"
+        );
+
+        // C#: same as Java — constructor convention applies.
+        let cs_ctor = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Method,
+            file: "/x.cs".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 1,
+            signature: "Foo()".to_string(),
+            namespace: String::new(),
+            parent: "Foo".to_string(),
+            language: Language::CSharp,
+        };
+        assert!(
+            is_unreliable_orphan(&cs_ctor, ReliabilityMode::VeryHigh, &g),
+            "C# constructor (name==parent) must trip the rule"
+        );
     }
 
     #[test]

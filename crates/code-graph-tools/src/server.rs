@@ -547,12 +547,19 @@ pub struct GetOrphansArgs {
                        false-positive classes; 'high' drops virtual methods (often reached via \
                        dynamic dispatch the resolver doesn't track) and macro-synthesized \
                        symbols (the macro IS the call site by construction); 'very_high' \
-                       additionally drops templated definitions (C++ functions/methods nested \
+                       additionally drops (a) templated definitions (C++ functions/methods nested \
                        under a `template_declaration` ancestor, including methods of a templated \
-                       class — the symbol carries a `/* template */` signature prefix) and any \
-                       symbol with at least one incoming Calls edge of any confidence (catches \
-                       candidates whose only callers are heuristic-resolution or bare-token \
-                       unresolved-source edges). 'high' typically cuts the orphan count by \
+                       class — the symbol carries a `/* template */` signature prefix), \
+                       (b) any symbol with at least one incoming Calls edge of any confidence \
+                       (catches candidates whose only callers are heuristic-resolution or \
+                       bare-token unresolved-source edges), \
+                       (c) C++ operator overloads (`operator<`, `operator==`, `operator()`, \
+                       etc. — invoked implicitly by STL containers and language built-ins; \
+                       gated on Language::Cpp so a Python or Rust `operator` identifier \
+                       doesn't trip it), and \
+                       (d) constructors in languages whose syntactic constructor name equals \
+                       the class name (C++/Java/C#; Rust uses `new()` by convention and is NOT \
+                       gated, Python uses `__init__`). 'high' typically cuts the orphan count by \
                        ~half on engine-style codebases; 'very_high' commonly cuts by 80-95%. \
                        Use 'very_high' for dead-code investigations on UE-scale codebases. \
                        Invalid values are rejected with a tool error."
@@ -812,9 +819,12 @@ impl CodeGraphServer {
                        When the inner pattern is a plain identifier (no regex \
                        metacharacters), candidates are sorted by ascending Levenshtein \
                        distance to the inner pattern (length-adaptive threshold: 1 edit \
-                       at length 2-11, 2 at 12-17, 3 at 18+), then by length-closeness \
-                       and name; falls back to a broad substring match when no symbols \
-                       are within the edit-distance threshold. When the inner pattern \
+                       at length 2-11, 2 at 12-17, 3 at 18+), then by common-prefix \
+                       length DESC (so obvious-intent names like `Actor` surface for \
+                       a `^Actr$` typo instead of getting buried under alphabetically- \
+                       earlier same-length candidates), then by length-closeness, then \
+                       name. Falls back to a broad substring match when no symbols are \
+                       within the edit-distance threshold. When the inner pattern \
                        contains regex metacharacters, candidates come from the broad \
                        substring match alone. **Absent from the wire entirely when empty** (no \
                        `\"suggestions\": []` key — serialization skips empty lists), \
