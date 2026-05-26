@@ -557,28 +557,37 @@ fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<Stri
             candidates.push((d, sym));
         }
     }
-    // Sort: (distance asc, common-prefix DESC, length-closeness asc,
-    // name asc).
+    // Sort: (distance asc, common-prefix DESC, is_shorter_than_query
+    // asc, length-closeness asc, name asc).
     //
     // - Distance dominates: closer matches win.
     // - Common-prefix length DESC as the secondary key captures
     //   "the user got the prefix right and typoed the end" — the
-    //   dominant typo pattern in code identifiers. Without it,
-    //   length-diff wins and the diff=0 bucket fills the top slots
-    //   with same-length-but-unrelated names (e.g. for `^Actr$`,
-    //   prefix-1 names like `Attr` rank ahead of prefix-3 `Actor`
-    //   solely because Actor is a length off). Common-prefix as the
-    //   secondary key surfaces obvious-intent names (`Actor`,
-    //   `AActor`) regardless of small length differences.
-    // - Length-closeness asc as the tertiary key: when two candidates
-    //   share the same prefix length, prefer the one closer in size
-    //   to the query.
+    //   dominant typo pattern in code identifiers.
+    // - **is_shorter_than_query asc**: when distance + prefix are tied,
+    //   prefer a candidate that is the same length as or LONGER than
+    //   the query. Captures "the user typed too few characters" (the
+    //   insert-typo case) as more likely than "typed too many" (the
+    //   delete-typo case) for short identifiers. Concretely: for
+    //   `^Actr$`, `Act` (delete) and `Actor` (insert) tie on distance
+    //   (both 1) and prefix (both 3); without this key, alphabetical
+    //   fallback put `Act` first even though `Actor` is the
+    //   overwhelmingly more likely intent. `false` (not shorter)
+    //   sorts before `true` (shorter), so longer-or-equal candidates
+    //   win the tie.
+    // - Length-closeness asc as the next key: when same-or-longer is
+    //   tied, prefer the one closer in size to the query.
     // - Name asc as the final stable key keeps results deterministic.
     candidates.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| {
                 // DESC: larger prefix-overlap comes first.
                 common_prefix_chars(&b.1.name, inner).cmp(&common_prefix_chars(&a.1.name, inner))
+            })
+            .then_with(|| {
+                let a_shorter = a.1.name.chars().count() < inner_char_len;
+                let b_shorter = b.1.name.chars().count() < inner_char_len;
+                a_shorter.cmp(&b_shorter)
             })
             .then_with(|| {
                 let a_diff = (a.1.name.chars().count() as i64 - inner_char_len as i64).abs();
@@ -720,15 +729,23 @@ fn near_search(
     let total = hits.len() as u32;
 
     // Phase 2: sort by (distance asc, common-prefix DESC,
-    // length-closeness asc, name asc). Matches the suggestion-path
-    // sort in `levenshtein_suggestions` — see that doc-comment for
-    // the rationale. Prefix-overlap as secondary key surfaces
-    // obvious-intent names ahead of same-length-but-unrelated ties.
+    // is_shorter_than_query asc, length-closeness asc, name asc).
+    // Matches the suggestion-path sort in `levenshtein_suggestions` —
+    // see that doc-comment for the rationale of each key. The
+    // shorter-than-query penalty captures the insert-typo bias in
+    // identifier completion: when a user types a 4-char query that's
+    // 1 edit from both a 3-char (delete) and 5-char (insert)
+    // candidate, the longer is the more likely intent.
     let query_char_len = query_chars.len();
     hits.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| {
                 common_prefix_chars(&b.1.name, query).cmp(&common_prefix_chars(&a.1.name, query))
+            })
+            .then_with(|| {
+                let a_shorter = a.1.name.chars().count() < query_char_len;
+                let b_shorter = b.1.name.chars().count() < query_char_len;
+                a_shorter.cmp(&b_shorter)
             })
             .then_with(|| {
                 let a_diff = (a.1.name.chars().count() as i64 - query_char_len as i64).abs();
@@ -2310,21 +2327,24 @@ mod tests {
         );
     }
 
-    /// Near-mode same-distance length-closeness: at distance 1 from
-    /// query `Actr` (4 chars), `Act` (3 chars, diff 1) and `Actor`
-    /// (5 chars, diff 1) tie on length-closeness. The tertiary
-    /// alphabetical sort then puts `Act` above `Actor`. This pins
-    /// the deterministic ordering when both primary AND secondary
-    /// keys tie.
+    /// Near-mode insert-typo preference: at distance 1 from query
+    /// `Actr` (4 chars), `Act` (3 chars — delete typo) and `Actor`
+    /// (5 chars — insert typo) tie on edit distance, prefix overlap
+    /// (both share `Act` = 3), and `|length_diff|` (both 1). The
+    /// `is_shorter_than_query` tiebreaker picks `Actor` (length 5 ≥
+    /// query 4 → not shorter → false) over `Act` (length 3 < query
+    /// 4 → shorter → true), reflecting that insert-typos (user
+    /// typed too few characters) are the more common intent than
+    /// delete-typos for short identifiers.
     #[test]
-    fn near_mode_alphabetical_when_distance_and_length_tie() {
+    fn near_mode_insert_typo_outranks_delete_typo() {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
             path: "/x.cpp".to_string(),
             language: Language::Cpp,
             symbols: vec![
-                sym("Act", SymbolKind::Class, "/x.cpp", ""), // d=1, len 3, diff 1
-                sym("Actor", SymbolKind::Class, "/x.cpp", ""), // d=1, len 5, diff 1
+                sym("Act", SymbolKind::Class, "/x.cpp", ""), // d=1, len 3, shorter
+                sym("Actor", SymbolKind::Class, "/x.cpp", ""), // d=1, len 5, longer
             ],
             edges: Vec::new(),
         });
@@ -2346,7 +2366,54 @@ mod tests {
             .iter()
             .map(|r| r["name"].as_str().unwrap())
             .collect();
-        assert_eq!(results, vec!["Act", "Actor"], "alphabetical tertiary key");
+        assert_eq!(
+            results,
+            vec!["Actor", "Act"],
+            "longer-than-query candidate should outrank shorter-than-query \
+             when distance + prefix + |length_diff| are all tied"
+        );
+    }
+
+    /// Anti-regression: when ALL candidates are shorter-than-query
+    /// (no insert-typo bias available), the tiebreaker falls through
+    /// to length-diff then alphabetical. Query `Actrx` (5 chars):
+    /// `Act` (len 3, diff 2) and `Actr` (len 4, diff 1) — both
+    /// shorter, but `Actr` has smaller diff so wins.
+    #[test]
+    fn near_mode_all_shorter_falls_through_to_length_diff() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("Act", SymbolKind::Class, "/x.cpp", ""), // d=2, len 3
+                sym("Actr", SymbolKind::Class, "/x.cpp", ""), // d=1, len 4
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("Actrx"),
+                near: true,
+                max_distance: Some(2),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        let results: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            results,
+            vec!["Actr", "Act"],
+            "distance dominates; Actr wins by distance over Act"
+        );
     }
 
     /// Near-mode prefix-overlap tiebreaker: when many candidates tie

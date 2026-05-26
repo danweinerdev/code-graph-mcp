@@ -822,8 +822,11 @@ impl CodeGraphServer {
                        at length 2-11, 2 at 12-17, 3 at 18+), then by common-prefix \
                        length DESC (so obvious-intent names like `Actor` surface for \
                        a `^Actr$` typo instead of getting buried under alphabetically- \
-                       earlier same-length candidates), then by length-closeness, then \
-                       name. Falls back to a broad substring match when no symbols are \
+                       earlier same-length candidates), then by `is_shorter_than_query` \
+                       asc (insert-typo bias — when a delete-typo and an insert-typo \
+                       tie on every other key, the insert-typo wins because users \
+                       under-type more often than over-type), then by length-closeness, \
+                       then name. Falls back to a broad substring match when no symbols are \
                        within the edit-distance threshold. When the inner pattern \
                        contains regex metacharacters, candidates come from the broad \
                        substring match alone. **Absent from the wire entirely when empty** (no \
