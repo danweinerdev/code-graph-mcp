@@ -1216,4 +1216,281 @@ mod tests {
         assert_eq!(async_result["files"], serde_json::json!(1));
         assert!(async_result["symbols"].as_u64().unwrap() >= 1);
     }
+
+    // ----- Task 2.2: single-flight race tests -------------------------------
+    //
+    // These tests verify the slot is the single-flight gate (Design Decision
+    // 1), duplicate kickoff against a Running slot returns the existing
+    // job_id (Decision 3), and sync vs. async exclude each other symmetrically
+    // (Decision 9). They use the recording plugin's `SLEEP_PER_PARSE_MS` knob
+    // (where required) to stretch the indexing window wide enough for a
+    // second handler call to land on the slot while the first is still
+    // Running.
+    //
+    // **Knob hygiene.** Every test that sets `SLEEP_PER_PARSE_MS` does so
+    // through the `ParseSleepGuard` RAII helper below. If two tests in this
+    // binary ran concurrently and one leaked a non-zero value, the other
+    // would silently slow down — Cargo's default is parallel test execution
+    // within a binary. The first two tests below (`concurrent_async_*`,
+    // `async_duplicate_*`) do NOT touch the knob; their synchronization
+    // primitive is the `Barrier` / `yield_now` pair, not stretched indexing
+    // time. The third and fourth do, and clean up via the guard.
+
+    use crate::test_recording_plugin::{Log, RecordingPlugin, SLEEP_PER_PARSE_MS};
+    use code_graph_core::Language;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// RAII guard that sets the recording plugin's per-`parse_file` sleep
+    /// knob on construction and resets it to `0` on drop. The Drop reset is
+    /// load-bearing: tests in this binary run concurrently by default, so a
+    /// leaked non-zero value would silently stretch every concurrent test's
+    /// indexing wall time and turn deterministic synchronization into
+    /// timing-dependent flake.
+    struct ParseSleepGuard;
+    impl ParseSleepGuard {
+        fn set(ms: u64) -> Self {
+            SLEEP_PER_PARSE_MS.store(ms, AtomicOrdering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for ParseSleepGuard {
+        fn drop(&mut self) {
+            SLEEP_PER_PARSE_MS.store(0, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Build a `CodeGraphServer` whose only registered plugin is the
+    /// `RecordingPlugin` claiming `.rec` files. Routing through the recording
+    /// plugin is what makes `SLEEP_PER_PARSE_MS` effective — the real
+    /// `CppParser` ignores the knob. The returned `Log` is captured for
+    /// callers that want to assert per-file invocation; the race tests below
+    /// drop it.
+    fn server_with_recording_plugin() -> (CodeGraphServer, Log) {
+        let calls: Log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut reg = LanguageRegistry::new();
+        reg.register(Box::new(RecordingPlugin::new(
+            Language::Cpp,
+            &[".rec"],
+            std::sync::Arc::clone(&calls),
+        )))
+        .unwrap();
+        (CodeGraphServer::new(reg), calls)
+    }
+
+    /// Seed a tempdir with `n` trivial `.rec` files. Paired with the
+    /// recording-plugin server above so the analyze handler routes each file
+    /// through `RecordingPlugin::parse_file` (and therefore the sleep knob).
+    fn tempdir_with_n_rec(n: usize) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for i in 0..n {
+            fs::write(dir.path().join(format!("f{i}.rec")), b"// rec\n").unwrap();
+        }
+        dir
+    }
+
+    /// (Task 2.2 / a) Two `analyze_codebase_async` calls released
+    /// simultaneously via a `Barrier` both hit the slot write lock at the
+    /// same instant; the `PlRwLock` serializes them so one observes the
+    /// other's `Running` write. Determinism comes from the barrier — both
+    /// tasks reach the slot-write attempt at the same wall-clock point —
+    /// and from the slot lock itself, which makes the check+rotate+install
+    /// step atomic. NO sleep knob: indexing time is irrelevant; the
+    /// synchronization happens entirely in the slot.
+    #[tokio::test]
+    async fn concurrent_async_kickoffs_only_one_spawns_worker() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let inner = inner.clone();
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            set.spawn(async move {
+                barrier.wait().await;
+                analyze_codebase_async(inner, path, false).await
+            });
+        }
+
+        let mut responses = Vec::with_capacity(2);
+        while let Some(joined) = set.join_next().await {
+            responses.push(joined.expect("kickoff task panicked"));
+        }
+        assert_eq!(responses.len(), 2);
+
+        let parsed: Vec<serde_json::Value> = responses
+            .iter()
+            .map(|r| {
+                assert!(
+                    r.is_error.is_none() || r.is_error == Some(false),
+                    "kickoff response unexpectedly errored: {r:?}"
+                );
+                serde_json::from_str(&body_text(r)).unwrap()
+            })
+            .collect();
+
+        let job_ids: Vec<String> = parsed
+            .iter()
+            .map(|v| v["job_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            job_ids[0], job_ids[1],
+            "both concurrent kickoffs must surface the same job_id (the slot's installed Running job)"
+        );
+
+        let mut existing_flags: Vec<bool> = parsed
+            .iter()
+            .map(|v| v["existing"].as_bool().unwrap())
+            .collect();
+        existing_flags.sort();
+        assert_eq!(
+            existing_flags,
+            vec![false, true],
+            "exactly one kickoff must report existing=false (the winner that installed the job) \
+             and the other existing=true (observer of the winner's write)"
+        );
+    }
+
+    /// (Task 2.2 / b) Sequential kickoff with a `yield_now` between calls.
+    /// The yield is a scheduling primitive — it surrenders the current task
+    /// to the runtime, giving the slot write a chance to commit visibly
+    /// before the second handler reads `slot.current.state.status`. The
+    /// in-flight job satisfies `Running`, so the second kickoff returns the
+    /// first's `job_id` with `existing: true`. NO sleep knob.
+    #[tokio::test]
+    async fn async_duplicate_kickoff_after_first_started_returns_existing_job_id() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let first = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let first_parsed: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_job_id = first_parsed["job_id"].as_str().unwrap().to_string();
+        assert_eq!(first_parsed["existing"], serde_json::json!(false));
+
+        tokio::task::yield_now().await;
+
+        let second = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let second_parsed: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
+        let second_job_id = second_parsed["job_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            second_parsed["existing"],
+            serde_json::json!(true),
+            "second kickoff against a Running slot must report existing=true; got: {second_parsed}"
+        );
+        assert_eq!(
+            second_job_id, first_job_id,
+            "duplicate kickoff must surface the in-flight job's job_id, not mint a new one"
+        );
+    }
+
+    /// (Task 2.2 / c) An async kickoff that is still indexing must block a
+    /// subsequent sync `analyze_codebase` with the same byte-identical error
+    /// the wire snapshot has always carried ("indexing already in
+    /// progress"). The 5-file × 50ms-per-parse fixture guarantees ≥ 250ms
+    /// of in-progress window — comfortably longer than any sync handler's
+    /// slot-check + spawn fast path. No yield between the async and sync
+    /// calls: the slot write happens before `analyze_codebase_async`
+    /// returns, so by the time we call sync the slot is already Running.
+    #[tokio::test]
+    async fn async_kickoff_blocks_sync_analyze() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let kickoff = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        assert!(
+            kickoff.is_error.is_none() || kickoff.is_error == Some(false),
+            "async kickoff itself must not error: {kickoff:?}"
+        );
+
+        let sync_r = analyze_codebase(inner.clone(), path.clone(), false, None, None).await;
+        assert_eq!(sync_r.is_error, Some(true));
+        assert_eq!(
+            body_text(&sync_r),
+            "indexing already in progress",
+            "sync handler must reject byte-identically when slot.current is Running"
+        );
+    }
+
+    /// (Task 2.2 / d) An in-flight sync `analyze_codebase` (Running slot,
+    /// inline await) must surface to a subsequent `analyze_codebase_async`
+    /// as `existing: true` carrying the sync job's `job_id`. The 20-file ×
+    /// 50ms-per-parse fixture guarantees ≥ 1s of in-progress window —
+    /// abundant headroom for the spin-yield loop to land while sync is
+    /// still in `run_analyze_job`'s parse phase.
+    ///
+    /// Synchronization primitive: bounded spin-yield against the slot's
+    /// observable state. NO sleep — only `yield_now`, with a 500ms wall-
+    /// clock guard so a regression that prevents the slot from reaching
+    /// Running surfaces as a panic rather than a hang.
+    ///
+    /// Sync runs in a `tokio::spawn`ed task; we drain its `JoinHandle` after
+    /// the assertion so the worker completes cleanly inside the test's
+    /// runtime (avoids any "destructor running during runtime shutdown"
+    /// noise from a dangling handle).
+    #[tokio::test]
+    async fn sync_kickoff_blocks_async_kickoff() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(20);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let sync_handle = {
+            let inner = inner.clone();
+            let path = path.clone();
+            tokio::spawn(async move { analyze_codebase(inner, path, false, None, None).await })
+        };
+
+        // Spin-yield until the slot's current job is Running. Bounded at
+        // 500ms — the 20-file × 50ms fixture gives ~1s of Running window,
+        // so 500ms is half that and any failure to reach Running in this
+        // window indicates the slot-write protocol regressed.
+        let start = Instant::now();
+        let sync_job_id = loop {
+            {
+                let slot = inner.analyze_slot.read();
+                if let Some(j) = &slot.current {
+                    if matches!(j.state.read().status, JobStatus::Running) {
+                        break j.job_id.clone();
+                    }
+                }
+            }
+            if start.elapsed() > Duration::from_millis(500) {
+                panic!(
+                    "sync analyze never reached Running state in slot within 500ms — \
+                     slot-write protocol regressed or sync handler returned before installing the job"
+                );
+            }
+            tokio::task::yield_now().await;
+        };
+
+        let async_r = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let async_parsed: serde_json::Value = serde_json::from_str(&body_text(&async_r)).unwrap();
+        assert_eq!(
+            async_parsed["existing"],
+            serde_json::json!(true),
+            "async kickoff against a Running sync slot must report existing=true; got: {async_parsed}"
+        );
+        assert_eq!(
+            async_parsed["job_id"].as_str().unwrap(),
+            sync_job_id,
+            "async kickoff must surface the in-flight sync job's job_id"
+        );
+
+        // Drain the sync handler so the worker completes inside this test's
+        // runtime — avoids the worker future being dropped mid-flight when
+        // the test's runtime tears down.
+        let _ = sync_handle.await.expect("sync handler task panicked");
+    }
 }
