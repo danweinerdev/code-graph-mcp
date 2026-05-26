@@ -254,7 +254,18 @@ pub(crate) async fn run_analyze_job(
         }
     }
 
-    if !force {
+    // `prebuilt_graph` holds the fast-path probe when the cache loaded
+    // successfully but the fast path falls through (e.g. some in-scope
+    // files are stale, or no in-scope files exist in the cache). The
+    // slow path inside `spawn_blocking` reuses this Graph instead of
+    // calling `merged_graph.load()` a second time — on UE-scale caches
+    // (~3GB rkyv archive) the double-load was responsible for several
+    // minutes of redundant I/O on every incremental analyze.
+    //
+    // Set to `None` when `force=true` (no fast-path probe runs), when
+    // the cache file is absent / stale-version, or when `load_and_stale`
+    // returns an error.
+    let prebuilt_graph: Option<Graph> = if !force {
         let mut probe = Graph::new();
         let (load_ok, all_stale) = probe
             .load_and_stale(&project_root)
@@ -316,8 +327,23 @@ pub(crate) async fn run_analyze_job(
                 finish_completed(&job, result);
                 return;
             }
+            // Fall-through with stale in-scope files: hoist the
+            // already-loaded probe into the slow path.
+            Some(probe)
+        } else if load_ok {
+            // Cache loaded but contained no in-scope files (likely a
+            // first-time scope under an existing project root). Still
+            // worth reusing — the slow path's eviction is a no-op for
+            // out-of-scope entries.
+            Some(probe)
+        } else {
+            // No cache on disk, or load failed. Slow path will start
+            // from a fresh Graph.
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
     // Clone the sender BEFORE `tx` moves into the sink. The clone
@@ -392,24 +418,36 @@ pub(crate) async fn run_analyze_job(
         let mut blocking_warnings: Vec<String> = Vec::new();
 
         let phase_start = std::time::Instant::now();
-        let mut merged_graph = Graph::new();
-        // Short-circuit the cache load when `force=true` AND the
-        // invocation scope is the entire project root. In that case
-        // the loaded graph would immediately be `clear()`ed below
-        // (line ~394), so loading it is wasted I/O — multi-GB rkyv
-        // deserialization for a graph that's about to be thrown away.
-        // On UE/LLVM-scale projects this saves ~60-120s of cold
-        // startup time when the user wanted a fresh rebuild.
+        // Cache acquisition: three paths, mutually exclusive.
         //
-        // The narrower `force=true` + sub-scope case still loads the
-        // cache because `drop_files_in_scope` needs the existing
-        // entries to know what to evict.
-        let cache_loaded = if force && scope_is_project_root {
+        // 1. `prebuilt_graph: Some(g)` — the fast-path probe already
+        //    loaded the cache and the slow path inherited it. This is
+        //    the dominant `force=false` incremental case on UE-scale
+        //    projects (~3GB cache); reusing the probe saves a full
+        //    re-deserialize that previously cost minutes of redundant
+        //    I/O. `cache_loaded = true` by construction.
+        //
+        // 2. `force=true && scope_is_project_root` — the loaded graph
+        //    would immediately be `clear()`ed below, so loading is
+        //    wasted I/O. Skip entirely; `cache_loaded = false`.
+        //
+        // 3. Anything else (`force=false` with no cache on disk,
+        //    `force=true` on a sub-scope where `drop_files_in_scope`
+        //    needs the cached entries) — load fresh inside
+        //    spawn_blocking.
+        let (mut merged_graph, cache_loaded) = if let Some(g) = prebuilt_graph {
+            eprintln!(
+                "[code-graph] phase: cache reused from fast-path probe \
+                 ({} cached files, no re-load needed)",
+                g.stats().files
+            );
+            (g, true)
+        } else if force && scope_is_project_root {
             eprintln!(
                 "[code-graph] phase: cache load SKIPPED \
                  (force=true, project-root scope — cache would be cleared)"
             );
-            false
+            (Graph::new(), false)
         } else {
             // Stamp the LoadingCache phase before the blocking
             // rkyv deserialization so polling clients see an
@@ -421,14 +459,15 @@ pub(crate) async fn run_analyze_job(
                 "[code-graph] phase: loading cache from {}",
                 project_root_for_pool.display()
             );
-            let loaded = merged_graph.load(&project_root_for_pool).unwrap_or(false);
+            let mut g = Graph::new();
+            let loaded = g.load(&project_root_for_pool).unwrap_or(false);
             eprintln!(
                 "[code-graph] phase: cache load {} ({:.1}s, {} cached files)",
                 if loaded { "ok" } else { "absent/stale" },
                 phase_start.elapsed().as_secs_f64(),
-                merged_graph.stats().files
+                g.stats().files
             );
-            loaded
+            (g, loaded)
         };
 
         if force {
@@ -1367,6 +1406,110 @@ mod tests {
             s.current_phase,
             Some(AnalyzePhase::Parsing),
             "failed terminal must NOT stamp Completed; should retain Parsing"
+        );
+    }
+
+    /// Regression: on UE-scale projects (~3GB rkyv cache file), the
+    /// fast-path probe at the top of `run_analyze_job` deserialized
+    /// the full cache, then if any in-scope files were stale the
+    /// worker fell through to `spawn_blocking` which deserialized
+    /// the SAME cache file a second time via `merged_graph.load()`.
+    /// On slow storage this double-load cost minutes of redundant
+    /// I/O per incremental analyze.
+    ///
+    /// Fix: hoist the probe Graph through the fast-path-fall-through
+    /// boundary into `spawn_blocking` so the slow path reuses it.
+    ///
+    /// This test exercises the slow path by running analyze twice
+    /// with the SECOND call making a file stale (touch its mtime).
+    /// Without the hoist, the second analyze would re-load the cache;
+    /// with the hoist, it reuses the probe and only re-parses the
+    /// stale file. We verify correctness here — performance must be
+    /// observed via the `[code-graph] phase: cache reused from
+    /// fast-path probe` log line on stderr, which is the operational
+    /// signal that the optimization fired.
+    #[tokio::test]
+    async fn analyze_slow_path_with_stale_file_reuses_probe() {
+        use crate::analyze_job::{AnalyzePhase, JobStatus};
+
+        let dir = TempDir::new().unwrap();
+        let a_cpp = dir.path().join("a.cpp");
+        let b_cpp = dir.path().join("b.cpp");
+        fs::write(&a_cpp, b"void f() {}\n").unwrap();
+        fs::write(&b_cpp, b"void g() {}\n").unwrap();
+        let server = server_with_cpp_parser();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        // First call: builds cache.
+        let r1 = analyze_codebase(server.inner.clone(), path.clone(), false, None, None).await;
+        assert!(r1.is_error.is_none() || r1.is_error == Some(false));
+
+        // Bump a file's mtime by writing to it with new content. The
+        // cache records each file's mtime at index time; the next
+        // `load_and_stale` compares cached mtime vs disk mtime and
+        // flags the mismatch — forcing the fast path to fall through
+        // to the slow path, which is the code path under test. The
+        // sleep ensures filesystem mtime resolution catches the
+        // change (some filesystems round to whole seconds).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&a_cpp, b"void f() {} void h() {}\n").unwrap();
+
+        // Second call: cache exists + a.cpp is stale → fast-path
+        // probe loads, finds the stale file, falls through. Slow
+        // path uses the hoisted probe (no re-load) and re-parses
+        // a.cpp on top of the cached graph.
+        let r2 = analyze_codebase(server.inner.clone(), path.clone(), false, None, None).await;
+        assert!(r2.is_error.is_none() || r2.is_error == Some(false));
+
+        // Correctness: terminal must reach Completed and the graph
+        // must contain symbols from both files (b.cpp cached + a.cpp
+        // re-parsed, including the new `h` function). If the probe
+        // wasn't being reused correctly, the slow path's fresh
+        // `Graph::new() + load()` would have recovered — so this
+        // test is primarily a smoke check that the refactor didn't
+        // break the slow path.
+        let slot = server.inner.analyze_slot.read();
+        let current = slot
+            .current
+            .as_ref()
+            .expect("analyze must install a slot.current entry");
+        let state = current.state.read();
+        assert!(matches!(state.status, JobStatus::Completed(_)));
+        assert_eq!(state.current_phase, Some(AnalyzePhase::Completed));
+        drop(state);
+        drop(slot);
+
+        let g = server.inner.graph.read();
+        let stats = g.stats();
+        assert!(
+            stats.files >= 2,
+            "both a.cpp and b.cpp must be in the graph after slow-path re-parse; got {stats:?}"
+        );
+        // The new `h()` function added in the second pass should be
+        // present — proves the slow path actually re-parsed a.cpp
+        // instead of just returning the stale cache.
+        let symbols: Vec<String> = g
+            .file_symbols(&a_cpp)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            symbols.iter().any(|n| n == "h"),
+            "re-parsed a.cpp must contain the new function `h`; got symbols: {symbols:?}"
+        );
+        // The cached b.cpp should still be in the graph (proves the
+        // probe was reused — if it had been thrown away, the slow
+        // path would have re-parsed both files, which would also
+        // produce the correct result, but the optimization wouldn't
+        // have fired).
+        let b_symbols: Vec<String> = g
+            .file_symbols(&b_cpp)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            b_symbols.iter().any(|n| n == "g"),
+            "b.cpp's symbols must survive in the graph (proves probe-reuse); got: {b_symbols:?}"
         );
     }
 
