@@ -99,6 +99,33 @@ impl ProgressSink for JobAwareProgressSink {
     }
 }
 
+impl JobAwareProgressSink {
+    /// Atomic phase transition + peer-notification emission. Calls
+    /// `AnalyzeJob::set_phase` to mutate job state (which sets the
+    /// phase-specific message and resets `progress`), then pushes a
+    /// snapshot of that state through the inner [`ChannelProgressSink`]
+    /// so the MCP `notifications/progress` peer stream observes the
+    /// phase boundary. Without this push, peers polling via the
+    /// notification channel would never see a "Resolving cross-file
+    /// edges" / "Persisting cache to disk" event — only via
+    /// `get_status` polling — because no per-step `report()` fires
+    /// from the worker between phase boundaries (and during persist
+    /// there are no per-step reports AT ALL).
+    ///
+    /// The push bypasses `Self::report` to avoid re-writing the same
+    /// values to `job.state` that `set_phase` already wrote (the read
+    /// snapshot ensures the pushed event exactly matches what
+    /// `get_status` would return at this instant).
+    fn transition_to(&self, phase: crate::analyze_job::AnalyzePhase) {
+        self.job.set_phase(phase);
+        let (progress, total, message) = {
+            let s = self.job.state.read();
+            (s.progress, s.progress_total, s.progress_message.clone())
+        };
+        self.inner.report(progress, total, &message);
+    }
+}
+
 /// Run the analyze pipeline to terminal state on a shared `AnalyzeJob`.
 ///
 /// Writes `JobStatus::Completed(AnalyzeResult)` or `JobStatus::Failed(msg)`
@@ -258,6 +285,15 @@ pub(crate) async fn run_analyze_job(
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+    // Clone the sender BEFORE `tx` moves into the sink. The clone
+    // outlives `spawn_blocking` and is used to emit the Persisting
+    // phase-boundary notification (which fires AFTER the blocking
+    // handle completes — sink and its `tx` are dropped at that
+    // point, so without this clone the mpsc channel would close and
+    // the forwarder would exit before Persisting could push). Kept
+    // alive through the persist-and-finalize sequence and dropped at
+    // the very end, just before the forwarder is awaited.
+    let tx_post_blocking = tx.clone();
 
     eprintln!(
         "[code-graph] analyze_codebase: progress_token_present={}",
@@ -361,22 +397,22 @@ pub(crate) async fn run_analyze_job(
             "[code-graph] phase: discovering + parsing under {}",
             abs_path_for_pool.display()
         );
-        sink.job.set_phase(AnalyzePhase::Discovering);
+        sink.transition_to(AnalyzePhase::Discovering);
         let phase_start = std::time::Instant::now();
         // `index_directory` starts with a file-walk (Discovering) and
         // then runs the rayon parse pool (Parsing). The first
-        // `ProgressSink::report` from the parse loop will overwrite
-        // progress/total/message with a Parsing snapshot; the only
-        // observable Discovering window is between this `set_phase` and
-        // the first parse report. We flip to Parsing right before
-        // entering `index_directory` so the dominant in-flight phase
-        // for polling clients is `parsing`, with `discovering` reserved
-        // for the briefly observable file-walk if the parse pool hasn't
-        // reported yet on a fast project. Doing both here keeps the
-        // worker code linear at the cost of overlapping the two flags;
-        // clients should treat both as "indexing in flight, dominant
-        // cost will be Parsing".
-        sink.job.set_phase(AnalyzePhase::Parsing);
+        // per-file `ProgressSink::report` from the parse loop will
+        // overwrite progress/total/message with a Parsing snapshot;
+        // the only observable Discovering window is between this
+        // `transition_to` and the first parse report. We flip to
+        // Parsing right before entering `index_directory` so the
+        // dominant in-flight phase for polling clients is `parsing`,
+        // with `discovering` reserved for the briefly observable
+        // file-walk. Each `transition_to` ALSO pushes a peer
+        // notification through the mpsc channel, so a client listening
+        // to MCP `notifications/progress` sees the phase boundary
+        // event in addition to the per-file events.
+        sink.transition_to(AnalyzePhase::Parsing);
         let (mut fresh_graphs, parse_warnings) =
             match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
                 Ok(v) => v,
@@ -390,7 +426,7 @@ pub(crate) async fn run_analyze_job(
         );
 
         eprintln!("[code-graph] phase: resolving edges");
-        sink.job.set_phase(AnalyzePhase::Resolving);
+        sink.transition_to(AnalyzePhase::Resolving);
         let phase_start = std::time::Instant::now();
         let cached_snapshot = merged_graph.file_graphs_snapshot();
         let mut symbol_index = build_symbol_index(&cached_snapshot);
@@ -444,91 +480,122 @@ pub(crate) async fn run_analyze_job(
 
     let blocking_result = blocking_handle.await;
 
+    // NOTE on cleanup ordering: the forwarder is awaited AFTER all
+    // post-blocking work, not right after `blocking_handle.await` (as
+    // earlier revisions did). The forwarder is kept alive so the
+    // Persisting phase-boundary notification can fan out to the peer.
+    // The mpsc rx stays open as long as `tx_post_blocking` holds a
+    // sender; dropping it just before `forwarder.await` lets the loop
+    // drain and flush the final pending event. Every early-return
+    // path below funnels through the single tail block at the bottom
+    // of this function so cleanup never leaks.
+
+    let outcome: Result<AnalyzeResult, String> = match blocking_result {
+        Ok(Ok((merged_graph, blocking_warnings))) => {
+            warnings.extend(blocking_warnings);
+            if merged_graph.stats().files == 0 {
+                Err(format!(
+                    "no supported source files found in {}",
+                    abs_path.display()
+                ))
+            } else {
+                let stats = {
+                    let mut g = inner.graph.write();
+                    *g = merged_graph;
+                    g.stats()
+                };
+
+                *inner.root_path.write() = Some(project_root.clone());
+                *inner.config.write() = cfg;
+                inner.indexed.store(true, Ordering::Release);
+                inner
+                    .index_built_at
+                    .store(now_nanos_u64(), Ordering::Release);
+                inner.index_force_built.store(force, Ordering::Release);
+
+                if abs_path != project_root {
+                    let in_scope_count = {
+                        let g = inner.graph.read();
+                        g.files_in_scope_count(&abs_path)
+                    };
+                    let out_of_scope_count = stats.files.saturating_sub(in_scope_count as u32);
+                    if out_of_scope_count > 0 {
+                        warnings.push(format!(
+                            "project cache contains {} file(s) outside the current scope ({}); \
+                             they are preserved across this invocation. Run analyze_codebase at {} \
+                             to refresh them, or force=true at any subtree to invalidate it.",
+                            out_of_scope_count,
+                            abs_path.display(),
+                            project_root.display()
+                        ));
+                    }
+                }
+
+                eprintln!(
+                    "[code-graph] phase: saving cache to {}",
+                    project_root.display()
+                );
+                // Transition to Persisting AND emit the phase-boundary
+                // notification through the still-alive forwarder. The
+                // sink itself is gone (spawn_blocking ended), so we
+                // mutate the job state directly via `set_phase` and
+                // push the snapshot through `tx_post_blocking`. Without
+                // this push, peers listening on
+                // `notifications/progress` would never observe the
+                // Persisting phase — `save_cache` has no per-step
+                // sink.report.
+                job.set_phase(AnalyzePhase::Persisting);
+                {
+                    let s = job.state.read();
+                    let evt = ProgressEvent {
+                        progress: s.progress,
+                        total: s.progress_total,
+                        message: s.progress_message.clone(),
+                    };
+                    drop(s);
+                    let _ = tx_post_blocking.try_send(evt);
+                }
+
+                let save_start = std::time::Instant::now();
+                if let Err(e) = save_cache(&inner.graph, &project_root) {
+                    warnings.push(format!("cache save failed: {e}"));
+                    eprintln!(
+                        "[code-graph] phase: save FAILED ({:.1}s)",
+                        save_start.elapsed().as_secs_f64()
+                    );
+                } else {
+                    eprintln!(
+                        "[code-graph] phase: save done ({:.1}s)",
+                        save_start.elapsed().as_secs_f64()
+                    );
+                }
+
+                Ok(AnalyzeResult {
+                    files: stats.files,
+                    symbols: stats.nodes,
+                    edges: stats.edges,
+                    root_path: project_root.to_string_lossy().into_owned(),
+                    warnings,
+                })
+            }
+        }
+        Ok(Err(e)) => Err(format!("indexing failed: {e}")),
+        Err(join_err) => Err(format!("indexing task panicked: {join_err}")),
+    };
+
+    // Tail cleanup. Drop the persist-side sender so `rx.recv()`
+    // returns None and the forwarder loop exits; then await the
+    // forwarder so its trailing flush (final pending notification)
+    // completes before this function returns. Finally stamp the
+    // terminal status on the job.
+    drop(tx_post_blocking);
     if let Some(handle) = forwarder {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
-
-    let (merged_graph, blocking_warnings) = match blocking_result {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            finish_failed(&job, format!("indexing failed: {e}"));
-            return;
-        }
-        Err(join_err) => {
-            finish_failed(&job, format!("indexing task panicked: {join_err}"));
-            return;
-        }
-    };
-
-    warnings.extend(blocking_warnings);
-
-    if merged_graph.stats().files == 0 {
-        finish_failed(
-            &job,
-            format!("no supported source files found in {}", abs_path.display()),
-        );
-        return;
+    match outcome {
+        Ok(result) => finish_completed(&job, result),
+        Err(msg) => finish_failed(&job, msg),
     }
-
-    let stats = {
-        let mut g = inner.graph.write();
-        *g = merged_graph;
-        g.stats()
-    };
-
-    *inner.root_path.write() = Some(project_root.clone());
-    *inner.config.write() = cfg;
-    inner.indexed.store(true, Ordering::Release);
-    inner
-        .index_built_at
-        .store(now_nanos_u64(), Ordering::Release);
-    inner.index_force_built.store(force, Ordering::Release);
-
-    if abs_path != project_root {
-        let in_scope_count = {
-            let g = inner.graph.read();
-            g.files_in_scope_count(&abs_path)
-        };
-        let out_of_scope_count = stats.files.saturating_sub(in_scope_count as u32);
-        if out_of_scope_count > 0 {
-            warnings.push(format!(
-                "project cache contains {} file(s) outside the current scope ({}); \
-                 they are preserved across this invocation. Run analyze_codebase at {} \
-                 to refresh them, or force=true at any subtree to invalidate it.",
-                out_of_scope_count,
-                abs_path.display(),
-                project_root.display()
-            ));
-        }
-    }
-
-    eprintln!(
-        "[code-graph] phase: saving cache to {}",
-        project_root.display()
-    );
-    job.set_phase(AnalyzePhase::Persisting);
-    let save_start = std::time::Instant::now();
-    if let Err(e) = save_cache(&inner.graph, &project_root) {
-        warnings.push(format!("cache save failed: {e}"));
-        eprintln!(
-            "[code-graph] phase: save FAILED ({:.1}s)",
-            save_start.elapsed().as_secs_f64()
-        );
-    } else {
-        eprintln!(
-            "[code-graph] phase: save done ({:.1}s)",
-            save_start.elapsed().as_secs_f64()
-        );
-    }
-
-    let result = AnalyzeResult {
-        files: stats.files,
-        symbols: stats.nodes,
-        edges: stats.edges,
-        root_path: project_root.to_string_lossy().into_owned(),
-        warnings,
-    };
-    finish_completed(&job, result);
 }
 
 /// Stamp terminal state under a single `state.write()` so an observer
@@ -767,6 +834,99 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.cpp"), b"void f() {}\n").unwrap();
         dir
+    }
+
+    /// `JobAwareProgressSink::transition_to` is the helper that
+    /// guarantees a peer-visible phase boundary notification. Two
+    /// post-conditions:
+    ///   1. The job state reflects the new phase + its phase-specific
+    ///      message (matches `AnalyzeJob::set_phase` semantics).
+    ///   2. The inner mpsc receives a `ProgressEvent` carrying the
+    ///      same `(progress, total, message)` triple — so the
+    ///      forwarder can fan it out as an MCP
+    ///      `notifications/progress` event.
+    ///
+    /// Without (2), peers polling via the notification stream would
+    /// never observe the Persisting boundary (cache serialization
+    /// has no per-step `report` of its own), and the
+    /// Parsing→Resolving transition would only be visible via
+    /// `get_status` polling.
+    #[tokio::test]
+    async fn transition_to_emits_phase_boundary_notification() {
+        use crate::analyze_job::AnalyzePhase;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::indexer::ProgressEvent>(8);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        // Seed prior phase state to verify set_phase's reset
+        // semantics carry through transition_to.
+        {
+            let mut s = job.state.write();
+            s.progress = 100;
+            s.progress_total = 100;
+            s.progress_message = "Parsing: foo.cpp".to_string();
+        }
+        let sink = JobAwareProgressSink {
+            inner: crate::indexer::ChannelProgressSink(tx),
+            job: Arc::clone(&job),
+        };
+
+        sink.transition_to(AnalyzePhase::Resolving);
+
+        // Post-condition 1: job state reflects the phase transition.
+        let s = job.state.read();
+        assert_eq!(s.current_phase, Some(AnalyzePhase::Resolving));
+        assert_eq!(s.progress, 0, "set_phase resets progress");
+        assert_eq!(
+            s.progress_total, 100,
+            "Resolving preserves prior progress_total"
+        );
+        assert_eq!(s.progress_message, "Resolving cross-file edges");
+        drop(s);
+
+        // Post-condition 2: mpsc receives a ProgressEvent with the
+        // same snapshot. `try_recv` should succeed immediately because
+        // transition_to pushes synchronously via try_send.
+        let evt = rx
+            .try_recv()
+            .expect("transition_to must push a ProgressEvent to the inner sink");
+        assert_eq!(evt.progress, 0);
+        assert_eq!(evt.total, 100);
+        assert_eq!(evt.message, "Resolving cross-file edges");
+        // No further events are queued (single transition emits a
+        // single event).
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `transition_to(Persisting)` emits the Persisting-specific
+    /// snapshot: `(progress=0, total=1, "Persisting cache to disk")`.
+    /// Pins the wire shape callers depend on for the notification
+    /// stream during cache serialization.
+    #[tokio::test]
+    async fn transition_to_persisting_emits_synthetic_one_of_one() {
+        use crate::analyze_job::AnalyzePhase;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::indexer::ProgressEvent>(8);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        {
+            let mut s = job.state.write();
+            s.progress = 63784;
+            s.progress_total = 63784;
+            s.progress_message = "Resolving edges: last.cpp".to_string();
+        }
+        let sink = JobAwareProgressSink {
+            inner: crate::indexer::ChannelProgressSink(tx),
+            job: Arc::clone(&job),
+        };
+
+        sink.transition_to(AnalyzePhase::Persisting);
+
+        let evt = rx
+            .try_recv()
+            .expect("transition_to(Persisting) must push a ProgressEvent");
+        assert_eq!(evt.progress, 0);
+        assert_eq!(
+            evt.total, 1,
+            "Persisting uses a synthetic single-task total of 1"
+        );
+        assert_eq!(evt.message, "Persisting cache to disk");
     }
 
     #[tokio::test]
