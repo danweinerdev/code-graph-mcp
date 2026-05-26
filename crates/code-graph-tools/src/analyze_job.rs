@@ -17,16 +17,17 @@ use parking_lot::RwLock as PlRwLock;
 
 use crate::handlers::analyze::AnalyzeResult;
 
-// Slot field reads, the constructor, the terminal-status helper, and the
-// terminal-variant payload reads land in 1.3 (sync handler) and 1.4 (async
-// handler + get_status view). Narrow allows here keep the rest of the
-// module under full dead-code lint coverage as the worker (1.2) already
-// reads `path`, `force`, `state`, `status` (via write), and matches the
-// `JobStatus` variants in `finish_*`.
+// Narrow `#[allow(dead_code)]` cover the surface area exercised only by
+// 1.4 (async handler + get_status view): `previous_terminal` is written
+// here but read by `get_status`; `job_id` / `started_at` ride the wire
+// in the async kickoff response; `is_terminal` is the rotation helper
+// used by both handlers when 1.4 lands. The sync handler (1.3) already
+// reads `current`, `state`, `status` (Running / Completed / Failed), and
+// calls `new_running` — no allow needed for those.
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
+    #[allow(dead_code)]
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
 }
 
@@ -50,7 +51,6 @@ pub(crate) struct JobMutableState {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) enum JobStatus {
     #[default]
     Running,
@@ -59,7 +59,6 @@ pub(crate) enum JobStatus {
 }
 
 impl AnalyzeJob {
-    #[allow(dead_code)]
     pub(crate) fn new_running(
         job_id: String,
         path: String,
