@@ -42,6 +42,11 @@ fn tools_list_analyze_codebase() {
 }
 
 #[test]
+fn tools_list_analyze_codebase_async() {
+    insta::assert_json_snapshot!(tool_entry("analyze_codebase_async"));
+}
+
+#[test]
 fn tools_list_get_file_symbols() {
     insta::assert_json_snapshot!(tool_entry("get_file_symbols"));
 }
