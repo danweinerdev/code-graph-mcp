@@ -5,7 +5,7 @@
 //! This crate wires the language parsers and the graph engine into a
 //! running MCP server. Submodule responsibilities:
 //!
-//! - [`server`] — `CodeGraphServer`, `ServerInner`, the 15-tool dispatch
+//! - [`server`] — `CodeGraphServer`, `ServerInner`, the 19-tool dispatch
 //!   table, and `require_indexed`.
 //! - [`discovery`] — parallel filesystem walker.
 //! - [`indexer`] — per-job rayon parsing pool, edge resolution, progress

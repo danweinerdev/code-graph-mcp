@@ -34,6 +34,7 @@ use crate::indexer::{
 };
 use crate::server::ServerInner;
 
+use super::status::format_unix_nanos_rfc3339;
 use super::{tool_error, tool_success_json};
 
 /// JSON-shape mirror of Go's `analyzeResult` in `internal/tools/analyze.go`.
@@ -590,6 +591,126 @@ pub async fn analyze_codebase(
             unreachable!("run_analyze_job must write a terminal JobStatus before returning")
         }
     }
+}
+
+/// `analyze_codebase_async` body — kickoff handler that returns in
+/// milliseconds regardless of indexing duration.
+///
+/// Identical slot protocol to [`analyze_codebase`] (Design Decision 1)
+/// except the worker is `tokio::spawn`ed and detached instead of
+/// `await`ed inline, and a duplicate kickoff against a `Running` slot
+/// is a SUCCESS (not an error — Design Decision 3) carrying the
+/// in-flight job's `job_id` with `existing: true`.
+///
+/// Protocol:
+/// 1. Pre-rotation cheap validation. Empty path returns immediately —
+///    no slot touch, mirroring sync wording.
+/// 2. Acquire the slot write lock. If `current` is `Running`, snapshot
+///    `(job_id, started_at)`, drop the guard, and return the duplicate
+///    response with `existing: true`. Args of the duplicate call
+///    (including `force`) are ignored.
+/// 3. Otherwise rotate any terminal `current` into `previous_terminal`,
+///    install a fresh `Running` job, drop the guard.
+/// 4. `tokio::spawn(run_analyze_job(inner, job))` — the `JoinHandle` is
+///    dropped to detach the worker.
+/// 5. Return the kickoff response with `existing: false` carrying the
+///    new `job_id` and `started_at`.
+///
+/// No `peer`/`progress_token` arguments — async kickoff has no
+/// client-side progress channel; agents observe progress by polling
+/// `get_status`.
+pub async fn analyze_codebase_async(
+    inner: Arc<ServerInner>,
+    path_raw: String,
+    force: bool,
+) -> CallToolResult {
+    if path_raw.is_empty() {
+        return tool_error("'path' is required");
+    }
+
+    enum Kickoff {
+        Existing { job_id: String, started_at: u64 },
+        New(Arc<AnalyzeJob>),
+    }
+
+    let kickoff = {
+        let mut slot = inner.analyze_slot.write();
+        if let Some(cur) = &slot.current {
+            if matches!(cur.state.read().status, JobStatus::Running) {
+                let existing = Kickoff::Existing {
+                    job_id: cur.job_id.clone(),
+                    started_at: cur.started_at,
+                };
+                drop(slot);
+                existing
+            } else {
+                let job = install_new_running(&mut slot, path_raw.clone(), force);
+                Kickoff::New(job)
+            }
+        } else {
+            let job = install_new_running(&mut slot, path_raw.clone(), force);
+            Kickoff::New(job)
+        }
+    };
+
+    match kickoff {
+        Kickoff::Existing { job_id, started_at } => tool_success_json(&AsyncKickoffResponse {
+            job_id,
+            status: "running",
+            started_at: format_unix_nanos_rfc3339(started_at),
+            existing: true,
+            note: "analyze already in progress — args ignored; poll get_status for progress",
+        }),
+        Kickoff::New(job) => {
+            let response = AsyncKickoffResponse {
+                job_id: job.job_id.clone(),
+                status: "running",
+                started_at: format_unix_nanos_rfc3339(job.started_at),
+                existing: false,
+                note: "analyze kicked off — poll get_status for progress and the terminal result",
+            };
+            // Detach: the JoinHandle is dropped intentionally so the
+            // worker outlives this handler invocation. Terminal state
+            // flows back through `job.state`, observable via get_status.
+            tokio::spawn(run_analyze_job(
+                Arc::clone(&inner),
+                Arc::clone(&job),
+                None,
+                None,
+            ));
+            tool_success_json(&response)
+        }
+    }
+}
+
+/// Slot-rotation primitive shared by the async kickoff and (potentially)
+/// future callers. Caller holds the slot write guard; this helper moves
+/// any terminal `current` into `previous_terminal`, installs a fresh
+/// `Running` job, and returns the Arc.
+fn install_new_running(
+    slot: &mut crate::analyze_job::AnalyzeSlot,
+    path: String,
+    force: bool,
+) -> Arc<AnalyzeJob> {
+    let started_at = now_nanos_u64();
+    let job_id = format!("{started_at:020}");
+    let job = AnalyzeJob::new_running(job_id, path, force, started_at);
+    if let Some(prev) = slot.current.take() {
+        slot.previous_terminal = Some(prev);
+    }
+    slot.current = Some(Arc::clone(&job));
+    job
+}
+
+/// Wire shape of the `analyze_codebase_async` kickoff response.
+/// `< 1KB` by construction — five fields, no nested payload.
+#[derive(Debug, Serialize)]
+struct AsyncKickoffResponse {
+    job_id: String,
+    status: &'static str,
+    started_at: String,
+    existing: bool,
+    note: &'static str,
 }
 
 /// Save the graph to `<dir>/.code-graph-cache.db`. Lifted to a helper so

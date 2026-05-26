@@ -1,6 +1,6 @@
-//! MCP server that exposes the code graph as 15 rmcp tools over stdio.
+//! MCP server that exposes the code graph as 19 rmcp tools over stdio.
 //!
-//! Phase 3.1 shipped the scaffold: [`CodeGraphServer`] with all 15 tools
+//! Phase 3.1 shipped the scaffold: [`CodeGraphServer`] with all tools
 //! wired through `#[tool_router]` plus the `ServerInner` state struct.
 //! Every tool handler is now implemented; query handlers gate on
 //! `ServerInner::require_indexed` before touching the graph.
@@ -8,7 +8,7 @@
 //! ## Tool wire format
 //!
 //! Tool descriptions are copied byte-for-byte from the Go reference at
-//! `internal/tools/tools.go` for 13 of the 15 tools. Two are updated for
+//! `internal/tools/tools.go` for the Go-derived tools. Two are updated for
 //! the multi-language Rust port:
 //!
 //! - `analyze_codebase`: widened from "Index a C/C++ codebase…" to "Index a
@@ -117,7 +117,7 @@ pub struct ServerInner {
     pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
-/// MCP server exposing the code graph through 15 tools.
+/// MCP server exposing the code graph through 19 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -157,7 +157,8 @@ impl CodeGraphServer {
     }
 
     /// Number of registered tools. Used by the smoke test to confirm the
-    /// `#[tool_router]` macro produced 15 entries before any IO loop runs.
+    /// `#[tool_router]` macro produced the expected entries before any IO
+    /// loop runs.
     pub fn tool_count(&self) -> usize {
         self.tool_router.list_all().len()
     }
@@ -267,6 +268,17 @@ pub struct EmptyParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeCodebaseArgs {
+    /// Absolute path to the directory to index.
+    #[schemars(description = "Absolute path to the directory to index")]
+    pub path: String,
+    /// Force full re-index, ignoring any cache.
+    #[schemars(description = "Force full re-index, ignoring any cache (default false)")]
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeCodebaseAsyncArgs {
     /// Absolute path to the directory to index.
     #[schemars(description = "Absolute path to the directory to index")]
     pub path: String,
@@ -645,6 +657,63 @@ impl CodeGraphServer {
             args.force.unwrap_or(false),
             Some(peer),
             progress_token,
+        )
+        .await)
+    }
+
+    #[tool(
+        description = "Kick off `analyze_codebase` on a background task and return \
+                       immediately (< 1KB, sub-second) with a job handle. The indexing \
+                       pipeline runs detached on the tokio runtime; agents observe \
+                       progress and the terminal result by polling `get_status`. \
+                       Prefer this over the sync `analyze_codebase` for large \
+                       codebases (UE / LLVM-scale, ~130-200s wall time) or any case \
+                       where the client's `MCP_TOOL_TIMEOUT` could fire on a long \
+                       sync call — every individual tool call is sub-second, so the \
+                       per-call timer never fires. Args: `path` (required, absolute \
+                       path to index — same wording as `analyze_codebase`), `force` \
+                       (optional, default false — full re-index ignoring the cache). \
+                       Response shape: \
+                       `{ job_id, status, started_at, existing, note }`. `job_id` is \
+                       a 20-char zero-padded nanosecond timestamp unique-by-construction \
+                       under single-flight; `status` is always the literal \
+                       `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
+                       `existing` is the duplicate-call discriminator (see below); \
+                       `note` is a short human-readable hint. **Polling pattern:** \
+                       call `get_status` and read the `analyze_job` field. Poll \
+                       while `analyze_job.status == \"running\"`; once it flips to \
+                       `\"completed\"` read `analyze_job.result` (byte-identical \
+                       shape to `analyze_codebase`'s success body — `{ files, \
+                       symbols, edges, root_path, warnings }`); on `\"failed\"` \
+                       read `analyze_job.error`. A poll cadence of 250-1000ms is \
+                       a reasonable starting point — the slot and inner state \
+                       locks are held only for `Arc::clone` and a small struct \
+                       read on each poll, so polling does not contend with the \
+                       worker meaningfully. **Grace window:** after a job \
+                       terminates its result is preserved in \
+                       `analyze_job_previous_terminal` for exactly ONE additional \
+                       kickoff — if you start a new analyze before reading the \
+                       prior terminal, the prior result is still recoverable for \
+                       that one rotation, after which it is gone. **Duplicate \
+                       kickoff (`existing: true`):** if a job is already in \
+                       flight when this is called, the response returns that \
+                       job's `job_id` and `started_at` with `existing: true` \
+                       (NOT a new job_id; NOT an error). Args of the duplicate \
+                       call — including `path` and `force` — are IGNORED; if \
+                       `force` is required, wait for the in-flight job to \
+                       terminate (poll `get_status`) and call again. Sync \
+                       `analyze_codebase` called against a `Running` slot \
+                       continues to error with `\"indexing already in progress\"` \
+                       — only async kickoff returns the duplicate-as-success."
+    )]
+    async fn analyze_codebase_async(
+        &self,
+        Parameters(args): Parameters<AnalyzeCodebaseAsyncArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(handlers::analyze::analyze_codebase_async(
+            self.inner.clone(),
+            args.path,
+            args.force.unwrap_or(false),
         )
         .await)
     }
@@ -1441,16 +1510,16 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// `tools/list` must surface exactly 18 tools. If a future change adds
+    /// `tools/list` must surface exactly 19 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_eighteen_tools() {
+    fn tool_router_registers_nineteen_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            18,
-            "expected 18 registered tools, got {}",
+            19,
+            "expected 19 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -1469,6 +1538,7 @@ mod tests {
             .collect();
         for expected in [
             "analyze_codebase",
+            "analyze_codebase_async",
             "get_file_symbols",
             "search_symbols",
             "get_symbol_detail",

@@ -24,7 +24,7 @@ tasks:
     depends_on: ["1.2"]
   - id: "1.4"
     title: "Add analyze_codebase_async tool handler + arg struct + tool registration"
-    status: planned
+    status: complete
     verification: "`crates/code-graph-tools/src/handlers/analyze.rs` gains `pub async fn analyze_codebase_async(inner: Arc<ServerInner>, path_raw: String, force: bool) -> CallToolResult` implementing the kickoff protocol: (a) acquire `analyze_slot.write()`; (b) if `current` is `Running`, build response with `existing: true` carrying the existing job_id and return; (c) otherwise validate args (path non-empty — args validation errors return `tool_error` with same wording as sync, NO slot rotation on validation failure); (d) rotate, install new Running job, drop guard; (e) `tokio::spawn(run_analyze_job(inner, job_arc))`; (f) return success JSON `{ job_id, status: \"running\", started_at, existing: false, note }`. New arg struct `AnalyzeCodebaseAsyncArgs { path: String, force: Option<bool> }` parallel to existing `AnalyzeCodebaseArgs`. New tool method `async fn analyze_codebase_async(&self, ...) -> Result<CallToolResult, McpError>` on `CodeGraphServer` in `crates/code-graph-tools/src/server.rs` registered via `#[tool(description = …)]` — description landed in this task per Key Decision 2 (operationally explains poll pattern, names the response shape, names the grace-window semantics, names the `existing: true` semantic). `job_id` is a 20-char zero-padded decimal nanosecond timestamp from existing `now_nanos_u64()` (Decision 6). `started_at` is RFC3339 via existing `format_unix_nanos_rfc3339()` helper. `tool_count()` returns 19 (was 18). `cargo build` clean."
     depends_on: ["1.3"]
   - id: "1.5"
@@ -110,8 +110,8 @@ The `unreachable!()` for `JobStatus::Running` after the worker's `await` is corr
 ## 1.4: Add analyze_codebase_async tool handler + arg struct + tool registration
 
 ### Subtasks
-- [ ] Add `pub async fn analyze_codebase_async(inner: Arc<ServerInner>, path_raw: String, force: bool) -> CallToolResult` to `handlers/analyze.rs`. (No peer/token — async mode has no client-side progress channel.)
-- [ ] Handler body:
+- [x] Add `pub async fn analyze_codebase_async(inner: Arc<ServerInner>, path_raw: String, force: bool) -> CallToolResult` to `handlers/analyze.rs`. (No peer/token — async mode has no client-side progress channel.)
+- [x] Handler body:
   - Acquire `inner.analyze_slot.write()`.
   - If `current.is_some()` and `matches!(current.state.read().status, JobStatus::Running)`:
     - Capture `existing_id = current.job_id.clone()` and `existing_started_at_rfc3339`.
@@ -123,8 +123,8 @@ The `unreachable!()` for `JobStatus::Running` after the worker's `await` is corr
   - Drop slot guard.
   - `tokio::spawn(run_analyze_job(Arc::clone(&inner), Arc::clone(&job)))` — return value (`JoinHandle`) is dropped, detaching the task.
   - Return response with `existing: false` carrying the new job_id and started_at.
-- [ ] Add `#[derive(Debug, Deserialize, JsonSchema)] pub struct AnalyzeCodebaseAsyncArgs { pub path: String, pub force: Option<bool> }` to `server.rs` next to the existing `AnalyzeCodebaseArgs`.
-- [ ] Add tool method on `CodeGraphServer` in `server.rs`:
+- [x] Add `#[derive(Debug, Deserialize, JsonSchema)] pub struct AnalyzeCodebaseAsyncArgs { pub path: String, pub force: Option<bool> }` to `server.rs` next to the existing `AnalyzeCodebaseArgs`.
+- [x] Add tool method on `CodeGraphServer` in `server.rs`:
   ```rust
   #[tool(description = "...")]
   async fn analyze_codebase_async(
@@ -138,11 +138,11 @@ The `unreachable!()` for `JobStatus::Running` after the worker's `await` is corr
       ).await)
   }
   ```
-- [ ] Tool description body — write per the "Agent-facing tool descriptions" lens in CLAUDE.md. Must include: args + defaults; the immediate-return semantic (`< 1KB response, status: "running"`); the poll pattern (call `get_status`, read `analyze_job` field, look for `status: "completed"` or `status: "failed"`); the grace-window semantic (`analyze_job_previous_terminal` holds the previous terminal if the slot has rotated); the `existing: true` semantic; and the explicit hint that args of a duplicate call are ignored (Decision 3). Length: comparable to other complex tool descriptions in the same file (e.g., `get_file_symbols`'s description).
-- [ ] Add the new tool name to the `tool_router_contains_every_expected_name` test's expected set in `server.rs` (or wherever the expected-tool-name list lives). Update `tool_count` assertions if any test pins the count to 18 (update to 19). Update any "18 registered tools" doc comment in `tests/snapshot_tools_list.rs` to "19".
-- [ ] Note: the corresponding per-tool snapshot test `tools_list_analyze_codebase_async` and its `.snap` file are added in Task 2.4 (snapshot rebaseline ritual) — this task is the compile-time / runtime regression update only.
-- [ ] `cargo build -p code-graph-tools` clean.
-- [ ] `cargo test -p code-graph-tools tool_count` (or the equivalent existing test) passes with new count.
+- [x] Tool description body — write per the "Agent-facing tool descriptions" lens in CLAUDE.md. Must include: args + defaults; the immediate-return semantic (`< 1KB response, status: "running"`); the poll pattern (call `get_status`, read `analyze_job` field, look for `status: "completed"` or `status: "failed"`); the grace-window semantic (`analyze_job_previous_terminal` holds the previous terminal if the slot has rotated); the `existing: true` semantic; and the explicit hint that args of a duplicate call are ignored (Decision 3). Length: comparable to other complex tool descriptions in the same file (e.g., `get_file_symbols`'s description).
+- [x] Add the new tool name to the `tool_router_contains_every_expected_name` test's expected set in `server.rs` (or wherever the expected-tool-name list lives). Update `tool_count` assertions if any test pins the count to 18 (update to 19). Update any "18 registered tools" doc comment in `tests/snapshot_tools_list.rs` to "19".
+- [x] Note: the corresponding per-tool snapshot test `tools_list_analyze_codebase_async` and its `.snap` file are added in Task 2.4 (snapshot rebaseline ritual) — this task is the compile-time / runtime regression update only.
+- [x] `cargo build -p code-graph-tools` clean.
+- [x] `cargo test -p code-graph-tools tool_count` (or the equivalent existing test) passes with new count.
 
 ### Notes
 The async handler does its own arg validation for the cheap checks (path non-empty) BEFORE rotating the slot. Disk-touching validation (canonicalize-path-fails, malformed toml) goes through the worker — that's a deliberate split to keep the kickoff handler's response time bounded by O(1) work, not by O(disk-stat) work that could be slow on a flaky NFS mount.

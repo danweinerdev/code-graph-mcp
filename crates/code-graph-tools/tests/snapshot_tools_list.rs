@@ -1,7 +1,7 @@
 //! Wire-format snapshots of every tool's `tools/list` entry.
 //!
 //! Captures the descriptor returned by
-//! `CodeGraphServer::tool_router().list_all()` for each of the 18 registered
+//! `CodeGraphServer::tool_router().list_all()` for each of the 19 registered
 //! tools. Each entry includes:
 //!
 //! - `name` — the tool name string used by `tools/call` dispatch.
@@ -23,7 +23,7 @@ use code_graph_tools::CodeGraphServer;
 use rmcp::model::Tool;
 
 /// Find a tool descriptor by name. Panics if the tool is missing — the
-/// 18-tool count is locked in by `tool_router_registers_eighteen_tools`,
+/// 19-tool count is locked in by `tool_router_registers_nineteen_tools`,
 /// so a missing tool here means a regression.
 fn tool_entry(name: &str) -> Tool {
     let server = CodeGraphServer::new(LanguageRegistry::new());
