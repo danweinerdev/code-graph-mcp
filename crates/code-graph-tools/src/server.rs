@@ -1489,7 +1489,21 @@ impl CodeGraphServer {
                        analyze_codebase + whether it was force-rebuilt. No side effects, no locks held across \
                        I/O — safe to call from any client at any time. Use this to verify which build is \
                        actually running before debugging behaviour, and to confirm config discovery picked \
-                       up the toml you expected."
+                       up the toml you expected. \
+                       \
+                       When an analyze is in flight or recently terminated, `analyze_job` carries \
+                       `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
+                       progress_message, error?, result? }`. Poll this tool while `analyze_job.status == \
+                       \"running\"` (a 250-1000ms cadence is reasonable — poll locks are constant-time); \
+                       read `analyze_job.result` once `status` flips to `\"completed\"` (shape: \
+                       `{ files, symbols, edges, root_path, warnings }`, byte-identical to \
+                       `analyze_codebase`'s success body), or `analyze_job.error` on `\"failed\"`. If \
+                       you've kicked off a new analyze before reading the previous terminal, \
+                       `analyze_job_previous_terminal` carries the prior terminal job for exactly one \
+                       grace-window kickoff (gone after the next rotation). Both fields are `null` \
+                       before any analyze has ever run, and emit explicit `null` (not absent) so \
+                       clients can distinguish \"no analyze ever\" from \"missing field on an old \
+                       server\"."
     )]
     async fn get_status(
         &self,

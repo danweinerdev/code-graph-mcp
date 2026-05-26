@@ -17,26 +17,20 @@ use parking_lot::RwLock as PlRwLock;
 
 use crate::handlers::analyze::AnalyzeResult;
 
-// Narrow `#[allow(dead_code)]` cover the surface area exercised only by
-// 1.4 (async handler + get_status view): `previous_terminal` is written
-// here but read by `get_status`; `job_id` / `started_at` ride the wire
-// in the async kickoff response; `is_terminal` is the rotation helper
-// used by both handlers when 1.4 lands. The sync handler (1.3) already
-// reads `current`, `state`, `status` (Running / Completed / Failed), and
-// calls `new_running` — no allow needed for those.
+// `is_terminal` is the rotation helper retained for callers who want
+// the predicate without pattern-matching on `JobStatus` directly —
+// kept for future use even though both handlers currently inline the
+// `matches!` check at their call sites.
 #[derive(Default)]
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
-    #[allow(dead_code)]
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
 }
 
 pub(crate) struct AnalyzeJob {
-    #[allow(dead_code)]
     pub(crate) job_id: String,
     pub(crate) path: String,
     pub(crate) force: bool,
-    #[allow(dead_code)]
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
 }

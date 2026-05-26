@@ -22,6 +22,8 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 
+use crate::analyze_job::{AnalyzeJob, JobStatus};
+use crate::handlers::analyze::AnalyzeResult;
 use crate::server::ServerInner;
 
 use super::tool_success_json;
@@ -88,6 +90,92 @@ pub struct StatusResult {
     /// full rebuild result" — the difference matters when the user
     /// is verifying a fix that requires a force-reindex to surface.
     pub index_force_built: Option<bool>,
+    /// Snapshot of the current `analyze_slot.current` job, when any
+    /// analyze has ever run (sync or async). `null` before the first
+    /// analyze. Serializes as explicit `null` (no
+    /// `skip_serializing_if`) so clients can distinguish "no analyze
+    /// ever" from "missing field on an old server" — matches the
+    /// `index_force_built` precedent above.
+    pub analyze_job: Option<AnalyzeJobView>,
+    /// Snapshot of the previous terminal job preserved across a single
+    /// grace-window kickoff (Design Decision 4). Becomes `null` again
+    /// once a second analyze terminates and rotates the slot. Same
+    /// explicit-`null` serialization rule as `analyze_job`.
+    pub analyze_job_previous_terminal: Option<AnalyzeJobView>,
+}
+
+/// Wire shape for one `AnalyzeJob` in a `get_status` response.
+///
+/// Snapshot taken under a single `job.state.read()` so `status` and
+/// its associated payload (`error` for Failed, `result` for Completed)
+/// are mutually consistent — see [`AnalyzeJobView::from_job`].
+///
+/// `status` serializes as the lowercase string `"running"`,
+/// `"completed"`, or `"failed"` — NOT the enum tag. `error` is
+/// populated ONLY when `status == "failed"`; `result` is populated
+/// ONLY when `status == "completed"`. The two never co-occur.
+#[derive(Debug, Serialize)]
+pub struct AnalyzeJobView {
+    /// 20-char zero-padded decimal nanosecond timestamp from
+    /// kickoff. Unique-by-construction under single-flight.
+    pub job_id: String,
+    /// `"running"` | `"completed"` | `"failed"`.
+    pub status: String,
+    /// User-supplied path that was indexed (as passed to the
+    /// originating `analyze_codebase` / `analyze_codebase_async`).
+    pub path: String,
+    /// `force` flag the originating call used.
+    pub force: bool,
+    /// RFC3339 UTC timestamp of kickoff.
+    pub started_at: String,
+    /// RFC3339 UTC timestamp of terminal transition; `null` while
+    /// `status == "running"`.
+    pub finished_at: Option<String>,
+    /// Files processed so far (monotonic during Running). On terminal
+    /// this is the last value the worker reported.
+    pub progress: u32,
+    /// Discovered file total. `0` during the discovery phase, set once
+    /// the indexer knows the universe.
+    pub progress_total: u32,
+    /// Human-readable phase label from the worker's most recent
+    /// `report()` call (e.g. `"parsing 42312/72345 files"`).
+    pub progress_message: String,
+    /// Failure message, `Some` only when `status == "failed"`.
+    pub error: Option<String>,
+    /// Terminal `AnalyzeResult`, `Some` only when `status ==
+    /// "completed"`. Byte-identical shape to `analyze_codebase`'s
+    /// success body.
+    pub result: Option<AnalyzeResult>,
+}
+
+impl AnalyzeJobView {
+    /// Project an [`AnalyzeJob`] onto its wire shape. Acquires
+    /// `job.state.read()` exactly once and snapshots every field
+    /// under that single guard, so `status`, `error`, and `result`
+    /// are mutually consistent with `progress` / `finished_at`. The
+    /// guard is dropped at the end of this scope; the returned view
+    /// owns its data and outlives the lock.
+    pub(crate) fn from_job(job: &AnalyzeJob) -> Self {
+        let state = job.state.read();
+        let (status, error, result) = match &state.status {
+            JobStatus::Running => ("running".to_string(), None, None),
+            JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
+            JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
+        };
+        Self {
+            job_id: job.job_id.clone(),
+            status,
+            path: job.path.clone(),
+            force: job.force,
+            started_at: format_unix_nanos_rfc3339(job.started_at),
+            finished_at: state.finished_at.map(format_unix_nanos_rfc3339),
+            progress: state.progress,
+            progress_total: state.progress_total,
+            progress_message: state.progress_message.clone(),
+            error,
+            result,
+        }
+    }
 }
 
 /// `get_status` body. Pure read — no locks held across `tool_success_json`.
@@ -135,6 +223,19 @@ pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
         None
     };
 
+    // Snapshot the slot under the read lock — just two Arc::clones —
+    // then drop the guard before walking the job state. Building views
+    // outside the slot lock keeps progress writes from contending with
+    // polls beyond the constant-time Arc::clone window.
+    let (current_job, previous_terminal_job) = {
+        let slot = inner.analyze_slot.read();
+        (slot.current.clone(), slot.previous_terminal.clone())
+    };
+    let analyze_job = current_job.as_deref().map(AnalyzeJobView::from_job);
+    let analyze_job_previous_terminal = previous_terminal_job
+        .as_deref()
+        .map(AnalyzeJobView::from_job);
+
     let result = StatusResult {
         binary_version,
         package_version,
@@ -149,6 +250,8 @@ pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
         index_edges: stats.edges,
         index_built_at,
         index_force_built,
+        analyze_job,
+        analyze_job_previous_terminal,
     };
 
     tool_success_json(&result)

@@ -3,7 +3,7 @@ title: "Implementation"
 type: phase
 plan: AnalyzeCodebaseAsync
 phase: 1
-status: in-progress
+status: complete
 created: 2026-05-23
 updated: 2026-05-25
 deliverable: "End-to-end working feature: `analyze_codebase_async` registered, `get_status` extended with `analyze_job` + `analyze_job_previous_terminal`, sync `analyze_codebase` rewritten to share the slot machinery (wire format unchanged). Agent can kick off → poll → read result. Tool descriptions and CLAUDE.md updated to document the polling pattern and grace-window semantics. Tests beyond what already covers the lifted code path land in Phase 2; this phase ships green via `cargo build` and the existing test suite (which must stay green after the sync refactor)."
@@ -29,7 +29,7 @@ tasks:
     depends_on: ["1.3"]
   - id: "1.5"
     title: "Extend StatusResult with analyze_job + analyze_job_previous_terminal fields + tool description + CLAUDE.md"
-    status: planned
+    status: complete
     verification: "`crates/code-graph-tools/src/handlers/status.rs::StatusResult` gains two optional fields: `pub analyze_job: Option<AnalyzeJobView>` and `pub analyze_job_previous_terminal: Option<AnalyzeJobView>` (both `#[serde(skip_serializing_if = \"Option::is_none\")]` … NO — see below). New type `AnalyzeJobView { job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error: Option<String>, result: Option<AnalyzeResult> }`. `status` serializes as `\"running\"` / `\"completed\"` / `\"failed\"` (lowercase string, not the enum tag). `error` populated only on Failed; `result` populated only on Completed. **Wire compatibility note:** per CLAUDE.md's existing `Page<T>` envelope contract pattern, new optional fields use `serde(default)` and the JSON SHOULD emit `null` (not absent) for unset values so clients can distinguish \"no analyze ever\" from \"missing field due to old server\" — match the project's convention by NOT using `skip_serializing_if` (emit `\"analyze_job\": null` explicitly). Conversion from `AnalyzeJob` + `JobMutableState` to `AnalyzeJobView` is a single helper `AnalyzeJobView::from(&AnalyzeJob)` that acquires `job.state.read()` once and snapshots. `get_status` handler reads `analyze_slot.read()`, Arc-clones the two job slots, drops the slot lock, builds two `AnalyzeJobView`s outside the slot lock. `get_status` tool description updated to mention the new fields and the poll-pattern hint. CLAUDE.md updated: tool count 18 → 19; new `analyze_codebase_async` row in the MCP tools table; `get_status` row mentions `analyze_job` and `analyze_job_previous_terminal`; new paragraph under the existing `MCP_TOOL_TIMEOUT` paragraph that async kickoff is the structural workaround; new paragraph under the watch handler section that sync `analyze_codebase` now waits for an in-flight watch reindex instead of erroring (Decision 9). `cargo build` clean; existing `get_status` tests stay green (response shape change is additive at the wire — old fields untouched)."
     depends_on: ["1.4"]
 tags: [analyze, mcp, async, get_status, single-flight]
@@ -150,22 +150,22 @@ The async handler does its own arg validation for the cheap checks (path non-emp
 ## 1.5: Extend StatusResult with analyze_job + analyze_job_previous_terminal fields + tool description + CLAUDE.md
 
 ### Subtasks
-- [ ] Add to `handlers/status.rs::StatusResult`:
+- [x] Add to `handlers/status.rs::StatusResult`:
   ```rust
   pub analyze_job: Option<AnalyzeJobView>,
   pub analyze_job_previous_terminal: Option<AnalyzeJobView>,
   ```
   Do NOT use `serde(skip_serializing_if = "Option::is_none")`. The existing precedent in `StatusResult` (`pub index_force_built: Option<bool>` at `status.rs:90` has no `skip_serializing_if` attribute and therefore serializes as `null` when `None`) is to emit `null` explicitly so clients can distinguish "no job ever" from "missing field due to old server". Match that precedent.
-- [ ] Define `pub struct AnalyzeJobView` with the 11 fields from the design (`job_id`, `status`, `path`, `force`, `started_at`, `finished_at`, `progress`, `progress_total`, `progress_message`, `error`, `result`). `status` is `String` ("running"/"completed"/"failed"). `finished_at` is RFC3339 `Option<String>`. `error` is `Option<String>`. `result` is `Option<AnalyzeResult>`.
-- [ ] Implement conversion: `impl AnalyzeJobView { pub fn from_job(job: &AnalyzeJob) -> Self }` — acquires `job.state.read()` once, snapshots into the view, drops the lock. The match on `JobStatus` populates `status` + `error` + `result` correctly (`Running` → status="running", error=None, result=None; `Completed(r)` → status="completed", error=None, result=Some(r.clone()); `Failed(e)` → status="failed", error=Some(e.clone()), result=None).
-- [ ] Update `handlers::status::get_status` body:
+- [x] Define `pub struct AnalyzeJobView` with the 11 fields from the design (`job_id`, `status`, `path`, `force`, `started_at`, `finished_at`, `progress`, `progress_total`, `progress_message`, `error`, `result`). `status` is `String` ("running"/"completed"/"failed"). `finished_at` is RFC3339 `Option<String>`. `error` is `Option<String>`. `result` is `Option<AnalyzeResult>`.
+- [x] Implement conversion: `impl AnalyzeJobView { pub fn from_job(job: &AnalyzeJob) -> Self }` — acquires `job.state.read()` once, snapshots into the view, drops the lock. The match on `JobStatus` populates `status` + `error` + `result` correctly (`Running` → status="running", error=None, result=None; `Completed(r)` → status="completed", error=None, result=Some(r.clone()); `Failed(e)` → status="failed", error=Some(e.clone()), result=None).
+- [x] Update `handlers::status::get_status` body:
   - After building the existing `StatusResult` fields, acquire `inner.analyze_slot.read()`.
   - Arc-clone `current` and `previous_terminal`.
   - Drop the slot lock.
   - Build `AnalyzeJobView` for each (via `from_job`) outside the slot lock.
   - Set the new fields on `StatusResult` before `tool_success_json(&result)`.
-- [ ] Update `get_status` tool description (the `#[tool(description = …)]` on `server.rs`) to mention the new fields and the poll-pattern hint. Specifically: "When an analyze is in flight or recently terminated, `analyze_job` carries `{ status, progress, progress_total, result | error, ... }`. Poll this tool while `status == \"running\"`; read `result` once `status == \"completed\"`. If you've kicked off a new analyze before reading the previous terminal, `analyze_job_previous_terminal` carries the prior result for one grace-window kickoff."
-- [ ] CLAUDE.md updates (`/home/daniel/Development/Code/code-graph-mcp/CLAUDE.md`):
+- [x] Update `get_status` tool description (the `#[tool(description = …)]` on `server.rs`) to mention the new fields and the poll-pattern hint. Specifically: "When an analyze is in flight or recently terminated, `analyze_job` carries `{ status, progress, progress_total, result | error, ... }`. Poll this tool while `status == \"running\"`; read `result` once `status == \"completed\"`. If you've kicked off a new analyze before reading the previous terminal, `analyze_job_previous_terminal` carries the prior result for one grace-window kickoff."
+- [x] CLAUDE.md updates (`/home/daniel/Development/Code/code-graph-mcp/CLAUDE.md`):
   - Tool count: `18` → `19` (every place it appears — search the file).
   - Add `analyze_codebase_async` row in the MCP tools table (under the "Indexing" group, alongside `analyze_codebase`).
   - Update the existing `analyze_codebase` row in the MCP tools table to note the Decision 9 behavior change: "Under watch contention, sync `analyze_codebase` now awaits the watch reindex (typically ms) rather than returning an error."
@@ -173,8 +173,8 @@ The async handler does its own arg validation for the cheap checks (path non-emp
   - Add a new paragraph under the existing `MCP_TOOL_TIMEOUT` bullet (in "Known cross-cutting limitations") noting that `analyze_codebase_async` is the structural workaround. Phrasing: "Clients hitting `MCP_TOOL_TIMEOUT` on long analyses should prefer `analyze_codebase_async` + poll `get_status` — every individual tool call is sub-second, so the per-call timer never fires."
   - CLAUDE.md has no dedicated "watch handler section" — the watch tooling appears as a row in the MCP tools table and the Windows watch-mode caveat lives in "Known cross-cutting limitations". Place the Decision 9 note as a new bullet in "Known cross-cutting limitations" titled "Sync `analyze_codebase` now waits for in-flight watch reindex", briefly stating the change and the rationale (slot is the gate; watch contention is bounded).
   - Add an entry to the Response shapes section describing `AnalyzeJobView` and how the grace-window rotation works.
-- [ ] `cargo build` clean.
-- [ ] Existing `get_status` tests still pass (the response shape change is additive — old fields untouched).
+- [x] `cargo build` clean.
+- [x] Existing `get_status` tests still pass (the response shape change is additive — old fields untouched).
 
 ### Notes
 The conversion helper acquires `job.state.read()` exactly once per job per `get_status` call. That's two read-lock acquisitions total per poll (one per slot field) — utterly negligible. The lock-acquisition-then-clone-into-view pattern means JSON serialization happens with NO locks held, preserving the existing handler invariant ("no locks held across `tool_success_json`" — see `handlers/status.rs:93`).
