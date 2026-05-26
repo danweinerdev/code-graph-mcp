@@ -131,8 +131,12 @@ pub struct AnalyzeJobView {
     /// RFC3339 UTC timestamp of terminal transition; `null` while
     /// `status == "running"`.
     pub finished_at: Option<String>,
-    /// Files processed so far (monotonic during Running). On terminal
-    /// this is the last value the worker reported.
+    /// Files processed in the current phase. Monotonic non-decreasing
+    /// **within a phase**; resets when the worker crosses a phase
+    /// boundary (parse → resolve → merge). Phase identity rides on
+    /// `progress_message`; consumers asserting monotonicity must scope
+    /// to a single phase. On terminal, this is the last value the
+    /// worker reported.
     pub progress: u32,
     /// Discovered file total. `0` during the discovery phase, set once
     /// the indexer knows the universe.

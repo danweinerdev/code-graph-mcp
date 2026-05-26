@@ -240,7 +240,7 @@ pub struct AnalyzeJob {
 pub struct JobMutableState {
     pub status: JobStatus,
     pub finished_at: Option<u64>,            // 0 → None; set on terminal transition
-    pub progress: u32,                       // monotonic, files processed
+    pub progress: u32,                       // files processed in current phase; monotonic within a phase, resets at phase boundaries (parse → resolve → merge); phase identity rides on progress_message
     pub progress_total: u32,                 // 0 → set once discovery completes
     pub progress_message: String,
 }

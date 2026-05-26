@@ -65,10 +65,15 @@ pub enum IndexError {
 
 /// One progress notification emitted by the indexer's parse loop.
 ///
-/// `progress` is a monotonic per-job counter; `total` is the total file
-/// count discovered before parsing began (`0` indicates an indeterminate
-/// phase). `message` is a human-readable status line — for the parse loop
-/// it has the form `Parsing: <absolute-path>`.
+/// `progress` is monotonic non-decreasing **within a phase** and resets
+/// when the worker crosses a phase boundary (parse counts `1..=total`,
+/// then resolve resets and counts `1..=total` again). Phase identity
+/// rides on `message`: `Parsing: <path>` during parse, `Resolving: <path>`
+/// during resolve, etc. Consumers asserting monotonicity must scope to
+/// a single phase via the `message` prefix. `total` is the file count
+/// discovered before parsing began (`0` indicates an indeterminate
+/// phase). `message` is a human-readable status line — for the parse
+/// loop it has the form `Parsing: <absolute-path>`.
 #[derive(Debug, Clone)]
 pub struct ProgressEvent {
     pub progress: u32,

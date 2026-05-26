@@ -1796,16 +1796,15 @@ mod tests {
     /// shorter than the 30ms cadence, and the test routinely sees < 3
     /// samples regardless of how the production code behaves.
     ///
-    /// **Sampling is filtered to the parse phase.** Production reports
-    /// progress per-phase (parse counts to `total`, then resolve resets
-    /// and counts to `total` again). Crossing a phase boundary mid-poll
-    /// would surface as a downward step on a monotonic-across-all-samples
-    /// check — a real implementation/design ambiguity (the design's
-    /// `progress` doc-comment says "monotonic, files processed", which
-    /// reads as a global count) but orthogonal to what this test pins.
-    /// We filter to `progress_message` carrying the `"Parsing: "` prefix
-    /// the parse-phase `report()` call emits so the assertion targets the
-    /// fan-out behavior cleanly.
+    /// **Sampling is filtered to the parse phase.** `progress` is
+    /// monotonic within a phase and resets at each phase boundary
+    /// (parse → resolve → merge); phase identity rides on
+    /// `progress_message`. We filter to messages carrying the
+    /// `"Parsing: "` prefix so the monotonicity assertion targets the
+    /// load-bearing fan-out behavior cleanly without crossing a phase
+    /// boundary mid-loop. See the `progress` doc-comment in
+    /// `crates/code-graph-tools/src/handlers/status.rs` for the
+    /// canonical contract.
     #[tokio::test]
     async fn progress_increments_during_indexing() {
         let _guard = ParseSleepGuard::set(10);
