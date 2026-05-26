@@ -184,6 +184,18 @@ pub(crate) async fn run_analyze_job(
     // analyze-vs-analyze, so this lock has no analyze contention.
     let _guard = inner.index_lock.lock().await;
 
+    // Stamp `Discovering` immediately so polling clients see a phase
+    // signal from the very first `get_status` call after kickoff —
+    // *including* when the cache fast-path is taken below. Without
+    // this, a successful fast-path run (cache fresh, all in-scope
+    // files clean) could spend ~30-90s on UE-scale projects in
+    // `load_and_stale` + the optional `sweep_missing_out_of_scope`
+    // stat scan with `current_phase` stuck at `null` and the terminal
+    // flipping straight from `null`/`Running` to `null`/`Completed`.
+    // The slow path will re-stamp `Discovering` (then `Parsing`) once
+    // it enters `spawn_blocking` — idempotent re-sets are harmless.
+    job.set_phase(AnalyzePhase::Discovering);
+
     if project_root != abs_path {
         let toml_at_root = project_root.join(".code-graph.toml");
         if toml_at_root.exists() {
@@ -266,6 +278,14 @@ pub(crate) async fn run_analyze_job(
                     .store(now_nanos_u64(), Ordering::Release);
                 inner.index_force_built.store(force, Ordering::Release);
                 if sweep_ran {
+                    // The sweep introduces a cache write — bump the
+                    // phase so a polling client doesn't see the
+                    // terminal stamp without ever observing a
+                    // `Persisting` signal. Skipped when `sweep_ran`
+                    // is false (no save_cache call) so the terminal
+                    // phase stays at `Discovering`, matching what
+                    // actually happened.
+                    job.set_phase(AnalyzePhase::Persisting);
                     if let Err(e) = save_cache(&inner.graph, &project_root) {
                         fast_path_warnings.push(format!("cache save failed: {e}"));
                     }
@@ -1092,6 +1112,63 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         // Same file count regardless of which path was taken.
         assert_eq!(parsed["files"], serde_json::json!(2));
+    }
+
+    /// Regression: the cache fast-path (`load_and_stale` succeeds +
+    /// no in-scope files are stale) used to leave `current_phase` at
+    /// `null` for its entire duration, then stamp the terminal with
+    /// `current_phase` still null. On UE-scale codebases that means
+    /// 30-90s of polling with `null`/`progress: 0/0` and then a
+    /// silent flip to `completed` — indistinguishable from "the
+    /// indexer is hung." Fix: stamp `Discovering` at the top of
+    /// `run_analyze_job` so every code path through the worker
+    /// emits at least one phase signal before terminal.
+    ///
+    /// This test exercises the regression by running analyze twice
+    /// against the same fixture (first call writes the cache, second
+    /// call hits the fast path) and asserting the second call's
+    /// terminal job carries a non-null `current_phase`.
+    #[tokio::test]
+    async fn analyze_fast_path_stamps_current_phase() {
+        use crate::analyze_job::JobStatus;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.cpp"), b"void f() {}\n").unwrap();
+        let server = server_with_cpp_parser();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        // First call: slow path. Writes the cache.
+        let r1 = analyze_codebase(server.inner.clone(), path.clone(), false, None, None).await;
+        assert!(r1.is_error.is_none() || r1.is_error == Some(false));
+
+        // Second call: cache exists + all files clean → fast path.
+        let r2 = analyze_codebase(server.inner.clone(), path.clone(), false, None, None).await;
+        assert!(r2.is_error.is_none() || r2.is_error == Some(false));
+
+        // Inspect the terminal job in slot.current.
+        let slot = server.inner.analyze_slot.read();
+        let current = slot
+            .current
+            .as_ref()
+            .expect("analyze must install a slot.current entry");
+        let state = current.state.read();
+        // Terminal must be Completed (fast path returns
+        // `finish_completed`).
+        assert!(
+            matches!(state.status, JobStatus::Completed(_)),
+            "second analyze should complete via fast path: {:?}",
+            std::any::type_name_of_val(&state.status)
+        );
+        // The regression: `current_phase` was `None`. After the fix,
+        // the top-of-worker `set_phase(Discovering)` runs before the
+        // fast-path probe so the terminal carries a non-null phase.
+        assert!(
+            state.current_phase.is_some(),
+            "fast-path terminal must carry a non-null current_phase \
+             (regression: was None before the top-of-worker set_phase \
+             stamp); got {:?}",
+            state.current_phase
+        );
     }
 
     #[tokio::test]
