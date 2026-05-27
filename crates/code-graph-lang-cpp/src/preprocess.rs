@@ -764,6 +764,54 @@ mod tests {
         );
     }
 
+    /// Case (l): bare-token annotation macro INSIDE a parameter list
+    /// (`void DoThing(const Options& opts, NOT_NULLABLE void* data) {}`).
+    /// Distinct shape from case (e), which puts the macro BEFORE the function
+    /// name; here it sits between parameters, mimicking SAL annotations
+    /// (`_In_`, `_Out_`), nonnull markers, and similar API decorations.
+    ///
+    /// The contract being pinned: tree-sitter-cpp v0.23.4 recovers from an
+    /// unknown identifier in a parameter list and still emits a
+    /// `function_definition` for the enclosing function — so `DoThing`
+    /// extracts whether or not the user has listed the macro in
+    /// `[cpp].macro_strip`. A future grammar bump that loses this recovery
+    /// would silently drop function symbols on any header using SAL-style
+    /// parameter annotations; this test fires immediately if that happens.
+    #[test]
+    fn case_l_param_position_annotation_macro_does_not_block_extraction() {
+        let src = "void DoThing(const Options& opts, NOT_NULLABLE void* data) {}";
+
+        // (1) No strip configured. The bare `NOT_NULLABLE` token rides through
+        // to tree-sitter, which must still extract the function definition.
+        let fg = parse_cleaned(src, &[]);
+        let s = find_symbol(&fg, "DoThing").expect(
+            "DoThing must extract even with an unlisted bare-token annotation \
+             in the parameter list — tree-sitter-cpp v0.23.4 recovers from \
+             unknown identifiers in parameter lists",
+        );
+        assert_eq!(s.kind, SymbolKind::Function);
+
+        // (2) Strip configured. Behavior must be identical — the macro is
+        // blanked to spaces before parsing, the function definition still
+        // extracts, and byte offsets stay aligned (DoThing's column is
+        // preserved because replacement is same-length).
+        let original_do_thing_col = src.find("DoThing").expect("DoThing in source") as u32;
+        let cleaned = strip_macros(src.as_bytes(), &["NOT_NULLABLE".to_owned()]);
+        let cleaned_do_thing_pos = cleaned
+            .windows(7)
+            .position(|w| w == b"DoThing")
+            .expect("DoThing survives substitution") as u32;
+        assert_eq!(
+            cleaned_do_thing_pos, original_do_thing_col,
+            "DoThing position must not shift after stripping NOT_NULLABLE",
+        );
+
+        let fg_stripped = parse_cleaned(src, &["NOT_NULLABLE".to_owned()]);
+        let s_stripped = find_symbol(&fg_stripped, "DoThing")
+            .expect("DoThing must extract with macro_strip applied");
+        assert_eq!(s_stripped.kind, SymbolKind::Function);
+    }
+
     // ---------------------------------------------------------------------
     // skip_lexical unit tests
     //
