@@ -21,7 +21,7 @@
 //! These strings are captured as wire-format snapshots; any future
 //! divergence triggers `cargo insta review`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
@@ -236,9 +236,46 @@ impl CodeGraphServer {
         let Some(s) = raw.filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
-        let normalized = code_graph_core::paths::normalize_user_path(s);
         let root_guard = self.inner.root_path.read();
-        if let Some(root) = root_guard.as_deref() {
+        let root = root_guard.as_deref();
+        // Resolve a RELATIVE subtree prefix against the indexed project
+        // root, NOT the MCP server's process CWD. A client that indexed
+        // `/proj` and passes `subtree="src"` means `/proj/src`; but
+        // `normalize_user_path("src")` would canonicalize against the
+        // server's launch directory (typically invisible to the client),
+        // or leave a lexical relative path — either way failing the
+        // absolute-prefix `starts_with(root)` guard below. Joining to the
+        // root first makes project-relative prefixes behave as clients
+        // expect. Absolute inputs pass through untouched. With no indexed
+        // root yet (no analyze has run) there is nothing to scope against,
+        // so a relative path normalizes lexically as before.
+        let candidate = match root {
+            Some(root) if Path::new(s).is_relative() => {
+                // A project-relative subtree must resolve INSIDE the root.
+                // Reject any `..` ascent up front: legitimate prefixes
+                // ("src", "src/handlers") never need it, and joining
+                // `../escape` to the root would otherwise land outside it —
+                // and for a NON-EXISTENT target it would even slip past the
+                // component-wise `starts_with` guard below, because
+                // `normalize_user_path` does not collapse `..` on a path
+                // that isn't on disk.
+                if Path::new(s)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(CallToolResult::error(vec![Content::text(format!(
+                        "subtree {s:?} escapes the indexed project root {} via a \
+                         parent-directory (`..`) segment",
+                        root.display(),
+                    ))]));
+                }
+                root.join(s)
+            }
+            _ => PathBuf::from(s),
+        };
+        let candidate_str = candidate.to_string_lossy();
+        let normalized = code_graph_core::paths::normalize_user_path(&candidate_str);
+        if let Some(root) = root {
             if !normalized.starts_with(root) {
                 return Err(CallToolResult::error(vec![Content::text(format!(
                     "subtree {:?} resolves to {} which is outside the \
