@@ -281,6 +281,21 @@ pub fn search_symbols(
         .filter(|s| !s.is_empty())
         .map(code_graph_core::paths::normalize_user_path);
 
+    // `near` mode and `count_only` are mutually exclusive — the tool
+    // schema advertises "Incompatible with count_only". A fuzzy count
+    // would still require the full N-symbol edit-distance scan with no
+    // heap short-circuit, so the combination buys nothing. This guard MUST
+    // precede the `count_only` short-circuit below: otherwise that
+    // short-circuit returns a regex/substring count (different query
+    // semantics, ignores `max_distance`) before the near branch is ever
+    // consulted, silently contradicting the schema.
+    if input.near && input.count_only {
+        return tool_error(
+            "near mode is incompatible with count_only; drop one of them \
+             (a fuzzy search has no bounded count short-circuit)",
+        );
+    }
+
     // Count-only short-circuit: delegate to `Graph::search` with
     // `count_only=true` so the
     // BinaryHeap<TopEntry> is never constructed. `sr.symbols` is guaranteed
@@ -350,6 +365,7 @@ pub fn search_symbols(
             parsed_kind,
             parsed_language,
             namespace_str,
+            resolved_subtree.as_deref(),
             resolved_limit,
             resolved_offset,
             input.brief,
@@ -686,6 +702,7 @@ fn near_search(
     kind: Option<code_graph_core::SymbolKind>,
     language: Option<code_graph_core::Language>,
     namespace: &str,
+    subtree: Option<&std::path::Path>,
     resolved_limit: u32,
     resolved_offset: u32,
     brief: bool,
@@ -714,6 +731,16 @@ fn near_search(
         }
         if !lower_ns.is_empty() && !sym.namespace.to_lowercase().contains(&lower_ns) {
             continue;
+        }
+        // Subtree filter — parity with the regex/substring path, which
+        // passes `subtree` through `SearchParams`. `starts_with` is
+        // component-aware (so `/a/foo` does NOT match `/a/foobar`). The
+        // prefix is the already-normalized, root-validated path proven at
+        // the MCP-dispatch boundary (`CodeGraphServer::validate_subtree`).
+        if let Some(prefix) = subtree {
+            if !std::path::Path::new(&sym.file).starts_with(prefix) {
+                continue;
+            }
         }
         let name_chars: Vec<char> = sym.name.chars().collect();
         if name_chars.len().abs_diff(query_chars.len()) > max_distance {
