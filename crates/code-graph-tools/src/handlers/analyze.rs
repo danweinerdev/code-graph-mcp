@@ -541,6 +541,7 @@ pub(crate) async fn run_analyze_job(
             &file_index,
             &registry.registry,
             &sink,
+            &cfg_for_pool.extensions,
         );
         eprintln!(
             "[code-graph] phase: resolve done ({:.1}s)",

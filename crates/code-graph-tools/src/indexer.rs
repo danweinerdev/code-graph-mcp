@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use code_graph_core::{symbol_id, EdgeKind, FileGraph, RootConfig};
+use code_graph_core::{symbol_id, EdgeKind, ExtensionsConfig, FileGraph, RootConfig};
 use code_graph_lang::{CallContext, FileIndex, LanguageRegistry, SymbolEntry, SymbolIndex};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rayon::ThreadPoolBuildError;
@@ -324,7 +324,20 @@ pub fn resolve_all_edges(
 ) {
     let symbol_index = build_symbol_index(graphs);
     let file_index = build_file_index(graphs);
-    resolve_edges_with_indexes(graphs, &symbol_index, &file_index, registry, progress);
+    // Built-in extensions only. This helper is the dev/bench + unit-test
+    // entry point; the production analyze path calls
+    // `resolve_edges_with_indexes` directly with the active
+    // `[extensions]` config (see `handlers::analyze`). Passing defaults
+    // here preserves the historical behavior for those callers without
+    // threading a `RootConfig` through the bench binary.
+    resolve_edges_with_indexes(
+        graphs,
+        &symbol_index,
+        &file_index,
+        registry,
+        progress,
+        &ExtensionsConfig::default(),
+    );
 }
 
 /// Resolve edges using PRE-BUILT `symbol_index` / `file_index` instead
@@ -356,6 +369,7 @@ pub fn resolve_edges_with_indexes(
     file_index: &FileIndex,
     registry: &LanguageRegistry,
     progress: &dyn ProgressSink,
+    extensions: &ExtensionsConfig,
 ) {
     let total = graphs.len() as u32;
     let counter = AtomicU32::new(0);
@@ -385,7 +399,9 @@ pub fn resolve_edges_with_indexes(
                 EdgeKind::Includes => {
                     match plugin.resolve_include(&edge.to, file_index) {
                         Some((resolved, confidence))
-                            if registry.language_for_path(&resolved).is_some() =>
+                            if registry
+                                .language_for_path_with_config(&resolved, extensions)
+                                .is_some() =>
                         {
                             edge.to = resolved.to_string_lossy().into_owned();
                             edge.confidence = confidence;
@@ -985,6 +1001,103 @@ mod tests {
                 .iter()
                 .any(|d| d.path.to_string_lossy().ends_with(".ini")),
             "filtered .ini include must NOT reach Graph::includes: {deps:?}"
+        );
+    }
+
+    /// Regression (Finding 2): an include edge resolving to a file whose
+    /// extension is a CONFIGURED source extension (`[extensions].cpp =
+    /// [".inc"]`) must survive resolution. The pre-fix filter used the
+    /// built-in `language_for_path`, which only knows the default
+    /// extensions, so it silently dropped edges to `.inc` files even
+    /// though discovery indexed them as C++ source. The contrast block
+    /// (default extensions → dropped) pins that the `extensions` argument
+    /// is the load-bearing gate, not an incidental pass-through.
+    #[test]
+    fn resolve_edges_keeps_include_to_configured_extension() {
+        let inc_path = "/proj/inc/dep.inc".to_string();
+        let main_path = "/proj/src/main.cpp".to_string();
+
+        // Build the two FileGraphs fresh for each resolution so the second
+        // pass isn't observing edges the first pass already rewrote/dropped.
+        let make_graphs = || {
+            let dep = FileGraph {
+                path: inc_path.clone(),
+                language: Language::Cpp,
+                symbols: Vec::new(),
+                edges: Vec::new(),
+            };
+            let main = FileGraph {
+                path: main_path.clone(),
+                language: Language::Cpp,
+                symbols: Vec::new(),
+                edges: vec![Edge {
+                    from: main_path.clone(),
+                    // Basename-resolves to /proj/inc/dep.inc (which is in
+                    // the FileIndex because `dep` has its own FileGraph).
+                    to: "dep.inc".to_string(),
+                    kind: EdgeKind::Includes,
+                    file: main_path.clone(),
+                    line: 1,
+                    confidence: Confidence::Resolved,
+                }],
+            };
+            vec![dep, main]
+        };
+
+        // The stub registry must claim `.inc` for C++ so the configured
+        // lookup can map the extension to a registered plugin. (The
+        // builtin `.cpp`/`.h` claim alone is what made the pre-fix
+        // `language_for_path` reject `.inc`.)
+        let reg = cpp_only_registry();
+
+        // (a) WITH `[extensions].cpp = [".inc"]`: the edge survives.
+        let mut graphs = make_graphs();
+        let symbol_index = build_symbol_index(&graphs);
+        let file_index = build_file_index(&graphs);
+        let ext_inc = ExtensionsConfig {
+            cpp: vec![".inc".to_string()],
+            ..Default::default()
+        };
+        resolve_edges_with_indexes(
+            &mut graphs,
+            &symbol_index,
+            &file_index,
+            &reg,
+            &NoopProgressSink,
+            &ext_inc,
+        );
+        let main_after = graphs.iter().find(|g| g.path == main_path).unwrap();
+        assert!(
+            main_after
+                .edges
+                .iter()
+                .any(|e| matches!(e.kind, EdgeKind::Includes) && e.to == inc_path),
+            "configured `.inc` include must survive resolution; edges: {:?}",
+            main_after.edges.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
+
+        // (b) WITHOUT the override (default extensions): the same edge is
+        // dropped, proving the `extensions` argument gates the decision.
+        let mut graphs = make_graphs();
+        let symbol_index = build_symbol_index(&graphs);
+        let file_index = build_file_index(&graphs);
+        resolve_edges_with_indexes(
+            &mut graphs,
+            &symbol_index,
+            &file_index,
+            &reg,
+            &NoopProgressSink,
+            &ExtensionsConfig::default(),
+        );
+        let main_after = graphs.iter().find(|g| g.path == main_path).unwrap();
+        assert!(
+            !main_after
+                .edges
+                .iter()
+                .any(|e| matches!(e.kind, EdgeKind::Includes)),
+            "without the `.inc` override the include must drop (built-in \
+             extensions don't claim `.inc`); edges: {:?}",
+            main_after.edges.iter().map(|e| &e.to).collect::<Vec<_>>()
         );
     }
 

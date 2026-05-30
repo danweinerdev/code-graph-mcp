@@ -323,7 +323,20 @@ pub async fn try_reindex_file(
         };
         let cleaned = plugin.preprocess(&content, &cfg_for_blocking);
         match plugin.parse_file(&path_owned, &cleaned) {
-            Ok(fg) => Ok(fg),
+            Ok(mut fg) => {
+                // Per-file post-parse synthesis hook — parity with the
+                // analyze path (`indexer::index_directory`). Sees the
+                // ORIGINAL bytes (NOT the preprocessed `cleaned`) so a
+                // plugin's secondary extractor over source the preprocess
+                // pass would have rewritten still fires — concretely,
+                // `[cpp].macro_define_function` invocations that
+                // `macro_strip` could otherwise blank. Without this call
+                // a watched edit of an affected file silently drops every
+                // synthesized symbol that a cold `analyze_codebase` would
+                // have produced (split-brain indexing).
+                plugin.synthesize_symbols(&path_owned, &content, &cfg_for_blocking, &mut fg);
+                Ok(fg)
+            }
             Err(e) => Err(ReindexOutcome::Error(format!(
                 "parse {}: {e}",
                 path_owned.display()
@@ -430,7 +443,10 @@ pub async fn try_reindex_file(
             EdgeKind::Includes => {
                 match plugin.resolve_include(&edge.to, &file_index) {
                     Some((resolved, confidence))
-                        if inner.registry.language_for_path(&resolved).is_some() =>
+                        if inner
+                            .registry
+                            .language_for_path_with_config(&resolved, &extensions_for_resolve)
+                            .is_some() =>
                     {
                         edge.to = resolved.to_string_lossy().into_owned();
                         edge.confidence = confidence;
