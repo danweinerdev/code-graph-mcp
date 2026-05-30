@@ -154,6 +154,59 @@ fn parsed_sorted(r: &CallToolResult) -> serde_json::Value {
     sort_json(parsed)
 }
 
+/// The `results` array of a paginated response, in EMISSION order (NOT
+/// re-sorted). Used to measure the exact serialized size of the records the
+/// handler produced.
+fn raw_results(r: &CallToolResult) -> Vec<serde_json::Value> {
+    let body = first_text(r);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("response body must be valid JSON");
+    parsed["results"]
+        .as_array()
+        .cloned()
+        .expect("paginated response carries a `results` array")
+}
+
+/// Compute a `max_bytes` that makes `byte_budget_take` keep EXACTLY the
+/// first `n` of `records` (in emission order), independent of the absolute
+/// path embedded in each record's `id`.
+///
+/// This is the antidote to the byte-budget snapshot tests' historical
+/// environment-coupling: the budget is enforced against the REAL serialized
+/// records, whose `id` carries the absolute TempDir path (which varies by
+/// machine — `/tmp/.tmpXXXX` vs `/tmp/claude-1000/.tmpXXXX`), while the
+/// snapshot redacts that path to a fixed token. A hardcoded `max_bytes`
+/// therefore truncated at a path-length-dependent record count. Sizing the
+/// budget from the records' MEASURED bytes pins the cut deterministically.
+///
+/// Mirrors `byte_budget_take`'s accounting exactly: each record costs
+/// `serialized_len + 1` (the inter-record comma), summed, plus the
+/// `ENVELOPE_OVERHEAD_BYTES` reserve the helper subtracts up front. Re-
+/// serializing the parsed `Value` is byte-length-faithful to the handler's
+/// struct serialization — key order may differ but the total length does
+/// not. With the budget set to the cumulative cost of the first `n`
+/// records, record `n-1` fits exactly (`projected == budget`, not `>`) and
+/// record `n` overflows.
+fn budget_fitting_first_n(records: &[serde_json::Value], n: usize) -> usize {
+    assert!(
+        records.len() > n,
+        "fixture must produce more than {n} records so truncation actually \
+         bites; got {}",
+        records.len()
+    );
+    let body_cost: usize = records
+        .iter()
+        .take(n)
+        .map(|rec| {
+            serde_json::to_string(rec)
+                .expect("record re-serializes")
+                .len()
+                + 1
+        })
+        .sum();
+    ENVELOPE_OVERHEAD_BYTES + body_cost
+}
+
 // --- analyze_codebase ----------------------------------------------------
 
 #[tokio::test]
@@ -544,26 +597,40 @@ async fn response_get_orphans_byte_budget_truncated() {
     // `truncated=true` and a `next_offset` pointing past the partial page.
     //
     // Reuses the 25-orphan synthetic fixture so the per-record serialized
-    // shape is small and predictable. With a budget of ~400 bytes after
-    // envelope overhead, only a handful of records fit before the budget
-    // bites. `limit=20` is well above what fits, so the byte budget (not
-    // the count cap) is what trims the page. The snapshot locks the
-    // truncated-page shape: `truncated:true`, `next_offset:N` where
-    // `N < limit`, and `total:25` (pre-pagination match count is
-    // unchanged regardless of truncation).
+    // shape is small and predictable. `limit=20` is well above what fits,
+    // so the byte budget (not the count cap) is what trims the page. The
+    // snapshot locks the truncated-page shape: `truncated:true`,
+    // `next_offset:N` where `N < limit`, and `total:25` (pre-pagination
+    // match count is unchanged regardless of truncation).
+    //
+    // HARDENING: the byte budget is enforced against the REAL serialized
+    // records, whose `id` embeds the absolute TempDir path — a value that
+    // varies by environment (`/tmp/.tmpXXXX` vs `/tmp/claude-1000/.tmpXXXX`).
+    // A hardcoded `max_bytes` therefore truncated at a path-length-dependent
+    // record count, so this snapshot flaked on machines whose temp prefix
+    // differed from the one it was recorded under. Instead, probe the actual
+    // record sizes UNBUDGETED and size the budget to fit EXACTLY 4 records,
+    // so the cut point — and thus the snapshot — is deterministic everywhere.
     let fx = build_indexed_fixture_with_many_orphans(25).await;
-    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
-    let r = get_orphans(
-        &fx.inner.graph,
-        Some("function"),
-        None,
-        Some(20),
-        Some(0),
-        None,
-        false,
-        None,
-        max_bytes,
-    );
+    let orphan_args = |max_bytes: usize| {
+        get_orphans(
+            &fx.inner.graph,
+            Some("function"),
+            None,
+            Some(20),
+            Some(0),
+            None,
+            false,
+            None,
+            max_bytes,
+        )
+    };
+
+    // Probe: emit every orphan (no budget) to measure real per-record bytes.
+    let probe_records = raw_results(&orphan_args(NO_BYTE_BUDGET));
+    let max_bytes = budget_fitting_first_n(&probe_records, 4);
+
+    let r = orphan_args(max_bytes);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
