@@ -27,7 +27,7 @@
 //!   macro names that appear inside class/function bodies for other
 //!   purposes — the same caveat applies to `macro_strip`.
 
-use crate::preprocess::find_balanced_close;
+use crate::preprocess::{find_balanced_close, skip_lexical};
 
 /// Call `emit(arg_text_slices, line)` for every invocation of
 /// `macro_name` in `content`. `arg_text_slices` is the per-arg
@@ -44,66 +44,61 @@ where
 
     let mut i: usize = 0;
     while i < content.len() {
-        // Look for the macro name as a whole word.
-        if let Some(rel) = find_subslice(&content[i..], macro_bytes) {
-            let pos = i + rel;
+        // Skip lexical regions WHOLESALE before testing for a macro name.
+        // A configured macro name appearing inside a line/block comment, a
+        // string or character literal, or a raw string (`// MAKE_FN(x)`,
+        // `/* MAKE_FN(x) */`, `"...MAKE_FN(x)..."`, `R"(MAKE_FN(x))"`) is
+        // NOT a real invocation and must not synthesize a phantom symbol.
+        // This reuses the same lexer `macro_strip_with_args` walks, so the
+        // synthesis pass and the strip pass agree on what is "code" vs
+        // "literal/comment".
+        if let Some(end) = skip_lexical(content, i) {
+            // `skip_lexical` returns the byte just past the region. The
+            // `.max(i + 1)` is a belt-and-suspenders guard against a
+            // zero-width advance (it never returns `Some(i)` for a real
+            // opener) so the loop can never spin.
+            i = end.max(i + 1);
+            continue;
+        }
+
+        // Whole-word match of the macro name starting at `i`. We only reach
+        // here on a "code" byte (outside any literal/comment), so a match
+        // is a genuine source-level token.
+        let end = i + macro_bytes.len();
+        if end <= content.len() && &content[i..end] == macro_bytes {
             // Whole-word boundary on the LEFT.
-            let left_ok = pos == 0 || !is_identifier_continue(content[pos - 1]);
-            let after = pos + macro_bytes.len();
+            let left_ok = i == 0 || !is_identifier_continue(content[i - 1]);
             // Whole-word boundary on the RIGHT.
-            let right_ok = after >= content.len() || !is_identifier_continue(content[after]);
+            let right_ok = end >= content.len() || !is_identifier_continue(content[end]);
             if left_ok && right_ok {
                 // Scan forward past whitespace looking for `(`.
-                let paren_pos = skip_ws_to_paren(content, after);
-                if let Some(open) = paren_pos {
+                if let Some(open) = skip_ws_to_paren(content, end) {
                     if let Some(close) = find_balanced_close(content, open) {
                         let args_slice = &content[open + 1..close];
-                        let line = count_lines_before(content, pos) + 1;
-                        let args_text = match std::str::from_utf8(args_slice) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                // Non-UTF8 args region — skip this
-                                // invocation rather than emit garbage.
-                                i = close + 1;
-                                continue;
-                            }
-                        };
-                        let parts = split_args_depth1(args_text);
-                        let parts_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-                        emit(&parts_refs, line);
+                        let line = count_lines_before(content, i) + 1;
+                        // A non-UTF8 args region is skipped (no emit) rather
+                        // than emitting garbage; either way we advance past
+                        // the close-paren below.
+                        if let Ok(args_text) = std::str::from_utf8(args_slice) {
+                            let parts = split_args_depth1(args_text);
+                            let parts_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                            emit(&parts_refs, line);
+                        }
                         // Advance past the close-paren.
                         i = close + 1;
                         continue;
                     }
                 }
-                // Not followed by parens — skip past the matched name.
-                i = after;
+                // Whole-word name but not followed by `(...)` — skip past
+                // the matched name.
+                i = end;
                 continue;
             }
             // Not a whole-word match (e.g. `MACROname` or `xMACRO`).
-            // Advance past the offending byte to avoid infinite loop.
-            i = pos + 1;
-        } else {
-            break;
+            // Fall through to the single-byte advance below.
         }
+        i += 1;
     }
-}
-
-/// Byte-level substring search. Returns the offset of `needle`
-/// inside `haystack`, or `None` if absent. Standalone (rather than
-/// using the `bytes` crate or `memchr`) so the cpp crate stays
-/// dependency-slim.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    let last = haystack.len() - needle.len();
-    for i in 0..=last {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-    }
-    None
 }
 
 /// Whether `byte` is part of an identifier continuation — letter,
@@ -358,5 +353,92 @@ mod tests {
         let src = "DECLARE_RELEASE_FN   (Spaced)";
         let r = collect_invocations(src, "DECLARE_RELEASE_FN");
         assert_eq!(r, vec![(vec!["Spaced".to_string()], 1)]);
+    }
+
+    // -- Lexical false positives (Finding 3) -----------------------------
+    //
+    // A configured macro name appearing inside a comment or a string/char/
+    // raw-string literal is NOT a real invocation and must not synthesize a
+    // symbol. The scanner skips lexical regions wholesale before testing a
+    // candidate name.
+
+    #[test]
+    fn macro_in_line_comment_not_matched() {
+        let src = "// MAKE_FN(Dead)\nint real = 0;\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "macro inside a // comment must not match: {r:?}"
+        );
+    }
+
+    #[test]
+    fn macro_in_block_comment_not_matched() {
+        let src = "/* MAKE_FN(Dead) spanning\n   MAKE_FN(AlsoDead) */\nint real = 0;\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "macro inside a /* */ block comment must not match: {r:?}"
+        );
+    }
+
+    #[test]
+    fn macro_in_string_literal_not_matched() {
+        let src = "const char* s = \"MAKE_FN(Dead)\";\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "macro inside a \"...\" string literal must not match: {r:?}"
+        );
+    }
+
+    #[test]
+    fn macro_in_char_literal_region_not_matched() {
+        // The char literal `'('` would otherwise feed the scanner a stray
+        // open-paren; skipping the literal wholesale avoids both that and a
+        // name match inside a quoted region.
+        let src = "char c = '('; const char* s = \"MAKE_FN(Dead)\";\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "macro inside a quoted region after a char literal must not match: {r:?}"
+        );
+    }
+
+    #[test]
+    fn macro_in_raw_string_not_matched() {
+        // Raw string delimiters wrap a body that contains both the macro
+        // name and balanced parens; skip_lexical jumps the whole region.
+        let src = "const char* s = R\"delim(MAKE_FN(Dead))delim\";\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "macro inside a raw string must not match: {r:?}"
+        );
+    }
+
+    #[test]
+    fn real_invocation_after_comment_still_matched() {
+        // Positive control: skipping lexical regions must NOT swallow a
+        // genuine invocation that follows a comment/string on the same or
+        // next line.
+        let src = "// MAKE_FN(Dead) is documentation\nMAKE_FN(Live)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(
+            r,
+            vec![(vec!["Live".to_string()], 2)],
+            "the real invocation on line 2 must still be found (and only it)"
+        );
+    }
+
+    #[test]
+    fn real_invocation_with_string_arg_still_matched() {
+        // Positive control: a real invocation whose ARGUMENT is a string
+        // containing the macro name must match exactly once — the argument
+        // string is part of the balanced-paren payload, not a separate
+        // candidate.
+        let src = "MAKE_FN(Live)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(r, vec![(vec!["Live".to_string()], 1)]);
     }
 }
