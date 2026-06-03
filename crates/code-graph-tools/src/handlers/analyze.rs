@@ -173,7 +173,9 @@ pub(crate) async fn run_analyze_job(
         }
         Err(e @ ConfigError::ExtensionMissingDot { .. })
         | Err(e @ ConfigError::ExtensionConflict { .. })
-        | Err(e @ ConfigError::MacroStripConflict { .. }) => {
+        | Err(e @ ConfigError::MacroStripConflict { .. })
+        | Err(e @ ConfigError::MacroDefineTypeEmptyName)
+        | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
             finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
             return;
         }

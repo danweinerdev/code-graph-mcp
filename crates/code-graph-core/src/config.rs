@@ -34,6 +34,15 @@ fn default_response_max_bytes() -> usize {
     DEFAULT_RESPONSE_MAX_BYTES
 }
 
+/// Helper for `#[serde(default = "...")]` on [`MacroDefineType::keyword`]. The
+/// documented default is `"struct"` (the overwhelmingly common engine pattern,
+/// where the macro expands to a plain-old-data aggregate). Plain
+/// `#[serde(default)]` would give an empty string, which
+/// [`RootConfig::load`] would then reject as an invalid keyword.
+fn default_macro_define_type_keyword() -> String {
+    "struct".to_string()
+}
+
 /// Custom deserializer for `[response].max_bytes`. Rejects zero with a
 /// clear error message — a budget of zero would make every paginated
 /// handler return an empty page with `truncated=true`, which is
@@ -180,6 +189,46 @@ pub struct CppConfig {
     /// here the dedup key is the `name` field of a struct).
     #[serde(default)]
     pub macro_define_function: Vec<MacroDefineFunction>,
+    /// Macros that WRAP a `struct` / `class` definition via a
+    /// parameterized expansion. Each entry tells the C++ parser to
+    /// rewrite the macro invocation IN PLACE into the real C++ the
+    /// macro would expand to, so tree-sitter parses the type natively
+    /// — recovering the type symbol AND its members (methods, nested
+    /// types) AND inheritance/call edges, not just a synthetic name.
+    ///
+    /// The canonical engine pattern is:
+    /// ```text
+    /// #define EXPORT_STRUCT(name, ...) struct CALL_API name { __VA_ARGS__ }
+    /// EXPORT_STRUCT(Foo, (
+    ///     int32_t bar;
+    ///     void method();
+    /// ));
+    /// ```
+    /// which is rewritten to `struct Foo { int32_t bar; void method(); };`.
+    ///
+    /// Each entry carries:
+    /// - `name` — the macro identifier (e.g. `"EXPORT_STRUCT"`).
+    /// - `name_arg` — zero-based index of the argument holding the
+    ///   type NAME (default `0`).
+    /// - `body_arg` — zero-based index of the argument holding the
+    ///   member BODY; absent = the LAST argument (the common
+    ///   `__VA_ARGS__` tail).
+    /// - `keyword` — `"struct"` (default) or `"class"`; written in
+    ///   place of the macro name. Any other value is rejected at load
+    ///   time with [`ConfigError::MacroDefineTypeKeyword`].
+    ///
+    /// **Distinct from `macro_define_function`:** that one SYNTHESIZES
+    /// a bare `Function` symbol from a token-pasting macro and does not
+    /// touch the source bytes. This one EXPANDS the macro into real
+    /// C++ in the preprocess pass so the full type body is parsed.
+    ///
+    /// Opt-in: empty list is the default and produces no expansion.
+    /// Within-list duplicates are silently deduplicated by `name`
+    /// (first-occurrence wins), mirroring `macro_define_function`.
+    /// An empty `name` is rejected at load with
+    /// [`ConfigError::MacroDefineTypeEmptyName`].
+    #[serde(default)]
+    pub macro_define_type: Vec<MacroDefineType>,
 }
 
 /// One entry in `[cpp].macro_define_function`. See [`CppConfig::macro_define_function`].
@@ -195,6 +244,30 @@ pub struct MacroDefineFunction {
     /// forming the synthesized function name.
     #[serde(default)]
     pub suffix: String,
+}
+
+/// One entry in `[cpp].macro_define_type`. See [`CppConfig::macro_define_type`].
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct MacroDefineType {
+    /// Macro identifier whose invocation wraps a struct/class
+    /// definition (e.g. `"EXPORT_STRUCT"`). Rejected at load time if
+    /// empty ([`ConfigError::MacroDefineTypeEmptyName`]).
+    pub name: String,
+    /// Zero-based index of the argument holding the type NAME.
+    /// Defaults to `0` (the first argument).
+    #[serde(default)]
+    pub name_arg: usize,
+    /// Zero-based index of the argument holding the member BODY.
+    /// `None` (the default) means the LAST argument — the common
+    /// `__VA_ARGS__` tail.
+    #[serde(default)]
+    pub body_arg: Option<usize>,
+    /// The C++ keyword written in place of the macro name when
+    /// expanding: `"struct"` (default) or `"class"`. Any other value
+    /// is rejected at load time
+    /// ([`ConfigError::MacroDefineTypeKeyword`]).
+    #[serde(default = "default_macro_define_type_keyword")]
+    pub keyword: String,
 }
 
 /// Per-language file-extension overrides.
@@ -382,6 +455,18 @@ pub enum ConfigError {
     /// there's no principled tiebreak.
     #[error("[cpp] macro '{token}' may not appear in both `macro_strip` and `macro_strip_with_args` (ambiguous strip target — remove it from one list or the other)")]
     MacroStripConflict { token: String },
+    /// An entry in `[cpp].macro_define_type` had an empty `name`.
+    /// Without a macro identifier the scanner has nothing to match,
+    /// so the entry is meaningless — reject it rather than silently
+    /// no-op (the user clearly intended to configure something).
+    #[error("[cpp].macro_define_type entry has an empty `name` (every entry must name the macro to expand)")]
+    MacroDefineTypeEmptyName,
+    /// An entry in `[cpp].macro_define_type` had a `keyword` other
+    /// than `struct` or `class`. The expansion writes this keyword
+    /// verbatim in place of the macro name; any other value would
+    /// produce invalid C++ that tree-sitter rejects.
+    #[error("[cpp].macro_define_type entry '{name}' has invalid keyword {keyword:?}: must be \"struct\" or \"class\"")]
+    MacroDefineTypeKeyword { name: String, keyword: String },
 }
 
 impl RootConfig {
@@ -506,6 +591,31 @@ impl RootConfig {
                 token: token.clone(),
             });
         }
+
+        // Validate and dedup `[cpp].macro_define_type`. An empty `name` has
+        // nothing for the scanner to match; an off-list `keyword` would
+        // produce invalid C++ on expansion. Both are hard errors (the user
+        // configured something concrete and got it wrong — silently
+        // dropping the entry would hide a real misconfiguration). Within-
+        // list duplicates dedup by `name` (first-occurrence wins), mirroring
+        // `macro_define_function`'s struct-keyed dedup.
+        for entry in &parsed.cpp.macro_define_type {
+            if entry.name.is_empty() {
+                return Err(ConfigError::MacroDefineTypeEmptyName);
+            }
+            if entry.keyword != "struct" && entry.keyword != "class" {
+                return Err(ConfigError::MacroDefineTypeKeyword {
+                    name: entry.name.clone(),
+                    keyword: entry.keyword.clone(),
+                });
+            }
+        }
+        let mut seen_define_type: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        parsed
+            .cpp
+            .macro_define_type
+            .retain(|e| seen_define_type.insert(e.name.clone()));
 
         // Normalize and validate `[extensions]` lists: drain empties (warn),
         // require leading dot, lowercase, and reject cross-additive
@@ -984,6 +1094,116 @@ mod tests {
         assert!(
             cfg.cpp.macro_strip.is_empty(),
             "explicit empty array must yield empty macro_strip"
+        );
+    }
+
+    // --- MacroDefineType tests ---------------------------------------------
+
+    #[test]
+    fn macro_define_type_default_is_empty() {
+        let cfg = RootConfig::default();
+        assert!(
+            cfg.cpp.macro_define_type.is_empty(),
+            "default macro_define_type must be empty (opt-in)"
+        );
+    }
+
+    #[test]
+    fn macro_define_type_keyword_defaults_to_struct() {
+        // `keyword` omitted → defaults to "struct" via the serde default.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [{ name = \"EXPORT_STRUCT\" }]\n",
+        )
+        .unwrap();
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("load must succeed");
+        assert_eq!(cfg.cpp.macro_define_type.len(), 1);
+        let e = &cfg.cpp.macro_define_type[0];
+        assert_eq!(e.name, "EXPORT_STRUCT");
+        assert_eq!(e.name_arg, 0, "name_arg defaults to 0");
+        assert_eq!(e.body_arg, None, "body_arg defaults to None (last arg)");
+        assert_eq!(e.keyword, "struct", "keyword defaults to struct");
+    }
+
+    #[test]
+    fn macro_define_type_class_keyword_accepted() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [{ name = \"EXPORT_CLASS\", keyword = \"class\" }]\n",
+        )
+        .unwrap();
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("class keyword must load");
+        assert_eq!(cfg.cpp.macro_define_type[0].keyword, "class");
+    }
+
+    #[test]
+    fn macro_define_type_explicit_fields_round_trip() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [{ name = \"DEF3\", name_arg = 1, body_arg = 2, keyword = \"struct\" }]\n",
+        )
+        .unwrap();
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("explicit fields must load");
+        let e = &cfg.cpp.macro_define_type[0];
+        assert_eq!(e.name_arg, 1);
+        assert_eq!(e.body_arg, Some(2));
+    }
+
+    #[test]
+    fn macro_define_type_empty_name_rejected() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [{ name = \"\" }]\n",
+        )
+        .unwrap();
+        let err = RootConfig::load(dir.path()).expect_err("empty name must be rejected");
+        match err {
+            ConfigError::MacroDefineTypeEmptyName => {}
+            other => panic!("expected MacroDefineTypeEmptyName, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macro_define_type_invalid_keyword_rejected() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [{ name = \"X\", keyword = \"enum\" }]\n",
+        )
+        .unwrap();
+        let err =
+            RootConfig::load(dir.path()).expect_err("non-struct/class keyword must be rejected");
+        match err {
+            ConfigError::MacroDefineTypeKeyword { name, keyword } => {
+                assert_eq!(name, "X");
+                assert_eq!(keyword, "enum");
+            }
+            other => panic!("expected MacroDefineTypeKeyword, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macro_define_type_within_list_dedup_by_name() {
+        // Two entries with the same name dedup to the first occurrence.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[cpp]\nmacro_define_type = [\n  { name = \"EXPORT_STRUCT\", keyword = \"struct\" },\n  { name = \"EXPORT_STRUCT\", keyword = \"class\" },\n]\n",
+        )
+        .unwrap();
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("dedup load must succeed");
+        assert_eq!(
+            cfg.cpp.macro_define_type.len(),
+            1,
+            "within-list duplicates dedup by name"
+        );
+        assert_eq!(
+            cfg.cpp.macro_define_type[0].keyword, "struct",
+            "first occurrence wins"
         );
     }
 

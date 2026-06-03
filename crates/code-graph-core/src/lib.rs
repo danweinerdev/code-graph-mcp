@@ -18,8 +18,8 @@ mod config;
 pub mod paths;
 
 pub use config::{
-    ConfigError, DiscoveryConfig, ExtensionsConfig, ParsingConfig, RootConfig,
-    DEFAULT_RESPONSE_MAX_BYTES,
+    ConfigError, DiscoveryConfig, ExtensionsConfig, MacroDefineFunction, MacroDefineType,
+    ParsingConfig, RootConfig, DEFAULT_RESPONSE_MAX_BYTES,
 };
 
 use serde::{Deserialize, Serialize};
