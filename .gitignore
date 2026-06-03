@@ -8,3 +8,6 @@ bin/
 # Rust workspace
 target/
 .code-graph.toml
+
+# IDEs
+.idea/
