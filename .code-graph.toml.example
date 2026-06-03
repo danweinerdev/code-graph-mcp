@@ -130,6 +130,39 @@ max_threads = 0
 # invalidate the mtime-based cache. Without `force=true`, files whose
 # mtime hasn't changed since the last index will skip preprocessing and
 # the new strip list will appear to have no effect.
+#
+# `macro_define_function` recovers FUNCTION definitions that a token-pasting
+# macro hides from tree-sitter. For each invocation `MACRO(arg0, …)` of a
+# configured macro it SYNTHESIZES a `Function` symbol named
+# `<arg><suffix>` (no byte rewrite). Opt-in; empty by default. Example —
+# `IMPLEMENT_RELEASE_FN(Bar)` synthesizes the `Bar_Release` function:
+# [[cpp.macro_define_function]]
+# name = "IMPLEMENT_RELEASE_FN"
+# arg = 0          # 0-based index of the arg naming the function (default 0)
+# suffix = "_Release"  # appended to the captured arg (default "")
+# (Within-list duplicates dedup by `name`. A config change needs force=true,
+#  same mtime-stale rule as macro_strip.)
+#
+# `macro_define_type` recovers a STRUCT/CLASS definition wrapped in a macro
+# by EXPANDING the invocation IN PLACE into native C++ (byte-preserving:
+# same length, every `\n` at its original offset), so tree-sitter recovers
+# the type symbol AND its members AND inheritance/call edges. Runs in the
+# preprocess pass BEFORE the strip passes. Opt-in; empty by default.
+# Example — given `#define EXPORT_STRUCT(name, ...) struct name { __VA_ARGS__ }`
+# and `EXPORT_STRUCT(Foo, ( int bar; void method() {} ));`, this recovers the
+# `Foo` struct, its `bar` field, and its `method`:
+# [[cpp.macro_define_type]]
+# name = "EXPORT_STRUCT"
+# name_arg = 0     # 0-based index of the arg holding the type name (default 0)
+# # body_arg = 1   # 0-based index of the arg holding the member body
+# #                # (omit = the LAST arg, the __VA_ARGS__ tail)
+# keyword = "struct"  # "struct" (default) or "class"; any other value is a
+# #                   # load error (MacroDefineTypeKeyword). Empty `name` is
+# #                   # a load error (MacroDefineTypeEmptyName).
+# (The keyword must FIT in the macro-name span — struct=6 ≤ EXPORT_STRUCT=13;
+#  if longer, that invocation is skipped with an eprintln! warning. A
+#  paren-wrapped body `(…)` is unwrapped. Within-list dedup by `name`. A
+#  config change needs force=true, same mtime-stale rule as macro_strip.)
 
 # Per-language file-extension overrides, layered on top of each plugin's
 # built-in extension list. Three semantics:

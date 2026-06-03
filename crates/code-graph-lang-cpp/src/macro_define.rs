@@ -71,6 +71,17 @@ where
             // Whole-word boundary on the RIGHT.
             let right_ok = end >= content.len() || !is_identifier_continue(content[end]);
             if left_ok && right_ok {
+                // Skip a configured macro name that appears on its own
+                // `#define` directive line. There the "invocation" is the
+                // macro's DEFINITION (`#define MACRO(name) struct name {…}`),
+                // and the args are the macro's formal parameters — matching
+                // it would synthesize a junk symbol named after the
+                // parameter (`name`), never the real type. Real invocations
+                // live on later, non-`#define` lines and still match.
+                if is_on_define_line(content, i) {
+                    i = end;
+                    continue;
+                }
                 // Scan forward past whitespace looking for `(`.
                 if let Some(open) = skip_ws_to_paren(content, end) {
                     if let Some(close) = find_balanced_close(content, open) {
@@ -103,13 +114,89 @@ where
 
 /// Whether `byte` is part of an identifier continuation — letter,
 /// digit, or `_`. Used for the whole-word match guard.
-fn is_identifier_continue(byte: u8) -> bool {
+///
+/// `pub(crate)` so the byte-span scanner in
+/// [`crate::macro_expand`] reuses the same boundary rule.
+pub(crate) fn is_identifier_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether the byte at `match_pos` sits on a `#define` directive's
+/// logical line — i.e. the first non-whitespace bytes of the line
+/// (after honoring backslash line-continuation upward) are `#` then
+/// optional whitespace then `define`.
+///
+/// Walks backward from `match_pos` to the start of the LOGICAL line.
+/// A physical line whose preceding line ends with a backslash
+/// (`\` immediately before its `\n`, modulo a trailing `\r`) is a
+/// continuation, so the walk keeps going up. Once the logical-line
+/// start is found, it checks for the `#`…`define` opener.
+///
+/// `pub(crate)` so the byte-span scanner in [`crate::macro_expand`]
+/// shares the exact same define-line guard.
+pub(crate) fn is_on_define_line(content: &[u8], match_pos: usize) -> bool {
+    // Find the start of the logical line: walk back over physical lines,
+    // continuing upward as long as the physical line above ends in `\`.
+    let mut line_start = start_of_physical_line(content, match_pos);
+    loop {
+        if line_start == 0 {
+            break;
+        }
+        // `line_start - 1` is the `\n` that ends the previous physical
+        // line. Look at the byte(s) before it for a continuation `\`,
+        // tolerating a `\r` between the `\` and the `\n` (CRLF files).
+        let nl = line_start - 1;
+        debug_assert!(content[nl] == b'\n');
+        let mut p = nl;
+        if p > 0 && content[p - 1] == b'\r' {
+            p -= 1;
+        }
+        if p > 0 && content[p - 1] == b'\\' {
+            // Previous physical line is a continuation — keep walking up.
+            line_start = start_of_physical_line(content, p - 1);
+        } else {
+            break;
+        }
+    }
+
+    // From the logical-line start, skip horizontal whitespace, require `#`,
+    // skip more whitespace, then require the literal `define`.
+    let mut i = line_start;
+    while i < content.len() && (content[i] == b' ' || content[i] == b'\t') {
+        i += 1;
+    }
+    if i >= content.len() || content[i] != b'#' {
+        return false;
+    }
+    i += 1;
+    while i < content.len() && (content[i] == b' ' || content[i] == b'\t') {
+        i += 1;
+    }
+    const DEFINE: &[u8] = b"define";
+    if i + DEFINE.len() > content.len() || &content[i..i + DEFINE.len()] != DEFINE {
+        return false;
+    }
+    // Whole-word boundary on the right: `#definex` is NOT `#define`.
+    let after = i + DEFINE.len();
+    after >= content.len() || !is_identifier_continue(content[after])
+}
+
+/// Return the index of the first byte of the physical line containing
+/// `pos` (the byte just after the preceding `\n`, or `0`).
+fn start_of_physical_line(content: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i > 0 && content[i - 1] != b'\n' {
+        i -= 1;
+    }
+    i
 }
 
 /// Scan forward from `start` past ASCII whitespace; return the
 /// index of the next `(` if that's what's there, else `None`.
-fn skip_ws_to_paren(content: &[u8], start: usize) -> Option<usize> {
+///
+/// `pub(crate)` so the byte-span scanner in [`crate::macro_expand`]
+/// reuses the same open-paren skip.
+pub(crate) fn skip_ws_to_paren(content: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     while i < content.len() && content[i].is_ascii_whitespace() {
         i += 1;
@@ -440,5 +527,99 @@ mod tests {
         let src = "MAKE_FN(Live)\n";
         let r = collect_invocations(src, "MAKE_FN");
         assert_eq!(r, vec![(vec!["Live".to_string()], 1)]);
+    }
+
+    // -- #define-line false positive (Deliverable 1) ---------------------
+    //
+    // A configured macro name appearing on its OWN `#define` directive line
+    // is the macro's DEFINITION, not an invocation. Matching it synthesizes
+    // a junk symbol named after the macro PARAMETER. The scanner must skip
+    // the define line while still matching real invocations on later lines.
+
+    #[test]
+    fn define_line_is_not_an_invocation() {
+        // The macro's own `#define` must NOT produce an invocation: the
+        // arg `x` is the formal parameter, not a real type.
+        let src = "#define MAKE_FN(x) void x##_Release() {}\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert!(
+            r.is_empty(),
+            "the macro's own #define line must not match as an invocation: {r:?}"
+        );
+    }
+
+    #[test]
+    fn define_line_skipped_but_real_invocation_after_still_matched() {
+        // Sentinel: the real invocation on a later line is found and the
+        // #define line above is skipped.
+        let src = "#define MAKE_FN(x) void x##_Release() {}\nMAKE_FN(Foo)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(
+            r,
+            vec![(vec!["Foo".to_string()], 2)],
+            "only the real invocation on line 2 must match, never the #define"
+        );
+    }
+
+    #[test]
+    fn define_line_with_leading_whitespace_skipped() {
+        // `#` may be indented (`   # define`), and whitespace may sit
+        // between `#` and `define`.
+        let src = "   #  define MAKE_FN(x) x\nMAKE_FN(Bar)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(r, vec![(vec!["Bar".to_string()], 2)]);
+    }
+
+    #[test]
+    fn define_line_with_backslash_continuation_skipped() {
+        // A multi-line `#define` continued with a trailing `\`. The macro
+        // name on the SECOND physical line is still on the directive's
+        // logical line and must be skipped. The real invocation on the
+        // following line still matches.
+        let src = "#define MAKE_FN(x) \\\n    void MAKE_FN(x)\nMAKE_FN(Baz)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(
+            r,
+            vec![(vec!["Baz".to_string()], 3)],
+            "continuation lines of a #define must be skipped; only the real \
+             invocation on line 3 matches"
+        );
+    }
+
+    #[test]
+    fn define_line_crlf_continuation_skipped() {
+        // CRLF line endings: the continuation `\` sits before `\r\n`.
+        let src = "#define MAKE_FN(x) \\\r\n    MAKE_FN(x)\r\nMAKE_FN(Qux)\r\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(
+            r,
+            vec![(vec!["Qux".to_string()], 3)],
+            "CRLF continuation of a #define must be skipped"
+        );
+    }
+
+    #[test]
+    fn definex_word_is_not_a_define_directive() {
+        // `#definex` is not the `#define` directive; an invocation on such
+        // a line (contrived) is NOT skipped. Guards the whole-word check.
+        let src = "#definex MAKE_FN(Real)\n";
+        let r = collect_invocations(src, "MAKE_FN");
+        assert_eq!(
+            r,
+            vec![(vec!["Real".to_string()], 1)],
+            "`#definex` is not the #define directive, so the invocation matches"
+        );
+    }
+
+    #[test]
+    fn is_on_define_line_direct() {
+        // Direct unit coverage of the helper at the macro-name offset.
+        let src = b"#define MAKE_FN(x) x";
+        let pos = src.windows(7).position(|w| w == b"MAKE_FN").unwrap();
+        assert!(is_on_define_line(src, pos));
+
+        let src2 = b"  MAKE_FN(Foo)";
+        let pos2 = src2.windows(7).position(|w| w == b"MAKE_FN").unwrap();
+        assert!(!is_on_define_line(src2, pos2));
     }
 }

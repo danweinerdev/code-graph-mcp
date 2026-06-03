@@ -36,7 +36,33 @@
 //! 1. **Macro-generated definitions** — Macros like `DEFINE_HANDLER(name)`
 //!    that expand to function definitions are not visible to tree-sitter (it
 //!    sees the macro call, not the expansion). Macro invocations that look
-//!    like function calls ARE captured as call edges.
+//!    like function calls ARE captured as call edges. **Two opt-in config
+//!    knobs recover macro-hidden definitions** (both default-empty, so the
+//!    base limitation stands unless configured):
+//!    - `[cpp].macro_define_function` SYNTHESIZES a bare `Function` symbol
+//!      named `<arg><suffix>` for each invocation of a token-pasting macro
+//!      (e.g. `IMPLEMENT_RELEASE_FN(Bar) → Bar_Release`). It does not touch
+//!      the source bytes; the synthetic symbol carries a
+//!      `/* synthesized by [cpp].macro_define_function: NAME */` signature
+//!      marker (consulted by `get_orphans` reliability filtering).
+//!    - `[cpp].macro_define_type` EXPANDS a struct/class-wrapping macro
+//!      invocation IN PLACE into the native C++ it produces (byte-preserving:
+//!      same length, every `\n` at its original offset), so tree-sitter
+//!      parses the type natively and recovers the type symbol AND its members
+//!      (methods, nested types) AND inheritance/call edges. See
+//!      [`crate::macro_expand`] for the rewrite algorithm.
+//!
+//!    Caveats shared by both knobs: (a) **opt-in** — empty by default;
+//!    (b) **body-vs-namespace scope is NOT discriminated** (a configured
+//!    macro name invoked inside a function body is treated like a top-level
+//!    invocation — a documented non-goal; choose macro names that don't
+//!    collide with other uses, same caveat as `macro_strip`); (c) the
+//!    same **raw-string-delimiter-collision** risk as `macro_strip` (a raw
+//!    string whose tag equals a configured macro name can be mis-scanned).
+//!    `macro_define_type` additionally requires the **keyword to FIT** in the
+//!    macro-name span (`struct`/`class` is written over the leading bytes of
+//!    the macro name; if longer, the invocation is skipped with a warning —
+//!    engine macro names like `EXPORT_STRUCT` are long enough in practice).
 //! 2. **Complex template metaprogramming** — Deeply nested template
 //!    specializations may produce incomplete or error-containing AST nodes.
 //!    The parser skips error nodes gracefully.
@@ -59,6 +85,7 @@
 
 pub(crate) mod helpers;
 pub(crate) mod macro_define;
+pub(crate) mod macro_expand;
 pub(crate) mod preprocess;
 pub(crate) mod queries;
 
@@ -737,31 +764,66 @@ impl LanguagePlugin for CppParser {
     }
 
     fn preprocess<'a>(&self, content: &'a [u8], cfg: &RootConfig) -> Cow<'a, [u8]> {
-        // Fast-path: both lists empty -> zero-cost identity. Most non-UE
-        // users will hit this branch.
-        if cfg.cpp.macro_strip.is_empty() && cfg.cpp.macro_strip_with_args.is_empty() {
+        // Fast-path: nothing configured -> zero-cost identity. Most non-UE
+        // users will hit this branch. The expansion pass
+        // (`macro_define_type`) is checked here too so an all-empty config
+        // never allocates.
+        if cfg.cpp.macro_strip.is_empty()
+            && cfg.cpp.macro_strip_with_args.is_empty()
+            && cfg.cpp.macro_define_type.is_empty()
+        {
             return Cow::Borrowed(content);
         }
-        // Pass 1: existing whole-word identifier replacement. Returns a
-        // fresh Cow; on `macro_strip = []` this is Borrowed-identity (no
-        // allocation), on non-empty it's Owned with the substitutions
-        // applied.
-        let cow = crate::preprocess::strip_macros(content, &cfg.cpp.macro_strip);
-        // Short-circuit when only `macro_strip` is populated. Without this
-        // guard we'd `into_owned()` the buffer (cheap if pass 1 already
-        // owns it; a fresh allocation if pass 1 returned Borrowed), then
-        // walk every byte calling `strip_macros_with_args` with an empty
-        // token set — a guaranteed-zero-replacement O(N) scan. The outer
-        // fast-path covers the "both empty" case; this covers "only
-        // pass-1 has work to do."
-        if cfg.cpp.macro_strip_with_args.is_empty() {
-            return cow;
+
+        // Pass 0: `macro_define_type` EXPANSION. Rewrites configured
+        // struct/class-wrapping macro invocations in place into the native
+        // C++ they expand to, producing a same-length owned buffer with
+        // every `\n` preserved at its original offset. Runs FIRST on the
+        // raw content so the subsequent strip passes see the now-revealed
+        // type body (and can blank any API macro inside it). Returns `None`
+        // when no configured macro matched — the borrowed content flows on
+        // to the strip passes unchanged.
+        let path_str: String;
+        let expanded: Cow<'a, [u8]> = if cfg.cpp.macro_define_type.is_empty() {
+            Cow::Borrowed(content)
+        } else {
+            // The expansion warns with a file path on skip; preprocess does
+            // not carry the path, so use a neutral placeholder. (The
+            // per-invocation warnings are diagnostic only.)
+            path_str = String::from("<preprocess>");
+            match crate::macro_expand::expand_macro_define_types(
+                content,
+                &cfg.cpp.macro_define_type,
+                &path_str,
+            ) {
+                Some(buf) => Cow::Owned(buf),
+                None => Cow::Borrowed(content),
+            }
+        };
+
+        // If only the expansion pass had work to do (both strip lists
+        // empty), return its result directly.
+        if cfg.cpp.macro_strip.is_empty() && cfg.cpp.macro_strip_with_args.is_empty() {
+            return expanded;
         }
-        // Pass 2 needs `&mut [u8]`; force ownership. If pass 1 returned
-        // Borrowed (macro_strip empty, macro_strip_with_args non-empty),
-        // `into_owned()` allocates the buffer pass 2 will mutate — that
-        // allocation has a purpose and clippy accepts it.
-        let mut buf: Vec<u8> = cow.into_owned();
+
+        // Pass 1: whole-word identifier replacement (`macro_strip`), run on
+        // the (possibly expanded) buffer. We materialize an owned buffer
+        // here because at least one strip list is non-empty; `into_owned`
+        // is a no-op move when expansion already owned, and a single
+        // allocation otherwise. `strip_macros` returns Borrowed on an empty
+        // `macro_strip` list, so reattach ownership.
+        let mut buf: Vec<u8> =
+            crate::preprocess::strip_macros(&expanded, &cfg.cpp.macro_strip).into_owned();
+
+        // Short-circuit when only `macro_strip` is populated — avoid a
+        // guaranteed-zero-replacement O(N) scan with an empty token set.
+        if cfg.cpp.macro_strip_with_args.is_empty() {
+            return Cow::Owned(buf);
+        }
+
+        // Pass 2: parameterized-macro replacement (`macro_strip_with_args`)
+        // operates on `&mut [u8]` in place.
         // Build the owned-bytes token set per call. Tiny lists in practice
         // (UE preset is ~25 tokens); HashSet construction is amortized
         // well below tree-sitter parse cost.

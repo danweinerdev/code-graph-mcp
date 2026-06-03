@@ -166,6 +166,37 @@ macro_strip_with_args = [] # identifier-plus-(args) tokens stripped the same way
                           # DECLARE_*_DELEGATE(...). `\n` preserved during fill so multi-line
                           # arg lists keep line offsets aligned. Token may not appear in both
                           # lists (ConfigError::MacroStripConflict).
+macro_define_function = [] # opt-in; default empty. Each entry SYNTHESIZES a Function symbol
+                          # for a token-pasting macro invocation. Fields:
+                          #   name   = macro identifier (e.g. "IMPLEMENT_RELEASE_FN")
+                          #   arg    = 0-based index of the arg naming the function (default 0)
+                          #   suffix = string appended to the captured arg (e.g. "_Release")
+                          # `IMPLEMENT_RELEASE_FN(Bar)` → synthesized `Bar_Release` Function.
+                          # Within-list dedup by `name`. Config change needs force=true.
+                          # Example: [[cpp.macro_define_function]]
+                          #          name = "IMPLEMENT_RELEASE_FN"
+                          #          arg = 0
+                          #          suffix = "_Release"
+macro_define_type = []    # opt-in; default empty. Each entry EXPANDS a struct/class-wrapping
+                          # macro invocation IN PLACE into native C++ (byte-preserving: same
+                          # length, every `\n` at its original offset) so tree-sitter recovers
+                          # the type symbol AND members AND inheritance/call edges. Runs in
+                          # preprocess BEFORE the strip passes. Fields:
+                          #   name     = macro identifier (e.g. "EXPORT_STRUCT")
+                          #   name_arg = 0-based index of the arg holding the type name (default 0)
+                          #   body_arg = 0-based index of the arg holding the member body
+                          #              (absent = the LAST arg, the __VA_ARGS__ tail)
+                          #   keyword  = "struct" (default) or "class"; any other value is
+                          #              ConfigError::MacroDefineTypeKeyword. Empty `name` is
+                          #              ConfigError::MacroDefineTypeEmptyName.
+                          # Keyword must FIT in the macro-name span (struct=6 ≤ EXPORT_STRUCT=13);
+                          # if longer, the invocation is skipped with an eprintln! warning.
+                          # A paren-wrapped body `(…)` is unwrapped. Within-list dedup by `name`.
+                          # Config change needs force=true. Example:
+                          #          [[cpp.macro_define_type]]
+                          #          name = "EXPORT_STRUCT"
+                          #          name_arg = 0
+                          #          keyword = "struct"
 
 [extensions]
 # Three semantics:
@@ -191,7 +222,7 @@ java = []
 
 - **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `8`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
 - **Version mismatch** on `Graph::load` → `Ok(false)` → caller **silently re-indexes**. No `force=true` required, no transparent migration.
-- **mtime-based stale checking.** Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime. Apply with `force=true`.
+- **mtime-based stale checking.** Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, `[cpp].macro_define_function`, `[cpp].macro_define_type`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime. Apply with `force=true`.
 - **Adding extensions:** new files brought in by `[extensions].<lang>` parse normally on next run (no `force=true`).
 - **Watch path** consults cached `RootConfig.extensions` on every reindex — disabled extensions stop reindexing on subsequent edits, but pre-existing graph entries persist until `force=true`.
 - **`[response].max_bytes`:** consulted from the cached `RootConfig` on each tool call. To apply a changed value, re-run `analyze_codebase` — **no `force=true` required** (no mtime-based entries affected; value only shapes response output).
@@ -215,9 +246,11 @@ Supported:
 - Call patterns: free, method, arrow, qualified, template.
 - Macro-prefixed classes (`class CORE_API MyClass : public Base {}`) iff listed in `[cpp].macro_strip`. Default (no `[cpp]` section) leaves these broken.
 - Parameterized API/reflection macros (`UCLASS(...)`, `UFUNCTION(...)`, `UPROPERTY(...)`, `GENERATED_BODY()`, `DECLARE_*_DELEGATE(...)`) iff listed in `[cpp].macro_strip_with_args`. Scanner uses `find_balanced_close` + `skip_lexical` (walks past strings/comments/raw-strings); `\n` preserved so multi-line arg lists keep line offsets aligned. Pair with `macro_strip` for `<MODULE>_API` bare-token coverage; same token may not appear in both lists.
+- Macro-hidden FUNCTION definitions via `[cpp].macro_define_function` (opt-in; default empty). Each entry `{ name, arg, suffix }` synthesizes a `Function` symbol named `<arg><suffix>` per invocation `MACRO(arg0, …)` (e.g. `IMPLEMENT_RELEASE_FN(Bar)` → `Bar_Release`). Byte-scan (not byte-rewrite); synthetic symbols carry a `/* synthesized by [cpp].macro_define_function: NAME */` signature marker. Within-list dedup by `name`.
+- Macro-hidden TYPE definitions via `[cpp].macro_define_type` (opt-in; default empty). Each entry `{ name, name_arg, body_arg, keyword }` EXPANDS a struct/class-wrapping macro invocation IN PLACE into native C++ (byte-preserving: same length, every `\n` at its original offset) so tree-sitter recovers the type symbol AND its members (methods, nested types) AND inheritance/call edges. Runs in `preprocess` BEFORE the `macro_strip`/`macro_strip_with_args` passes. `keyword` is `struct` (default) or `class`. `name_arg` (default 0) holds the type name; `body_arg` (default = last arg) holds the member body; a paren-wrapped body `(…)` is unwrapped. Within-list dedup by `name`.
 
 Limitations:
-1. **Macro-generated definitions invisible.** `DEFINE_HANDLER(name)` expansions aren't seen by tree-sitter. Macro invocations that look like calls ARE captured as call edges.
+1. **Macro-generated definitions invisible by default.** `DEFINE_HANDLER(name)` expansions aren't seen by tree-sitter. Macro invocations that look like calls ARE captured as call edges. RECOVERABLE via opt-in config: `[cpp].macro_define_function` (synthesizes a `Function` symbol from a token-pasting macro) and `[cpp].macro_define_type` (byte-preserving struct/class expansion → full type body). Both default-empty, so the limitation stands unless configured. Shared caveats: opt-in; body-vs-namespace scope NOT discriminated (a configured macro name invoked inside any scope is treated like a top-level invocation — documented non-goal); raw-string-delimiter-collision risk shared with `macro_strip`. `macro_define_type` additionally requires the keyword (`struct`/`class`) to FIT in the macro-name span; if longer, the invocation is skipped with an `eprintln!` warning. Config change to either knob needs `force=true` (mtime-stale rule, same as `macro_strip`).
 2. **Complex template metaprogramming** → ERROR nodes; parser skips gracefully.
 3. **Call resolution heuristic** — same-file > same-class > same-namespace > global. Syntactic, not semantic. Overloads may misresolve.
 4. **Cast expressions filtered:** `static_cast`/`dynamic_cast`/`const_cast`/`reinterpret_cast`.

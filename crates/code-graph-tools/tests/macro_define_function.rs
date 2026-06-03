@@ -76,6 +76,18 @@ IMPLEMENT_RELEASE_FN(Bar)
     assert_eq!(bar_release.kind, SymbolKind::Function);
     // No parent — synthesized at top-level scope.
     assert!(bar_release.parent.is_empty());
+
+    // #define-line false-positive guard (Deliverable 1): the macro's own
+    // `#define IMPLEMENT_RELEASE_FN(name) ...` line must NOT be scanned as
+    // an invocation — doing so would synthesize a junk `name_Release` symbol
+    // named after the macro's formal parameter. Only the real `Bar`
+    // invocation produces a symbol.
+    assert!(
+        !syms.iter().any(|s| s.name == "name_Release"),
+        "the #define line must not synthesize a `name_Release` symbol from the macro parameter; \
+         got: {:?}",
+        syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
 }
 
 /// Multiple invocations in the same file produce multiple synthetic
