@@ -575,8 +575,23 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
     // filter consistent within the batch.
     let extensions = inner.config.read().extensions.clone();
     for evt in evts {
-        let is_remove = matches!(evt.event.kind, EventKind::Remove(_));
+        let kind_is_remove = matches!(evt.event.kind, EventKind::Remove(_));
         for raw_path in &evt.event.paths {
+            // Classify removal by DISK REALITY, not the reported event
+            // kind alone. notify's `EventKind::Remove` is not delivered
+            // uniformly across backends: macOS FSEvents coalesces a
+            // delete (and the remove arm of a rename) into
+            // `Modify(Name(..))` or a detail-less `Modify(Any)`, so a
+            // kind-only check leaves `is_remove=false` and the loop tries
+            // to RE-READ a file that is already gone — failing with
+            // "No such file or directory" and leaving the stale symbols
+            // in the graph (the `watch_loop_handles_file_removal_*`
+            // regression). Treating "event fired but the path no longer
+            // exists" as a removal makes the graph converge on every
+            // platform. A create/modify whose file is genuinely present
+            // keeps `is_remove=false`; a path that reappears after this
+            // check is re-added by its subsequent create event.
+            let is_remove = kind_is_remove || !raw_path.exists();
             // Canonicalize at the dispatch boundary so every downstream
             // graph lookup and merge sees the same shape the indexer
             // stored. On Windows the raw event path arrives in the
@@ -1067,6 +1082,60 @@ mod tests {
         assert_eq!(
             first_text(&r),
             format!("no symbols found in file: {path_str}"),
+        );
+
+        drop(dir);
+    }
+
+    /// Regression for the macOS file-removal flake
+    /// (`watch_loop_handles_file_removal_end_to_end`): a delete is not
+    /// always delivered as `EventKind::Remove`. macOS FSEvents coalesces
+    /// a delete into `Modify(Name(..))` / `Modify(Any)`, so classifying
+    /// removal by event kind alone left `is_remove=false` and the loop
+    /// tried to RE-READ the gone file, leaving its stale symbols in the
+    /// graph. `process_event_batch` now also treats "event fired but path
+    /// no longer exists" as a removal.
+    ///
+    /// This drives `process_event_batch` directly with a synthetic
+    /// NON-Remove event for an already-deleted file, so it reproduces the
+    /// misclassification deterministically on EVERY platform (not just on
+    /// a host whose backend happens to coalesce). Linux/notify would
+    /// normally emit `Remove` here; pinning the disk-reality fallback
+    /// guards the contract regardless of backend.
+    #[tokio::test]
+    async fn non_remove_event_for_deleted_file_drops_it_from_graph() {
+        use notify_debouncer_full::notify::event::{ModifyKind, RenameMode};
+        use notify_debouncer_full::notify::Event;
+
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+
+        // Sentinel: the file is in the graph before the event.
+        assert!(
+            !inner.graph.read().file_symbols(&a_cpp).is_empty(),
+            "sentinel: a.cpp must be indexed before the delete event"
+        );
+
+        // Delete on disk, then feed a MODIFY (not Remove) event — the
+        // exact misclassification macOS FSEvents produces for a delete.
+        std::fs::remove_file(&a_cpp).unwrap();
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            paths: vec![a_cpp.clone()],
+            attrs: Default::default(),
+        };
+        let batch = vec![DebouncedEvent {
+            event,
+            time: std::time::Instant::now(),
+        }];
+        process_event_batch(&inner, batch).await;
+
+        // Discriminator: despite the non-Remove kind, the gone file must
+        // be dropped from the graph.
+        assert!(
+            inner.graph.read().file_symbols(&a_cpp).is_empty(),
+            "a non-Remove event for a deleted file must drop it from the graph"
         );
 
         drop(dir);
