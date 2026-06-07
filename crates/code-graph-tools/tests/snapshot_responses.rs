@@ -304,20 +304,33 @@ async fn response_search_symbols_byte_budget_truncated() {
     // regardless of trim outcome). Kept records are in `symbol_id`
     // ascending order — `Graph::search`'s deterministic bounded-heap
     // sort, preserved by the handler-layer trim.
+    //
+    // HARDENING (see `budget_fitting_first_n`): the byte budget bites
+    // against the REAL serialized records, whose `id` embeds the absolute
+    // TempDir path — a value that varies by environment (and is longer on
+    // macOS, where `/var` canonicalizes to `/private/var`). A hardcoded
+    // `max_bytes` therefore cut at a path-length-dependent record count and
+    // flaked off the machine it was recorded on. Probe the records
+    // UNBUDGETED, then size the budget to fit EXACTLY 4 so the cut — and the
+    // snapshot — is deterministic everywhere.
     let fx = build_indexed_fixture_with_many_file_symbols(30).await;
-    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
-    let r = search_symbols(
-        &fx.inner.graph,
-        SearchSymbolsInput {
-            subtree: None,
-            query: Some("func"),
-            limit: Some(1000),
-            offset: Some(0),
-            brief: true,
-            ..Default::default()
-        },
-        max_bytes,
-    );
+    let search_args = |max_bytes: usize| {
+        search_symbols(
+            &fx.inner.graph,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("func"),
+                limit: Some(1000),
+                offset: Some(0),
+                brief: true,
+                ..Default::default()
+            },
+            max_bytes,
+        )
+    };
+    let probe_records = raw_results(&search_args(NO_BYTE_BUDGET));
+    let max_bytes = budget_fitting_first_n(&probe_records, 4);
+    let r = search_args(max_bytes);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -842,23 +855,34 @@ async fn response_get_file_symbols_byte_budget_truncated() {
     // locks the truncated-page shape: `truncated:true`, `next_offset:N`
     // where `N < limit`, and `total:30` (pre-pagination match count is
     // unchanged regardless of truncation).
+    //
+    // HARDENING (see `budget_fitting_first_n`): the byte budget bites
+    // against the REAL serialized records, whose `id` embeds the absolute
+    // TempDir path — a value that varies by environment (and is longer on
+    // macOS, where `/var` canonicalizes to `/private/var`). A hardcoded
+    // `max_bytes` therefore cut at a path-length-dependent record count.
+    // Probe UNBUDGETED, then size the budget to fit EXACTLY 4 records.
     let fx = build_indexed_fixture_with_many_file_symbols(30).await;
     let file = fx
         .indexed_root
         .join("big.cpp")
         .to_string_lossy()
         .into_owned();
-    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
-    let r = get_file_symbols(
-        &fx.inner.graph,
-        &file,
-        false,
-        true,
-        Some(20),
-        Some(0),
-        false,
-        max_bytes,
-    );
+    let symbol_args = |max_bytes: usize| {
+        get_file_symbols(
+            &fx.inner.graph,
+            &file,
+            false,
+            true,
+            Some(20),
+            Some(0),
+            false,
+            max_bytes,
+        )
+    };
+    let probe_records = raw_results(&symbol_args(NO_BYTE_BUDGET));
+    let max_bytes = budget_fitting_first_n(&probe_records, 4);
+    let r = symbol_args(max_bytes);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -961,19 +985,30 @@ async fn response_get_callers_byte_budget_truncated() {
     // regardless of truncation), and the kept records are in
     // (depth, symbol_id) ascending order — the helper preserves the
     // handler's pre-truncation sort.
+    //
+    // HARDENING (see `budget_fitting_first_n`): the byte budget bites
+    // against the REAL serialized records, whose `symbol_id`/`file` embed the
+    // absolute TempDir path — a value that varies by environment (and is
+    // longer on macOS, where `/var` canonicalizes to `/private/var`). A
+    // hardcoded `max_bytes` therefore cut at a path-length-dependent record
+    // count. Probe UNBUDGETED, then size the budget to fit EXACTLY 3 records.
     let fx = build_indexed_fixture_with_high_fan().await;
     let id = format!("{}:target", fx.indexed_root.join("hub.cpp").display());
-    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
-    let r = callers_or_callees(
-        &fx.inner.graph,
-        &id,
-        Some(1),
-        Direction::Callers,
-        Some(50),
-        Some(0),
-        max_bytes,
-        None,
-    );
+    let caller_args = |max_bytes: usize| {
+        callers_or_callees(
+            &fx.inner.graph,
+            &id,
+            Some(1),
+            Direction::Callers,
+            Some(50),
+            Some(0),
+            max_bytes,
+            None,
+        )
+    };
+    let probe_records = raw_results(&caller_args(NO_BYTE_BUDGET));
+    let max_bytes = budget_fitting_first_n(&probe_records, 3);
+    let r = caller_args(max_bytes);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1022,19 +1057,30 @@ async fn response_get_callees_byte_budget_truncated() {
     // unchanged regardless of truncation), and the kept records are in
     // (depth, symbol_id) ascending order — the helper preserves the
     // handler's pre-truncation sort.
+    //
+    // HARDENING (see `budget_fitting_first_n`): the byte budget bites
+    // against the REAL serialized records, whose `symbol_id`/`file` embed the
+    // absolute TempDir path — a value that varies by environment (and is
+    // longer on macOS, where `/var` canonicalizes to `/private/var`). A
+    // hardcoded `max_bytes` therefore cut at a path-length-dependent record
+    // count. Probe UNBUDGETED, then size the budget to fit EXACTLY 3 records.
     let fx = build_indexed_fixture_with_high_fan().await;
     let id = format!("{}:entry", fx.indexed_root.join("hub.cpp").display());
-    let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
-    let r = callers_or_callees(
-        &fx.inner.graph,
-        &id,
-        Some(1),
-        Direction::Callees,
-        Some(50),
-        Some(0),
-        max_bytes,
-        None,
-    );
+    let callee_args = |max_bytes: usize| {
+        callers_or_callees(
+            &fx.inner.graph,
+            &id,
+            Some(1),
+            Direction::Callees,
+            Some(50),
+            Some(0),
+            max_bytes,
+            None,
+        )
+    };
+    let probe_records = raw_results(&callee_args(NO_BYTE_BUDGET));
+    let max_bytes = budget_fitting_first_n(&probe_records, 3);
+    let r = callee_args(max_bytes);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
