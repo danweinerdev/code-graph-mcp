@@ -1488,11 +1488,19 @@ mod tests {
             stats.files >= 2,
             "both a.cpp and b.cpp must be in the graph after slow-path re-parse; got {stats:?}"
         );
+        // The graph keys files by the canonicalized path the indexer
+        // stored (`code_graph_core::paths::canonicalize`). On macOS the
+        // `TempDir` root lives under `/var/folders/...`, a symlink to
+        // `/private/var/...`; canonicalize resolves it, so the raw
+        // `a_cpp`/`b_cpp` paths would miss `file_symbols` and return
+        // empty. Canonicalize the lookup paths to match storage.
+        let a_key = code_graph_core::paths::canonicalize(&a_cpp).unwrap();
+        let b_key = code_graph_core::paths::canonicalize(&b_cpp).unwrap();
         // The new `h()` function added in the second pass should be
         // present — proves the slow path actually re-parsed a.cpp
         // instead of just returning the stale cache.
         let symbols: Vec<String> = g
-            .file_symbols(&a_cpp)
+            .file_symbols(&a_key)
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -1506,13 +1514,169 @@ mod tests {
         // produce the correct result, but the optimization wouldn't
         // have fired).
         let b_symbols: Vec<String> = g
-            .file_symbols(&b_cpp)
+            .file_symbols(&b_key)
             .iter()
             .map(|s| s.name.clone())
             .collect();
         assert!(
             b_symbols.iter().any(|n| n == "g"),
             "b.cpp's symbols must survive in the graph (proves probe-reuse); got: {b_symbols:?}"
+        );
+    }
+
+    /// Portable regression for the path-keying contract that
+    /// `analyze_slow_path_with_stale_file_reuses_probe` originally
+    /// tripped over: the indexer stores every file under its
+    /// `paths::canonicalize`-normalized key (project invariant —
+    /// "stored file paths are absolute and `\\?\`-prefix-stripped via
+    /// `dunce` at index time"). A `file_symbols` lookup therefore only
+    /// hits when handed the canonicalized form.
+    ///
+    /// This test runs identically on every platform. On macOS it would
+    /// have caught the original bug (the `TempDir` root lives under
+    /// `/var/...`, a symlink to `/private/var/...`, so the raw path
+    /// diverges from the stored canonical key). On Linux the raw and
+    /// canonical forms coincide, so the assertions hold as a tautology
+    /// — but they still pin the contract: were the indexer ever changed
+    /// to store a non-canonical key, `file_symbols(canonical)` would
+    /// stop resolving and this test would fail.
+    #[tokio::test]
+    async fn analyze_stores_files_under_canonicalized_paths() {
+        let dir = TempDir::new().unwrap();
+        let a_cpp = dir.path().join("a.cpp");
+        fs::write(&a_cpp, b"void f() {}\n").unwrap();
+        let server = server_with_cpp_parser();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let r = analyze_codebase(server.inner.clone(), path, false, None, None).await;
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+
+        let g = server.inner.graph.read();
+
+        // The stored key must equal the canonicalized raw path.
+        let canonical = paths::canonicalize(&a_cpp).unwrap();
+        let stored: Vec<String> = g
+            .file_graphs_snapshot()
+            .into_iter()
+            .map(|fg| fg.path)
+            .collect();
+        assert!(
+            stored
+                .iter()
+                .any(|p| p == &canonical.to_string_lossy().into_owned()),
+            "graph must key a.cpp under its canonicalized path {}; stored: {stored:?}",
+            canonical.display()
+        );
+
+        // Every stored key must already be canonical (idempotent under
+        // re-canonicalization) — the cross-platform statement of the
+        // "paths are canonical at index time" invariant.
+        for p in &stored {
+            let reparsed = paths::canonicalize(std::path::Path::new(p)).unwrap();
+            assert_eq!(
+                &reparsed.to_string_lossy().into_owned(),
+                p,
+                "stored path {p} is not in canonical form (would defeat file_symbols lookups)"
+            );
+        }
+
+        // The lookup contract: canonical hits.
+        let symbols: Vec<String> = g
+            .file_symbols(&canonical)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            symbols.iter().any(|n| n == "f"),
+            "file_symbols(canonical) must resolve a.cpp's symbols; got: {symbols:?}"
+        );
+    }
+
+    /// Deterministically reproduces, on ANY unix platform (Linux CI
+    /// included), the exact path divergence that made
+    /// `analyze_slow_path_with_stale_file_reuses_probe` fail only on
+    /// macOS. Rather than rely on the host's incidental `/var ->
+    /// /private/var` symlink, we create our own symlinked access path
+    /// and index through it, forcing the raw access path to differ from
+    /// the canonical on-disk path everywhere.
+    ///
+    /// Contract pinned:
+    ///   - the indexer stores the canonical (symlink-resolved) key;
+    ///   - `file_symbols(raw_symlink_path)` MISSES (returns empty) —
+    ///     this is precisely the original test bug;
+    ///   - `file_symbols(canonicalize(raw_symlink_path))` HITS.
+    ///
+    /// `#[cfg(unix)]`: `std::os::unix::fs::symlink` is unprivileged on
+    /// Linux + macOS, which is where the divergence manifests. Windows
+    /// symlink creation requires elevation/developer-mode and carries
+    /// its own `\\?\`-strip coverage (see CLAUDE.md), so it is out of
+    /// scope here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_symbols_through_symlink_requires_canonical_path() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("a.cpp"), b"void f() {}\n").unwrap();
+
+        // Access the same directory through a symlink — `link/a.cpp` is
+        // a valid path to the file but is NOT its canonical on-disk
+        // path.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = link.join("a.cpp");
+
+        let server = server_with_cpp_parser();
+        let r = analyze_codebase(
+            server.inner.clone(),
+            link.to_string_lossy().into_owned(),
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+
+        let g = server.inner.graph.read();
+
+        // Sentinel: confirm indexing actually happened before asserting
+        // the discriminator (timing/IO-independent here, but keeps the
+        // failure message honest if the corpus ever fails to parse).
+        let canonical = paths::canonicalize(&via_link).unwrap();
+        let canonical_hits: Vec<String> = g
+            .file_symbols(&canonical)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            canonical_hits.iter().any(|n| n == "f"),
+            "file_symbols(canonical) must resolve the file indexed via symlink; got: {canonical_hits:?}"
+        );
+
+        // Discriminator: the raw symlink path must MISS — this is the
+        // bug class the original probe test hit on macOS.
+        let raw_hits = g.file_symbols(&via_link);
+        assert!(
+            raw_hits.is_empty(),
+            "file_symbols(raw symlink path) must miss — graph keys files \
+             by canonical path, not the access path used to reach them"
+        );
+
+        // And the stored key is the resolved real path, not the link.
+        let stored: Vec<String> = g
+            .file_graphs_snapshot()
+            .into_iter()
+            .map(|fg| fg.path)
+            .collect();
+        assert_eq!(
+            stored.len(),
+            1,
+            "exactly one file expected; got: {stored:?}"
+        );
+        assert_eq!(
+            stored[0],
+            canonical.to_string_lossy().into_owned(),
+            "stored key must be the canonical (symlink-resolved) path"
         );
     }
 
