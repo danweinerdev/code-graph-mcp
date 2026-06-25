@@ -9,5 +9,8 @@ bin/
 target/
 .code-graph.toml
 
+# Dev-container host-side cargo/target cache (claude-container.sh)
+.cache/
+
 # IDEs
 .idea/

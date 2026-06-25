@@ -1,0 +1,14 @@
+# Build context hygiene for tools/claude/Containerfile (build context = repo root).
+# The builder stage COPYs the workspace source to compile code-graph-mcp; keep
+# the context lean so the image build doesn't drag in build outputs, the local
+# cargo/registry cache, the on-disk graph cache, VCS metadata, or the large
+# external/ dogfood corpora (test fixtures, not build inputs).
+target/
+.cache/
+.git/
+.idea/
+.code-graph-cache.db
+.code-graph-cache.json
+.code-graph.toml
+external/
+dist/

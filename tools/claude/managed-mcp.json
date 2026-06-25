@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "code-graph": {
+      "type": "stdio",
+      "command": "/opt/mcp/bin/code-graph-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
