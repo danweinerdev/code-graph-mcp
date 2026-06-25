@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "code-graph-mcp",
+  "owner": {
+    "name": "Daniel Weiner"
+  },
+  "metadata": {
+    "description": "Plugins shipped with the code-graph-mcp repository."
+  },
+  "plugins": [
+    {
+      "name": "code-graph",
+      "source": "./plugin",
+      "description": "Steers Claude Code toward the code-graph MCP server for structural code questions: a Grep/Glob nudge hook plus scenario skills for the code-graph tool surface."
+    }
+  ]
+}
