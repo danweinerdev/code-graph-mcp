@@ -1,0 +1,263 @@
+# Containerfile — Fedora-based Rust dev container for code-graph-mcp with Claude Code.
+#
+# Build context is the REPO ROOT (not this directory): the builder stage compiles
+# the code-graph-mcp MCP server straight from the checked-out workspace, so the
+# baked-in server always matches the tree you launch from. The sidecar config
+# files COPYed below are addressed by their repo-relative path (tools/claude/*).
+# claude-container.sh sets the context to the repo root for exactly this reason.
+#
+# Two-stage build:
+#   builder - everything that needs a Rust compiler: the supply-chain cargo
+#             tools (audit/deny) and the code-graph-mcp server (built from the
+#             local workspace source). All build artifacts stay in this
+#             throwaway stage.
+#   final   - the actual dev image; it COPYs only the resulting binaries out of
+#             the builder, so none of the build outputs land in the shipped
+#             layers.
+#
+# Toolchain layout (final image):
+#   /opt/rust/rustup  - RUSTUP_HOME, baked into the image (toolchain bits)
+#   /opt/rust/cargo   - rustup-installed proxies (cargo/rustc/rustup), in PATH;
+#                       also where the cargo tools are COPYed so they're on PATH
+#   /opt/mcp/bin      - the baked-in code-graph-mcp server binary, on PATH
+#   /cache/cargo      - CARGO_HOME at runtime (registry, git, installed bins)  <- volume
+#   /cache/target     - CARGO_TARGET_DIR at runtime (build outputs)             <- volume
+#
+# The /cache/* paths are populated by ./claude-container.sh from ./.cache on
+# the host, so cargo state and build outputs survive across container runs.
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder — compile the cargo tools + the code-graph-mcp server.
+# ---------------------------------------------------------------------------
+FROM docker.io/library/fedora:44 AS builder
+
+# Enough to compile the workspace: a C/C++ toolchain (the tree-sitter grammars
+# build through the pure-Rust `cc` crate — no CGo, but it still shells out to a
+# host C compiler), plus git/curl/ca-certificates for the rustup-init download.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates curl git \
+        gcc gcc-c++ make cmake pkgconf-pkg-config \
+        rustup \
+    && dnf clean all
+
+# The workspace pins channel "stable" via rust-toolchain.toml, so install the
+# stable channel up front (with rustfmt + clippy, the components the toolchain
+# file requests) to avoid a surprise toolchain download when cargo first runs
+# in the clone.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN set -eux; \
+    mkdir -p /opt/rust/rustup /opt/rust/cargo; \
+    rustup-init -y --no-modify-path \
+        --default-toolchain stable --profile minimal \
+        --component rustfmt --component clippy
+
+# Supply-chain tooling: cargo-audit (RUSTSEC advisory scan) and cargo-deny
+# (license / advisory / source / duplicate-dependency policy). --locked uses
+# each crate's published Cargo.lock for a reproducible build; --root /opt/build
+# collects the bins under /opt/build/bin so the final stage has one predictable
+# COPY source, decoupled from CARGO_HOME.
+RUN cargo install --locked --root /opt/build \
+        cargo-audit cargo-deny
+
+# Build the code-graph-mcp server from the local workspace. The build context
+# is the repo root (see header); .containerignore keeps target/, .git, the local
+# caches, and the external/ dogfood corpora out so this COPY stays lean. The
+# external/ submodules are C/C++ test fixtures, not build inputs, so their
+# absence does not affect the release build.
+COPY . /tmp/code-graph-mcp
+RUN set -eux; \
+    cd /tmp/code-graph-mcp; \
+    cargo build --release -p code-graph-mcp; \
+    install -Dm755 target/release/code-graph-mcp /opt/build/bin/code-graph-mcp
+
+# ---------------------------------------------------------------------------
+# Stage 2: final — the dev image.
+# ---------------------------------------------------------------------------
+FROM docker.io/library/fedora:44
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG USERNAME=dev
+
+# System packages: build deps, debuggers + the sanitizer runtimes, common dev
+# utilities, rustup (provides rustup-init), shadow-utils for user creation.
+# Claude Code is a native standalone binary installed per-user below, so no
+# Node.js/npm is needed; curl + jq cover its download + checksum step.
+#
+# Sanitizer support is intentionally retained: clang/lld/llvm + libasan/libtsan
+# (static variants too) back ASan/TSan runs against the nightly toolchain's
+# -Zbuild-std, and gdb/lldb/valgrind/strace round out the debugging kit.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates curl wget git gnupg2 \
+        gcc gcc-c++ make cmake pkgconf-pkg-config \
+        gdb lldb valgrind strace ltrace perf \
+        clang lld mold llvm libasan libasan-static libtsan libtsan-static \
+        python3 python3-pip \
+        less vim nano ripgrep fd-find jq \
+        procps-ng file unzip xz tar diffutils \
+        shadow-utils \
+        rustup \
+    && dnf clean all
+
+# Create a dev user whose UID/GID match the host caller so bind-mounted files
+# keep correct ownership under --userns=keep-id. No sudo is installed or
+# configured: the container runs entirely as this unprivileged user, all
+# writable paths (/cache/*) are user-owned, and the baked toolchain at
+# /opt/rust is world-readable — `make test` needs no privilege escalation.
+RUN set -eux; \
+    if ! getent group "${USER_GID}" >/dev/null; then \
+        groupadd --gid "${USER_GID}" "${USERNAME}"; \
+    fi; \
+    useradd --uid "${USER_UID}" --gid "${USER_GID}" \
+        --create-home --shell /bin/bash "${USERNAME}"
+
+# Install the Rust toolchains into a fixed image path. CARGO_HOME is set only
+# for these build steps so rustup writes its proxies under /opt/rust/cargo; at
+# runtime CARGO_HOME is redirected to the bind-mounted volume below.
+#
+# Two toolchains are installed:
+#   stable  - default; the channel rust-toolchain.toml selects. Drives the
+#             normal build/test/clippy/fmt/doc flow. Installed with the
+#             `minimal` profile plus only the components used here (clippy,
+#             rustfmt, llvm-tools-preview, rust-src) — NOT the `default`
+#             profile, which bundles the ~715MB rust-docs HTML set and
+#             rust-analyzer, neither of which a CLI-agent container needs.
+#   nightly - drives the sanitizer suites and Miri (ASan/TSan via
+#             `cargo +nightly` with `-Zbuild-std`; `cargo +nightly miri test`
+#             uses the `miri` component). `rust-src` is mandatory for
+#             `-Zbuild-std` (TSan ships no prebuilt std) and for Miri's
+#             sysroot; `llvm-tools-preview` provides the
+#             sanitizer/symbolization tooling. Installed as bare `nightly` so
+#             `cargo +nightly` resolves without a pinned date.
+ENV RUSTUP_HOME=/opt/rust/rustup
+RUN set -eux; \
+    mkdir -p /opt/rust/rustup /opt/rust/cargo; \
+    CARGO_HOME=/opt/rust/cargo rustup-init -y --no-modify-path \
+        --default-toolchain stable --profile minimal \
+        --component rust-src \
+        --component clippy --component rustfmt --component llvm-tools-preview; \
+    CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup toolchain install nightly \
+        --profile minimal \
+        --component rust-src --component llvm-tools-preview --component miri; \
+    chmod -R a+rX /opt/rust
+
+# Supply-chain tooling, built in the `builder` stage and copied in: cargo-audit
+# (RUSTSEC advisory scan), cargo-deny (license / advisory / source / duplicate
+# policy). They land in the baked toolchain's bin dir (/opt/rust/cargo/bin) so
+# they're on PATH for every container run, rather than landing in the
+# bind-mounted /cache/cargo volume.
+COPY --from=builder /opt/build/bin/cargo-audit /opt/rust/cargo/bin/cargo-audit
+COPY --from=builder /opt/build/bin/cargo-deny  /opt/rust/cargo/bin/cargo-deny
+
+# The code-graph-mcp server, built in the `builder` stage from the local
+# workspace and copied into its own baked-in PATH dir. This is the project's
+# `code-graph` MCP server; it's wired for Claude Code via
+# /etc/claude-code/managed-mcp.json below.
+RUN mkdir -p /opt/mcp/bin
+COPY --from=builder /opt/build/bin/code-graph-mcp /opt/mcp/bin/code-graph-mcp
+
+# Make every copied binary world-readable/executable for the unprivileged `dev`
+# user (the COPY'd files are root-owned; the baked toolchain is already a+rX).
+RUN chmod -R a+rX /opt/rust /opt/mcp
+
+# Runtime cache layout: registry, git, installed crate bins under /cache/cargo;
+# build outputs under /cache/target. PATH puts /cache/cargo/bin first so
+# user-installed cargo crates win over baked-in ones; /opt/mcp/bin carries the
+# baked-in MCP server binary.
+ENV CARGO_HOME=/cache/cargo \
+    CARGO_TARGET_DIR=/cache/target \
+    PATH=/cache/cargo/bin:/opt/rust/cargo/bin:/opt/mcp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Claude Code — installed per-user as a native standalone binary (no Node.js
+# at runtime). This inlines the official install.sh flow rather than piping it
+# into a shell: it resolves a version, fetches that release's manifest, and
+# verifies the downloaded binary against the manifest's published SHA256 before
+# trusting it. Override the version at build time with
+# `--build-arg CLAUDE_CODE_VERSION=2.1.145` (or `stable`); the default tracks
+# the latest release.
+# Also pre-create ~/.ssh/ with 0700 so a bind-mounted config file at runtime
+# doesn't trigger podman to auto-create the parent as root (which would make
+# ssh reject the config with "Bad owner or permissions").
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+ARG CLAUDE_CODE_VERSION=latest
+RUN set -eux; \
+    base_url="https://downloads.claude.ai/claude-code-releases"; \
+    case "$(uname -m)" in \
+        x86_64|amd64) arch="x64" ;; \
+        aarch64|arm64) arch="arm64" ;; \
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    platform="linux-${arch}"; \
+    case "${CLAUDE_CODE_VERSION}" in \
+        latest|stable) version="$(curl -fsSL "${base_url}/${CLAUDE_CODE_VERSION}")" ;; \
+        *)             version="${CLAUDE_CODE_VERSION}" ;; \
+    esac; \
+    case "${version}" in \
+        [0-9]*.[0-9]*.[0-9]*) ;; \
+        *) echo "Resolved an invalid Claude Code version: '${version}'" >&2; exit 1 ;; \
+    esac; \
+    checksum="$(curl -fsSL "${base_url}/${version}/manifest.json" \
+        | jq -r ".platforms[\"${platform}\"].checksum // empty")"; \
+    [ "${#checksum}" -eq 64 ] \
+        || { echo "No SHA256 for ${platform} in the ${version} manifest" >&2; exit 1; }; \
+    mkdir -p /home/${USERNAME}/.local/bin; \
+    curl -fsSL -o /home/${USERNAME}/.local/bin/claude \
+        "${base_url}/${version}/${platform}/claude"; \
+    echo "${checksum}  /home/${USERNAME}/.local/bin/claude" | sha256sum -c -; \
+    chmod 0755 /home/${USERNAME}/.local/bin/claude; \
+    /home/${USERNAME}/.local/bin/claude --version; \
+    mkdir -m 700 -p /home/${USERNAME}/.ssh
+ENV PATH=/home/${USERNAME}/.local/bin:/cache/cargo/bin:/opt/rust/cargo/bin:/opt/mcp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The code-graph Claude Code plugin, baked into the image at a fixed path rather
+# than loaded from the bind-mounted /src. Copying it in (instead of pointing at
+# /src) means the plugin is always present and version-locked to the image, even
+# if the repo isn't mounted or a different tree is checked out. The repo-root
+# relative layout is preserved so the marketplace manifest's per-plugin
+# `source: "./plugin"` still resolves for anyone who installs it interactively:
+#   /opt/code-graph-plugin/.claude-plugin/marketplace.json  (the marketplace)
+#   /opt/code-graph-plugin/plugin/                          (the plugin itself)
+#
+# How it's enabled: the launcher (and this image's CMD) pass
+# `--plugin-dir /opt/code-graph-plugin/plugin`, which LOADS the plugin's hooks
+# and skills for the session with no install step and no writes under the
+# bind-mounted host ~/.claude. (Managed-settings `enabledPlugins` /
+# `extraKnownMarketplaces` were tried first but only DECLARE intent — they do
+# not auto-install a directory-sourced plugin headlessly, so the cache stays
+# empty and nothing loads. `--plugin-dir` is the mechanism that actually
+# activates it: verified `Status: ✔ loaded`.) The baked marketplace is kept so
+# `claude plugin install code-graph@code-graph-mcp` also works interactively.
+USER root
+COPY .claude-plugin /opt/code-graph-plugin/.claude-plugin
+COPY plugin /opt/code-graph-plugin/plugin
+RUN chmod -R a+rX /opt/code-graph-plugin \
+    && find /opt/code-graph-plugin/plugin/scripts -type f -name '*.sh' -exec chmod 0755 {} +
+
+# System-level Claude Code policy: a read-only Bash allowlist that runs without
+# per-command permission prompts. Edit tools/claude/managed-settings.json in the
+# repo and rebuild to change it. This system file is read before and takes
+# precedence over user/project settings and is NOT shadowed by the bind-mounted
+# host ~/.claude, so the host's own Claude is unaffected.
+COPY tools/claude/managed-settings.json /etc/claude-code/managed-settings.json
+RUN chmod 0644 /etc/claude-code/managed-settings.json
+
+# System-level MCP server registry: wires the baked-in code-graph-mcp server
+# (/opt/mcp/bin/code-graph-mcp) for the in-container Claude. Read from a system
+# path, so the bind-mounted host ~/.claude.json cannot shadow it, and auto-loaded
+# without an approval prompt. Note: managed-mcp.json is *exclusive* — when
+# present, Claude Code in this container loads ONLY these servers (the user
+# cannot add others in-container). That is the intent for this sandbox; the
+# host's Claude, which uses its own host-path config, is entirely unaffected.
+COPY tools/claude/managed-mcp.json /etc/claude-code/managed-mcp.json
+RUN chmod 0644 /etc/claude-code/managed-mcp.json
+USER ${USERNAME}
+
+WORKDIR /src
+# Default command activates the baked-in code-graph plugin (hooks + skills) via
+# --plugin-dir. The launcher (claude-container.sh) passes the same flag in its
+# CG_DEFAULT_CMD, so plain `./claude-container.sh` gets it too; this CMD covers a
+# bare `podman run <image>`.
+CMD ["claude", "--plugin-dir", "/opt/code-graph-plugin/plugin"]
