@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "code-graph",
+  "version": "0.1.0",
+  "description": "Steers Claude Code toward the code-graph MCP server for structural code questions: intercepts Grep/Glob to nudge symbol-aware queries first, and ships scenario skills covering the code-graph tool surface (symbol search, call graphs, dependencies, cycles, orphans, inheritance, diagrams).",
+  "author": {
+    "name": "Daniel Weiner"
+  },
+  "keywords": [
+    "code-graph",
+    "mcp",
+    "code-search",
+    "call-graph",
+    "static-analysis"
+  ]
+}
