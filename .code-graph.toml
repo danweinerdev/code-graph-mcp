@@ -1,0 +1,19 @@
+# .code-graph.toml — code-graph configuration for developing THIS repo
+# (intended for use inside the dev container, ./claude-container.sh).
+#
+# Purpose: keep `analyze_codebase` focused on the workspace crates and off the
+# `external/` dogfood submodules. Those are large upstream test corpora (linux,
+# llvm, mozilla-central, abseil, curl, fmt, …) pulled in only for baseline
+# parse tests — indexing them would balloon the graph, the cache, and analyze
+# time for no benefit when working on the server itself.
+#
+# Discovery walks up from the analyze invocation path to the nearest directory
+# containing this file (the repo root), so this applies to every scoped
+# invocation under the repo regardless of subtree.
+
+[discovery]
+# gitignore-syntax globs ADDED to the built-in defaults (.git, target,
+# node_modules, …). NOTE: the field is the SINGULAR `extra_ignore`; the plural
+# spelling silently no-ops (no deny_unknown_fields). `external/` matches the
+# dogfood-submodule directory; the dist/ artifact dir is excluded too.
+extra_ignore = ["external/", "dist/"]
