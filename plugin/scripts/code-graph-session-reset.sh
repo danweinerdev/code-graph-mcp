@@ -17,10 +17,44 @@
 
 set -euo pipefail
 
+# Resolve the per-user, per-project state dir holding the nudge throttle stamps.
+#
+# Rooted at a user-level XDG state dir ($XDG_STATE_HOME, else ~/.local/state),
+# falling back to $TMPDIR/tmp when no usable HOME is set — so we NEVER write into
+# the project tree. Earlier versions rooted directly at $CLAUDE_PROJECT_DIR,
+# which littered the working tree with a `.code-graph-plugin/` dir (and, when the
+# project was a bind-mounted container workdir, leaked those files onto the
+# host). $CLAUDE_PROJECT_DIR is still honoured, but ONLY to namespace the state
+# per project (basename + a hash of the full path), preserving the original
+# per-project throttling without the pollution.
+#
+# Keep this function byte-identical to the copy in code-graph-nudge.sh so both
+# hooks resolve the same directory.
+code_graph_state_dir() {
+  local base proj ns
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    base="${XDG_STATE_HOME}/code-graph-plugin"
+  elif [[ -n "${HOME:-}" ]]; then
+    base="${HOME}/.local/state/code-graph-plugin"
+  else
+    base="${TMPDIR:-/tmp}/code-graph-plugin"
+  fi
+  proj="${CLAUDE_PROJECT_DIR:-}"
+  if [[ -n "${proj}" ]]; then
+    # basename for readability + a cksum of the full path for collision safety.
+    local h
+    h="$(printf '%s' "${proj}" | cksum 2>/dev/null | cut -d' ' -f1)"
+    ns="$(basename "${proj}")-${h:-0}"
+  else
+    ns="no-project"
+  fi
+  # Sanitise the namespace to a safe single path component.
+  printf '%s/nudge/%s' "${base}" "${ns//[^A-Za-z0-9_.-]/_}"
+}
+
 input="$(cat 2>/dev/null || true)"
 
-state_root="${CLAUDE_PROJECT_DIR:-${TMPDIR:-/tmp}}"
-state_dir="${state_root}/.code-graph-plugin/nudge"
+state_dir="$(code_graph_state_dir)"
 [[ -d "${state_dir}" ]] || exit 0
 
 session=""

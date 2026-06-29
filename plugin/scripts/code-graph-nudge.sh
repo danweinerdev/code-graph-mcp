@@ -26,6 +26,41 @@ set -euo pipefail
 # Fail-open helper: emit nothing, let the tool proceed untouched.
 pass_through() { exit 0; }
 
+# Resolve the per-user, per-project state dir holding the nudge throttle stamps.
+#
+# Rooted at a user-level XDG state dir ($XDG_STATE_HOME, else ~/.local/state),
+# falling back to $TMPDIR/tmp when no usable HOME is set — so we NEVER write into
+# the project tree. Earlier versions rooted directly at $CLAUDE_PROJECT_DIR,
+# which littered the working tree with a `.code-graph-plugin/` dir (and, when the
+# project was a bind-mounted container workdir, leaked those files onto the
+# host). $CLAUDE_PROJECT_DIR is still honoured, but ONLY to namespace the state
+# per project (basename + a hash of the full path), preserving the original
+# per-project throttling without the pollution.
+#
+# Keep this function byte-identical to the copy in code-graph-session-reset.sh so
+# both hooks resolve the same directory.
+code_graph_state_dir() {
+  local base proj ns
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    base="${XDG_STATE_HOME}/code-graph-plugin"
+  elif [[ -n "${HOME:-}" ]]; then
+    base="${HOME}/.local/state/code-graph-plugin"
+  else
+    base="${TMPDIR:-/tmp}/code-graph-plugin"
+  fi
+  proj="${CLAUDE_PROJECT_DIR:-}"
+  if [[ -n "${proj}" ]]; then
+    # basename for readability + a cksum of the full path for collision safety.
+    local h
+    h="$(printf '%s' "${proj}" | cksum 2>/dev/null | cut -d' ' -f1)"
+    ns="$(basename "${proj}")-${h:-0}"
+  else
+    ns="no-project"
+  fi
+  # Sanitise the namespace to a safe single path component.
+  printf '%s/nudge/%s' "${base}" "${ns//[^A-Za-z0-9_.-]/_}"
+}
+
 # jq is required to parse the event and build valid JSON output. If it's
 # missing, silently pass through rather than risk malformed stdout.
 command -v jq >/dev/null 2>&1 || pass_through
@@ -75,8 +110,10 @@ fi
 
 # --- Throttle: one nudge per (session, tool) per cooldown window. -----------
 NUDGE_COOLDOWN_SECONDS="${CODE_GRAPH_NUDGE_COOLDOWN:-900}"
-state_root="${CLAUDE_PROJECT_DIR:-${TMPDIR:-/tmp}}"
-state_dir="${state_root}/.code-graph-plugin/nudge"
+# State dir for the throttle stamps — per-user, per-project, never written into
+# the project tree (see code_graph_state_dir above). Keep the resolver IDENTICAL
+# to the one in code-graph-session-reset.sh.
+state_dir="$(code_graph_state_dir)"
 mkdir -p "${state_dir}" 2>/dev/null || state_dir="${TMPDIR:-/tmp}"
 stamp="${state_dir}/${session//[^A-Za-z0-9_-]/_}.${tool}"
 
