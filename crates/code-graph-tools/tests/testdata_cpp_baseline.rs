@@ -95,19 +95,48 @@ async fn analyze_testdata_cpp_locks_in_baseline_counts() {
         serde_json::json!(17),
         "edges count drifted from baseline; full body: {body}",
     );
-    // `warnings` is `omitempty`-flavored on the Rust side: the field
-    // is skipped when the Vec is empty. After the upward-walk config
-    // discovery work (commit c06fc73 and follow-on work), a
-    // testdata fixture lacking a `.code-graph.toml` surfaces a
-    // "no .code-graph.toml found" warning by design. Any warning
-    // OTHER than that one is a regression worth investigating; the
-    // no-config warning itself is the intended behaviour.
+    // `warnings` is `omitempty`-flavored on the Rust side: the field is
+    // skipped when the Vec is empty. The counts above are this test's real
+    // contract; the warning check is a tripwire for anything unexpected
+    // alongside them.
+    //
+    // Three notices are by-design here and say nothing about indexing
+    // correctness. Which ones appear depends on ambient state this test
+    // does not control (whether a root config exists, whether a previous
+    // run left cache entries), so all three are tolerated:
+    //
+    //   1. "no .code-graph.toml found" — nothing above `testdata/cpp`.
+    //   2. "using .code-graph.toml found at <root> (parent of indexed
+    //      root ...)" — the repo root has carried a tracked
+    //      `.code-graph.toml` since 012bd08 (it excludes `external/`
+    //      from indexing). The fixture lives inside the repo, so the
+    //      upward walk cannot help but find it. Before this notice was
+    //      accepted, the test failed on every checkout.
+    //   3. "force=true dropped N cached file(s) ... before re-index" —
+    //      self-inflicted. This test passes `force = true` (see above),
+    //      and since the cache is co-located at the project root, a prior
+    //      run of this same test leaves `testdata/cpp` entries there for
+    //      the next run to drop. Without this, the test passed once on a
+    //      cold cache and failed on every subsequent run.
+    //
+    // Deliberately NOT tolerated: the orphan-cache notice. That one flags
+    // a real stale artifact (a pre-co-location `.code-graph-cache.db`
+    // inside the fixture) and the remedy is to delete it, not to silence
+    // the warning.
+    //
+    // The counts are unaffected by any of this: the root config only sets
+    // `[discovery] extra_ignore`, which does not match `testdata/cpp`.
+    const EXPECTED_NOTICES: [&str; 3] = [
+        "no .code-graph.toml found",
+        "using .code-graph.toml found at",
+        "before re-index",
+    ];
     if let Some(serde_json::Value::Array(a)) = parsed.get("warnings") {
         for w in a {
             let s = w.as_str().unwrap_or("");
             assert!(
-                s.contains("no .code-graph.toml found"),
-                "unexpected warning beyond the no-config notice: {s:?}"
+                EXPECTED_NOTICES.iter().any(|notice| s.contains(notice)),
+                "unexpected warning beyond the by-design config/cache notices: {s:?}"
             );
         }
     }
