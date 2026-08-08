@@ -70,6 +70,42 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// One row of the `get_symbol_at` response: a symbol whose `[line,
+/// end_line]` span contains the queried line.
+///
+/// **Not goto-definition.** This answers "what encloses this line?" by
+/// span containment; it does not resolve an identifier to its binding
+/// (that needs scope resolution, a documented Non-Goal).
+///
+/// Field order — `symbol_id`, `name`, `kind`, `line`, `end_line`,
+/// `span_lines`, `parent`, `namespace` — is the wire-format contract.
+/// `span_lines = end_line.saturating_sub(line)` is precomputed so clients
+/// don't have to; it is also the primary sort key
+/// [`code_graph_graph::Graph::symbols_at_line`] orders results by, so
+/// exposing it lets a client confirm the "innermost first" ordering
+/// without recomputing it. `kind` reuses [`kind_str`] so spelling matches
+/// every other tool. `parent`/`namespace` follow [`SymbolResult`]'s
+/// convention of dropping when empty.
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; clients consume it as
+/// JSON via `CallToolResult`, never as a Rust type. Derive set matches
+/// [`SummaryRow`] / [`CouplingEntry`] (`Debug`, `Serialize` only — no
+/// `Deserialize`).
+#[derive(Debug, Serialize)]
+pub(super) struct EnclosingSymbol {
+    pub symbol_id: String,
+    pub name: String,
+    pub kind: String,
+    pub line: u32,
+    pub end_line: u32,
+    pub span_lines: u32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub parent: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+}
+
 /// One row of the `get_symbol_summary` response.
 ///
 /// The handler emits a flat `Page<SummaryRow>` envelope rather than the

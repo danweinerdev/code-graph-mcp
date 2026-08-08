@@ -14,8 +14,8 @@ use rmcp::model::CallToolResult;
 
 use super::{
     byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    tool_error, tool_success_json, Page, SearchSymbolsResponse, SummaryRow, SymbolResult,
-    ENVELOPE_OVERHEAD_BYTES,
+    tool_error, tool_success_json, EnclosingSymbol, Page, SearchSymbolsResponse, SummaryRow,
+    SymbolResult, ENVELOPE_OVERHEAD_BYTES,
 };
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
@@ -155,6 +155,97 @@ pub fn get_file_symbols(
         byte_budget_take(results, resolved_offset, resolved_limit, max_bytes);
 
     let response = Page::<SymbolResult> {
+        results: records,
+        total,
+        offset: resolved_offset,
+        limit: resolved_limit,
+        truncated,
+        next_offset,
+    };
+    tool_success_json(&response)
+}
+
+/// `get_symbol_at` body. Answers "what symbol encloses this line?" by
+/// span containment — **not** goto-definition: it does not resolve an
+/// identifier to its binding (scope resolution is a documented Non-Goal).
+/// Delegates the containment scan + total ordering to
+/// [`code_graph_graph::Graph::symbols_at_line`].
+///
+/// `line` is 1-based; `line == 0` is rejected as a tool error rather than
+/// silently clamped, since a caller passing `0` almost certainly has an
+/// off-by-one bug worth surfacing immediately. An unknown `file` is a tool
+/// error naming the path (mirrors the `generate_diagram(file=…)` wording:
+/// `"file not found: {file:?}"`) — this handler distinguishes "file isn't
+/// indexed at all" from "file is indexed but nothing encloses this line",
+/// which the wrapped query alone cannot: `symbols_at_line` returns an
+/// empty `Vec` for both cases. **No enclosing symbol is SUCCESS with an
+/// empty `Page`, never a tool error and never a nearest-neighbour guess**
+/// (the Trap this task exists to avoid).
+///
+/// Defaults: `limit = 100`, `offset = 0`, mirroring [`get_file_symbols`];
+/// `limit = 0` means "use the default" and `limit` is clamped at 1000.
+/// Results are already in [`code_graph_graph::Graph::symbols_at_line`]'s
+/// total order (`span_lines` asc, `line` desc, `symbol_id` asc — innermost
+/// first) before pagination, so page boundaries are deterministic across
+/// calls without re-sorting here.
+pub fn get_symbol_at(
+    graph: &RwLock<Graph>,
+    file: &str,
+    line: u32,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
+    if file.is_empty() {
+        return tool_error("'file' is required");
+    }
+    if line == 0 {
+        return tool_error("'line' must be >= 1 (lines are 1-based)");
+    }
+
+    // Normalize the user-supplied file argument before graph lookup,
+    // exactly as `get_file_symbols` does.
+    let path = paths::normalize_user_path(file);
+
+    let g = graph.read();
+    // Distinguish "file not indexed" from "no symbol encloses this line":
+    // `file_symbols` on an unknown path returns empty regardless of
+    // `line`, so checking it first (before the line-scoped query) lets us
+    // surface the diagnostic file-not-found error rather than a silent
+    // empty envelope for a misspelled/unindexed path.
+    if g.file_symbols(&path).is_empty() {
+        drop(g);
+        return tool_error(format!("file not found: {file:?}"));
+    }
+    let symbols = g.symbols_at_line(&path, line);
+    drop(g);
+
+    let total = symbols.len() as u32;
+
+    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
+    // Already in `symbols_at_line`'s total order (span_lines asc, line
+    // desc, symbol_id asc) — no re-sort needed before pagination.
+    let results: Vec<EnclosingSymbol> = symbols
+        .iter()
+        .map(|s| EnclosingSymbol {
+            symbol_id: symbol_id(s),
+            name: s.name.clone(),
+            kind: kind_str(s.kind).to_string(),
+            line: s.line,
+            end_line: s.end_line,
+            span_lines: s.end_line.saturating_sub(s.line),
+            parent: s.parent.clone(),
+            namespace: s.namespace.clone(),
+        })
+        .collect();
+
+    let (records, _total_kept, truncated, next_offset) =
+        byte_budget_take(results, resolved_offset, resolved_limit, max_bytes);
+
+    let response = Page::<EnclosingSymbol> {
         results: records,
         total,
         offset: resolved_offset,
@@ -1640,6 +1731,93 @@ mod tests {
         let r = get_file_symbols(&g, "", false, true, None, None, true, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
+    }
+
+    // --- get_symbol_at ---
+
+    fn sym_span(
+        name: &str,
+        kind: SymbolKind,
+        file: &str,
+        parent: &str,
+        line: u32,
+        end_line: u32,
+    ) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            file: file.to_string(),
+            line,
+            column: 0,
+            end_line,
+            signature: format!("sig {name}"),
+            namespace: String::new(),
+            parent: parent.to_string(),
+            language: Language::Cpp,
+        }
+    }
+
+    fn nested_graph() -> Graph {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/a.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym_span("Bar", SymbolKind::Class, "/a.cpp", "", 1, 20),
+                sym_span("do_thing", SymbolKind::Method, "/a.cpp", "Bar", 5, 10),
+            ],
+            edges: Vec::new(),
+        });
+        g
+    }
+
+    #[test]
+    fn symbol_at_line_zero_errors() {
+        let g = locked(nested_graph());
+        let r = get_symbol_at(&g, "/a.cpp", 0, None, None, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "'line' must be >= 1 (lines are 1-based)");
+    }
+
+    #[test]
+    fn symbol_at_unknown_file_errors() {
+        let g = locked(nested_graph());
+        let r = get_symbol_at(&g, "/missing.cpp", 5, None, None, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "file not found: \"/missing.cpp\"");
+    }
+
+    #[test]
+    fn symbol_at_empty_file_param_errors() {
+        let g = locked(nested_graph());
+        let r = get_symbol_at(&g, "", 5, None, None, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "'file' is required");
+    }
+
+    #[test]
+    fn symbol_at_no_enclosing_symbol_is_success_with_empty_page() {
+        // Known file, but no symbol spans this line: SUCCESS with an
+        // empty Page, NOT an error, NOT a nearest-neighbour guess.
+        let g = locked(nested_graph());
+        let r = get_symbol_at(&g, "/a.cpp", 500, None, None, NO_BYTE_BUDGET);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 100);
+    }
+
+    #[test]
+    fn symbol_at_nesting_returns_method_before_class() {
+        let g = locked(nested_graph());
+        let r = get_symbol_at(&g, "/a.cpp", 7, None, None, NO_BYTE_BUDGET);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let (arr, total, _, _) = page_parts(&r);
+        assert_eq!(total, 2);
+        assert_eq!(arr[0]["name"], "do_thing");
+        assert_eq!(arr[1]["name"], "Bar");
     }
 
     // --- search_symbols ---

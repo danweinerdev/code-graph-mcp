@@ -168,6 +168,59 @@ impl Graph {
         out
     }
 
+    /// Symbols in `path` whose `[line, end_line]` span contains `line`
+    /// (inclusive on both ends), innermost first.
+    ///
+    /// The candidate set is `path`'s symbols via the same `files` PathTrie
+    /// lookup [`Graph::file_symbols`] uses (linear scan over tens to
+    /// hundreds of entries — deliberately not a line index, since adding
+    /// one to `FileEntry` would force a `PackedSymbol` field and a
+    /// `CACHE_VERSION` bump). Unknown `path`, or no symbol whose span
+    /// contains `line`, returns an empty `Vec`.
+    ///
+    /// A malformed span (`end_line < line` for that symbol) is treated as
+    /// zero-width — the symbol still participates in containment/ sort as
+    /// if `end_line == line` — rather than being dropped or causing a
+    /// panic; all arithmetic here is saturating.
+    ///
+    /// Sort order is `(span_lines asc, line desc, symbol_id asc)`, where
+    /// `span_lines = end_line.saturating_sub(line)` (the symbol's own
+    /// line/end_line, not the query line). Smaller spans are "more
+    /// specific" and sort first (a method nested in a class sorts before
+    /// the class). This is a *total* order, not merely mostly-determined:
+    /// Java anonymous-class methods can produce two symbols with the same
+    /// [`symbol_id`] distinguished only by `line` (CLAUDE.md, Java
+    /// limitation 5), so without the final `symbol_id` tiebreak the
+    /// response order would vary between runs.
+    pub fn symbols_at_line(&self, path: &Path, line: u32) -> Vec<Symbol> {
+        let Some(entry) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Symbol> = Vec::new();
+        for id in &entry.symbol_ids {
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+            let s = &node.symbol;
+            // Malformed span guard: clamp the effective end up to at least
+            // `s.line` so `end_line < s.line` behaves as zero-width instead
+            // of making every containment check fail via an inverted range.
+            let effective_end = s.end_line.max(s.line);
+            if s.line <= line && line <= effective_end {
+                out.push(s.clone());
+            }
+        }
+        out.sort_by(|a, b| {
+            let span_a = a.end_line.saturating_sub(a.line);
+            let span_b = b.end_line.saturating_sub(b.line);
+            span_a
+                .cmp(&span_b)
+                .then_with(|| b.line.cmp(&a.line))
+                .then_with(|| symbol_id(a).cmp(&symbol_id(b)))
+        });
+        out
+    }
+
     /// Cloned [`Symbol`] for `id`, or `None` if no such symbol exists. The
     /// MCP handler is responsible for translating `None` into a did-you-mean
     /// suggestion via [`Graph::search_symbols`].
@@ -490,6 +543,123 @@ mod tests {
         let out = g.file_symbols(&PathBuf::from("/never-merged.cpp"));
         // Must be a Vec (not Option), so JSON serializes as `[]` not `null`.
         assert!(out.is_empty());
+    }
+
+    // --- symbols_at_line ---
+
+    /// Build a symbol with an explicit `[line, end_line]` span, otherwise
+    /// matching the `sym`/`sym_full` fixture shape.
+    fn sym_span(
+        name: &str,
+        kind: SymbolKind,
+        file: &str,
+        parent: &str,
+        line: u32,
+        end_line: u32,
+    ) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            file: file.to_string(),
+            line,
+            column: 0,
+            end_line,
+            signature: format!("sig {name}"),
+            namespace: String::new(),
+            parent: parent.to_string(),
+            language: Language::Cpp,
+        }
+    }
+
+    #[test]
+    fn symbols_at_line_nesting_returns_method_before_class() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                // Class spans the whole file; method is a narrower nested
+                // span. A line inside the method must return the method
+                // FIRST (smaller span = more specific = innermost).
+                sym_span("Bar", SymbolKind::Class, "/a.cpp", "", 1, 20),
+                sym_span("do_thing", SymbolKind::Method, "/a.cpp", "Bar", 5, 10),
+            ],
+            vec![],
+        ));
+
+        let out = g.symbols_at_line(&PathBuf::from("/a.cpp"), 7);
+        assert_eq!(out.len(), 2, "line 7 is inside both spans");
+        assert_eq!(out[0].name, "do_thing", "innermost (method) sorts first");
+        assert_eq!(out[1].name, "Bar", "outer (class) sorts second");
+    }
+
+    #[test]
+    fn symbols_at_line_no_containing_span_returns_empty() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym_span("foo", SymbolKind::Function, "/a.cpp", "", 10, 20)],
+            vec![],
+        ));
+
+        // Neither above nor below the span, nor an unknown file, produces a
+        // result — never an error, never a nearest-neighbour guess.
+        assert!(g.symbols_at_line(&PathBuf::from("/a.cpp"), 5).is_empty());
+        assert!(g.symbols_at_line(&PathBuf::from("/a.cpp"), 25).is_empty());
+        assert!(g
+            .symbols_at_line(&PathBuf::from("/never-merged.cpp"), 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn symbols_at_line_malformed_span_does_not_panic() {
+        // end_line < line is malformed; the symbol must be treated as
+        // zero-width (only matches its own `line`), never dropped, never
+        // panicking on the containment or span-length arithmetic.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym_span("weird", SymbolKind::Function, "/a.cpp", "", 10, 3)],
+            vec![],
+        ));
+
+        let hit = g.symbols_at_line(&PathBuf::from("/a.cpp"), 10);
+        assert_eq!(hit.len(), 1, "zero-width span still matches its own line");
+        assert_eq!(hit[0].name, "weird");
+
+        let miss = g.symbols_at_line(&PathBuf::from("/a.cpp"), 11);
+        assert!(miss.is_empty(), "zero-width span matches nothing else");
+    }
+
+    #[test]
+    fn symbols_at_line_stable_order_across_repeated_calls() {
+        // Two symbols sharing an identical span (same `symbol_id` shape is
+        // not required here — the total order must still be stable via the
+        // `symbol_id` tiebreak) must come back in the same order on every
+        // call. 20 repeats guards against any accidental reliance on
+        // HashMap iteration order.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym_span("alpha", SymbolKind::Function, "/a.cpp", "", 1, 10),
+                sym_span("beta", SymbolKind::Function, "/a.cpp", "", 1, 10),
+            ],
+            vec![],
+        ));
+
+        let first = g.symbols_at_line(&PathBuf::from("/a.cpp"), 5);
+        let first_ids: Vec<String> = first.iter().map(symbol_id).collect();
+        assert_eq!(first_ids.len(), 2);
+
+        for _ in 0..20 {
+            let out = g.symbols_at_line(&PathBuf::from("/a.cpp"), 5);
+            let ids: Vec<String> = out.iter().map(symbol_id).collect();
+            assert_eq!(ids, first_ids, "order must be stable across repeat calls");
+        }
     }
 
     // --- symbol_detail ---
