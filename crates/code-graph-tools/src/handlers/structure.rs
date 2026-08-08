@@ -219,14 +219,13 @@ pub fn get_orphans(
     reliability: Option<&str>,
     max_bytes: usize,
 ) -> CallToolResult {
-    let parsed_kind: Option<SymbolKind> =
-        match kind.and_then(|s| if s.is_empty() { None } else { Some(s) }) {
-            None => None,
-            Some(s) => match parse_kind(s) {
-                Some(k) => Some(k),
-                None => return tool_error(format!("invalid kind: {s}")),
-            },
-        };
+    let parsed_kind: Option<SymbolKind> = match kind.filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => match parse_kind(s) {
+            Some(k) => Some(k),
+            None => return tool_error(format!("invalid kind: {s}")),
+        },
+    };
 
     // Reliability filter. Default `all` (or unspecified) preserves
     // the legacy behaviour: every Graph::orphans result surfaces,
