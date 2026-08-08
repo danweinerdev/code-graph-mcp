@@ -3,7 +3,10 @@
 Steers Claude Code toward the **code-graph MCP server** for structural code
 questions instead of raw text search.
 
-Two parts:
+This directory is also the **canonical source** for the Codex and OpenCode
+plugin trees — see [Other harnesses](#other-harnesses) below.
+
+Three parts:
 
 1. **A `PreToolUse` hook** on `Grep`/`Glob` that injects a one-time,
    non-blocking nudge when the search looks like a symbol query — pointing the
@@ -19,6 +22,17 @@ Two parts:
    | `code-graph-dependencies` | Imports, coupling, cycles, diagrams (get_dependencies, get_coupling, detect_cycles, generate_diagram) |
    | `code-graph-refactor-survey` | Dead code, blast radius, codebase orientation (get_orphans + workflows) |
    | `code-graph-indexing` | analyze_codebase (sync/async), watch mode, scoping, caching, config |
+
+3. **Six slash commands** for driving the toolset directly:
+
+   | Command | Does |
+   |---|---|
+   | `/cg <question>` | Routes any structural question to the right tool |
+   | `/cg-index [path] [force]` | analyze_codebase, sync or async, scoped or whole-tree |
+   | `/cg-impact <symbol>` | Blast radius — callers, callees, overrides, hierarchy |
+   | `/cg-deps [file]` | Dependencies, coupling, cycles, diagrams |
+   | `/cg-survey [subtree]` | Structural health report — shape, dead code, cycles, hotspots |
+   | `/cg-status` | Server + index diagnostics, async job progress |
 
 ## Requirements
 
@@ -56,6 +70,36 @@ code-graph@code-graph-mcp`). Note: managed-settings `enabledPlugins` /
 `extraKnownMarketplaces` alone do **not** auto-install a directory-sourced
 plugin headlessly — they only declare intent — so the container uses
 `--plugin-dir`, which actually loads it.
+
+## Other harnesses
+
+The same skills and commands ship to Codex and OpenCode. **`plugin/` is the
+single source of truth** — the other trees are generated:
+
+| Tree | Harness | Contains |
+|---|---|---|
+| `plugin/` | Claude Code | canonical skills, commands, hooks, scripts |
+| `.codex-plugin/` | Codex | `plugin.json`, generated skills + commands, `hooks/` |
+| `opencode-plugin/` | OpenCode | npm package (`code-graph-opencode`), generated skills + commands |
+
+Author in `plugin/`, then fan out:
+
+```bash
+make plugin-sync         # regenerate the mirrors
+make plugin-sync-check   # fail if a mirror is stale (also part of `make verify`)
+```
+
+Never hand-edit a mirror — the next sync overwrites it. The one exception is
+each mirror's own manifest (`.codex-plugin/plugin.json`,
+`.codex-plugin/hooks/hooks.json`, `opencode-plugin/{package.json,code-graph.js,README.md}`),
+which is hand-maintained and left alone by the sync.
+
+Two hook scripts in `plugin/scripts/` are shared across harnesses and get
+mirrored: `session-start` (emits the SDK-standard `{"additionalContext": …}`
+orientation blob) and `run-hook.cmd` (a cmd/bash polyglot wrapper so the
+extensionless hook scripts run on Windows). The two `.sh` hooks are
+Claude-only — they implement a `PreToolUse` Grep/Glob interception no other
+harness exposes — and are deliberately not mirrored.
 
 ## Behavior notes
 
