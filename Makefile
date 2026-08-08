@@ -3,6 +3,7 @@
 
 .PHONY: build release test lint fmt fmt-check clean verify leak-scan \
 	snapshot-clean snapshot-accept snapshot-audit install-hooks submodules \
+	plugin-sync plugin-sync-check \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -48,7 +49,24 @@ verify:
 	cargo test --workspace
 	@echo ">>> verify: pending snapshots"
 	@$(MAKE) --no-print-directory snapshot-clean
+	@echo ">>> verify: plugin mirrors in sync"
+	@$(MAKE) --no-print-directory plugin-sync-check
 	@echo "✓ verify: all structural checks passed"
+
+# Regenerate the Codex and OpenCode plugin trees from the canonical Claude
+# plugin under plugin/. Skills and commands are authored ONCE, in plugin/, and
+# fanned out; the mirrors are generated artifacts. Run this after touching
+# plugin/skills/, plugin/commands/, or the shared hook scripts in
+# plugin/scripts/ (session-start, run-hook.cmd).
+plugin-sync:
+	@scripts/sync-plugin-skills.sh
+
+# Drift gate for the above. Fails if a mirror does not match what a fresh sync
+# would produce — which is what happens when someone edits .codex-plugin/ or
+# opencode-plugin/ by hand, or adds a skill to plugin/ and forgets to fan it out.
+# Part of `make verify`.
+plugin-sync-check:
+	@scripts/sync-plugin-skills.sh --check
 
 # Verify no pending insta snapshots in the working tree. `*.snap.new`
 # files exist when a snapshot test produced new output that hasn't been
