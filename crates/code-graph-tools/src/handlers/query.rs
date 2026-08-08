@@ -14,7 +14,7 @@ use rmcp::model::{CallToolResult, Content};
 
 use super::{
     byte_budget_take, edge_kind_str, kind_str, parse_min_confidence, suggest_symbols, tool_error,
-    tool_success_json, DependencyEntry, Page,
+    tool_success_json, DependencyEntry, FindPathResponse, Page,
 };
 
 /// Symbol-ID basename for advisory messages.
@@ -432,6 +432,103 @@ pub fn get_dependencies(
         limit: resolved_limit,
         truncated,
         next_offset,
+    };
+    tool_success_json(&response)
+}
+
+/// `find_path` body (1.2). Shortest call-path from `from` to `to`,
+/// returned as a single JSON object (NOT a `Page`) — see
+/// [`super::FindPathResponse`].
+///
+/// `node_cap`: zero-or-missing resolves to the default `100_000`; clamped
+/// at a hard ceiling of `5_000_000` regardless of caller input (design
+/// Decision 9 — the ceiling is what makes the `((hops as u64) << 32) |
+/// heuristic_hops` packing provably overflow-safe, since both components
+/// are bounded by nodes examined, which is bounded by `node_cap`). The
+/// resolved value is always echoed back on the response.
+///
+/// `min_confidence`: parsed via the shared [`parse_min_confidence`]
+/// helper; an unrecognized spelling is a tool error, matching
+/// `get_callers`/`get_callees`.
+///
+/// Either endpoint unknown is a tool error naming WHICH one failed, with
+/// the same did-you-mean affordance `callers_or_callees` uses.
+/// `from == to` and "no path within the cap" both succeed — the caller
+/// distinguishes the latter two via `cap_reached`.
+pub fn find_path(
+    graph: &RwLock<Graph>,
+    from: &str,
+    to: &str,
+    node_cap: Option<u32>,
+    min_confidence: Option<&str>,
+) -> CallToolResult {
+    if from.is_empty() {
+        return tool_error("'from' is required");
+    }
+    if to.is_empty() {
+        return tool_error("'to' is required");
+    }
+
+    let min_confidence_filter = match parse_min_confidence(min_confidence) {
+        Ok(v) => v,
+        Err(e) => return tool_error(e),
+    };
+
+    // Resolve node_cap: zero-or-missing -> default 100_000; clamp at the
+    // 5_000_000 ceiling.
+    let resolved_cap = node_cap
+        .filter(|&n| n != 0)
+        .unwrap_or(100_000)
+        .min(5_000_000);
+
+    let g = graph.read();
+
+    if g.symbol_detail(from).is_none() {
+        let suggestions = suggest_symbols(&g, from, 5);
+        drop(g);
+        return if suggestions.is_empty() {
+            tool_error(format!("'from' symbol not found: {from:?}"))
+        } else {
+            tool_error(format!(
+                "'from' symbol not found: {from:?}. Did you mean: {suggestions}?"
+            ))
+        };
+    }
+    if g.symbol_detail(to).is_none() {
+        let suggestions = suggest_symbols(&g, to, 5);
+        drop(g);
+        return if suggestions.is_empty() {
+            tool_error(format!("'to' symbol not found: {to:?}"))
+        } else {
+            tool_error(format!(
+                "'to' symbol not found: {to:?}. Did you mean: {suggestions}?"
+            ))
+        };
+    }
+
+    let (result, nodes_examined, cap_reached) =
+        g.shortest_path(from, to, resolved_cap, min_confidence_filter);
+    drop(g);
+
+    let response = match result {
+        Some(r) => FindPathResponse {
+            found: true,
+            hop_count: r.hops.len().saturating_sub(1) as u32,
+            hops: r.hops,
+            heuristic_hops: r.heuristic_hops,
+            nodes_examined,
+            node_cap: resolved_cap,
+            cap_reached,
+        },
+        None => FindPathResponse {
+            found: false,
+            hops: Vec::new(),
+            hop_count: 0,
+            heuristic_hops: 0,
+            nodes_examined,
+            node_cap: resolved_cap,
+            cap_reached,
+        },
     };
     tool_success_json(&response)
 }
@@ -2353,5 +2450,210 @@ mod tests {
         strings_messy.sort();
         strings_canonical_sorted.sort();
         assert_eq!(strings_messy, strings_canonical_sorted);
+    }
+
+    // --- find_path (1.2) ---------------------------------------------
+
+    #[test]
+    fn find_path_missing_from_errors() {
+        let g = locked(Graph::new());
+        let r = find_path(&g, "", "/x.cpp:c", None, None);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "'from' is required");
+    }
+
+    #[test]
+    fn find_path_missing_to_errors() {
+        let g = locked(Graph::new());
+        let r = find_path(&g, "/x.cpp:a", "", None, None);
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(body_text(&r), "'to' is required");
+    }
+
+    #[test]
+    fn find_path_unknown_from_names_which_endpoint() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "nonexistent", "/x.cpp:c", None, None);
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(
+            text.starts_with("'from' symbol not found: \"nonexistent\""),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn find_path_unknown_to_names_which_endpoint() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "nonexistent", None, None);
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(
+            text.starts_with("'to' symbol not found: \"nonexistent\""),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn find_path_unknown_from_offers_did_you_mean() {
+        let g = locked(graph_with_calls());
+        // "a" substring-matches "/x.cpp:a".
+        let r = find_path(&g, "a", "/x.cpp:c", None, None);
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(text.contains("Did you mean: "), "got: {text}");
+    }
+
+    #[test]
+    fn find_path_invalid_min_confidence_errors() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", None, Some("low"));
+        assert_eq!(r.is_error, Some(true));
+        let text = body_text(&r);
+        assert!(
+            text.contains("invalid min_confidence") && text.contains("\"low\""),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn find_path_connected_pair_returns_found_true_with_chain() {
+        // graph_with_calls(): a -> b -> c.
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", None, None);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["found"], serde_json::json!(true));
+        assert_eq!(parsed["hop_count"], serde_json::json!(2));
+        assert_eq!(parsed["cap_reached"], serde_json::json!(false));
+        let hops = parsed["hops"].as_array().unwrap();
+        assert_eq!(hops.len(), 3);
+        assert_eq!(hops[0]["symbol_id"], serde_json::json!("/x.cpp:a"));
+        assert_eq!(hops[2]["symbol_id"], serde_json::json!("/x.cpp:c"));
+        assert_eq!(parsed["node_cap"], serde_json::json!(100_000));
+    }
+
+    #[test]
+    fn find_path_unconnected_pair_returns_found_false_success() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("a", "/x.cpp"), sym("b", "/x.cpp")],
+            edges: vec![],
+        });
+        let g = locked(g);
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:b", None, None);
+        // Not-found is a SUCCESS, never a tool error.
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["found"], serde_json::json!(false));
+        assert_eq!(parsed["hops"], serde_json::json!([]));
+        assert_eq!(parsed["hop_count"], serde_json::json!(0));
+        assert_eq!(parsed["cap_reached"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn find_path_source_equals_target_is_success_zero_hop_count() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:a", None, None);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["found"], serde_json::json!(true));
+        assert_eq!(parsed["hop_count"], serde_json::json!(0));
+        let hops = parsed["hops"].as_array().unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0]["symbol_id"], serde_json::json!("/x.cpp:a"));
+    }
+
+    #[test]
+    fn find_path_node_cap_zero_uses_default() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", Some(0), None);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["node_cap"], serde_json::json!(100_000));
+    }
+
+    #[test]
+    fn find_path_node_cap_clamped_at_ceiling() {
+        let g = locked(graph_with_calls());
+        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", Some(10_000_000), None);
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["node_cap"], serde_json::json!(5_000_000));
+    }
+
+    #[test]
+    fn find_path_node_cap_too_small_returns_found_false_cap_reached() {
+        // 200 callers forming a chain: caller_000 -> caller_001 -> ... The
+        // hub target "target" is called from caller_199. cap=2 must be
+        // far too small to walk the whole chain.
+        let mut g = Graph::new();
+        let mut symbols = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            symbols.push(sym(&format!("n{i}"), "/x.cpp"));
+            if i > 0 {
+                edges.push(call_edge(
+                    &format!("/x.cpp:n{}", i - 1),
+                    &format!("/x.cpp:n{i}"),
+                    "/x.cpp",
+                    i as u32,
+                ));
+            }
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols,
+            edges,
+        });
+        let g = locked(g);
+        let r = find_path(&g, "/x.cpp:n0", "/x.cpp:n19", Some(2), None);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["found"], serde_json::json!(false));
+        assert_eq!(parsed["cap_reached"], serde_json::json!(true));
+        assert_eq!(parsed["hops"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn find_path_min_confidence_resolved_filters_heuristic_only_path() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/x.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![
+                sym("start", "/x.cpp"),
+                sym("h1", "/x.cpp"),
+                sym("target", "/x.cpp"),
+            ],
+            edges: vec![
+                Edge {
+                    from: "/x.cpp:start".to_string(),
+                    to: "/x.cpp:h1".to_string(),
+                    kind: EdgeKind::Calls,
+                    file: "/x.cpp".to_string(),
+                    line: 1,
+                    confidence: Confidence::Heuristic,
+                },
+                Edge {
+                    from: "/x.cpp:h1".to_string(),
+                    to: "/x.cpp:target".to_string(),
+                    kind: EdgeKind::Calls,
+                    file: "/x.cpp".to_string(),
+                    line: 2,
+                    confidence: Confidence::Heuristic,
+                },
+            ],
+        });
+        let g = locked(g);
+        let r = find_path(&g, "/x.cpp:start", "/x.cpp:target", None, Some("resolved"));
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(
+            parsed["found"],
+            serde_json::json!(false),
+            "only path is Heuristic; must be filtered under min_confidence=resolved"
+        );
     }
 }

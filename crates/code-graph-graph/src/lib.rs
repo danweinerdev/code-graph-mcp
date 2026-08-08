@@ -34,7 +34,7 @@ mod queries;
 mod test_fixtures;
 
 pub use algorithms::HierarchyNode;
-pub use callgraph::CallChain;
+pub use callgraph::{CallChain, PathHop, PathResult};
 pub use diagrams::{DiagramDirection, DiagramEdge, DiagramResult, EdgeDirection};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, IncludeEntry, Node};
 pub use persist::{cache_path, stale_paths, PersistError, SWEEP_INTERVAL_NANOS};

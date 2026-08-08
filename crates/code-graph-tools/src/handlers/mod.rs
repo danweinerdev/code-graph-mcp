@@ -301,6 +301,36 @@ pub(super) struct CallChainResponse {
     pub warnings: Vec<String>,
 }
 
+/// Response payload for `find_path`. A single object, NOT a `Page` —
+/// `find_path` answers "what is *the* shortest path", not a list query, so
+/// a page envelope would be noise (design Decision 10; `get_class_hierarchy`
+/// sets the non-`Page` structured-response precedent).
+///
+/// Field order — `found`, `hops`, `hop_count`, `heuristic_hops`,
+/// `nodes_examined`, `node_cap`, `cap_reached` — is the wire-format
+/// contract.
+///
+/// `found = false` is a SUCCESS response (never a tool error): either no
+/// path exists, or `node_cap` was exhausted before one was found —
+/// `cap_reached` is the sole discriminator between those two cases. When
+/// `found = false`, `hops` is `[]` and `hop_count`/`heuristic_hops` are `0`.
+///
+/// `hops` reuses [`code_graph_graph::PathHop`] directly as the wire type
+/// (same precedent as [`CallChainResponse`] reusing `CallChain`
+/// unmodified). `hop_count` is the number of edges traversed
+/// (`hops.len() - 1`), NOT the node count — `from == to` yields a
+/// single-element `hops` and `hop_count: 0`.
+#[derive(Debug, Serialize)]
+pub(super) struct FindPathResponse {
+    pub found: bool,
+    pub hops: Vec<code_graph_graph::PathHop>,
+    pub hop_count: u32,
+    pub heuristic_hops: u32,
+    pub nodes_examined: u32,
+    pub node_cap: u32,
+    pub cap_reached: bool,
+}
+
 /// Convert a [`Symbol`] to a [`SymbolResult`]. In `brief` mode, `column`,
 /// `end_line`, and `signature` are reset to defaults so they drop out of
 /// the JSON output via `skip_serializing_if`. Mirrors Go's `symbolToResult`.
