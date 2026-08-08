@@ -9,11 +9,13 @@ rem            script under whatever bash it can find.
 rem   bash     treats the opening `:` as a no-op whose heredoc swallows the whole
 rem            batch block, then runs the shell section at the bottom.
 rem
-rem Hook scripts dispatched through here carry no file extension on purpose:
-rem Claude Code's Windows shim rewrites any command containing ".sh" to run under
-rem bash, which would double-wrap the invocation.
+rem Hook scripts are `.sh`-suffixed so that mode-setting passes which allowlist
+rem by extension (notably the container build in tools/claude/Containerfile)
+rem cannot silently skip them. A Windows shim that reacts to ".sh" by prepending
+rem bash to the whole command is harmless here: `bash run-hook.cmd <hook>` runs
+rem the POSIX section below, which is exactly the intended path.
 rem
-rem   run-hook.cmd <hook-name> [args...]
+rem   run-hook.cmd <hook-name>.sh [args...]
 rem ---------------------------------------------------------------------------
 
 if "%~1"=="" (

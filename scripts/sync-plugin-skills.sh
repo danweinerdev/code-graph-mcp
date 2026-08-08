@@ -68,7 +68,7 @@ done
 # contract. The Claude-specific .sh hooks (nudge + session-reset) are NOT mirrored:
 # they implement a PreToolUse Grep/Glob interception that only Claude Code exposes.
 HOOK_SCRIPTS=(
-	"session-start"
+	"session-start.sh"
 	"run-hook.cmd"
 )
 
@@ -122,14 +122,35 @@ materialize() {
 # Move the generated hook scripts into place. Kept separate from materialize()
 # because hooks/ also holds a hand-maintained hooks.json that is NOT generated --
 # clobbering the whole directory would delete it.
+#
+# Prunes anything in hooks/ that is neither hooks.json nor a current entry of
+# HOOK_SCRIPTS. Without this, renaming a canonical hook script leaves the old
+# name behind in every mirror: still present, still executable, no longer
+# referenced by hooks.json, and indistinguishable from a live script to anyone
+# reading the tree. Copy-only sync cannot express a delete.
 install_hooks() {
-	local dest="$1" script
+	local dest="$1" script existing base keep
 	[[ -d "$dest/hooks-generated" ]] || return 0
 	mkdir -p "$dest/hooks"
+
 	for script in "${HOOK_SCRIPTS[@]}"; do
 		cp -p "$dest/hooks-generated/$script" "$dest/hooks/$script"
 	done
 	rm -rf "$dest/hooks-generated"
+
+	for existing in "$dest/hooks"/*; do
+		[[ -e "$existing" ]] || continue
+		base="$(basename "$existing")"
+		[[ "$base" == "hooks.json" ]] && continue
+		keep=0
+		for script in "${HOOK_SCRIPTS[@]}"; do
+			[[ "$base" == "$script" ]] && keep=1 && break
+		done
+		if [[ $keep -eq 0 ]]; then
+			rm -f "$existing"
+			printf 'sync-plugin-skills: pruned stale %s/hooks/%s\n' "$dest" "$base"
+		fi
+	done
 }
 
 STALE=0
@@ -140,11 +161,22 @@ for tree in "${TREES[@]}"; do
 		materialize "$tree" "$staging"
 		install_hooks "$staging"
 		for sub in skills commands $(tree_wants_hooks "$tree" && echo hooks); do
-			# hooks/ carries a non-generated hooks.json; compare only the files we own.
+			# hooks/ carries a non-generated hooks.json, so a recursive diff would
+			# flag it every time. Compare the files we own individually, then
+			# check for extras a rename would have orphaned.
 			if [[ "$sub" == "hooks" ]]; then
 				for script in "${HOOK_SCRIPTS[@]}"; do
 					if ! diff -q "$staging/hooks/$script" "$tree/hooks/$script" >/dev/null 2>&1; then
 						printf 'sync-plugin-skills: STALE %s/hooks/%s\n' "$tree" "$script" >&2
+						STALE=1
+					fi
+				done
+				for existing in "$tree/hooks"/*; do
+					[[ -e "$existing" ]] || continue
+					base="$(basename "$existing")"
+					[[ "$base" == "hooks.json" ]] && continue
+					if [[ ! -e "$staging/hooks/$base" ]]; then
+						printf 'sync-plugin-skills: ORPHAN %s/hooks/%s (no canonical source)\n' "$tree" "$base" >&2
 						STALE=1
 					fi
 				done

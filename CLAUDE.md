@@ -46,14 +46,14 @@ Three harness integrations ship from this repo. **`plugin/` is the single source
 | Tree | Harness | Hand-maintained | Generated |
 |---|---|---|---|
 | `plugin/` | Claude Code | everything (canonical) | — |
-| `.codex-plugin/` | Codex | `plugin.json`, `hooks/hooks.json` | `skills/`, `commands/`, `hooks/session-start`, `hooks/run-hook.cmd` |
+| `.codex-plugin/` | Codex | `plugin.json`, `hooks/hooks.json` | `skills/`, `commands/`, `hooks/session-start.sh`, `hooks/run-hook.cmd` |
 | `opencode-plugin/` | OpenCode | `package.json`, `code-graph.js`, `README.md` | `skills/`, `commands/` |
 
 Canonical content lives at `plugin/skills/<name>/SKILL.md`, `plugin/commands/<name>.md`, `plugin/scripts/`. Fan out with `make plugin-sync` (`scripts/sync-plugin-skills.sh`). `make plugin-sync-check` is the drift gate and **runs as part of `make verify`** — a hand-edited mirror or a new skill that was never fanned out fails the build.
 
 The skill and command lists are **derived** from the canonical directories, not enumerated in the sync script: adding `plugin/skills/<new>/SKILL.md` or `plugin/commands/<new>.md` ships it to every tree on the next sync with no script edit.
 
-Hook-script mirroring is selective. `plugin/scripts/session-start` (emits SDK-standard `{"additionalContext": …}`) and `plugin/scripts/run-hook.cmd` (cmd/bash polyglot wrapper for Windows) are shared and mirrored. `code-graph-nudge.sh` and `code-graph-session-reset.sh` are Claude-only — they implement a `PreToolUse` Grep/Glob interception no other harness exposes — and are deliberately NOT mirrored. All hook scripts fail open (every error path exits 0 with no output).
+Hook-script mirroring is selective. `plugin/scripts/session-start.sh` (emits SDK-standard `{"additionalContext": …}`) and `plugin/scripts/run-hook.cmd` (cmd/bash polyglot wrapper for Windows) are shared and mirrored. `code-graph-nudge.sh` and `code-graph-session-reset.sh` are Claude-only — they implement a `PreToolUse` Grep/Glob interception no other harness exposes — and are deliberately NOT mirrored. All hook scripts fail open (every error path exits 0 with no output).
 
 MCP server name must stay `code-graph` in every tree: the skills and the nudge reference `mcp__code-graph__*` tool names, which will not resolve under a different registration name.
 

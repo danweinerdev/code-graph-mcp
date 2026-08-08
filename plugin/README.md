@@ -95,7 +95,7 @@ each mirror's own manifest (`.codex-plugin/plugin.json`,
 which is hand-maintained and left alone by the sync.
 
 Two hook scripts in `plugin/scripts/` are shared across harnesses and get
-mirrored: `session-start` (emits the SDK-standard `{"additionalContext": …}`
+mirrored: `session-start.sh` (emits the SDK-standard `{"additionalContext": …}`
 orientation blob) and `run-hook.cmd` (a cmd/bash polyglot wrapper so the
 extensionless hook scripts run on Windows). The two `.sh` hooks are
 Claude-only — they implement a `PreToolUse` Grep/Glob interception no other
