@@ -1,0 +1,183 @@
+---
+title: "Daemon Foundation"
+type: phase
+plan: GraphPlatformExpansion
+phase: 3
+status: planned
+created: 2026-08-08
+updated: 2026-08-08
+deliverable: "A repository-local daemon holding one graph per project root, with the stdio binary attaching to it transparently, an idle timeout, and in-process fallback."
+tasks:
+  - id: "3.1"
+    title: "[daemon] config section, parsed and inert"
+    status: planned
+    justifies: "FR-10, FR-07. A config surface that lands separately can be reviewed and shipped with zero behaviour change, which is what makes every later task in the phase individually revertible."
+    verification: "cargo test -p code-graph-core config:: — a .code-graph.toml with [daemon] enabled and idle_timeout_secs parses; absent section yields documented defaults; idle_timeout_secs = 0 parses as the never-exit sentinel; an unknown key is ignored consistently with the existing sections; no behaviour changes anywhere."
+  - id: "3.2"
+    title: "Daemon mode: transport, metadata, lockfile, single-instance"
+    status: planned
+    justifies: "FR-06, FR-07, FR-13, FR-38, FR-39, FR-40, NFR-06, NFR-07, AC-05, AC-08, AC-47, AC-48, AC-49. Without an atomic single-instance protocol, concurrent sessions produce two daemons on one cache; without the transport hierarchy the daemon cannot satisfy NFR-06 on every platform."
+    verification: "cargo test -p code-graph-tools daemon:: plus an integration test — --serve creates .code-graph/ with socket, daemon.json, and lock and nothing outside the repository (AC-05); named pipe or UDS is used by default and loopback TCP only on fallback, with the fallback reported (AC-47); the TCP path refuses a client with no or stale secret and the secret file is owner-only (AC-48); a client reads the transport from metadata and connects first try (AC-49); N clients started simultaneously converge on one daemon with no orphans, run 20 times (AC-08); an orphaned socket inode does not block startup and a live one is never unlinked."
+    depends_on: ["3.1"]
+  - id: "3.3"
+    title: "Proxy mode behind [daemon].enabled, default off"
+    status: planned
+    justifies: "FR-08, FR-09, FR-14, FR-15, FR-16, AC-04, AC-10, AC-30, AC-31. Shipping the proxy default-off is what lets the byte-pump and shared-state behaviour be exercised in the real harness before it becomes everyone's default path."
+    verification: "Integration tests — with the flag on, two clients on one root share an index: one runs analyze_codebase and the other queries without indexing (AC-04); a file edit triggers exactly one watcher and both clients see it (AC-30); session B observes session A's analyze job in get_status including progress and terminal result (AC-31); with the daemon prevented from starting, every existing tool answers in-process and the fallback is reported (AC-10)."
+    depends_on: ["3.2"]
+  - id: "3.4"
+    title: "Flip the default on, with binary-identity replacement"
+    status: planned
+    justifies: "FR-08, FR-12, NFR-01, AC-09. This is the commit where users get the feature; the binary-SHA gate has to land with it because a dirty SHA never changes between dev builds, so without it an edit-rebuild loop silently talks to the stale daemon."
+    verification: "Integration tests plus the full snapshot suite — the existing snapshot suite passes unchanged against a daemon-backed server, proving the proxy is transparent (NFR-01); a client built from a different binary does not attach and the daemon is replaced (AC-09); the replaced daemon persists its cache before exiting and a signal mid-persist completes the write; a daemon that ignores the signal is hard-killed after a bounded grace period and the client falls back in-process."
+    depends_on: ["3.3"]
+  - id: "3.5"
+    title: "Idle timeout and warm-attach measurement"
+    status: planned
+    justifies: "FR-10, FR-11, NFR-09, AC-06, AC-07, AC-25, AC-26, AC-42. An always-resident daemon per repository is a resource leak users will notice; the measurement is what turns NFR-09's claimed benefit into a verified one rather than an assumption."
+    verification: "Integration tests with a short timeout — exits with no clients, does not exit with a client attached, does not exit with an analyze in flight and no clients (AC-06); the timer restarts from zero rather than resuming after an analyze terminates; the cache reflects the last index after idle exit and the next start loads rather than re-indexes (AC-07); the endpoint is unreachable from another machine and unusable by another local user (AC-25); warm-attach time-to-first-query measured on external/ripgrep and external/abseil-cpp shows no corpus-size scaling while cold start does, all four numbers recorded in notes/ (AC-26); Linux, macOS, and Windows each exercised, including the POSIX-only stale-inode path (AC-42)."
+    depends_on: ["3.4"]
+---
+
+# Phase 3: Daemon Foundation
+
+## Overview
+
+One daemon per project root, discovered by the same upward walk that finds `.code-graph.toml`, with all runtime state under `<project_root>/.code-graph/`. The stdio binary becomes a byte proxy that attaches or spawns, and falls back in-process if it cannot. `ServerInner` is reused verbatim — repository-local scoping (D-0001) means a keyed workspace registry cannot arise.
+
+Independent of phases 1, 2, and 5. Gates phases 4 and 7.
+
+## 3.1: [daemon] config section, parsed and inert
+
+### Subtasks
+- [ ] Add `DaemonConfig { enabled: bool, idle_timeout_secs: u64 }` to `RootConfig`
+- [ ] Default `enabled = **false**` in the type — the flip to true is task 3.4's job, and defaulting true here would make the daemon live as soon as 3.2 and 3.3 land, before the binary-identity guard exists
+- [ ] Document the section in `.code-graph.toml.example` and CLAUDE.md
+- [ ] Add `.code-graph/` to `.gitignore`
+- [ ] Config parsing tests
+
+### Notes
+Revision boundary: the config surface exists and is documented; no code reads it yet.
+
+The default is `false` deliberately, and 3.4 is the only task that changes it. Defaulting to `true` here — even with the code path unused — means that the moment 3.2 adds `--serve` and 3.3 adds attachment, every session is on the daemon path with no binary-SHA replacement protection, which is precisely the stale-daemon hazard 3.4 exists to close.
+
+Follow the existing section conventions exactly — `#[serde(default)]` on every field, no `deny_unknown_fields`. Note that the singular/plural trap already documented for `extra_ignore` applies here too: a misspelled key silently no-ops, so the example file is load-bearing documentation.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 3.2: Daemon mode: transport, metadata, lockfile, single-instance
+
+### Subtasks
+- [ ] Add `--serve` mode to the binary; keep the no-arg invocation behaving exactly as today
+- [ ] Implement transport selection: Unix socket / named pipe first, loopback TCP with a per-instance secret on fallback
+- [ ] Write `daemon.json` (pid, transport, endpoint, binary SHA, started_at) after the listener is live
+- [ ] Implement exclusive-create `daemon.lock` with the pid inside; remove on clean exit
+- [ ] Stale-lock detection: liveness by connection attempt, pid only to avoid removing a live starter's lock
+- [ ] POSIX: unlink a pre-existing socket inode only while holding the lock and only after a connection attempt is refused
+- [ ] Serve `CodeGraphServer` over the accepted stream via rmcp's async-rw transport
+- [ ] Tests per the verification field, including the 20x concurrency run
+
+### Notes
+Revision boundary: a daemon can be started explicitly and serves MCP over a socket. Nothing attaches to it automatically yet.
+
+This is the largest task in the plan and the pieces are genuinely coupled — a lockfile without stale detection is unsafe, transport selection without metadata is unusable — so it is one bisectable unit rather than seven. If `make verify` cannot be kept green across the whole bundle in one sitting, land the subtasks as sub-commits within the task rather than splitting the task; the revision boundary is the working daemon, not each part of it.
+
+The `server` feature already enabled in this workspace pulls in `transport-async-rw`, so no rmcp feature change is needed. Both stdio and socket transports frame through the same `JsonRpcMessageCodec`, which is what makes 3.3's byte pump safe.
+
+Loopback TCP does **not** by itself restrict access to the invoking user — that is why the secret exists on that path and not on the others.
+
+### Completion Evidence
+
+Pending — not complete.
+
+### Trap
+Testing "is a daemon already running?" by checking whether the socket file exists. It doesn't work in either direction: a crashed daemon leaves the file behind (so existence is a false positive, and on POSIX the leftover inode makes `bind` fail with `EADDRINUSE` forever), and the file appears slightly after the process starts (so absence is a false negative). The only sound test is attempting a connection.
+
+## 3.3: Proxy mode behind [daemon].enabled, default off
+
+### Subtasks
+- [ ] Implement the attach sequence: discover root, read metadata, connect; on failure take the lock and spawn; on losing the lock retry with backoff, re-probing lock staleness each attempt
+- [ ] Implement the bidirectional byte pump between stdio and the socket
+- [ ] Implement in-process fallback with a reported diagnostic
+- [ ] Add `--no-daemon` to force today's behaviour
+- [ ] Integration tests for shared index, shared watcher, shared analyze slot, and forced fallback
+
+### Notes
+Revision boundary: attaching works end to end and is opt-in; the default path is unchanged, so this commit cannot regress anyone.
+
+Watch and the analyze slot need no code change to become shared — they already live in `ServerInner`, and N rmcp services over one `Arc` is the shape `CodeGraphServer` was built for. What changes is that `watch_start`'s "already active" message now means "another session started it", which the tool description should say.
+
+Re-probing lock staleness on each backoff attempt matters: if the winner dies after taking the lock but before writing metadata, a one-shot check strands every loser in the backoff window on in-process fallback.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 3.4: Flip the default on, with binary-identity replacement
+
+### Subtasks
+- [ ] Flip the `[daemon].enabled` default from false to true — the single line that makes the daemon everyone's path
+- [ ] Compare the client's build SHA against `daemon.json`; treat any `-dirty` SHA as always mismatching
+- [ ] On mismatch, signal the daemon and wait for exit, then respawn
+- [ ] Install a signal handler in the daemon routing to the same graceful shutdown as idle exit
+- [ ] Finish an in-flight cache persist before exiting; hard-kill after a bounded grace period
+- [ ] Run the full snapshot suite against a daemon-backed server
+
+### Notes
+Revision boundary: the daemon is the default path, with a working replacement protocol.
+
+The shutdown mechanism is a signal, not an MCP call — a hidden control tool would contradict both the no-new-protocol decision and the unchanged-tool-surface guarantee. Because the dirty-SHA rule makes replacement fire on *every* rebuild during development, a bare kill would corrupt the cache routinely rather than rarely.
+
+### Completion Evidence
+
+Pending — not complete.
+
+### Trap
+Treating a `-dirty` SHA as matching itself. It looks correct — the strings are equal — but two different dirty builds share a SHA, so the client attaches to a daemon running code it no longer has. This is the highest-frequency failure in the whole phase and it manifests as "my change didn't take effect".
+
+## 3.5: Idle timeout and warm-attach measurement
+
+### Subtasks
+- [ ] Implement the idle timer: runs only at zero connections and no analyze in flight
+- [ ] Cancel on new attachment; restart from zero after an analyze terminates
+- [ ] Persist cache, remove metadata and lock, close the listener before exit
+- [ ] Add the security tests for endpoint reachability and permissions
+- [ ] Run and record the warm-attach benchmark on two corpora
+- [ ] Exercise Linux, macOS, and Windows including the POSIX stale-inode path
+
+### Notes
+Revision boundary: the daemon has a complete lifecycle — start, serve, idle out, restart warm.
+
+Restart-from-zero rather than resume is the rule that is easy to get wrong: resuming a partial count means an analyze finishing at T-1s leaves one second of grace, and the next client attaches to a corpse.
+
+AC-26 is a recorded metric, not an automated gate. The pass condition is the *absence of corpus-size scaling* in warm attach, not a millisecond target — a fixed threshold would be flaky across machines.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## Acceptance Criteria
+
+- [ ] **AC-04**: Two clients on one daemon share an index; one indexes, the other queries without re-indexing (FR-09).
+- [ ] **AC-05**: Spawning creates `.code-graph/` and nothing outside the repository (FR-06, FR-07, FR-08).
+- [ ] **AC-06**: Idle exit fires with no clients; not with a client attached; not with an analyze in flight (FR-10, FR-11).
+- [ ] **AC-07**: The cache reflects the last index after idle exit; the next start loads it (FR-11).
+- [ ] **AC-08**: Simultaneous starts converge on one daemon with no orphans (FR-13).
+- [ ] **AC-09**: A differently-built client does not attach; the daemon is replaced (FR-12).
+- [ ] **AC-10**: With the daemon unavailable, every tool answers in-process and the fallback is reported (FR-16).
+- [ ] **AC-25**: The endpoint is unreachable remotely and unusable by another local user (NFR-06).
+- [ ] **AC-26**: Warm attach does not scale with corpus size; measured on two corpora and recorded (NFR-09).
+- [ ] **AC-30**: One watcher serves all attached clients (FR-14).
+- [ ] **AC-31**: The analyze job started by one session is observable by another (FR-15).
+- [ ] **AC-42**: Linux, macOS, and Windows each exercised, per-platform transport covered (NFR-07).
+- [ ] **AC-47**: Named-pipe/UDS default with reported loopback-TCP fallback (FR-38).
+- [ ] **AC-48**: TCP fallback requires a per-instance secret; file is owner-only (FR-39).
+- [ ] **AC-49**: Clients read the transport from metadata and connect first try (FR-40).
+- [ ] **AC-27**: `make verify` passes (NFR-04).
+- [ ] FR-06 through FR-16 and FR-38 through FR-40 realized; NFR-06, NFR-07, NFR-09 satisfied; NFR-01 preserved.
+
+## Phase Completion Evidence
+
+Pending — not complete.

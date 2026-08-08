@@ -1,9 +1,9 @@
 ---
 title: "Shared Daemon for Multi-Tenant Code Graph Sharing"
 type: design
-status: draft
+status: superseded
 created: 2026-04-28
-updated: 2026-04-28
+updated: 2026-08-08
 tags: [daemon, multi-tenancy, http, rmcp, workspace, vnext]
 related:
   - Designs/RustRewrite
@@ -12,7 +12,12 @@ related:
 
 # Shared Daemon for Multi-Tenant Code Graph Sharing
 
-> **Status: deferred.** This design captures the planned next step after the RustRewrite (`Designs/RustRewrite/`) ships and stabilizes. It is intentionally less detailed than RustRewrite — enough for a future contributor to pick up cold, not enough to start implementation. Specific dependency pins, response-shape changes, and phase plan are deferred to the implementation plan that will follow this design's approval.
+> **Status: superseded (2026-08-08) by `Specs/GraphPlatformExpansion` (D-0001).** The daemon is now
+> specified as repository-local — one daemon per project root, all state inside the repository — rather
+> than the multi-tenant shape below. This document is retained as the record of a considered
+> alternative; a later expansion to multi-tenancy is not blocked by the narrower model.
+>
+> **Original status: deferred.** This design captures the planned next step after the RustRewrite (`Designs/RustRewrite/`) ships and stabilizes. It is intentionally less detailed than RustRewrite — enough for a future contributor to pick up cold, not enough to start implementation. Specific dependency pins, response-shape changes, and phase plan are deferred to the implementation plan that will follow this design's approval.
 
 ## Overview
 

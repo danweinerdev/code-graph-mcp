@@ -17,7 +17,7 @@ Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs 
 | Install pre-commit hooks | `make install-hooks` | sets `core.hooksPath=scripts/hooks` |
 | Init dogfood submodules | `make submodules` | `git submodule update --init external/<name>` |
 
-No CGo/C toolchain — tree-sitter grammars build via pure-Rust `cc`. Build natively per target (no cross-compile pipeline). Pre-commit runs `make snapshot-clean`.
+**A C compiler IS required.** The six `tree-sitter-*` grammar crates compile generated `parser.c`/`scanner.c` into static archives via the `cc` crate — `cc` is a pure-Rust build *driver*, not a pure-Rust compiler, so it shells out to the platform's cc. What the workspace avoids is CGo and any vendored or system C *library*: the only C compiled is the self-contained grammar sources, and nothing links against an external library or needs `pkg-config`. Preserve that distinction when adding dependencies (D-0004). Build natively per target (no cross-compile pipeline). Pre-commit runs `make snapshot-clean`.
 
 ## Workspace map
 
@@ -26,7 +26,7 @@ No CGo/C toolchain — tree-sitter grammars build via pure-Rust `cc`. Build nati
 | `code-graph-mcp` | `crates/code-graph-mcp` | Binary; rmcp stdio server entry |
 | `code-graph-core` | `crates/code-graph-core` | `Symbol`, `Edge`, `SymbolKind`, `EdgeKind`, `Confidence`, `RootConfig` (TOML) |
 | `code-graph-lang` | `crates/code-graph-lang` | `LanguagePlugin` trait, `LanguageRegistry`, `SymbolIndex` |
-| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v8) at `<project_root>/.code-graph-cache.db`. The single `#![allow(unsafe_code)]` opt-in in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs`. |
+| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v10) at `<project_root>/.code-graph-cache.db`. The single `#![allow(unsafe_code)]` opt-in in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs`. |
 | `code-graph-path-trie` | `crates/code-graph-path-trie` | Segment-keyed Patricia trie (`PathTrie<V>`), `PathSet`, `PathInterner`. Backs `Graph.files`/`Graph.includes` and the cache encoder's path interning. `#![forbid(unsafe_code)]`. |
 | `code-graph-tools` | `crates/code-graph-tools` | Tool handlers; parallel discovery+indexer; watcher (notify-debouncer-full) |
 | `code-graph-parse-test` | `crates/code-graph-parse-test` | Dev binaries: `code-graph-parse-test` (parser-corpus harness) and `code-graph-bench` (repo-agnostic index/cache/verify). Not built into the server. |
@@ -124,7 +124,7 @@ Tool descriptions in `#[tool(description=…)]` strings (`server.rs`) are **prod
   - `HierarchyNode.ref` is `Option<bool>` with `skip_serializing_if = "Option::is_none"`. Only ever `Some(true)`; `ref: false` is never on the wire.
 - **`get_symbol_summary`** → `Page<SummaryRow>`. `SummaryRow = { namespace, kind, count }`. Empty namespace → literal `<global>` (rewritten pre-sort, so sorts where `<` lands in ASCII). `kind` byte-identical to other tools' kind spelling via `kind_str`. Sorted by `(namespace, kind)` asc. `count_only=true` total = `(namespace, kind)` pair count, NOT symbol sum.
 - **`search_symbols`** → `SearchSymbolsResponse`. `Page<SymbolResult>` envelope `#[serde(flatten)]`-ed (top-level wire shape byte-identical to bare `Page<SymbolResult>`), PLUS optional `suggestions: string[]`. `suggestions` carries `skip_serializing_if = "Vec::is_empty"` — **absent from JSON entirely** when empty (no `"suggestions": []`). Populated ONLY when raw query is anchored (`^…$`, length ≥ 2, non-empty inner) AND `total == 0`; up to 5 candidate symbol-id strings from broad substring match on the anchors-stripped inner. `count_only=true` short-circuits before the suggestion block.
-- **`get_dependencies`** → `Page<DependencyEntry>`. `DependencyEntry = { file, kind, line }`. `kind` is **always the string `"includes"`** for every language — Rust `mod`, Python/Go/Java `import`, C# `using`, C++ `#include` all map to `EdgeKind::Includes` (the enum has exactly three variants: `Calls`/`Includes`/`Inherits`; there is no `"imports"`). `line` is the source line. Only includes resolving to an indexed source file appear — system headers, external paths, `.ini`/`.cfg`/`.txt`, anything no plugin claims are filtered at index time. **Rust:** only intra-crate `mod foo;` survives; `use`/`extern crate` dotted tokens (`std::io`, `alloc`) drop at resolve via `RustParser::resolve_include` (intentional scope boundary).
+- **`get_dependencies`** → `Page<DependencyEntry>`. `DependencyEntry = { file, kind, line }`. `kind` is **always the string `"includes"`** for every language — Rust `mod`, Python/Go/Java `import`, C# `using`, C++ `#include` all map to `EdgeKind::Includes` (there is no `"imports"`). `EdgeKind` has **four** variants — `Calls`, `Includes`, `Inherits`, `Overrides` — and `Inherits`/`Overrides` are routed into `adj`/`radj` alongside `Calls`, so any new whole-graph traversal must filter by kind explicitly rather than assuming `adj` holds only calls. `line` is the source line. Only includes resolving to an indexed source file appear — system headers, external paths, `.ini`/`.cfg`/`.txt`, anything no plugin claims are filtered at index time. **Rust:** only intra-crate `mod foo;` survives; `use`/`extern crate` dotted tokens (`std::io`, `alloc`) drop at resolve via `RustParser::resolve_include` (intentional scope boundary).
 - **`get_coupling`** depends on `direction`:
   - `outgoing` (default) / `incoming` → `Page<CouplingEntry>`. `CouplingEntry = { file, count }` (`count` = call+include edges between the two files in that direction). Sorted by `count` desc, then `file` asc.
   - `both` → `CouplingBoth = { incoming: Page<CouplingEntry>, outgoing: Page<CouplingEntry> }`. **No top-level `results`.** Pages byte-budgeted SEQUENTIALLY: incoming first against the full budget; outgoing gets what remains after incoming + fixed wrapper reserve. If incoming exhausts budget, outgoing returns empty with `truncated: true` and `next_offset: Some(0)` (start-fresh marker). Field-declaration order (`incoming`, `outgoing`) is the wire contract.
@@ -238,7 +238,7 @@ java = []
 
 ### Cache invalidation
 
-- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `8`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
+- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `10`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
 - **Version mismatch** on `Graph::load` → `Ok(false)` → caller **silently re-indexes**. No `force=true` required, no transparent migration.
 - **mtime-based stale checking.** Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, `[cpp].macro_define_function`, `[cpp].macro_define_type`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime. Apply with `force=true`.
 - **Adding extensions:** new files brought in by `[extensions].<lang>` parse normally on next run (no `force=true`).
@@ -443,7 +443,7 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
                               |
                      +--------+--------+
                      |                 |
-              [Tool Handlers]     [Graph + rkyv v8 cache]
+              [Tool Handlers]     [Graph + rkyv v10 cache]
               (code-graph-tools)  (code-graph-graph)
                      |                 |
               [LanguageRegistry]

@@ -1,0 +1,116 @@
+---
+title: "Command-Line Interface"
+type: phase
+plan: GraphPlatformExpansion
+phase: 7
+status: planned
+created: 2026-08-08
+updated: 2026-08-08
+deliverable: "A code-graph CLI over the typed core, producing payloads identical to the MCP surface and working with or without a daemon."
+tasks:
+  - id: "7.1"
+    title: "CLI interface design: command surface, output modes, exit statuses"
+    status: planned
+    justifies: "FR-19, FR-20. Designs/RepoLocalDaemon Decision 8 deliberately deferred this because designing a command surface against a typed core that did not exist was guesswork; with phase 2 landed the signatures are known and the design is short."
+    verification: "A design document exists at Designs/CommandLineInterface with status review or approved, covering: the subcommand surface mapped to typed core functions, the machine-readable output convention, the human-readable default, and the exit-status mapping for success, tool error, and operational failure. Reviewed by plan-reviewer or spec-reviewer with no unresolved Critical or Major findings."
+  - id: "7.2"
+    title: "code-graph binary over the typed core"
+    status: planned
+    justifies: "FR-17, FR-18, AC-33 (CLI half), AC-40. FR-17's 'no duplicated query logic' is only achievable through the typed core; a CLI parsing JSON back out of CallToolResult would be a second place for response shapes to drift."
+    verification: "cargo test -p code-graph-cli — every subcommand calls a core:: function with no rmcp type constructed; the three phase 1 queries are invocable from the CLI, completing AC-33; identical invocations produce identical machine-readable output with and without a running daemon (AC-40, FR-18); a query against an unindexed repository reports the same domain error the MCP surface does."
+    depends_on: ["7.1"]
+  - id: "7.3"
+    title: "Output parity and exit-status behaviour"
+    status: planned
+    justifies: "FR-19, FR-20, AC-11, AC-12. Payload parity is the property that makes the CLI trustworthy for scripting; without per-shape coverage a divergence in one envelope type would go unnoticed until someone depended on it."
+    verification: "cargo test -p code-graph-cli parity:: — machine-readable output equals the MCP payload for one query of each distinct shape: a Page envelope (get_callers), a non-Page tree (get_class_hierarchy), a flattened envelope with a conditional field (search_symbols, both with and without suggestions), a dual-page response (get_coupling direction=both), and a non-JSON body (generate_diagram format=mermaid) (AC-11); exit status distinguishes success, an unknown-symbol tool error, and an operational failure such as an unreadable cache (AC-12)."
+    depends_on: ["7.2"]
+---
+
+# Phase 7: Command-Line Interface
+
+## Overview
+
+A second front-end over the typed core, so graph queries are usable from a terminal and in scripts rather than only from an agent session. Depends on phase 1 for the three new queries, phase 2 for the typed core that exposes them, and phase 3 for daemon attachment.
+
+This phase opens with a design task rather than code — the CLI's interface was deliberately left unspecified until the core existed.
+
+## 7.1: CLI interface design: command surface, output modes, exit statuses
+
+### Subtasks
+- [ ] Read the landed `core::` signatures and enumerate what each subcommand needs
+- [ ] Design the subcommand surface, mapped one-to-one onto core functions
+- [ ] Decide the machine-readable output convention and the human-readable default rendering
+- [ ] Define the exit-status mapping for the three outcome classes
+- [ ] Decide whether the CLI auto-spawns a daemon or only attaches, resolving the plan's open question
+- [ ] Write `Designs/CommandLineInterface/README.md` following the design template
+- [ ] Dispatch a reviewer and address Critical and Major findings
+
+### Notes
+Revision boundary: an approved interface design exists; no CLI code is written. The artifact is the deliverable.
+
+The starting sketch from Designs/RepoLocalDaemon Decision 8: a `--json` flag selecting machine output, subcommands mirroring tool names, and exit `0` / `1` / `2` for success / tool error / operational failure. Treat it as a starting point, not a conclusion — the point of deferring was to design against real signatures.
+
+`ToolOk`'s three outcomes map naturally onto the exit-status classes, and `ToolOk::Text` is the case that needs thought: a mermaid diagram and a non-callable advisory are both text successes but want different human rendering.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 7.2: code-graph binary over the typed core
+
+### Subtasks
+- [ ] Create the `code-graph` binary crate with `clap`, added to the workspace members
+- [ ] Implement subcommands calling `core::` functions directly
+- [ ] Implement daemon attachment reusing phase 3's discovery, with standalone as the fallback
+- [ ] Wire the three phase 1 queries through their `core::` functions — migrated there by phase 2 tasks 2.3 through 2.5 — so AC-33's CLI half is satisfied
+- [ ] Tests for daemon and standalone parity and the unindexed error path
+
+### Notes
+Revision boundary: the CLI answers queries end to end in both modes.
+
+`clap` is a new workspace dependency scoped to this binary. It does not enter any of the four protected crates, so NFR-02 is unaffected.
+
+The CLI must not construct an rmcp type anywhere. If a subcommand finds itself deserializing a `CallToolResult`, the typed core is being bypassed and FR-17 is violated in spirit even if the output happens to match.
+
+### Completion Evidence
+
+Pending — not complete.
+
+### Trap
+Reaching for the MCP handlers because they are already wired and their signatures are familiar. That produces a CLI that parses JSON out of a wire envelope to re-render it — the exact duplication Track A existed to prevent, and it will pass every parity test while making the next response-shape change a two-place edit.
+
+## 7.3: Output parity and exit-status behaviour
+
+### Subtasks
+- [ ] Implement the machine-readable output mode per the 7.1 design
+- [ ] Implement the human-readable default rendering
+- [ ] Implement the exit-status mapping
+- [ ] Add parity tests across the five distinct response shapes
+- [ ] Add exit-status tests for the three outcome classes
+- [ ] Update CLAUDE.md and the plugin README with CLI usage
+
+### Notes
+Revision boundary: the CLI is complete and its output contract is verified.
+
+The five shapes are chosen to cover structurally different envelopes, not five arbitrary tools: a plain `Page`, a non-`Page` tree, a flattened envelope with a `skip_serializing_if` field, a dual-page response with no top-level `results`, and a non-JSON body. A parity bug will live in one of those shapes, not in a particular tool.
+
+`search_symbols` must be exercised both with and without `suggestions`, since the field is absent rather than null when empty — a renderer that assumes presence fails only on the populated path, or only on the empty one.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## Acceptance Criteria
+
+- [ ] **AC-11**: CLI machine-readable output equals the MCP payload for each of the five distinct response shapes (FR-17, FR-19).
+- [ ] **AC-12**: Exit status distinguishes success, tool error, and operational failure (FR-20).
+- [ ] **AC-33**: Position lookup, shortest path, and community detection are invocable from both the MCP surface and the CLI, completing the criterion opened in phase 1 (FR-26).
+- [ ] **AC-40**: Identical output with and without a running daemon (FR-18).
+- [ ] No query logic duplicated between the CLI and the MCP adapter; every subcommand calls the typed core (FR-17).
+- [ ] **AC-27**: `make verify` passes (NFR-04).
+- [ ] FR-17, FR-18, FR-19, FR-20 realized.
+
+## Phase Completion Evidence
+
+Pending — not complete.
