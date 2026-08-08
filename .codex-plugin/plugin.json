@@ -1,0 +1,35 @@
+{
+  "name": "code-graph",
+  "version": "0.1.0",
+  "description": "Structural code navigation over MCP — tree-sitter symbol graph with resolved call, include, and inheritance edges for C++, Rust, Go, Python, C#, and Java. Answers where-is-it-defined, what-calls-it, what-depends-on-what, and what's-dead without reading files.",
+  "author": {
+    "name": "Daniel Weiner"
+  },
+  "homepage": "https://github.com/danweinerdev/code-graph-mcp",
+  "repository": "https://github.com/danweinerdev/code-graph-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "code-graph", "code-search", "call-graph", "static-analysis", "tree-sitter"],
+  "skills": "./skills/",
+  "mcpServers": {
+    "code-graph": {
+      "command": "code-graph-mcp",
+      "args": [],
+      "startup_timeout_sec": 120
+    }
+  },
+  "interface": {
+    "displayName": "code-graph",
+    "shortDescription": "Semantic code-graph MCP server for navigating large codebases",
+    "longDescription": "code-graph indexes a repository with tree-sitter into an in-memory semantic graph and exposes it over MCP — symbol search, call graphs, inheritance, file dependencies, cycles, orphans, and diagrams. Built for AI agents to navigate unfamiliar code without reading every file.",
+    "developerName": "Daniel Weiner",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read"],
+    "defaultPrompt": [
+      "Where is `<symbol>` defined?",
+      "What calls `<symbol>` in this repo?",
+      "What does this file depend on?",
+      "Is there any dead code in this codebase?"
+    ],
+    "websiteURL": "https://github.com/danweinerdev/code-graph-mcp"
+  }
+}
