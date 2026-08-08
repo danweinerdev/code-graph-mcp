@@ -1,0 +1,25 @@
+{
+  "name": "code-graph-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for code-graph — a tree-sitter semantic code-graph MCP server with resolved call, include, and inheritance edges for C++, Rust, Go, Python, C#, and Java.",
+  "keywords": ["opencode", "mcp", "code-graph", "code-search", "call-graph", "static-analysis", "tree-sitter"],
+  "homepage": "https://github.com/danweinerdev/code-graph-mcp#opencode",
+  "bugs": {
+    "url": "https://github.com/danweinerdev/code-graph-mcp/issues"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Daniel Weiner"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danweinerdev/code-graph-mcp.git",
+    "directory": "opencode-plugin"
+  },
+  "files": ["code-graph.js", "skills/", "commands/", "README.md"],
+  "type": "module",
+  "main": "code-graph.js",
+  "engines": {
+    "node": ">=22"
+  }
+}
