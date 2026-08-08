@@ -12,3 +12,8 @@ target/
 .code-graph.toml
 external/
 dist/
+# Generated plugin trees for other agent harnesses. This image ships Claude Code
+# only and COPYs `plugin/` (their canonical source), so these are never build
+# inputs — see CLAUDE.md, "Agent-harness plugin trees".
+.codex-plugin/
+opencode-plugin/

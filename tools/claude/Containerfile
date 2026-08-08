@@ -230,9 +230,23 @@ ENV PATH=/home/${USERNAME}/.local/bin:/cache/cargo/bin:/opt/rust/cargo/bin:/opt/
 # empty and nothing loads. `--plugin-dir` is the mechanism that actually
 # activates it: verified `Status: ✔ loaded`.) The baked marketplace is kept so
 # `claude plugin install code-graph@code-graph-mcp` also works interactively.
+#
+# `plugin/` is also the canonical source the Codex and OpenCode trees are
+# generated from (see CLAUDE.md), so it carries a few harness-neutral hook
+# scripts this container never invokes. They are copied anyway — the directory
+# is version-locked to the image as a unit, and excluding them would mean
+# tracking which subset Claude Code uses.
 USER root
 COPY .claude-plugin /opt/code-graph-plugin/.claude-plugin
 COPY plugin /opt/code-graph-plugin/plugin
+# Hook scripts need the exec bit; `chmod -R a+rX` alone does not grant it
+# (capital X only sets execute on directories and already-executable files).
+# The `*.sh` filter is deliberately an allowlist rather than a blanket
+# `-type f`: everything in this directory that must run is named `.sh`, and a
+# blanket chmod would mark any future data file, fixture, or README executable
+# by accident. Keep new hook scripts `.sh`-suffixed so they are picked up here.
+# `run-hook.cmd` is intentionally NOT matched — it is the Windows-side
+# dispatcher, and Claude Code (the only harness in this image) never invokes it.
 RUN chmod -R a+rX /opt/code-graph-plugin \
     && find /opt/code-graph-plugin/plugin/scripts -type f -name '*.sh' -exec chmod 0755 {} +
 
