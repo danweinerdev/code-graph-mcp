@@ -157,7 +157,7 @@ idle_timeout_secs = 1800 # 0 = never exit
 
 A consequence worth stating: because the proxy is byte-level, protocol version skew is impossible — but *binary* skew is not, which is what Decision 5 handles.
 
-### Decision 3: Named pipe / Unix socket first, loopback TCP with a secret as fallback
+### Decision 3: Named pipe / Unix socket first, loopback TCP with a secret as fallback (FR-38, FR-39, FR-40)
 
 **Context:** FR-38 – FR-40 and NFR-06/07. (Resolves the spec's OQ-02.)
 
@@ -205,7 +205,7 @@ Two details that follow: if the daemon is mid-`Persisting` when signalled it fin
 
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 
-### Decision 7: Analyze requests queue and coalesce by path containment
+### Decision 7: Analyze requests queue and coalesce by path containment (FR-41, FR-42, FR-43)
 
 **Context:** FR-41 – FR-43. Today `analyze_codebase` inspects the slot and returns `"indexing already in progress"` on contention. With N attached sessions, that error goes from rare to routine.
 
@@ -235,7 +235,7 @@ This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent se
 
 **The CLI's own interface design is deliberately deferred, not omitted.** This design fixes only what constrains the daemon: that the CLI is a separate binary, that it calls the typed core, and that it is sequenced after Track A. The command surface, the human-vs-machine output convention (FR-19), and the exit-status mapping (FR-20) are settled in a follow-on design once the typed core exists and its function signatures are known — designing a command surface against a core that has not been written yet would be guesswork, and the shapes it must render are exactly what Track A produces. The sketch to start from: a `--json` flag selecting machine output, subcommands mirroring tool names, and exit `0` / `1` / `2` for success / tool error / operational failure. AC-11, AC-12, and AC-40 are that follow-on's acceptance gate.
 
-### Decision 9: Watch becomes daemon-owned
+### Decision 9: Watch becomes daemon-owned (FR-14, FR-15)
 
 **Context:** FR-14. `watch_start` stores a single `WatchHandle` in `ServerInner`; with N clients, N calls would contend.
 
@@ -306,10 +306,13 @@ Additive and reversible at every step. The default invocation is unchanged, and 
 
 Documentation lands with the code: the `[daemon]` section in `.code-graph.toml.example` and CLAUDE.md, the `.code-graph/` directory added to `.gitignore`, the analyze-contention behaviour change, and the note that watch is now shared.
 
-## Open Questions
+## Resolved Questions
 
-- **OQ-B1 (non-blocking): Idle default of 1800s.** The mechanism, the config key, and the `0` sentinel are fixed; only the number is a guess, and it is tunable without touching any interface.
-- **OQ-B2 (non-blocking): Should the CLI auto-spawn a daemon, or only attach to a running one?** Either satisfies FR-18, which requires identical output in both modes; auto-spawn is a latency question for one-shot commands, not a correctness one.
-- **OQ-B3 — RESOLVED.** *Does the coalesced-caller response fit the existing `AnalyzeResult`?* Evolve the wire format with an **additive optional field** rather than introducing a second shape. The field carries the coalescing fact and the identity of the request that satisfied it, is annotated `skip_serializing_if` so it is **absent** — not `null` — whenever coalescing did not occur, and is added to the *shared* shape so `analyze_codebase`'s body and `analyze_job.result` stay structurally identical and one client deserializer still covers both (the property CLAUDE.md documents). Byte-identity of the non-coalesced path is therefore preserved, satisfying NFR-01 without special-casing.
+**OQ-B3 — RESOLVED.** *Does the coalesced-caller response fit the existing `AnalyzeResult`?* Evolve the wire format with an **additive optional field** rather than introducing a second shape. The field carries the coalescing fact and the identity of the request that satisfied it, is annotated `skip_serializing_if` so it is **absent** — not `null` — whenever coalescing did not occur, and is added to the *shared* shape so `analyze_codebase`'s body and `analyze_job.result` stay structurally identical and one client deserializer still covers both (the property CLAUDE.md documents). Byte-identity of the non-coalesced path is therefore preserved, satisfying NFR-01 without special-casing.
 
   Note the deliberate asymmetry with `analyze_job` / `analyze_job_previous_terminal`, which serialize explicit `null` so a client can distinguish "no analyze ever" from "old server". That reasoning does not apply here: absence and "not coalesced" are the same fact, so an explicit `null` would add a field to every response to convey nothing.
+
+## Open Questions
+
+- The idle-timeout default of 1800 seconds (OQ-B1) — **non-blocking** — the mechanism, the config key, and the `0` sentinel are fixed; only the number is a guess and it is tunable without touching an interface.
+- Whether the CLI auto-spawns a daemon or only attaches to a running one (OQ-B2) — **non-blocking** — FR-18 requires identical output in both modes either way, so this is a latency question for one-shot commands, not a correctness one.

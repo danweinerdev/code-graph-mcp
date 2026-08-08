@@ -382,8 +382,12 @@ Rollout order within the track, each independently shippable:
 
 Two documentation updates land with the code, not after: the MCP tools table in CLAUDE.md moves from 19 to 22 with the new response shapes described, and the three tool descriptions are written under the agent-facing-description lens (NFR-11, AC-45) — arguments documented with defaults and ceilings, envelope named rather than implied, and `get_symbol_at` explicitly *not* described as goto-definition.
 
+## Resolved Questions
+
+**OQ-C1 — RESOLVED by Decision 9.** *What is the default node cap for `find_path`?* Filed before Decision 9 existed and left stale: Decision 9 fixes the default at 100 000 and the ceiling at 5 000 000, alongside the other two knobs. The number remains tunable from the AC-43 measurement without touching an interface, but it is no longer unsettled.
+
+**OQ-C2 — RESOLVED, not deferred.** *How is a community's label derived?* Originally filed as cosmetic, which was wrong: `label` is part of the output, so AC-18's byte-identical requirement covers it, and an unspecified tie-break is a determinism hole rather than a styling question. Pinned now: the label is the longest directory prefix shared by the greatest number of members; **on a count tie, the lexicographically smallest prefix wins**; a community whose members share no prefix is labelled with the lexicographically smallest member path. Whether to additionally enrich the label with a central member's name remains genuinely cosmetic and is out of scope.
+
 ## Open Questions
 
-- **OQ-C1 — RESOLVED by Decision 9.** *What is the default node cap for `find_path`?* Filed before Decision 9 existed and left stale: Decision 9 fixes the default at 100 000 and the ceiling at 5 000 000, alongside the other two knobs. The number remains tunable from the AC-43 measurement without touching an interface, but it is no longer unsettled.
-- **OQ-C2 — RESOLVED, not deferred.** *How is a community's label derived?* Originally filed as cosmetic, which was wrong: `label` is part of the output, so AC-18's byte-identical requirement covers it, and an unspecified tie-break is a determinism hole rather than a styling question. Pinned now: the label is the longest directory prefix shared by the greatest number of members; **on a count tie, the lexicographically smallest prefix wins**; a community whose members share no prefix is labelled with the lexicographically smallest member path. Whether to additionally enrich the label with a central member's name remains genuinely cosmetic and is out of scope.
-- **OQ-C3 (non-blocking): Whether `get_symbol_at` should accept a column.** `Symbol` carries `column` but no end column, so a column could filter the start position only and would not sharpen enclosure. Omitted for now; adding an optional argument later is additive and changes no existing behaviour.
+- Whether `get_symbol_at` should accept a column argument (OQ-C3) — **non-blocking** — `Symbol` carries no end column, so a column could filter the start position only and would not sharpen enclosure; adding an optional argument later is additive and changes no existing behaviour.

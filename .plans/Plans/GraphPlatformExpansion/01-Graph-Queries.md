@@ -3,14 +3,14 @@ title: "Graph Queries"
 type: phase
 plan: GraphPlatformExpansion
 phase: 1
-status: planned
+status: in-progress
 created: 2026-08-08
 updated: 2026-08-08
 deliverable: "Three new MCP tools — get_symbol_at, find_path, detect_communities — answering position, reachability, and module-structure questions the current surface cannot answer."
 tasks:
   - id: "1.1"
     title: "Position lookup: symbols_at_line and get_symbol_at"
-    status: planned
+    status: complete
     justifies: "FR-21, AC-13, AC-14, AC-15. Every entry point into the graph is name-addressed, but an agent reading a diff hunk, a stack trace, or a compiler error holds file:line — without this the graph is unreachable from the information the agent actually has."
     verification: "cargo test -p code-graph-graph symbols_at_line and cargo test -p code-graph-tools get_symbol_at — a line inside a method nested in a class returns the method before the class (AC-13); a line in no span returns an empty Page, not an error and not a nearest guess (AC-14); an existing pre-change cache file loads unchanged, proving no CACHE_VERSION bump (AC-15); two symbols sharing a span return in a stable order across 20 repeated calls."
   - id: "1.2"
@@ -41,12 +41,12 @@ Three self-contained read-only queries added to `code-graph-graph`, with thin ha
 ## 1.1: Position lookup: symbols_at_line and get_symbol_at
 
 ### Subtasks
-- [ ] Add `Graph::symbols_at_line(&self, path: &Path, line: u32) -> Vec<Symbol>` in `crates/code-graph-graph/src/queries.rs`, filtering the file's symbols on `line <= L <= end_line`
-- [ ] Sort candidates by `(span_lines asc, line desc, symbol_id asc)` so the order is total, not merely mostly-determined
-- [ ] Guard malformed spans (`end_line < line`) as zero-width rather than dropping or panicking
-- [ ] Add `EnclosingSymbol` and the `get_symbol_at` handler returning `Page<EnclosingSymbol>`
-- [ ] Reject `line = 0` as a tool error; return an empty page for a line enclosed by nothing
-- [ ] Unit tests for nesting, empty result, malformed span, and repeated-call stability
+- [x] Add `Graph::symbols_at_line(&self, path: &Path, line: u32) -> Vec<Symbol>` in `crates/code-graph-graph/src/queries.rs`, filtering the file's symbols on `line <= L <= end_line`
+- [x] Sort candidates by `(span_lines asc, line desc, symbol_id asc)` so the order is total, not merely mostly-determined
+- [x] Guard malformed spans (`end_line < line`) as zero-width rather than dropping or panicking
+- [x] Add `EnclosingSymbol` and the `get_symbol_at` handler returning `Page<EnclosingSymbol>`
+- [x] Reject `line = 0` as a tool error; return an empty page for a line enclosed by nothing
+- [x] Unit tests for nesting, empty result, malformed span, and repeated-call stability
 
 ### Notes
 Revision boundary: `get_symbol_at` answers position queries end to end — graph function, handler, and tests — with no tool registered yet. The tool registration lands in 1.4 so the tool-list snapshot moves exactly once for all three queries.
@@ -57,7 +57,25 @@ The candidate set is one file's symbols via the `files` PathTrie, so a linear sc
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-08
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `50450d5065bcf4254cbca4624d196fdb9389189f`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-08T14:05, matching `50450d5065bcf4254cbca4624d196fdb9389189f`
+- Focused review: `git show 50450d5065bcf4254cbca4624d196fdb9389189f`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `50450d5065bcf4254cbca4624d196fdb9389189f`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-graph` | `.` | PASS (`exit 0`) | 142 passed, incl. nesting order, empty result, malformed span, 20-run stability |
+| `cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | all suites pass; new get_symbol_at cases for line 0, unknown file, empty page |
+| `make verify` | `.` | PASS (`exit 0`) | clippy -D warnings, rustfmt, full workspace tests, no pending snapshots, plugin mirrors in sync |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Diff read of `symbols_at_line` | `crates/code-graph-graph/src/queries.rs` | PASS | sort is `(span asc, line desc, symbol_id asc)`; malformed span clamped via `end_line.max(line)`; saturating span arithmetic |
+| `git show --stat` | `.` | PASS | touches only queries.rs, handlers/mod.rs, handlers/symbols.rs — `server.rs` untouched, so no snapshot movement |
 
 ### Trap
 You will want to describe this as goto-definition, or to make it resolve the identifier *at* the position. Don't. It answers "what encloses this line" by span containment; resolving an identifier to its binding needs scope resolution, which the spec rules out as a Non-Goal. The tool description in 1.4 must say so explicitly.

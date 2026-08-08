@@ -144,11 +144,11 @@ fn fingerprint_symbol(&self, content: &[u8], symbol: &Symbol, mode: FingerprintM
 
 **Rationale:** The trait's asynchrony is about the *caller* not being blocked, not about the library being async. Both realistic providers block: git on local IO, Perforce on the network. Wrapping in a blocking-task pool satisfies NFR-10 (a slow provider delays only history tools) and is the same mechanism both need, so the abstraction is honest rather than aspirational. `async_trait` is required for `Box<dyn VcsProvider>` dispatch — native async-fn-in-trait is not object-safe — and is a new, small dependency confined to the vcs crates.
 
-### Decision 3: Revision identity is an opaque newtype (D-0002)
+### Decision 3: Revision identity is an opaque newtype (FR-28, D-0002)
 
 **Context:** Git identifies revisions by 40-hex SHA; Perforce by changelist number and `#rev`.
 
-**Decision:** `RevId(String)`, constructed only by a provider, never parsed or validated by callers.
+**Decision:** `RevId(String)`, constructed only by a provider, never parsed or validated by callers (D-0002).
 
 **Rationale:** D-0002 is `reversibility: one-way` precisely because the cost lands the moment a hash-shaped identifier reaches a persisted field or the MCP wire — after that, relaxing it is a breaking change. A newtype rather than a bare `String` means a compile error, not a code review, catches a caller that starts treating it as a SHA. Neither handler ever inspects the contents; they pass it through and render it.
 
@@ -172,13 +172,13 @@ If that accessor proves not to be cheaply reachable, the fallback is to drop the
 
 **Options considered:** (1) Text-based fingerprint over the symbol's line span, in the vcs layer. (2) Extend `LanguagePlugin` with a fingerprint hook, defaulting to text-based, overridable per language with an AST implementation. (3) Extend `parse_file` to return the tree.
 
-**Decision:** Option 2.
+**Decision:** Option 2. Historical bytes are parsed through the existing plugins with no filesystem round-trip (FR-35).
 
 **Rationale:** Option 3 changes the signature every language plugin implements and leaks tree-sitter lifetimes across the crate boundary — a large, invasive change for one feature. Option 1 cannot satisfy FR-34's literal-insensitive mode, which needs to distinguish a literal token from surrounding code, i.e. lexing at minimum. Option 2 matches how the trait already handles optional per-language behaviour — `preprocess`, `synthesize_symbols`, `resolve_call`, and `post_index` are all default-provided hooks that plugins override — so it adds no new pattern, and the fingerprint logic lives where the grammar already is.
 
 The default implementation supports `Normalized` only. `LiteralInsensitive` returns `None` until a plugin implements it, and the handler reports the mode as unsupported for that language rather than silently falling back to `Normalized` — a silent fallback would make "the logic didn't change" mean two different things depending on language, which is worse than an explicit gap.
 
-**Per OQ-D1, that gap is a sequencing step, not the end state.** Both modes are committed for all six languages: the text default gets `Normalized` working everywhere on day one, and step 6 of the rollout adds an AST-backed override per language plugin to enable `LiteralInsensitive`. FR-34 is met in full when step 6 completes, and the `None`-plus-report behaviour is what keeps the intermediate state honest rather than misleading.
+**Per OQ-D1 and D-0006, that gap is a sequencing step, not the end state.** Both modes are committed for all six languages: the text default gets `Normalized` working everywhere on day one, and step 6 of the rollout adds an AST-backed override per language plugin to enable `LiteralInsensitive`. FR-34 is met in full when step 6 completes, and the `None`-plus-report behaviour is what keeps the intermediate state honest rather than misleading.
 
 **The default implementation must hash with `std` only.** It lives in `code-graph-lang`, one of the four crates NFR-02 forbids adding dependencies to, so the text-based default uses `std::collections::hash_map::DefaultHasher` and nothing else. The spec's Dependencies section anticipates "a hash function for symbol fingerprinting" as a new dependency — that dependency is permitted only in `code-graph-vcs`/`code-graph-vcs-git`, never in the default impl. Reaching for `blake3`, `xxhash`, or `ahash` here would violate NFR-02 the moment it lands, and it would do so invisibly, since nothing about the code would look wrong. Fingerprints are compared for equality within one process against one cache, never published or persisted across versions, so `DefaultHasher`'s unstable-across-releases property is acceptable — but the fingerprint cache (Decision 8) must therefore key on the binary identity too, or be treated as invalid across upgrades.
 
@@ -196,7 +196,7 @@ Neither mode touches identifiers or case — see the terminology note in Open Qu
 
 The window is bounded by the `limit` on `revisions_touching`, so results are "changes within the last N revisions touching this file". The oldest entry in a bounded window cannot be distinguished from an introduction, and the response says which it is rather than mislabelling it.
 
-### Decision 7: A blocking, pure-Rust git provider (D-0004)
+### Decision 7: A blocking, pure-Rust git provider (FR-47, D-0004)
 
 **Context:** D-0004 requires a pure-Rust backend and no further native library.
 
@@ -270,15 +270,19 @@ Purely additive: two new crates, one new optional trait method with a default im
 
 Steps 1–5 deliver FR-32/FR-33 with `Normalized` everywhere; step 6 closes FR-34 language by language. Until a given language's override lands, requesting `LiteralInsensitive` for it reports the mode as unsupported rather than degrading silently. Documentation lands with the code: the two tools in CLAUDE.md's table (taking the count to 24 with Track C), the per-language fingerprint-support matrix, and the line-granularity and rename-tracking limitations under Known cross-cutting limitations.
 
-## Open Questions
+## Resolved Questions
 
-- **OQ-D1 — RESOLVED: both modes are committed deliverables for all six languages.** `Normalized` ships first and is sufficient to start; `LiteralInsensitive` is **not** left as an optional per-language override. Step 6 of the rollout is therefore required rather than opportunistic: six AST-backed `fingerprint_symbol` implementations, one per language plugin, each enabling the literal-insensitive mode. FR-34 stands as written and needs no amendment.
+**OQ-D1 — RESOLVED: both modes are committed deliverables for all six languages.** `Normalized` ships first and is sufficient to start; `LiteralInsensitive` is **not** left as an optional per-language override. Step 6 of the rollout is therefore required rather than opportunistic: six AST-backed `fingerprint_symbol` implementations, one per language plugin, each enabling the literal-insensitive mode. FR-34 stands as written and needs no amendment.
 
   **Terminology note, recorded because the names invited a misreading.** Neither mode has anything to do with case sensitivity or identifier matching. `Normalized` hashes the symbol's source span with comments stripped and whitespace runs collapsed — identifiers, keywords, and literals all contribute verbatim, and nothing is case-folded. `LiteralInsensitive` additionally excludes the *values* of string and numeric literals, so a changed message or constant does not read as a logic change. "Insensitive" qualifies *literals*, not case. Because these fingerprints are computed within one already-identified symbol's span and are never used to match symbols to each other, they cannot affect symbol resolution. Consider renaming the variants during implementation — `IgnoreFormatting` and `IgnoreLiterals` say what they do and would not have prompted this — but the wire spelling should be settled before the tool description ships, since agents pattern-match on it (NFR-11).
-- **OQ-D5 — RESOLVED: exact, case-sensitive `(name, kind)` matching.** Decision 6 locates the symbol at each revision by `(name, kind)`, and that lookup is the design's only identifier-matching surface — distinct from the fingerprint modes, which never match symbols to each other. Exact matching is the decision. Consequence, which the tool description must state rather than leave to be discovered: **any rename, including a case-only rename (`fooBar` → `FooBar`), reports as `Removed` followed by `Introduced`, not `Modified`.**
+
+**OQ-D5 — RESOLVED: exact, case-sensitive `(name, kind)` matching.** Decision 6 locates the symbol at each revision by `(name, kind)`, and that lookup is the design's only identifier-matching surface — distinct from the fingerprint modes, which never match symbols to each other. Exact matching is the decision (D-0005). Consequence, which the tool description must state rather than leave to be discovered: **any rename, including a case-only rename (`fooBar` → `FooBar`), reports as `Removed` followed by `Introduced`, not `Modified`.**
 
   Case-insensitive matching was rejected as actively wrong: `Foo` and `foo` can legitimately coexist as distinct symbols in five of the six supported languages, so folding case would silently interleave two symbols' histories — a worse failure than an honest delete-plus-add, because it produces a plausible answer instead of an obviously incomplete one. Similarity-based rename detection was rejected as materially more work and squarely inside the "no rename tracking" Non-Goal. Exact matching is also defensible on its merits: a renamed function is a different symbol to every caller.
 
-- **OQ-D2 (non-blocking): Default revision-window size for `symbol_history`.** The mechanism, the bound, and the partial-result flag are fixed; only the default is unsettled and is tunable without touching an interface.
-- **OQ-D3 — RESOLVED: the cache is designed and lands in this track.** Filed as a deferral, which was a coverage failure: AC-46 is in scope and testable, so it needed a design rather than a measurement. See Decision 8.
-- **OQ-D4 (non-blocking): Which timeout for a slow provider?** NFR-10 requires isolation, which the blocking-pool dispatch already provides; the specific duration is a tuning value.
+**OQ-D3 — RESOLVED: the cache is designed and lands in this track.** Filed as a deferral, which was a coverage failure: AC-46 is in scope and testable, so it needed a design rather than a measurement. See Decision 8.
+
+## Open Questions
+
+- The default revision-window size for `symbol_history` (OQ-D2) — **non-blocking** — the mechanism, the bound, and the partial-result flag are fixed; only the default is unsettled and it is tunable without touching an interface.
+- The timeout applied to a slow VCS provider (OQ-D4) — **non-blocking** — NFR-10's isolation comes from blocking-pool dispatch, which holds at any duration; the specific value is tuning.
