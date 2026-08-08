@@ -1,4 +1,4 @@
-//! MCP server that exposes the code graph as 19 rmcp tools over stdio.
+//! MCP server that exposes the code graph as 22 rmcp tools over stdio.
 //!
 //! Phase 3.1 shipped the scaffold: [`CodeGraphServer`] with all tools
 //! wired through `#[tool_router]` plus the `ServerInner` state struct.
@@ -117,7 +117,7 @@ pub struct ServerInner {
     pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
-/// MCP server exposing the code graph through 19 tools.
+/// MCP server exposing the code graph through 22 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -435,6 +435,47 @@ pub struct GetSymbolSummaryArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetSymbolAtArgs {
+    #[schemars(description = "Absolute path to the source file")]
+    pub file: String,
+    #[schemars(
+        description = "1-based source line. 0 is rejected as a tool error (likely off-by-one)."
+    )]
+    pub line: u32,
+    #[schemars(description = "Maximum enclosing symbols to return (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N matches for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindPathArgs {
+    #[schemars(description = "Source symbol ID in format file:name or file:Parent::name")]
+    pub from: String,
+    #[schemars(description = "Target symbol ID in format file:name or file:Parent::name")]
+    pub to: String,
+    #[schemars(
+        description = "Maximum nodes to examine before giving up (default 100000, max \
+                       5000000). Lower to bound search cost on huge graphs; a search that \
+                       hits the cap returns `found: false` with `cap_reached: true`, \
+                       distinct from a genuine no-path result (`cap_reached: false`)."
+    )]
+    #[serde(default)]
+    pub node_cap: Option<u32>,
+    #[schemars(
+        description = "Minimum resolver confidence required for an edge to be traversable. \
+                       \"any\" (default) allows every resolved edge; \"resolved\" restricts \
+                       the search to edges the resolver was unambiguous about, dropping \
+                       Heuristic edges (picked from ≥ 2 same-name candidates via the scope \
+                       rule)."
+    )]
+    #[serde(default)]
+    pub min_confidence: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCallersArgs {
     #[schemars(description = "Symbol ID in format file:name")]
     pub symbol: String,
@@ -640,6 +681,42 @@ pub struct GetCouplingArgs {
     #[schemars(description = "Maximum results to return per side (default 50, max 1000)")]
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DetectCommunitiesArgs {
+    #[schemars(
+        description = "Aggregation granularity for community detection. Only \"file\" is \
+                       currently supported and is the default (absent/empty also resolves \
+                       to \"file\"); any other non-empty value is a tool error."
+    )]
+    #[serde(default)]
+    pub granularity: Option<String>,
+    #[schemars(
+        description = "Maximum label-propagation sweeps before giving up (default 50, max \
+                       500; 0 resolves to the default). The response's `termination` field \
+                       reports whether propagation converged before this ceiling or was cut \
+                       off by it."
+    )]
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[schemars(
+        description = "Maximum member file paths kept per community (default 10, max 100; \
+                       0 resolves to the default). Independent of `limit`/`offset`, which \
+                       page over the LIST of communities — this caps the member list INSIDE \
+                       each community. A community whose members are cut by this cap sets \
+                       that community's own `truncated: true` and `original_len` to the \
+                       pre-truncation member count; raise `members_per_community` to see \
+                       fuller member lists, not `limit`."
+    )]
+    #[serde(default)]
+    pub members_per_community: Option<u32>,
+    #[schemars(description = "Maximum communities to return (default 100, max 1000)")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip first N communities for pagination (default 0)")]
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -983,6 +1060,65 @@ impl CodeGraphServer {
     }
 
     #[tool(
+        description = "Find the symbol(s) whose source span encloses a given file+line — \
+                       e.g. 'what function/method is at file X, line N'. NOT goto-definition: \
+                       it does not resolve the identifier written at that position to its \
+                       binding (scope resolution is out of scope for this tool); it answers \
+                       'what encloses this line' purely by span containment (line is between \
+                       a symbol's `line` and `end_line`). Enclosure is LINE-granular, not \
+                       column-granular — symbols carry no end column, so if two symbols share \
+                       the same starting line (e.g. a one-line method and its enclosing \
+                       one-line class), both match. Returns the `Page<EnclosingSymbol>` \
+                       envelope {results, total, offset, limit, truncated, next_offset}, \
+                       where each row is {symbol_id, name, kind, line, end_line, span_lines, \
+                       parent, namespace}. Results are ordered innermost-first (smallest \
+                       `span_lines` ascending, then `line` descending, then `symbol_id` \
+                       ascending) — a method nested in a class returns the method before the \
+                       class. `file` is an absolute path resolved against the indexed graph \
+                       (`\\\\?\\` extended-path prefix handled automatically, relative `.`/`..` \
+                       segments resolved against the on-disk file when it exists); an unknown \
+                       file is a tool error naming the path. `line` is 1-based and REQUIRED; \
+                       `line = 0` is a tool error (very likely an off-by-one bug, not silently \
+                       clamped). A line enclosed by no symbol returns SUCCESS with an empty \
+                       `Page` (results: [], total: 0) — never an error and never a \
+                       nearest-symbol guess. `limit` defaults to 100 (max 1000, clamped \
+                       silently — the echoed `limit` reflects the resolved value); raise \
+                       `limit` for deeply-nested spans, or use `offset` to page through. \
+                       Responses are also capped by `[response].max_bytes` (default 100KB); \
+                       when the byte budget bites, `truncated` is true and `next_offset` \
+                       points at the first un-emitted record — re-call with `offset = \
+                       next_offset` to resume. `truncated=false` plus `next_offset=null` \
+                       means the page is complete."
+    )]
+    async fn get_symbol_at(
+        &self,
+        Parameters(args): Parameters<GetSymbolAtArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let max_bytes = self.inner.config.read().response.max_bytes;
+        // `paths::normalize_user_path` inside the handler may block on a
+        // filesystem stat (see `get_file_symbols` comment).
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::symbols::get_symbol_at(
+                &inner.graph,
+                &args.file,
+                args.line,
+                args.limit,
+                args.offset,
+                max_bytes,
+            )
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("get_symbol_at task panicked: {e}")),
+        })
+    }
+
+    #[tool(
         description = "Find functions that call the given symbol (upstream call chain). \
                        `symbol` is a Symbol ID in the `file:name` or `file:Parent::name` \
                        format returned by get_file_symbols/search_symbols. Returns the \
@@ -1131,6 +1267,56 @@ impl CodeGraphServer {
             args.limit,
             args.offset,
             max_bytes,
+            args.min_confidence.as_deref(),
+        ))
+    }
+
+    #[tool(
+        description = "Find the shortest call-path from one symbol to another — a chain of \
+                       `Calls` edges answering 'how does A reach B', without walking \
+                       `get_callers`/`get_callees` by hand. Returns a SINGLE JSON OBJECT \
+                       {found, hops, hop_count, heuristic_hops, nodes_examined, node_cap, \
+                       cap_reached} — NOT a `Page` envelope, since this is one shortest-path \
+                       answer, not a list. `hops` is an array of `{symbol_id, file, line, \
+                       entered_by}`: `hops[0]` is `from` (its `entered_by` is null, since no \
+                       edge reached it), `hops[last]` is `to`, and every adjacent pair is a \
+                       real `Calls` edge; `hop_count = hops.length - 1` (the edge count, not \
+                       the node count). IMPORTANT CAVEAT: call resolution is a syntactic \
+                       heuristic (same file > same parent > same namespace > global, per \
+                       CLAUDE.md), so a returned path is EVIDENCE that a call chain likely \
+                       exists, not a proof — treat `heuristic_hops` (the count of edges on \
+                       the path whose resolver confidence was Heuristic rather than Resolved) \
+                       as a trust signal; a path with `heuristic_hops: 0` is fully resolved. \
+                       Among equal-hop-count paths the search prefers the one with fewer \
+                       Heuristic edges. `found: false` is SUCCESS, not an error — it covers \
+                       two distinct cases distinguished ONLY by `cap_reached`: `cap_reached: \
+                       false` means no path exists in the graph at all; `cap_reached: true` \
+                       means the search gave up after examining `node_cap` nodes without \
+                       finding one — raise `node_cap` to search further, don't treat it as \
+                       'no path'. `from == to` is success with `hop_count: 0` and a \
+                       single-element `hops`, not an error. Args: `from`/`to` (required \
+                       Symbol IDs in `file:name`/`file:Parent::name` form; either being \
+                       unknown is a tool error with did-you-mean suggestions). `node_cap` \
+                       defaults to 100000 (max 5000000, clamped silently — 0 resolves to the \
+                       default; the echoed `node_cap` reflects the resolved value); lower it \
+                       to bound search cost, raise it if `cap_reached` fires before finding a \
+                       path. `min_confidence` — \"any\" (default) traverses every resolved \
+                       edge; \"resolved\" restricts the search to edges the resolver was \
+                       unambiguous about, dropping Heuristic edges entirely from the search \
+                       space (not merely from the result)."
+    )]
+    async fn find_path(
+        &self,
+        Parameters(args): Parameters<FindPathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::query::find_path(
+            &self.inner.graph,
+            &args.from,
+            &args.to,
+            args.node_cap,
             args.min_confidence.as_deref(),
         ))
     }
@@ -1442,6 +1628,77 @@ impl CodeGraphServer {
     }
 
     #[tool(
+        description = "Detect the codebase's de-facto module structure via label \
+                       propagation over the file-level call+include graph — answers 'what \
+                       are the clusters here' for an unfamiliar codebase, which pairwise \
+                       `get_coupling` alone cannot. Returns the flattened envelope \
+                       {results, total, offset, limit, truncated, next_offset, granularity, \
+                       termination, iterations, node_count, edge_count, degenerate} — the \
+                       `Page<Community>` fields are flattened onto the top level (same \
+                       precedent as `search_symbols`), where each `results[i]` is a \
+                       `Community` {label, size, members, truncated, original_len?}: `label` \
+                       is a derived directory-prefix name, `size` is the community's true \
+                       total member-file count, and `members` is the (possibly capped) file \
+                       list. TWO INDEPENDENT CAPS, do not conflate them: `limit`/`offset` \
+                       page over the LIST of communities against the byte budget (standard \
+                       envelope pagination, like any other `Page<T>` tool); \
+                       `members_per_community` separately caps the member file list WITHIN \
+                       each community. A community whose member list was cut by \
+                       `members_per_community` carries `truncated: true` and `original_len` \
+                       = its true pre-cap member count on THAT community — this mirrors \
+                       `Cycle.truncated`/`Cycle.original_len` exactly, and as with `Cycle`, \
+                       neither the per-community `truncated` nor the envelope's `truncated` \
+                       implies the other. `results` are sorted by descending `size`. \
+                       `granularity` (default \"file\", the only supported value today; any \
+                       other non-empty value is a tool error) is echoed back. `termination` \
+                       is `\"converged\"` (propagation reached a stable partition) or \
+                       `\"iteration_ceiling\"` (cut off at `iterations` sweeps without \
+                       converging — no tuning is required to get a result either way). \
+                       `node_count`/`edge_count` describe the aggregated file graph itself \
+                       (unaffected by `limit`/`offset` pagination). `degenerate` is `null` \
+                       for an ordinary partition; when the partition is degenerate it is \
+                       FLAGGED rather than silently returned as an ordinary result — \
+                       `{kind: \"giant\", share_permille}` when one community holds >= 90% \
+                       of nodes (`node_count >= 10`), or `{kind: \"atomized\"}` when every \
+                       node is its own singleton community — either signal means the \
+                       result is likely not a useful module breakdown as-is. \
+                       `max_iterations` defaults to 50 (max 500, 0 resolves to the default). \
+                       `members_per_community` defaults to 10 (max 100, 0 resolves to the \
+                       default); raise it for fuller member lists per community, not \
+                       `limit`. `limit` defaults to 100 (max 1000, clamped silently); raise \
+                       `limit` for more communities per page, use `offset` to page through \
+                       the rest. Responses are capped by `[response].max_bytes` (default \
+                       100KB); `truncated`/`next_offset` resume contract identical to the \
+                       other paginated tools."
+    )]
+    async fn detect_communities(
+        &self,
+        Parameters(args): Parameters<DetectCommunitiesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let max_bytes = self.inner.config.read().response.max_bytes;
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::structure::detect_communities(
+                &inner.graph,
+                args.granularity.as_deref(),
+                args.max_iterations,
+                args.members_per_community,
+                args.limit,
+                args.offset,
+                max_bytes,
+            )
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("detect_communities task panicked: {e}")),
+        })
+    }
+
+    #[tool(
         description = "Generate a graph diagram: call graph (`symbol=`), file dependencies \
                        (`file=`), or inheritance tree (`class=`). Provide EXACTLY ONE of \
                        `symbol`/`file`/`class` (empty strings count as absent); zero or more \
@@ -1602,16 +1859,16 @@ mod tests {
         CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    /// `tools/list` must surface exactly 19 tools. If a future change adds
+    /// `tools/list` must surface exactly 22 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_nineteen_tools() {
+    fn tool_router_registers_twenty_two_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            19,
-            "expected 19 registered tools, got {}",
+            22,
+            "expected 22 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -1648,6 +1905,9 @@ mod tests {
             "get_status",
             "find_overrides",
             "find_class_candidates",
+            "get_symbol_at",
+            "find_path",
+            "detect_communities",
         ] {
             assert!(
                 names.contains(expected),

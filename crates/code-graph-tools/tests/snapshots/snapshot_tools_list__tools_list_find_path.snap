@@ -1,0 +1,45 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"find_path\")"
+---
+{
+  "name": "find_path",
+  "description": "Find the shortest call-path from one symbol to another — a chain of `Calls` edges answering 'how does A reach B', without walking `get_callers`/`get_callees` by hand. Returns a SINGLE JSON OBJECT {found, hops, hop_count, heuristic_hops, nodes_examined, node_cap, cap_reached} — NOT a `Page` envelope, since this is one shortest-path answer, not a list. `hops` is an array of `{symbol_id, file, line, entered_by}`: `hops[0]` is `from` (its `entered_by` is null, since no edge reached it), `hops[last]` is `to`, and every adjacent pair is a real `Calls` edge; `hop_count = hops.length - 1` (the edge count, not the node count). IMPORTANT CAVEAT: call resolution is a syntactic heuristic (same file > same parent > same namespace > global, per CLAUDE.md), so a returned path is EVIDENCE that a call chain likely exists, not a proof — treat `heuristic_hops` (the count of edges on the path whose resolver confidence was Heuristic rather than Resolved) as a trust signal; a path with `heuristic_hops: 0` is fully resolved. Among equal-hop-count paths the search prefers the one with fewer Heuristic edges. `found: false` is SUCCESS, not an error — it covers two distinct cases distinguished ONLY by `cap_reached`: `cap_reached: false` means no path exists in the graph at all; `cap_reached: true` means the search gave up after examining `node_cap` nodes without finding one — raise `node_cap` to search further, don't treat it as 'no path'. `from == to` is success with `hop_count: 0` and a single-element `hops`, not an error. Args: `from`/`to` (required Symbol IDs in `file:name`/`file:Parent::name` form; either being unknown is a tool error with did-you-mean suggestions). `node_cap` defaults to 100000 (max 5000000, clamped silently — 0 resolves to the default; the echoed `node_cap` reflects the resolved value); lower it to bound search cost, raise it if `cap_reached` fires before finding a path. `min_confidence` — \"any\" (default) traverses every resolved edge; \"resolved\" restricts the search to edges the resolver was unambiguous about, dropping Heuristic edges entirely from the search space (not merely from the result).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "from": {
+        "description": "Source symbol ID in format file:name or file:Parent::name",
+        "type": "string"
+      },
+      "min_confidence": {
+        "default": null,
+        "description": "Minimum resolver confidence required for an edge to be traversable. \"any\" (default) allows every resolved edge; \"resolved\" restricts the search to edges the resolver was unambiguous about, dropping Heuristic edges (picked from ≥ 2 same-name candidates via the scope rule).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "node_cap": {
+        "default": null,
+        "description": "Maximum nodes to examine before giving up (default 100000, max 5000000). Lower to bound search cost on huge graphs; a search that hits the cap returns `found: false` with `cap_reached: true`, distinct from a genuine no-path result (`cap_reached: false`).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "to": {
+        "description": "Target symbol ID in format file:name or file:Parent::name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "from",
+      "to"
+    ],
+    "title": "FindPathArgs",
+    "type": "object"
+  }
+}

@@ -1,0 +1,63 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"detect_communities\")"
+---
+{
+  "name": "detect_communities",
+  "description": "Detect the codebase's de-facto module structure via label propagation over the file-level call+include graph — answers 'what are the clusters here' for an unfamiliar codebase, which pairwise `get_coupling` alone cannot. Returns the flattened envelope {results, total, offset, limit, truncated, next_offset, granularity, termination, iterations, node_count, edge_count, degenerate} — the `Page<Community>` fields are flattened onto the top level (same precedent as `search_symbols`), where each `results[i]` is a `Community` {label, size, members, truncated, original_len?}: `label` is a derived directory-prefix name, `size` is the community's true total member-file count, and `members` is the (possibly capped) file list. TWO INDEPENDENT CAPS, do not conflate them: `limit`/`offset` page over the LIST of communities against the byte budget (standard envelope pagination, like any other `Page<T>` tool); `members_per_community` separately caps the member file list WITHIN each community. A community whose member list was cut by `members_per_community` carries `truncated: true` and `original_len` = its true pre-cap member count on THAT community — this mirrors `Cycle.truncated`/`Cycle.original_len` exactly, and as with `Cycle`, neither the per-community `truncated` nor the envelope's `truncated` implies the other. `results` are sorted by descending `size`. `granularity` (default \"file\", the only supported value today; any other non-empty value is a tool error) is echoed back. `termination` is `\"converged\"` (propagation reached a stable partition) or `\"iteration_ceiling\"` (cut off at `iterations` sweeps without converging — no tuning is required to get a result either way). `node_count`/`edge_count` describe the aggregated file graph itself (unaffected by `limit`/`offset` pagination). `degenerate` is `null` for an ordinary partition; when the partition is degenerate it is FLAGGED rather than silently returned as an ordinary result — `{kind: \"giant\", share_permille}` when one community holds >= 90% of nodes (`node_count >= 10`), or `{kind: \"atomized\"}` when every node is its own singleton community — either signal means the result is likely not a useful module breakdown as-is. `max_iterations` defaults to 50 (max 500, 0 resolves to the default). `members_per_community` defaults to 10 (max 100, 0 resolves to the default); raise it for fuller member lists per community, not `limit`. `limit` defaults to 100 (max 1000, clamped silently); raise `limit` for more communities per page, use `offset` to page through the rest. Responses are capped by `[response].max_bytes` (default 100KB); `truncated`/`next_offset` resume contract identical to the other paginated tools.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "granularity": {
+        "default": null,
+        "description": "Aggregation granularity for community detection. Only \"file\" is currently supported and is the default (absent/empty also resolves to \"file\"); any other non-empty value is a tool error.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": null,
+        "description": "Maximum communities to return (default 100, max 1000)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "max_iterations": {
+        "default": null,
+        "description": "Maximum label-propagation sweeps before giving up (default 50, max 500; 0 resolves to the default). The response's `termination` field reports whether propagation converged before this ceiling or was cut off by it.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "members_per_community": {
+        "default": null,
+        "description": "Maximum member file paths kept per community (default 10, max 100; 0 resolves to the default). Independent of `limit`/`offset`, which page over the LIST of communities — this caps the member list INSIDE each community. A community whose members are cut by this cap sets that community's own `truncated: true` and `original_len` to the pre-truncation member count; raise `members_per_community` to see fuller member lists, not `limit`.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "default": null,
+        "description": "Skip first N communities for pagination (default 0)",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "title": "DetectCommunitiesArgs",
+    "type": "object"
+  }
+}
