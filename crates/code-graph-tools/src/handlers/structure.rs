@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use super::{
     byte_budget_take, kind_str, parse_kind, suggest_symbols, symbol_to_result, tool_error,
-    tool_success_json, CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
+    tool_success_json, Community, CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
 };
 
 // ----- detect_cycles -----
@@ -1059,6 +1059,134 @@ pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) 
         }
         _ => unreachable!("format validation rejects everything else above"),
     }
+}
+
+// ----- detect_communities -----
+
+/// `detect_communities` body (`Designs/GraphQueries` Decision 4/9). Runs
+/// [`Graph::file_communities`] and reshapes the result into a flattened
+/// [`Page<Community>`] envelope plus community-detection metadata
+/// (`granularity`, `termination`, `iterations`, `node_count`,
+/// `edge_count`, `degenerate`).
+///
+/// **`granularity`** — default (`None` or `""`) resolves to `"file"`, the
+/// only supported value today (Decision 4). Any other non-empty value is
+/// a tool error listing the accepted value, so the parameter is
+/// forward-compatible with a future symbol-granularity mode without a
+/// silent no-op.
+///
+/// **Three independent numeric knobs, each clamped and echoed
+/// (Decision 9):**
+/// - `max_iterations`: default 50, `0` resolves to the default, ceiling 500.
+/// - `members_per_community`: default 10, `0` resolves to the default,
+///   ceiling 100. Caps each community's `members` list IN PLACE —
+///   independent of `limit`/`offset` page-level pagination, mirroring
+///   [`Cycle`]'s per-cycle `max_cycle_size` axis exactly (see
+///   [`Community`]).
+/// - `limit`/`offset`: standard envelope pagination, default 100, ceiling
+///   1000 (same convention as every other `Page<T>` tool). Unlike
+///   `detect_cycles`, this envelope IS byte-budgeted via
+///   [`byte_budget_take`] — the member cap is applied to every community
+///   BEFORE byte-budget pagination runs, so the byte count the budget
+///   sees matches the payload actually emitted (the two caps stay
+///   independent in effect, not just in the wire shape).
+///
+/// `total` is the pre-pagination community count; `node_count`/
+/// `edge_count` describe the aggregated file graph itself (not a
+/// per-page quantity), so they are NOT affected by pagination.
+pub fn detect_communities(
+    graph: &RwLock<Graph>,
+    granularity: Option<&str>,
+    max_iterations: Option<u32>,
+    members_per_community: Option<u32>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    max_bytes: usize,
+) -> CallToolResult {
+    let resolved_granularity = match granularity.filter(|s| !s.is_empty()) {
+        None | Some("file") => "file",
+        Some(other) => {
+            return tool_error(format!("invalid granularity: {other:?}; expected \"file\""))
+        }
+    };
+
+    let resolved_max_iterations = max_iterations.filter(|&n| n != 0).unwrap_or(50).min(500);
+    let resolved_members_cap = members_per_community
+        .filter(|&n| n != 0)
+        .unwrap_or(10)
+        .min(100);
+    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
+    let resolved_offset = offset.unwrap_or(0);
+
+    let result = graph.read().file_communities(resolved_max_iterations);
+
+    let total = result.communities.len() as u32;
+
+    // Member cap applied to every community up front (not just the page
+    // slice) so the byte count `byte_budget_take` measures below matches
+    // what's actually emitted — see fn-level doc comment.
+    let communities: Vec<Community> = result
+        .communities
+        .iter()
+        .map(|c| {
+            let original_len = c.members.len() as u32;
+            let mut members: Vec<String> = c
+                .members
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let truncated = original_len > resolved_members_cap;
+            if truncated {
+                members.truncate(resolved_members_cap as usize);
+            }
+            Community {
+                label: c.label.clone(),
+                size: original_len,
+                members,
+                truncated,
+                original_len: if truncated { Some(original_len) } else { None },
+            }
+        })
+        .collect();
+
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
+
+    let (termination, iterations) = match result.termination {
+        code_graph_graph::Termination::Converged { iterations } => ("converged", iterations),
+        code_graph_graph::Termination::IterationCeiling { iterations } => {
+            ("iteration_ceiling", iterations)
+        }
+    };
+
+    let degenerate = result.degeneracy.map(|d| match d {
+        code_graph_graph::Degeneracy::Giant { share_permille } => super::DegenerateInfo {
+            kind: "giant",
+            share_permille: Some(share_permille),
+        },
+        code_graph_graph::Degeneracy::Atomized => super::DegenerateInfo {
+            kind: "atomized",
+            share_permille: None,
+        },
+    });
+
+    let response = super::DetectCommunitiesResponse {
+        page: Page::<Community> {
+            results,
+            total,
+            offset: resolved_offset,
+            limit: resolved_limit,
+            truncated,
+            next_offset,
+        },
+        granularity: resolved_granularity,
+        termination,
+        iterations,
+        node_count: result.node_count,
+        edge_count: result.edge_count,
+        degenerate,
+    };
+    tool_success_json(&response)
 }
 
 #[cfg(test)]
@@ -4315,5 +4443,96 @@ mod tests {
             "messy form must return the same edge set as canonical",
         );
         assert_eq!(arr_messy[0]["label"], serde_json::json!("includes"));
+    }
+
+    // --- detect_communities ---
+
+    /// Build a graph with one dense 6-file community and one lone,
+    /// unconnected file, so tests have both a member-capped community and
+    /// a resolved granularity/termination/degenerate baseline to check.
+    fn communities_fixture() -> Graph {
+        let mut g = Graph::new();
+        for i in 0..6 {
+            let path = format!("/mod/f{i}.cpp");
+            let mut edges = vec![];
+            for j in 0..6 {
+                if i != j {
+                    edges.push(call_edge(
+                        &format!("/mod/f{i}.cpp:f"),
+                        &format!("/mod/f{j}.cpp:f"),
+                        &path,
+                    ));
+                }
+            }
+            g.merge_file_graph(FileGraph {
+                path: path.clone(),
+                language: Language::Cpp,
+                symbols: vec![sym("f", SymbolKind::Function, &path)],
+                edges,
+            });
+        }
+        g.merge_file_graph(FileGraph {
+            path: "/lone.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![sym("f", SymbolKind::Function, "/lone.cpp")],
+            edges: vec![],
+        });
+        g
+    }
+
+    #[test]
+    fn detect_communities_echoes_resolved_caps() {
+        let g = locked(communities_fixture());
+
+        // limit = 0 resolves to the default (100); offset defaults to 0.
+        let r = detect_communities(&g, None, None, None, Some(0), None, NO_BYTE_BUDGET);
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(v["limit"], serde_json::json!(100));
+        assert_eq!(v["offset"], serde_json::json!(0));
+        assert_eq!(v["granularity"], serde_json::json!("file"));
+        assert_eq!(v["total"], serde_json::json!(2));
+        assert!(v["termination"].as_str().is_some());
+        assert!(v["iterations"].as_u64().is_some());
+        assert_eq!(v["node_count"], serde_json::json!(7));
+
+        // A limit above the 1000 ceiling clamps and the clamp is visible
+        // on the wire.
+        let r2 = detect_communities(&g, None, None, None, Some(5000), None, NO_BYTE_BUDGET);
+        let v2: serde_json::Value = serde_json::from_str(&body_text(&r2)).unwrap();
+        assert_eq!(v2["limit"], serde_json::json!(1000));
+    }
+
+    #[test]
+    fn detect_communities_member_capped_community_carries_truncated_and_original_len() {
+        let g = locked(communities_fixture());
+
+        let r = detect_communities(&g, None, None, Some(2), None, None, NO_BYTE_BUDGET);
+        let (results, total, _offset, _limit) = page_parts(&r);
+        assert_eq!(total, 2);
+
+        let capped = results
+            .iter()
+            .find(|c| c["members"].as_array().unwrap().len() == 2)
+            .expect("the 6-member community must be capped to 2");
+        assert_eq!(capped["truncated"], serde_json::json!(true));
+        assert_eq!(capped["original_len"], serde_json::json!(6));
+        assert_eq!(capped["size"], serde_json::json!(6));
+
+        let uncapped = results
+            .iter()
+            .find(|c| c["members"].as_array().unwrap().len() == 1)
+            .expect("the lone-file community must be under the cap");
+        assert_eq!(uncapped["truncated"], serde_json::json!(false));
+        assert!(uncapped.get("original_len").is_none());
+        assert_eq!(uncapped["size"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn detect_communities_unknown_granularity_is_a_tool_error() {
+        let g = locked(communities_fixture());
+        let r = detect_communities(&g, Some("symbol"), None, None, None, None, NO_BYTE_BUDGET);
+        assert_eq!(r.is_error, Some(true));
+        assert!(body_text(&r).contains("granularity"));
     }
 }

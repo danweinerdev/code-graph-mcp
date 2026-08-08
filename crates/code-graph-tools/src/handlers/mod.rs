@@ -203,6 +203,69 @@ pub(super) struct Cycle {
     pub original_len: Option<u32>,
 }
 
+/// One community row in the `detect_communities` response: a member-file
+/// group plus its derived label and per-item truncation metadata.
+///
+/// `truncated`/`original_len` mirror [`Cycle`] EXACTLY — a distinct axis
+/// from the envelope's page truncation (`Page::truncated`). Here the cap
+/// is `members_per_community`: when a community's member list exceeds it,
+/// `members` is shortened in place, `truncated` is set, and
+/// `original_len` carries the pre-truncation count. `truncated` always
+/// serializes (no `skip_serializing_if`), matching `Cycle` and `Page`'s
+/// always-present `truncated` convention so a single client deserializer
+/// covers both.
+///
+/// Visibility is `pub(super)`: the type only appears inside the
+/// `handlers` module's response payloads and tests; clients consume it as
+/// JSON via `CallToolResult`, never as a Rust type. Derive set matches
+/// [`Cycle`] (`Debug`, `Serialize` only — no `Deserialize`).
+#[derive(Debug, Serialize)]
+pub(super) struct Community {
+    pub label: String,
+    pub size: u32,
+    pub members: Vec<String>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_len: Option<u32>,
+}
+
+/// Response payload for `detect_communities`: the standard paginated
+/// [`Page`]`<`[`Community`]`>` envelope (`#[serde(flatten)]`, same
+/// precedent as [`SearchSymbolsResponse`]) plus community-detection
+/// metadata that isn't per-row: the resolved `granularity` (echoes the
+/// validated argument — currently always `"file"`, AC-53), the
+/// termination condition and iteration count label propagation actually
+/// used (AC-54), the aggregated file graph's node/edge counts, and
+/// `degenerate` — `null` for an ordinary partition, or
+/// `{kind, share_permille}` when [`code_graph_graph::Degeneracy`] fired
+/// (AC-55; `share_permille` is only ever present on `"giant"`).
+///
+/// Field order after the flattened `Page` fields —
+/// `granularity`, `termination`, `iterations`, `node_count`,
+/// `edge_count`, `degenerate` — is the wire-format contract.
+#[derive(Debug, Serialize)]
+pub(super) struct DetectCommunitiesResponse {
+    #[serde(flatten)]
+    pub page: Page<Community>,
+    pub granularity: &'static str,
+    pub termination: &'static str,
+    pub iterations: u32,
+    pub node_count: u32,
+    pub edge_count: u32,
+    pub degenerate: Option<DegenerateInfo>,
+}
+
+/// `detect_communities.degenerate` payload. `kind` is `"giant"` or
+/// `"atomized"`; `share_permille` is `Some` only on `"giant"` (absent —
+/// not `null` — on `"atomized"` via `skip_serializing_if`, since an
+/// atomized partition has no single dominant share to report).
+#[derive(Debug, Serialize)]
+pub(super) struct DegenerateInfo {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_permille: Option<u32>,
+}
+
 /// Bundled response for `get_coupling` with `direction = "both"`: each
 /// side carries its own independently-paginated [`Page<CouplingEntry>`].
 ///

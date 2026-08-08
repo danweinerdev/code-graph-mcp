@@ -25,6 +25,7 @@
 
 mod algorithms;
 mod callgraph;
+mod community;
 mod diagrams;
 pub mod graph;
 pub mod persist;
@@ -35,6 +36,7 @@ mod test_fixtures;
 
 pub use algorithms::HierarchyNode;
 pub use callgraph::{CallChain, PathHop, PathResult};
+pub use community::{CommunityResult, Degeneracy, FileCommunity, Termination};
 pub use diagrams::{DiagramDirection, DiagramEdge, DiagramResult, EdgeDirection};
 pub use graph::{EdgeEntry, FileEntry, Graph, GraphStats, IncludeEntry, Node};
 pub use persist::{cache_path, stale_paths, PersistError, SWEEP_INTERVAL_NANOS};
