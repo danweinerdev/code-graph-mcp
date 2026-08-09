@@ -49,6 +49,11 @@ phases:
     status: planned
     doc: "08-Per-Language-Fingerprints.md"
     depends_on: [6]
+  - id: 9
+    title: "Resolver Candidate Count"
+    status: planned
+    doc: "09-Resolver-Candidate-Count.md"
+    depends_on: [1]
 ---
 
 # Graph Platform Expansion
@@ -144,6 +149,7 @@ flowchart LR
 - **The daemon client is a byte proxy** (Designs/RepoLocalDaemon Decision 2). Both stdio and socket transports frame through the same `JsonRpcMessageCodec`, so forwarding preserves message boundaries without parsing MCP.
 - **Symbol history matches by exact, case-sensitive `(name, kind)`** (D-0005). A rename, including a case-only rename, reports as removed-plus-introduced; case-folding would interleave two symbols' histories in the five case-sensitive languages.
 - **Both fingerprint sensitivities ship for all six languages** (D-0006). `LiteralInsensitive` is a required rollout step, not an opportunistic per-language override.
+- **A response field earns its place by removing a round-trip** (D-0007). These responses are consumed by agents; an indicator that only changes hedging language is close to worthless, while one that lets the agent skip a query or names the next action changes behaviour. This is why per-hop resolution detail stays on `find_path` and why candidate count (FR-48, phase 9) is specified properly rather than approximated by the existing one-bit tag.
 - **Community detection runs at file granularity** (Designs/GraphQueries Decision 4). The `files` PathTrie iterates deterministically, which gives FR-25 for free; walking `nodes` would not.
 
 ## Dependencies

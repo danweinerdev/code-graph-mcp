@@ -388,6 +388,14 @@ Two documentation updates land with the code, not after: the MCP tools table in 
 
 **OQ-C2 — RESOLVED, not deferred.** *How is a community's label derived?* Originally filed as cosmetic, which was wrong: `label` is part of the output, so AC-18's byte-identical requirement covers it, and an unspecified tie-break is a determinism hole rather than a styling question. Pinned now: the label is the longest directory prefix shared by the greatest number of members; **on a count tie, the lexicographically smallest prefix wins**; a community whose members share no prefix is labelled with the lexicographically smallest member path. Whether to additionally enrich the label with a central member's name remains genuinely cosmetic and is out of scope.
 
+## Follow-On Work
+
+**Candidate count supersedes the binary confidence tag as the signal worth reporting (FR-48, AC-57, D-0007).** `find_path` ships `PathHop.entered_by`, a per-hop `resolved`/`heuristic` tag. Phase 1's review established why that is the weaker indicator: `Heuristic` means "at least two indexed candidates shared this name and the resolver picked one by scope rule", so the tag is a one-bit projection of *how many* competed. Three candidates tells a caller what to disambiguate; "heuristic" only tells it to be uneasy.
+
+The per-hop tag stays, because it lets a caller find the weak link without a second query and a field earns its place by removing a round-trip (D-0007). The count cannot be added here: the resolver discards it, so recovering it needs a resolver change and a cache-format bump. That is specified as FR-48 and planned as phase 9, not smuggled into this design.
+
+This also settles the FR-23 tension the review raised: the *weighting* is internal — no numeric value, score, or cost reaches the wire — while reporting which hops were heuristically resolved is permitted, and FR-23 now says so explicitly.
+
 ## Open Questions
 
 - Whether `get_symbol_at` should accept a column argument (OQ-C3) — **non-blocking** — `Symbol` carries no end column, so a column could filter the start position only and would not sharpen enclosure; adding an optional argument later is additive and changes no existing behaviour.

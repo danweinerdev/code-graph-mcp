@@ -102,6 +102,22 @@ decisions:
       - Plans/GraphPlatformExpansion
     tags: [vcs, fingerprint, scope, languages]
     reversibility: two-way
+  - id: D-0007
+    kind: decision
+    status: accepted
+    date: 2026-08-08
+    decided_by: user
+    statement: "A field on an LLM-facing response earns its place by removing a round-trip. Per-hop resolution detail stays because it saves the caller a follow-up query; the confidence arithmetic itself stays internal. Candidate count is the stronger signal and is specified as FR-48 rather than approximated."
+    rejected:
+      - "Dropping per-hop resolution detail to honour a strict reading of FR-23"
+      - "Approximating candidate count with the existing binary resolved/heuristic tag"
+    rationale: "These responses are consumed by agents, not humans. An indicator that only changes hedging language in prose is close to worthless — the agent softens its wording and moves on. An indicator that lets the agent skip a query, or tells it exactly what to verify next, changes behaviour. A binary heuristic tag is a one-bit projection of 'N candidates competed'; N is what a caller can act on, so it is specified properly rather than faked."
+    confirmation: "New or changed fields on a tool response can be justified by naming the round-trip they remove or the next action they enable; a field that only qualifies prose is challenged in review."
+    scope:
+      - Specs/GraphPlatformExpansion
+      - Designs/GraphQueries
+    tags: [api-design, llm-facing, confidence, wire-contract]
+    reversibility: two-way
 ---
 
 # Decision Ledger
