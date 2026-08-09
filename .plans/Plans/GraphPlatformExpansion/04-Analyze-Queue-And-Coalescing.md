@@ -6,7 +6,7 @@ phase: 4
 status: planned
 created: 2026-08-08
 updated: 2026-08-08
-deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, with the wire format evolved additively."
+deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, the wire format evolves additively, and the job slot generalizes to cover long-running whole-graph queries."
 tasks:
   - id: "4.1"
     title: "Pending queue in AnalyzeSlot and the queued job status"
@@ -25,6 +25,13 @@ tasks:
     justifies: "FR-43, NFR-01, AC-52. A caller whose request vanished into another needs its outcome, and a sync caller queued behind N jobs would hit MCP_TOOL_TIMEOUT on any corpus — turning a documented large-repo hazard into an everyday one."
     verification: "cargo test -p code-graph-tools analyze:: plus the snapshot suite — a coalesced caller receives the covering request's outcome with an additive optional field naming it (AC-52); that field is absent, not null, when no coalescing occurred, so non-coalesced bodies stay byte-identical (NFR-01); analyze_codebase's body and analyze_job.result remain structurally identical under one deserializer; a sync request admitted behind pending jobs returns immediately with job_id and status queued rather than blocking."
     depends_on: ["4.2"]
+  - id: "4.4"
+    title: "Generalize the job slot to long-running queries and add detect_communities_async"
+    status: planned
+    justifies: "FR-49, AC-58, review follow-up FU-01. detect_communities runs whole-graph label propagation while holding the read lock, and the client tool timeout is wall-clock — spawn_blocking does not extend it, so at UE4 scale the server can finish and the caller still see a timeout with no way to recover the result. Landing it here reuses the slot being reshaped by 4.1 rather than touching AnalyzeSlot and AnalyzeJobView a second time."
+    verification: "cargo test -p code-graph-tools job:: — a whole-graph query started asynchronously returns a job id sub-second and reports progress; get_status exposes it under the same polling vocabulary as an analyze job; the terminal result is retrievable and byte-identical to the synchronous response; every individual call is short enough that a wall-clock timeout cannot fire; the synchronous detect_communities still works unchanged for small graphs."
+    depends_on: ["4.1"]
+
 ---
 
 # Phase 4: Analyze Queue and Coalescing
@@ -99,6 +106,30 @@ Pending — not complete.
 ### Trap
 Letting sync `analyze_codebase` block behind the queue because "that's what a queue means". CLAUDE.md already documents `MCP_TOOL_TIMEOUT` killing long sync analyses on large trees; queueing makes wall-clock depend on other sessions' work, so a small repo can now time out because someone else started an index. Return queued instead.
 
+## 4.4: Generalize the job slot to long-running queries and add detect_communities_async
+
+### Subtasks
+- [ ] Widen the job slot from analyze-specific to a job kind that covers long-running queries
+- [ ] Keep `analyze_job` in `get_status` reporting analyze jobs, so no existing client breaks
+- [ ] Add an async form of `detect_communities` on that machinery
+- [ ] Ensure the async result is byte-identical to the synchronous response for the same inputs
+- [ ] Leave synchronous `detect_communities` working unchanged — it is the right call on a small graph
+- [ ] Document both forms and when to reach for each (NFR-11)
+
+### Notes
+Revision boundary: any whole-graph query can run as a job, and `detect_communities` uses it.
+
+This arrives from phase 1's review as FU-01. The measured cost is 177 ms on 841 files, which is fine; the concern is UE4/LLVM scale, which nothing has measured. CLAUDE.md already documents the failure mode for `analyze_codebase`: the client gives up on wall-clock while the server runs to completion, and the result is unrecoverable because there is no polling path. `spawn_blocking` does not help — it protects the tokio scheduler, not the client's timer.
+
+Generalize rather than special-case. A second job mechanism beside the analyze one means two vocabularies for the same concept and two things to keep in sync.
+
+### Completion Evidence
+
+Pending — not complete.
+
+### Trap
+Reaching for `spawn_blocking` and considering it solved. It moves the work off the async worker and does nothing about the client's wall-clock timeout, which is the actual failure. Only a return-immediately-and-poll shape fixes that.
+
 ## Acceptance Criteria
 
 - [ ] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
@@ -107,7 +138,8 @@ Letting sync `analyze_codebase` block behind the queue because "that's what a qu
 - [ ] Non-coalesced analyze bodies remain byte-identical; one deserializer still covers both shapes (NFR-01).
 - [ ] CLAUDE.md and tool descriptions updated for the retired error, the `"queued"` status, the new optional field, and the sync blocking change (NFR-11).
 - [ ] **AC-27**: `make verify` passes (NFR-04).
-- [ ] FR-41, FR-42, FR-43 realized.
+- [ ] **AC-58**: A whole-graph query runs asynchronously with sub-second calls throughout, so a wall-clock client timeout cannot fire (FR-49).
+- [ ] FR-41, FR-42, FR-43, FR-49 realized.
 
 ## Phase Completion Evidence
 

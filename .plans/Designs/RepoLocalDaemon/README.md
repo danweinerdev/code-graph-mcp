@@ -223,6 +223,14 @@ Three consequences the coverage rule alone does not settle:
 
 This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent sessions produce far fewer jobs, so the slot's existing one-rotation `previous_terminal` window stops being contended and its documented semantics need no change.
 
+### Decision 10: The job slot generalizes beyond analyze (FR-49, AC-58)
+
+**Context:** `analyze_codebase_async` exists because a UE4-scale analyze exceeds the client's wall-clock tool timeout and `spawn_blocking` cannot help — the timer is client-side. Phase 1's review found `detect_communities` has the same shape: whole-graph label propagation, measured only at 841 files, with no async escape.
+
+**Decision:** When Decision 7 reshapes `AnalyzeSlot` into a queue, generalize it to hold long-running *query* jobs as well, and give `detect_communities` an async form on that machinery. Do not build a second, parallel job mechanism.
+
+**Rationale:** The slot is already being reshaped for the analyze queue — adding a `pending` vector, a `Queued` status, and coalescing. Generalizing the job concept in the same pass costs far less than touching `AnalyzeSlot` and `AnalyzeJobView` again later, and it means one polling vocabulary rather than two. Building `detect_communities_async` standalone would duplicate the job-id, progress, and terminal-result plumbing that already exists for analyze.
+
 ### Decision 8: The CLI is a separate binary and depends on Track A
 
 **Context:** FR-17 – FR-20 require a CLI whose output matches the MCP payload and which does not duplicate query logic.

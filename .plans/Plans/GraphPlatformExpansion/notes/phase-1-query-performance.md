@@ -44,6 +44,14 @@ The test auto-skips with a hint if the corpus is uninitialised, per the dogfood-
 
 **Neither corpus nor run count is what the design imagined.** `abseil-cpp/absl` at 841 files is the largest initialised C++ corpus here, but it is far from the UE4/LLVM scale CLAUDE.md discusses elsewhere. These numbers say "not slow at this size", not "scales".
 
-## Follow-up worth considering
+## Decisions Made
+
+- **AC-43 is recorded, not gated.** No wall-clock assertion was added; a timing threshold would be flaky across machines and CI load. Cap enforcement is separately automated in tasks 1.2 and 1.3.
+- **abseil-cpp/absl was used** as the largest initialised C++ corpus available. It is not large in the sense CLAUDE.md means when it discusses UE4/LLVM scale, and the note says so rather than implying coverage it does not have.
+- **The `shortest_path` figure is published with its limitation attached** rather than withheld or quoted plainly. It exhausted after 307 nodes, so it demonstrates correct not-found termination, not scaling.
+
+## Follow-Ups
+
+### Worth considering
 
 A better `shortest_path` worst case — source selected by maximum transitive fan-out rather than by orphan status — would make this measurement meaningful rather than merely present. Not filed as a task: AC-43 asks for a recorded metric and this records one, with its limits stated. Worth revisiting if the query is ever reported as slow.

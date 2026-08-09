@@ -51,8 +51,8 @@ findings:
 followups:
   - id: FU-01
     finding: F-08
-    summary: "Decide whether detect_communities needs an async job plus polling shape like analyze_codebase_async, or a work budget independent of max_iterations, for UE4/LLVM-scale graphs"
-    tracked_in: ""
+    summary: "detect_communities needs an async job plus polling shape; landed on the generalized job slot rather than a second mechanism"
+    tracked_in: "4.4"
 ---
 
 # Code Review: GraphPlatformExpansion Phase 1 — Graph Queries

@@ -51,6 +51,8 @@ tasks:
 
 ## Overview
 
+**Status: all seven tasks complete; the phase is deliberately left `in-progress`.** Formal completion requires a four-lane review returning Aligned across every lane. Two cycles ran: cycle 1 returned Moderate with seven findings, cycle 2 returned Strong on drift, quality, and spec-compliance but Elevated on blind spots with two more. All nine are fixed and recorded in `reviews/01-graph-platform-expansion-code-review-2986df0.md`. A third cycle would be needed to certify, and was skipped by explicit decision — the returns were diminishing and seven phases follow. The phase is therefore code-complete and review-evidenced, but not certified, and `Phase Completion Evidence` below stays pending rather than claiming a gate that was not run.
+
 Three self-contained read-only queries added to `code-graph-graph`, with thin handlers and three new MCP tools. No cache-format change, no change to any existing tool's output. This phase depends on nothing else in the plan and can run first, or concurrently with phases 3 and 5. Phase 2 follows it rather than running beside it — both edit the same three handler files, and phase 2's migration is what carries these three queries into the typed core.
 
 ## 1.1: Position lookup: symbols_at_line and get_symbol_at
