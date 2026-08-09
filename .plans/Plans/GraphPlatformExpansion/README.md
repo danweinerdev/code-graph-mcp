@@ -18,7 +18,7 @@ phases:
     doc: "01-Graph-Queries.md"
   - id: 2
     title: "Typed Core Layering"
-    status: planned
+    status: in-progress
     doc: "02-Typed-Core-Layering.md"
     depends_on: [1]
   - id: 3
