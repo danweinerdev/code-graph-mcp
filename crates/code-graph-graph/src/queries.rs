@@ -152,6 +152,24 @@ pub struct SearchResult {
 }
 
 impl Graph {
+    /// Whether `path` has a [`FileEntry`] in the graph at all — i.e. the
+    /// file was indexed, regardless of how many symbols (zero or more) it
+    /// produced. Backed by [`code_graph_path_trie::PathTrie::contains_path`]
+    /// on [`Graph::files`](Graph) (the `files` field), so this is a trie
+    /// lookup, not a linear scan.
+    ///
+    /// This is the presence check `file_symbols(path).is_empty()` cannot
+    /// give you: that expression is `true` both for "no `FileEntry` at
+    /// all" and for "`FileEntry` exists but `symbol_ids` is empty" (a
+    /// legitimately indexed file that yielded zero symbols — e.g. a
+    /// forward-declaration-only header, a comment-only file, or an
+    /// unconfigured macro invocation). Callers that need to distinguish
+    /// "file not indexed" from "file indexed, nothing enclosing/matching"
+    /// should check `has_file` first.
+    pub fn has_file(&self, path: &Path) -> bool {
+        self.files.contains_path(path)
+    }
+
     /// All symbols defined in `path`, in the order they were inserted at
     /// merge time. Returns an empty `Vec` for unknown paths so JSON
     /// serialization yields `[]`, never `null`.

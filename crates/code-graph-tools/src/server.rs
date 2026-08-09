@@ -1693,6 +1693,15 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
+        // Label propagation runs over the whole aggregated file graph and
+        // holds a parking_lot read guard for the duration (see `find_path`
+        // above) — a concurrent watch-driven reindex needing the write
+        // lock waits. `spawn_blocking` protects the tokio scheduler, NOT
+        // the client's `MCP_TOOL_TIMEOUT` (CLAUDE.md documents this for
+        // `analyze_codebase`): that timeout is wall-clock and unaffected
+        // by which thread pool runs the work. Measured cost: 177ms on an
+        // 841-file corpus; no larger corpus has been measured — see
+        // `.plans/Plans/GraphPlatformExpansion/notes/phase-1-query-performance.md`.
         let max_bytes = self.inner.config.read().response.max_bytes;
         let inner = self.inner.clone();
         let result = tokio::task::spawn_blocking(move || {

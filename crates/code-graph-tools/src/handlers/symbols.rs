@@ -176,11 +176,17 @@ pub fn get_file_symbols(
 /// off-by-one bug worth surfacing immediately. An unknown `file` is a tool
 /// error naming the path (mirrors the `generate_diagram(file=…)` wording:
 /// `"file not found: {file:?}"`) — this handler distinguishes "file isn't
-/// indexed at all" from "file is indexed but nothing encloses this line",
-/// which the wrapped query alone cannot: `symbols_at_line` returns an
-/// empty `Vec` for both cases. **No enclosing symbol is SUCCESS with an
-/// empty `Page`, never a tool error and never a nearest-neighbour guess**
-/// (the Trap this task exists to avoid).
+/// indexed at all" from "file is indexed but nothing encloses this line"
+/// via [`code_graph_graph::Graph::has_file`], a real presence check on the
+/// `files` PathTrie — NOT `file_symbols(path).is_empty()`, which conflates
+/// "no `FileEntry`" with "`FileEntry` exists but the file has zero
+/// symbols" (a forward-declaration-only header, a comment-only file, an
+/// unconfigured macro invocation — all legitimately indexed, all
+/// zero-symbol). A file present in the graph with zero symbols, or with
+/// symbols but none enclosing `line`, is SUCCESS with an empty `Page`,
+/// never a tool error and never a nearest-neighbour guess (the trap this
+/// handler exists to avoid). Only a file genuinely absent from the graph
+/// is the tool error.
 ///
 /// Defaults: `limit = 100`, `offset = 0`, mirroring [`get_file_symbols`];
 /// `limit = 0` means "use the default" and `limit` is clamped at 1000.
@@ -208,12 +214,13 @@ pub fn get_symbol_at(
     let path = paths::normalize_user_path(file);
 
     let g = graph.read();
-    // Distinguish "file not indexed" from "no symbol encloses this line":
-    // `file_symbols` on an unknown path returns empty regardless of
-    // `line`, so checking it first (before the line-scoped query) lets us
-    // surface the diagnostic file-not-found error rather than a silent
-    // empty envelope for a misspelled/unindexed path.
-    if g.file_symbols(&path).is_empty() {
+    // Distinguish "file not indexed" from "file indexed but nothing
+    // encloses this line (including a file with zero symbols at all)":
+    // `has_file` is a real presence check on the `files` PathTrie, unlike
+    // `file_symbols(&path).is_empty()` which is also true for a
+    // legitimately indexed zero-symbol file (forward-declaration-only
+    // header, comment-only file, unconfigured macro invocation).
+    if !g.has_file(&path) {
         drop(g);
         return tool_error(format!("file not found: {file:?}"));
     }
@@ -1818,6 +1825,35 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(arr[0]["name"], "do_thing");
         assert_eq!(arr[1]["name"], "Bar");
+    }
+
+    #[test]
+    fn symbol_at_zero_symbol_indexed_file_is_success_not_error() {
+        // F-09 regression: a file that IS indexed (has a FileEntry in the
+        // graph) but produced zero symbols — e.g. a forward-declaration-
+        // only header, a comment-only file, an unconfigured macro
+        // invocation — must NOT be conflated with "file not found".
+        // `file_symbols(path).is_empty()` is true for both cases;
+        // `Graph::has_file` distinguishes them.
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/empty.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        });
+        assert!(g.has_file(Path::new("/empty.cpp")));
+        let g = locked(g);
+        let r = get_symbol_at(&g, "/empty.cpp", 5, None, None, NO_BYTE_BUDGET);
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "zero-symbol indexed file must be SUCCESS, not a tool error"
+        );
+        let (arr, total, offset, limit) = page_parts(&r);
+        assert!(arr.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 100);
     }
 
     // --- search_symbols ---
