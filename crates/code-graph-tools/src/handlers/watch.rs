@@ -22,14 +22,12 @@ use std::time::Duration;
 
 use code_graph_core::{paths, symbol_id, EdgeKind, FileGraph, SymbolId};
 use code_graph_lang::CallContext;
-use notify_debouncer_full::notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
+use notify_debouncer_full::notify::EventKind;
+use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::indexer::{build_file_index, build_symbol_index};
-use crate::server::{ServerInner, WatchHandle};
-
-use super::{tool_error, tool_success_json};
+use crate::server::ServerInner;
 
 /// Debounce window for the filesystem watcher. The `notify-debouncer-full`
 /// API coalesces every event for a given path that arrives within this
@@ -43,7 +41,7 @@ pub(crate) const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
 /// channel is full, the debouncer's notify thread will fall back to
 /// `blocking_send` (see [`forward_events`]) so no events are silently
 /// dropped at the producer.
-const EVENT_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// JSON body for both `watch_start` and `watch_stop`. The single boolean
 /// carries the difference: `true` from `watch_start`, `false` from
@@ -52,8 +50,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// and gives clients a single field to assert against, locked in by the
 /// snapshot tests.
 #[derive(serde::Serialize)]
-struct WatchResponse {
-    watching: bool,
+pub(crate) struct WatchResponse {
+    pub(crate) watching: bool,
 }
 
 /// `watch_start` body. Caller must already have passed `require_indexed`.
@@ -75,49 +73,7 @@ struct WatchResponse {
 /// (no IO on user input, no blocking on async work), and the alternative
 /// (two-phase lock-build-lock) reintroduces the very race we're closing.
 pub fn watch_start(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
-    let mut watch_guard = inner.watch.write();
-    if watch_guard.is_some() {
-        return tool_error("watch mode is already active");
-    }
-
-    let root_path = match inner.root_path.read().clone() {
-        Some(p) => p,
-        None => {
-            // require_indexed passed (the indexed atomic flag is set) but
-            // root_path is empty — this means the index was loaded by some
-            // path that didn't populate root_path. Today's analyze_codebase
-            // always populates it, so this branch is defensive only.
-            return tool_error("no codebase indexed — call analyze_codebase first");
-        }
-    };
-
-    // Channel: notify-debouncer-full's notify thread (non-tokio) →
-    // watch_loop tokio task. The closure passed to `new_debouncer` is
-    // `Fn(DebounceEventResult)` and may run on a worker thread that has
-    // no tokio runtime — `mpsc::Sender::try_send` is blocking-thread
-    // safe, so the closure forwards events without needing to be inside
-    // a tokio context.
-    let (events_tx, events_rx) = mpsc::channel::<Vec<DebouncedEvent>>(EVENT_CHANNEL_CAPACITY);
-
-    let mut debouncer = match new_debouncer(DEBOUNCE_TIMEOUT, None, forward_events(events_tx)) {
-        Ok(d) => d,
-        Err(e) => return tool_error(format!("failed to start watcher: {e}")),
-    };
-
-    if let Err(e) = debouncer.watch(&root_path, RecursiveMode::Recursive) {
-        return tool_error(format!("failed to watch {}: {e}", root_path.display()));
-    }
-
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-    tokio::spawn(watch_loop(Arc::clone(inner), events_rx, cancel_rx));
-
-    *watch_guard = Some(WatchHandle {
-        debouncer,
-        cancel: cancel_tx,
-    });
-
-    tool_success_json(&WatchResponse { watching: true })
+    crate::core::to_call_tool_result(crate::core::watch::watch_start(inner))
 }
 
 /// `watch_stop` body. Caller must already have passed `require_indexed`.
@@ -126,20 +82,7 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
 /// signal so the watch_loop task exits, then drops the debouncer (which
 /// tears down the OS watch).
 pub fn watch_stop(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
-    let handle = match inner.watch.write().take() {
-        Some(h) => h,
-        None => return tool_error("watch mode is not active"),
-    };
-
-    let WatchHandle { debouncer, cancel } = handle;
-    // Best-effort: if the watch_loop task has already exited (e.g. its
-    // future was cancelled at runtime shutdown), the receiver is gone and
-    // `send` returns Err. That's fine — the goal is "stop watching", and
-    // dropping the debouncer below achieves that regardless.
-    let _ = cancel.send(());
-    drop(debouncer);
-
-    tool_success_json(&WatchResponse { watching: false })
+    crate::core::to_call_tool_result(crate::core::watch::watch_stop(inner))
 }
 
 /// Build the `Fn(DebounceEventResult)` closure that the debouncer's notify
@@ -150,7 +93,9 @@ pub fn watch_stop(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
 /// `events_tx` by move, then `clone`s for each invocation. Errors from
 /// notify itself are swallowed: the contract is "do not crash the
 /// watcher thread".
-fn forward_events(events_tx: mpsc::Sender<Vec<DebouncedEvent>>) -> impl Fn(DebounceEventResult) {
+pub(crate) fn forward_events(
+    events_tx: mpsc::Sender<Vec<DebouncedEvent>>,
+) -> impl Fn(DebounceEventResult) {
     move |result| {
         let events = match result {
             Ok(e) => e,
@@ -544,7 +489,7 @@ fn canonicalize_event_path(path: &Path, exists_hint: bool) -> PathBuf {
 /// and drives per-path reindexes through [`try_reindex_file`]. Cancellation
 /// arrives on `cancel`; the loop also exits when the events channel
 /// closes (the producing side of the channel — the debouncer — went away).
-async fn watch_loop(
+pub(crate) async fn watch_loop(
     inner: Arc<ServerInner>,
     mut events: mpsc::Receiver<Vec<DebouncedEvent>>,
     cancel: oneshot::Receiver<()>,

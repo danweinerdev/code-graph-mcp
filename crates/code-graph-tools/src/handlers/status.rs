@@ -16,7 +16,6 @@
 //! re-loading the config. All reads are O(1) or O(small-constant)
 //! against `ServerInner` state.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
@@ -25,8 +24,6 @@ use serde::Serialize;
 use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
 use crate::handlers::analyze::AnalyzeResult;
 use crate::server::ServerInner;
-
-use super::tool_success_json;
 
 /// Wire shape of `get_status` output. Field order chosen so the most
 /// frequently-checked fields (binary version, indexed state) appear
@@ -194,83 +191,10 @@ impl AnalyzeJobView {
     }
 }
 
-/// `get_status` body. Pure read — no locks held across `tool_success_json`.
+/// `get_status` adapter. Body lives in `core::status::get_status`; this
+/// wrapper only converts the typed result to the rmcp wire type.
 pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
-    let binary_version = env!("CODE_GRAPH_GIT_SHA").to_string();
-    let package_version = env!("CARGO_PKG_VERSION").to_string();
-    let release_build = !cfg!(debug_assertions);
-
-    // Project root + config path: both derive from `root_path` (set by
-    // the most recent analyze). If never indexed, both are None.
-    let project_root = inner.root_path.read().clone();
-    let config_path = project_root.as_ref().and_then(|root| {
-        let p = root.join(".code-graph.toml");
-        if p.exists() {
-            Some(p.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    });
-    let indexed_root = project_root.map(|p| p.to_string_lossy().into_owned());
-
-    // Config counts: cheap read of the cached `RootConfig`. The TOML
-    // file is NOT re-read here — these are exactly the values that
-    // applied during the most recent analyze.
-    let (macro_strip_count, macro_strip_with_args_count) = {
-        let cfg = inner.config.read();
-        (
-            cfg.cpp.macro_strip.len(),
-            cfg.cpp.macro_strip_with_args.len(),
-        )
-    };
-
-    let indexed = inner.indexed.load(Ordering::Acquire);
-    let stats = inner.graph.read().stats();
-
-    let built_at_nanos = inner.index_built_at.load(Ordering::Acquire);
-    let index_built_at = if built_at_nanos == 0 {
-        None
-    } else {
-        Some(format_unix_nanos_rfc3339(built_at_nanos))
-    };
-    let index_force_built = if indexed {
-        Some(inner.index_force_built.load(Ordering::Acquire))
-    } else {
-        None
-    };
-
-    // Snapshot the slot under the read lock — just two Arc::clones —
-    // then drop the guard before walking the job state. Building views
-    // outside the slot lock keeps progress writes from contending with
-    // polls beyond the constant-time Arc::clone window.
-    let (current_job, previous_terminal_job) = {
-        let slot = inner.analyze_slot.read();
-        (slot.current.clone(), slot.previous_terminal.clone())
-    };
-    let analyze_job = current_job.as_deref().map(AnalyzeJobView::from_job);
-    let analyze_job_previous_terminal = previous_terminal_job
-        .as_deref()
-        .map(AnalyzeJobView::from_job);
-
-    let result = StatusResult {
-        binary_version,
-        package_version,
-        release_build,
-        config_path,
-        config_macro_strip_count: macro_strip_count,
-        config_macro_strip_with_args_count: macro_strip_with_args_count,
-        indexed,
-        indexed_root,
-        index_files: stats.files,
-        index_symbols: stats.nodes,
-        index_edges: stats.edges,
-        index_built_at,
-        index_force_built,
-        analyze_job,
-        analyze_job_previous_terminal,
-    };
-
-    tool_success_json(&result)
+    crate::core::to_call_tool_result(crate::core::status::get_status(inner))
 }
 
 /// Format `nanos` since UNIX_EPOCH as an RFC3339 UTC string of the

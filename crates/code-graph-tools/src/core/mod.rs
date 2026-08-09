@@ -14,6 +14,9 @@ use crate::handlers::{tool_error, tool_success_json};
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
+pub mod status;
+pub mod watch;
+
 /// A successful outcome. Two variants because two tools legitimately
 /// return prose rather than a structured document:
 ///
