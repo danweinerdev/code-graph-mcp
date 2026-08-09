@@ -6,20 +6,18 @@
 //! values inline) over rote Go parity. Specific divergences are
 //! documented inline so future readers understand which strings are
 //! deliberate.
+//!
+//! Logic lives in `crate::core::structure` (Typed Core Layering, task
+//! 2.5); every function below is a one-line adapter over the typed core,
+//! converted back to `CallToolResult` via
+//! `crate::core::to_call_tool_result`. `ReliabilityMode` and
+//! `is_unreliable_orphan` stay here (not moved to the core) because this
+//! module's own `#[cfg(test)]` block asserts against them directly.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
-use code_graph_core::{paths, symbol_id, SymbolKind};
-use code_graph_graph::{DiagramDirection, DiagramEdge, Graph, HierarchyNode};
+use code_graph_core::{symbol_id, Symbol};
+use code_graph_graph::Graph;
 use parking_lot::RwLock;
-use rmcp::model::{CallToolResult, Content};
-use serde::Serialize;
-
-use super::{
-    byte_budget_take, kind_str, parse_kind, suggest_symbols, symbol_to_result, tool_error,
-    tool_success_json, Community, CouplingBoth, CouplingEntry, Cycle, Page, SymbolResult,
-};
+use rmcp::model::CallToolResult;
 
 // ----- detect_cycles -----
 
@@ -62,120 +60,14 @@ pub fn detect_cycles(
     offset: Option<u32>,
     max_cycle_size: Option<u32>,
 ) -> CallToolResult {
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-    let resolved_max = max_cycle_size.filter(|&n| n != 0).unwrap_or(50).min(500);
-
-    // Subtree filter (Phase E.3 C). Empty / absent value keeps the
-    // whole-graph behavior. A non-empty value drops every cycle that
-    // includes a file OUTSIDE the prefix — semantics match
-    // "cycles confined to this subtree." Filter happens post-detection
-    // because cycle membership is global; restricting cycle detection
-    // itself to a subtree would change the answer (a cycle through a
-    // file outside the subtree would never be found, hiding real
-    // cyclic dependencies). The subtree filter just narrows reporting.
-    //
-    // **Scope validation lives at the server-dispatch boundary** in
-    // `CodeGraphServer::validate_subtree`, NOT here. By the time
-    // `detect_cycles` is called, `subtree` is either absent / empty
-    // (no filter) or an already-canonical path proven to be at or
-    // under the indexed root — out-of-scope inputs (e.g.
-    // `subtree="../.."` canonicalizing to a project-root ancestor)
-    // have already been rejected with a tool error before this
-    // function ran. `normalize_user_path` here is therefore
-    // idempotent on the server-validated value.
-    let subtree_prefix: Option<std::path::PathBuf> = subtree
-        .filter(|s| !s.is_empty())
-        .map(code_graph_core::paths::normalize_user_path);
-
-    let raw_cycles: Vec<Vec<PathBuf>> = graph.read().detect_cycles();
-    let cycles: Vec<Vec<PathBuf>> = match subtree_prefix.as_deref() {
-        Some(p) => raw_cycles
-            .into_iter()
-            .filter(|cycle| cycle.iter().all(|file| file.starts_with(p)))
-            .collect(),
-        None => raw_cycles,
-    };
-
-    // Convert PathBuf -> String for stable JSON output. PathBuf serializes
-    // through serde as `String` on Unix, but going through to_string_lossy
-    // makes the conversion explicit and is robust on platforms whose
-    // OsStr is not UTF-8 (Windows). Sort within each cycle for canonical
-    // representation.
-    let mut stringified: Vec<Vec<String>> = cycles
-        .into_iter()
-        .map(|cycle| {
-            let mut paths: Vec<String> = cycle
-                .into_iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            paths.sort();
-            paths
-        })
-        .collect();
-
-    // Sort outer Vec by the first path in each cycle. The cycles are
-    // already canonical-sorted internally, so first-path is stable. This
-    // makes page 1 + page 2 partition deterministically across calls.
-    stringified.sort_by(|a, b| a.first().cmp(&b.first()));
-
-    let total = stringified.len() as u32;
-    let mut results: Vec<Cycle> = stringified
-        .into_iter()
-        .skip(resolved_offset as usize)
-        .take(resolved_limit as usize)
-        .map(|files| Cycle {
-            files,
-            // Per-cycle truncation is a separate axis from envelope
-            // pagination; the cap is applied below, after the page slice,
-            // so only cycles actually on this page pay the cost.
-            truncated: false,
-            original_len: None,
-        })
-        .collect();
-
-    // Per-cycle file-list cap, applied to the cycles ON THIS PAGE only
-    // (after skip/take above). This shrinks an oversized cycle's `files`
-    // in place and records the pre-truncation length; it never adds or
-    // removes cycles, so the by-count envelope arithmetic below
-    // (offset/emitted/total) is untouched. A cycle whose file list is at
-    // or under the cap is left exactly as built (truncated:false,
-    // original_len:None) — the two truncation axes stay independent.
-    for cycle in &mut results {
-        if cycle.files.len() as u32 > resolved_max {
-            let original = cycle.files.len() as u32;
-            cycle.files.truncate(resolved_max as usize);
-            cycle.truncated = true;
-            cycle.original_len = Some(original);
-        }
-    }
-
-    // Cycle pagination is by COUNT, not by serialized byte size: the
-    // envelope's `truncated`/`next_offset` are derived purely from
-    // offset/emitted/total, NOT from `[response].max_bytes`. A future
-    // reader must NOT "fix" this by routing through `byte_budget_take`
-    // — detect_cycles deliberately has no byte budget threaded in.
-    // `resolved_offset` and `emitted` are both `u32` bounded by the
-    // 1000-clamped limit and a graph that fits in memory, so the sum
-    // cannot overflow; the `as u32` cast matches the handler's existing
-    // count-cast idiom.
-    let emitted = results.len() as u32;
-    let truncated = (resolved_offset + emitted) < total;
-    let next_offset = if truncated {
-        Some(resolved_offset + emitted)
-    } else {
-        None
-    };
-
-    let response = Page::<Cycle> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::structure::detect_cycles(
+        graph,
+        true,
+        subtree,
+        limit,
+        offset,
+        max_cycle_size,
+    ))
 }
 
 // ----- get_orphans -----
@@ -219,158 +111,21 @@ pub fn get_orphans(
     reliability: Option<&str>,
     max_bytes: usize,
 ) -> CallToolResult {
-    let parsed_kind: Option<SymbolKind> = match kind.filter(|s| !s.is_empty()) {
-        None => None,
-        Some(s) => match parse_kind(s) {
-            Some(k) => Some(k),
-            None => return tool_error(format!("invalid kind: {s}")),
-        },
-    };
-
-    // Reliability filter. Default `all` (or unspecified) preserves
-    // the legacy behaviour: every Graph::orphans result surfaces,
-    // including symbols that are almost-certainly false positives.
-    //
-    // - `high` drops virtual methods and macro-synthesized symbols
-    //   (the two original false-positive classes).
-    // - `very_high` additionally drops templated definitions (signature
-    //   carries the `/* template */` prefix emitted by the C++
-    //   extractor when the def has a `template_declaration` ancestor)
-    //   AND any symbol with at least one incoming `Calls` edge,
-    //   regardless of edge confidence (so a heuristic-confidence
-    //   caller or a bare-token unresolved-source caller still excludes
-    //   the symbol from the orphan list). The pair drives the orphan
-    //   count down to candidates that look genuinely dead.
-    let reliability_mode = match reliability {
-        None | Some("") | Some("all") => ReliabilityMode::All,
-        Some("high") => ReliabilityMode::High,
-        Some("very_high") => ReliabilityMode::VeryHigh,
-        Some(other) => {
-            return tool_error(format!(
-                "invalid reliability: {other:?} (expected \"all\", \"high\", or \"very_high\")"
-            ))
-        }
-    };
-
-    // Subtree filter (Phase E). Scope validation lives at the
-    // server-dispatch boundary in `CodeGraphServer::validate_subtree`;
-    // by the time this function is called, `subtree` is either
-    // absent / empty (no filter) or an already-canonical path proven
-    // to be at or under the indexed root. Empty / absent value means
-    // "whole graph"; a valid non-empty value routes through
-    // `Graph::orphans_under` which walks the path-trie's
-    // `iter_subtree` — bounded work proportional to the directory
-    // subtree.
-    let subtree_prefix: Option<std::path::PathBuf> = subtree
-        .filter(|s| !s.is_empty())
-        .map(code_graph_core::paths::normalize_user_path);
-
-    // Count-only short-circuit: compute `total` via the cheap path
-    // (filter + count) and emit the
-    // sentinel envelope WITHOUT materializing SymbolResults or invoking
-    // `byte_budget_take`. Order is load-bearing — must precede the
-    // materialization step below so the byte-budget cost is never paid.
-    if count_only {
-        let g = graph.read();
-        let raw = match subtree_prefix.as_deref() {
-            Some(p) => g.orphans_under(p, parsed_kind),
-            None => g.orphans(parsed_kind),
-        };
-        let total = match reliability_mode {
-            ReliabilityMode::All => raw.len() as u32,
-            ReliabilityMode::High | ReliabilityMode::VeryHigh => raw
-                .iter()
-                .filter(|s| !is_unreliable_orphan(s, reliability_mode, &g))
-                .count() as u32,
-        };
-        drop(g);
-        // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract. count_only callers
-        // opted out of paging; echoing a would-have-been limit would
-        // mislead them into thinking there's a record page to fetch. The
-        // exception is documented in CLAUDE.md alongside the count_only
-        // sub-block.
-        let response = Page::<SymbolResult> {
-            results: vec![],
-            total,
-            offset: 0,
-            limit: 0,
-            truncated: false,
-            next_offset: None,
-        };
-        return tool_success_json(&response);
-    }
-
-    // Resolve defaults: zero-or-missing limit -> 20; clamp at 1000.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(20).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-    let resolved_brief = brief.unwrap_or(true);
-
-    let g = graph.read();
-    let mut matches = match subtree_prefix.as_deref() {
-        Some(p) => g.orphans_under(p, parsed_kind),
-        None => g.orphans(parsed_kind),
-    };
-    if !matches!(reliability_mode, ReliabilityMode::All) {
-        matches.retain(|s| !is_unreliable_orphan(s, reliability_mode, &g));
-    }
-    drop(g);
-    let total = matches.len() as u32;
-
-    // Sort by symbol_id ascending so page 1 + page 2 partition the result
-    // deterministically across calls. Graph::orphans walks a HashMap and
-    // returns symbols in non-deterministic order; symbol_id is unique by
-    // construction, so this canonicalizes the sequence without needing
-    // tie-break rules.
-    matches.sort_by_key(symbol_id);
-
-    // Materialize to SymbolResult first, then route through byte_budget_take:
-    // the helper internally applies
-    // offset+limit skip/take and stops early if the running serialized byte
-    // count would exceed `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept`
-    // from the helper is `results.len() as u32`, NOT the pre-pagination match
-    // count — that's `total` captured above and held unchanged.
-    let (results, _total_kept, truncated, next_offset) = byte_budget_take(
-        matches
-            .into_iter()
-            .map(|s| symbol_to_result(&s, resolved_brief)),
-        resolved_offset,
-        resolved_limit,
+    crate::core::to_call_tool_result(crate::core::structure::get_orphans(
+        graph,
+        true,
+        kind,
+        subtree,
+        limit,
+        offset,
+        brief,
+        count_only,
+        reliability,
         max_bytes,
-    );
-
-    let response = Page::<SymbolResult> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    ))
 }
 
 // ----- get_class_hierarchy -----
-
-/// Wire-format envelope for `get_class_hierarchy`. Tree-shaped tool, so
-/// the wrapper carries `max_nodes` budget metadata instead of the
-/// list-shaped `Page<T>`'s `total/offset/limit`. Field-declaration order
-/// — `hierarchy`, `truncated`, `max_nodes`, `total_nodes_seen` — is the
-/// JSON wire-format contract; reordering is a breaking change. Insta
-/// alphabetizes keys before snapshotting, so the snapshot files do not
-/// preserve declaration order — the struct is the source of truth.
-///
-/// `total_nodes_seen` is the count of *unique* class names actually
-/// walked; equal to `max_nodes` when truncation occurred, less when the
-/// hierarchy fit. Combined with `truncated`, agents can decide whether
-/// to retry with a larger budget.
-#[derive(Debug, Serialize)]
-struct ClassHierarchyResponse {
-    hierarchy: HierarchyNode,
-    truncated: bool,
-    max_nodes: u32,
-    total_nodes_seen: u32,
-}
 
 /// `get_class_hierarchy` body. Required `class` string; optional `depth`
 /// (default 1) and `max_nodes` (default 250, clamped at 1000; `0` is
@@ -382,121 +137,19 @@ struct ClassHierarchyResponse {
 /// patterns: `class not found: "<name>". Did you mean: a, b, c?`
 /// when suggestions exist; otherwise just `class not found: "<name>"`.
 ///
-/// On success, returns the [`ClassHierarchyResponse`] envelope:
-/// `{hierarchy, truncated, max_nodes, total_nodes_seen}`. The Graph
-/// layer's unique-name budget guarantees diamond inheritance doesn't
-/// burn the budget twice for shared ancestors — see
-/// `Graph::class_hierarchy`.
+/// On success, returns the `{hierarchy, truncated, max_nodes,
+/// total_nodes_seen}` envelope. The Graph layer's unique-name budget
+/// guarantees diamond inheritance doesn't burn the budget twice for
+/// shared ancestors — see `Graph::class_hierarchy`.
 pub fn get_class_hierarchy(
     graph: &RwLock<Graph>,
     class: &str,
     depth: Option<u32>,
     max_nodes: Option<u32>,
 ) -> CallToolResult {
-    if class.is_empty() {
-        return tool_error("'class' is required");
-    }
-
-    let depth = depth.filter(|&d| d > 0).unwrap_or(1);
-    // Resolve max_nodes: zero-or-missing -> default 250; clamp at 1000.
-    // Matches the pagination convention for limit resolution.
-    let resolved_max_nodes = max_nodes.filter(|&n| n != 0).unwrap_or(250).min(1000);
-
-    let g = graph.read();
-
-    // Symbol-id path: when the input resolves directly to an indexed
-    // node, take it as a fully-qualified symbol_id and bypass the
-    // bare-name ambiguity gate. This is the completion path for the
-    // `find_class_candidates` -> "pick one and re-query" workflow:
-    // having already disambiguated, the caller passes the exact id
-    // and expects this tool to walk it. The kind gate rejects
-    // non-class-like ids with a kind-specific error so callers can
-    // distinguish "wrong id" from "wrong kind" from "empty graph".
-    if let Some(sym) = g.symbol_detail(class) {
-        if !matches!(
-            sym.kind,
-            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
-        ) {
-            let kind = kind_str(sym.kind);
-            drop(g);
-            return tool_error(format!(
-                "symbol {class:?} is a {kind}, not a class-like symbol; \
-                 get_class_hierarchy requires a Class, Struct, Interface, or Trait"
-            ));
-        }
-        if let Some((hierarchy, total_nodes_seen, truncated)) =
-            g.class_hierarchy_for_symbol(class, depth, resolved_max_nodes)
-        {
-            let response = ClassHierarchyResponse {
-                hierarchy,
-                truncated,
-                max_nodes: resolved_max_nodes,
-                total_nodes_seen,
-            };
-            return tool_success_json(&response);
-        }
-        // Defensive: `symbol_detail` succeeded with a class-like kind
-        // but the walker returned None. Should not happen — surface as
-        // a tool error so the inconsistency is visible.
-        drop(g);
-        return tool_error(format!(
-            "internal: symbol {class:?} resolved but hierarchy walk returned no tree"
-        ));
-    }
-
-    // Bare-name path: when no node matches the input as a symbol_id,
-    // treat it as a class name and use the existing find-by-name flow.
-
-    // Ambiguity gate: when multiple class-like symbols share this
-    // bare name (e.g. UE's `UObject` and ICU's `UObject` both
-    // indexed), the hierarchy walker would silently merge them
-    // under one node — every class deriving from EITHER ends up in
-    // the same flat list. Surface the ambiguity explicitly and tell
-    // the agent to re-call this tool with one of the listed
-    // symbol_ids — the symbol-id branch above takes that path.
-    let candidates = g.find_classes_named(class);
-    if candidates.len() > 1 {
-        let mut listed: Vec<String> = candidates
-            .iter()
-            .map(|s| code_graph_core::symbol_id(s))
-            .collect();
-        listed.sort();
-        let bullet_list = listed
-            .iter()
-            .map(|s| format!("  - {s}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        drop(g);
-        return tool_error(format!(
-            "ambiguous class name {class:?} ({n} candidates):\n{bullet_list}\nRe-run \
-             get_class_hierarchy with one of the symbol_ids listed above, or call \
-             find_class_candidates for full details.",
-            n = listed.len()
-        ));
-    }
-
-    if let Some((hierarchy, total_nodes_seen, truncated)) =
-        g.class_hierarchy(class, depth, resolved_max_nodes)
-    {
-        let response = ClassHierarchyResponse {
-            hierarchy,
-            truncated,
-            max_nodes: resolved_max_nodes,
-            total_nodes_seen,
-        };
-        return tool_success_json(&response);
-    }
-    let class_like = suggest_class_symbols(&g, class, 5);
-    drop(g);
-
-    if class_like.is_empty() {
-        tool_error(format!("class not found: {class:?}"))
-    } else {
-        let suggestions = class_like.join(", ");
-        tool_error(format!(
-            "class not found: {class:?}. Did you mean: {suggestions}?"
-        ))
-    }
+    crate::core::to_call_tool_result(crate::core::structure::get_class_hierarchy(
+        graph, true, class, depth, max_nodes,
+    ))
 }
 
 /// `find_class_candidates` body. Returns every class-like symbol
@@ -511,21 +164,9 @@ pub fn get_class_hierarchy(
 /// error) so clients building UI on top can treat zero hits as
 /// "nothing to disambiguate" rather than special-casing an error.
 pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResult {
-    if name.is_empty() {
-        return tool_error("'name' is required");
-    }
-    let g = graph.read();
-    let mut candidates: Vec<_> = g.find_classes_named(name).into_iter().cloned().collect();
-    candidates.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
-    drop(g);
-    // Map to the standard SymbolResult shape (brief=false to include
-    // signature/column/end_line — discovery is the use case here, and
-    // full fidelity helps the agent decide which candidate it wants).
-    let results: Vec<_> = candidates
-        .iter()
-        .map(|s| super::symbol_to_result(s, false))
-        .collect();
-    tool_success_json(&results)
+    crate::core::to_call_tool_result(crate::core::structure::find_class_candidates(
+        graph, true, name,
+    ))
 }
 
 /// `reliability` tier discriminator for the orphan filter. The
@@ -533,7 +174,7 @@ pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResul
 /// lower-tier rule plus additional ones — so a symbol filtered out at
 /// `high` is also filtered out at `very_high`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReliabilityMode {
+pub(crate) enum ReliabilityMode {
     /// Default. Every `Graph::orphans` result surfaces unchanged.
     All,
     /// Drop virtual methods + macro-synthesized symbols.
@@ -596,11 +237,7 @@ enum ReliabilityMode {
 ///    in those languages. Destructors have name `~ClassName` (C++)
 ///    so they're naturally excluded — orphan destructors are rare
 ///    and worth surfacing.
-fn is_unreliable_orphan(
-    sym: &code_graph_core::Symbol,
-    mode: ReliabilityMode,
-    graph: &Graph,
-) -> bool {
+pub(crate) fn is_unreliable_orphan(sym: &Symbol, mode: ReliabilityMode, graph: &Graph) -> bool {
     let sig = sym.signature.as_str();
     // `High` AND `VeryHigh` apply rules 1+2.
     if sig.starts_with("virtual ") || sig.contains(" virtual ") {
@@ -659,71 +296,15 @@ fn is_unreliable_orphan(
     false
 }
 
-/// Did-you-mean helper for class-like lookups. Filters the candidate pool
-/// to `{Class, Struct, Interface, Trait}` so a Function named "FooBar"
-/// never appears as a suggestion for `class_hierarchy("Foo")`. Deliberately
-/// does NOT reuse `suggest_symbols` from `mod.rs` because that helper is
-/// kind-agnostic.
-fn suggest_class_symbols(graph: &Graph, name: &str, limit: usize) -> Vec<String> {
-    graph
-        .search_symbols(name, None)
-        .into_iter()
-        .filter(|s| {
-            matches!(
-                s.kind,
-                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Trait
-            )
-        })
-        .take(limit)
-        .map(|s| s.name)
-        .collect()
-}
-
 // ----- get_coupling -----
-
-/// Fixed reserve, in bytes, for the [`CouplingBoth`] outer wrapper
-/// (`{"incoming":<page>,"outgoing":<page>}`) when sizing the `both`
-/// response. The literal wrapper text outside the two nested pages is
-/// `{"incoming":,"outgoing":}` = 24 bytes; this rounds up to a
-/// conservative 48 so the envelope can never exceed `max_bytes` even
-/// after the incoming page is serialized at its full byte cost.
-/// Under-estimating here risks an over-budget envelope, so the slack is
-/// deliberate.
-const COUPLING_BOTH_WRAPPER_OVERHEAD: usize = 48;
-
-/// Sort coupling rows by `count` descending, then `file` ascending. The
-/// secondary file-ascending key makes pagination deterministic across
-/// calls when several files share the same edge count (the underlying
-/// `Graph::coupling` walks a `HashMap`, so insertion order is not
-/// stable). Page 1 + page 2 partition the result deterministically.
-fn sort_coupling_rows(rows: &mut [CouplingEntry]) {
-    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.file.cmp(&b.file)));
-}
-
-/// Map a raw `HashMap<PathBuf, u32>` of coupling counts into sorted
-/// [`CouplingEntry`] rows. Path keys are stringified via
-/// `to_string_lossy` for stable cross-platform JSON (`PathBuf`
-/// serializes through `OsStr`, which on Windows can hold a non-UTF-8
-/// surrogate) — same pattern as `detect_cycles`.
-fn coupling_rows(counts: HashMap<PathBuf, u32>) -> Vec<CouplingEntry> {
-    let mut rows: Vec<CouplingEntry> = counts
-        .into_iter()
-        .map(|(path, count)| CouplingEntry {
-            file: path.to_string_lossy().into_owned(),
-            count,
-        })
-        .collect();
-    sort_coupling_rows(&mut rows);
-    rows
-}
 
 /// `get_coupling` body. Required `file` string; optional `direction` in
 /// `{outgoing(default), incoming, both}`; optional `offset`/`limit`
 /// pagination.
 ///
-/// `incoming` / `outgoing` return a [`Page<CouplingEntry>`] — rows sorted
+/// `incoming` / `outgoing` return a `Page<CouplingEntry>` — rows sorted
 /// by `count` descending then `file` ascending, then sliced+byte-budgeted
-/// via `byte_budget_take`. `both` returns a [`CouplingBoth`] carrying two
+/// via `byte_budget_take`. `both` returns a `CouplingBoth` carrying two
 /// independently-paginated pages; the budget is allocated sequentially
 /// (incoming first against the full `max_bytes`, outgoing against the
 /// remainder after the incoming page plus a fixed wrapper overhead).
@@ -752,133 +333,9 @@ pub fn get_coupling(
     limit: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    if file.is_empty() {
-        return tool_error("'file' is required");
-    }
-
-    // Resolve direction up front so an invalid spelling errors before any
-    // graph work. Empty / absent resolves to "outgoing". Accepted
-    // spellings and the error wording mirror `generate_diagram`'s
-    // direction validation idiom.
-    let direction = match direction.unwrap_or("") {
-        "" | "outgoing" => "outgoing",
-        "incoming" => "incoming",
-        "both" => "both",
-        other => {
-            return tool_error(format!(
-                "invalid direction: {other}. Expected one of: outgoing, incoming, both"
-            ));
-        }
-    };
-
-    // Resolve defaults: zero-or-missing limit -> 50; clamp at 1000.
-    // Matches the pagination convention used by `get_orphans` /
-    // `search_symbols` for limit resolution.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(50).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    // Normalize the user-supplied `file` argument before graph lookup.
-    // Mirrors `get_file_symbols`: canonical form when the path exists on
-    // disk (resolving `.` / `..` and stripping
-    // the Windows `\\?\` extended-path prefix), lexical fallback otherwise.
-    // On Linux with an already-canonical path this is effectively identity.
-    let path = paths::normalize_user_path(file);
-
-    if direction == "both" {
-        // Sequential budget allocation. Incoming is sized first against
-        // the full `max_bytes`. The incoming page's serialized cost plus
-        // a conservative fixed wrapper overhead is then subtracted from
-        // `max_bytes` (floored at 0) and the remainder is passed to a
-        // second `byte_budget_take` for outgoing. This guarantees the
-        // `{"incoming":<page>,"outgoing":<page>}` envelope stays within
-        // `max_bytes` even when incoming is large.
-        let g = graph.read();
-        let incoming_rows = coupling_rows(g.incoming_coupling(&path));
-        let outgoing_rows = coupling_rows(g.coupling(&path));
-        drop(g);
-
-        let incoming_total = incoming_rows.len() as u32;
-        let outgoing_total = outgoing_rows.len() as u32;
-
-        let (in_results, _in_kept, in_truncated, in_next) =
-            byte_budget_take(incoming_rows, resolved_offset, resolved_limit, max_bytes);
-        let incoming = Page::<CouplingEntry> {
-            results: in_results,
-            total: incoming_total,
-            offset: resolved_offset,
-            limit: resolved_limit,
-            truncated: in_truncated,
-            next_offset: in_next,
-        };
-
-        // Bytes already spent by the serialized incoming page, plus the
-        // fixed outer-wrapper reserve. `to_string` on plain owned data is
-        // infallible in practice; on the unreachable failure path fall
-        // back to the full budget so `remaining` saturates to 0 and the
-        // outgoing side is starved rather than handed a budget that
-        // could overflow `max_bytes` (a `0` fallback would do the
-        // opposite — the conservative direction is "assume incoming
-        // consumed everything").
-        let incoming_bytes = serde_json::to_string(&incoming)
-            .map(|s| s.len())
-            .unwrap_or(max_bytes);
-        let remaining = max_bytes
-            .saturating_sub(incoming_bytes)
-            .saturating_sub(COUPLING_BOTH_WRAPPER_OVERHEAD);
-
-        let outgoing = if remaining == 0 {
-            // Incoming ate the whole budget. Emit an empty outgoing page
-            // flagged truncated with `next_offset: Some(0)` — the
-            // start-fresh marker telling the client to re-call with
-            // `direction=outgoing offset=0`.
-            Page::<CouplingEntry> {
-                results: vec![],
-                total: outgoing_total,
-                offset: resolved_offset,
-                limit: resolved_limit,
-                truncated: true,
-                next_offset: Some(0),
-            }
-        } else {
-            let (out_results, _out_kept, out_truncated, out_next) =
-                byte_budget_take(outgoing_rows, resolved_offset, resolved_limit, remaining);
-            Page::<CouplingEntry> {
-                results: out_results,
-                total: outgoing_total,
-                offset: resolved_offset,
-                limit: resolved_limit,
-                truncated: out_truncated,
-                next_offset: out_next,
-            }
-        };
-
-        return tool_success_json(&CouplingBoth { incoming, outgoing });
-    }
-
-    let rows = {
-        let g = graph.read();
-        let counts = if direction == "incoming" {
-            g.incoming_coupling(&path)
-        } else {
-            g.coupling(&path)
-        };
-        drop(g);
-        coupling_rows(counts)
-    };
-    let total = rows.len() as u32;
-
-    let (results, _kept, truncated, next_offset) =
-        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<CouplingEntry> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::structure::get_coupling(
+        graph, true, file, direction, offset, limit, max_bytes,
+    ))
 }
 
 // ----- generate_diagram -----
@@ -932,133 +389,7 @@ pub struct GenerateDiagramInput<'a> {
 /// `DiagramResult::edges` is a `Vec`, not `Option`, so this falls out
 /// of the type system.
 pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) -> CallToolResult {
-    // Exactly-one-of validation. Empty strings count as absent so a
-    // client passing `{"symbol": ""}` doesn't pass the check.
-    let symbol = input.symbol.filter(|s| !s.is_empty());
-    let file = input.file.filter(|s| !s.is_empty());
-    let class = input.class.filter(|s| !s.is_empty());
-    let count =
-        usize::from(symbol.is_some()) + usize::from(file.is_some()) + usize::from(class.is_some());
-    if count != 1 {
-        return tool_error("exactly one of 'symbol', 'file', or 'class' is required");
-    }
-
-    let depth = input.depth.filter(|&d| d > 0).unwrap_or(1);
-    let max_nodes = input.max_nodes.filter(|&m| m > 0).unwrap_or(30);
-
-    // Only the `symbol` (call graph) branch consults `direction`, so it is
-    // resolved and validated solely for that mode — a `direction` passed
-    // alongside `file=`/`class=` is ignored rather than rejected, keeping
-    // the "symbol mode only" contract honest. Absent or empty means "both
-    // arms" so callers predating the direction filter keep the original
-    // who-calls-X-and-who-X-calls behavior. Accepted spellings mirror the
-    // serde renames on `DiagramDirection`.
-    let direction = if symbol.is_some() {
-        match input.direction.unwrap_or("") {
-            "" | "both" => DiagramDirection::Both,
-            "callees" => DiagramDirection::Callees,
-            "callers" => DiagramDirection::Callers,
-            other => {
-                return tool_error(format!(
-                    "invalid direction: {other}. Expected one of: callees, callers, both"
-                ));
-            }
-        }
-    } else {
-        // Unused by the file/class branches; the value never reaches a
-        // traversal so the choice is irrelevant.
-        DiagramDirection::Both
-    };
-
-    let format = input.format.unwrap_or("");
-    let format = if format.is_empty() { "edges" } else { format };
-
-    // Validate format up front so an invalid format with valid dispatch
-    // params still produces the format error (not a not-found from the
-    // graph lookup).
-    if format != "edges" && format != "mermaid" {
-        return tool_error(format!(
-            "invalid format: {format}. Expected 'edges' or 'mermaid'"
-        ));
-    }
-
-    // Confidence threshold only applies to `symbol=` mode (call-graph
-    // walks). Parsed up front so an invalid spelling is caught before
-    // the lock is taken even if symbol mode wasn't requested — the
-    // alternative is silently ignoring a typo in non-symbol modes, which
-    // is the bug the per-direction validation already prevents.
-    let min_confidence_filter = match super::parse_min_confidence(input.min_confidence) {
-        Ok(v) => v,
-        Err(e) => return tool_error(e),
-    };
-
-    let g = graph.read();
-    let dr_opt = if let Some(id) = symbol {
-        g.diagram_call_graph(id, direction, depth, max_nodes, min_confidence_filter)
-    } else if let Some(path) = file {
-        // Same normalize wrap as `get_coupling` and `get_file_symbols`.
-        // Only the file-mode branch needs it — the
-        // `symbol` and `class` branches take symbol IDs, not file paths.
-        let normalized = paths::normalize_user_path(path);
-        g.diagram_file_graph(&normalized, depth, max_nodes)
-    } else if let Some(name) = class {
-        g.diagram_inheritance(name, depth, max_nodes)
-    } else {
-        // Unreachable: the exactly-one-of check above guarantees one is
-        // Some. `unreachable!()` documents the invariant; if a future
-        // edit weakens the check, the panic surfaces in tests.
-        unreachable!("exactly-one-of validation guarantees one branch is taken");
-    };
-
-    let dr = match dr_opt {
-        Some(d) => d,
-        None => {
-            // Did-you-mean for symbol/class on miss; bare not-found
-            // for file (no useful suggestion source for filenames).
-            if let Some(id) = symbol {
-                let suggestions = suggest_symbols(&g, id, 5);
-                drop(g);
-                return if suggestions.is_empty() {
-                    tool_error(format!("symbol not found: {id:?}"))
-                } else {
-                    tool_error(format!(
-                        "symbol not found: {id:?}. Did you mean: {suggestions}?"
-                    ))
-                };
-            }
-            if let Some(name) = class {
-                let class_like = suggest_class_symbols(&g, name, 5);
-                drop(g);
-                return if class_like.is_empty() {
-                    tool_error(format!("class not found: {name:?}"))
-                } else {
-                    let suggestions = class_like.join(", ");
-                    tool_error(format!(
-                        "class not found: {name:?}. Did you mean: {suggestions}?"
-                    ))
-                };
-            }
-            // file branch: no did-you-mean.
-            let path = file.expect("exactly-one-of guarantees file is Some on this branch");
-            drop(g);
-            return tool_error(format!("file not found: {path:?}"));
-        }
-    };
-    drop(g);
-
-    match format {
-        "edges" => {
-            // DiagramResult.edges is already Vec<DiagramEdge>; serialize directly.
-            let edges: &Vec<DiagramEdge> = &dr.edges;
-            tool_success_json(edges)
-        }
-        "mermaid" => {
-            // Hardcode "TD" — see fn-level doc comment for rationale.
-            let rendered = dr.render_mermaid("TD", input.styled);
-            CallToolResult::success(vec![Content::text(rendered)])
-        }
-        _ => unreachable!("format validation rejects everything else above"),
-    }
+    crate::core::to_call_tool_result(crate::core::structure::generate_diagram(graph, true, input))
 }
 
 // ----- detect_communities -----
@@ -1103,98 +434,26 @@ pub fn detect_communities(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    let resolved_granularity = match granularity.filter(|s| !s.is_empty()) {
-        None | Some("file") => "file",
-        Some(other) => {
-            return tool_error(format!("invalid granularity: {other:?}; expected \"file\""))
-        }
-    };
-
-    let resolved_max_iterations = max_iterations.filter(|&n| n != 0).unwrap_or(50).min(500);
-    let resolved_members_cap = members_per_community
-        .filter(|&n| n != 0)
-        .unwrap_or(10)
-        .min(100);
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    let result = graph.read().file_communities(resolved_max_iterations);
-
-    let total = result.communities.len() as u32;
-
-    // Member cap applied to every community up front (not just the page
-    // slice) so the byte count `byte_budget_take` measures below matches
-    // what's actually emitted — see fn-level doc comment.
-    let communities: Vec<Community> = result
-        .communities
-        .iter()
-        .map(|c| {
-            let original_len = c.members.len() as u32;
-            let mut members: Vec<String> = c
-                .members
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            let truncated = original_len > resolved_members_cap;
-            if truncated {
-                members.truncate(resolved_members_cap as usize);
-            }
-            Community {
-                label: c.label.clone(),
-                size: original_len,
-                members,
-                truncated,
-                original_len: if truncated { Some(original_len) } else { None },
-            }
-        })
-        .collect();
-
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
-
-    let (termination, iterations) = match result.termination {
-        code_graph_graph::Termination::Converged { iterations } => ("converged", iterations),
-        code_graph_graph::Termination::IterationCeiling { iterations } => {
-            ("iteration_ceiling", iterations)
-        }
-    };
-
-    let degenerate = result.degeneracy.map(|d| match d {
-        code_graph_graph::Degeneracy::Giant { share_permille } => super::DegenerateInfo {
-            kind: "giant",
-            share_permille: Some(share_permille),
-        },
-        code_graph_graph::Degeneracy::Atomized => super::DegenerateInfo {
-            kind: "atomized",
-            share_permille: None,
-        },
-    });
-
-    let response = super::DetectCommunitiesResponse {
-        page: Page::<Community> {
-            results,
-            total,
-            offset: resolved_offset,
-            limit: resolved_limit,
-            truncated,
-            next_offset,
-        },
-        granularity: resolved_granularity,
-        termination,
-        iterations,
-        node_count: result.node_count,
-        edge_count: result.edge_count,
-        degenerate,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::structure::detect_communities(
+        graph,
+        true,
+        granularity,
+        max_iterations,
+        members_per_community,
+        limit,
+        offset,
+        max_bytes,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{body_text, page_parts};
-    use super::super::NO_BYTE_BUDGET;
+    use super::super::{Cycle, NO_BYTE_BUDGET};
     use super::*;
-    use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+    use code_graph_core::{
+        paths, Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind,
+    };
 
     fn sym(name: &str, kind: SymbolKind, file: &str) -> Symbol {
         sym_full(name, kind, file, "")
