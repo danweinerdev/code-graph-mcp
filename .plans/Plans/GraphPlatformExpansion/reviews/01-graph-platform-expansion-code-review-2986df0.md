@@ -40,7 +40,19 @@ findings:
     severity: minor
     title: "PathHop per-hop confidence on the wire sits in tension with FR-23's internal-weighting wording"
     status: answered
-followups: []
+  - id: F-08
+    severity: major
+    title: "detect_communities holds the graph read lock across whole-graph label propagation with no documented tradeoff and no async escape"
+    status: fixed
+  - id: F-09
+    severity: minor
+    title: "get_symbol_at reports an indexed file with zero symbols as file-not-found"
+    status: fixed
+followups:
+  - id: FU-01
+    finding: F-08
+    summary: "Decide whether detect_communities needs an async job plus polling shape like analyze_codebase_async, or a work budget independent of max_iterations, for UE4/LLVM-scale graphs"
+    tracked_in: ""
 ---
 
 # Code Review: GraphPlatformExpansion Phase 1 — Graph Queries
@@ -121,7 +133,15 @@ Added six response snapshots covering all three tools, including a member-capped
 Recorded completion evidence and flipped status for tasks 1.2 through 1.7; the phase doc now matches the tree.
 
 ### F-05 — fixed (2026-08-08)
-Reconciled the design's four-field `PathResult` sketch with the shipped two-field shape, stating why the change was made. Commit 2d8ba81.
+Reconciled the design's four-field `PathResult` sketch with the shipped two-field shape, stating why the change was made. Commit 0820c59.
 
 ### F-06 — fixed (2026-08-08)
 Applied `saturating_add` to the hop and heuristic accumulation and `saturating_mul` to the permille share, per the design's Structural Verification section. The `u64` widen-before-shift in the cost packing is deliberately untouched. Landed as task 1.7, commit a407b41.
+
+### F-08 — fixed (2026-08-08)
+Documented rather than re-architected. `detect_communities` now carries the same acknowledgement `find_path` has: label propagation holds the read guard over the whole aggregated file graph so a concurrent watch reindex waits, `spawn_blocking` protects the tokio scheduler but not the client's wall-clock `MCP_TOOL_TIMEOUT`, and 177 ms on 841 files is the only measured point. Commit 5a5f9f6.
+
+Whether the tool needs the async-job-plus-polling shape `analyze_codebase_async` uses, or a work budget independent of `max_iterations`, is a scope decision tracked as FU-01 rather than settled here. The concern is real at UE4/LLVM scale, which no measurement covers.
+
+### F-09 — fixed (2026-08-08)
+Added `Graph::has_file` backed by the trie's `contains_path` and used it for the file-not-found branch. `merge_file_graph` inserts a `FileEntry` even for a file that parses to zero symbols, so the old emptiness check reported a header of forward declarations as unindexed — while the doc comment claimed it distinguished the two. Regression test merges a `FileGraph` with an empty symbols vec. `get_file_symbols` deliberately untouched: same conflation, but pre-existing and documented as intentional. Commit 5a5f9f6.
