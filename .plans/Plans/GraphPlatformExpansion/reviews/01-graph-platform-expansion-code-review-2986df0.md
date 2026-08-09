@@ -1,7 +1,7 @@
 ---
 title: "Code Review: GraphPlatformExpansion Phase 1 — Graph Queries"
 type: review
-status: open
+status: resolved
 created: 2026-08-08
 updated: 2026-08-08
 tags: [review, phase-1, track-c]
@@ -15,27 +15,27 @@ findings:
   - id: F-01
     severity: major
     title: "find_path dispatches inline while its sibling tools use spawn_blocking, holding the graph read lock across an unbounded Dijkstra"
-    status: open
+    status: fixed
   - id: F-02
     severity: major
     title: "AC-43 performance measurement never run or recorded"
-    status: open
+    status: fixed
   - id: F-03
     severity: major
     title: "AC-18's snapshot half missing — no snapshot_responses.rs coverage for the three new tools"
-    status: open
+    status: fixed
   - id: F-04
     severity: major
     title: "Phase doc marks tasks 1.2-1.4 planned though the code is merged and tested"
-    status: open
+    status: fixed
   - id: F-05
     severity: minor
     title: "Shipped PathResult has two fields where the design documents four"
-    status: open
+    status: fixed
   - id: F-06
     severity: minor
     title: "Saturating arithmetic not applied at the two sites the design names"
-    status: open
+    status: fixed
   - id: F-07
     severity: minor
     title: "PathHop per-hop confidence on the wire sits in tension with FR-23's internal-weighting wording"
@@ -107,3 +107,21 @@ followups: []
 Kept, and the requirement clarified rather than the field removed. These responses are consumed by agents, and per-hop detail lets a caller identify the weak link without a second query — a field earns its place by removing a round-trip (D-0007). FR-23 was amended to distinguish the *weighting* (internal: no numeric value, score, or cost on the wire) from *which hops were heuristically resolved* (permitted, and useful).
 
 The review also surfaced that a binary resolved/heuristic tag is a one-bit projection of the signal a caller can actually act on — how many candidates competed. That is now FR-48 / AC-57, with phase 9 (`09-Resolver-Candidate-Count.md`) carrying the work, since it needs a resolver change and a cache-format bump and cannot be reconstructed downstream. Governing facts: D-0007, FR-23, FR-48, AC-57.
+
+### F-01 — fixed (2026-08-08)
+Wrapped `find_path`'s `#[tool]` dispatch in `tokio::task::spawn_blocking`, matching the `get_coupling` and `detect_communities` precedent. Landed as task 1.5, commit 8d3e7ca. No behaviour or response-byte change.
+
+### F-02 — fixed (2026-08-08)
+Added an `#[ignore]`-gated `query_perf` test — the existing bench harness measures indexing only, which is why AC-43 was never runnable — and recorded the numbers in `notes/phase-1-query-performance.md`: `file_communities` 177.3 ms and `shortest_path` 0.4 ms against `external/abseil-cpp/absl` (841 files, 9,879 symbols, 91,874 edges). The path figure is recorded with an explicit caveat that it is not a worst case: the search exhausted after 307 nodes. Task 1.4's subtask plus commit 8dac325.
+
+### F-03 — fixed (2026-08-08)
+Added six response snapshots covering all three tools, including a member-capped community pinning `truncated: true` with `original_len: 5` (AC-32) and the granularity/termination fields (AC-53, AC-54). Landed as task 1.6, commit 28ac556. Only new `.snap` files; no existing snapshot moved.
+
+### F-04 — fixed (2026-08-08)
+Recorded completion evidence and flipped status for tasks 1.2 through 1.7; the phase doc now matches the tree.
+
+### F-05 — fixed (2026-08-08)
+Reconciled the design's four-field `PathResult` sketch with the shipped two-field shape, stating why the change was made. Commit 2d8ba81.
+
+### F-06 — fixed (2026-08-08)
+Applied `saturating_add` to the hop and heuristic accumulation and `saturating_mul` to the permille share, per the design's Structural Verification section. The `u64` widen-before-shift in the cost packing is deliberately untouched. Landed as task 1.7, commit a407b41.
