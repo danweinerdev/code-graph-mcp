@@ -5,18 +5,24 @@
 //! returns a `CallToolResult` ready to hand back to rmcp. Error wording
 //! matches the Go reference at `internal/tools/symbols.go` byte-for-byte.
 
-use std::path::Path;
-
-use code_graph_core::{paths, symbol_id, Symbol};
-use code_graph_graph::{Graph, SearchParams};
+use code_graph_graph::Graph;
 use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 
-use super::{
-    byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    tool_error, tool_success_json, EnclosingSymbol, Page, SearchSymbolsResponse, SummaryRow,
-    SymbolResult, ENVELOPE_OVERHEAD_BYTES,
-};
+// Logic (and most of these types) moved to `crate::core::symbols` (task
+// 2.4). The remaining production code here is thin adapters plus the pure
+// helpers (`is_plain_identifier`, `max_distance_for_query`, `levenshtein`)
+// kept per Decision 4, none of which need these imports. They survive only
+// because the existing `#[cfg(test)] mod tests` (Decision 6 — left
+// unmodified) still exercises the adapter output and the pure helpers
+// through `use super::*`.
+#[cfg(test)]
+use code_graph_core::paths;
+#[cfg(test)]
+use std::path::Path;
+
+#[cfg(test)]
+use super::{Page, SymbolResult};
 
 /// `get_file_symbols` body. Returns a tool error when `file` is empty or
 /// when the file has no symbols at all (raw set empty — the Go binary's
@@ -71,98 +77,17 @@ pub fn get_file_symbols(
     count_only: bool,
     max_bytes: usize,
 ) -> CallToolResult {
-    if file.is_empty() {
-        return tool_error("'file' is required");
-    }
-
-    // Normalize the user-supplied file argument before graph lookup.
-    // `normalize_user_path` returns the canonical form
-    // when the path exists on disk (resolving `.` / `..` and stripping the
-    // Windows `\\?\` extended-path prefix when the short form is valid) and
-    // falls back to a lexical strip otherwise. On Linux with an already-
-    // canonical path this is effectively identity, so existing call sites
-    // (and snapshot tests) are byte-identical.
-    let path = paths::normalize_user_path(file);
-    let symbols = graph.read().file_symbols(&path);
-    // Raw-set-empty -> existing tool error. Wording preserved byte-for-byte
-    // so agents that match against this string keep working. This branch
-    // executes BEFORE the byte-budget step so a misspelled file path
-    // always surfaces the diagnostic error wording rather than an
-    // empty Page<T>.
-    if symbols.is_empty() {
-        return tool_error(format!("no symbols found in file: {file}"));
-    }
-
-    // Count-only short-circuit: count the post-filter match set WITHOUT
-    // materializing SymbolResults or
-    // invoking `byte_budget_take`. Order is load-bearing — must run AFTER
-    // the empty-raw-set check (so misspelled files keep the diagnostic
-    // error wording) but BEFORE the materialization step below.
-    if count_only {
-        let total = if top_level_only {
-            symbols.iter().filter(|s| s.parent.is_empty()).count() as u32
-        } else {
-            symbols.len() as u32
-        };
-        // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract. count_only callers
-        // opted out of paging; echoing a would-have-been limit would
-        // mislead them into thinking there's a record page to fetch. The
-        // exception is documented in CLAUDE.md alongside the count_only
-        // sub-block.
-        let response = Page::<SymbolResult> {
-            results: vec![],
-            total,
-            offset: 0,
-            limit: 0,
-            truncated: false,
-            next_offset: None,
-        };
-        return tool_success_json(&response);
-    }
-
-    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    // Apply `top_level_only` filter into a Vec<SymbolResult>. Build the
-    // Vec eagerly so we can sort + slice + count it in subsequent steps.
-    // The filter runs BEFORE `total` is captured so `total` reflects the
-    // post-filter, pre-pagination match count.
-    let mut results: Vec<SymbolResult> = Vec::with_capacity(symbols.len());
-    for s in &symbols {
-        if top_level_only && !s.parent.is_empty() {
-            continue;
-        }
-        results.push(symbol_to_result(s, brief));
-    }
-
-    let total = results.len() as u32;
-
-    // Sort by symbol_id ascending so pagination is deterministic across
-    // calls. `Graph::file_symbols` returns symbols in graph-merge order
-    // which is stable per-build but not part of the wire contract; sorting
-    // canonicalizes the sequence.
-    results.sort_by(|a, b| a.id.cmp(&b.id));
-
-    // Route through byte_budget_take so the page honors the byte budget:
-    // the helper internally applies offset+limit skip/take and stops early
-    // if the running serialized byte count would exceed
-    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
-    // `results.len() as u32`, NOT the pre-pagination match count — that's
-    // `total` captured above and held unchanged.
-    let (records, _total_kept, truncated, next_offset) =
-        byte_budget_take(results, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<SymbolResult> {
-        results: records,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::symbols::get_file_symbols(
+        graph,
+        true,
+        file,
+        top_level_only,
+        brief,
+        limit,
+        offset,
+        count_only,
+        max_bytes,
+    ))
 }
 
 /// `get_symbol_at` body. Answers "what symbol encloses this line?" by
@@ -202,65 +127,9 @@ pub fn get_symbol_at(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    if file.is_empty() {
-        return tool_error("'file' is required");
-    }
-    if line == 0 {
-        return tool_error("'line' must be >= 1 (lines are 1-based)");
-    }
-
-    // Normalize the user-supplied file argument before graph lookup,
-    // exactly as `get_file_symbols` does.
-    let path = paths::normalize_user_path(file);
-
-    let g = graph.read();
-    // Distinguish "file not indexed" from "file indexed but nothing
-    // encloses this line (including a file with zero symbols at all)":
-    // `has_file` is a real presence check on the `files` PathTrie, unlike
-    // `file_symbols(&path).is_empty()` which is also true for a
-    // legitimately indexed zero-symbol file (forward-declaration-only
-    // header, comment-only file, unconfigured macro invocation).
-    if !g.has_file(&path) {
-        drop(g);
-        return tool_error(format!("file not found: {file:?}"));
-    }
-    let symbols = g.symbols_at_line(&path, line);
-    drop(g);
-
-    let total = symbols.len() as u32;
-
-    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    // Already in `symbols_at_line`'s total order (span_lines asc, line
-    // desc, symbol_id asc) — no re-sort needed before pagination.
-    let results: Vec<EnclosingSymbol> = symbols
-        .iter()
-        .map(|s| EnclosingSymbol {
-            symbol_id: symbol_id(s),
-            name: s.name.clone(),
-            kind: kind_str(s.kind).to_string(),
-            line: s.line,
-            end_line: s.end_line,
-            span_lines: s.end_line.saturating_sub(s.line),
-            parent: s.parent.clone(),
-            namespace: s.namespace.clone(),
-        })
-        .collect();
-
-    let (records, _total_kept, truncated, next_offset) =
-        byte_budget_take(results, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<EnclosingSymbol> {
-        results: records,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::symbols::get_symbol_at(
+        graph, true, file, line, limit, offset, max_bytes,
+    ))
 }
 
 /// Inputs to [`search_symbols`]. Bundled into a struct so the handler
@@ -332,295 +201,9 @@ pub fn search_symbols(
     input: SearchSymbolsInput<'_>,
     max_bytes: usize,
 ) -> CallToolResult {
-    let query_str = input.query.unwrap_or("");
-    let kind_str_ref = input.kind.unwrap_or("");
-    let namespace_str = input.namespace.unwrap_or("");
-    let language_str = input.language.unwrap_or("");
-
-    if query_str.is_empty()
-        && kind_str_ref.is_empty()
-        && namespace_str.is_empty()
-        && language_str.is_empty()
-    {
-        // Four-term message (vs. Go's three) — `language` is a Rust-only filter
-        // addition (the first consumer of `Symbol::language`). Listing
-        // it here keeps the error truthful about what satisfies the validation.
-        return tool_error("'query', 'kind', 'namespace', or 'language' is required");
-    }
-
-    let parsed_kind = if kind_str_ref.is_empty() {
-        None
-    } else {
-        match parse_kind(kind_str_ref) {
-            Some(k) => Some(k),
-            None => return tool_error(format!("invalid kind: {kind_str_ref}")),
-        }
-    };
-
-    let parsed_language = if language_str.is_empty() {
-        None
-    } else {
-        match parse_language(language_str) {
-            Some(l) => Some(l),
-            None => return tool_error(format!("invalid language: {language_str}")),
-        }
-    };
-
-    let resolved_limit = input.limit.filter(|&l| l > 0).unwrap_or(20).min(1000);
-    let resolved_offset = input.offset.unwrap_or(0);
-    // Normalize subtree the same way every path-taking tool does.
-    // Scope validation lives at the server-dispatch boundary in
-    // `CodeGraphServer::validate_subtree`; by the time this function
-    // is called, `input.subtree` is either absent / empty (no filter)
-    // or an already-canonical path proven to be at or under the
-    // indexed root.
-    let resolved_subtree: Option<std::path::PathBuf> = input
-        .subtree
-        .filter(|s| !s.is_empty())
-        .map(code_graph_core::paths::normalize_user_path);
-
-    // `near` mode and `count_only` are mutually exclusive — the tool
-    // schema advertises "Incompatible with count_only". A fuzzy count
-    // would still require the full N-symbol edit-distance scan with no
-    // heap short-circuit, so the combination buys nothing. This guard MUST
-    // precede the `count_only` short-circuit below: otherwise that
-    // short-circuit returns a regex/substring count (different query
-    // semantics, ignores `max_distance`) before the near branch is ever
-    // consulted, silently contradicting the schema.
-    if input.near && input.count_only {
-        return tool_error(
-            "near mode is incompatible with count_only; drop one of them \
-             (a fuzzy search has no bounded count short-circuit)",
-        );
-    }
-
-    // Count-only short-circuit: delegate to `Graph::search` with
-    // `count_only=true` so the
-    // BinaryHeap<TopEntry> is never constructed. `sr.symbols` is guaranteed
-    // empty on this path; only `sr.total` (the pre-pagination match count)
-    // is meaningful. Emit the documented sentinel envelope.
-    // The `^…$` anchored-zero `suggestions` enrichment deliberately does NOT
-    // apply on this path: count_only callers opted out of the records-bearing
-    // response, and a suggestion list would breach the < 1 KB sentinel
-    // contract. Anchored-exact misses under count_only get a bare count only.
-    if input.count_only {
-        let sr = graph.read().search(SearchParams {
-            pattern: query_str.to_string(),
-            kind: parsed_kind,
-            namespace: namespace_str.to_string(),
-            language: parsed_language,
-            limit: 0,
-            offset: 0,
-            count_only: true,
-            subtree: resolved_subtree.clone(),
-        });
-        // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract. count_only callers
-        // opted out of paging; echoing a would-have-been limit would
-        // mislead them into thinking there's a record page to fetch. The
-        // exception is documented in CLAUDE.md alongside the count_only
-        // sub-block.
-        let response = Page::<SymbolResult> {
-            results: vec![],
-            total: sr.total,
-            offset: 0,
-            limit: 0,
-            truncated: false,
-            next_offset: None,
-        };
-        return tool_success_json(&response);
-    }
-
-    // Near mode (fuzzy / edit-distance) dispatch. Branches BEFORE the
-    // regex/substring path. `query` is required and must be a plain
-    // identifier (no regex metacharacters) — the edit-distance pass
-    // operates over the symbol-name dictionary, not over regex
-    // matches. `count_only` is incompatible with near mode: a
-    // count-only fuzzy search would still have to do the full N-scan
-    // (no heap short-circuit makes sense here), so we reject the
-    // combination rather than silently incurring the cost. Kind /
-    // language / namespace filters compose normally as a
-    // post-distance filter pass.
-    if input.near {
-        if query_str.is_empty() {
-            return tool_error("near mode requires a non-empty 'query'");
-        }
-        if !is_plain_identifier(query_str) {
-            return tool_error(
-                "near mode requires a plain identifier query (no regex metacharacters); \
-                 use the default mode if you need regex matching",
-            );
-        }
-        // Clamp + length-adapt the distance threshold.
-        let max_distance = input
-            .max_distance
-            .map(|d| (d as usize).min(8))
-            .unwrap_or_else(|| max_distance_for_query(query_str.len()));
-        return near_search(
-            graph,
-            query_str,
-            max_distance,
-            parsed_kind,
-            parsed_language,
-            namespace_str,
-            resolved_subtree.as_deref(),
-            resolved_limit,
-            resolved_offset,
-            input.brief,
-            max_bytes,
-        );
-    }
-
-    let sr = graph.read().search(SearchParams {
-        pattern: query_str.to_string(),
-        kind: parsed_kind,
-        namespace: namespace_str.to_string(),
-        language: parsed_language,
-        limit: resolved_limit,
-        offset: resolved_offset,
-        count_only: false,
-        subtree: resolved_subtree,
-    });
-
-    // `sr.symbols` is the already-sliced page (length <= resolved_limit).
-    // Map to SymbolResult eagerly so we can size each record against the
-    // byte budget.
-    let page: Vec<SymbolResult> = sr
-        .symbols
-        .iter()
-        .map(|s| symbol_to_result(s, input.brief))
-        .collect();
-
-    // Handler-layer trim: iterate the mapped page, accumulating
-    // serialized-JSON byte counts (plus a +1 inter-record comma, mirroring
-    // `byte_budget_take`'s accounting). Stop at the first record whose
-    // admission would push the running total past
-    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. The dropped record's index `k`
-    // (within `page`) becomes the offset delta for `next_offset`.
-    //
-    // saturating_sub guards against pathological `max_bytes` smaller than
-    // `ENVELOPE_OVERHEAD_BYTES` (including `max_bytes == 0`): budget
-    // becomes 0 and the first record's projected total trips the cutoff.
-    //
-    // If we exhaust the page without the budget biting, `truncated` stays
-    // `false` and `next_offset` stays `None` — including the case where
-    // `Graph::search` returned a short page (end of match set). Only the
-    // budget-driven trim sets `truncated=true`.
-    let budget = max_bytes.saturating_sub(ENVELOPE_OVERHEAD_BYTES);
-    let mut results: Vec<SymbolResult> = Vec::with_capacity(page.len());
-    let mut running_bytes: usize = 0;
-    let mut truncated = false;
-    let mut next_offset: Option<u32> = None;
-
-    for record in page {
-        // Production records (SymbolResult) hold only plain owned data and
-        // never fail to serialize; the unwrap_or(0) fallback mirrors
-        // `byte_budget_take` and only exists to satisfy the Serialize bound.
-        let serialized_len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
-        // +1 covers the inter-record comma. Over-counts by 1 on the first
-        // record — intentional headroom, same as `byte_budget_take`.
-        let projected = running_bytes
-            .saturating_add(serialized_len)
-            .saturating_add(1);
-        if projected > budget {
-            // Budget bites: this record is the first one DROPPED. `k` is the
-            // count of records ALREADY kept; `resolved_offset + k` is where
-            // the next call should re-page from to pick up this dropped
-            // record as its first entry — no overlap, no gap at the trim
-            // boundary.
-            let k = results.len() as u32;
-            truncated = true;
-            next_offset = Some(resolved_offset.saturating_add(k));
-            break;
-        }
-        running_bytes = projected;
-        results.push(record);
-    }
-
-    let page = Page::<SymbolResult> {
-        results,
-        total: sr.total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-
-    // Anchored-zero suggestion trigger. Only an *exact-match* query
-    // (`^…$`) that found zero results earns did-you-mean candidates: an
-    // anchored query expresses "I expect this precise symbol to exist", so
-    // a zero-result anchored query is most likely a typo of a real symbol.
-    // A non-anchored zero-result query is treated as "this concept is not
-    // in the codebase" and gets NO suggestions — the absence is the
-    // answer, not an error to recover from. `query_str` is the raw,
-    // untransformed user input the tool received, so the `^`/`$` test
-    // keys off exactly what the caller typed.
-    //
-    // The candidate pool comes from a broad substring match on the
-    // anchors-stripped inner pattern via `Graph::search_symbols(inner,
-    // None)` (no kind filter), taking the first five matches' symbol-id
-    // strings. `Graph::search_symbols` returns `Vec<Symbol>`, so the id
-    // string is constructed with `symbol_id` (the same idiom
-    // `suggest_symbols` uses); it is intentionally NOT reused here because
-    // it returns a comma-joined `String` shaped for error messages, and
-    // its other callers depend on that form.
-    //
-    // A degenerate `"^$"` query strips to an empty inner pattern. Calling
-    // the broad matcher with `""` would match every symbol in the graph
-    // and surface noise, so the empty-inner case is short-circuited to no
-    // suggestions — an exact-match request for the empty string has no
-    // meaningful "did you mean".
-    let suggestions: Vec<String> = if page.total == 0
-        && query_str.starts_with('^')
-        && query_str.ends_with('$')
-        && query_str.len() >= 2
-    {
-        let inner = &query_str[1..query_str.len() - 1];
-        if inner.is_empty() {
-            Vec::new()
-        } else if is_plain_identifier(inner) {
-            // Plain identifier — user likely typed a name that's close
-            // to a real symbol. Prefer Levenshtein over substring because
-            // substring matching routinely hits incidental matches inside
-            // long compound names (e.g. "Actr" appearing inside
-            // "ExtractRelativePath"), so the substring hits aren't
-            // actually close to what the user typed.
-            //
-            // Substring stays as the fallback when Levenshtein finds
-            // nothing within the length-adaptive threshold — better-
-            // than-nothing for very-short queries (`^A$` has threshold
-            // 0, so only exact matches pass Levenshtein) and for queries
-            // far from any real symbol.
-            let near_hits = levenshtein_suggestions(&graph.read(), inner, 5);
-            if !near_hits.is_empty() {
-                near_hits
-            } else {
-                graph
-                    .read()
-                    .search_symbols(inner, None)
-                    .iter()
-                    .take(5)
-                    .map(symbol_id)
-                    .collect()
-            }
-        } else {
-            // Regex pattern — Levenshtein doesn't semantically apply
-            // (the user wrote metacharacters intentionally, not a typo).
-            // Fall back to substring.
-            graph
-                .read()
-                .search_symbols(inner, None)
-                .iter()
-                .take(5)
-                .map(symbol_id)
-                .collect()
-        }
-    } else {
-        Vec::new()
-    };
-
-    let response = SearchSymbolsResponse { page, suggestions };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::symbols::search_symbols(
+        graph, true, input, max_bytes,
+    ))
 }
 
 /// Whether `s` consists of identifier-safe bytes only — ASCII letters,
@@ -633,101 +216,13 @@ pub fn search_symbols(
 /// Unicode identifier support here is straightforward
 /// (`UnicodeXID::is_xid_continue`) but pulls a new dependency for a
 /// low-value case — deferred until a user actually hits it.
-fn is_plain_identifier(s: &str) -> bool {
+pub(crate) fn is_plain_identifier(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Return up to `limit` symbols whose name is within an
-/// length-adaptive Levenshtein distance of `inner`. Sorted by
-/// ascending distance, then alphabetically.
-///
-/// The distance threshold scales with name length: 1 edit at lengths
-/// 2-11, 2 edits at 12-17, 3 edits at 18+. This avoids "every short
-/// name matches every 1-char query" while still giving meaningful
-/// hits on long identifiers (`FAchievmentsClient` → `FAchievementsClient`
-/// is a 1-edit fix at length 19).
-///
-/// Cost: O(N × len²) where N is the symbol name count (~700k on
-/// Engine-scale codebases) and `len` is `inner.len()`. The standard
-/// two-row Wagner-Fischer DP is fast enough at typical query lengths
-/// (~50ms on Engine) for the failure-path-only fallback. A BK-tree or
-/// min-hash index would amortize this if benchmarks ever justify it;
-/// the unconditional N-scan keeps the implementation slim until then.
-fn levenshtein_suggestions(graph: &Graph, inner: &str, limit: usize) -> Vec<String> {
-    let max_distance = max_distance_for_query(inner.len());
-    let mut candidates: Vec<(usize, &Symbol)> = Vec::new();
-    let inner_chars: Vec<char> = inner.chars().collect();
-    let inner_char_len = inner_chars.len();
-    for sym in graph.all_symbols() {
-        let name_chars: Vec<char> = sym.name.chars().collect();
-        // Length-difference quick-reject: two strings whose lengths
-        // differ by more than `max_distance` cannot be within
-        // `max_distance` edits of each other.
-        if name_chars.len().abs_diff(inner_char_len) > max_distance {
-            continue;
-        }
-        let d = levenshtein(&inner_chars, &name_chars, max_distance);
-        if d <= max_distance {
-            candidates.push((d, sym));
-        }
-    }
-    // Sort: (distance asc, common-prefix DESC, is_shorter_than_query
-    // asc, length-closeness asc, name asc).
-    //
-    // - Distance dominates: closer matches win.
-    // - Common-prefix length DESC as the secondary key captures
-    //   "the user got the prefix right and typoed the end" — the
-    //   dominant typo pattern in code identifiers.
-    // - **is_shorter_than_query asc**: when distance + prefix are tied,
-    //   prefer a candidate that is the same length as or LONGER than
-    //   the query. Captures "the user typed too few characters" (the
-    //   insert-typo case) as more likely than "typed too many" (the
-    //   delete-typo case) for short identifiers. Concretely: for
-    //   `^Actr$`, `Act` (delete) and `Actor` (insert) tie on distance
-    //   (both 1) and prefix (both 3); without this key, alphabetical
-    //   fallback put `Act` first even though `Actor` is the
-    //   overwhelmingly more likely intent. `false` (not shorter)
-    //   sorts before `true` (shorter), so longer-or-equal candidates
-    //   win the tie.
-    // - Length-closeness asc as the next key: when same-or-longer is
-    //   tied, prefer the one closer in size to the query.
-    // - Name asc as the final stable key keeps results deterministic.
-    candidates.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| {
-                // DESC: larger prefix-overlap comes first.
-                common_prefix_chars(&b.1.name, inner).cmp(&common_prefix_chars(&a.1.name, inner))
-            })
-            .then_with(|| {
-                let a_shorter = a.1.name.chars().count() < inner_char_len;
-                let b_shorter = b.1.name.chars().count() < inner_char_len;
-                a_shorter.cmp(&b_shorter)
-            })
-            .then_with(|| {
-                let a_diff = (a.1.name.chars().count() as i64 - inner_char_len as i64).abs();
-                let b_diff = (b.1.name.chars().count() as i64 - inner_char_len as i64).abs();
-                a_diff.cmp(&b_diff)
-            })
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
-    candidates
-        .into_iter()
-        .take(limit)
-        .map(|(_, s)| symbol_id(s))
-        .collect()
-}
-
-/// Count leading characters `a` and `b` share. UTF-8-safe (counts
-/// `char`s, not bytes) so multi-byte identifiers don't desync the
-/// comparison. Used as the tertiary sort key in
-/// [`levenshtein_suggestions`] and [`near_search`].
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
-}
-
-/// Length-adaptive max-edit-distance gate. Documented in the
-/// [`levenshtein_suggestions`] doc-comment.
-fn max_distance_for_query(len: usize) -> usize {
+/// Length-adaptive max-edit-distance gate. Documented alongside the
+/// (now `core::symbols`) Levenshtein-suggestion callers.
+pub(crate) fn max_distance_for_query(len: usize) -> usize {
     match len {
         0..=1 => 0,
         2..=11 => 1,
@@ -743,7 +238,7 @@ fn max_distance_for_query(len: usize) -> usize {
 ///
 /// `a` and `b` are passed as char slices so multi-byte code points
 /// count as one edit (e.g. accented characters), not one per byte.
-fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
+pub(crate) fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
     let n = a.len();
     let m = b.len();
     if n == 0 {
@@ -779,151 +274,11 @@ fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
     prev[m]
 }
 
-/// `search_symbols(near=true, …)` body. Edit-distance scan over the
-/// whole symbol-name dictionary, post-filtered by kind / language /
-/// namespace, sorted `(distance asc, name asc)`, paginated, then
-/// byte-budgeted via the same envelope-overhead accounting the
-/// regex/substring path uses. Returns the standard `Page<SymbolResult>`
-/// envelope so consumers can switch between modes without reshaping
-/// their deserializer.
-///
-/// Compared with the failure-only Levenshtein in the suggestion path:
-/// this version (a) is opt-in, (b) returns full SymbolResult records
-/// instead of bare symbol-id strings, (c) honors `total` /
-/// `truncated` / `next_offset` for pagination, and (d) composes with
-/// kind/language/namespace filters.
-#[allow(clippy::too_many_arguments)]
-fn near_search(
-    graph: &RwLock<Graph>,
-    query: &str,
-    max_distance: usize,
-    kind: Option<code_graph_core::SymbolKind>,
-    language: Option<code_graph_core::Language>,
-    namespace: &str,
-    subtree: Option<&std::path::Path>,
-    resolved_limit: u32,
-    resolved_offset: u32,
-    brief: bool,
-    max_bytes: usize,
-) -> CallToolResult {
-    let query_chars: Vec<char> = query.chars().collect();
-    let lower_ns = namespace.to_lowercase();
-
-    // Phase 1: scan all symbols, keep those within `max_distance`. The
-    // length-difference quick-reject prunes most candidates without
-    // entering the DP. Apply kind/language/namespace post-filters
-    // alongside so we never compute distance for a symbol that would
-    // have been dropped anyway.
-    let g = graph.read();
-    let mut hits: Vec<(usize, Symbol)> = Vec::new();
-    for sym in g.all_symbols() {
-        if let Some(k) = kind {
-            if sym.kind != k {
-                continue;
-            }
-        }
-        if let Some(l) = language {
-            if sym.language != l {
-                continue;
-            }
-        }
-        if !lower_ns.is_empty() && !sym.namespace.to_lowercase().contains(&lower_ns) {
-            continue;
-        }
-        // Subtree filter — parity with the regex/substring path, which
-        // passes `subtree` through `SearchParams`. `starts_with` is
-        // component-aware (so `/a/foo` does NOT match `/a/foobar`). The
-        // prefix is the already-normalized, root-validated path proven at
-        // the MCP-dispatch boundary (`CodeGraphServer::validate_subtree`).
-        if let Some(prefix) = subtree {
-            if !std::path::Path::new(&sym.file).starts_with(prefix) {
-                continue;
-            }
-        }
-        let name_chars: Vec<char> = sym.name.chars().collect();
-        if name_chars.len().abs_diff(query_chars.len()) > max_distance {
-            continue;
-        }
-        let d = levenshtein(&query_chars, &name_chars, max_distance);
-        if d <= max_distance {
-            hits.push((d, sym.clone()));
-        }
-    }
-    drop(g);
-
-    let total = hits.len() as u32;
-
-    // Phase 2: sort by (distance asc, common-prefix DESC,
-    // is_shorter_than_query asc, length-closeness asc, name asc).
-    // Matches the suggestion-path sort in `levenshtein_suggestions` —
-    // see that doc-comment for the rationale of each key. The
-    // shorter-than-query penalty captures the insert-typo bias in
-    // identifier completion: when a user types a 4-char query that's
-    // 1 edit from both a 3-char (delete) and 5-char (insert)
-    // candidate, the longer is the more likely intent.
-    let query_char_len = query_chars.len();
-    hits.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| {
-                common_prefix_chars(&b.1.name, query).cmp(&common_prefix_chars(&a.1.name, query))
-            })
-            .then_with(|| {
-                let a_shorter = a.1.name.chars().count() < query_char_len;
-                let b_shorter = b.1.name.chars().count() < query_char_len;
-                a_shorter.cmp(&b_shorter)
-            })
-            .then_with(|| {
-                let a_diff = (a.1.name.chars().count() as i64 - query_char_len as i64).abs();
-                let b_diff = (b.1.name.chars().count() as i64 - query_char_len as i64).abs();
-                a_diff.cmp(&b_diff)
-            })
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
-
-    // Phase 3: paginate via byte_budget_take on the SymbolResult-mapped
-    // form. The mapping happens before the cut so each candidate is
-    // sized against the budget as JSON, not as Rust.
-    let mapped: Vec<SymbolResult> = hits
-        .into_iter()
-        .map(|(_d, s)| symbol_to_result(&s, brief))
-        .collect();
-    let (results, _kept, truncated, next_offset) =
-        super::byte_budget_take(mapped, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<SymbolResult> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
-}
-
 /// `get_symbol_detail` body. Returns full detail (brief=false) on hit; on
 /// miss, attaches a did-you-mean suggestion when any candidate symbols
 /// match the substring.
 pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult {
-    if symbol.is_empty() {
-        return tool_error("'symbol' is required");
-    }
-
-    let g = graph.read();
-    if let Some(s) = g.symbol_detail(symbol) {
-        let result = symbol_to_result(&s, false);
-        return tool_success_json(&result);
-    }
-
-    let suggestions = suggest_symbols(&g, symbol, 5);
-    drop(g);
-    if suggestions.is_empty() {
-        tool_error(format!("symbol not found: {symbol:?}"))
-    } else {
-        tool_error(format!(
-            "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
-        ))
-    }
+    crate::core::to_call_tool_result(crate::core::symbols::get_symbol_detail(graph, true, symbol))
 }
 
 /// `get_symbol_summary` body. Returns a [`Page`]`<`[`SummaryRow`]`>`
@@ -964,87 +319,9 @@ pub fn get_symbol_summary(
     count_only: bool,
     max_bytes: usize,
 ) -> CallToolResult {
-    let path: Option<&Path> = file.filter(|s| !s.is_empty()).map(Path::new);
-    let summary = graph.read().symbol_summary(path);
-
-    // Count-only short-circuit: emit the sentinel envelope
-    // WITHOUT flattening rows or invoking `byte_budget_take`. `total` is
-    // the number of distinct `(namespace, kind)` pairs — i.e. the row
-    // count the paginated path below would emit (one row per inner-map
-    // entry). Summing inner-map lengths matches the nested-loop count
-    // exactly, so `count_only=true` and `count_only=false` agree on `total`.
-    if count_only {
-        let total: u32 = summary.values().map(|m| m.len()).sum::<usize>() as u32;
-        // `limit: 0` is a deliberate exception to the
-        // "envelope echoes resolved limit" contract.
-        // count_only callers opted out of paging; echoing a would-have-been
-        // limit would mislead them into thinking there's a record page to
-        // fetch. The exception is documented in CLAUDE.md alongside the
-        // count_only sub-block.
-        let response = Page::<SummaryRow> {
-            results: vec![],
-            total,
-            offset: 0,
-            limit: 0,
-            truncated: false,
-            next_offset: None,
-        };
-        return tool_success_json(&response);
-    }
-
-    // Flatten the nested map: one row per (namespace, kind) pair. The
-    // empty-namespace -> `<global>` rename is applied at row
-    // build time, BEFORE the sort, and only here — the graph's
-    // `Symbol.namespace` stays empty and `search_symbols(namespace="")`
-    // still filters by the empty string. The rename is intentionally
-    // asymmetric: display label vs query filter.
-    let mut rows: Vec<SummaryRow> = Vec::new();
-    for (ns, kinds) in summary {
-        let display_ns = if ns.is_empty() {
-            "<global>".to_string()
-        } else {
-            ns.clone()
-        };
-        for (k, count) in kinds {
-            rows.push(SummaryRow {
-                namespace: display_ns.clone(),
-                kind: kind_str(k),
-                count,
-            });
-        }
-    }
-
-    // Sort by `(namespace, kind)` ascending so pagination is deterministic
-    // across calls. `Graph::symbol_summary` walks a HashMap, so without
-    // this canonicalization the page boundaries would shift between runs.
-    // The sort key matches the contract documented on `SummaryRow`.
-    rows.sort_by(|a, b| (a.namespace.as_str(), a.kind).cmp(&(b.namespace.as_str(), b.kind)));
-
-    let total = rows.len() as u32;
-
-    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
-    // Mirrors `get_orphans` / `get_file_symbols` conventions.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    // Route through byte_budget_take so the page honors the byte budget:
-    // the helper internally applies offset+limit skip/take and stops early
-    // if the running serialized byte count would exceed
-    // `max_bytes - ENVELOPE_OVERHEAD_BYTES`. `total_kept` from the helper is
-    // `results.len() as u32`, NOT the pre-pagination row count — that's
-    // `total` captured above and held unchanged.
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<SummaryRow> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::symbols::get_symbol_summary(
+        graph, true, file, limit, offset, count_only, max_bytes,
+    ))
 }
 
 #[cfg(test)]

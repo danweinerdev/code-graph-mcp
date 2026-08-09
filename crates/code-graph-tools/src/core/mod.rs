@@ -16,6 +16,7 @@ use serde::Serialize;
 
 pub mod query;
 pub mod status;
+pub mod symbols;
 pub mod watch;
 
 /// A successful outcome. Two variants because two tools legitimately
