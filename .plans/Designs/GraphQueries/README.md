@@ -178,6 +178,8 @@ pub struct CommunityResult {
 pub fn file_communities(&self, max_iterations: u32) -> CommunityResult;
 ```
 
+The shipped `PathResult` carries `hops` and `heuristic_hops` only; `nodes_examined` and `cap_reached` are returned on the outer tuple instead, where they are available on both the found and not-found paths. The four-field sketch above was the original shape — holding those two values in the struct *and* the tuple gave two copies that could disagree (review F-05).
+
 **MCP surface — three new tools, taking the count from 19 to 22.**
 
 `get_symbol_at` → `Page<EnclosingSymbol>`; `EnclosingSymbol = { symbol_id, name, kind, line, end_line, span_lines, parent, namespace }`, innermost first.
