@@ -30,6 +30,21 @@ tasks:
     justifies: "FR-26, NFR-11, AC-33 (MCP half), AC-45. Tool descriptions are production behavior that agents pattern-match on; a get_symbol_at description implying goto-definition would cause misuse that no test catches."
     verification: "cargo test -p code-graph-tools --test snapshot_tools_list — the tool-list snapshot rebaselines from 19 to 22 tools and no other snapshot changes; each description names its response envelope, documents every argument with default and ceiling, and get_symbol_at is explicitly not described as goto-definition; make verify passes."
     depends_on: ["1.1", "1.2", "1.3"]
+  - id: "1.5"
+    title: "Dispatch find_path off the async runtime (review F-01)"
+    status: planned
+    justifies: "Review finding F-01, reached independently by review_quality and review_blind_spots. Prevents one tokio worker being occupied for the length of an unbounded Dijkstra while holding the graph read lock, which stalls a concurrent watch-driven reindex needing the write lock."
+    verification: "cargo test -p code-graph-tools find_path:: and make verify — find_path's #[tool] wrapper dispatches through tokio::task::spawn_blocking and maps a join error through tool_error, matching the get_symbol_at and detect_communities precedent set in the same phase; behaviour and response bytes are unchanged."
+  - id: "1.6"
+    title: "Add handler response snapshots for the three new tools (review F-03)"
+    status: planned
+    justifies: "Review finding F-03, and AC-18/NFR-03 as the design states them: determinism needs the 20-run unit test AND a committed insta golden file, 'neither alone closes AC-18'. Without a golden, a change to field order, label derivation, or community ranking passes silently."
+    verification: "cargo test -p code-graph-tools --test snapshot_responses — committed snapshots exist for get_symbol_at, find_path, and detect_communities using the established build_indexed_fixture/parsed_sorted/settings_with_path_redaction helpers, including a member-capped community showing truncated plus original_len (AC-32) and the granularity and termination fields (AC-53, AC-54); make snapshot-clean passes."
+  - id: "1.7"
+    title: "Apply saturating arithmetic at the two sites the design names (review F-06)"
+    status: planned
+    justifies: "Review finding F-06. The design's Structural Verification section requires saturating arithmetic at the packed Dijkstra cost and the permille share so a pathological graph degrades rather than panicking in debug or wrapping in release; both currently use plain arithmetic."
+    verification: "cargo test -p code-graph-graph and make verify — the packed cost accumulation in shortest_path and the permille share in detect_degeneracy use saturating operations; existing tests still pass, confirming no behavioural change at realistic magnitudes."
 ---
 
 # Phase 1: Graph Queries
@@ -154,6 +169,59 @@ AC-43 is a recorded-metric criterion, not an automated gate — a wall-clock ass
 AC-33 is only half-satisfiable here: the CLI half needs phase 7. Do not mark AC-33 complete in this phase.
 
 These three handlers land in `handlers/symbols.rs`, `handlers/query.rs`, and `handlers/structure.rs` as ordinary `CallToolResult`-returning functions, matching every existing handler. **Phase 2 migrates them into `core/` along with the originals** — that is what puts them within the CLI's reach and why phase 2 is sequenced after this one. Do not pre-emptively write them against a typed core that does not exist yet.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 1.5: Dispatch find_path off the async runtime (review F-01)
+
+### Subtasks
+- [ ] Wrap `handlers::query::find_path` in `tokio::task::spawn_blocking` in its `#[tool]` method
+- [ ] Clone the `Arc<ServerInner>` and move owned arguments into the closure, as `get_coupling` does
+- [ ] Map the join error through `handlers::tool_error`
+- [ ] Confirm no response bytes change
+
+### Notes
+Revision boundary: all three phase 1 tools dispatch consistently.
+
+`find_path` was the outlier: no `.await` exists anywhere in its chain and it holds a `parking_lot` read guard for the whole search, so the scheduler cannot preempt it. Its two siblings, added in the same commit, already do this.
+
+The tests cannot catch this class of bug as written — every one of them calls the handler function directly and never goes through the `#[tool]` wrapper. That is worth knowing before trusting a green suite here.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 1.6: Add handler response snapshots for the three new tools (review F-03)
+
+### Subtasks
+- [ ] Add `snapshot_responses.rs` cases for `get_symbol_at`, `find_path`, and `detect_communities`
+- [ ] Reuse `build_indexed_fixture`, `parsed_sorted`, and `settings_with_path_redaction` — no new snapshot infrastructure
+- [ ] Cover a member-capped community carrying `truncated` and `original_len` (AC-32)
+- [ ] Cover the `granularity` and `termination` fields (AC-53, AC-54)
+- [ ] Accept the new snapshots and confirm no existing snapshot moved
+
+### Notes
+Revision boundary: AC-18 is closed by both halves — the 20-run determinism test and a committed golden.
+
+The unit test proves the output is stable across runs; the golden proves it is the output we meant. A field-order change or a different label tie-break satisfies the first and fails the second, which is exactly why the design insisted on both.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 1.7: Apply saturating arithmetic at the two sites the design names (review F-06)
+
+### Subtasks
+- [ ] Use saturating accumulation for hops and heuristic hops in the packed Dijkstra cost
+- [ ] Use saturating operations for the permille share in degeneracy detection
+- [ ] Confirm existing tests pass unchanged
+
+### Notes
+Revision boundary: the design's stated overflow mitigation is actually in force.
+
+No bug is observed today — both values are bounded well below overflow by the `node_cap` ceiling and realistic corpus sizes. This closes the gap between what the design promises and what the code does, so a future change to the ceiling cannot quietly turn a documented mitigation into a panic.
 
 ### Completion Evidence
 
