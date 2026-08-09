@@ -12,6 +12,7 @@
 //!   reporting trait, and the tokio bridge sink.
 
 pub(crate) mod analyze_job;
+pub mod core;
 pub mod discovery;
 pub mod handlers;
 pub mod indexer;
