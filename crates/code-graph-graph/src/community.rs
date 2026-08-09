@@ -358,7 +358,8 @@ fn detect_degeneracy(node_count: u32, communities: &[FileCommunity]) -> Option<D
     }
 
     if let Some(largest) = communities.first() {
-        let share_permille = (largest.members.len() as u64 * 1000 / node_count as u64) as u32;
+        let share_permille =
+            ((largest.members.len() as u64).saturating_mul(1000) / node_count as u64) as u32;
         if share_permille >= 900 {
             return Some(Degeneracy::Giant { share_permille });
         }

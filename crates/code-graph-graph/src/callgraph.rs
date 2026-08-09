@@ -417,9 +417,9 @@ impl Graph {
                     continue;
                 }
 
-                let new_hops = hops + 1;
+                let new_hops = hops.saturating_add(1);
                 let new_heuristic =
-                    heuristic + u32::from(entry.confidence == Confidence::Heuristic);
+                    heuristic.saturating_add(u32::from(entry.confidence == Confidence::Heuristic));
                 let new_cost = ((new_hops as u64) << 32) | (new_heuristic as u64);
 
                 let is_better = match best_cost.get(&entry.target) {
