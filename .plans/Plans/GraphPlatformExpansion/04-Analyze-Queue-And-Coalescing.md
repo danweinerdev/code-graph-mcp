@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 4
 status: planned
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, the wire format evolves additively, and the job slot generalizes to cover long-running whole-graph queries."
 tasks:
   - id: "4.1"

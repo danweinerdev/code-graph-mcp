@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 2
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 deliverable: "A typed core beneath every MCP handler, returning domain values instead of rmcp wire types, with byte-identical output and server.rs untouched."
 tasks:
   - id: "2.1"

@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: spec
 status: approved
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 tags: [daemon, cli, vcs, graph-queries, architecture, perforce]
 related:
   - Designs/SharedDaemon

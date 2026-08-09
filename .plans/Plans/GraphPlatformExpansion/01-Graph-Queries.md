@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 1
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 deliverable: "Three new MCP tools — get_symbol_at, find_path, detect_communities — answering position, reachability, and module-structure questions the current surface cannot answer."
 tasks:
   - id: "1.1"

@@ -1,9 +1,9 @@
 ---
 title: "Graph Platform Expansion"
 type: plan
-status: approved
+status: active
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -70,6 +70,50 @@ Four tracks that lift three constraints on the code graph: it is reachable only 
 Phases 1, 3, and 5 have no dependencies on each other and may run concurrently in separate worktrees. Phase 2 follows phase 1 rather than running beside it: both edit `handlers/{query,symbols,structure}.rs` — phase 1 adds three handlers to them, phase 2 empties all three into `core/` — so concurrent worktrees would collide on every one of those files. Sequencing them also closes a coverage gap, since phase 2's migration is what puts the three new queries in the typed core where the CLI can reach them (AC-33, FR-17).
 
 Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a suggested order; `depends_on` is the real constraint.
+
+## Current State
+
+*Written for a cold start. Last updated 2026-08-09 at `f2d6583`.*
+
+| Phase | Status | Where it stands |
+|---|---|---|
+| 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
+| 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
+| 3 Daemon Foundation | planned | **Next.** Independent of everything except gating 4 and 7. |
+| 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
+| 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
+| 6 Symbol History | planned | Gated on 5. |
+| 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
+| 8 Per-Language Fingerprints | planned | Gated on 6. Six sub-tasks, one per language. |
+| 9 Resolver Candidate Count | planned | Added mid-flight from phase 1's review. Gated on 1. |
+
+### Why phases 1 and 2 are `in-progress` with every task complete
+
+Phase completion requires a four-lane review returning Aligned on all four lanes. Both phases had findings fixed *after* their last review, and a material change supersedes a review — so certifying either needs a fresh cycle. That was skipped by explicit decision: the returns were diminishing and seven phases remained. Both phases are code-complete, fully evidenced, and reviewed; neither is certified, and `Phase Completion Evidence` in each stays pending rather than claiming a gate that was not run.
+
+If certification matters later, run a fresh four-lane review of each phase's full range and write the Aligned artifact. Nothing else is outstanding.
+
+### Work added after approval
+
+- **Phase 9** and **FR-48 / AC-57** — candidate count. Phase 1's review asked whether `PathHop.entered_by` violated FR-23; reframing it around what an agent actually does with the field produced D-0007 and a better signal. The resolver knows how many candidates competed and discards it; recovering that needs a resolver change and a cache-format bump, so it is its own phase.
+- **Task 4.4** and **FR-49 / AC-58** — async whole-graph queries. `detect_communities` holds the read lock across label propagation, and `spawn_blocking` does not extend the client's wall-clock timeout. Landed in phase 4 because 4.1 already reshapes the job slot.
+
+### Corrections made to approved artifacts
+
+Each is a reconciliation event, not drift — the code was right and the document was wrong:
+
+- **AC-41** claimed `tracing` appears nowhere in the dependency graph. It does, transitively via `rmcp`. Restated as "no direct dependency".
+- **Decision 8** said "16 gated call sites"; phase 1's tools made it 19 sites over 18 functions. Restated as a set-equality invariant.
+- **`PathResult`** shipped with two fields where the design sketched four; the design was reconciled to the code.
+- **CLAUDE.md** carried three stale claims found incidentally: the cache is v10 not v8, `EdgeKind` has four variants not three, and the workspace is *not* C-compiler-free (the tree-sitter grammars compile C via the `cc` crate). The last of these had already been recorded as a decision on the false premise, so D-0004 restates it on the argument that actually holds — add no *further* native library, rather than stay C-free.
+
+### What a cold start should know before writing code
+
+- **`make verify` is the gate** and includes a plugin-mirror drift check; run it per task, not per phase.
+- **Tests live inside `code-graph-tools`**, which means they cannot exercise the `#[tool]` wrapper or any cross-crate contract. Both Major findings so far lived in exactly that blind spot.
+- **The intent-blind review lane has found the real bug in both phases**, after the three plan-aware lanes passed the same code. Do not skip it.
+- **Batch fixes before re-reviewing.** Phase 1 spent two cycles fixing findings piecemeal; phase 2 spent one.
+- **Deterministic output matters more than it looks.** `Graph.nodes`/`adj`/`radj` are `HashMap` with a random seed; `files`/`includes` are a `PathTrie` that iterates sorted. Anything whose output is snapshotted must drive iteration from the trie and use keyed lookups only.
 
 ## Non-Goals
 

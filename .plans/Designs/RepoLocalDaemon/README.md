@@ -3,7 +3,7 @@ title: "Repository-Local Daemon and CLI (Track B)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-09
 tags: [daemon, cli, ipc, named-pipe, unix-socket, idle-timeout, analyze-queue]
 related:
   - Specs/GraphPlatformExpansion
