@@ -119,6 +119,17 @@ impl ProgressSink for NoopProgressSink {
     fn report(&self, _: u32, _: u32, _: &str) {}
 }
 
+/// Forwarding impl so `Arc<dyn ProgressSink>` (the shape `core::analyze`
+/// takes at its rmcp-agnostic boundary — see Designs/TypedCoreLayering
+/// OQ-A3) is itself a `ProgressSink`, and can be wrapped by generic
+/// adapters like `JobAwareProgressSink<S: ProgressSink>` without a
+/// second, parallel trait.
+impl<T: ProgressSink + ?Sized> ProgressSink for std::sync::Arc<T> {
+    fn report(&self, progress: u32, total: u32, message: &str) {
+        (**self).report(progress, total, message);
+    }
+}
+
 /// Discover and parse every source file under `root` in parallel.
 ///
 /// Returns the per-file [`FileGraph`]s plus a flat `Vec<String>` of

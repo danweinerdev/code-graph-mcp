@@ -14,6 +14,7 @@ use crate::handlers::{tool_error, tool_success_json};
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
+pub mod analyze;
 pub mod query;
 pub mod status;
 pub mod structure;

@@ -189,7 +189,7 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-38**: Fingerprinting a symbol that was reformatted — whitespace and comments only — yields an unchanged fingerprint under the formatting-insensitive mode. (FR-34)
 - [ ] **AC-39**: Fingerprinting a symbol in which only a string or numeric literal changed yields a changed fingerprint under the formatting-insensitive mode and an unchanged one under the literal-insensitive mode. (FR-34)
 - [ ] **AC-40**: The same CLI invocation against the same repository produces identical machine-readable output whether a daemon is running or not. (FR-18)
-- [ ] **AC-41**: `tracing` appears nowhere in the workspace dependency graph, and new diagnostic output uses `eprintln!`. (NFR-05)
+- [ ] **AC-41**: No crate in the workspace declares a direct `tracing` dependency, and diagnostic output uses `eprintln!`. (`tracing` does appear in the dependency graph transitively, pulled by `rmcp`; that is pre-existing and outside this work's control. The requirement is that no code here logs through it.) (NFR-05)
 - [ ] **AC-42**: The daemon and CLI are exercised on Linux, macOS, and Windows. Where a platform uses a different local transport, that path has its own coverage rather than being assumed from another platform's result. (NFR-07)
 - [ ] **AC-43**: Shortest path and community detection each complete within an interactive budget on the largest initialised dogfood corpus, and both enforce their caps rather than degrading, with the timings recorded. (NFR-08)
 - [ ] **AC-44**: With a deliberately slow version-control provider, a concurrent non-history query returns in its normal time — the slow provider delays only the history tools. (NFR-10)

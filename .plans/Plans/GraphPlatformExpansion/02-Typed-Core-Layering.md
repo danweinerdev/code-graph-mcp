@@ -41,7 +41,7 @@ tasks:
     title: "Migrate analyze handlers and complete the guard-coverage sweep"
     status: planned
     justifies: "FR-01, FR-04, NFR-01, NFR-02, NFR-05, AC-28, AC-41. analyze is last because it is async and owns progress reporting; the sweep is what stops Decision 8's new require_indexed call sites from being silently skipped by a mechanical pass."
-    verification: "cargo test --workspace — analyze and analyze_async return typed values with progress bridged through an abstract sink rather than rmcp types; a grep comparing the guarded set in server.rs against core/ matches at 16 functions; cargo tree shows no tracing dependency (AC-41, NFR-05) and no new dependency in the four core crates (NFR-02); the full snapshot suite passes unmodified (NFR-01, AC-02)."
+    verification: "cargo test --workspace — analyze and analyze_async return typed values with progress bridged through an abstract sink rather than rmcp types; a comparison of the guarded set in server.rs against core/ shows the two sets are equal; cargo tree shows no tracing dependency (AC-41, NFR-05) and no new dependency in the four core crates (NFR-02); the full snapshot suite passes unmodified (NFR-01, AC-02)."
     depends_on: ["2.2", "2.3", "2.4", "2.5"]
 ---
 
@@ -156,7 +156,7 @@ Pending — not complete.
 ### Subtasks
 - [ ] Move `analyze_codebase` and `analyze_codebase_async` bodies to `core::analyze`
 - [ ] Replace the rmcp `Peer`/`ProgressToken` parameters with an abstract progress sink; supply the rmcp-backed implementation from the adapter
-- [ ] Verify the 16 gated core functions each call the core `require_indexed`
+- [ ] Verify the guarded set in server.rs and the set of core functions calling the core `require_indexed` are equal
 - [ ] Run `cargo tree` for the NFR-02 and NFR-05 checks
 - [ ] Full workspace test run and snapshot verification
 

@@ -172,9 +172,9 @@ Stated plainly so it is a decision and not an oversight: this leaves the test su
 
 ### Decision 8: The indexed-state guard is a NEW call site in each core function, not a moved one
 
-**Context:** `require_indexed` is called from **`server.rs`**, before the handler runs — 16 call sites guarding every query and watch tool (`analyze_codebase`, `analyze_codebase_async`, and `get_status` are ungated by design). **Zero occurrences exist inside `handlers/*.rs`.**
+**Context:** `require_indexed` is called from **`server.rs`**, before the handler runs — guarding every query and watch tool (`analyze_codebase`, `analyze_codebase_async`, and `get_status` are ungated by design). **Zero occurrences exist inside `handlers/*.rs`.**
 
-**Decision:** Each of the 16 gated core functions calls the core-level `require_indexed` at its own entry. The `server.rs` call sites stay exactly where they are, so the guard runs twice on the MCP path — once in the wire layer, once in the core.
+**Decision:** Each gated core function calls the core-level `require_indexed` at its own entry. At the time of writing that is 19 `#[tool]` call sites mapping to 18 distinct core functions, since `get_callers` and `get_callees` share `callers_or_callees`. The count moved during implementation: the design was written against 16, before phase 1's three new tools were folded into this migration. The invariant is set equality between the two sides, not a fixed number — verify by comparison, never by counting to a remembered total. The `server.rs` call sites stay exactly where they are, so the guard runs twice on the MCP path — once in the wire layer, once in the core.
 
 **Rationale:** Decision 3's mechanical framing — move a body, add an adapter — silently produces core functions with **no guard at all**, because there was never a guard in the handler to move. A caller reaching `core::get_callers` directly on an unindexed graph would get whatever an empty `Graph` returns instead of the domain error FR-04 and AC-28 require. Since reaching the core directly is the entire point of Track A (FR-01), that is a hole precisely where the track claims its value.
 
@@ -220,7 +220,7 @@ The messages are moved, never rewritten. A changed error string is a wire change
 - Dependency check: `core` must not gain an rmcp import. Worth a grep in review, and the AC-01 test above enforces it mechanically.
 - **NFR-02** holds by construction: Track A touches only `code-graph-tools`, so `code-graph-core`, `-graph`, `-lang`, and `-path-trie` gain nothing. Confirm with `cargo tree` rather than assuming.
 - **NFR-05**: no `tracing` dependency introduced; new diagnostics use `eprintln!`. Confirm with `cargo tree`.
-- **Decision 8 coverage sweep**: after each module's commit, confirm every gated core function in that module calls the core `require_indexed`. A grep comparing the guarded set in `server.rs` against the guarded set in `core/` is the mechanical check; the count must match at 16.
+- **Decision 8 coverage sweep**: after each module's commit, confirm every gated core function in that module calls the core `require_indexed`. A grep comparing the guarded set in `server.rs` against the guarded set in `core/` is the mechanical check; the two sets must be equal.
 
 ## Migration / Rollout
 
