@@ -1,5 +1,5 @@
 ---
-title: "Phase 1 Query Performance Measurement"
+title: "Phase 1 Debrief: Graph Queries"
 type: debrief
 status: complete
 plan: GraphPlatformExpansion
@@ -13,7 +13,7 @@ related:
   - Specs/GraphPlatformExpansion
 ---
 
-# Phase 1 Query Performance Measurement
+# Phase 1 Debrief: Graph Queries
 
 Records AC-43 / NFR-08. AC-43 is deliberately a **recorded-metric** criterion, not an automated gate: a wall-clock assertion would be flaky across machines and CI load, so the pass condition is a human reading these numbers. What *is* automated is cap enforcement, covered by unit tests in tasks 1.2 and 1.3.
 
@@ -52,6 +52,43 @@ The test auto-skips with a hint if the corpus is uninitialised, per the dogfood-
 
 ## Follow-Ups
 
-### Worth considering
+### Worth considering later
 
 A better `shortest_path` worst case — source selected by maximum transitive fan-out rather than by orphan status — would make this measurement meaningful rather than merely present. Not filed as a task: AC-43 asks for a recorded metric and this records one, with its limits stated. Worth revisiting if the query is ever reported as slow.
+
+## Requirements Assessment
+
+Every in-scope requirement is implemented and evidenced: FR-21 through FR-26, FR-44, FR-45, FR-46, NFR-03, NFR-08, NFR-11, and acceptance criteria AC-13 through AC-18, AC-32, AC-43, AC-45, AC-53 through AC-55. AC-33 is deliberately half-open — its CLI arm cannot close until phase 7, and the phase criteria never claimed it.
+
+Two requirements were added *during* the phase rather than satisfied by it. FR-48/AC-57 (candidate count) and FR-49/AC-58 (async whole-graph queries) both came out of review and are carried by phases 9 and 4.
+
+## Deviations
+
+- **`PathResult` shipped with two fields, not the four the design sketched.** `nodes_examined` and `cap_reached` live on the returned tuple, where they exist on both the found and not-found paths. Holding them in both places let two copies disagree. The design was reconciled to the shipped shape.
+- **AC-43 could not be satisfied as written.** It named `code-graph-bench`, which measures indexing and has no notion of a query. A dedicated `#[ignore]`-gated `query_perf` test was added instead. The criterion's intent was met; its stated mechanism was wrong.
+- **Three tasks were added mid-phase** (1.5, 1.6, 1.7) to carry review fixes, per the rule that a review-driven code fix gets its own task revision.
+- **The phase is not formally complete.** All tasks are done and all nine review findings are fixed, but certification needs an all-lanes-Aligned review and the third cycle was skipped by decision.
+
+## Risks & Issues Encountered
+
+- **The test suite could not have caught the worst bug in the phase.** F-01 — `find_path` holding a `parking_lot` read guard across an unbounded Dijkstra with no await point — was invisible to all 15 of its tests, because every one calls the handler directly and never the `#[tool]` wrapper. Green meant nothing there.
+- **Two silent-correctness contracts in community detection** would have degraded results without failing anything: folding self-pairs into the weight table biases label propagation toward stasis, and omitting the `EdgeKind::Calls` filter lets inheritance edges become community weight. Both are now pinned by dedicated regression tests.
+- **`EdgeKind` has four variants, not the three CLAUDE.md claimed.** Found while writing the aggregator's filter. Two further stale claims surfaced in the same sweep — the cache is v10 not v8, and the workspace is not C-compiler-free.
+
+## Lessons Learned
+
+- **Ask what the consumer does with a field.** The most valuable output of this phase was not code: reframing "does `entered_by` violate FR-23" into "what actually helps an agent" produced D-0007 and FR-48, and changed the API for the better. A binary confidence tag is a one-bit projection of the number a caller can act on.
+- **An acceptance criterion naming a tool should be checked against that tool.** AC-43 named a harness that could not measure what the criterion asked for, and nobody noticed until a review lane went looking.
+- **Amending commits breaks paper trails.** The F-05 resolution cited a SHA that no longer existed after two amendments. The drift lane caught it; nothing else would have.
+
+## Impact on Subsequent Phases
+
+- **Phase 2** must migrate the three new handlers alongside the original nineteen — that is what puts them in the typed core where the CLI can reach them, and why phase 2 now depends on phase 1.
+- **Phase 4** absorbs FU-01 as task 4.4, generalizing the job slot it is already reshaping.
+- **Phase 9** is new, carrying candidate count.
+- **The four-lane review is worth its cost but it compounds.** Every material fix supersedes the review, so certification is a fixed-point iteration. Later phases should batch fixes before re-reviewing rather than fixing findings one at a time.
+
+## Skill Opportunities
+
+- A convention that tests exercise the `#[tool]` wrapper, not only the handler, would have caught F-01 at write time.
+- The stale-CLAUDE.md pattern recurred three times in one phase; a periodic doc-vs-code audit would find these before a reviewer does.
