@@ -1312,13 +1312,28 @@ impl CodeGraphServer {
         if let Err(r) = self.require_indexed() {
             return Ok(r);
         }
-        Ok(handlers::query::find_path(
-            &self.inner.graph,
-            &args.from,
-            &args.to,
-            args.node_cap,
-            args.min_confidence.as_deref(),
-        ))
+        // The Dijkstra search holds a parking_lot read guard with no await
+        // point across the whole traversal; on the multi-thread runtime that
+        // would occupy a worker and block a concurrent watch reindex needing
+        // the write lock (see `get_coupling`).
+        let inner = self.inner.clone();
+        let from = args.from.clone();
+        let to = args.to.clone();
+        let min_confidence = args.min_confidence.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handlers::query::find_path(
+                &inner.graph,
+                &from,
+                &to,
+                args.node_cap,
+                min_confidence.as_deref(),
+            )
+        })
+        .await;
+        Ok(match result {
+            Ok(r) => r,
+            Err(e) => handlers::tool_error(format!("find_path task panicked: {e}")),
+        })
     }
 
     #[tool(
