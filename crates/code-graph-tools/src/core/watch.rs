@@ -23,7 +23,7 @@ use crate::server::{ServerInner, WatchHandle};
 /// `watch_start` body. Body moved verbatim from
 /// `handlers::watch::watch_start`, plus the core `require_indexed` call
 /// at entry (Decision 8 — this call site is new, not moved).
-pub(crate) fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
+pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
     require_indexed(inner.indexed.load(std::sync::atomic::Ordering::Acquire))?;
 
     let mut watch_guard = inner.watch.write();
@@ -85,7 +85,7 @@ pub(crate) fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse>
 /// `watch_stop` body. Body moved verbatim from
 /// `handlers::watch::watch_stop`, plus the core `require_indexed` call
 /// at entry (Decision 8).
-pub(crate) fn watch_stop(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
+pub fn watch_stop(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
     require_indexed(inner.indexed.load(std::sync::atomic::Ordering::Acquire))?;
 
     let handle = match inner.watch.write().take() {

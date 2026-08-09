@@ -688,7 +688,7 @@ pub async fn analyze_codebase(
 /// The detached worker runs with `Arc::new(NoopProgressSink)`.
 ///
 /// Ungated by design, same as [`analyze_codebase`].
-pub(crate) async fn analyze_codebase_async(
+pub async fn analyze_codebase_async(
     inner: Arc<ServerInner>,
     path_raw: String,
     force: bool,

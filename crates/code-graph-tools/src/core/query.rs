@@ -50,7 +50,7 @@ use crate::handlers::{
 /// 3. callable kind with zero resolved hops → `Ok(ToolOk::Value(_))`
 ///    carrying an empty `Page<CallChain>`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn callers_or_callees(
+pub fn callers_or_callees(
     graph: &RwLock<Graph>,
     indexed: bool,
     symbol: &str,
@@ -267,7 +267,7 @@ pub fn find_overrides(
 /// `get_dependencies` body. Body moved verbatim from
 /// `handlers::query::get_dependencies`, plus the core `require_indexed`
 /// call at entry (Decision 8).
-pub(crate) fn get_dependencies(
+pub fn get_dependencies(
     graph: &RwLock<Graph>,
     indexed: bool,
     file: &str,
@@ -339,7 +339,7 @@ pub(crate) fn get_dependencies(
 /// `find_path` body (phase 1). Body moved verbatim from
 /// `handlers::query::find_path`, plus the core `require_indexed` call at
 /// entry (Decision 8).
-pub(crate) fn find_path(
+pub fn find_path(
     graph: &RwLock<Graph>,
     indexed: bool,
     from: &str,

@@ -50,8 +50,8 @@ pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// and gives clients a single field to assert against, locked in by the
 /// snapshot tests.
 #[derive(serde::Serialize)]
-pub(crate) struct WatchResponse {
-    pub(crate) watching: bool,
+pub struct WatchResponse {
+    pub watching: bool,
 }
 
 /// `watch_start` body. Caller must already have passed `require_indexed`.

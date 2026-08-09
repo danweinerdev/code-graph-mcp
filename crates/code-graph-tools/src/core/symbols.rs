@@ -52,7 +52,7 @@ use crate::handlers::{
 /// authoritative) for the full behavioural contract — empty-raw-set error
 /// wording, `count_only` sentinel shape, and default/clamp resolution.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_file_symbols(
+pub fn get_file_symbols(
     graph: &RwLock<Graph>,
     indexed: bool,
     file: &str,
@@ -124,7 +124,7 @@ pub(crate) fn get_file_symbols(
 /// `get_symbol_at` body (phase 1). Body moved verbatim from
 /// `handlers::symbols::get_symbol_at`, plus the core `require_indexed` call
 /// at entry (Decision 8).
-pub(crate) fn get_symbol_at(
+pub fn get_symbol_at(
     graph: &RwLock<Graph>,
     indexed: bool,
     file: &str,
@@ -192,7 +192,7 @@ pub(crate) fn get_symbol_at(
 /// call at entry (Decision 8). See the handler doc-comment (unchanged, and
 /// authoritative) for the byte-budget-trim architectural exception this
 /// function preserves.
-pub(crate) fn search_symbols(
+pub fn search_symbols(
     graph: &RwLock<Graph>,
     indexed: bool,
     input: SearchSymbolsInput<'_>,
@@ -535,7 +535,7 @@ fn near_search(
 /// `get_symbol_detail` body. Body moved verbatim from
 /// `handlers::symbols::get_symbol_detail`, plus the core `require_indexed`
 /// call at entry (Decision 8).
-pub(crate) fn get_symbol_detail(
+pub fn get_symbol_detail(
     graph: &RwLock<Graph>,
     indexed: bool,
     symbol: &str,
@@ -566,7 +566,7 @@ pub(crate) fn get_symbol_detail(
 /// `get_symbol_summary` body. Body moved verbatim from
 /// `handlers::symbols::get_symbol_summary`, plus the core `require_indexed`
 /// call at entry (Decision 8).
-pub(crate) fn get_symbol_summary(
+pub fn get_symbol_summary(
     graph: &RwLock<Graph>,
     indexed: bool,
     file: Option<&str>,

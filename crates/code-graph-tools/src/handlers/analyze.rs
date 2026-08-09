@@ -207,12 +207,12 @@ pub async fn analyze_codebase_async(
 /// Wire shape of the `analyze_codebase_async` kickoff response.
 /// `< 1KB` by construction — five fields, no nested payload.
 #[derive(Debug, Serialize)]
-pub(crate) struct AsyncKickoffResponse {
-    pub(crate) job_id: String,
-    pub(crate) status: &'static str,
-    pub(crate) started_at: String,
-    pub(crate) existing: bool,
-    pub(crate) note: &'static str,
+pub struct AsyncKickoffResponse {
+    pub job_id: String,
+    pub status: &'static str,
+    pub started_at: String,
+    pub existing: bool,
+    pub note: &'static str,
 }
 
 #[cfg(test)]

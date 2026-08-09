@@ -93,7 +93,7 @@ fn is_zero_u32(n: &u32) -> bool {
 /// [`SummaryRow`] / [`CouplingEntry`] (`Debug`, `Serialize` only — no
 /// `Deserialize`).
 #[derive(Debug, Serialize)]
-pub(super) struct EnclosingSymbol {
+pub struct EnclosingSymbol {
     pub symbol_id: String,
     pub name: String,
     pub kind: String,
@@ -126,7 +126,7 @@ pub(super) struct EnclosingSymbol {
 /// `handlers` module's response payloads and tests; callers consume it
 /// as JSON via `CallToolResult`, never as a Rust type.
 #[derive(Debug, Serialize)]
-pub(super) struct SummaryRow {
+pub struct SummaryRow {
     pub namespace: String,
     pub kind: &'static str,
     pub count: u32,
@@ -145,7 +145,7 @@ pub(super) struct SummaryRow {
 /// JSON via `CallToolResult`, never as a Rust type. Derive set matches
 /// [`SummaryRow`] (`Debug`, `Serialize` only — no `Deserialize`).
 #[derive(Debug, Serialize)]
-pub(super) struct CouplingEntry {
+pub struct CouplingEntry {
     pub file: String,
     pub count: u32,
 }
@@ -161,7 +161,7 @@ pub(super) struct CouplingEntry {
 /// `line` is `u32` for byte-identical JSON across platforms. Visibility
 /// and derive set match [`CouplingEntry`] / [`SummaryRow`].
 #[derive(Debug, Serialize)]
-pub(super) struct DependencyEntry {
+pub struct DependencyEntry {
     pub file: String,
     pub kind: &'static str,
     pub line: u32,
@@ -196,7 +196,7 @@ pub(super) struct DependencyEntry {
 /// [`SummaryRow`] / [`CouplingEntry`] (`Debug`, `Serialize` only — no
 /// `Deserialize`).
 #[derive(Debug, Serialize)]
-pub(super) struct Cycle {
+pub struct Cycle {
     pub files: Vec<String>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,7 +220,7 @@ pub(super) struct Cycle {
 /// JSON via `CallToolResult`, never as a Rust type. Derive set matches
 /// [`Cycle`] (`Debug`, `Serialize` only — no `Deserialize`).
 #[derive(Debug, Serialize)]
-pub(super) struct Community {
+pub struct Community {
     pub label: String,
     pub size: u32,
     pub members: Vec<String>,
@@ -244,7 +244,7 @@ pub(super) struct Community {
 /// `granularity`, `termination`, `iterations`, `node_count`,
 /// `edge_count`, `degenerate` — is the wire-format contract.
 #[derive(Debug, Serialize)]
-pub(super) struct DetectCommunitiesResponse {
+pub struct DetectCommunitiesResponse {
     #[serde(flatten)]
     pub page: Page<Community>,
     pub granularity: &'static str,
@@ -260,7 +260,7 @@ pub(super) struct DetectCommunitiesResponse {
 /// not `null` — on `"atomized"` via `skip_serializing_if`, since an
 /// atomized partition has no single dominant share to report).
 #[derive(Debug, Serialize)]
-pub(super) struct DegenerateInfo {
+pub struct DegenerateInfo {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_permille: Option<u32>,
@@ -278,7 +278,7 @@ pub(super) struct DegenerateInfo {
 /// `truncated: true` with `next_offset: Some(0)` so a client knows to
 /// re-request the outgoing side fresh.
 #[derive(Debug, Serialize)]
-pub(super) struct CouplingBoth {
+pub struct CouplingBoth {
     pub incoming: Page<CouplingEntry>,
     pub outgoing: Page<CouplingEntry>,
 }
@@ -335,7 +335,7 @@ pub struct Page<T: Serialize> {
 /// sibling response types (`Debug`, `Serialize` only — no `Deserialize`;
 /// the response is serialize-only).
 #[derive(Debug, Serialize)]
-pub(super) struct SearchSymbolsResponse {
+pub struct SearchSymbolsResponse {
     #[serde(flatten)]
     pub page: Page<SymbolResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -357,7 +357,7 @@ pub(super) struct SearchSymbolsResponse {
 /// by the current resolver. The warning makes that point-of-use
 /// limitation visible without forcing the agent to read docs.
 #[derive(Debug, Serialize)]
-pub(super) struct CallChainResponse {
+pub struct CallChainResponse {
     #[serde(flatten)]
     pub page: Page<code_graph_graph::CallChain>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -384,7 +384,7 @@ pub(super) struct CallChainResponse {
 /// (`hops.len() - 1`), NOT the node count — `from == to` yields a
 /// single-element `hops` and `hop_count: 0`.
 #[derive(Debug, Serialize)]
-pub(super) struct FindPathResponse {
+pub struct FindPathResponse {
     pub found: bool,
     pub hops: Vec<code_graph_graph::PathHop>,
     pub hop_count: u32,

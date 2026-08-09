@@ -79,10 +79,15 @@ pub fn to_call_tool_result<T: Serialize>(r: ToolResult<T>) -> CallToolResult {
 /// runs — `handlers/*.rs` contain zero occurrences of it. A mechanical
 /// "move the body into `core`" migration would therefore leave every
 /// gated core function with no guard at all, because there was never one
-/// in the handler to move. Each of the 16 gated core functions (all query
+/// in the handler to move. The invariant is set equality, not a fixed
+/// count: the set of core functions that call `require_indexed` at their
+/// own entry must equal the set of gated `#[tool]` call sites (all query
 /// and watch tools; `get_status`, `analyze_codebase`, and
-/// `analyze_codebase_async` are ungated by design) must call this at its
-/// own entry as it migrates in tasks 2.2 through 2.6.
+/// `analyze_codebase_async` are ungated by design). Verify this by
+/// diffing the two sets directly — never by counting to a remembered
+/// total, since a remembered total silently goes stale the moment either
+/// side gains or loses a member (this comment has already done that
+/// once).
 ///
 /// The message is copied verbatim from
 /// `CodeGraphServer::require_indexed` in `server.rs` so the two guards

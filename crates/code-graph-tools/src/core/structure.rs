@@ -71,7 +71,7 @@ use crate::handlers::{
 /// call at entry (Decision 8). See the handler doc-comment (unchanged,
 /// and authoritative) for the full behavioural contract — pagination is
 /// purely by COUNT, deliberately not byte-budgeted.
-pub(crate) fn detect_cycles(
+pub fn detect_cycles(
     graph: &RwLock<Graph>,
     indexed: bool,
     subtree: Option<&str>,
@@ -161,7 +161,7 @@ pub(crate) fn detect_cycles(
 /// call at entry (Decision 8). See the handler doc-comment (unchanged,
 /// and authoritative) for the full behavioural contract.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_orphans(
+pub fn get_orphans(
     graph: &RwLock<Graph>,
     indexed: bool,
     kind: Option<&str>,
@@ -265,11 +265,11 @@ pub(crate) fn get_orphans(
 /// Wire-format envelope for `get_class_hierarchy`. Body moved verbatim
 /// from `handlers::structure::ClassHierarchyResponse`.
 #[derive(Debug, Serialize)]
-pub(crate) struct ClassHierarchyResponse {
-    hierarchy: HierarchyNode,
-    truncated: bool,
-    max_nodes: u32,
-    total_nodes_seen: u32,
+pub struct ClassHierarchyResponse {
+    pub hierarchy: HierarchyNode,
+    pub truncated: bool,
+    pub max_nodes: u32,
+    pub total_nodes_seen: u32,
 }
 
 /// Did-you-mean helper for class-like lookups. Body moved verbatim from
@@ -292,7 +292,7 @@ fn suggest_class_symbols(graph: &Graph, name: &str, limit: usize) -> Vec<String>
 /// `get_class_hierarchy` body. Body moved verbatim from
 /// `handlers::structure::get_class_hierarchy`, plus the core
 /// `require_indexed` call at entry (Decision 8).
-pub(crate) fn get_class_hierarchy(
+pub fn get_class_hierarchy(
     graph: &RwLock<Graph>,
     indexed: bool,
     class: &str,
@@ -387,7 +387,7 @@ pub(crate) fn get_class_hierarchy(
 /// `find_class_candidates` body. Body moved verbatim from
 /// `handlers::structure::find_class_candidates`, plus the core
 /// `require_indexed` call at entry (Decision 8).
-pub(crate) fn find_class_candidates(
+pub fn find_class_candidates(
     graph: &RwLock<Graph>,
     indexed: bool,
     name: &str,
@@ -437,7 +437,7 @@ fn coupling_rows(counts: HashMap<PathBuf, u32>) -> Vec<CouplingEntry> {
 /// distinct response types on one function, exactly like the handler
 /// today (`CallToolResult` erased the distinction; the core keeps it
 /// explicit via an enum rather than serializing early).
-pub(crate) enum CouplingResult {
+pub enum CouplingResult {
     Single(Page<CouplingEntry>),
     Both(CouplingBoth),
 }
@@ -460,7 +460,7 @@ impl Serialize for CouplingResult {
 /// sequential byte-budget allocation exactly: incoming is sized first
 /// against the full `max_bytes`; outgoing gets what remains after
 /// incoming plus [`COUPLING_BOTH_WRAPPER_OVERHEAD`].
-pub(crate) fn get_coupling(
+pub fn get_coupling(
     graph: &RwLock<Graph>,
     indexed: bool,
     file: &str,
@@ -580,7 +580,7 @@ pub(crate) fn get_coupling(
 /// `Ok(ToolOk::Value(_))` and `format="mermaid"` to
 /// `Ok(ToolOk::Text(rendered))` — see the module doc comment for why this
 /// is the case that proves `ToolOk::Text` was modeled generally.
-pub(crate) fn generate_diagram(
+pub fn generate_diagram(
     graph: &RwLock<Graph>,
     indexed: bool,
     input: GenerateDiagramInput<'_>,
@@ -691,7 +691,7 @@ pub(crate) fn generate_diagram(
 /// moved verbatim from `handlers::structure::detect_communities`, plus
 /// the core `require_indexed` call at entry (Decision 8).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn detect_communities(
+pub fn detect_communities(
     graph: &RwLock<Graph>,
     indexed: bool,
     granularity: Option<&str>,
