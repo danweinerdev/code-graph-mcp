@@ -1,0 +1,57 @@
+{
+  "guard": {
+    "inline_budget": 40,
+    "exempt_planning_root": true
+  },
+  "profiles": [
+    "sdd-planner"
+  ],
+  "agents": {
+    "sdd-planner:spec-reviewer": {
+      "tier": "opus",
+      "capabilities": [
+        "review-spec",
+        "testability-check",
+        "ambiguity-check"
+      ],
+      "read_only": true,
+      "description": "Reviews specs for testability, completeness, ambiguity."
+    },
+    "sdd-planner:plan-reviewer": {
+      "tier": "fable",
+      "capabilities": [
+        "review-plan",
+        "gap-analysis",
+        "feasibility-check"
+      ],
+      "read_only": true,
+      "escalation_only": false,
+      "description": "Reviews plans for completeness, feasibility, convention compliance."
+    },
+    "sdd-planner:quality-scanner": {
+      "tier": "fable",
+      "capabilities": [
+        "review-lane",
+        "review-quality",
+        "detect-over-engineering"
+      ],
+      "read_only": true,
+      "escalation_only": false,
+      "self_context": true,
+      "lane": "code",
+      "description": "Diff + code only, intent-blind. Correctness, safety, maintainability. Gathers its own context; never prefetch for it."
+    },
+    "sdd-planner:code-implementer": {
+      "tier": "opus",
+      "capabilities": [
+        "implement-task",
+        "mutation-test",
+        "fix-defect",
+        "write-tests"
+      ],
+      "read_only": false,
+      "escalation_only": false,
+      "description": "Implements a single plan task end to end: writes the code, runs the tests, mutation-proves the behaviour is pinned, and reports evidence. Not a mechanical editor -- it makes scoped design calls and escalates plan-vs-reality mismatches rather than working around them."
+    }
+  }
+}
