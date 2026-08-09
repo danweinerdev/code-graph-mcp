@@ -7,15 +7,10 @@
 //! return `[]` for a known symbol that just has no callers/callees, and
 //! to return a tool error only when the symbol itself isn't in the graph.
 
-use code_graph_core::{paths, EdgeKind, SymbolKind};
-use code_graph_graph::{CallChain, Graph};
+use code_graph_core::SymbolKind;
+use code_graph_graph::Graph;
 use parking_lot::RwLock;
-use rmcp::model::{CallToolResult, Content};
-
-use super::{
-    byte_budget_take, edge_kind_str, kind_str, parse_min_confidence, suggest_symbols, tool_error,
-    tool_success_json, DependencyEntry, FindPathResponse, Page,
-};
+use rmcp::model::CallToolResult;
 
 /// Symbol-ID basename for advisory messages.
 ///
@@ -24,7 +19,7 @@ use super::{
 /// id contains `::`, take everything after the last `::`; otherwise take
 /// everything after the last `:`. Returns the full input when neither
 /// separator is present, so malformed inputs never produce an empty string.
-fn symbol_id_basename(id: &str) -> &str {
+pub(crate) fn symbol_id_basename(id: &str) -> &str {
     if let Some(idx) = id.rfind("::") {
         &id[idx + 2..]
     } else if let Some(idx) = id.rfind(':') {
@@ -47,7 +42,7 @@ fn symbol_id_basename(id: &str) -> &str {
 /// explicitly listed below. If you add a new non-callable variant (e.g.
 /// `Field`, `Constant`), extend the `matches!` arm here — there is no
 /// compile-time signal when the predicate omits a new variant.
-fn is_non_callable_kind(kind: SymbolKind) -> bool {
+pub(crate) fn is_non_callable_kind(kind: SymbolKind) -> bool {
     matches!(
         kind,
         SymbolKind::Struct
@@ -63,7 +58,7 @@ fn is_non_callable_kind(kind: SymbolKind) -> bool {
 /// `"a"` for non-vowel starts, empty strings, or non-ASCII leaders. Used
 /// to keep the soft-hint grammar correct as the non-callable kind set
 /// grows (`"an enum"`, `"an interface"`, `"a struct"`, `"a typedef"`).
-fn article(word: &str) -> &'static str {
+pub(crate) fn article(word: &str) -> &'static str {
     match word.chars().next() {
         Some('a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U') => "an",
         _ => "a",
@@ -74,7 +69,7 @@ fn article(word: &str) -> &'static str {
 /// Structural kinds (`Struct`/`Enum`/`Trait`/`Interface`) get a hierarchy
 /// pointer; `Typedef` gets a detail pointer; everything else (defensive
 /// fall-through) gets both so the hint is never empty.
-fn alternative_tool_hint(kind: SymbolKind) -> &'static str {
+pub(crate) fn alternative_tool_hint(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait | SymbolKind::Interface => {
             "Try `get_class_hierarchy` for inheritance or `get_symbol_detail` for a full symbol view."
@@ -126,149 +121,17 @@ pub fn callers_or_callees(
     max_bytes: usize,
     min_confidence: Option<&str>,
 ) -> CallToolResult {
-    if symbol.is_empty() {
-        return tool_error("'symbol' is required");
-    }
-
-    let depth = depth.filter(|&d| d > 0).unwrap_or(1);
-
-    let min_confidence_filter = match parse_min_confidence(min_confidence) {
-        Ok(v) => v,
-        Err(e) => return tool_error(e),
-    };
-
-    let g = graph.read();
-    let mut chains: Vec<CallChain> = match direction {
-        Direction::Callers => g.callers(symbol, depth, min_confidence_filter),
-        Direction::Callees => g.callees(symbol, depth, min_confidence_filter),
-    };
-
-    // Accuracy-warning probe: when the target symbol carries `virtual`
-    // in its signature, we know the resolver doesn't track
-    // dynamic-dispatch call sites. The result page is correct for
-    // static dispatch; surface the limitation as a warning so the
-    // agent doesn't treat "0 callers" as authoritative on a virtual.
-    //
-    // Detection is a substring check on the signature text the parser
-    // captured from source. The C++ parser preserves `virtual void
-    // Foo()` verbatim in `Symbol.signature` — a substring search for
-    // `"virtual "` (with the trailing space to avoid matching names
-    // like `virtualize`) catches every virtual-method declaration.
-    // The check fires for both `Direction::Callers` and
-    // `Direction::Callees` because dynamic dispatch is the resolver
-    // gap in BOTH directions.
-    //
-    // The lookup is `symbol_detail` (cheap HashMap hit). On a symbol
-    // we can't find we silently skip — the no-result path below
-    // surfaces the proper "symbol not found" error with its own
-    // diagnostics.
-    let mut response_warnings: Vec<String> = Vec::new();
-    if let Some(s) = g.symbol_detail(symbol) {
-        if is_virtual_signature(&s.signature) {
-            response_warnings.push(
-                "target is a virtual method; the resolver currently tracks \
-                 STATIC-dispatch call sites only. Callers that dispatch \
-                 through a base-class pointer or reference (e.g. \
-                 `base_ptr->Foo()`) will not appear here even when they \
-                 invoke this override at runtime. A `find_overrides` / \
-                 `EdgeKind::Overrides` tool to bridge dynamic dispatch \
-                 is on the roadmap."
-                    .to_string(),
-            );
-        }
-    }
-
-    if chains.is_empty() {
-        // Symbol may not exist at all — surface a did-you-mean error.
-        // If it exists but is a non-callable kind (struct/enum/trait/
-        // typedef/interface — structurally shaped, no call edges by
-        // design), surface a soft-hint CallToolResult success that names
-        // the kind and points the agent at the right alternative tool
-        // (`get_class_hierarchy` / `get_symbol_detail`). This branch is
-        // gated strictly on a kind set disjoint from the callable kinds
-        // (`Function` / `Method`), so a callable symbol whose only
-        // resolved callers/callees were filtered out by the resolved-only
-        // BFS (e.g. a function whose only outgoing call edges target
-        // unresolved tokens) still falls through to the empty envelope
-        // below — that "wrong tool" vs "wrong symbol" vs "no callers in
-        // scope" trichotomy is the agent-facing contract this handler
-        // implements.
-        //
-        // The advisory is a `CallToolResult` success (not `Err`),
-        // matching the workspace's core invariant that user-visible
-        // errors travel as `CallToolResult { is_error: true }` —
-        // guidance is success, not failure.
-        match g.symbol_detail(symbol) {
-            None => {
-                let suggestions = suggest_symbols(&g, symbol, 5);
-                drop(g);
-                return if suggestions.is_empty() {
-                    tool_error(format!("symbol not found: {symbol:?}"))
-                } else {
-                    tool_error(format!(
-                        "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
-                    ))
-                };
-            }
-            Some(s) if is_non_callable_kind(s.kind) => {
-                let kind_name = kind_str(s.kind);
-                let basename = symbol_id_basename(symbol);
-                let kind_article = article(kind_name);
-                let alt = alternative_tool_hint(s.kind);
-                drop(g);
-                let advisory = format!(
-                    "{basename} is {kind_article} {kind_name}; {kind_name}s don't have call edges. {alt}"
-                );
-                return CallToolResult::success(vec![Content::text(advisory)]);
-            }
-            Some(_) => {
-                // Callable kind (Function/Method/Class) with no resolved
-                // callers/callees — fall through to the empty envelope.
-            }
-        }
-    }
-    drop(g);
-
-    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    let total = chains.len() as u32;
-
-    // Sort by (depth, symbol_id) ascending — depth first so page 1 holds
-    // the closest hops, then symbol_id as a stable tiebreaker. The BFS in
-    // `Graph::bfs` walks adjacency entries in HashMap iteration order
-    // which is non-deterministic across runs; this canonicalizes the
-    // sequence so offset/limit pagination partitions deterministically.
-    chains.sort_by(|a, b| {
-        a.depth
-            .cmp(&b.depth)
-            .then_with(|| a.symbol_id.cmp(&b.symbol_id))
-    });
-
-    // Route through byte_budget_take so the page honors the byte budget.
-    // The helper internally applies offset+limit skip/take and stops early if
-    // the running serialized byte count would exceed `max_bytes -
-    // ENVELOPE_OVERHEAD_BYTES`. The helper preserves iteration order, so the
-    // (depth, symbol_id) sort above is preserved across truncation: kept
-    // records are a strict prefix of the sorted chain set. `total` (captured
-    // above) remains the pre-pagination match count regardless of truncation.
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(chains, resolved_offset, resolved_limit, max_bytes);
-
-    let page = Page::<CallChain> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    let response = super::CallChainResponse {
-        page,
-        warnings: response_warnings,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::query::callers_or_callees(
+        graph,
+        true,
+        symbol,
+        depth,
+        direction,
+        limit,
+        offset,
+        max_bytes,
+        min_confidence,
+    ))
 }
 
 /// Detect whether a captured signature string begins with or contains
@@ -281,7 +144,7 @@ pub fn callers_or_callees(
 /// still start with `virtual`. Late-in-signature `override` /
 /// `final` specifiers don't affect detection — we key on the
 /// declarator, not the trailing decorators.
-fn is_virtual_signature(signature: &str) -> bool {
+pub(crate) fn is_virtual_signature(signature: &str) -> bool {
     signature.starts_with("virtual ") || signature.contains(" virtual ")
 }
 
@@ -311,47 +174,9 @@ pub fn find_overrides(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    if symbol.is_empty() {
-        return tool_error("'symbol' is required");
-    }
-
-    let g = graph.read();
-    let mut overrides: Vec<CallChain> = g.find_overrides(symbol);
-
-    if overrides.is_empty() && g.symbol_detail(symbol).is_none() {
-        let suggestions = suggest_symbols(&g, symbol, 5);
-        drop(g);
-        return if suggestions.is_empty() {
-            tool_error(format!("symbol not found: {symbol:?}"))
-        } else {
-            tool_error(format!(
-                "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
-            ))
-        };
-    }
-    drop(g);
-
-    // Sort by symbol_id ascending for deterministic pagination.
-    // Depth is always 1 for overrides; secondary sort by symbol_id
-    // suffices.
-    overrides.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
-
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-    let total = overrides.len() as u32;
-
-    let (results, _kept, truncated, next_offset) =
-        super::byte_budget_take(overrides, resolved_offset, resolved_limit, max_bytes);
-
-    let page = Page::<CallChain> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&page)
+    crate::core::to_call_tool_result(crate::core::query::find_overrides(
+        graph, true, symbol, limit, offset, max_bytes,
+    ))
 }
 
 /// `get_dependencies` body. Returns the shared [`Page`]`<`[`DependencyEntry`]`>`
@@ -377,63 +202,9 @@ pub fn get_dependencies(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
-    if file.is_empty() {
-        return tool_error("'file' is required");
-    }
-
-    // Normalize the user-supplied `file` argument before graph lookup.
-    // Mirrors `get_file_symbols`: canonical form when the path exists on
-    // disk (resolving `.` / `..` and stripping the Windows `\\?\`
-    // extended-path prefix), lexical fallback otherwise. On Linux with an
-    // already-canonical path this is effectively identity, so existing
-    // tests stay byte-identical.
-    let path = paths::normalize_user_path(file);
-    let deps = graph.read().file_dependencies(&path);
-
-    // Resolve defaults: zero-or-missing limit -> 100; clamp at 1000.
-    let resolved_limit = limit.filter(|&n| n != 0).unwrap_or(100).min(1000);
-    let resolved_offset = offset.unwrap_or(0);
-
-    // `file_dependencies` returns include entries each carrying the source
-    // line of the `#include`. Map every entry to a `DependencyEntry`; the
-    // kind is always `Includes` here (the include graph holds only
-    // include edges), routed through `edge_kind_str` so the wire string
-    // stays identical to `EdgeKind`'s serde output.
-    let mut rows: Vec<DependencyEntry> = deps
-        .into_iter()
-        .map(|inc| DependencyEntry {
-            file: inc.path.to_string_lossy().into_owned(),
-            kind: edge_kind_str(EdgeKind::Includes),
-            line: inc.line,
-        })
-        .collect();
-
-    // Sort by (file, line) ascending so offset/limit pagination
-    // partitions deterministically across calls. `file_dependencies`
-    // clones the stored Vec in insertion order, which is not a stable
-    // contract; this canonicalizes the sequence.
-    rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
-
-    let total = rows.len() as u32;
-
-    // Route through byte_budget_take: the helper applies offset+limit
-    // skip/take and stops early if the running serialized byte count
-    // would exceed `max_bytes - ENVELOPE_OVERHEAD_BYTES`. It preserves
-    // iteration order, so the (file, line) sort above survives
-    // truncation. `total` (captured above) stays the pre-pagination match
-    // count regardless of truncation.
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(rows, resolved_offset, resolved_limit, max_bytes);
-
-    let response = Page::<DependencyEntry> {
-        results,
-        total,
-        offset: resolved_offset,
-        limit: resolved_limit,
-        truncated,
-        next_offset,
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::query::get_dependencies(
+        graph, true, file, limit, offset, max_bytes,
+    ))
 }
 
 /// `find_path` body (1.2). Shortest call-path from `from` to `to`,
@@ -462,75 +233,14 @@ pub fn find_path(
     node_cap: Option<u32>,
     min_confidence: Option<&str>,
 ) -> CallToolResult {
-    if from.is_empty() {
-        return tool_error("'from' is required");
-    }
-    if to.is_empty() {
-        return tool_error("'to' is required");
-    }
-
-    let min_confidence_filter = match parse_min_confidence(min_confidence) {
-        Ok(v) => v,
-        Err(e) => return tool_error(e),
-    };
-
-    // Resolve node_cap: zero-or-missing -> default 100_000; clamp at the
-    // 5_000_000 ceiling.
-    let resolved_cap = node_cap
-        .filter(|&n| n != 0)
-        .unwrap_or(100_000)
-        .min(5_000_000);
-
-    let g = graph.read();
-
-    if g.symbol_detail(from).is_none() {
-        let suggestions = suggest_symbols(&g, from, 5);
-        drop(g);
-        return if suggestions.is_empty() {
-            tool_error(format!("'from' symbol not found: {from:?}"))
-        } else {
-            tool_error(format!(
-                "'from' symbol not found: {from:?}. Did you mean: {suggestions}?"
-            ))
-        };
-    }
-    if g.symbol_detail(to).is_none() {
-        let suggestions = suggest_symbols(&g, to, 5);
-        drop(g);
-        return if suggestions.is_empty() {
-            tool_error(format!("'to' symbol not found: {to:?}"))
-        } else {
-            tool_error(format!(
-                "'to' symbol not found: {to:?}. Did you mean: {suggestions}?"
-            ))
-        };
-    }
-
-    let (result, nodes_examined, cap_reached) =
-        g.shortest_path(from, to, resolved_cap, min_confidence_filter);
-    drop(g);
-
-    let response = match result {
-        Some(r) => FindPathResponse {
-            found: true,
-            hop_count: r.hops.len().saturating_sub(1) as u32,
-            hops: r.hops,
-            heuristic_hops: r.heuristic_hops,
-            nodes_examined,
-            node_cap: resolved_cap,
-            cap_reached,
-        },
-        None => FindPathResponse {
-            found: false,
-            hops: Vec::new(),
-            hop_count: 0,
-            heuristic_hops: 0,
-            nodes_examined,
-            node_cap: resolved_cap,
-            cap_reached,
-        },
-    };
-    tool_success_json(&response)
+    crate::core::to_call_tool_result(crate::core::query::find_path(
+        graph,
+        true,
+        from,
+        to,
+        node_cap,
+        min_confidence,
+    ))
 }
 
 #[cfg(test)]
@@ -538,7 +248,9 @@ mod tests {
     use super::super::test_helpers::{body_text, page_parts};
     use super::super::NO_BYTE_BUDGET;
     use super::*;
-    use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+    use code_graph_core::{
+        paths, Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind,
+    };
 
     fn sym(name: &str, file: &str) -> Symbol {
         Symbol {

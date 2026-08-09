@@ -180,6 +180,10 @@ Stated plainly so it is a decision and not an oversight: this leaves the test su
 
 The double-check on the MCP path is deliberate and cheap: `require_indexed` reads one `AtomicBool` with `Ordering::Acquire` and takes no lock. Removing the `server.rs` call to avoid it would mean editing `server.rs`, forfeiting Decision 3's central guarantee, for a saved atomic load. The core check is the authoritative one; the wire-layer check is a fast path that also keeps `server.rs` byte-identical.
 
+**How the core learns whether the graph is indexed differs by module, and the difference is forced.** The watch handlers take `&Arc<ServerInner>`, so `core::watch` reads `inner.indexed` directly and the guard genuinely runs twice on the MCP path, as described above. The query, symbols, and structure handlers take `&RwLock<Graph>` and have no access to the flag at all — so their core functions take an explicit `indexed: bool` parameter and the adapter passes `true`, since `server.rs` has already gated that path. The guard therefore runs once on the MCP path for those modules, not twice.
+
+That is a deviation from the double-check described above, and it is the better shape given the constraint: the core cannot read state it was never handed, and an explicit parameter makes the obligation visible to a CLI or socket caller rather than hiding it behind global state the caller cannot see. Changing the handler signatures to carry `ServerInner` would restore the double-check at the cost of Decision 3's central guarantee, which is not a trade worth making.
+
 **This must be enumerated per module in Decision 7's commits, not left as an implied consequence.** It is exactly the kind of addition a mechanical "one-line adapter" pass skips, and the only thing that would catch the omission is the AC-28 test — which, being new, might not be written until late in the sequence.
 
 ## Error Handling
