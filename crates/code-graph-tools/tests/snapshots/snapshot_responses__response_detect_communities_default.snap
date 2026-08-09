@@ -1,0 +1,48 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "degenerate": null,
+  "edge_count": 9,
+  "granularity": "file",
+  "iterations": 2,
+  "limit": 100,
+  "next_offset": null,
+  "node_count": 8,
+  "offset": 0,
+  "results": [
+    {
+      "label": "[testdata]",
+      "members": [
+        "[testdata]/engine.cpp",
+        "[testdata]/engine.h",
+        "[testdata]/main.cpp",
+        "[testdata]/utils.cpp",
+        "[testdata]/utils.h"
+      ],
+      "size": 5,
+      "truncated": false
+    },
+    {
+      "label": "[testdata]",
+      "members": [
+        "[testdata]/circular_a.h",
+        "[testdata]/circular_b.h"
+      ],
+      "size": 2,
+      "truncated": false
+    },
+    {
+      "label": "[testdata]/orphan.cpp",
+      "members": [
+        "[testdata]/orphan.cpp"
+      ],
+      "size": 1,
+      "truncated": false
+    }
+  ],
+  "termination": "converged",
+  "total": 3,
+  "truncated": false
+}

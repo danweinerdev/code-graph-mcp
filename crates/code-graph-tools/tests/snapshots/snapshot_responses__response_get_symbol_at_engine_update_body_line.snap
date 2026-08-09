@@ -1,0 +1,22 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "limit": 100,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "end_line": 10,
+      "kind": "method",
+      "line": 6,
+      "name": "update",
+      "parent": "Engine",
+      "span_lines": 4,
+      "symbol_id": "[testdata]/engine.cpp:Engine::update"
+    }
+  ],
+  "total": 1,
+  "truncated": false
+}

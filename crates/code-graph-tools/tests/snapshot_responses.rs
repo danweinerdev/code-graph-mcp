@@ -42,13 +42,16 @@ use code_graph_lang_go::GoParser;
 use code_graph_lang_python::PythonParser;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
-use code_graph_tools::handlers::query::{callers_or_callees, get_dependencies, Direction};
+use code_graph_tools::handlers::query::{
+    callers_or_callees, find_path, get_dependencies, Direction,
+};
 use code_graph_tools::handlers::structure::{
-    detect_cycles, generate_diagram, get_class_hierarchy, get_coupling, get_orphans,
-    GenerateDiagramInput,
+    detect_communities, detect_cycles, generate_diagram, get_class_hierarchy, get_coupling,
+    get_orphans, GenerateDiagramInput,
 };
 use code_graph_tools::handlers::symbols::{
-    get_file_symbols, get_symbol_detail, get_symbol_summary, search_symbols, SearchSymbolsInput,
+    get_file_symbols, get_symbol_at, get_symbol_detail, get_symbol_summary, search_symbols,
+    SearchSymbolsInput,
 };
 use code_graph_tools::handlers::{ENVELOPE_OVERHEAD_BYTES, NO_BYTE_BUDGET};
 use code_graph_tools::server::ServerInner;
@@ -1458,6 +1461,135 @@ fn python_parser_registers_for_python_language() {
     assert!(registry.plugin_for(Language::Go).is_some());
     assert!(registry.plugin_for(Language::Rust).is_some());
     assert!(registry.plugin_for(Language::Cpp).is_some());
+}
+
+// --- get_symbol_at (phase 1: Graph Queries, task 1.6) --------------------
+
+#[tokio::test]
+async fn response_get_symbol_at_engine_update_body_line() {
+    // engine.cpp:8 (`position_.x = newX;`) is inside `Engine::update`
+    // (lines 6-10). `testdata/cpp` has no file where a class body and a
+    // method-with-a-body share the same file (C++ methods are usually
+    // defined out-of-line), so the nested-class case from the task
+    // description doesn't apply here — this pins the single-enclosing-
+    // function shape instead, per the task's documented fallback.
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_symbol_at(&fx.inner.graph, &file, 8, None, None, NO_BYTE_BUDGET);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_get_symbol_at_no_enclosing_symbol() {
+    // engine.cpp:2 is a bare `#include` line, enclosed by nothing. Pins
+    // the empty-`Page` success shape (AC-14): `results: []`, `total: 0`,
+    // never a tool error.
+    let fx = build_indexed_fixture().await;
+    let file = fx
+        .indexed_root
+        .join("engine.cpp")
+        .to_string_lossy()
+        .into_owned();
+    let r = get_symbol_at(&fx.inner.graph, &file, 2, None, None, NO_BYTE_BUDGET);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- find_path (phase 1: Graph Queries, task 1.6) ------------------------
+
+#[tokio::test]
+async fn response_find_path_main_to_utils_clamp() {
+    // `main()` calls `utils::clamp` directly (main.cpp:14) — a genuine
+    // connected pair through `testdata/cpp`. Pins `found`, `hop_count`,
+    // `heuristic_hops`, `nodes_examined`, `node_cap`, and `cap_reached`
+    // (AC-16).
+    let fx = build_indexed_fixture().await;
+    let from = format!("{}:main", fx.indexed_root.join("main.cpp").display());
+    let to = format!("{}:clamp", fx.indexed_root.join("utils.cpp").display());
+    let r = find_path(&fx.inner.graph, &from, &to, None, None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_find_path_not_found() {
+    // `neverCalled` and `alsoOrphaned` (both in orphan.cpp) call nothing
+    // and are called by nothing — no path exists either direction. Pins
+    // the `found: false` success shape (never a tool error).
+    let fx = build_indexed_fixture().await;
+    let from = format!(
+        "{}:neverCalled",
+        fx.indexed_root.join("orphan.cpp").display()
+    );
+    let to = format!(
+        "{}:alsoOrphaned",
+        fx.indexed_root.join("orphan.cpp").display()
+    );
+    let r = find_path(&fx.inner.graph, &from, &to, None, None);
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+// --- detect_communities (phase 1: Graph Queries, task 1.6) ---------------
+
+#[tokio::test]
+async fn response_detect_communities_default() {
+    // `testdata/cpp`'s aggregated file graph clusters `main.cpp`,
+    // `engine.cpp`, `utils.cpp`, and their headers into one community
+    // via `Calls` + folded `Includes` edges; `circular_a.h`/`circular_b.h`
+    // form a second (mutual `#include`); `orphan.cpp` is a singleton
+    // (isolated). Pins `granularity`, `termination`, `iterations`,
+    // `node_count`, `edge_count`, and `degenerate` (AC-53, AC-54).
+    let fx = build_indexed_fixture().await;
+    let r = detect_communities(
+        &fx.inner.graph,
+        None,
+        None,
+        None,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+}
+
+#[tokio::test]
+async fn response_detect_communities_member_capped() {
+    // Same fixture, `members_per_community=2`. The main/engine/utils
+    // cluster has 5 members (`Calls` + folded `Includes` edges pull the
+    // header files in too), so it overflows the cap and carries
+    // `truncated: true` + `original_len: 5` (AC-32) while smaller
+    // communities stay `truncated: false` with no `original_len`.
+    let fx = build_indexed_fixture().await;
+    let r = detect_communities(
+        &fx.inner.graph,
+        None,
+        None,
+        Some(2),
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
+    let parsed = parsed_sorted(&r);
+    settings_with_path_redaction(&fx.indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
 }
 
 // --- Rust-side snapshots ------------------------------------------------

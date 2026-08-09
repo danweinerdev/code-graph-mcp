@@ -1,0 +1,13 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "cap_reached": false,
+  "found": false,
+  "heuristic_hops": 0,
+  "hop_count": 0,
+  "hops": [],
+  "node_cap": 100000,
+  "nodes_examined": 1
+}

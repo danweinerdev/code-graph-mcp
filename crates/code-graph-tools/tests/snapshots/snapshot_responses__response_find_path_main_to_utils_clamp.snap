@@ -1,0 +1,26 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+expression: parsed
+---
+{
+  "cap_reached": false,
+  "found": true,
+  "heuristic_hops": 0,
+  "hop_count": 1,
+  "hops": [
+    {
+      "entered_by": null,
+      "file": "[testdata]/main.cpp",
+      "line": 9,
+      "symbol_id": "[testdata]/main.cpp:main"
+    },
+    {
+      "entered_by": "resolved",
+      "file": "[testdata]/main.cpp",
+      "line": 14,
+      "symbol_id": "[testdata]/utils.cpp:clamp"
+    }
+  ],
+  "node_cap": 100000,
+  "nodes_examined": 5
+}
