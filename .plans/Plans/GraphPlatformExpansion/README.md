@@ -79,7 +79,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a 
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | in-progress | Task 3.1 complete: inert `[daemon]` config shipped. **Next: 3.2**, explicit daemon mode, transport, metadata, lockfile, and single-instance startup. |
+| 3 Daemon Foundation | in-progress | Tasks 3.1–3.2 complete: config plus explicit daemon mode, transport metadata, authenticated fallback, crash-safe single-instance ownership, and cleanup shipped. **Next: 3.3**, opt-in proxy attachment. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
@@ -195,6 +195,7 @@ flowchart LR
 - **Both fingerprint sensitivities ship for all six languages** (D-0006). `LiteralInsensitive` is a required rollout step, not an opportunistic per-language override.
 - **A response field earns its place by removing a round-trip** (D-0007). These responses are consumed by agents; an indicator that only changes hedging language is close to worthless, while one that lets the agent skip a query or names the next action changes behaviour. This is why per-hop resolution detail stays on `find_path` and why candidate count (FR-48, phase 9) is specified properly rather than approximated by the existing one-bit tag.
 - **Community detection runs at file granularity** (Designs/GraphQueries Decision 4). The `files` PathTrie iterates deterministically, which gives FR-25 for free; walking `nodes` would not.
+- **Validation is initiative-scoped for implementation gating** (D-0008). Diagnostics in this plan and its directly governing GraphPlatformExpansion spec/designs block progression; unrelated legacy-artifact diagnostics reached through transitive links are reported but do not.
 
 ## Dependencies
 

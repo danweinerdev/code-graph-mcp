@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [decisions]
 related: []
 decisions:
@@ -118,6 +118,25 @@ decisions:
       - Designs/GraphQueries
     tags: [api-design, llm-facing, confidence, wire-contract]
     reversibility: two-way
+  - id: D-0008
+    kind: decision
+    status: accepted
+    date: 2026-08-10
+    decided_by: user
+    statement: "GraphPlatformExpansion implementation is blocked only by validation errors in that plan and its governing GraphPlatformExpansion spec and designs; validation errors confined to unrelated legacy artifacts do not block its tasks."
+    rejected:
+      - "Treating repository-wide legacy SDD validation debt as a blocker for GraphPlatformExpansion tasks"
+    rationale: "The validator follows transitive related links into many historical artifacts outside this initiative. Those findings are real repository debt but do not establish a defect in the active plan, its governing contracts, or its implementation evidence."
+    confirmation: "Before advancing a task, filter validation diagnostics to Plans/GraphPlatformExpansion, Specs/GraphPlatformExpansion, and the four designs directly related by the plan; stop only for diagnostics in that governing set."
+    scope:
+      - Plans/GraphPlatformExpansion
+      - Specs/GraphPlatformExpansion
+      - Designs/GraphQueries
+      - Designs/TypedCoreLayering
+      - Designs/RepoLocalDaemon
+      - Designs/VcsHistory
+    tags: [validation, implementation, legacy-artifacts, workflow]
+    reversibility: two-way
 ---
 
 # Decision Ledger
@@ -143,3 +162,7 @@ The conclusion is unchanged. D-0004 restates it on the argument that actually ho
 ## D-0002 — Opaque revision identity
 
 `reversibility: one-way` because the constraint's whole value is being applied before any revision identifier reaches a persisted field or the MCP wire contract. Once a hash-shaped identifier ships in a response, relaxing this is a breaking change rather than a refactor.
+
+## D-0008 — Validation scope for GraphPlatformExpansion
+
+Repository-wide validation still reports legacy structural debt through transitive `related` links. During this plan, diagnostics outside the active plan and its directly governing spec/design set are reported but do not stop task progression; diagnostics inside that set remain blocking.

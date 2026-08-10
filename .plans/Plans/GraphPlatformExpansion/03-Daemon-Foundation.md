@@ -15,9 +15,9 @@ tasks:
     verification: "cargo test -p code-graph-core config:: — a .code-graph.toml with [daemon] enabled and idle_timeout_secs parses; absent section yields documented defaults; idle_timeout_secs = 0 parses as the never-exit sentinel; an unknown key is ignored consistently with the existing sections; no behaviour changes anywhere."
   - id: "3.2"
     title: "Daemon mode: transport, metadata, lockfile, single-instance"
-    status: planned
+    status: complete
     justifies: "FR-06, FR-07, FR-13, FR-38, FR-39, FR-40, NFR-06, NFR-07, AC-05, AC-08, AC-47, AC-48, AC-49. Without an atomic single-instance protocol, concurrent sessions produce two daemons on one cache; without the transport hierarchy the daemon cannot satisfy NFR-06 on every platform."
-    verification: "cargo test -p code-graph-tools daemon:: plus an integration test — --serve creates .code-graph/ with socket, daemon.json, and lock and nothing outside the repository (AC-05); named pipe or UDS is used by default and loopback TCP only on fallback, with the fallback reported (AC-47); the TCP path refuses a client with no or stale secret and the secret file is owner-only (AC-48); a client reads the transport from metadata and connects first try (AC-49); N clients started simultaneously converge on one daemon with no orphans, run 20 times (AC-08); an orphaned socket inode does not block startup and a live one is never unlinked."
+    verification: "cargo test -p code-graph-mcp daemon:: plus process integration tests — --serve creates .code-graph/ with socket, daemon.json, and lock and nothing outside the repository (AC-05); named pipe or UDS is used by default and loopback TCP only on fallback, with the fallback reported (AC-47); the TCP transport-auth prelude refuses a client with no or stale secret and the secret file is owner-only (AC-48); a test client reads the transport from metadata and connects first try (AC-49); N simultaneous --serve contenders produce one daemon owner and no leaked contenders, run 20 times (task 3.3 completes AC-08 with real attaching clients); an orphaned socket inode does not block startup and a live one is never unlinked; Ctrl-C removes owned runtime files."
     depends_on: ["3.1"]
   - id: "3.3"
     title: "Proxy mode behind [daemon].enabled, default off"
@@ -88,30 +88,57 @@ Follow the existing section conventions exactly — `#[serde(default)]` on every
 ## 3.2: Daemon mode: transport, metadata, lockfile, single-instance
 
 ### Subtasks
-- [ ] Add `--serve` mode to the binary; keep the no-arg invocation behaving exactly as today
-- [ ] Implement transport selection: Unix socket / named pipe first, loopback TCP with a per-instance secret on fallback
-- [ ] Write `daemon.json` (pid, transport, endpoint, binary SHA, started_at) after the listener is live
-- [ ] Implement exclusive-create `daemon.lock` with the pid inside; remove on clean exit
-- [ ] Stale-lock detection: liveness by connection attempt, pid only to avoid removing a live starter's lock
-- [ ] POSIX: unlink a pre-existing socket inode only while holding the lock and only after a connection attempt is refused
-- [ ] Serve `CodeGraphServer` over the accepted stream via rmcp's async-rw transport
-- [ ] Tests per the verification field, including the 20x concurrency run
+- [x] Add `--serve` mode to the binary; keep the no-arg invocation behaving exactly as today
+- [x] Implement transport selection: Unix socket / named pipe first, loopback TCP with a per-instance secret on fallback
+- [x] Write `daemon.json` (pid, transport, endpoint, binary SHA, started_at) after the listener is live
+- [x] Implement exclusive-create `daemon.lock` with the pid inside; remove on clean exit
+- [x] The daemon process acquires and owns the lock; losing `--serve` contenders exit cleanly rather than receiving transferred lock ownership from a parent
+- [x] Stale-lock recovery: held `fs2` OS ownership plus pid/start-time/nonce identity; endpoint probing is reserved for safe POSIX socket-inode cleanup
+- [x] POSIX: unlink a pre-existing socket inode only while holding the lock and only after a connection attempt is refused
+- [x] Serve `CodeGraphServer` over the accepted stream via rmcp's async-rw transport
+- [x] Add Ctrl-C cleanup for owned metadata, lock, secret, and local endpoint; task 3.4 extends this path for binary-replacement signals and cache-persist coordination
+- [x] Tests per the verification field, including the 20x concurrency run
 
 ### Notes
 Revision boundary: a daemon can be started explicitly and serves MCP over a socket. Nothing attaches to it automatically yet.
 
 This is the largest task in the plan and the pieces are genuinely coupled — a lockfile without stale detection is unsafe, transport selection without metadata is unusable — so it is one bisectable unit rather than seven. If `make verify` cannot be kept green across the whole bundle in one sitting, land the subtasks as sub-commits within the task rather than splitting the task; the revision boundary is the working daemon, not each part of it.
 
-The `server` feature already enabled in this workspace pulls in `transport-async-rw`, so no rmcp feature change is needed. Both stdio and socket transports frame through the same `JsonRpcMessageCodec`, which is what makes 3.3's byte pump safe.
+The workspace's pinned rmcp enables `transport-io`, which provides the async read/write transport used here; no rmcp feature change is needed. Both stdio and socket transports frame through the same `JsonRpcMessageCodec`, which is what makes 3.3's byte pump safe.
 
 Loopback TCP does **not** by itself restrict access to the invoking user — that is why the secret exists on that path and not on the others.
 
+The amended implementation boundary uses daemon-owned locking, a pre-MCP TCP authentication prelude, binary-crate-only platform dependencies, tests under `code-graph-mcp`, Ctrl-C cleanup in this task, and contender-only concurrency here with real client convergence deferred to 3.3.
+
+The amended spec pins the remaining platform details: `CG-AUTH <64 lowercase hex>\n`, a 73-byte cap, a two-second timeout, constant-time comparison, safe `sysinfo` identity checks, crash-released `fs2` locking, default named-pipe ACLs, and built-in `icacls` for owner-only Windows token-file access. The binary uses `getrandom` / `sysinfo` / `fs2`, not direct unsafe `windows-sys` calls.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-10
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `221b0184fd543f606d48e39880c3fee15c0a5c3b`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-10T21:21:25Z, matching `221b0184fd543f606d48e39880c3fee15c0a5c3b`
+- Focused review: `git show 221b0184fd543f606d48e39880c3fee15c0a5c3b`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `221b0184fd543f606d48e39880c3fee15c0a5c3b`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon::` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 16 focused daemon tests passed: auth grammar, owner-only paths, symlink rejection, malformed/stale lock takeover, PID/start-time identity, stale-vs-live UDS, endpoint reuse, metadata/token cleanup, and bounded fallback behavior. |
+| `cargo test -p code-graph-mcp --test daemon_serve` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 4 process tests passed: UDS MCP round-trip and cleanup, 20 repeated six-contender races with natural loser exit, simultaneous stale-lock recovery, and forced TCP fallback with rejection, MCP round-trip, crash recovery, and token rotation. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | All 21 binary-crate tests passed, including the unchanged no-argument stdio smoke test advertising 22 tools. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.2.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, snapshot cleanliness, and plugin mirror synchronization passed after temporarily relocating and restoring the pre-existing orphan fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 221b0184fd543f606d48e39880c3fee15c0a5c3b` | Complete task commit | PASS | One explicit-daemon slice: binary dispatch, repository-local transports/state, crash-released ownership, authentication, cleanup, build identity, and focused process coverage; proxy attachment remains absent for task 3.3. |
+| Four-lane iterative task review plus final focused quality confirmation | Complete task diff | PASS | Lock TOCTOU, stale token/metadata poisoning, owner-only UDS/runtime paths, endpoint reuse, connection admission, symlink escape, process leaks, and build-SHA invalidation findings were fixed; final confirmation reported no findings. |
+| Windows target check attempt | `x86_64-pc-windows-msvc` from Linux | DEFERRED | Rust reached target dependency compilation but tree-sitter grammar build scripts require native MSVC `lib.exe`; native Windows named-pipe and `icacls` runtime exercise remains explicitly assigned to task 3.5 / AC-42. |
 
 ### Trap
-Testing "is a daemon already running?" by checking whether the socket file exists. It doesn't work in either direction: a crashed daemon leaves the file behind (so existence is a false positive, and on POSIX the leftover inode makes `bind` fail with `EADDRINUSE` forever), and the file appears slightly after the process starts (so absence is a false negative). The only sound test is attempting a connection.
+Testing "is a daemon already running?" by checking whether the socket file exists. It doesn't work in either direction: a crashed daemon leaves the file behind (so existence is a false positive, and on POSIX the leftover inode makes `bind` fail with `EADDRINUSE` forever), and the file appears slightly after the process starts (so absence is a false negative). A connection attempt determines whether that socket inode is live; the held OS lock is the single-instance authority.
 
 ## 3.3: Proxy mode behind [daemon].enabled, default off
 

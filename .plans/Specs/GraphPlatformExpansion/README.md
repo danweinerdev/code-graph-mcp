@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: spec
 status: approved
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [daemon, cli, vcs, graph-queries, architecture, perforce]
 related:
   - Designs/SharedDaemon
@@ -223,8 +223,8 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - Track B and Track C's CLI exposure depend on Track A. Track C's query implementations do not.
 - Track D depends on Track A only for front-end exposure; the provider trait and git implementation are independent.
 - Track D depends on the existing language-plugin parse interface accepting a byte buffer rather than a path — confirmed present.
-- New third-party dependencies expected, all confined outside the core crates: an argument parser for the CLI, a git library for the git provider, and a hash function for symbol fingerprinting. The daemon's local transport is expected to need none, as the async runtime already present provides it.
-- No decision ledger exists in this planning root yet. One will be created to record the supersession noted in Constraints.
+- New third-party dependencies are confined outside the protected core crates: an argument parser for the CLI, a git library for the git provider, a hash function for symbol fingerprinting, and binary-crate-only `getrandom` / `sysinfo` / `fs2` support for daemon secrets, safe process identity, and crash-released cross-platform file locking. Tokio supplies the transport itself; Windows ACL adjustment uses built-in `icacls` without application unsafe code.
+- The decision ledger lives at `Decisions/decisions.md`; D-0001 records the repository-local daemon supersession described in Constraints.
 
 ## Resolved Questions
 

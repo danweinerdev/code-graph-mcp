@@ -3,7 +3,7 @@ title: "Repository-Local Daemon and CLI (Track B)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [daemon, cli, ipc, named-pipe, unix-socket, idle-timeout, analyze-queue]
 related:
   - Specs/GraphPlatformExpansion
@@ -92,11 +92,12 @@ sequenceDiagram
         end
     end
     alt no live daemon
-        Cl->>L: exclusive create
-        alt won the lock
-            Cl->>D: spawn, wait for daemon.json
-        else lost the lock
-            Cl->>D: retry connect with backoff
+        Cl->>D: spawn a daemon contender
+        D->>L: exclusive create
+        alt daemon won the lock
+            D->>D: bind listener, publish daemon.json
+        else daemon lost the lock
+            D->>D: exit; client retries connect with backoff
         end
     end
     alt still no daemon
@@ -161,21 +162,21 @@ A consequence worth stating: because the proxy is byte-level, protocol version s
 
 **Context:** FR-38 – FR-40 and NFR-06/07. (Resolves the spec's OQ-02.)
 
-**Decision:** POSIX uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`; Windows uses a named pipe. If the preferred transport cannot be established, fall back to a TCP listener bound to `127.0.0.1:0`, and require clients to present a per-instance secret stored at `<project_root>/.code-graph/secret` with owner-only permissions. The transport in use is recorded in `daemon.json`, and the fallback is reported rather than silent.
+**Decision:** POSIX uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`; Windows uses a named pipe with the operating system's default ACL. If the preferred transport cannot be established, fall back to a TCP listener bound to `127.0.0.1:0`, and require clients to present a per-instance secret stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison, before the stream reaches rmcp's MCP codec; this is transport authentication, not a second graph-query protocol. On Windows the token file is restricted with built-in `icacls`. The transport in use is recorded in `daemon.json`, and the fallback is reported rather than silent.
 
 **Rationale:** A Unix socket and a named pipe both carry OS-level access control, so NFR-06 is satisfied by the filesystem/pipe ACL with no application-level auth. Loopback TCP does **not** — binding `127.0.0.1` excludes other machines but not other users on this machine — so the fallback must add a secret to hold the same property. The fallback exists because a socket file cannot always be created inside the repository: some network filesystems and container bind-mounts refuse it. Recording the transport in metadata rather than probing means the client connects on the first attempt and never rattles a door the daemon isn't serving (FR-40).
 
-`tokio` is already present with `features = ["full"]`, which covers `net` on all three transports — no new dependency (NFR-02).
+`tokio` is already present with `features = ["full"]`, which covers `net` on all three transports. Task 3.2 adds direct `getrandom`, safe `sysinfo`, and `fs2` dependencies for CSPRNG-backed secrets, process identity, and an OS lock that releases on crash; all stay in the binary crate, outside the protected core crates. Windows ACL adjustment uses built-in `icacls`, so the binary adds no unsafe Windows API calls (NFR-02).
 
-### Decision 4: Exclusive-create lockfile, with liveness probe and connect-retry for the losers
+### Decision 4: Exclusive-create lockfile with crash-released OS ownership
 
 **Context:** FR-13 — several sessions may start at once against a root with no daemon. Nothing in the workspace does single-instance today; there is no precedent to follow.
 
-**Decision:** A client that finds no live daemon attempts an atomic exclusive create of `<project_root>/.code-graph/daemon.lock` containing its pid. The winner spawns the daemon and waits for `daemon.json` to appear, with a timeout. Losers do not spawn; they retry connecting with bounded backoff. A lockfile whose recorded pid is not alive is treated as stale and removed before retrying, and the daemon removes its own lock and metadata on clean exit.
+**Decision:** A client that finds no live daemon may spawn a daemon contender. Each daemon contender atomically attempts to create `<project_root>/.code-graph/daemon.lock`, then holds an exclusive `fs2` OS lock on that file for its lifetime. The file records pid, process start time, and a random nonce. The winner binds and publishes metadata; losers exit and their clients retry with bounded backoff. After a crash the OS releases ownership even though the file remains, so exactly one contender locks that same inode and replaces a dead/malformed identity in place. The winning daemon removes its own lock and metadata on clean exit. Lock ownership is never transferred from a proxy parent to a daemon child.
 
-**Rationale:** Exclusive create is the one primitive that is atomic on every target filesystem without a dependency. Binding the socket itself as the lock is tempting and wrong: a crashed daemon leaves the socket file behind, so bind-fails-therefore-running produces a permanent deadlock. Making the lock a separate file with a pid inside gives a liveness test that distinguishes "running" from "crashed", which is the case that actually happens.
+**Rationale:** Exclusive create resolves a clean start, while the held OS lock resolves stale-file takeover without a pathname delete/recreate race between contenders. Binding the socket itself as the lock is tempting and wrong: a crashed daemon leaves the socket file behind, so bind-fails-therefore-running produces a permanent deadlock. Pid plus start time distinguishes PID reuse; the nonce binds metadata cleanup to one instance.
 
-The stale-lock check is the subtle part and needs its own test: pid reuse means "a process with this pid exists" is not "the daemon is alive". The definitive check is whether a connection to the recorded endpoint succeeds, with the pid used only to avoid removing the lock of a live starter mid-startup.
+The OS lock is the single-instance authority. If it is contended, a daemon or starter owns it; if it can be acquired, no process retained ownership through a crash. The recorded pid/start-time identity is a conservative startup check and cleanup binding, not a substitute for the OS lock. Endpoint connection probing has one narrower job: deciding whether a POSIX socket inode is live before unlinking it.
 
 **Stale socket inodes are a separate hazard from stale locks.** On POSIX, `bind()` on a Unix-socket path fails with `EADDRINUSE` when the path already exists as a socket inode — **even when nothing is listening on it**. An unclean daemon exit therefore leaves a file that permanently blocks every future daemon for that root unless it is unlinked. But blindly unlinking before binding reintroduces the very race the lock exists to prevent: two starters could each unlink the other's live socket.
 
@@ -183,7 +184,7 @@ The rule: **a daemon may unlink a pre-existing socket path only after it holds `
 
 Named pipes and TCP do not have this problem — a pipe vanishes with its owning process and a TCP port is released by the kernel — so this is a POSIX-specific step in the bind path, not a general one.
 
-**Losers re-probe rather than probing once.** If the winner dies after taking the lock but before writing metadata, a loser that checked liveness once at first failure would ride out its whole backoff and fall back in-process even though the daemon slot is now free. The backoff loop therefore re-checks lock staleness on each attempt, not only at entry. Self-healing on the *next* session is not good enough when the whole point is to avoid redundant in-process fallbacks.
+**Clients re-probe rather than probing once.** If the winning daemon dies after taking the lock but before writing metadata, a client that checked liveness once at first failure would ride out its whole backoff and fall back in-process even though the daemon slot is now free. The client backoff loop therefore re-checks lock staleness and may spawn another contender on each attempt, not only at entry. Self-healing on the *next* session is not good enough when the whole point is to avoid redundant in-process fallbacks.
 
 ### Decision 5: Binary identity, not protocol version, gates attachment
 
@@ -193,7 +194,7 @@ Named pipes and TCP do not have this problem — a pipe vanishes with its owning
 
 **Rationale:** The proxy is byte-level, so there is no protocol version to compare — the only thing that can differ is behaviour, and the build SHA is exactly that. It already exists and is already surfaced, so this costs a field. The `-dirty` suffix matters more than it looks: during active development every build is dirty and the SHA does not change between them, so a dirty SHA must be treated as *always* mismatching. Otherwise an edit-rebuild-rerun loop silently keeps talking to the old daemon — the single most likely way this feature wastes someone's afternoon.
 
-**The shutdown mechanism is a signal, and it must route through the graceful path.** "Ask the daemon to exit" cannot be an MCP call: Decision 2 declines to add any protocol, and a hidden control tool would contradict both that and the unchanged-tool-surface guarantee. So the client sends `SIGTERM` (POSIX) or the platform equivalent (Windows) to the pid in `daemon.json`, and **the daemon installs a handler that runs the same shutdown path as idle exit** — persist the cache, remove metadata and lock, close the listener. A bare kill would violate Decision 6's persist-before-exit invariant, and because the dirty-SHA rule makes this path fire on *every rebuild during development*, a torn `.code-graph-cache.db` would be a routine occurrence rather than an edge case.
+**The shutdown mechanism is a signal, and it must route through the graceful path.** "Ask the daemon to exit" cannot be an MCP call: Decision 2 declines to add any graph-query protocol, and a hidden control tool would contradict both that and the unchanged-tool-surface guarantee. Task 3.2 establishes the graceful cleanup path for Ctrl-C — remove metadata, lock, secret, and local endpoint. Task 3.4 extends the same path so a client can signal a binary-mismatched daemon, wait for any cache persist, and escalate after a bounded grace period. A bare kill would violate Decision 6's persist-before-exit invariant, and because the dirty-SHA rule makes this path fire on *every rebuild during development*, a torn `.code-graph-cache.db` would be a routine occurrence rather than an edge case.
 
 Two details that follow: if the daemon is mid-`Persisting` when signalled it finishes that write before exiting rather than aborting it, since a partial rkyv archive is worse than a stale one; and if it does not exit within a bounded grace period the client escalates to a hard kill, accepts that the cache may be stale, and falls back in-process. A refusal to die must not wedge the session.
 
@@ -280,7 +281,7 @@ All user-visible failures remain `CallToolResult` with the error flag. Diagnosti
 - Spawn from a clean root creates `.code-graph/` and nothing outside the repository — assert by snapshotting the set of paths written (AC-05).
 - Short idle timeout: exits with no clients; does not exit with a client attached; does not exit with an analyze in flight and no clients (AC-06).
 - Cache reflects the last index after idle exit; next start loads rather than re-indexes (AC-07).
-- N clients started simultaneously converge on one daemon, no orphans (AC-08). Run repeatedly — this is a race, and a single pass proves little.
+- Task 3.2: N simultaneous `--serve` contenders produce one daemon owner and no leaked contender processes, repeated to exercise the race. Task 3.3 completes AC-08 with simultaneous real clients that attach to that winner.
 - Mismatched binary SHA does not attach (AC-09).
 - Daemon prevented from starting: every existing tool still answers in-process (AC-10).
 
