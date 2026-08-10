@@ -172,6 +172,10 @@ max_threads = 0           # 0 = num_cpus
 [parsing]
 max_threads = 0           # 0 = num_cpus; indexer caps discovery+parse sum at num_cpus
 
+[daemon]
+enabled = false           # parsed but inert; no runtime code reads or acts on it yet.
+idle_timeout_secs = 1800  # seconds; 0 = never exit.
+
 [response]
 max_bytes = 102400        # byte cap on paginated MCP responses; mid-page truncation
                           # surfaces `truncated: true` + `next_offset` for paging resume.
@@ -236,6 +240,11 @@ python = []
 csharp = []
 java = []
 ```
+
+`[daemon]` reserves lifecycle settings for exactly one repository-local daemon
+per project root, with all future runtime state inside that repository. It is
+parsed but inert in the current release: no runtime code reads or acts on
+`enabled` or `idle_timeout_secs`.
 
 `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (TOML NOT re-read per query).
 

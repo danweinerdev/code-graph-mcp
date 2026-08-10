@@ -34,6 +34,13 @@ fn default_response_max_bytes() -> usize {
     DEFAULT_RESPONSE_MAX_BYTES
 }
 
+/// Helper for `#[serde(default = "...")]` on
+/// `DaemonConfig::idle_timeout_secs`. `0` remains a valid value and is the
+/// never-exit sentinel; it is deliberately not validated here.
+fn default_daemon_idle_timeout_secs() -> u64 {
+    1_800
+}
+
 /// Helper for `#[serde(default = "...")]` on [`MacroDefineType::keyword`]. The
 /// documented default is `"struct"` (the overwhelmingly common engine pattern,
 /// where the macro expands to a plain-old-data aggregate). Plain
@@ -75,6 +82,8 @@ pub struct RootConfig {
     pub discovery: DiscoveryConfig,
     #[serde(default)]
     pub parsing: ParsingConfig,
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     #[serde(default)]
     pub cpp: CppConfig,
     #[serde(default)]
@@ -127,6 +136,32 @@ pub struct ParsingConfig {
     /// Values above the cap are clamped with a warning.
     #[serde(default)]
     pub max_threads: usize,
+}
+
+/// Daemon lifecycle settings reserved for the repository-local daemon.
+///
+/// This configuration is parsed and retained but is currently inert: no
+/// runtime code reads or acts on it. Future daemon state is scoped to one
+/// daemon per project root and remains inside that repository.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DaemonConfig {
+    /// Whether the repository-local daemon is enabled. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds of inactivity before the daemon exits. Defaults to `1800`;
+    /// `0` is the never-exit sentinel.
+    #[serde(default = "default_daemon_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+// Cannot derive: idle_timeout_secs defaults to 1_800, not 0.
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_timeout_secs: default_daemon_idle_timeout_secs(),
+        }
+    }
 }
 
 /// C++-specific knobs. `macro_strip` is whole-word identifier replacement;
@@ -1453,6 +1488,69 @@ disabled = [""]
             RootConfig::load(dir.path()).expect("empty entries must be dropped, not error");
         assert_eq!(cfg.extensions.cpp, vec![".cu".to_string()]);
         assert!(cfg.extensions.disabled.is_empty());
+    }
+
+    // --- DaemonConfig tests -------------------------------------------------
+
+    #[test]
+    fn daemon_section_absent_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[discovery]\nmax_threads = 0\n",
+        )
+        .unwrap();
+
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("config without [daemon] section must load");
+        assert!(!cfg.daemon.enabled, "daemon must default to disabled");
+        assert_eq!(
+            cfg.daemon.idle_timeout_secs, 1_800,
+            "daemon idle timeout must default to 1800 seconds"
+        );
+    }
+
+    #[test]
+    fn daemon_explicit_values_are_parsed() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[daemon]\nenabled = true\nidle_timeout_secs = 60\n",
+        )
+        .unwrap();
+
+        let (cfg, _root) = RootConfig::load(dir.path()).expect("daemon settings must load");
+        assert!(cfg.daemon.enabled);
+        assert_eq!(cfg.daemon.idle_timeout_secs, 60);
+    }
+
+    #[test]
+    fn daemon_zero_idle_timeout_is_never_exit_sentinel() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[daemon]\nidle_timeout_secs = 0\n",
+        )
+        .unwrap();
+
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("zero daemon idle timeout must remain valid");
+        assert_eq!(cfg.daemon.idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn daemon_unknown_keys_are_ignored() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[daemon]\nenabled = true\nunknown_setting = \"ignored\"\n",
+        )
+        .unwrap();
+
+        let (cfg, _root) =
+            RootConfig::load(dir.path()).expect("unknown [daemon] keys must remain ignored");
+        assert!(cfg.daemon.enabled, "known daemon settings must still parse");
+        assert_eq!(cfg.daemon.idle_timeout_secs, 1_800);
     }
 
     // --- ResponseConfig tests ----------------------------------------------

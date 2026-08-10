@@ -4,6 +4,7 @@ bin/
 !crates/*/src/bin/
 .code-graph-cache.json
 .code-graph-cache.db
+.code-graph/
 
 # Rust workspace
 target/
