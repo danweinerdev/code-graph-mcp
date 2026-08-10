@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -23,7 +23,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Daemon Foundation"
-    status: planned
+    status: in-progress
     doc: "03-Daemon-Foundation.md"
   - id: 4
     title: "Analyze Queue and Coalescing"
@@ -79,7 +79,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a 
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | planned | **Next.** Independent of everything except gating 4 and 7. |
+| 3 Daemon Foundation | in-progress | Task 3.1 complete: inert `[daemon]` config shipped. **Next: 3.2**, explicit daemon mode, transport, metadata, lockfile, and single-instance startup. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |

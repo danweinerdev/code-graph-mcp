@@ -3,14 +3,14 @@ title: "Daemon Foundation"
 type: phase
 plan: GraphPlatformExpansion
 phase: 3
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-10
 deliverable: "A repository-local daemon holding one graph per project root, with the stdio binary attaching to it transparently, an idle timeout, and in-process fallback."
 tasks:
   - id: "3.1"
     title: "[daemon] config section, parsed and inert"
-    status: planned
+    status: complete
     justifies: "FR-10, FR-07. A config surface that lands separately can be reviewed and shipped with zero behaviour change, which is what makes every later task in the phase individually revertible."
     verification: "cargo test -p code-graph-core config:: — a .code-graph.toml with [daemon] enabled and idle_timeout_secs parses; absent section yields documented defaults; idle_timeout_secs = 0 parses as the never-exit sentinel; an unknown key is ignored consistently with the existing sections; no behaviour changes anywhere."
   - id: "3.2"
@@ -50,11 +50,11 @@ Independent of phases 1, 2, and 5. Gates phases 4 and 7.
 ## 3.1: [daemon] config section, parsed and inert
 
 ### Subtasks
-- [ ] Add `DaemonConfig { enabled: bool, idle_timeout_secs: u64 }` to `RootConfig`
-- [ ] Default `enabled = **false**` in the type — the flip to true is task 3.4's job, and defaulting true here would make the daemon live as soon as 3.2 and 3.3 land, before the binary-identity guard exists
-- [ ] Document the section in `.code-graph.toml.example` and CLAUDE.md
-- [ ] Add `.code-graph/` to `.gitignore`
-- [ ] Config parsing tests
+- [x] Add `DaemonConfig { enabled: bool, idle_timeout_secs: u64 }` to `RootConfig`
+- [x] Default `enabled = **false**` in the type — the flip to true is task 3.4's job, and defaulting true here would make the daemon live as soon as 3.2 and 3.3 land, before the binary-identity guard exists
+- [x] Document the section in `.code-graph.toml.example` and CLAUDE.md
+- [x] Add `.code-graph/` to `.gitignore`
+- [x] Config parsing tests
 
 ### Notes
 Revision boundary: the config surface exists and is documented; no code reads it yet.
@@ -65,7 +65,25 @@ Follow the existing section conventions exactly — `#[serde(default)]` on every
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-10
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `16497990b8acc564441efed3eeee9513e138f6a4`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-10T19:35:13Z, matching `16497990b8acc564441efed3eeee9513e138f6a4`
+- Focused review: `git show 16497990b8acc564441efed3eeee9513e138f6a4`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `16497990b8acc564441efed3eeee9513e138f6a4`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-core config::` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 60 config tests passed, including absent-section defaults, explicit values, the `0` never-exit sentinel, unknown-key tolerance, and shipped-example parsing. |
+| `git diff --check && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Diff whitespace, rustfmt, and workspace clippy with warnings denied all passed. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.1.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace verification, snapshots, and plugin-sync gate passed after temporarily relocating and then restoring a pre-existing orphan fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 16497990b8acc564441efed3eeee9513e138f6a4` | Complete task commit | PASS | The commit is one bisectable schema-only slice: config type/defaults, public export, focused tests, docs, and ignore rule; no runtime daemon behavior was added. |
+| Intent-blind quality review | Current tracked task diff before commit | PASS | No findings; Serde defaults, sentinel behavior, test coverage, and inert-runtime boundary were confirmed. |
 
 ## 3.2: Daemon mode: transport, metadata, lockfile, single-instance
 
