@@ -3,7 +3,7 @@ title: "Typed Core Layering (Track A)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [refactor, layering, handlers, rmcp, wire-compatibility]
 related:
   - Specs/GraphPlatformExpansion
@@ -11,6 +11,8 @@ related:
 ---
 
 # Typed Core Layering (Track A)
+
+Implementation-gate validation for this design follows the initiative scope recorded in D-0008.
 
 ## Overview
 

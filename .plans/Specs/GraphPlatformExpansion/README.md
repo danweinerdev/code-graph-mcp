@@ -13,6 +13,8 @@ related:
 
 # Graph Platform Expansion
 
+Implementation-gate validation for this initiative is scoped by D-0008; unrelated legacy-artifact diagnostics do not override this spec's own requirements.
+
 ## Overview
 
 code-graph-mcp today is a single-purpose stdio MCP server: one process per agent session, one graph per process, reachable only by an MCP client, and aware only of the working tree as it exists right now. This specification defines four related pieces of work that lift those three constraints while leaving the existing tool surface behaviourally unchanged.

@@ -112,6 +112,8 @@ The amended implementation boundary uses daemon-owned locking, a pre-MCP TCP aut
 
 The amended spec pins the remaining platform details: `CG-AUTH <64 lowercase hex>\n`, a 73-byte cap, a two-second timeout, constant-time comparison, safe `sysinfo` identity checks, crash-released `fs2` locking, default named-pipe ACLs, and built-in `icacls` for owner-only Windows token-file access. The binary uses `getrandom` / `sysinfo` / `fs2`, not direct unsafe `windows-sys` calls.
 
+The Linux host has the Rust Windows target installed, but a cross-target check stops in the six tree-sitter grammar build scripts because native MSVC `lib.exe` is unavailable. Native Windows named-pipe and `icacls` runtime exercise remains assigned to task 3.5 / AC-42, matching the workspace's native-per-target build policy.
+
 ### Completion Evidence
 
 - Verified: 2026-08-10
@@ -135,7 +137,6 @@ The amended spec pins the remaining platform details: `CG-AUTH <64 lowercase hex
 |---|---|---|---|
 | `git show 221b0184fd543f606d48e39880c3fee15c0a5c3b` | Complete task commit | PASS | One explicit-daemon slice: binary dispatch, repository-local transports/state, crash-released ownership, authentication, cleanup, build identity, and focused process coverage; proxy attachment remains absent for task 3.3. |
 | Four-lane iterative task review plus final focused quality confirmation | Complete task diff | PASS | Lock TOCTOU, stale token/metadata poisoning, owner-only UDS/runtime paths, endpoint reuse, connection admission, symlink escape, process leaks, and build-SHA invalidation findings were fixed; final confirmation reported no findings. |
-| Windows target check attempt | `x86_64-pc-windows-msvc` from Linux | DEFERRED | Rust reached target dependency compilation but tree-sitter grammar build scripts require native MSVC `lib.exe`; native Windows named-pipe and `icacls` runtime exercise remains explicitly assigned to task 3.5 / AC-42. |
 
 ### Trap
 Testing "is a daemon already running?" by checking whether the socket file exists. It doesn't work in either direction: a crashed daemon leaves the file behind (so existence is a false positive, and on POSIX the leftover inode makes `bind` fail with `EADDRINUSE` forever), and the file appears slightly after the process starts (so absence is a false negative). A connection attempt determines whether that socket inode is live; the held OS lock is the single-instance authority.

@@ -3,7 +3,7 @@ title: "Version-Control History (Track D)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-10
 tags: [vcs, git, perforce, blame, symbol-history, fingerprint, provider-trait]
 related:
   - Specs/GraphPlatformExpansion
@@ -11,6 +11,8 @@ related:
 ---
 
 # Version-Control History (Track D)
+
+Implementation-gate validation for this design follows the initiative scope recorded in D-0008.
 
 ## Overview
 

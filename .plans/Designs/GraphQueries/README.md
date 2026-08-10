@@ -3,7 +3,7 @@ title: "Graph Queries (Track C)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [graph, queries, position-lookup, shortest-path, community-detection, determinism]
 related:
   - Specs/GraphPlatformExpansion
@@ -11,6 +11,8 @@ related:
 ---
 
 # Graph Queries (Track C)
+
+Implementation-gate validation for this design follows the initiative scope recorded in D-0008.
 
 ## Overview
 

@@ -13,6 +13,8 @@ related:
 
 # Repository-Local Daemon and CLI (Track B)
 
+Implementation-gate validation for this design follows the initiative scope recorded in D-0008.
+
 ## Overview
 
 Today every agent session spawns its own `code-graph-mcp`, builds or loads its own graph, and holds its own copy in memory. Two sessions on one repository pay the indexing cost twice and cannot see each other's index. This design makes the graph a per-repository service: one daemon per project root, N clients attached, with the existing stdio binary demoted to a thin proxy so no client configuration changes (FR-06 – FR-16, D-0001).
