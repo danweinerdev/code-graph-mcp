@@ -24,7 +24,11 @@ code-graph-tools = { path = "../code-graph-tools" }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+fs2 = "0.4"
+getrandom = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = "0.33"
 
 [dev-dependencies]
 tokio = { workspace = true }
-serde_json = { workspace = true }

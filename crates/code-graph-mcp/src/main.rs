@@ -2,8 +2,10 @@
 //!
 //! Builds a [`LanguageRegistry`] with all six shipped language plugins —
 //! C++, Rust, Go, Python, C#, and Java — constructs a [`CodeGraphServer`],
-//! and serves stdio MCP via rmcp's [`ServiceExt::serve`] /
-//! [`RunningService::waiting`].
+//! and serves stdio MCP by default. `--serve` starts the repository-local
+//! daemon transport used by the later proxy mode.
+
+mod daemon;
 
 use anyhow::Context;
 use code_graph_lang::LanguageRegistry;
@@ -19,6 +21,9 @@ use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let serve_daemon = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--serve");
     let mut registry = LanguageRegistry::new();
     registry
         .register(Box::new(
@@ -52,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
         .context("register Java language plugin")?;
 
     let server = CodeGraphServer::new(registry);
+
+    if serve_daemon {
+        return daemon::run(server).await;
+    }
 
     let service = server
         .serve(stdio())

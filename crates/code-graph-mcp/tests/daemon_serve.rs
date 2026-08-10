@@ -1,0 +1,390 @@
+//! Process coverage for the explicit `--serve` daemon mode.
+
+#![cfg(unix)]
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Reaps a test daemon on every failure path. Successful tests explicitly
+/// wait for children before this guard is dropped, so it cannot hide leaks.
+struct DaemonChild {
+    child: Child,
+    stderr: Option<ChildStderr>,
+}
+
+impl DaemonChild {
+    fn spawn(root: &std::path::Path, capture_stderr: bool) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_code-graph-mcp"));
+        command
+            .arg("--serve")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        let mut child = command.spawn().expect("spawn daemon contender");
+        let stderr = child.stderr.take();
+        Self { child, stderr }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            if self.child.try_wait().expect("poll daemon child").is_some() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon child {} did not exit",
+                self.pid()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stderr_text(&mut self) -> String {
+        let mut output = String::new();
+        if let Some(mut stderr) = self.stderr.take() {
+            stderr
+                .read_to_string(&mut output)
+                .expect("read daemon stderr");
+        }
+        output
+    }
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct TestRoot(PathBuf);
+
+impl TestRoot {
+    fn new(iteration: usize) -> Self {
+        let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-mcp-daemon-serve-{}-{iteration}-{sequence}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&root).expect("create test project root");
+        Self(root)
+    }
+}
+
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn wait_for_metadata(root: &std::path::Path) -> Value {
+    let metadata = root.join(".code-graph/daemon.json");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if let Ok(contents) = fs::read(&metadata) {
+            return serde_json::from_slice(&contents).expect("daemon metadata JSON");
+        }
+        assert!(Instant::now() < deadline, "daemon did not publish metadata");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_metadata_for_pid(root: &std::path::Path, pid: u32) -> Value {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let metadata = wait_for_metadata(root);
+        if metadata["pid"].as_u64() == Some(u64::from(pid)) {
+            return metadata;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement daemon did not publish metadata"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn stop_owned_daemon(metadata: &Value) {
+    let pid = metadata["pid"].as_u64().expect("metadata pid").to_string();
+    let status = Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("send SIGINT to daemon");
+    assert!(status.success(), "SIGINT daemon");
+}
+
+fn kill_unclean(child: &mut DaemonChild) {
+    child.child.kill().expect("SIGKILL daemon");
+    child.wait();
+}
+
+fn wait_for_cleanup(root: &std::path::Path) {
+    let runtime = root.join(".code-graph");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while runtime.join("daemon.lock").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!runtime.join("daemon.lock").exists(), "daemon lock cleanup");
+    assert!(
+        !runtime.join("daemon.json").exists(),
+        "daemon metadata cleanup"
+    );
+}
+
+fn mcp_round_trip<W: Write, R: Read>(mut writer: W, reader: R) {
+    writeln!(
+        writer,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "daemon-test", "version": "0.1.0" }
+            }
+        })
+    )
+    .expect("write initialize");
+    writer.flush().expect("flush initialize");
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read initialize response");
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).expect("initialize JSON")["id"],
+        1
+    );
+
+    writeln!(
+        writer,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .expect("write initialized notification");
+    writeln!(
+        writer,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    )
+    .expect("write tools/list");
+    writer.flush().expect("flush tools/list");
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .expect("read tools/list response");
+    let response: Value = serde_json::from_str(&line).expect("tools/list JSON");
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
+}
+
+fn uds_mcp(endpoint: &str) {
+    let stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
+    stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+    mcp_round_trip(stream.try_clone().unwrap(), stream);
+}
+
+fn tcp_mcp(endpoint: &str, token: &str) {
+    let mut stream = TcpStream::connect(endpoint).expect("connect TCP from metadata");
+    stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+    writeln!(stream, "CG-AUTH {token}").expect("write TCP authentication");
+    stream.flush().expect("flush TCP authentication");
+    mcp_round_trip(stream.try_clone().unwrap(), stream);
+}
+
+fn tcp_rejected(endpoint: &str, prelude: &[u8]) {
+    let mut stream = TcpStream::connect(endpoint).expect("connect rejected TCP client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(prelude).expect("write rejected prelude");
+    stream.flush().expect("flush rejected prelude");
+    let mut byte = [0_u8; 1];
+    assert!(
+        stream.read(&mut byte).map_or(true, |read| read == 0),
+        "unauthenticated TCP client must not receive MCP data"
+    );
+}
+
+#[test]
+fn serve_publishes_owner_only_uds_and_serves_mcp() {
+    let root = TestRoot::new(0);
+    let mut daemon = DaemonChild::spawn(&root.0, false);
+    let metadata = wait_for_metadata(&root.0);
+    let runtime = root.0.join(".code-graph");
+
+    assert_eq!(metadata["pid"].as_u64(), Some(u64::from(daemon.pid())));
+    assert_eq!(metadata["transport"], "uds");
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let endpoint = metadata["endpoint"].as_str().expect("UDS endpoint");
+    assert!(fs::symlink_metadata(endpoint)
+        .unwrap()
+        .file_type()
+        .is_socket());
+    assert_eq!(
+        fs::metadata(endpoint).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    uds_mcp(endpoint);
+
+    stop_owned_daemon(&metadata);
+    daemon.wait();
+    wait_for_cleanup(&root.0);
+    assert!(!runtime.join("daemon.sock").exists(), "UDS cleanup");
+}
+
+#[test]
+fn simultaneous_serve_contenders_converge_twenty_times_without_leaks() {
+    for iteration in 0..20 {
+        let root = TestRoot::new(iteration);
+        let mut children: Vec<DaemonChild> =
+            (0..6).map(|_| DaemonChild::spawn(&root.0, false)).collect();
+        let metadata = wait_for_metadata(&root.0);
+        let winner = metadata["pid"].as_u64().expect("metadata pid") as u32;
+        let winner_index = children
+            .iter()
+            .position(|child| child.pid() == winner)
+            .expect("metadata PID identifies one spawned contender");
+        for (index, child) in children.iter_mut().enumerate() {
+            if index != winner_index {
+                child.wait();
+            }
+        }
+        uds_mcp(metadata["endpoint"].as_str().unwrap());
+        stop_owned_daemon(&metadata);
+        children[winner_index].wait();
+        wait_for_cleanup(&root.0);
+        assert!(
+            !root.0.join(".code-graph/daemon.sock").exists(),
+            "iteration {iteration}: no daemon socket leaks"
+        );
+    }
+}
+
+#[test]
+fn simultaneous_contenders_recover_one_stale_lock() {
+    let root = TestRoot::new(2);
+    let runtime = root.0.join(".code-graph");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(
+        runtime.join("daemon.lock"),
+        json!({"pid": 99999999_u32, "start_time": 0_u64, "nonce": "stale"}).to_string(),
+    )
+    .unwrap();
+    let mut children: Vec<DaemonChild> =
+        (0..6).map(|_| DaemonChild::spawn(&root.0, false)).collect();
+    let metadata = wait_for_metadata(&root.0);
+    let winner = metadata["pid"].as_u64().expect("metadata pid") as u32;
+    let winner_index = children
+        .iter()
+        .position(|child| child.pid() == winner)
+        .expect("one contender owns stale-lock replacement");
+    for (index, child) in children.iter_mut().enumerate() {
+        if index != winner_index {
+            child.wait();
+        }
+    }
+    uds_mcp(metadata["endpoint"].as_str().unwrap());
+    stop_owned_daemon(&metadata);
+    children[winner_index].wait();
+    wait_for_cleanup(&root.0);
+    assert!(!runtime.join("daemon.lock").exists(), "lock cleanup");
+}
+
+#[test]
+fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
+    let root = TestRoot::new(1);
+    let runtime = root.0.join(".code-graph");
+    fs::create_dir_all(&runtime).unwrap();
+    let socket_path = runtime.join("daemon.sock");
+    fs::write(&socket_path, b"force TCP fallback").unwrap();
+
+    let mut first = DaemonChild::spawn(&root.0, true);
+    let first_metadata = wait_for_metadata_for_pid(&root.0, first.pid());
+    assert_eq!(first_metadata["transport"], "tcp");
+    assert!(fs::symlink_metadata(&socket_path)
+        .unwrap()
+        .file_type()
+        .is_file());
+    let first_token = fs::read_to_string(runtime.join("secret"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(first_token.len(), 64);
+    assert_eq!(
+        fs::metadata(runtime.join("secret"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    tcp_rejected(first_metadata["endpoint"].as_str().unwrap(), b"");
+    tcp_rejected(
+        first_metadata["endpoint"].as_str().unwrap(),
+        b"CG-AUTH 0000000000000000000000000000000000000000000000000000000000000000\n",
+    );
+    tcp_mcp(first_metadata["endpoint"].as_str().unwrap(), &first_token);
+
+    kill_unclean(&mut first);
+    let mut second = DaemonChild::spawn(&root.0, true);
+    let second_metadata = wait_for_metadata_for_pid(&root.0, second.pid());
+    let second_token = fs::read_to_string(runtime.join("secret"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(second_metadata["transport"], "tcp");
+    assert_ne!(
+        first_token, second_token,
+        "token rotates per daemon instance"
+    );
+    tcp_rejected(
+        second_metadata["endpoint"].as_str().unwrap(),
+        format!("CG-AUTH {first_token}\n").as_bytes(),
+    );
+    tcp_mcp(second_metadata["endpoint"].as_str().unwrap(), &second_token);
+
+    stop_owned_daemon(&second_metadata);
+    second.wait();
+    wait_for_cleanup(&root.0);
+    assert!(fs::symlink_metadata(&socket_path)
+        .unwrap()
+        .file_type()
+        .is_file());
+    let first_stderr = first.stderr_text();
+    let second_stderr = second.stderr_text();
+    assert!(
+        first_stderr.contains("UDS unavailable") && second_stderr.contains("UDS unavailable"),
+        "TCP fallback is reported"
+    );
+}
