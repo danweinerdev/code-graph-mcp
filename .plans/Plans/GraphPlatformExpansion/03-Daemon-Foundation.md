@@ -67,6 +67,12 @@ tasks:
     justifies: "NFR-06, AC-07, AC-08. The definitive review found unlock-before-unlink can remove a successor's active lock, final cache save can follow a repository-planted temp symlink/hardlink, and the delayed-persist replacement test waits for completion rather than proving drain during persistence."
     verification: "On Linux, owned lock cleanup unlinks the pathname while the exclusive lock is still held and a deterministic handoff regression prevents a successor lock from being removed. `Graph::save` removes a pre-existing non-directory temp entry itself and then opens the temp path with create-new semantics, so symlink/hardlink sentinels remain byte-identical; non-regular directory entries fail safely. Debug persistence instrumentation exposes a distinct admitted/before-delay marker while preserving the existing completion marker, and the replacement test starts replacement after admission but before save completion. Run focused graph/daemon tests, full package/workspace gates, and `make verify` twice."
     depends_on: ["3.9"]
+  - id: "3.11"
+    title: "Harden metadata reads, fallback reporting, and lock waiters"
+    status: complete
+    justifies: "FR-38, NFR-06, AC-08, AC-47. The final review found static FIFO/symlink/oversized metadata can block startup, spawned-daemon TCP fallback is hidden because stderr is null, and a contender waiting on an inode unlinked during owner cleanup can acquire it and delete a successor's state."
+    verification: "Metadata reads reject symlinks/non-regular files and oversized payloads without blocking; FIFO/symlink/large-file tests prove bounded safe fallback. A normal stdio proxy reports metadata-selected TCP fallback after successful attachment. On Unix, after acquiring an existing lock inode, the contender compares its fd dev/inode with the current pathname and retries without cleanup if they differ; a deterministic pre-opened waiter/successor regression proves successor metadata and lock survive. Run full daemon tests and two `make verify` gates."
+    depends_on: ["3.10"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -473,6 +479,41 @@ Revision boundary: daemon shutdown handoff keeps one authoritative lock, final c
 |---|---|---|---|
 | `git show 6d1bbc71230fcc32d77cb9050af7da03eedf906f` | Complete task commit | PASS | One persistence/handoff slice: Unix unlink-before-unlock, unique create-new cache temps with cleanup/collision handling, updated mmap safety rationale, and true in-flight replacement instrumentation. |
 | Focused final quality review | Exact task commit plus callers/tests | PASS | Lock handoff, concurrent cache saves, planted legacy temp entries, mmap stability, and marker sequencing align under the accepted threat boundary. |
+
+## 3.11: Harden metadata reads, fallback reporting, and lock waiters
+
+### Subtasks
+- [x] Bound and type-check daemon metadata reads before parsing
+- [x] Report metadata-selected TCP fallback to normal proxy clients
+- [x] Revalidate acquired existing-lock inode against the current pathname before cleanup
+- [x] Add malicious metadata and pre-opened-waiter handoff regressions
+
+### Notes
+Revision boundary: static repository entries cannot block metadata discovery, fallback reporting reaches the actual client, and stale waiters cannot mutate a successor daemon's runtime state.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `061f414916835ecbfa664f59f8dc087181088586`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T08:46:26Z, matching `061f414916835ecbfa664f59f8dc087181088586`
+- Focused review: `git show 061f414916835ecbfa664f59f8dc087181088586`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `061f414916835ecbfa664f59f8dc087181088586`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon:: -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 38 daemon tests passed, including bounded directory/symlink/oversized metadata rejection and detached-lock successor preservation. |
+| `cargo test -p code-graph-mcp --test daemon_proxy tcp_metadata_attachment_and_start_failure_fallback_are_safe -- --exact` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Forced TCP attachment reports the metadata-selected fallback exactly once; in-process fallback reporting remains distinct. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 38 daemon unit, 13 proxy process, 8 serve process, and 1 smoke test passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.11.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 061f414916835ecbfa664f59f8dc087181088586` | Complete task commit | PASS | One metadata/handoff slice: bounded no-follow reads at discovery, preparation, and cleanup; TCP fallback reporting; fd/path inode revalidation and deterministic successor-state regression. |
+| Focused final quality review | Exact task commit plus all metadata callers | PASS | Unsafe static metadata entries cannot block, fallback reporting reaches the client, and detached waiters retry without successor cleanup. |
 
 ## Acceptance Criteria
 
