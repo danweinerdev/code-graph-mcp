@@ -87,7 +87,7 @@ tasks:
     depends_on: ["3.12"]
   - id: "3.14"
     title: "Acknowledge connection admission and harden process fixtures"
-    status: planned
+    status: complete
     justifies: "FR-16, NFR-04. The final frozen review found that UDS saturation is accepted at transport level then silently dropped before MCP admission, and interrupted process tests can later reuse predictable stale roots."
     verification: "For Linux UDS, complete an admission prelude only after both the service permit and lifecycle connection guard are secured; the proxy must not treat attachment as established before that acknowledgement. A saturation regression proves the 129th client retries or falls back rather than exiting successfully with no MCP response. Process-test roots are atomically fresh or collision-refusing and retain cleanup. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
     depends_on: ["3.13"]
@@ -604,9 +604,9 @@ Revision boundary: every daemon-owned JSON record has the same bounded descripto
 ## 3.14: Acknowledge connection admission and harden process fixtures
 
 ### Subtasks
-- [ ] Add and validate a Linux UDS post-admission acknowledgement
-- [ ] Exercise connection-permit saturation through the normal proxy path
-- [ ] Make daemon process-test roots fresh and collision-safe
+- [x] Add and validate a Linux UDS post-admission acknowledgement
+- [x] Exercise connection-permit saturation through the normal proxy path
+- [x] Make daemon process-test roots fresh and collision-safe
 
 ### Notes
 
@@ -614,7 +614,25 @@ Revision boundary: transport connection is not considered attached until daemon 
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `5dfb170c82c89d1fd5988235e9b41cd6e475c880`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T17:55:49Z, matching `5dfb170c82c89d1fd5988235e9b41cd6e475c880`
+- Focused review: `git show 5dfb170c82c89d1fd5988235e9b41cd6e475c880`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `5dfb170c82c89d1fd5988235e9b41cd6e475c880`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 48 daemon unit, 14 proxy process, 8 serve process, and 1 smoke test passed; the new 129th UDS client receives working in-process MCP after explicit failed admission. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.14.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 5dfb170c82c89d1fd5988235e9b41cd6e475c880` | Complete task commit | PASS | UDS emits `CG-OK` only after permit and lifecycle admission; clients consume it before MCP framing; both process suites allocate roots with atomic `create_dir` collision retry. |
+| Independent focused quality and blind-spots reviews | Complete task diff plus transport/lifecycle callers | PASS | No material findings: guard lifetime, idle race, acknowledgement timeout/error propagation, saturation fallback, framing, and fixture cleanup align. |
 
 ## Acceptance Criteria
 

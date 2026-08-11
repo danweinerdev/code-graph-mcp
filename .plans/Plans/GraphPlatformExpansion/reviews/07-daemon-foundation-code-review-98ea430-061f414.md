@@ -1,7 +1,7 @@
 ---
 title: "Code Review: Daemon Foundation Final Gate"
 type: review
-status: open
+status: resolved
 created: 2026-08-11
 updated: 2026-08-11
 tags: [review, daemon, phase-3, security, concurrency]
@@ -40,7 +40,7 @@ findings:
   - id: F-03
     severity: major
     title: "UDS admission saturation masquerades as a successful attachment"
-    status: open
+    status: fixed
   - id: F-04
     severity: major
     title: "In-process fallback can race a live daemon cache writer"
@@ -48,7 +48,7 @@ findings:
   - id: F-05
     severity: minor
     title: "Process tests can reuse stale predictable roots after interruption"
-    status: open
+    status: fixed
 followups:
   - id: FU-01
     finding: F-01
@@ -115,3 +115,9 @@ Task 3.12 commit `201e2f7454a310393c6ef8c88d33b3759a8d0965` establishes `.code-g
 
 ### F-02 — fixed (2026-08-11)
 Task 3.13 commit `2594f124e3954cd15393ef7b0650eab8b8d497d0` introduces one descriptor-validated bounded record reader for metadata, lock identity, shutdown request/ack, and the fixed-size TCP credential. It also bounds reads from an already-open recovery lock descriptor and pins oversized and substituted-record behavior without mutation.
+
+### F-03 — fixed (2026-08-11)
+Task 3.14 commit `5dfb170c82c89d1fd5988235e9b41cd6e475c880` adds a UDS `CG-OK` prelude emitted only after the semaphore permit and lifecycle connection guard are held. The proxy consumes it before MCP framing; the deterministic 129th-client regression proves saturation becomes an explicit attach failure and in-process fallback rather than a successful dead byte pump.
+
+### F-05 — fixed (2026-08-11)
+Task 3.14 replaces predictable `create_dir_all` process roots with atomically fresh timestamp/sequence candidates created by `create_dir`, retaining existing daemon cleanup guards and per-binary test serialization.
