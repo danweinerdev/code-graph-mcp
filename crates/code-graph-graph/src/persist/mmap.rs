@@ -37,7 +37,7 @@ pub(crate) fn mmap_read_only(path: &Path) -> io::Result<Option<MmapHolder>> {
     // SAFETY: We just opened the file read-only and own the `File`
     // handle for the lifetime of the returned `MmapHolder` (which
     // bundles both). The atomic-rename write contract used by
-    // `Graph::save` (write to `.tmp`, fsync, rename over the final
+    // `Graph::save` (write to a unique sibling temporary file, fsync, rename over the final
     // path) means concurrent writers always create a new inode rather
     // than mutating the inode we hold open — so the mapped pages stay
     // stable for the duration of our read. The only remaining UB
@@ -50,7 +50,7 @@ pub(crate) fn mmap_read_only(path: &Path) -> io::Result<Option<MmapHolder>> {
     // default. A concurrent writer using `OpenOptions::write(true)
     // .share_mode(FILE_SHARE_READ)` would fail to open while we hold
     // the mmap. Since `Graph::save` does NOT use restrictive share
-    // modes (it uses the default `File::create`), the rename-based
+    // modes (it uses the default `OpenOptions` mode), the rename-based
     // atomic write contract still holds: the rename succeeds even
     // while our mmap is open, but it points at a NEW inode; our mmap
     // continues to read the OLD inode until we drop it. Standard

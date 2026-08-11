@@ -4,8 +4,8 @@
 //! The on-disk cache lives at `<dir>/.code-graph-cache.db` — a rkyv
 //! archive prepended by an 8-byte header (endian probe + version).
 //! See [`packed`] for the schema and [`mmap`] for the load-time
-//! mmap boundary. Saves are atomic: write to `<dir>/.code-graph-cache.db.tmp`,
-//! `File::sync_all`, then rename over the final path. The rename is
+//! mmap boundary. Saves are atomic: write to a uniquely named sibling temporary
+//! file, `File::sync_all`, then rename over the final path. The rename is
 //! atomic on POSIX and on Windows since Rust 1.84.
 //!
 //! Version handling:
@@ -17,9 +17,10 @@
 //!   recovery.
 //! - True IO errors (permission, disk full, etc.) → `Err(PersistError::Io)`.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use crate::graph::Graph;
@@ -28,6 +29,7 @@ mod mmap;
 pub mod packed;
 
 const CACHE_FILE_NAME: &str = ".code-graph-cache.db";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // v3: include entries now carry the source line of the `#include`
 // directive (was a bare path list) so the dependency query can report
 // where each include was declared. The shape change is not
@@ -138,11 +140,73 @@ fn mtime_nanos(path: &Path) -> Option<u64> {
     u64::try_from(nanos_u128).ok()
 }
 
+/// Remove a stale cache temporary entry without following a symlink.
+///
+/// A regular file includes a hard link: removing this directory entry leaves
+/// its other links unchanged. `remove_file` similarly unlinks a symlink
+/// rather than touching its target. Non-file entries are retained and surface
+/// as an IO error instead of being opened or removed.
+fn remove_stale_tmp_entry(tmp_path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(tmp_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.file_type().is_file() => {
+            match fs::remove_file(tmp_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace non-file cache temporary entry {}",
+                tmp_path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Derive one process-unique temporary pathname for a cache save.
+fn unique_tmp_path(dir: &Path, sequence: u64) -> PathBuf {
+    dir.join(format!(
+        "{CACHE_FILE_NAME}.tmp.{}.{}",
+        std::process::id(),
+        sequence
+    ))
+}
+
+/// Open a fresh temporary file, retrying if a previously crashed writer left
+/// this process's candidate behind.
+fn create_unique_tmp_with_sequence(
+    dir: &Path,
+    next_sequence: &mut impl FnMut() -> u64,
+) -> io::Result<(File, PathBuf)> {
+    loop {
+        let tmp_path = unique_tmp_path(dir, next_sequence());
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((file, tmp_path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn create_unique_tmp(dir: &Path) -> io::Result<(File, PathBuf)> {
+    let mut next_sequence = || TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    create_unique_tmp_with_sequence(dir, &mut next_sequence)
+}
+
 impl Graph {
     /// Atomically write the graph to `<dir>/.code-graph-cache.db`.
     ///
-    /// Strategy: encode, rkyv-serialize, write to a sibling `.tmp`
-    /// file with the 8-byte header (endian probe + version) prepended,
+    /// Strategy: remove any stale legacy `.tmp` entry, then rkyv-serialize
+    /// into a unique sibling temporary file with the 8-byte header (endian
+    /// probe + version) prepended,
     /// `File::sync_all`, then `fs::rename` to swap over the final
     /// path. The rename is atomic on POSIX and on Windows since
     /// Rust 1.84.
@@ -155,7 +219,7 @@ impl Graph {
     ///   bug, not a recoverable on-disk state).
     pub fn save(&self, dir: &Path) -> Result<(), PersistError> {
         let final_path = cache_path(dir);
-        let tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
+        let legacy_tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
 
         // Build the v7 packed cache. The encoder interns paths + name
         // strings into compact tables; mtimes are stat'd fresh inside
@@ -169,12 +233,17 @@ impl Graph {
         let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
             .map_err(|e| io::Error::other(format!("rkyv serialize: {e}")))?;
 
+        // Preserve safe recovery for the pre-unique-name temporary path, but
+        // never use that shared pathname for an active write.
+        remove_stale_tmp_entry(&legacy_tmp_path)?;
+
+        let (file, tmp_path) = create_unique_tmp(dir)?;
+
         // Write header + archive → flush → fsync → rename.
         // Header layout: [ENDIAN_PROBE: u32 native][CACHE_VERSION: u32 native]
         // (see packed::ENDIAN_PROBE / CACHE_VERSION doc-comments).
-        {
-            let f = File::create(&tmp_path)?;
-            let mut writer = io::BufWriter::new(f);
+        let write_result = (|| -> io::Result<()> {
+            let mut writer = io::BufWriter::new(file);
             writer.write_all(&packed::ENDIAN_PROBE.to_ne_bytes())?;
             writer.write_all(&CACHE_VERSION.to_ne_bytes())?;
             writer.write_all(&archive)?;
@@ -182,9 +251,16 @@ impl Graph {
             let f = writer
                 .into_inner()
                 .map_err(|e| io::Error::other(e.into_error()))?;
-            f.sync_all()?;
+            f.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error.into());
         }
-        fs::rename(&tmp_path, &final_path)?;
+        if let Err(error) = fs::rename(&tmp_path, &final_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -388,6 +464,8 @@ mod tests {
     use code_graph_core::{Language, SymbolKind};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::TempDir;
 
     /// Sample graph: two files, mix of edge kinds + an include. Used by
@@ -616,13 +694,16 @@ mod tests {
         assert!(loaded.load(dir.path()).unwrap());
         assert_eq!(loaded.nodes.len(), 1);
         assert!(loaded.nodes.contains_key("/different.cpp:only"));
-        // Tmp file should not survive the rename.
+        // The legacy fixed temporary path is not used for active writes.
         let tmp = dir.path().join(format!("{CACHE_FILE_NAME}.tmp"));
-        assert!(!tmp.exists(), "tmp file must not survive successful save");
+        assert!(
+            !tmp.exists(),
+            "the legacy fixed temporary path must not be created by save"
+        );
     }
 
     #[test]
-    fn save_does_not_disturb_unrelated_tmp_file() {
+    fn save_recovers_ordinary_stale_tmp_file() {
         // If a previous (crashed) save left a `.tmp` file behind, a
         // subsequent successful save overwrites it cleanly.
         let dir = TempDir::new().unwrap();
@@ -641,11 +722,125 @@ mod tests {
         let g = build_sample_graph();
         g.save(dir.path()).unwrap();
 
-        // Successful save: tmp is consumed by the rename.
-        assert!(!tmp.exists(), "save must consume the tmp file via rename");
+        // Successful save removes the stale legacy entry without reusing it.
+        assert!(
+            !tmp.exists(),
+            "save must remove the stale legacy temporary entry"
+        );
         // Final cache file exists and is valid.
         let mut loaded = Graph::new();
         assert!(loaded.load(dir.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_unlinks_stale_tmp_symlink_without_touching_its_target() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        let contents = b"external symlink sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let tmp = dir.path().join(format!("{CACHE_FILE_NAME}.tmp"));
+        std::os::unix::fs::symlink(&sentinel, &tmp).unwrap();
+
+        build_sample_graph().save(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        assert!(!tmp.exists(), "successful save consumes its temporary path");
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_unlinks_stale_tmp_hardlink_without_touching_its_target() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        let contents = b"external hardlink sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let tmp = dir.path().join(format!("{CACHE_FILE_NAME}.tmp"));
+        fs::hard_link(&sentinel, &tmp).unwrap();
+
+        build_sample_graph().save(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        assert!(!tmp.exists(), "successful save consumes its temporary path");
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn save_rejects_directory_at_tmp_path() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join(format!("{CACHE_FILE_NAME}.tmp"));
+        fs::create_dir(&tmp).unwrap();
+
+        let error = build_sample_graph().save(dir.path()).unwrap_err();
+
+        assert!(matches!(error, PersistError::Io(_)));
+        assert!(tmp.is_dir(), "non-file temporary entry is retained");
+        assert!(!cache_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn unique_tmp_creation_retries_candidate_collision_without_touching_entry() {
+        let dir = TempDir::new().unwrap();
+        let collision = unique_tmp_path(dir.path(), 41);
+        fs::write(&collision, b"pre-existing writer temporary data").unwrap();
+        let mut candidates = [41, 42].into_iter();
+
+        let (file, tmp_path) = create_unique_tmp_with_sequence(dir.path(), &mut || {
+            candidates.next().expect("test supplies a fresh candidate")
+        })
+        .unwrap();
+
+        assert_eq!(tmp_path, unique_tmp_path(dir.path(), 42));
+        assert_eq!(
+            fs::read(&collision).unwrap(),
+            b"pre-existing writer temporary data"
+        );
+        drop(file);
+        fs::remove_file(&tmp_path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_saves_use_distinct_temps_and_leave_a_loadable_cache() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let start = Arc::new(Barrier::new(3));
+        let saves = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    build_sample_graph().save(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for save in saves {
+            save.join()
+                .expect("concurrent save thread must not panic")
+                .expect("concurrent save must not rename another writer's temporary file");
+        }
+
+        let mut loaded = Graph::new();
+        assert!(
+            loaded.load(dir.path()).unwrap(),
+            "final cache must be loadable"
+        );
+        let prefix = format!("{CACHE_FILE_NAME}.tmp.");
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)),
+            "successful concurrent saves must not leak unique temporary files"
+        );
     }
 
     // ---- stale_paths ----

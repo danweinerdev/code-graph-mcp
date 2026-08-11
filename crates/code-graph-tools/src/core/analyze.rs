@@ -821,6 +821,8 @@ fn install_new_running(
 pub(crate) fn save_cache(inner: &ServerInner, dir: &std::path::Path) -> Result<(), String> {
     let _persist = inner.persist.begin_persist().map_err(str::to_owned)?;
     #[cfg(debug_assertions)]
+    debug_write_persist_admitted_marker();
+    #[cfg(debug_assertions)]
     debug_delay_persist(dir);
     let g = inner.graph.read();
     let result = g.save(dir).map_err(|error| error.to_string());
@@ -843,6 +845,13 @@ fn debug_delay_persist(dir: &std::path::Path) {
         if let Ok(delay_millis) = delay_millis.parse::<u64>() {
             std::thread::sleep(std::time::Duration::from_millis(delay_millis));
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_write_persist_admitted_marker() {
+    if let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER") {
+        let _ = std::fs::write(marker, b"persist admitted\n");
     }
 }
 

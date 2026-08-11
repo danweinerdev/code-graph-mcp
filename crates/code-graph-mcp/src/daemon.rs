@@ -797,6 +797,29 @@ impl DaemonLock {
         }
     }
 
+    #[cfg(unix)]
+    fn remove_if_owned(self) {
+        self.remove_if_owned_before_release(|| {});
+    }
+
+    /// Unlink an owned Unix lock while its inode remains exclusively locked.
+    /// A successor can then exclusively create and lock a new pathname before
+    /// this owner releases the unlinked inode; releasing cannot remove that
+    /// successor.
+    #[cfg(unix)]
+    fn remove_if_owned_before_release(self, after_unlink: impl FnOnce()) {
+        let owned = self.still_owned();
+        if owned {
+            let _ = fs::remove_file(&self.path);
+        }
+        after_unlink();
+        self.release();
+    }
+
+    // Windows cannot unlink an open locked file with the Unix handoff
+    // ordering. Keep the prior ownership check and best-effort cleanup until
+    // native Windows lock handoff semantics are implemented.
+    #[cfg(not(unix))]
     fn remove_if_owned(self) {
         let owned = self.still_owned();
         let path = self.path.clone();
@@ -2024,6 +2047,49 @@ mod tests {
         let live = DaemonLock::acquire(&paths).unwrap();
         assert!(acquire_or_detect_live(&paths).await.unwrap().is_none());
         live.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_lock_is_unlinked_before_release_and_handoff_preserves_successor() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let owner = DaemonLock::acquire(&paths).unwrap();
+        let mut successor = None;
+
+        owner.remove_if_owned_before_release(|| {
+            assert!(
+                !paths.lock.exists(),
+                "owned pathname is gone while the original lock remains held"
+            );
+            successor = Some(DaemonLock::acquire(&paths).unwrap());
+        });
+
+        let successor = successor.expect("successor acquires the unlinked pathname");
+        assert!(
+            successor.still_owned(),
+            "releasing the original unlinked inode cannot remove the successor"
+        );
+        successor.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_cleanup_preserves_a_non_owner_replacement() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let owner = DaemonLock::acquire(&paths).unwrap();
+        fs::remove_file(&paths.lock).unwrap();
+        fs::write(&paths.lock, b"replacement owner\n").unwrap();
+
+        owner.remove_if_owned();
+
+        assert_eq!(fs::read(&paths.lock).unwrap(), b"replacement owner\n");
+        fs::remove_file(&paths.lock).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

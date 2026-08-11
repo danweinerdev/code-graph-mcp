@@ -961,8 +961,10 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
     let root = TestRoot::new(false);
     let root_string = root.0.to_string_lossy().into_owned();
     let source = root.0.join("persist.rs");
-    let marker = root.0.join("persist-admitted.marker");
-    let marker_string = marker.to_string_lossy().into_owned();
+    let admitted_marker = root.0.join("persist-admitted.marker");
+    let admitted_marker_string = admitted_marker.to_string_lossy().into_owned();
+    let completion_marker = root.0.join("persist-complete.marker");
+    let completion_marker_string = completion_marker.to_string_lossy().into_owned();
     fs::write(&source, "fn persisted() {}\n").unwrap();
     let mut client = Client::launch_with_env(
         &root.0,
@@ -970,7 +972,11 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
         &[
             ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
             ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "3000"),
-            ("CODE_GRAPH_TEST_PERSIST_MARKER", &marker_string),
+            (
+                "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
+                &admitted_marker_string,
+            ),
+            ("CODE_GRAPH_TEST_PERSIST_MARKER", &completion_marker_string),
         ],
     )
     .initialize();
@@ -981,7 +987,7 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
     );
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        if marker.exists() {
+        if admitted_marker.exists() {
             break;
         }
         assert!(
@@ -990,6 +996,10 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        !completion_marker.exists(),
+        "admission marker is emitted before delayed persistence completes"
+    );
     replace_metadata_sha(&root, &old, "persist-replacement-dirty".to_owned());
     let started = Instant::now();
     let mut replacement = Client::spawn(&root.0, &[]);
@@ -1007,6 +1017,10 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
     let mut graph = Graph::new();
     assert!(graph.load(&root.0).unwrap(), "drained cache is loadable");
     assert_eq!(graph.stats().files, 1, "drained cache is current");
+    assert!(
+        completion_marker.exists(),
+        "completion marker remains a post-save signal"
+    );
     let new = wait_metadata(&root);
     client.close();
     replacement.close();
