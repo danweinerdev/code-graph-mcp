@@ -1,7 +1,7 @@
 ---
 title: "Code Review: Daemon Foundation Control-Publication Gate"
 type: review
-status: open
+status: resolved
 created: 2026-08-11
 updated: 2026-08-11
 tags: [review, daemon, phase-3, persistence]
@@ -15,7 +15,7 @@ findings:
   - id: F-01
     severity: major
     title: "Abandoned unique cache temps accumulate across crashes"
-    status: open
+    status: fixed
   - id: F-02
     severity: major
     title: "Windows pipe attachment lacks admission acknowledgement"
@@ -50,3 +50,6 @@ followups:
 
 ### F-02 — rejected (2026-08-11)
 The governing Phase 3 gate is the Linux MVP; native Windows transport semantics and acceptance are explicitly assigned to Phase 11. Linux UDS/TCP admission is acknowledged and tested.
+
+### F-01 — fixed (2026-08-11)
+Task 3.16 commit `fc82fd00f3fd38663f9d09614d6ac3285c5999ff` serializes same-process saves and scavenges only exact generated `.code-graph-cache.db.tmp.<pid>.<sequence>` siblings before each new save. Symlink and hardlink targets remain byte-identical, directory candidates fail safely, unrelated names survive, and repeated/concurrent saves leave a loadable final cache with no unique temps. Cross-process direct/daemon cache locking remains the design's explicit non-goal.

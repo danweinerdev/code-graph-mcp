@@ -99,7 +99,7 @@ tasks:
     depends_on: ["3.14"]
   - id: "3.16"
     title: "Scavenge abandoned unique cache temporaries"
-    status: planned
+    status: complete
     justifies: "NFR-06, AC-07. The final post-control review found that hard-killed cache writers leave uniquely named multi-megabyte temporaries that no later save removes, allowing project-disk growth across repeated crashes."
     verification: "Serialize `Graph::save` calls within a process and, before allocating a new unique temp, remove reserved unique temp sibling entries left by prior writers plus the legacy fixed temp. Never follow symlinks or mutate hardlink targets; refuse/retain directories and unrelated names. Tests pin interrupted-temp cleanup, symlink/hardlink sentinel contents, same-process concurrent saves, no candidate leaks, and final cache loadability. Run persistence tests, daemon replacement tests, workspace lint/format, and two `make verify` runs."
     depends_on: ["3.15"]
@@ -682,9 +682,9 @@ Revision boundary: interrupted owner-control publication cannot permanently obst
 ## 3.16: Scavenge abandoned unique cache temporaries
 
 ### Subtasks
-- [ ] Serialize same-process cache saves
-- [ ] Remove reserved abandoned unique and legacy temp siblings before each save
-- [ ] Add crash-temp, sentinel, concurrency, leak, and loadability regressions
+- [x] Serialize same-process cache saves
+- [x] Remove reserved abandoned unique and legacy temp siblings before each save
+- [x] Add crash-temp, sentinel, concurrency, leak, and loadability regressions
 
 ### Notes
 
@@ -692,7 +692,26 @@ Revision boundary: each new save bounds crash residue by scavenging the reserved
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `fc82fd00f3fd38663f9d09614d6ac3285c5999ff`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T20:23:15Z, matching `fc82fd00f3fd38663f9d09614d6ac3285c5999ff`
+- Focused review: `git show fc82fd00f3fd38663f9d09614d6ac3285c5999ff`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `fc82fd00f3fd38663f9d09614d6ac3285c5999ff`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-graph persist::` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 31 persistence tests passed: exact-shape crash-temp scavenging, symlink/hardlink contents, directory refusal, unrelated siblings, serialized concurrency, poison recovery, no leaks, and loadability. |
+| `cargo test -p code-graph-mcp --test daemon_proxy replacement_waits_for_delayed_persist_before_runtime_cleanup -- --exact` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Replacement still waits for admitted persistence and observes a loadable current cache. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.16.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show fc82fd00f3fd38663f9d09614d6ac3285c5999ff` | Complete task commit | PASS | `Graph::save` recovers a poisoned process-wide mutex, scavenges only exact `<pid>.<sequence>` reserved siblings, retains unsafe directories, and then performs the existing atomic save. |
+| Independent focused quality and blind-spots reviews | Complete task diff plus persistence callers/tests | PASS | Prefix-only deletion was narrowed to the generated numeric shape. Cross-process direct/daemon save coordination remains the approved explicit non-goal; same-process active temps are serialized and cannot be scavenged. |
 
 ## Acceptance Criteria
 
