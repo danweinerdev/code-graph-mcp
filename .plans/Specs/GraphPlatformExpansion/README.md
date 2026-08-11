@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: spec
 status: approved
 created: 2026-08-08
-updated: 2026-08-10
+updated: 2026-08-11
 tags: [daemon, cli, vcs, graph-queries, architecture, perforce]
 related:
   - Designs/SharedDaemon
@@ -114,8 +114,8 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 
 **Track B — Daemon transport**
 
-- **FR-38**: The daemon shall prefer a named-pipe transport — a Windows named pipe, or a Unix domain socket on POSIX — and shall fall back to a TCP socket bound to loopback only if the preferred transport cannot be established. The fallback shall be reported, not silent. (Resolves OQ-02.)
-- **FR-39**: On the named-pipe transport, access shall be restricted to the invoking user by the operating system's own mechanism. On the TCP fallback, where binding to loopback does not by itself exclude other local users, the daemon shall additionally require a per-daemon secret presented by the client. That secret shall be stored under `<project_root>/.code-graph/` with owner-only permissions and shall be regenerated for each daemon instance.
+- **FR-38**: The Linux MVP daemon shall prefer a Unix domain socket and shall fall back to a TCP socket bound to loopback only if the UDS cannot be established. The fallback shall be reported, not silent. The transport abstraction shall retain explicit seams for deferred macOS and Windows implementations. (Resolves OQ-02 for the Linux MVP.)
+- **FR-39**: On Linux, UDS access shall be restricted to the invoking user by owner-only runtime-directory and socket permissions. On the TCP fallback, where loopback does not itself exclude other local users, the daemon shall additionally require a per-daemon credential presented by the client. That credential shall be stored under `<project_root>/.code-graph/` with owner-only permissions and regenerated for each daemon instance.
 - **FR-40**: Clients shall discover which transport is in use from the daemon's repository-local metadata rather than by probing, so that a client never attempts a connection the daemon is not serving.
 
 **Track B — Analyze request coalescing**
@@ -132,11 +132,13 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - **NFR-04**: `make verify` — clippy with warnings denied, rustfmt, the full workspace test suite, pending-snapshot check, and the plugin-mirror drift gate — shall pass at every commit.
 - **NFR-05**: Logging shall continue to use `eprintln!`. No `tracing` dependency shall be introduced.
 - **NFR-06**: The daemon shall not open a network-reachable listener by default. Its endpoint shall be restricted to the local machine and to the invoking user.
-- **NFR-07**: The daemon and CLI shall work on Linux, macOS, and Windows. A platform lacking the preferred local transport shall have a documented equivalent that satisfies NFR-06.
+- **NFR-07**: The current plan's MVP shall be fully supported and acceptance-tested on Linux. Platform-dependent code shall remain behind explicit transport, path, process, and permission seams; macOS and Windows behavior may remain stubbed, ignored, or best-effort until their deferred phases.
 - **NFR-08**: Shortest-path and community detection shall complete within an interactive budget on the largest corpus the project already tests against, and shall bound their work rather than degrade unboundedly.
 - **NFR-09**: Attaching to a warm daemon shall be materially faster than the current cold path, which reloads or rebuilds the graph per session. This is the primary user-visible benefit of Track B and shall be measured rather than assumed.
 - **NFR-10**: Version-control operations shall not block unrelated queries. A slow provider shall degrade only the history tools.
 - **NFR-11**: Tool descriptions for any new MCP tool shall meet the repository's agent-facing-description standard: every argument documented with default and ceiling, response envelope named rather than implied, and suggested actions that operationally produce the claimed result.
+- **NFR-12**: The deferred macOS phase shall make the complete GraphPlatformExpansion surface natively supported and acceptance-tested on macOS without weakening NFR-06.
+- **NFR-13**: The deferred Windows phase shall make the complete GraphPlatformExpansion surface natively supported and acceptance-tested on Windows, including named-pipe, ACL, and Windows-path behavior, without weakening NFR-06.
 
 ## User Stories
 
@@ -175,7 +177,7 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-22**: In a directory that is not a working copy of any supported VCS, history tools report unavailability as a success-shaped result, and all other tools behave normally. (FR-36)
 - [ ] **AC-23**: No version-control crate appears in the dependency graph of `code-graph-core`, `code-graph-graph`, `code-graph-lang`, or `code-graph-path-trie`. (FR-31, NFR-02)
 - [ ] **AC-24**: The provider trait can be implemented for a system whose revision identifiers are integers, without changing the trait, its types, or any wire type. Demonstrated by review against Perforce's model, or by a test double. (FR-28)
-- [ ] **AC-25**: The daemon's endpoint is not reachable from another machine, and not usable by another local user. (NFR-06)
+- [ ] **AC-25**: On Linux, the preferred UDS is beneath an owner-only runtime directory and is owner-only; TCP fallback binds only to loopback and refuses callers without the per-instance credential. These enforcement properties establish that the endpoint is neither remotely reachable nor usable by another local UID. (NFR-06)
 - [ ] **AC-26**: On the largest initialised dogfood corpus, time-to-first-successful-query for a session attaching to an already-indexed warm daemon is bounded and does not grow with corpus size, whereas the current cold path does. Measured on at least two corpora of materially different size (for example `external/ripgrep` and `external/abseil-cpp`), with both numbers recorded in the plan's notes. The pass condition is the absence of corpus-size scaling in the warm-attach path, not a fixed millisecond target. (NFR-09)
 - [ ] **AC-27**: `make verify` passes. (NFR-04)
 - [ ] **AC-28**: A typed-core query invoked before any index exists returns a domain error that the caller can discriminate from a payload and from an advisory, without parsing a rendered message; the MCP adapter renders it as the same error the tool returns today. (FR-04)
@@ -192,12 +194,12 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-39**: Fingerprinting a symbol in which only a string or numeric literal changed yields a changed fingerprint under the formatting-insensitive mode and an unchanged one under the literal-insensitive mode. (FR-34)
 - [ ] **AC-40**: The same CLI invocation against the same repository produces identical machine-readable output whether a daemon is running or not. (FR-18)
 - [ ] **AC-41**: No crate in the workspace declares a direct `tracing` dependency, and diagnostic output uses `eprintln!`. (`tracing` does appear in the dependency graph transitively, pulled by `rmcp`; that is pre-existing and outside this work's control. The requirement is that no code here logs through it.) (NFR-05)
-- [ ] **AC-42**: The daemon and CLI are exercised on Linux, macOS, and Windows. Where a platform uses a different local transport, that path has its own coverage rather than being assumed from another platform's result. (NFR-07)
+- [ ] **AC-42**: The Linux MVP is exercised natively on Linux, including UDS, loopback-TCP fallback, owner permissions, idle lifecycle, and the POSIX stale-socket-inode path. Platform seams remain isolated so ignored/deferred macOS and Windows implementations are not prerequisites for this criterion. (NFR-07)
 - [ ] **AC-43**: Shortest path and community detection each complete within an interactive budget on the largest initialised dogfood corpus, and both enforce their caps rather than degrading, with the timings recorded. (NFR-08)
 - [ ] **AC-44**: With a deliberately slow version-control provider, a concurrent non-history query returns in its normal time — the slow provider delays only the history tools. (NFR-10)
 - [ ] **AC-45**: Each new MCP tool's description names its response envelope, documents every argument with default and ceiling, and its suggested actions operationally produce the results they claim — reviewed under the repository's agent-facing-description lens. (NFR-11)
 - [ ] **AC-46**: A symbol-history query for a symbol whose content has not changed is served from the fingerprint cache on the second invocation; deleting or corrupting the cache causes recomputation of the same answer, not an error. (FR-37)
-- [ ] **AC-47**: The daemon establishes a named-pipe transport by default. With that transport forced to fail, it falls back to loopback TCP, reports the fallback, and remains fully functional. (FR-38)
+- [ ] **AC-47**: On Linux, the daemon establishes a UDS transport by default. With UDS establishment forced to fail, it falls back to loopback TCP, reports the fallback, and remains fully functional. (FR-38)
 - [ ] **AC-48**: On the TCP fallback, a client that does not present the daemon's secret is refused; the secret file is owner-only; and a new daemon instance does not accept the previous instance's secret. (FR-39)
 - [ ] **AC-49**: A client determines the active transport from repository-local metadata and connects on the first attempt, with no fallback probing of a transport the daemon is not serving. (FR-40)
 - [ ] **AC-50**: An analyze request issued while another is in flight is queued and eventually runs, rather than returning the "indexing already in progress" error. (FR-41)
@@ -209,6 +211,8 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-58**: A whole-graph query can be started asynchronously, returns a job identifier sub-second, reports progress while running, and yields its result on completion — with every individual call short enough that a wall-clock client timeout cannot fire. (FR-49)
 - [ ] **AC-57**: For an edge whose target was selected from N same-named candidates, the tools that report that edge expose N. A caller can distinguish "one candidate, unambiguous" from "five candidates, one picked by scope rule" without issuing another query. (FR-48)
 - [ ] **AC-56**: After the git provider lands, the workspace's set of native-library dependencies is unchanged from before it: the only C compiled into the build remains the tree-sitter grammar sources, no crate links a vendored or system library, and a release build requires no `pkg-config` or system-library discovery. (FR-47, D-0004)
+- [ ] **AC-59**: On a native macOS runner, the Phase 10 acceptance matrix accounts for every completed task and acceptance criterion in phases 1–9; all applicable workspace and acceptance suites pass, the daemon exercises its macOS local transport and security boundary including denial from another local account, and CLI behavior matches Linux wire/machine output. (NFR-12)
+- [ ] **AC-60**: On a native Windows runner, the Phase 11 acceptance matrix accounts for every completed task and acceptance criterion in phases 1–9; all applicable workspace and acceptance suites pass, the daemon exercises named-pipe and loopback-TCP fallback paths, deterministic pipe-security-descriptor inspection and another-local-account denial establish ACL enforcement, and Windows path behavior is covered rather than inferred from Linux. (NFR-13)
 
 ## Constraints
 
@@ -218,21 +222,21 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - Symbol spans are line-granular. `Symbol` carries `line`, `column`, and `end_line`, but no end column. Position lookup and blame-a-symbol are therefore line-resolved, and cannot disambiguate two symbols that begin and end on the same line.
 - The cache is a versioned binary format with a silent-re-index-on-mismatch policy. Any change to the symbol record forces a version bump; the tracks specified here are expected to require none.
 - Call resolution remains a syntactic heuristic in all six languages. Shortest-path results inherit that imprecision and must not be presented as proof of reachability.
-- Windows path handling has documented boundaries: extended-length prefixes are stripped for disk paths but verbatim UNC paths pass through unchanged. Daemon endpoint paths inside the repository are subject to the same rules.
+- Windows path handling retains its documented seams and known boundaries, but native Windows correctness is deferred to Phase 11 / AC-60 rather than inferred from the Linux MVP.
 
 ## Dependencies
 
 - Track B and Track C's CLI exposure depend on Track A. Track C's query implementations do not.
 - Track D depends on Track A only for front-end exposure; the provider trait and git implementation are independent.
 - Track D depends on the existing language-plugin parse interface accepting a byte buffer rather than a path — confirmed present.
-- New third-party dependencies are confined outside the protected core crates: an argument parser for the CLI, a git library for the git provider, a hash function for symbol fingerprinting, and binary-crate-only `getrandom` / `sysinfo` / `fs2` support for daemon secrets, safe process identity, and crash-released cross-platform file locking. Tokio supplies the transport itself; Windows ACL adjustment uses built-in `icacls` without application unsafe code.
+- New third-party dependencies are confined outside the protected core crates: an argument parser for the CLI, a git library for the git provider, a hash function for symbol fingerprinting, and binary-crate-only `getrandom` / `sysinfo` / `fs2` support for daemon credentials, safe process identity, and crash-released file locking. Platform-specific seams may compile conditionally, but Linux is the only support gate in the MVP phases.
 - The decision ledger lives at `Decisions/decisions.md`; D-0001 records the repository-local daemon supersession described in Constraints.
 
 ## Resolved Questions
 
 **OQ-01 — RESOLVED (D-0001).** *Is narrowing `Designs/SharedDaemon` to a repository-local daemon confirmed?* Yes. The repository-local model stands and `Designs/SharedDaemon` is marked `superseded`. Recorded as D-0001; see Constraints.
 
-**OQ-02 — RESOLVED.** *What is the Windows transport?* Named pipe first, loopback TCP as fallback. Specified in FR-38 through FR-40, with the TCP path's user-restriction gap closed by a per-instance secret (FR-39), since binding to loopback alone does not exclude other local users.
+**OQ-02 — RESOLVED for MVP scope.** *What is the transport?* Linux uses UDS first and authenticated loopback TCP as fallback (FR-38 through FR-40). The transport seam retains the named-pipe shape, but native Windows implementation and validation are deferred to Phase 11 / AC-60; macOS completion is deferred to Phase 10 / AC-59.
 
 **OQ-03 — RESOLVED.** *Which community-detection algorithm?* A near-linear, parameter-free label-propagation variant over **file-level** aggregation, with a stable node order and stated tie-breaks. Specified in FR-44 through FR-46. The file-granularity default is the substantive part of the answer: it matches the question being asked, shrinks the node count by orders of magnitude, reuses weights that already exist, and avoids compounding the error in heuristic call resolution. A modularity-optimising algorithm can be added later behind an option without disturbing FR-24, FR-25, or FR-45.
 

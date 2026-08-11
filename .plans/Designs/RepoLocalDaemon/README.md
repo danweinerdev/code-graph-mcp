@@ -3,7 +3,7 @@ title: "Repository-Local Daemon and CLI (Track B)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-10
+updated: 2026-08-11
 tags: [daemon, cli, ipc, named-pipe, unix-socket, idle-timeout, analyze-queue]
 related:
   - Specs/GraphPlatformExpansion
@@ -171,15 +171,15 @@ idle_timeout_secs = 1800 # automatic idle exit after 1800 seconds; 0 = never exi
 
 A consequence worth stating: because the proxy is byte-level, protocol version skew is impossible — but *binary* skew is not, which is what Decision 5 handles.
 
-### Decision 3: Named pipe / Unix socket first, loopback TCP with a secret as fallback (FR-38, FR-39, FR-40)
+### Decision 3: Linux UDS first, loopback TCP with a credential as fallback (FR-38, FR-39, FR-40)
 
-**Context:** FR-38 – FR-40 and NFR-06/07. (Resolves the spec's OQ-02.)
+**Context:** FR-38 – FR-40 and NFR-06/07. Native platform completion is governed separately by NFR-12/13. (Resolves the spec's OQ-02.)
 
-**Decision:** POSIX uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`; Windows uses a named pipe with the operating system's default ACL. If the preferred transport cannot be established, fall back to a TCP listener bound to `127.0.0.1:0`, and require clients to present a per-instance secret stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison; after successful validation, the daemon acknowledges with `CG-OK\n` before either side passes the stream to rmcp's MCP codec. Both lines are transport authentication, not a second graph-query protocol. On Windows the token file is restricted with built-in `icacls`. The transport in use is recorded in `daemon.json`, and the fallback is reported rather than silent.
+**Decision:** The Linux MVP uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`. If UDS establishment fails, it falls back to a TCP listener bound to `127.0.0.1:0` and requires a per-instance credential stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison; after successful validation, the daemon acknowledges with `CG-OK\n` before either side passes the stream to rmcp's MCP codec. Both lines are transport authentication, not a graph-query protocol. The transport enum and accept-loop boundary retain macOS/Windows seams; native macOS support is deferred to Phase 10 (NFR-12) and Windows named-pipe/ACL support to Phase 11 (NFR-13). Those branches may remain ignored or best-effort during the Linux MVP. The active transport is recorded in `daemon.json`, and fallback is reported rather than silent.
 
-**Rationale:** A Unix socket and a named pipe both carry OS-level access control, so NFR-06 is satisfied by the filesystem/pipe ACL with no application-level auth. Loopback TCP does **not** — binding `127.0.0.1` excludes other machines but not other users on this machine — so the fallback must add a secret to hold the same property. The fallback exists because a socket file cannot always be created inside the repository: some network filesystems and container bind-mounts refuse it. Recording the transport in metadata rather than probing means the client connects on the first attempt and never rattles a door the daemon isn't serving (FR-40).
+**Rationale:** A Linux UDS carries filesystem access control, so NFR-06 is satisfied by `0700` runtime-directory and `0600` socket modes. Loopback TCP does **not** exclude other local users, so fallback adds the per-instance credential. The fallback exists because a socket file cannot always be created inside the repository. Recording the transport in metadata rather than probing means the client connects on the first attempt and never rattles a door the daemon is not serving (FR-40). Keeping platform differences behind the same listener/client enums prevents Linux code from hard-coding UDS assumptions while avoiding unsupported macOS/Windows claims in the MVP.
 
-`tokio` is already present with `features = ["full"]`, which covers `net` on all three transports. Task 3.2 adds direct `getrandom`, safe `sysinfo`, and `fs2` dependencies for CSPRNG-backed secrets, process identity, and an OS lock that releases on crash; all stay in the binary crate, outside the protected core crates. Windows ACL adjustment uses built-in `icacls`, so the binary adds no unsafe Windows API calls (NFR-02).
+`tokio` is already present with `features = ["full"]`, which covers the Linux UDS/TCP implementation and the deferred transport seams. Task 3.2 adds direct `getrandom`, safe `sysinfo`, and `fs2` dependencies for CSPRNG-backed credentials, process identity, and an OS lock that releases on crash; all stay in the binary crate, outside the protected core crates. No MVP acceptance claim depends on unexercised Windows ACL code (NFR-02).
 
 ### Decision 4: Exclusive-create lockfile with crash-released OS ownership
 
@@ -302,7 +302,7 @@ All user-visible failures remain `CallToolResult` with the error flag. Diagnosti
 
 **Security** — TCP fallback refuses a connection with no secret and with a stale secret; the secret file is owner-only; the socket is not reachable from another machine (AC-25, AC-48).
 
-**Cross-platform** — the transport layer is the one part that genuinely differs per platform, so Linux, macOS, and Windows each need their own run; a Windows named-pipe path cannot be inferred from a passing Unix socket test (AC-42, NFR-07). The POSIX-only stale-socket-inode path (Decision 4) needs its own case: leave an orphaned `.sock` file, confirm the daemon starts anyway, and confirm it refuses to unlink one that is live.
+**Linux MVP platform gate** — run UDS, loopback-TCP fallback, permissions, lifecycle, and POSIX stale-socket-inode coverage natively on Linux (AC-42, NFR-07). Leave an orphaned `.sock` file, confirm the daemon starts anyway, and confirm it refuses to unlink one that is live. The transport/process/path/permission seams remain explicit, but passing Linux does not claim macOS or Windows correctness. Phase 10 owns native macOS completion (AC-59); Phase 11 owns named-pipe, ACL, TCP fallback, and Windows-path completion (AC-60).
 
 **Warm-attach benchmark (AC-26, NFR-09)** — time-to-first-successful-query against two corpora of materially different size, `external/ripgrep` and `external/abseil-cpp`, measured both warm-attach and cold-start, with all four numbers recorded in the plan's notes. The pass condition is that warm attach does not scale with corpus size while cold start does. Recorded metric, not an automated gate, for the same flakiness reason as Track C's AC-43.
 

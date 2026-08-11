@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-10
+updated: 2026-08-11
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -23,7 +23,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Daemon Foundation"
-    status: blocked
+    status: in-progress
     doc: "03-Daemon-Foundation.md"
   - id: 4
     title: "Analyze Queue and Coalescing"
@@ -54,38 +54,51 @@ phases:
     status: planned
     doc: "09-Resolver-Candidate-Count.md"
     depends_on: [1]
+  - id: 10
+    title: "macOS Platform Completion"
+    status: deferred
+    doc: "10-MacOS-Platform-Completion.md"
+    depends_on: [4, 7, 8, 9]
+  - id: 11
+    title: "Windows Platform Completion"
+    status: deferred
+    doc: "11-Windows-Platform-Completion.md"
+    depends_on: [4, 7, 8, 9]
 ---
 
 # Graph Platform Expansion
 
 ## Overview
 
-Four tracks that lift three constraints on the code graph: it is reachable only from an MCP client, only one session at a time can hold it, and it knows nothing about history. Delivered as eight phases that interleave the tracks rather than running them end to end.
+Five tracks that lift three constraints on the code graph: it is reachable only from an MCP client, only one session at a time can hold it, and it knows nothing about history. Delivered as eleven phases that interleave the implementation tracks, complete a fully supported Linux MVP first, and defer native macOS/Windows completion behind explicit platform seams.
 
 - **Track A** (phase 2) — a typed core beneath the MCP handlers, so a CLI or socket front-end can reach structured results.
 - **Track B** (phases 3, 4, 7) — a repository-local daemon sharing one graph across sessions, an analyze queue, and a CLI.
 - **Track C** (phase 1) — three graph queries the current surface cannot answer at all.
 - **Track D** (phases 5, 6, 8) — version-control history behind a provider trait, git first, Perforce-ready.
+- **Track E** (phases 10, 11) — deferred native macOS and Windows completion after the Linux MVP, activating the transport/path/process/permission seams without reopening Linux semantics.
 
 Phases 1, 3, and 5 have no dependencies on each other and may run concurrently in separate worktrees. Phase 2 follows phase 1 rather than running beside it: both edit `handlers/{query,symbols,structure}.rs` — phase 1 adds three handlers to them, phase 2 empties all three into `core/` — so concurrent worktrees would collide on every one of those files. Sequencing them also closes a coverage gap, since phase 2's migration is what puts the three new queries in the typed core where the CLI can reach them (AC-33, FR-17).
 
-Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a suggested order; `depends_on` is the real constraint.
+Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deliberately deferred until the Linux implementation phases they certify are complete. The phase numbering is a suggested order; `depends_on` is the real constraint.
 
 ## Current State
 
-*Written for a cold start. Last updated 2026-08-11 at `80f92a9`.*
+*Written for a cold start. Last updated 2026-08-11 at Linux idle-lifecycle revision `73c332f`.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | blocked | Task 3.5 implementation and two-corpus measurement are complete on Linux (`73c332f`), but native macOS/Windows transport evidence and a genuine second-UID access attempt remain unavailable. Phase certification cannot infer AC-25/AC-42 from Linux permissions or cross-compilation. |
+| 3 Daemon Foundation | tasks complete, phase `in-progress` | Linux daemon MVP is implemented through idle lifecycle (`73c332f`), measured on two corpora, and fully gated by `make verify`. Native platform completion moved to deferred phases 10/11. **Next: final four-lane Phase 3 review.** |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
 | 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
 | 8 Per-Language Fingerprints | planned | Gated on 6. Six sub-tasks, one per language. |
 | 9 Resolver Candidate Count | planned | Added mid-flight from phase 1's review. Gated on 1. |
+| 10 macOS Platform Completion | deferred | Activates and certifies macOS seams after the Linux MVP; not part of current support acceptance. |
+| 11 Windows Platform Completion | deferred | Activates named-pipe, ACL, path, and Windows runtime seams after the Linux MVP; not part of current support acceptance. |
 
 ### Why phases 1 and 2 are `in-progress` with every task complete
 
@@ -133,6 +146,7 @@ Decided during planning:
 - **No rename tracking in history.** A renamed symbol reports as removed-plus-introduced (Designs/VcsHistory OQ-D5).
 - **No history indexing and no change to `.code-graph-cache.db`.** The fingerprint sidecar is disposable and separate.
 - **No CLI command-surface design in phase 3.** It is a task inside phase 7, once Track A's signatures exist.
+- **No native macOS or Windows support claim in phases 1–9.** Those phases deliver the Linux MVP while preserving explicit platform seams; phases 10/11 own native enablement and acceptance.
 
 ## Architecture
 
@@ -146,6 +160,9 @@ graph TD
     P6["Phase 6<br/>Symbol History<br/>(Track D)"]
     P7["Phase 7<br/>CLI<br/>(Track B)"]
     P8["Phase 8<br/>Per-Language<br/>Fingerprints (Track D)"]
+    P9["Phase 9<br/>Resolver Candidate<br/>Count"]
+    P10["Phase 10<br/>macOS Completion<br/>(deferred)"]
+    P11["Phase 11<br/>Windows Completion<br/>(deferred)"]
 
     P1 --> P2
     P3 --> P4
@@ -153,11 +170,20 @@ graph TD
     P2 --> P7
     P3 --> P7
     P6 --> P8
+    P1 --> P9
+    P4 --> P10
+    P7 --> P10
+    P8 --> P10
+    P9 --> P10
+    P4 --> P11
+    P7 --> P11
+    P8 --> P11
+    P9 --> P11
 
     classDef free fill:#e8f5e9,stroke:#2e7d32
     classDef gated fill:#fff8e1,stroke:#f9a825
     class P1,P3,P5 free
-    class P2,P4,P6,P7,P8 gated
+    class P2,P4,P6,P7,P8,P9,P10,P11 gated
 ```
 
 Layering the phases build toward:

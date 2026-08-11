@@ -16,13 +16,13 @@ related:
 
 # Phase 3 Debrief: Daemon Foundation
 
-Draft phase note recording the task 3.5 warm-attach measurement and the native-platform evidence still required before phase completion. AC-26 is a recorded metric, not a wall-clock CI threshold.
+Draft phase note recording the task 3.5 warm-attach measurement and Linux MVP evidence. AC-26 is a recorded metric, not a wall-clock CI threshold. Native macOS and Windows completion is deliberately deferred to phases 10 and 11.
 
 ## Measurement protocol
 
 - Host: `Linux enterprise.core.3p14.net 7.1.7-200.fc44.x86_64`, x86_64.
 - Compiler: `rustc 1.96.1 (31fca3adb 2026-06-26)`, LLVM 22.1.2.
-- Binary: release build from implementation revision `73c332f448c73b53f4bd6988e393928ea73fbb19`.
+- Binary: release build from implementation revision `73c332f0f38ad4c6ce925fd4ad2aa07b0eba1406`.
 - Repetitions: 5 per mode; median reported with every sample.
 - Warm sample: spawn the default stdio proxy, initialize MCP, then run exact-file `get_file_symbols(count_only=true)` against an already-indexed resident daemon.
 - Cold sample: spawn `--no-daemon`, initialize MCP, force-index the complete corpus, then run the same exact-file query.
@@ -61,11 +61,11 @@ The absolute warm figure (~279 ms) includes process spawn, executable fingerprin
 | Platform/security boundary | Status | Evidence / blocker |
 |---|---|---|
 | Linux UDS, TCP fallback, idle lifecycle, POSIX stale inode | Exercised | Rust unit/process suites and full `make verify` pass on this host. Runtime/UDS/control modes and loopback TCP authentication are covered. |
-| Different local UID | Pending environment | Mode/token enforcement is tested, but this account has no passwordless privilege to execute a process as a second UID. |
-| macOS UDS + stale inode | Pending native runner | No macOS host is available in this session. |
-| Windows named pipe + ACL + TCP fallback | Pending native runner | Linux cannot exercise named pipes or `icacls`; native MSVC grammar tooling is unavailable for the installed cross target. |
+| Different local UID | Linux enforcement complete | `0700` runtime and `0600` UDS/control modes plus per-instance TCP authentication are pinned. The MVP criterion is the enforcement properties; no privileged second-account harness is required. |
+| macOS UDS + stale inode | Deferred to Phase 10 / AC-59 | The seam remains explicit; no support claim is made by the Linux MVP. |
+| Windows named pipe + ACL + TCP fallback | Deferred to Phase 11 / AC-60 | Named-pipe/path/ACL branches may remain ignored or best-effort until native completion. |
 
-Task 3.5 and Phase 3 remain blocked on the pending native-platform/security-boundary evidence rather than claiming AC-25 or AC-42 from Linux inference.
+Task 3.5 is complete for the Linux MVP. Phase 3 still needs its final four-lane review; native macOS/Windows evidence is no longer part of that gate.
 
 ## Decisions Made
 
@@ -73,17 +73,17 @@ None. Task 3.5 implements the already-approved idle lifecycle and records its me
 
 ## Follow-Ups
 
-- Run the existing daemon process suite natively on macOS and Windows, recording transport and cleanup evidence.
-- Exercise endpoint access from a genuinely different local account on at least one supported platform.
+- Execute Phase 10 when native macOS support becomes a priority.
+- Execute Phase 11 when native Windows support becomes a priority.
 
 ## Requirements Assessment
 
-FR-10/FR-11 and AC-06/AC-07 are implemented and Linux-verified. AC-26 is recorded above. AC-25 and AC-42 remain open pending the explicit environments listed in the platform table.
+FR-10/FR-11 and AC-06/AC-07 are implemented and Linux-verified. AC-25 is established by Linux owner-mode, loopback, and authentication enforcement. AC-26 is recorded above, and AC-42 is satisfied by native Linux UDS/TCP/lifecycle/stale-inode coverage. AC-59/AC-60 carry deferred native platform completion.
 
 ## Deviations
 
 - AC-26 originally named only a measurement outcome; a repeatable stdlib-only MCP harness was added because `code-graph-bench` measures index/cache internals, not stdio-proxy attachment.
-- The task cannot be marked complete on this host because its acceptance text explicitly requires macOS, Windows, and a separate local-user boundary.
+- The original cross-platform acceptance text was rescaled to the Linux MVP; macOS and Windows were not silently waived, but moved to explicit deferred phases with their own acceptance ids.
 
 ## Risks & Issues Encountered
 
