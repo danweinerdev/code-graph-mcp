@@ -21,7 +21,7 @@ tasks:
     depends_on: ["3.1"]
   - id: "3.3"
     title: "Proxy mode behind [daemon].enabled, default off"
-    status: in-progress
+    status: complete
     justifies: "FR-08, FR-09, FR-14, FR-15, FR-16, AC-04, AC-10, AC-30, AC-31. Shipping the proxy default-off is what lets the byte-pump and shared-state behaviour be exercised in the real harness before it becomes everyone's default path."
     verification: "Integration tests — with the flag on, two clients on one root share an index: one runs analyze_codebase and the other queries without indexing (AC-04); a file edit triggers exactly one watcher and both clients see it (AC-30); session B observes session A's analyze job in get_status including progress and terminal result (AC-31); with the daemon prevented from starting, every existing tool answers in-process and the fallback is reported (AC-10)."
     depends_on: ["3.2"]
@@ -144,11 +144,11 @@ Testing "is a daemon already running?" by checking whether the socket file exist
 ## 3.3: Proxy mode behind [daemon].enabled, default off
 
 ### Subtasks
-- [ ] Implement the attach sequence: discover root, read metadata, connect; on failure take the lock and spawn; on losing the lock retry with backoff, re-probing lock staleness each attempt
-- [ ] Implement the bidirectional byte pump between stdio and the socket
-- [ ] Implement in-process fallback with a reported diagnostic
-- [ ] Add `--no-daemon` to force today's behaviour
-- [ ] Integration tests for shared index, shared watcher, shared analyze slot, and forced fallback
+- [x] Implement the attach sequence: discover root, read metadata, connect; on failure take the lock and spawn; on losing the lock retry with backoff, re-probing lock staleness each attempt
+- [x] Implement the bidirectional byte pump between stdio and the socket
+- [x] Implement in-process fallback with a reported diagnostic
+- [x] Add `--no-daemon` to force today's behaviour
+- [x] Integration tests for shared index, shared watcher, shared analyze slot, and forced fallback
 
 ### Notes
 Revision boundary: attaching works end to end and is opt-in; the default path is unchanged, so this commit cannot regress anyone.
@@ -159,7 +159,28 @@ Re-probing lock staleness on each backoff attempt matters: if the winner dies af
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T00:38:40Z, matching `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
+- Focused review: `git show 5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`; complete task diff reviewed for correctness, scope, tests, maintainability, task boundary, process lifecycle, fallback safety, and transport authentication
+- Reviewed candidate / final: `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp --test daemon_proxy -- --test-threads=2` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 6 process tests passed: default-off/`--no-daemon` preservation, shared index/watch/analyze state across root and nested clients, authenticated TCP metadata attachment plus in-process fallback, slow-contender termination before fallback, established-daemon EOF handling, and simultaneous real-client convergence on one owner with no loser children. The concurrency run was also repeated three times during review. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 17 daemon unit tests, 6 proxy process tests, 4 explicit-daemon process tests, and the unchanged 22-tool stdio smoke test passed. |
+| `cargo test --release -p code-graph-mcp --test daemon_proxy --no-run` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | The release-profile proxy integration target compiled; debug-only slow-start instrumentation is paired with a debug-only test. |
+| `cargo test -p code-graph-tools --test snapshot_tools_list && make snapshot-clean` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | All 29 tool-description snapshots passed, including the shared-watch description; no pending snapshots remained. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.3.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, response/tool snapshots, snapshot cleanliness, and plugin mirror synchronization passed after temporarily relocating and restoring the pre-existing orphan fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b` | Complete task commit | PASS | One default-off proxy slice: root discovery, attach/spawn/backoff, UDS/pipe/TCP clients, authenticated TCP acknowledgement, byte pumping, `--no-daemon`, bounded safe fallback, shared-state process coverage, and the agent-facing watch description. Binary replacement and the default-on flip remain absent for task 3.4. |
+| Four-lane iterative review plus final focused quality/spec confirmation | Complete task diff | PASS | Initial findings around daemon EOF hangs, slow-start kill races, unacknowledged TCP auth, contender/zombie leaks, fallback timing, snapshot drift, weak concurrency, and default-path regressions were fixed. Final actionable quality findings were closed before the full gate. |
 
 ## 3.4: Flip the default on, with binary-identity replacement
 
@@ -206,21 +227,21 @@ Pending — not complete.
 
 ## Acceptance Criteria
 
-- [ ] **AC-04**: Two clients on one daemon share an index; one indexes, the other queries without re-indexing (FR-09).
-- [ ] **AC-05**: Spawning creates `.code-graph/` and nothing outside the repository (FR-06, FR-07, FR-08).
+- [x] **AC-04**: Two clients on one daemon share an index; one indexes, the other queries without re-indexing (FR-09).
+- [x] **AC-05**: Spawning creates `.code-graph/` and nothing outside the repository (FR-06, FR-07, FR-08).
 - [ ] **AC-06**: Idle exit fires with no clients; not with a client attached; not with an analyze in flight (FR-10, FR-11).
 - [ ] **AC-07**: The cache reflects the last index after idle exit; the next start loads it (FR-11).
-- [ ] **AC-08**: Simultaneous starts converge on one daemon with no orphans (FR-13).
+- [x] **AC-08**: Simultaneous starts converge on one daemon with no orphans (FR-13).
 - [ ] **AC-09**: A differently-built client does not attach; the daemon is replaced (FR-12).
-- [ ] **AC-10**: With the daemon unavailable, every tool answers in-process and the fallback is reported (FR-16).
+- [x] **AC-10**: With the daemon unavailable, every tool answers in-process and the fallback is reported (FR-16).
 - [ ] **AC-25**: The endpoint is unreachable remotely and unusable by another local user (NFR-06).
 - [ ] **AC-26**: Warm attach does not scale with corpus size; measured on two corpora and recorded (NFR-09).
-- [ ] **AC-30**: One watcher serves all attached clients (FR-14).
-- [ ] **AC-31**: The analyze job started by one session is observable by another (FR-15).
+- [x] **AC-30**: One watcher serves all attached clients (FR-14).
+- [x] **AC-31**: The analyze job started by one session is observable by another (FR-15).
 - [ ] **AC-42**: Linux, macOS, and Windows each exercised, per-platform transport covered (NFR-07).
-- [ ] **AC-47**: Named-pipe/UDS default with reported loopback-TCP fallback (FR-38).
-- [ ] **AC-48**: TCP fallback requires a per-instance secret; file is owner-only (FR-39).
-- [ ] **AC-49**: Clients read the transport from metadata and connect first try (FR-40).
+- [x] **AC-47**: Named-pipe/UDS default with reported loopback-TCP fallback (FR-38).
+- [x] **AC-48**: TCP fallback requires a per-instance secret; file is owner-only (FR-39).
+- [x] **AC-49**: Clients read the transport from metadata and connect first try (FR-40).
 - [ ] **AC-27**: `make verify` passes (NFR-04).
 - [ ] FR-06 through FR-16 and FR-38 through FR-40 realized; NFR-06, NFR-07, NFR-09 satisfied; NFR-01 preserved.
 
