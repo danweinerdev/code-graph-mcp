@@ -27,7 +27,7 @@ tasks:
     depends_on: ["3.2"]
   - id: "3.4"
     title: "Flip the default on, with binary-identity replacement"
-    status: in-progress
+    status: complete
     justifies: "FR-08, FR-12, NFR-01, AC-09. This is the commit where users get the feature; the binary-identity gate has to land with it because a dirty SHA never changes between dev builds, so without the executable fingerprint an edit-rebuild loop silently talks to the stale daemon."
     verification: "Integration tests plus the full snapshot suite — the existing snapshot suite passes unchanged with daemon mode default-on, proving the proxy does not change tool behavior (NFR-01); a client running a byte-distinct executable does not attach and the daemon is replaced (AC-09); the replaced daemon persists its active graph before exiting and an owner-bound control signal mid-persist completes the write; a daemon that ignores the signal is hard-killed after a bounded grace period and the client falls back in-process."
     depends_on: ["3.3"]
@@ -186,12 +186,12 @@ Re-probing lock staleness on each backoff attempt matters: if the winner dies af
 ## 3.4: Flip the default on, with binary-identity replacement
 
 ### Subtasks
-- [ ] Flip the `[daemon].enabled` default from false to true — the single line that makes the daemon everyone's path
-- [ ] Compare the client's build identity against `daemon.json`: clean/dirty SHA plus executable-content fingerprint; a dirty SHA alone never establishes compatibility
-- [ ] On mismatch, publish an owner-bound repository-local control signal and wait for exit, then respawn
-- [ ] Route the control signal through the same graceful shutdown path as Ctrl-C and future idle exit
-- [ ] Finish an in-flight cache persist before exiting; hard-kill after a bounded grace period
-- [ ] Run the full snapshot suite against a daemon-backed server
+- [x] Flip the `[daemon].enabled` default from false to true — the single line that makes the daemon everyone's path
+- [x] Compare the client's build identity against `daemon.json`: clean/dirty SHA plus executable-content fingerprint; a dirty SHA alone never establishes compatibility
+- [x] On mismatch, publish an owner-bound repository-local control signal and wait for exit, then respawn
+- [x] Route the control signal through the same graceful shutdown path as Ctrl-C and future idle exit
+- [x] Finish an in-flight cache persist before exiting; hard-kill after a bounded grace period
+- [x] Run the full snapshot suite against a daemon-backed server
 
 ### Notes
 Revision boundary: the daemon is the default path, with a working replacement protocol.
@@ -200,7 +200,29 @@ The shutdown mechanism is an owner-bound file signal under `.code-graph/`, not a
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `80f92a9d1e00e05aeb20b4a8934d3c68ec80fc0d`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T02:01:56Z, matching `80f92a9d1e00e05aeb20b4a8934d3c68ec80fc0d`
+- Focused review: `git show 80f92a9d1e00e05aeb20b4a8934d3c68ec80fc0d`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `80f92a9d1e00e05aeb20b4a8934d3c68ec80fc0d`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp --test daemon_proxy -- --test-threads=2` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 12 process tests passed: default-on plus both opt-outs, real byte-distinct executable replacement, clean and dirty identity handling, sequential/concurrent owner convergence, acknowledged delayed-persist drain, bounded hard-kill fallback, authenticated TCP attachment, established-daemon EOF, shared state, and contender cleanup. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 20 daemon unit tests, 12 proxy process tests, 4 explicit-daemon process tests, and the unchanged 22-tool stdio smoke test passed. |
+| `cargo test -p code-graph-tools persist_coordinator && cargo test -p code-graph-tools core::watch::tests && cargo test -p code-graph-tools --test watch_race` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Coordinator admission/drain/lost-wake tests, 8 typed watch lifecycle tests, and 3 watcher race tests passed; shutdown waits admitted analyses, persists, live watchers, and detached watch cleanup before its final active-project cache save. |
+| `cargo test --release -p code-graph-mcp --test daemon_proxy --no-run` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | The release-profile replacement process target compiled; debug-only delay/ignore instrumentation remains paired with debug-only tests. |
+| `cargo test -p code-graph-tools --test snapshot_tools_list && cargo test -p code-graph-tools --test snapshot_responses && make snapshot-clean` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | All 29 tool-description and 59 representative response snapshots passed unchanged; no pending snapshots remained and the tool surface stayed at 22. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting, workspace lint with warnings denied, and whitespace validation passed. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.4.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, response/tool snapshots, snapshot cleanliness, and plugin mirror synchronization passed after temporarily relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 80f92a9d1e00e05aeb20b4a8934d3c68ec80fc0d` | Complete task commit | PASS | One default-on replacement slice: executable identity metadata, active-lock authorization, request/ack control signal, bounded replacement and fallback, analyze/persist/watch drain coordination, final active-project cache save, truthful config docs, and unchanged MCP descriptors/responses. Idle connection accounting remains absent for task 3.5. |
+| Four-lane iterative review plus final focused quality/blind-spot confirmation | Complete task diff | PASS | Findings around dirty replacement storms, cross-build attach races, unacknowledged long drains, lost wakeups, active-analysis and watcher mutation races, wrong-root final saves, stale request poisoning, control-file clobber, replacement oscillation, and default/idle documentation were fixed. The remaining safe-`sysinfo` PID-reuse interval is the accepted cross-platform/no-unsafe limitation already bounded by exact lock identity checks immediately before hard kill. |
 
 ### Trap
 Treating a `-dirty` SHA as sufficient identity. It looks correct — the strings are equal — but two different dirty builds share a SHA. Require the executable fingerprint too; sessions launched from the exact same dirty executable may share, while a byte-distinct rebuild replaces the daemon. Omitting that second discriminator manifests as "my change didn't take effect".
@@ -233,7 +255,7 @@ Pending — not complete.
 - [ ] **AC-06**: Idle exit fires with no clients; not with a client attached; not with an analyze in flight (FR-10, FR-11).
 - [ ] **AC-07**: The cache reflects the last index after idle exit; the next start loads it (FR-11).
 - [x] **AC-08**: Simultaneous starts converge on one daemon with no orphans (FR-13).
-- [ ] **AC-09**: A differently-built client does not attach; the daemon is replaced (FR-12).
+- [x] **AC-09**: A differently-built client does not attach; the daemon is replaced (FR-12).
 - [x] **AC-10**: With the daemon unavailable, every tool answers in-process and the fallback is reported (FR-16).
 - [ ] **AC-25**: The endpoint is unreachable remotely and unusable by another local user (NFR-06).
 - [ ] **AC-26**: Warm attach does not scale with corpus size; measured on two corpora and recorded (NFR-09).

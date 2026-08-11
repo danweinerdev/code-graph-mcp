@@ -73,13 +73,13 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a 
 
 ## Current State
 
-*Written for a cold start. Last updated 2026-08-11 at `5bae8b6`.*
+*Written for a cold start. Last updated 2026-08-11 at `80f92a9`.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | in-progress | Tasks 3.1–3.3 complete: opt-in stdio proxy attachment now shares index, watcher, and analyze state, with authenticated TCP attachment, bounded spawn convergence, `--no-daemon`, and safe in-process fallback. **Next: 3.4**, default-on binary-identity replacement. |
+| 3 Daemon Foundation | in-progress | Tasks 3.1–3.4 complete: daemon attachment is default-on with executable-identity replacement, graceful analyze/persist/watch drain, final cache save, bounded hard-kill fallback, and unchanged 22-tool responses. **Next: 3.5**, idle lifecycle and warm-attach measurement. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
