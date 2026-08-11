@@ -37,6 +37,18 @@ tasks:
     justifies: "FR-10, FR-11, NFR-09, AC-06, AC-07, AC-25, AC-26, AC-42. An always-resident daemon per repository is a resource leak users will notice; the measurement is what turns NFR-09's claimed benefit into a verified one rather than an assumption."
     verification: "Linux integration tests with a short timeout — exits with no clients, does not exit with a client attached, does not exit with an analyze in flight and no clients (AC-06); the timer restarts from zero rather than resuming after an analyze terminates; the cache reflects the last index after idle exit and the next start loads rather than re-indexes (AC-07); UDS/runtime modes plus loopback TCP credential enforcement satisfy the Linux local-user boundary (AC-25); warm-attach time-to-first-query measured on external/ripgrep and external/abseil-cpp shows no corpus-size scaling while cold start does (AC-26); Linux UDS/TCP/idle/stale-inode paths are exercised while macOS/Windows seams remain deferred (AC-42)."
     depends_on: ["3.4"]
+  - id: "3.6"
+    title: "Close final daemon review findings"
+    status: complete
+    justifies: "AC-05, AC-10, NFR-06. The final Phase 3 review found that a daemon could accept an analyze rooted in another project and race that project's daemon cache, a direct smoke test leaked the now-default daemon, stale metadata could be kept alive by an unrelated recycled endpoint, and fallback coverage did not call every advertised tool route."
+    verification: "Bind daemon-mode `ServerInner` to its discovered project root and reject cross-project analyze requests before graph/cache mutation; a two-project process test proves the foreign cache is untouched. Make direct stdio smoke explicitly use `--no-daemon` and prove no runtime state/process remains. Once lock ownership is acquired, dead-owner metadata is not preserved merely because an unrelated endpoint accepts connections. In forced in-process fallback, invoke every name returned by `tools/list` with route-valid arguments and assert no method-not-found response. Run `cargo test -p code-graph-mcp -- --test-threads=1`, focused coordinator tests, clippy/rustfmt, and `make verify`."
+    depends_on: ["3.5"]
+  - id: "3.7"
+    title: "Harden daemon root rejection ordering and normalization"
+    status: complete
+    justifies: "NFR-06, NFR-07. Task 3.6 prevents cross-root mutation, but focused review found that it reads a foreign root's config before rejection and compares roots produced by different canonicalizers, which can reject an equivalent Windows path form."
+    verification: "Canonicalize the daemon root through the same `code_graph_core::paths` helper used by analyze requests. Reject an analyze path outside the bound daemon root before loading foreign config, while retaining the post-discovery equality check that rejects nested project configs. Linux tests prove an outside malformed config still returns the root-boundary error without parsing it and same-root/nested-scope requests continue to work; relevant native Windows normalization coverage remains assigned to Phase 11. Run focused daemon tests, rustfmt, clippy, and `make verify`."
+    depends_on: ["3.6"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -271,6 +283,74 @@ AC-26 is a recorded metric, not an automated gate. The pass condition is the *ab
 | `git show 73c332f0f38ad4c6ce925fd4ad2aa07b0eba1406` | Complete task commit | PASS | One Linux-MVP lifecycle slice: connection/analyze generation accounting, atomic idle claim, transport guard integration, graceful final save/cleanup, security-mode coverage, process tests, docs, and reproducible benchmark harness. macOS/Windows remain outside this revision behind existing seams. |
 | Four-lane iterative review plus final quality/blind-spot confirmation | Complete task diff | PASS | Timer races, unauthenticated TCP accounting, cache-load evidence, flaky timing margins, benchmark root isolation, query scaling, state restoration, request deadlines, and TCP acknowledgement ordering were reviewed and fixed. |
 | Linux permission and transport inspection | UDS/runtime/control files and forced TCP fallback | PASS | Runtime is `0700`; UDS and owner files are `0600`; TCP metadata is loopback-only; missing, wrong, and stale credentials are rejected. This is the Linux enforcement criterion; native macOS/Windows behavior is carried by phases 10/11. |
+
+## 3.6: Close final daemon review findings
+
+### Subtasks
+- [x] Bind daemon-mode server state to one immutable project root and reject foreign sync/async analyze jobs before graph/cache mutation
+- [x] Keep the direct stdio smoke explicitly in-process and isolated from the caller's working directory
+- [x] Make dead owner identity authoritative over an unrelated accepting endpoint after lock acquisition
+- [x] Exercise all 22 advertised tool routes through forced in-process fallback
+
+### Notes
+Revision boundary: the four findings from the first frozen Phase 3 review are closed as one daemon-isolation and process-hygiene hardening slice. Follow-up task 3.7 handles two additional rejection-order/path-normalization findings discovered by focused review without rewriting this immutable task commit.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `6599c8bc1bd5347fd4843855b6aba93e13cce9aa`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T04:52:44Z, matching `6599c8bc1bd5347fd4843855b6aba93e13cce9aa`
+- Focused review: `git show 6599c8bc1bd5347fd4843855b6aba93e13cce9aa`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `6599c8bc1bd5347fd4843855b6aba93e13cce9aa`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 28 daemon unit tests, 13 proxy process tests, 8 explicit-daemon process tests, and the direct smoke passed. Coverage includes two-root sync/async rejection, all-tool fallback routing, recycled endpoint cleanup, and no-daemon smoke isolation. |
+| `cargo test -p code-graph-tools server::tests` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 50 server/coordinator tests passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.6.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, snapshot cleanliness, and plugin mirror synchronization passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 6599c8bc1bd5347fd4843855b6aba93e13cce9aa` | Complete task commit | PASS | The diff contains only immutable daemon-root binding, pre-mutation rejection, stale-runtime owner handling, process hygiene, and focused regressions for the original four findings. |
+| Focused semantic review | Complete task diff plus callers | PASS | Original findings F-01 through F-04 are closed; two newly discovered rejection-order/path-normalization items are tracked in task 3.7 rather than hidden or folded into this immutable commit. |
+
+## 3.7: Harden daemon root rejection ordering and normalization
+
+### Subtasks
+- [x] Normalize daemon startup root with `code_graph_core::paths::canonicalize`
+- [x] Reject paths outside the bound root before loading their configuration
+- [x] Preserve post-discovery rejection for nested project configurations
+- [x] Add focused ordering and same-root regressions
+
+### Notes
+Revision boundary: root isolation is enforced before foreign reads and compares canonical paths produced by one shared helper. Native Windows execution remains Phase 11 evidence, but this task must not knowingly compare incompatible path representations.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `ae2a3d3b202be25de6049000dd13085ddeb6b6db`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T05:08:30Z, matching `ae2a3d3b202be25de6049000dd13085ddeb6b6db`
+- Focused review: `git show ae2a3d3b202be25de6049000dd13085ddeb6b6db`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `ae2a3d3b202be25de6049000dd13085ddeb6b6db`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools daemon_root_boundary_precedes_foreign_config_and_accepts_owned_scopes` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | The focused test proves outside malformed config is rejected before parsing or mutation, same-root and nested scopes sharing the root remain valid, and a nested project config remains a distinct rejected root. |
+| `cargo test -p code-graph-mcp -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 28 daemon unit, 13 proxy process, 8 serve process, and 1 smoke test passed sequentially after the task commit. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.7.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, snapshots, and plugin mirror checks passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show ae2a3d3b202be25de6049000dd13085ddeb6b6db` | Complete task commit | PASS | One focused boundary slice: shared canonicalizer at daemon startup, pre-config outside-root rejection, retained nested-project equality gate, and regression coverage. |
+| Focused final quality review | Exact task commit plus callers/tests | PASS | Linux MVP root ordering and canonicalization behavior aligned. Native Windows long-path representation remains explicitly deferred to Phase 11 rather than inferred from Linux. |
 
 ## Acceptance Criteria
 
