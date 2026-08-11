@@ -164,7 +164,7 @@ Re-probing lock staleness on each backoff attempt matters: if the winner dies af
 - VCS: `git`
 - Revision / checkpoint: `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
 - Identity recheck: `git rev-parse HEAD` at 2026-08-11T00:38:40Z, matching `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
-- Focused review: `git show 5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`; complete task diff reviewed for correctness, scope, tests, maintainability, task boundary, process lifecycle, fallback safety, and transport authentication
+- Focused review: `git show 5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
 - Reviewed candidate / final: `5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b`
 - Review result: PASS/Aligned
 
