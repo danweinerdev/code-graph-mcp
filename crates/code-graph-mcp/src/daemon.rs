@@ -1114,25 +1114,22 @@ async fn acquire_or_detect_live(paths: &DaemonPaths) -> anyhow::Result<Option<Da
     match DaemonLock::acquire(paths) {
         Ok(lock) => Ok(Some(lock)),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&paths.lock)
-                .context("open existing daemon lock")?;
+            let file = open_existing_lock(&paths.lock).context("open existing daemon lock")?;
             match file.try_lock_exclusive() {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(error) => return Err(error).context("lock existing daemon lock"),
             };
-            let previous_identity = read_lock_identity_from(&file);
-            if previous_identity.as_ref().is_some_and(identity_is_alive) {
-                FileExt::unlock(&file).ok();
-                return Ok(None);
+            #[cfg(unix)]
+            {
+                fs::set_permissions(&paths.lock, std::fs::Permissions::from_mode(0o600))
+                    .context("restrict recovered daemon lock permissions")?;
             }
+            let previous_identity = read_lock_identity_from(&file);
 
-            // The OS lock is the single-instance authority. A dead or
-            // malformed on-disk identity cannot own this file, so endpoint
-            // reuse is not evidence that its metadata/token remain valid.
+            // The OS lock is the single-instance authority. Once it is ours,
+            // lock-file contents cannot retain ownership, even if a stale
+            // identity happens to name a currently live process.
             cleanup_stale_runtime(paths, previous_identity.as_ref()).await;
             let identity = previous_identity.unwrap_or(LockIdentity {
                 pid: 0,
@@ -1151,6 +1148,32 @@ async fn acquire_or_detect_live(paths: &DaemonPaths) -> anyhow::Result<Option<Da
         }
         Err(error) => Err(error).context("create daemon lock"),
     }
+}
+
+fn open_existing_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "existing daemon lock {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(std::io::Error::other(format!(
+            "existing daemon lock {} has multiple links",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn read_lock_identity_from(file: &std::fs::File) -> Option<LockIdentity> {
@@ -1188,9 +1211,8 @@ async fn prepare_runtime_for_owner(paths: &DaemonPaths) -> bool {
         let _ = fs::remove_file(&paths.secret);
         return true;
     };
-    if identity_is_alive(&metadata.owner) {
-        return false;
-    }
+    // The caller already owns daemon.lock, so metadata identity is only
+    // stale instance data. A reused PID/start time must not veto cleanup.
     cleanup_stale_runtime(paths, Some(&metadata.owner)).await;
     true
 }
@@ -1995,17 +2017,87 @@ mod tests {
         let root = test_root();
         let paths = DaemonPaths::for_root(&root);
         paths.ensure_runtime_dir().unwrap();
-        let stale = LockIdentity {
-            pid: 99_999_999,
-            start_time: 0,
-            nonce: "stale".to_owned(),
-        };
+        let stale = LockIdentity::current().unwrap();
         fs::write(&paths.lock, serde_json::to_vec(&stale).unwrap()).unwrap();
         let reclaimed = acquire_or_detect_live(&paths).await.unwrap().unwrap();
         reclaimed.remove_if_owned();
         let live = DaemonLock::acquire(&paths).unwrap();
         assert!(acquire_or_detect_live(&paths).await.unwrap().is_none());
         live.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_lock_recovery_refuses_symlink_without_touching_target() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let sentinel = outside.join("sentinel");
+        let contents = b"external sentinel contents\n";
+        fs::write(&sentinel, contents).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &paths.lock).unwrap();
+
+        assert!(acquire_or_detect_live(&paths).await.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&paths.lock).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_lock_recovery_refuses_hardlink_without_touching_target() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let sentinel = outside.join("sentinel");
+        let contents = b"hard-linked external sentinel contents\n";
+        fs::write(&sentinel, contents).unwrap();
+        fs::hard_link(&sentinel, &paths.lock).unwrap();
+
+        assert!(acquire_or_detect_live(&paths).await.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&paths.lock).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_lock_recovery_refuses_non_regular_entry() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        fs::create_dir(&paths.lock).unwrap();
+
+        assert!(acquire_or_detect_live(&paths).await.is_err());
+        assert!(paths.lock.is_dir(), "non-regular lock entry is untouched");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_regular_lock_recovery_repairs_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        fs::write(&paths.lock, b"partial lock write").unwrap();
+        fs::set_permissions(&paths.lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let lock = acquire_or_detect_live(&paths).await.unwrap().unwrap();
+        assert_eq!(
+            fs::metadata(&paths.lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2439,7 +2531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locked_owner_retains_metadata_for_a_genuinely_live_owner() {
+    async fn locked_owner_clears_metadata_with_a_current_looking_identity() {
         let root = test_root();
         let paths = DaemonPaths::for_root(&root);
         paths.ensure_runtime_dir().unwrap();
@@ -2453,9 +2545,9 @@ mod tests {
         write_metadata_atomically(&paths.metadata, &metadata).unwrap();
         fs::write(&paths.secret, b"live token\n").unwrap();
 
-        assert!(!prepare_runtime_for_owner(&paths).await);
-        assert!(paths.metadata.exists());
-        assert!(paths.secret.exists());
+        assert!(prepare_runtime_for_owner(&paths).await);
+        assert!(!paths.metadata.exists());
+        assert!(!paths.secret.exists());
 
         lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();

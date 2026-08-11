@@ -320,6 +320,7 @@ dependencies = [
  "code-graph-tools",
  "fs2",
  "getrandom",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",
