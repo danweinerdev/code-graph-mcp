@@ -52,8 +52,9 @@ max_threads = 0
 # Exactly one repository-local daemon serves this project root by default. Its
 # runtime state remains inside that repository. Set false to serve in-process.
 enabled = true
-# Reserved for task 3.5: current daemons do not idle-exit yet. 0 will mean
-# never exit when idle lifecycle support lands.
+# Idle lifetime after the last attached client disconnects and no analyze is
+# running. Every attach or analyze activity restarts the full interval. 0 =
+# never exit automatically.
 idle_timeout_secs = 1800
 
 [response]

@@ -739,16 +739,19 @@ struct DaemonLock {
 
 impl DaemonLock {
     fn acquire(paths: &DaemonPaths) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
         let identity = LockIdentity::current()?;
         let contents = format!(
             "{}\n",
             serde_json::to_string(&identity).map_err(std::io::Error::other)?
         );
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&paths.lock)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&paths.lock)?;
         let initialize = (|| -> std::io::Result<()> {
             file.try_lock_exclusive()?;
             file.write_all(contents.as_bytes())?;
@@ -810,11 +813,16 @@ impl DaemonLock {
 pub async fn run(server: CodeGraphServer) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("read current directory for daemon root")?;
     let cwd = fs::canonicalize(&cwd).context("canonicalize daemon root")?;
-    let (_, root) = RootConfig::load(&cwd).context("discover daemon project root")?;
+    let (config, root) = RootConfig::load(&cwd).context("discover daemon project root")?;
     slow_test_contender_start(&root).await;
-    run_until(server, root, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    run_until(
+        server,
+        root,
+        Duration::from_secs(config.daemon.idle_timeout_secs),
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
     .await
 }
 
@@ -837,7 +845,12 @@ async fn slow_test_contender_start(root: &Path) {
 #[cfg(not(debug_assertions))]
 async fn slow_test_contender_start(_root: &Path) {}
 
-async fn run_until<F>(server: CodeGraphServer, root: PathBuf, shutdown: F) -> anyhow::Result<()>
+async fn run_until<F>(
+    server: CodeGraphServer,
+    root: PathBuf,
+    idle_timeout: Duration,
+    shutdown: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()>,
 {
@@ -890,23 +903,27 @@ where
         return Err(error);
     }
 
-    serve_listener(
-        listener,
-        server.clone(),
-        tcp_secret,
-        shutdown_with_request(&paths, &lock.identity, shutdown),
-    )
-    .await;
+    let shutdown_or_idle = async {
+        tokio::select! {
+            _ = shutdown_with_request(&paths, &lock.identity, shutdown) => {},
+            claimed = server.inner.persist.wait_for_idle_shutdown(idle_timeout) => {
+                if claimed {
+                    eprintln!("code-graph-mcp: daemon idle timeout reached for {}", root.display());
+                }
+            },
+        }
+    };
+    serve_listener(listener, server.clone(), tcp_secret, shutdown_or_idle).await;
     graceful_shutdown(&server, &root).await;
     cleanup_owned(&paths, lock, &metadata).await;
     Ok(())
 }
 
-/// Drains graph mutation before runtime cleanup without implementing the
-/// separate idle-lifecycle policy. Existing analyses finish and may persist;
-/// then the watcher and any watch reindex drain before one exclusive final
-/// cache save captures the current graph. The watcher task is awaited before
-/// the index lock, so no queued watch batch can mutate after that save.
+/// Drains graph mutation before runtime cleanup. Existing analyses finish and
+/// may persist; then the watcher and any watch reindex drain before one
+/// exclusive final cache save captures the current graph. The watcher task is
+/// awaited before the index lock, so no queued watch batch can mutate after
+/// that save.
 async fn graceful_shutdown(server: &CodeGraphServer, _daemon_root: &Path) {
     server.inner.persist.close_analyze_and_wait().await;
     let handle = { server.inner.watch.write().take() };
@@ -1421,6 +1438,9 @@ fn restrict_windows_path(path: &Path, permissions: &str, label: &str) -> anyhow:
 }
 
 fn write_metadata_atomically(path: &Path, metadata: &DaemonMetadata) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     let encoded = serde_json::to_vec(metadata).context("serialize daemon metadata")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1428,9 +1448,11 @@ fn write_metadata_atomically(path: &Path, metadata: &DaemonMetadata) -> anyhow::
         .as_nanos();
     let temp = path.with_file_name(format!(".daemon-{}-{nonce}.tmp", std::process::id()));
     let write = || -> anyhow::Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&temp)
             .with_context(|| format!("create daemon metadata temp {}", temp.display()))?;
         file.write_all(&encoded)?;
@@ -1497,8 +1519,14 @@ where
             _ = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    let Ok(connection) = server.inner.persist.begin_connection() else {
+                        // The idle timer may have claimed shutdown after this
+                        // accept completed. Reject this racing stream rather
+                        // than reviving the daemon after listener closure.
+                        continue;
+                    };
                     if let Ok(permit) = permits.clone().try_acquire_owned() {
-                        spawn_service(server.clone(), stream, permit);
+                        spawn_service(server.clone(), stream, permit, connection);
                     }
                 }
                 Err(error) => eprintln!("code-graph-mcp: accept daemon UDS connection: {error}"),
@@ -1529,8 +1557,17 @@ async fn serve_tcp<F>(
                     let server = server.clone();
                     let secret = secret.clone();
                     tokio::spawn(async move {
-                        if authenticate_tcp(&mut stream, &secret).await.is_ok() {
-                            serve_service(server, stream, permit).await;
+                        if validate_tcp_auth(&mut stream, &secret).await.is_ok() {
+                            // TCP peers do not affect idle accounting until
+                            // they have proved possession of the daemon secret.
+                            // The permit still bounds unauthenticated handshakes.
+                            if let Ok(connection) = server.inner.persist.begin_connection() {
+                                // Admission atomically loses to an idle claim.
+                                // A peer that loses must not receive CG-OK.
+                                if acknowledge_tcp(&mut stream).await.is_ok() {
+                                    serve_service(server, stream, permit, connection).await;
+                                }
+                            }
                         }
                     });
                 }
@@ -1562,9 +1599,10 @@ async fn serve_pipe<F>(
                     // Hand it to rmcp before retrying the replacement so a
                     // transient pipe-create error neither spins nor strands
                     // the already attached client.
+                    let connection = server.inner.persist.begin_connection().ok();
                     let permit = permits.clone().try_acquire_owned().ok();
-                    if let Some(permit) = permit {
-                        spawn_service(server.clone(), listener, permit);
+                    if let (Some(permit), Some(connection)) = (permit, connection) {
+                        spawn_service(server.clone(), listener, permit, connection);
                     } else {
                         drop(listener);
                     }
@@ -1590,17 +1628,25 @@ async fn serve_pipe<F>(
     }
 }
 
-fn spawn_service<S>(server: CodeGraphServer, stream: S, permit: OwnedSemaphorePermit)
-where
+fn spawn_service<S>(
+    server: CodeGraphServer,
+    stream: S,
+    permit: OwnedSemaphorePermit,
+    connection: code_graph_tools::ConnectionGuard,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        serve_service(server, stream, permit).await;
+        serve_service(server, stream, permit, connection).await;
     });
 }
 
-async fn serve_service<S>(server: CodeGraphServer, stream: S, _permit: OwnedSemaphorePermit)
-where
+async fn serve_service<S>(
+    server: CodeGraphServer,
+    stream: S,
+    _permit: OwnedSemaphorePermit,
+    _connection: code_graph_tools::ConnectionGuard,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match server.serve(stream).await {
@@ -1613,9 +1659,18 @@ where
     }
 }
 
+#[cfg(test)]
 async fn authenticate_tcp<S>(stream: &mut S, secret: &str) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    validate_tcp_auth(stream, secret).await?;
+    acknowledge_tcp(stream).await
+}
+
+async fn validate_tcp_auth<S>(stream: &mut S, secret: &str) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
 {
     let mut line = [0_u8; AUTH_LINE_LEN];
     timeout(AUTH_TIMEOUT, stream.read_exact(&mut line))
@@ -1627,6 +1682,13 @@ where
     {
         bail!("invalid TCP daemon authentication prelude")
     }
+    Ok(())
+}
+
+async fn acknowledge_tcp<S>(stream: &mut S) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     stream
         .write_all(AUTH_ACK)
         .await
@@ -1787,6 +1849,28 @@ mod tests {
         assert!(!encoded["binary_sha"].as_str().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn tcp_fallback_metadata_is_loopback_only() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        fs::write(&paths.socket, b"force TCP fallback").unwrap();
+        let (listener, metadata, secret) = bind_listener(&paths, &lock).await.unwrap();
+        let address: std::net::SocketAddr = metadata.endpoint.parse().unwrap();
+        assert_eq!(metadata.transport, Transport::Tcp);
+        assert!(
+            address.ip().is_loopback(),
+            "TCP fallback never binds a LAN address"
+        );
+        drop(listener);
+        drop(secret);
+        let _ = fs::remove_file(&paths.secret);
+        let _ = fs::remove_file(&paths.socket);
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn binary_sha_gate_accepts_only_equal_clean_builds() {
         assert!(sha_compatible_with("clean-a", "clean-a", "fp-a", "fp-a"));
@@ -1841,6 +1925,27 @@ mod tests {
         assert!(!code_graph_graph::cache_path(&daemon_root).exists());
         fs::remove_dir_all(daemon_root).unwrap();
         fs::remove_dir_all(active_project).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_until_uses_the_idle_future_to_close_and_cleanup_the_listener() {
+        let root = test_root();
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                server,
+                root.clone(),
+                Duration::from_millis(20),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("idle future shuts the listener down")
+        .unwrap();
+        assert!(!root.join(".code-graph/daemon.lock").exists());
+        assert!(!root.join(".code-graph/daemon.json").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -2107,6 +2212,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_idle_claim_rejects_valid_auth_without_success_acknowledgement() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        assert!(
+            server
+                .inner
+                .persist
+                .wait_for_idle_shutdown(Duration::from_millis(1))
+                .await,
+            "test setup claims idle shutdown before TCP admission"
+        );
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let service = server.clone();
+        let server = tokio::spawn(async move {
+            serve_tcp(listener, service, token, async move {
+                let _ = shutdown.await;
+            })
+            .await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"CG-AUTH 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            )
+            .await
+            .unwrap();
+        let mut acknowledgement = [0_u8; AUTH_ACK.len()];
+        assert!(
+            matches!(
+                timeout(
+                    Duration::from_secs(1),
+                    stream.read_exact(&mut acknowledgement)
+                )
+                .await,
+                Ok(Err(_))
+            ),
+            "a valid TCP peer racing an idle claim must close without CG-OK"
+        );
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn tcp_proxy_attachment_requires_the_authentication_acknowledgement() {
         let root = test_root();
         let paths = DaemonPaths::for_root(&root);
@@ -2150,6 +2301,50 @@ mod tests {
             fs::metadata(&paths.secret).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_files_are_owner_only_for_local_user_exclusion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            lock.identity.clone(),
+        )
+        .unwrap();
+        write_metadata_atomically(&paths.metadata, &metadata).unwrap();
+        write_shutdown_request(&paths, &lock.identity).unwrap();
+        write_shutdown_ack(&paths, &lock.identity).unwrap();
+
+        // This is the strongest Linux-runnable evidence available without
+        // manufacturing a second UID: other users cannot traverse the 0700
+        // runtime directory, and every sensitive regular file is 0600. It
+        // intentionally does not claim a second-UID runtime exercise.
+        assert_eq!(
+            fs::metadata(&paths.runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [
+            &paths.lock,
+            &paths.metadata,
+            &paths.shutdown_request,
+            &paths.shutdown_ack,
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{} must be owner-only",
+                path.display()
+            );
+        }
+        lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -796,14 +796,16 @@ pub(crate) fn save_cache(inner: &ServerInner, dir: &std::path::Path) -> Result<(
     #[cfg(debug_assertions)]
     debug_delay_persist(dir);
     let g = inner.graph.read();
-    g.save(dir).map_err(|error| error.to_string())
+    let result = g.save(dir).map_err(|error| error.to_string());
+    #[cfg(debug_assertions)]
+    if result.is_ok() {
+        debug_write_persist_completion_marker();
+    }
+    result
 }
 
 #[cfg(debug_assertions)]
 fn debug_delay_persist(dir: &std::path::Path) {
-    if let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_MARKER") {
-        let _ = std::fs::write(marker, b"persist admitted\n");
-    }
     let Ok(root) = std::env::var("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT") else {
         return;
     };
@@ -814,5 +816,12 @@ fn debug_delay_persist(dir: &std::path::Path) {
         if let Ok(delay_millis) = delay_millis.parse::<u64>() {
             std::thread::sleep(std::time::Duration::from_millis(delay_millis));
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_write_persist_completion_marker() {
+    if let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_MARKER") {
+        let _ = std::fs::write(marker, b"persist complete\n");
     }
 }

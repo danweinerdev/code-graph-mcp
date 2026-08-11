@@ -78,9 +78,18 @@ pub struct PersistCoordinator {
 
 struct PersistState {
     analyze_closed: bool,
+    connection_closed: bool,
     persist_closed: bool,
     watch_cleanup_closed: bool,
+    /// Set exactly once by the idle waiter that won the expiry race. It closes
+    /// both connection and analyze admission before the daemon starts its
+    /// graceful drain.
+    idle_claimed: bool,
+    /// Every connection/analyze begin and drop advances this value. The idle
+    /// waiter uses it as an epoch so any activity restarts its full interval.
+    lifecycle_generation: u64,
     analyses: u32,
+    connections: u32,
     persists: u32,
     watch_cleanups: u32,
 }
@@ -90,9 +99,13 @@ impl PersistCoordinator {
         Self {
             state: parking_lot::Mutex::new(PersistState {
                 analyze_closed: false,
+                connection_closed: false,
                 persist_closed: false,
                 watch_cleanup_closed: false,
+                idle_claimed: false,
+                lifecycle_generation: 0,
                 analyses: 0,
+                connections: 0,
                 persists: 0,
                 watch_cleanups: 0,
             }),
@@ -108,7 +121,25 @@ impl PersistCoordinator {
             return Err("daemon shutdown in progress; new analyze jobs are not accepted");
         }
         state.analyses += 1;
+        state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
+        self.changed.notify_waiters();
         Ok(AnalyzeGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Atomically admit an MCP connection. The returned guard spans the
+    /// accepted transport, any TCP authentication prelude, and the complete
+    /// rmcp service lifetime so idle accounting never relies on permits.
+    pub fn begin_connection(self: &Arc<Self>) -> Result<ConnectionGuard, &'static str> {
+        let mut state = self.state.lock();
+        if state.connection_closed {
+            return Err("daemon shutdown in progress; new connections are not accepted");
+        }
+        state.connections += 1;
+        state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
+        self.changed.notify_waiters();
+        Ok(ConnectionGuard {
             coordinator: Arc::clone(self),
         })
     }
@@ -148,6 +179,61 @@ impl PersistCoordinator {
         self.state.lock().analyze_closed
     }
 
+    /// Wait for an uninterrupted idle interval, then atomically claim daemon
+    /// shutdown. `Duration::ZERO` is the documented never-exit sentinel and
+    /// remains pending even when the daemon is otherwise idle.
+    ///
+    /// The generation is captured only after both counts are zero. Every
+    /// analyze/connection begin or drop changes it and wakes this waiter, so a
+    /// return to zero always receives a fresh full interval. Expiry rechecks
+    /// under the same mutex before closing admission, making attach-vs-expiry
+    /// deterministic: whichever operation gets the mutex first wins.
+    pub async fn wait_for_idle_shutdown(&self, idle_timeout: std::time::Duration) -> bool {
+        if idle_timeout.is_zero() {
+            std::future::pending::<()>().await;
+            unreachable!("the zero idle timeout sentinel never resolves")
+        }
+
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let generation = {
+                let state = self.state.lock();
+                if state.idle_claimed {
+                    return false;
+                }
+                if state.connections != 0 || state.analyses != 0 {
+                    None
+                } else {
+                    Some(state.lifecycle_generation)
+                }
+            };
+            let Some(generation) = generation else {
+                notified.await;
+                continue;
+            };
+
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = tokio::time::sleep(idle_timeout) => {
+                    let mut state = self.state.lock();
+                    if !state.idle_claimed
+                        && state.connections == 0
+                        && state.analyses == 0
+                        && state.lifecycle_generation == generation
+                    {
+                        state.idle_claimed = true;
+                        state.connection_closed = true;
+                        state.analyze_closed = true;
+                        self.changed.notify_waiters();
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     /// Close new analyze admission and wait for every previously-admitted
     /// pipeline. A notified future is created before inspecting state so a
     /// final guard drop cannot be lost between the check and await.
@@ -159,6 +245,7 @@ impl PersistCoordinator {
             {
                 let mut state = self.state.lock();
                 state.analyze_closed = true;
+                state.connection_closed = true;
                 if state.analyses == 0 {
                     return;
                 }
@@ -221,9 +308,26 @@ impl Drop for AnalyzeGuard {
         let mut state = self.coordinator.state.lock();
         debug_assert!(state.analyses > 0, "analyze guard must hold an active slot");
         state.analyses -= 1;
-        if state.analyses == 0 {
-            self.coordinator.changed.notify_waiters();
-        }
+        state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
+        self.coordinator.changed.notify_waiters();
+    }
+}
+
+/// RAII admission for one accepted daemon connection.
+pub struct ConnectionGuard {
+    coordinator: Arc<PersistCoordinator>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock();
+        debug_assert!(
+            state.connections > 0,
+            "connection guard must hold an active connection slot"
+        );
+        state.connections -= 1;
+        state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
+        self.coordinator.changed.notify_waiters();
     }
 }
 
@@ -2152,6 +2256,135 @@ mod tests {
         .await
         .expect("multiple close callers drain together");
         assert!(coordinator.begin_analyze().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_shutdown_claims_after_an_uninterrupted_idle_interval() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .wait_for_idle_shutdown(Duration::from_secs(5))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(waiter.await.unwrap());
+        assert!(coordinator.begin_connection().is_err());
+        assert!(coordinator.begin_analyze().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_shutdown_waits_for_an_attached_connection() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let connection = coordinator.begin_connection().unwrap();
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .wait_for_idle_shutdown(Duration::from_secs(5))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "attached client holds the daemon open"
+        );
+        drop(connection);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_shutdown_waits_for_an_admitted_analyze() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let analyze = coordinator.begin_analyze().unwrap();
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .wait_for_idle_shutdown(Duration::from_secs(5))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "active analyze holds the daemon open"
+        );
+        drop(analyze);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_shutdown_restarts_the_full_interval_after_activity_returns_to_zero() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .wait_for_idle_shutdown(Duration::from_secs(10))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        let connection = coordinator.begin_connection().unwrap();
+        drop(connection);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a return to zero must not resume the previous interval"
+        );
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_idle_timeout_never_claims_shutdown() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.wait_for_idle_shutdown(Duration::ZERO).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        assert!(!waiter.is_finished(), "zero is the never-exit sentinel");
+        waiter.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_wins_the_idle_expiry_race_when_it_acquires_the_mutex_first() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .wait_for_idle_shutdown(Duration::from_secs(5))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        // Advancing makes the sleep ready, but this task has not yielded, so
+        // the admission takes the shared mutex before the expiry branch can
+        // claim shutdown.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let connection = coordinator.begin_connection().unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "accepted attach prevents idle claim");
+        drop(connection);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(waiter.await.unwrap());
     }
 
     /// `tools/list` must surface exactly 22 tools. If a future change adds

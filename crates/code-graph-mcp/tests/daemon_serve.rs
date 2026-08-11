@@ -27,6 +27,14 @@ struct DaemonChild {
 
 impl DaemonChild {
     fn spawn(root: &std::path::Path, capture_stderr: bool) -> Self {
+        Self::spawn_with_env(root, capture_stderr, &[])
+    }
+
+    fn spawn_with_env(
+        root: &std::path::Path,
+        capture_stderr: bool,
+        environment: &[(String, String)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_code-graph-mcp"));
         command
             .arg("--serve")
@@ -38,6 +46,7 @@ impl DaemonChild {
             } else {
                 Stdio::null()
             });
+        command.envs(environment.iter().map(|(key, value)| (key, value)));
         let mut child = command.spawn().expect("spawn daemon contender");
         let stderr = child.stderr.take();
         Self { child, stderr }
@@ -93,6 +102,16 @@ impl TestRoot {
         ));
         fs::create_dir_all(&root).expect("create test project root");
         Self(root)
+    }
+
+    fn with_idle_timeout(iteration: usize, seconds: u64) -> Self {
+        let root = Self::new(iteration);
+        fs::write(
+            root.0.join(".code-graph.toml"),
+            format!("[daemon]\nidle_timeout_secs = {seconds}\n"),
+        )
+        .expect("write daemon test config");
+        root
     }
 }
 
@@ -156,6 +175,17 @@ fn wait_for_cleanup(root: &std::path::Path) {
     );
 }
 
+fn assert_alive(daemon: &mut DaemonChild, detail: &str) {
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("poll daemon child")
+            .is_none(),
+        "{detail}"
+    );
+}
+
 fn mcp_round_trip<W: Write, R: Read>(mut writer: W, reader: R) {
     writeln!(
         writer,
@@ -209,6 +239,61 @@ fn uds_mcp(endpoint: &str) {
     let stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
     stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
     mcp_round_trip(stream.try_clone().unwrap(), stream);
+}
+
+fn uds_analyze(endpoint: &str, root: &std::path::Path, asynchronous: bool, force: bool) -> Value {
+    let stream = UnixStream::connect(endpoint).expect("connect UDS for analyze");
+    stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    writeln!(
+        writer,
+        "{}",
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "daemon-idle-test", "version": "1"}}
+        })
+    )
+    .unwrap();
+    writer.flush().unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
+    writeln!(
+        writer,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    writeln!(
+        writer,
+        "{}",
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": if asynchronous { "analyze_codebase_async" } else { "analyze_codebase" },
+                       "arguments": {"path": root, "force": force}}
+        })
+    )
+    .unwrap();
+    writer.flush().unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 2);
+    response
+}
+
+fn wait_for_path(path: &std::path::Path) {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was not created",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn tcp_mcp(endpoint: &str, token: &str) {
@@ -392,4 +477,122 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
         first_stderr.contains("UDS unavailable") && second_stderr.contains("UDS unavailable"),
         "TCP fallback is reported"
     );
+}
+
+#[test]
+fn idle_daemon_exits_at_zero_clients_and_zero_never_exits() {
+    let one_second = TestRoot::with_idle_timeout(3, 1);
+    let mut daemon = DaemonChild::spawn(&one_second.0, false);
+    wait_for_metadata(&one_second.0);
+    daemon.wait();
+    wait_for_cleanup(&one_second.0);
+
+    let never = TestRoot::with_idle_timeout(4, 0);
+    let mut daemon = DaemonChild::spawn(&never.0, false);
+    let metadata = wait_for_metadata(&never.0);
+    thread::sleep(Duration::from_millis(1_300));
+    assert_alive(
+        &mut daemon,
+        "zero idle timeout must not exit during observation",
+    );
+    stop_owned_daemon(&metadata);
+    daemon.wait();
+    wait_for_cleanup(&never.0);
+}
+
+#[test]
+fn attached_client_and_disconnect_restart_the_full_idle_timeout() {
+    let root = TestRoot::with_idle_timeout(5, 2);
+    let mut daemon = DaemonChild::spawn(&root.0, false);
+    let metadata = wait_for_metadata(&root.0);
+    // Attach promptly, hold beyond the timeout, then verify disconnect starts
+    // a fresh interval rather than resuming an elapsed zero-client countdown.
+    let stream = UnixStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(2_300));
+    assert_alive(&mut daemon, "attached client must prevent idle exit");
+    drop(stream);
+    thread::sleep(Duration::from_millis(500));
+    assert_alive(&mut daemon, "disconnect must restart a full idle timeout");
+    daemon.wait();
+    wait_for_cleanup(&root.0);
+}
+
+#[test]
+fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
+    let root = TestRoot::with_idle_timeout(6, 1);
+    fs::write(root.0.join("main.rs"), "fn benchmark_idle() {}\n").unwrap();
+    let marker = root.0.join("persist.marker");
+    let environment = [
+        (
+            "CODE_GRAPH_TEST_PERSIST_DELAY_ROOT".to_owned(),
+            root.0.to_string_lossy().into_owned(),
+        ),
+        (
+            "CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS".to_owned(),
+            "1600".to_owned(),
+        ),
+        (
+            "CODE_GRAPH_TEST_PERSIST_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ),
+    ];
+    let mut daemon = DaemonChild::spawn_with_env(&root.0, true, &environment);
+    let metadata = wait_for_metadata(&root.0);
+    let response = uds_analyze(metadata["endpoint"].as_str().unwrap(), &root.0, true, true);
+    assert_eq!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .unwrap()["status"],
+        "running"
+    );
+    wait_for_path(&marker);
+    // The debug marker is written only after g.save returns. The daemon must
+    // remain alive for a fresh sub-timeout interval from this terminal point.
+    thread::sleep(Duration::from_millis(400));
+    assert_alive(
+        &mut daemon,
+        "idle timer must start after terminal analyze persistence completes",
+    );
+    daemon.wait();
+    wait_for_cleanup(&root.0);
+    let cache = root.0.join(".code-graph-cache.db");
+    let first_cache = fs::read(&cache).expect("idle exit persisted cache");
+
+    let mut warm = DaemonChild::spawn(&root.0, true);
+    let warm_metadata = wait_for_metadata(&root.0);
+    let response = uds_analyze(
+        warm_metadata["endpoint"].as_str().unwrap(),
+        &root.0,
+        false,
+        false,
+    );
+    assert!(response["result"].is_object(), "warm analyze succeeds");
+    warm.wait();
+    wait_for_cleanup(&root.0);
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        first_cache,
+        "a loadable unchanged cache takes the no-save fast path"
+    );
+    let stderr = warm.stderr_text();
+    assert!(
+        !stderr.contains("phase: discovering + parsing under"),
+        "warm --serve analyze must not parse unchanged source: {stderr}"
+    );
+}
+
+#[test]
+fn unauthenticated_tcp_socket_does_not_hold_idle_daemon_alive() {
+    let root = TestRoot::with_idle_timeout(7, 1);
+    let runtime = root.0.join(".code-graph");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(runtime.join("daemon.sock"), b"force TCP fallback").unwrap();
+    let mut daemon = DaemonChild::spawn(&root.0, false);
+    let metadata = wait_for_metadata(&root.0);
+    assert_eq!(metadata["transport"], "tcp");
+    let _unauthenticated = TcpStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(1_300));
+    daemon.wait();
+    wait_for_cleanup(&root.0);
 }

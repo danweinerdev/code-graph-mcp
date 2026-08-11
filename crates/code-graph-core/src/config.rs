@@ -147,8 +147,9 @@ pub struct DaemonConfig {
     /// Whether the repository-local daemon is enabled. Defaults to `true`.
     #[serde(default = "default_daemon_enabled")]
     pub enabled: bool,
-    /// Reserved idle-lifecycle interval. Defaults to `1800`; task 3.5 will
-    /// apply it and interpret `0` as the never-exit sentinel.
+    /// Automatic idle-exit interval. Defaults to `1800`; `0` is the
+    /// never-exit sentinel. The daemon starts this full interval only while
+    /// no connection is attached and no analyze pipeline is active.
     #[serde(default = "default_daemon_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 }

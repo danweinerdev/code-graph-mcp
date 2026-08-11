@@ -33,7 +33,7 @@ tasks:
     depends_on: ["3.3"]
   - id: "3.5"
     title: "Idle timeout and warm-attach measurement"
-    status: planned
+    status: in-progress
     justifies: "FR-10, FR-11, NFR-09, AC-06, AC-07, AC-25, AC-26, AC-42. An always-resident daemon per repository is a resource leak users will notice; the measurement is what turns NFR-09's claimed benefit into a verified one rather than an assumption."
     verification: "Integration tests with a short timeout — exits with no clients, does not exit with a client attached, does not exit with an analyze in flight and no clients (AC-06); the timer restarts from zero rather than resuming after an analyze terminates; the cache reflects the last index after idle exit and the next start loads rather than re-indexes (AC-07); the endpoint is unreachable from another machine and unusable by another local user (AC-25); warm-attach time-to-first-query measured on external/ripgrep and external/abseil-cpp shows no corpus-size scaling while cold start does, all four numbers recorded in notes/ (AC-26); Linux, macOS, and Windows each exercised, including the POSIX-only stale-inode path (AC-42)."
     depends_on: ["3.4"]

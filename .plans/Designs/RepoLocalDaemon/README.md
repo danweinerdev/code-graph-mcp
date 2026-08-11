@@ -142,7 +142,7 @@ sequenceDiagram
 ```toml
 [daemon]
 enabled = true           # false => always in-process
-idle_timeout_secs = 1800 # task 3.5: 0 = never exit; parsed but not applied before then
+idle_timeout_secs = 1800 # automatic idle exit after 1800 seconds; 0 = never exit
 ```
 
 ## Design Decisions
@@ -215,7 +215,7 @@ Two details that follow: after acknowledgement, the daemon closes new analyze/wa
 
 **Context:** FR-10, FR-11.
 
-**Decision (implemented in task 3.5):** `[daemon].idle_timeout_secs`, default 1800, `0` meaning never. Before task 3.5 the field parses but no idle timer consumes it. Once implemented, the timer runs only when attached connections are zero **and** no analyze job is in flight. A new attachment cancels it. When an analyze reaches a terminal state with no connections attached, the timer starts again **from zero**, not from where it paused. Before exiting, the daemon persists the cache, removes `daemon.json` and the lock, and closes the listener.
+**Decision (implemented in task 3.5):** `[daemon].idle_timeout_secs`, default 1800, `0` meaning never. The timer runs only when attached connections are zero **and** no analyze job is in flight. A new attachment or analyze transition restarts the full interval. When an analyze reaches a terminal state with no connections attached, the timer starts again **from zero**, not from where it paused. On expiry it atomically closes new connection/analyze admission before closing the listener; graceful shutdown then persists the cache and removes `daemon.json` and the lock.
 
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 

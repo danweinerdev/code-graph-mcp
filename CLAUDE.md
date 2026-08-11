@@ -174,7 +174,7 @@ max_threads = 0           # 0 = num_cpus; indexer caps discovery+parse sum at nu
 
 [daemon]
 enabled = true            # default: attach to/start one repository-local daemon.
-idle_timeout_secs = 1800  # reserved for task 3.5; current daemons do not idle-exit.
+idle_timeout_secs = 1800  # exits after this idle interval; 0 = never exit automatically.
 
 [response]
 max_bytes = 102400        # byte cap on paginated MCP responses; mid-page truncation
@@ -244,8 +244,10 @@ java = []
 `[daemon]` controls exactly one repository-local daemon per project root, with
 all runtime state inside that repository. It is enabled by default; set
 `enabled = false` (or pass `--no-daemon`) for direct in-process serving.
-`idle_timeout_secs` is reserved for task 3.5 and is not applied by the current
-daemon lifecycle.
+`idle_timeout_secs` starts only when no client is attached and no analyze is
+active; every connection/analyze transition restarts the full interval. `0`
+disables automatic idle exit. Idle shutdown closes admission, saves the active
+cache, and removes its repository-local runtime files before exit.
 
 `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (TOML NOT re-read per query).
 
