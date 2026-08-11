@@ -61,6 +61,12 @@ tasks:
     justifies: "NFR-04, AC-27. The final post-lock review reproduced metadata readiness timeouts and owner churn only when Cargo ran process-heavy daemon tests concurrently; isolated and `--test-threads=1` reruns passed, so the standard `make verify` gate is nondeterministic."
     verification: "Add dependency-free per-test-binary serialization guards to the Linux `daemon_proxy` and `daemon_serve` process suites so their multi-process timing scenarios do not compete with sibling scenarios under Cargo's default runner. `cargo test -p code-graph-mcp --test daemon_proxy` and `--test daemon_serve` each pass repeatedly without `--test-threads=1`; full package tests and two consecutive `make verify` runs pass."
     depends_on: ["3.8"]
+  - id: "3.10"
+    title: "Close final persistence and lock-handoff findings"
+    status: complete
+    justifies: "NFR-06, AC-07, AC-08. The definitive review found unlock-before-unlink can remove a successor's active lock, final cache save can follow a repository-planted temp symlink/hardlink, and the delayed-persist replacement test waits for completion rather than proving drain during persistence."
+    verification: "On Linux, owned lock cleanup unlinks the pathname while the exclusive lock is still held and a deterministic handoff regression prevents a successor lock from being removed. `Graph::save` removes a pre-existing non-directory temp entry itself and then opens the temp path with create-new semantics, so symlink/hardlink sentinels remain byte-identical; non-regular directory entries fail safely. Debug persistence instrumentation exposes a distinct admitted/before-delay marker while preserving the existing completion marker, and the replacement test starts replacement after admission but before save completion. Run focused graph/daemon tests, full package/workspace gates, and `make verify` twice."
+    depends_on: ["3.9"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -432,6 +438,41 @@ Revision boundary: default `cargo test` and `make verify` no longer depend on ho
 |---|---|---|---|
 | `git show 18dfd7cd4dc98d278eeef68edb53ce011fbcf1da` | Complete task commit | PASS | Only the two Linux process integration binaries changed; all 21 process tests acquire a full-scope per-binary mutex guard, with poison recovery and no production timeout/behavior edits. |
 | Focused final quality review | Exact task commit | PASS | Every process scenario is serialized as its first statement; unit tests remain parallel and no dependency was added. |
+
+## 3.10: Close final persistence and lock-handoff findings
+
+### Subtasks
+- [x] Remove owned Linux lock pathname before releasing its exclusive lock
+- [x] Harden cache temp creation against planted symlink/hardlink/nonregular entries and concurrent ordinary saves
+- [x] Split persistence admission and completion test markers
+- [x] Make replacement start during the admitted delayed save and add focused regressions
+
+### Notes
+Revision boundary: daemon shutdown handoff keeps one authoritative lock, final cache persistence cannot redirect writes outside the project cache path, and the replacement drain test observes the intended in-flight interval.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `6d1bbc71230fcc32d77cb9050af7da03eedf906f`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T07:03:22Z, matching `6d1bbc71230fcc32d77cb9050af7da03eedf906f`
+- Focused review: `git show 6d1bbc71230fcc32d77cb9050af7da03eedf906f`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `6d1bbc71230fcc32d77cb9050af7da03eedf906f`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-graph persist::` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 24 persistence tests passed: legacy temp recovery, symlink/hardlink sentinel preservation, directory refusal, candidate collision retry, concurrent unique-temp saves, atomic loadability, and no temp leaks. |
+| `cargo test -p code-graph-mcp --test daemon_proxy replacement_waits_for_delayed_persist_before_runtime_cleanup -- --exact` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Replacement starts after persistence admission while completion is absent, waits through the delay/save, then observes a current loadable cache and completion marker. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 34 daemon unit, 13 proxy process, 8 serve process, and 1 smoke test passed under the default runner. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.10.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 6d1bbc71230fcc32d77cb9050af7da03eedf906f` | Complete task commit | PASS | One persistence/handoff slice: Unix unlink-before-unlock, unique create-new cache temps with cleanup/collision handling, updated mmap safety rationale, and true in-flight replacement instrumentation. |
+| Focused final quality review | Exact task commit plus callers/tests | PASS | Lock handoff, concurrent cache saves, planted legacy temp entries, mmap stability, and marker sequencing align under the accepted threat boundary. |
 
 ## Acceptance Criteria
 
