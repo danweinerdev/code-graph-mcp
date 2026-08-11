@@ -39,6 +39,9 @@ const MAX_LOCK_RECORD_BYTES: usize = 4 * 1024;
 const MAX_SHUTDOWN_RECORD_BYTES: usize = 4 * 1024;
 const MAX_SECRET_RECORD_BYTES: usize = 65;
 const AUTH_PREFIX: &[u8] = b"CG-AUTH ";
+/// Fixed transport prelude used for TCP authentication and UDS admission.
+/// It is consumed before either transport starts its newline-delimited MCP
+/// session, so it cannot be mistaken for a JSON-RPC message.
 const AUTH_ACK: &[u8] = b"CG-OK\n";
 const AUTH_LINE_LEN: usize = 73;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -870,14 +873,16 @@ async fn connect_to_metadata(
 ) -> anyhow::Result<ConnectedDaemon> {
     let stream = match metadata.transport {
         #[cfg(unix)]
-        Transport::Uds => ClientStream::Uds(
-            timeout(
+        Transport::Uds => {
+            let mut stream = timeout(
                 connect_timeout,
                 tokio::net::UnixStream::connect(paths.uds_bind_path()?),
             )
             .await
-            .context("connect daemon UDS timed out")??,
-        ),
+            .context("connect daemon UDS timed out")??;
+            read_acknowledgement(&mut stream, connect_timeout, "UDS admission").await?;
+            ClientStream::Uds(stream)
+        }
         #[cfg(windows)]
         Transport::Pipe => ClientStream::Pipe(
             tokio::net::windows::named_pipe::ClientOptions::new()
@@ -900,14 +905,7 @@ async fn connect_to_metadata(
                 .flush()
                 .await
                 .context("flush daemon TCP authentication")?;
-            let mut acknowledgement = [0_u8; AUTH_ACK.len()];
-            timeout(connect_timeout, stream.read_exact(&mut acknowledgement))
-                .await
-                .context("read daemon TCP authentication acknowledgement timed out")?
-                .context("read daemon TCP authentication acknowledgement")?;
-            if acknowledgement != AUTH_ACK {
-                bail!("invalid daemon TCP authentication acknowledgement")
-            }
+            read_acknowledgement(&mut stream, connect_timeout, "TCP authentication").await?;
             ClientStream::Tcp(stream)
         }
         #[cfg(not(unix))]
@@ -2014,16 +2012,27 @@ where
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        continue;
+                    };
                     let Ok(connection) = server.inner.persist.begin_connection() else {
                         // The idle timer may have claimed shutdown after this
                         // accept completed. Reject this racing stream rather
                         // than reviving the daemon after listener closure.
                         continue;
                     };
-                    if let Ok(permit) = permits.clone().try_acquire_owned() {
-                        spawn_service(server.clone(), stream, permit, connection);
-                    }
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        // A connected UDS peer is not attached until both
+                        // guards above are held and this prelude is delivered.
+                        // A saturated or shutdown-racing peer sees EOF here,
+                        // which lets its proxy retry or fall back instead of
+                        // byte-pumping a dead MCP stream.
+                        if write_acknowledgement(&mut stream).await.is_ok() {
+                            serve_service(server, stream, permit, connection).await;
+                        }
+                    });
                 }
                 Err(error) => eprintln!("code-graph-mcp: accept daemon UDS connection: {error}"),
             }
@@ -2060,7 +2069,7 @@ async fn serve_tcp<F>(
                             if let Ok(connection) = server.inner.persist.begin_connection() {
                                 // Admission atomically loses to an idle claim.
                                 // A peer that loses must not receive CG-OK.
-                                if acknowledge_tcp(&mut stream).await.is_ok() {
+                                if write_acknowledgement(&mut stream).await.is_ok() {
                                     serve_service(server, stream, permit, connection).await;
                                 }
                             }
@@ -2124,6 +2133,7 @@ async fn serve_pipe<F>(
     }
 }
 
+#[cfg(windows)]
 fn spawn_service<S>(
     server: CodeGraphServer,
     stream: S,
@@ -2161,7 +2171,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     validate_tcp_auth(stream, secret).await?;
-    acknowledge_tcp(stream).await
+    write_acknowledgement(stream).await
 }
 
 async fn validate_tcp_auth<S>(stream: &mut S, secret: &str) -> anyhow::Result<()>
@@ -2181,7 +2191,29 @@ where
     Ok(())
 }
 
-async fn acknowledge_tcp<S>(stream: &mut S) -> anyhow::Result<()>
+async fn read_acknowledgement<S>(
+    stream: &mut S,
+    acknowledgement_timeout: Duration,
+    transport: &str,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut acknowledgement = [0_u8; AUTH_ACK.len()];
+    timeout(
+        acknowledgement_timeout,
+        stream.read_exact(&mut acknowledgement),
+    )
+    .await
+    .with_context(|| format!("read daemon {transport} acknowledgement timed out"))?
+    .with_context(|| format!("read daemon {transport} acknowledgement"))?;
+    if acknowledgement != AUTH_ACK {
+        bail!("invalid daemon {transport} acknowledgement")
+    }
+    Ok(())
+}
+
+async fn write_acknowledgement<S>(stream: &mut S) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -2546,11 +2578,18 @@ mod tests {
             .uds_bind_path()
             .unwrap()
             .starts_with(format!("/proc/{}/fd/", std::process::id())));
+        let Listener::Uds(listener) = listener else {
+            panic!("test UDS binding selected TCP fallback");
+        };
+        let acknowledgement = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            write_acknowledgement(&mut stream).await.unwrap();
+        });
         let connection = connect_to_metadata(&paths, &metadata, Duration::from_secs(1))
             .await
             .unwrap();
         assert!(matches!(connection.stream, ClientStream::Uds(_)));
-        drop(listener);
+        acknowledgement.await.unwrap();
         drop(secret);
         let _ = paths.remove_child(SOCKET_FILE);
         lock.remove_if_owned();

@@ -12,7 +12,7 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -104,13 +104,23 @@ struct TestRoot(PathBuf);
 
 impl TestRoot {
     fn new(iteration: usize) -> Self {
-        let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "code-graph-mcp-daemon-serve-{}-{iteration}-{sequence}",
-            std::process::id(),
-        ));
-        fs::create_dir_all(&root).expect("create test project root");
-        Self(root)
+        for _ in 0..1_000 {
+            let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "code-graph-mcp-daemon-serve-{}-{iteration}-{nonce}-{sequence}",
+                std::process::id(),
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return Self(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create fresh test project root: {error}"),
+            }
+        }
+        panic!("could not allocate a fresh daemon serve test root")
     }
 
     fn with_idle_timeout(iteration: usize, seconds: u64) -> Self {
@@ -244,15 +254,24 @@ fn mcp_round_trip<W: Write, R: Read>(mut writer: W, reader: R) {
     assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
 }
 
-fn uds_mcp(endpoint: &str) {
-    let stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
+fn uds_connect(endpoint: &str) -> UnixStream {
+    let mut stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
     stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+    let mut acknowledgement = [0_u8; 6];
+    stream
+        .read_exact(&mut acknowledgement)
+        .expect("read UDS admission acknowledgement");
+    assert_eq!(&acknowledgement, b"CG-OK\n");
+    stream
+}
+
+fn uds_mcp(endpoint: &str) {
+    let stream = uds_connect(endpoint);
     mcp_round_trip(stream.try_clone().unwrap(), stream);
 }
 
 fn uds_analyze(endpoint: &str, root: &std::path::Path, asynchronous: bool, force: bool) -> Value {
-    let stream = UnixStream::connect(endpoint).expect("connect UDS for analyze");
-    stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+    let stream = uds_connect(endpoint);
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     writeln!(
@@ -522,7 +541,7 @@ fn attached_client_and_disconnect_restart_the_full_idle_timeout() {
     let metadata = wait_for_metadata(&root.0);
     // Attach promptly, hold beyond the timeout, then verify disconnect starts
     // a fresh interval rather than resuming an elapsed zero-client countdown.
-    let stream = UnixStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
+    let stream = uds_connect(metadata["endpoint"].as_str().unwrap());
     thread::sleep(Duration::from_millis(2_300));
     assert_alive(&mut daemon, "attached client must prevent idle exit");
     drop(stream);

@@ -4,13 +4,15 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(debug_assertions)]
 use code_graph_graph::Graph;
@@ -31,12 +33,24 @@ struct TestRoot(PathBuf, Arc<Mutex<Option<u32>>>);
 
 impl TestRoot {
     fn new(enabled: bool) -> Self {
-        let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "code-graph-mcp-daemon-proxy-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("create test root");
+        let root = (0..1_000)
+            .find_map(|_| {
+                let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock after Unix epoch")
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "code-graph-mcp-daemon-proxy-{}-{nonce}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&root) {
+                    Ok(()) => Some(root),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => panic!("create fresh test root: {error}"),
+                }
+            })
+            .expect("could not allocate a fresh daemon proxy test root");
         if enabled {
             fs::write(root.join(".code-graph.toml"), "[daemon]\nenabled = true\n")
                 .expect("write enabled daemon config");
@@ -308,6 +322,23 @@ fn wait_runtime_cleanup(root: &Path) {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(!lock.exists(), "daemon lock was cleaned up");
+}
+
+#[cfg(target_os = "linux")]
+fn admitted_uds_connection(endpoint: &str) -> UnixStream {
+    let mut stream = UnixStream::connect(endpoint).expect("connect UDS saturation holder");
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .expect("set UDS saturation holder timeout");
+    let mut acknowledgement = [0_u8; 6];
+    stream
+        .read_exact(&mut acknowledgement)
+        .expect("read UDS admission acknowledgement");
+    assert_eq!(
+        &acknowledgement, b"CG-OK\n",
+        "holder is admitted before occupying a daemon connection permit"
+    );
+    stream
 }
 
 fn child_pids(parent: u32) -> Vec<u32> {
@@ -760,6 +791,50 @@ fn established_daemon_death_ends_proxy_while_stdin_remains_open() {
     );
     root.disarm_daemon();
     let _ = fs::remove_file(root.0.join(".code-graph/daemon.json"));
+}
+
+/// The UDS accept queue can accept one more transport connection than the
+/// daemon's 128-service limit. The admission prelude must make that peer a
+/// failed proxy attach rather than a byte pump connected to no MCP service.
+#[cfg(target_os = "linux")]
+#[test]
+fn saturated_uds_attachment_falls_back_instead_of_reporting_a_dead_connection() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+
+    // Start through the same public proxy route, then close that bootstrap
+    // client before filling every daemon permit with acknowledged raw clients.
+    let bootstrap = Client::spawn(&root.0, &[]);
+    let metadata = wait_metadata(&root);
+    bootstrap.close();
+    let endpoint = metadata["endpoint"].as_str().expect("UDS endpoint");
+    let holders: Vec<_> = (0..128)
+        .map(|_| admitted_uds_connection(endpoint))
+        .collect();
+
+    // This is the 129th peer. A successful MCP initialize proves that the
+    // normal proxy retried the failed admission and fell back in-process; it
+    // cannot have treated the immediately dropped UDS connection as attached.
+    let mut client = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        client.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22,
+        "the saturated proxy still has MCP service through fallback"
+    );
+    let stderr = client.close();
+    assert!(
+        stderr.contains("daemon unavailable")
+            && stderr.contains("falling back to in-process stdio"),
+        "the 129th UDS client must fail attachment and use fallback: {stderr}"
+    );
+
+    drop(holders);
+    stop_daemon(&metadata);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
 }
 
 #[test]
