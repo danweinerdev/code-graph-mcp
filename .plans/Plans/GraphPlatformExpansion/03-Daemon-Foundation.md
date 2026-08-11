@@ -181,6 +181,7 @@ Re-probing lock staleness on each backoff attempt matters: if the winner dies af
 |---|---|---|---|
 | `git show 5bae8b697f8e93c0b65d2f01afc79bbfafc6d92b` | Complete task commit | PASS | One default-off proxy slice: root discovery, attach/spawn/backoff, UDS/pipe/TCP clients, authenticated TCP acknowledgement, byte pumping, `--no-daemon`, bounded safe fallback, shared-state process coverage, and the agent-facing watch description. Binary replacement and the default-on flip remain absent for task 3.4. |
 | Four-lane iterative review plus final focused quality/spec confirmation | Complete task diff | PASS | Initial findings around daemon EOF hangs, slow-start kill races, unacknowledged TCP auth, contender/zombie leaks, fallback timing, snapshot drift, weak concurrency, and default-path regressions were fixed. Final actionable quality findings were closed before the full gate. |
+| `sdd_validate.py --format json --scope Plans/GraphPlatformExpansion --identity-mode current` plus governing-path diagnostic filter | GraphPlatformExpansion related graph; task 3.3 phase/plan, governing spec, and daemon design | PASS | The validator parsed 60 related artifacts; the scoped governing set reported 0 diagnostics. The repository-wide related graph still reports unrelated legacy-format diagnostics outside the current initiative boundary, consistent with the recorded scoped-validation policy. |
 
 ## 3.4: Flip the default on, with binary-identity replacement
 
