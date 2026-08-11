@@ -120,6 +120,14 @@ pub(crate) async fn run_analyze_job(
     let path_raw = job.path.clone();
     let force = job.force;
 
+    // A bound Linux daemon keeps logical paths for all index work, but must
+    // reject the operation before its first filesystem lookup if that logical
+    // root has been substituted since startup.
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        finish_failed(&job, error);
+        return;
+    }
+
     let abs_path = match paths::canonicalize(std::path::Path::new(&path_raw)) {
         Ok(p) => p,
         Err(_) => {
@@ -185,7 +193,13 @@ pub(crate) async fn run_analyze_job(
 
     // Serialize against the watch reindex path; the slot already gates
     // analyze-vs-analyze, so this lock has no analyze contention.
+    #[cfg(debug_assertions)]
+    debug_write_before_index_lock_marker(&abs_path);
     let _guard = inner.index_lock.lock().await;
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        finish_failed(&job, error);
+        return;
+    }
 
     // Stamp an initial phase immediately so polling clients see a
     // phase signal from the very first `get_status` call after
@@ -295,6 +309,10 @@ pub(crate) async fn run_analyze_job(
                     probe.set_last_sweep_at(now_nanos);
                 }
                 let stats = probe.stats();
+                if let Err(error) = inner.ensure_daemon_root_current() {
+                    finish_failed(&job, error);
+                    return;
+                }
                 {
                     let mut g = inner.graph.write();
                     *g = probe;
@@ -536,6 +554,8 @@ pub(crate) async fn run_analyze_job(
                     "no supported source files found in {}",
                     abs_path.display()
                 ))
+            } else if let Err(error) = inner.ensure_daemon_root_current() {
+                Err(error)
             } else {
                 let stats = {
                     let mut g = inner.graph.write();
@@ -824,8 +844,21 @@ pub(crate) fn save_cache(inner: &ServerInner, dir: &std::path::Path) -> Result<(
     debug_write_persist_admitted_marker();
     #[cfg(debug_assertions)]
     debug_delay_persist(dir);
+    let io_dir = inner.cache_io_root.read().clone();
+    // A daemon without the retained procfd capability must not perform a
+    // pathname-based save: validating the pathname and opening the cache are
+    // separate operations, so root replacement could redirect the latter.
+    // Direct servers are unbound and retain their existing logical-path save.
+    #[cfg(target_os = "linux")]
+    if io_dir.is_none() && inner.daemon_project_root.get().is_some() {
+        return Err(
+            "retained-root cache I/O is unavailable; refusing an unanchored daemon cache save"
+                .to_string(),
+        );
+    }
+    let io_dir = io_dir.unwrap_or_else(|| dir.to_path_buf());
     let g = inner.graph.read();
-    let result = g.save(dir).map_err(|error| error.to_string());
+    let result = g.save(&io_dir).map_err(|error| error.to_string());
     #[cfg(debug_assertions)]
     if result.is_ok() {
         debug_write_persist_completion_marker();
@@ -859,5 +892,256 @@ fn debug_write_persist_admitted_marker() {
 fn debug_write_persist_completion_marker() {
     if let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_MARKER") {
         let _ = std::fs::write(marker, b"persist complete\n");
+    }
+}
+
+/// Test-only synchronization point after config/root discovery but before an
+/// analyze worker waits for `index_lock`. The root match keeps concurrent
+/// test roots isolated; production release builds omit the marker entirely.
+#[cfg(debug_assertions)]
+fn debug_write_before_index_lock_marker(path: &std::path::Path) {
+    let Ok(root) = std::env::var("CODE_GRAPH_TEST_ANALYZE_BEFORE_LOCK_ROOT") else {
+        return;
+    };
+    let Ok(marker) = std::env::var("CODE_GRAPH_TEST_ANALYZE_BEFORE_LOCK_MARKER") else {
+        return;
+    };
+    if std::path::Path::new(&root) == path {
+        let _ = std::fs::write(marker, b"analyze reached index-lock wait\n");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    #[test]
+    fn save_cache_uses_retained_root_io_after_visible_root_replacement() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-cache-io-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        let io_root = std::path::PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            retained_root.as_raw_fd()
+        ));
+        let server = crate::server::CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        *server.inner.cache_io_root.write() = Some(io_root);
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        save_cache(&server.inner, &root).unwrap();
+
+        assert!(
+            !code_graph_graph::cache_path(&root).exists(),
+            "save never follows the replacement root path"
+        );
+        let mut loaded = Graph::new();
+        assert!(
+            loaded.load(&relocated).unwrap(),
+            "cache written through retained I/O root is loadable at the original inode"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[test]
+    fn save_cache_without_alias_refuses_a_replaced_daemon_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-cache-no-alias-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let server = crate::server::CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = save_cache(&server.inner, &root).unwrap_err();
+        assert!(error.contains("retained-root cache I/O is unavailable"));
+        assert!(
+            !code_graph_graph::cache_path(&root).exists(),
+            "an alias-less daemon must not save through a replacement pathname"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replaced_daemon_root_is_rejected_before_analysis_filesystem_work() {
+        use code_graph_lang_cpp::CppParser;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-analyze-replaced-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("old.cpp"), b"void retained() {}\n").unwrap();
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().unwrap()))
+            .unwrap();
+        let server = crate::server::CodeGraphServer::new(registry);
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement.cpp"), b"void replacement() {}\n").unwrap();
+
+        let result = analyze_codebase(
+            Arc::clone(&server.inner),
+            root.to_string_lossy().into_owned(),
+            true,
+            Arc::new(NoopProgressSink),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ToolError(message)) if message.contains("project root was replaced")),
+            "replacement namespace must fail before indexing"
+        );
+        assert_eq!(server.inner.graph.read().stats().files, 0);
+        assert!(
+            !code_graph_graph::cache_path(&relocated).exists(),
+            "replacement symbols must not be persisted into the retained root"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_analyze_waiting_for_index_lock_cannot_publish_replacement_root_data() {
+        use code_graph_lang_cpp::CppParser;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-analyze-lock-replaced-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let old_source = root.join("old.cpp");
+        std::fs::write(&old_source, b"void retained() {}\n").unwrap();
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().unwrap()))
+            .unwrap();
+        let server = crate::server::CodeGraphServer::new(registry);
+        analyze_codebase(
+            Arc::clone(&server.inner),
+            root.to_string_lossy().into_owned(),
+            true,
+            Arc::new(NoopProgressSink),
+        )
+        .await
+        .unwrap();
+        let before = server.inner.graph.read().stats();
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let marker = root.join("before-index-lock.marker");
+        let _root_env = EnvVarGuard::set("CODE_GRAPH_TEST_ANALYZE_BEFORE_LOCK_ROOT", &root);
+        let _marker_env = EnvVarGuard::set("CODE_GRAPH_TEST_ANALYZE_BEFORE_LOCK_MARKER", &marker);
+        let held_lock = server.inner.index_lock.lock().await;
+        let inner = Arc::clone(&server.inner);
+        let path = root.to_string_lossy().into_owned();
+        let analyze = tokio::spawn(async move {
+            analyze_codebase(inner, path, true, Arc::new(NoopProgressSink)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("analyze must finish config/root work before waiting on index_lock");
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let replacement = root.join("replacement.cpp");
+        std::fs::write(&replacement, b"void replacement() {}\n").unwrap();
+        drop(held_lock);
+
+        let result = analyze.await.unwrap();
+        assert!(
+            matches!(&result, Err(ToolError(message)) if message.contains("project root was replaced")),
+            "the post-lock root check must fail the already-admitted job"
+        );
+        let after = server.inner.graph.read().stats();
+        assert_eq!(after.files, before.files);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
+        assert!(server
+            .inner
+            .graph
+            .read()
+            .file_symbols(&replacement)
+            .is_empty());
+        let mut retained_cache = Graph::new();
+        assert!(retained_cache.load(&relocated).unwrap());
+        assert!(retained_cache.file_symbols(&replacement).is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
     }
 }

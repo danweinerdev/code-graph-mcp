@@ -38,6 +38,10 @@ const SHUTDOWN_ACK_FILE: &str = "shutdown.ack";
 const SHUTDOWN_CONTROL_LOCK_FILE: &str = "shutdown.control.lock";
 #[cfg(target_os = "linux")]
 const OWNER_RECORD_TEMP_PREFIX: &str = ".daemon-owner-record-";
+#[cfg(target_os = "linux")]
+const METADATA_TEMP_PREFIX: &str = ".daemon-";
+#[cfg(target_os = "linux")]
+const METADATA_TEMP_SUFFIX: &str = ".tmp";
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_LOCK_RECORD_BYTES: usize = 4 * 1024;
 const MAX_SHUTDOWN_RECORD_BYTES: usize = 4 * 1024;
@@ -65,6 +69,11 @@ const REPLACEMENT_KILL_WAIT: Duration = Duration::from_millis(500);
 /// window for admitted indexing and cache persistence before escalation.
 const REPLACEMENT_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const SHUTDOWN_REQUEST_POLL: Duration = Duration::from_millis(50);
+/// Ownership paths are only advisory while the root-inode lock is held, but a
+/// short poll bounds the time an old daemon can keep serving after its visible
+/// namespace has been replaced.
+#[cfg(target_os = "linux")]
+const OWNERSHIP_PATH_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 struct DaemonPaths {
@@ -90,7 +99,20 @@ struct DaemonPaths {
 #[cfg(unix)]
 #[derive(Debug)]
 struct RuntimeDir {
+    /// The verified canonical project-root descriptor remains available after
+    /// runtime setup. Linux daemon ownership is locked on this immutable inode,
+    /// rather than on the replaceable `.code-graph` child directory.
+    #[cfg(target_os = "linux")]
+    root: std::fs::File,
     file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnershipPathChange {
+    Intact,
+    RuntimeReplaced,
+    RootReplaced,
 }
 
 /// Persistent serialization lock for shutdown request/ack mutations. It is
@@ -209,7 +231,11 @@ impl DaemonPaths {
                     self.runtime.display()
                 )
             })?;
-            let _ = self.runtime_dir.set(RuntimeDir { file: directory });
+            let _ = self.runtime_dir.set(RuntimeDir {
+                #[cfg(target_os = "linux")]
+                root,
+                file: directory,
+            });
         }
         #[cfg(windows)]
         {
@@ -268,6 +294,48 @@ impl DaemonPaths {
                 "daemon runtime directory is absent",
             )
         })
+    }
+
+    /// Opens a distinct descriptor for the retained project-root inode. A
+    /// distinct open-file description is required for `flock` to contend with
+    /// another local contender as well as another process; cloning the retained
+    /// descriptor would share its lock state.
+    #[cfg(target_os = "linux")]
+    fn open_root_for_ownership(&self) -> std::io::Result<std::fs::File> {
+        let runtime = self.runtime_dir_for_child()?;
+        let root = rustix_fs::openat(
+            &runtime.root,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(std::fs::File::from(root))
+    }
+
+    /// Compares the visible namespace paths against the descriptors retained
+    /// when this daemon became owner. `symlink_metadata` deliberately observes
+    /// a replacement symlink itself rather than following it into a new tree.
+    #[cfg(target_os = "linux")]
+    fn ownership_path_change(&self) -> OwnershipPathChange {
+        let Ok(runtime) = self.runtime_dir_for_child() else {
+            return OwnershipPathChange::RootReplaced;
+        };
+        if !same_directory_inode(fs::symlink_metadata(&self.root), runtime.root.metadata()) {
+            return OwnershipPathChange::RootReplaced;
+        }
+        if !same_directory_inode(fs::symlink_metadata(&self.runtime), runtime.file.metadata()) {
+            return OwnershipPathChange::RuntimeReplaced;
+        }
+        OwnershipPathChange::Intact
+    }
+
+    /// Proxies retain a runtime descriptor only after the runtime exists. An
+    /// absent runtime has no pinned namespace to refresh; a present descriptor
+    /// must be replaced once either visible ownership path diverges.
+    #[cfg(target_os = "linux")]
+    fn proxy_capability_diverged(&self) -> bool {
+        self.runtime_dir.get().is_some()
+            && self.ownership_path_change() != OwnershipPathChange::Intact
     }
 
     #[cfg(unix)]
@@ -417,6 +485,32 @@ impl DaemonPaths {
         Ok(())
     }
 
+    /// Removes only exact crash-abandoned metadata publication entries. This
+    /// runs after a daemon owns both the project-root and runtime lock inodes;
+    /// links, directories, special entries, and near-miss names are retained.
+    #[cfg(target_os = "linux")]
+    fn scavenge_metadata_temps(&self, lock: &DaemonLock) -> std::io::Result<()> {
+        if !lock.has_root_ownership() || !lock.still_owned() {
+            return Err(std::io::Error::other(
+                "metadata temp scavenging requires authoritative daemon ownership",
+            ));
+        }
+        let runtime = self.runtime_dir_for_child()?;
+        let mut entries = rustix_fs::Dir::read_from(&runtime.file)?;
+        for entry in &mut entries {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if !is_metadata_temp_name(bytes) {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            let _ = self.remove_single_link_regular_child(name);
+        }
+        Ok(())
+    }
+
     #[cfg(not(unix))]
     fn ordinary_path(&self, name: &str) -> PathBuf {
         match name {
@@ -453,6 +547,36 @@ impl DaemonPaths {
         )))
     }
 
+    /// Returns a verified procfd alias for the retained project-root inode.
+    /// Cache I/O through this path remains anchored if the visible project-root
+    /// pathname is renamed or recreated while the daemon drains.
+    #[cfg(target_os = "linux")]
+    fn root_io_alias(&self) -> std::io::Result<PathBuf> {
+        #[cfg(debug_assertions)]
+        if debug_force_root_io_alias_failure(&self.root) {
+            return Err(std::io::Error::other(
+                "retained-root cache I/O alias deliberately unavailable for test",
+            ));
+        }
+        let runtime = self.runtime_dir_for_child()?;
+        let alias = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            runtime.root.as_raw_fd()
+        ));
+        if !same_directory_inode(fs::metadata(&alias), runtime.root.metadata()) {
+            return Err(std::io::Error::other(
+                "daemon project-root procfd alias does not resolve to the retained root inode",
+            ));
+        }
+        Ok(alias)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_root_metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.runtime_dir_for_child()?.root.metadata()
+    }
+
     #[cfg(unix)]
     fn uds_bind_path(&self) -> std::io::Result<PathBuf> {
         #[cfg(target_os = "linux")]
@@ -464,6 +588,29 @@ impl DaemonPaths {
     }
 }
 
+/// Root-scoped debug seam for proving that procfd alias unavailability is an
+/// environmental fallback rather than a daemon-startup failure. It is omitted
+/// from release builds and cannot affect a different concurrent test root.
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn debug_force_root_io_alias_failure(root: &Path) -> bool {
+    std::env::var("CODE_GRAPH_TEST_FAIL_ROOT_IO_ALIAS_ROOT")
+        .is_ok_and(|expected| Path::new(&expected) == root)
+}
+
+#[cfg(target_os = "linux")]
+fn same_directory_inode(
+    visible: std::io::Result<fs::Metadata>,
+    retained: std::io::Result<fs::Metadata>,
+) -> bool {
+    let (Ok(visible), Ok(retained)) = (visible, retained) else {
+        return false;
+    };
+    visible.is_dir()
+        && retained.is_dir()
+        && visible.dev() == retained.dev()
+        && visible.ino() == retained.ino()
+}
+
 /// Attaches the invoking stdio process to the repository-local daemon.
 ///
 /// The caller has already discovered `root` with [`RootConfig::load`]. This
@@ -472,7 +619,7 @@ impl DaemonPaths {
 /// Every retry reads metadata and probes its recorded endpoint anew, because a
 /// competing daemon can publish between any two attempts.
 pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
-    let paths = DaemonPaths::for_root(&root);
+    let mut paths = DaemonPaths::for_root(&root);
     paths.open_runtime_dir_if_present()?;
     let fingerprint = executable_fingerprint()?;
     let mut deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
@@ -483,6 +630,15 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
     let mut spawn_backoff = PROXY_RETRY_INTERVAL;
 
     while std::time::Instant::now() < deadline {
+        if refresh_proxy_paths(&mut paths, &root)? {
+            reset_proxy_after_namespace_change(
+                &mut contender,
+                &mut replaced_owner,
+                &mut next_spawn_at,
+                &mut spawn_backoff,
+            )
+            .await;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match read_metadata(&paths) {
             Ok(metadata) if metadata_compatible(&metadata, &fingerprint) => {
@@ -504,15 +660,25 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
                             // being established. Do not hand an established
                             // proxy stream to a daemon that has since lost its
                             // lock ownership.
-                            if metadata_owner_is_active(&paths, &metadata) {
-                                settle_contender(contender, connection.pid).await;
-                                report_tcp_fallback(&metadata);
-                                return finish_proxy(connection.stream).await;
+                            if metadata_owner_is_active(&paths, &metadata)
+                                && proxy_namespace_is_current(&paths)
+                            {
+                                settle_contender(contender.take(), connection.pid).await;
+                                if metadata_owner_is_active(&paths, &metadata)
+                                    && proxy_namespace_is_current(&paths)
+                                {
+                                    report_tcp_fallback(&metadata);
+                                    return finish_proxy(connection.stream).await;
+                                }
+                                last_error = Some(anyhow::anyhow!(
+                                    "daemon namespace changed while settling its contender"
+                                ));
+                            } else {
+                                last_error = Some(anyhow::anyhow!(
+                                    "daemon metadata owner changed while connecting"
+                                ));
                             }
                             drop(connection);
-                            last_error = Some(anyhow::anyhow!(
-                                "daemon metadata owner changed while connecting"
-                            ));
                         }
                         Err(error) => last_error = Some(error),
                     }
@@ -575,6 +741,15 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
 
     // One final short probe closes the publication race at the deadline while
     // keeping the total attach budget comfortably under five seconds.
+    if refresh_proxy_paths(&mut paths, &root)? {
+        reset_proxy_after_namespace_change(
+            &mut contender,
+            &mut replaced_owner,
+            &mut next_spawn_at,
+            &mut spawn_backoff,
+        )
+        .await;
+    }
     if let Ok(metadata) = read_metadata(&paths) {
         if metadata_compatible(&metadata, &fingerprint)
             && metadata_owner_is_active(&paths, &metadata)
@@ -582,16 +757,65 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
             if let Ok(connection) =
                 connect_to_metadata(&paths, &metadata, Duration::from_millis(250)).await
             {
-                if metadata_owner_is_active(&paths, &metadata) {
-                    settle_contender(contender, connection.pid).await;
-                    report_tcp_fallback(&metadata);
-                    return finish_proxy(connection.stream).await;
+                if metadata_owner_is_active(&paths, &metadata) && proxy_namespace_is_current(&paths)
+                {
+                    settle_contender(contender.take(), connection.pid).await;
+                    if metadata_owner_is_active(&paths, &metadata)
+                        && proxy_namespace_is_current(&paths)
+                    {
+                        report_tcp_fallback(&metadata);
+                        return finish_proxy(connection.stream).await;
+                    }
+                    drop(connection);
                 }
             }
         }
     }
     terminate_contender(contender).await;
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not publish metadata")))
+}
+
+/// A proxy normally keeps its verified runtime descriptor to avoid path
+/// reopening races. If the visible root or runtime inode diverges, that
+/// capability is detached and cannot observe the successor namespace; replace
+/// it before the next metadata probe.
+fn refresh_proxy_paths(paths: &mut DaemonPaths, root: &Path) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if paths.proxy_capability_diverged() {
+        *paths = DaemonPaths::for_root(root);
+        paths.open_runtime_dir_if_present()?;
+        return Ok(true);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (paths, root);
+    Ok(false)
+}
+
+fn proxy_namespace_is_current(paths: &DaemonPaths) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        paths.ownership_path_change() == OwnershipPathChange::Intact
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = paths;
+        true
+    }
+}
+
+/// A contender started against a detached daemon namespace cannot publish in
+/// the replacement namespace. Reap it before allowing an immediate successor
+/// spawn, and discard owner/backoff state learned from that old namespace.
+async fn reset_proxy_after_namespace_change(
+    contender: &mut Option<tokio::process::Child>,
+    replaced_owner: &mut Option<LockIdentity>,
+    next_spawn_at: &mut std::time::Instant,
+    spawn_backoff: &mut Duration,
+) {
+    terminate_contender(contender.take()).await;
+    *replaced_owner = None;
+    *next_spawn_at = std::time::Instant::now();
+    *spawn_backoff = PROXY_RETRY_INTERVAL;
 }
 
 fn metadata_compatible(metadata: &DaemonMetadata, fingerprint: &str) -> bool {
@@ -1194,6 +1418,11 @@ struct DaemonLock {
     contents: String,
     identity: LockIdentity,
     file: Option<std::fs::File>,
+    /// Production Linux acquisition holds this separate root-inode lock for
+    /// the entire daemon lifetime. Direct `DaemonLock::acquire` remains the
+    /// runtime-lock test helper, so it deliberately leaves this absent.
+    #[cfg(target_os = "linux")]
+    root_file: Option<std::fs::File>,
 }
 
 impl DaemonLock {
@@ -1235,7 +1464,21 @@ impl DaemonLock {
             contents,
             identity,
             file: Some(file),
+            #[cfg(target_os = "linux")]
+            root_file: None,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_root_ownership(mut self, root_file: std::fs::File) -> Self {
+        debug_assert!(self.root_file.is_none());
+        self.root_file = Some(root_file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_root_ownership(&self) -> bool {
+        self.root_file.is_some()
     }
 
     fn still_owned(&self) -> bool {
@@ -1261,11 +1504,20 @@ impl DaemonLock {
         Ok(())
     }
 
-    fn release(mut self) {
+    fn release_files(&mut self) {
         if let Some(file) = self.file.take() {
             let _ = FileExt::unlock(&file);
             drop(file);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(root_file) = self.root_file.take() {
+            let _ = FileExt::unlock(&root_file);
+            drop(root_file);
+        }
+    }
+
+    fn release(mut self) {
+        self.release_files();
     }
 
     #[cfg(unix)]
@@ -1298,6 +1550,12 @@ impl DaemonLock {
         if owned {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        self.release_files();
     }
 }
 
@@ -1357,6 +1615,10 @@ where
     }
     let paths = DaemonPaths::for_root(&root);
     paths.ensure_runtime_dir()?;
+    #[cfg(target_os = "linux")]
+    server
+        .bind_daemon_retained_root(&paths.retained_root_metadata()?)
+        .map_err(|_| anyhow::anyhow!("daemon retained project-root identity was already bound"))?;
 
     let Some(lock) = acquire_or_detect_live(&paths).await? else {
         eprintln!(
@@ -1365,6 +1627,31 @@ where
         );
         return Ok(());
     };
+
+    // Root ownership and runtime locking both succeeded through retained
+    // descriptors, but their visible paths may have been substituted in the
+    // handoff window. Treat that detached owner as a loser before scavenging
+    // or publishing anything into either namespace.
+    #[cfg(target_os = "linux")]
+    if paths.ownership_path_change() != OwnershipPathChange::Intact {
+        lock.remove_if_owned();
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let cache_io_root = match paths.root_io_alias() {
+            Ok(alias) => Some(alias),
+            Err(error) => {
+                eprintln!(
+                    "code-graph-mcp: retained-root cache I/O alias unavailable for {}; logical cache saves remain guarded: {error}",
+                    root.display()
+                );
+                None
+            }
+        };
+        *server.inner.cache_io_root.write() = cache_io_root;
+    }
 
     #[cfg(target_os = "linux")]
     if let Err(error) = paths.scavenge_owner_record_temps() {
@@ -1403,6 +1690,12 @@ where
         drop(listener);
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    if paths.ownership_path_change() != OwnershipPathChange::Intact {
+        drop(listener);
+        lock.remove_if_owned();
+        return Ok(());
+    }
 
     if let Err(error) = write_metadata_atomically_at(&paths, &metadata) {
         drop(listener);
@@ -1410,6 +1703,10 @@ where
         return Err(error);
     }
 
+    #[cfg(target_os = "linux")]
+    let ownership_watchdog = ownership_path_watchdog(&paths, &server);
+    #[cfg(not(target_os = "linux"))]
+    let ownership_watchdog = std::future::pending::<()>();
     let shutdown_or_idle = async {
         tokio::select! {
             _ = shutdown_with_request(&paths, &lock.identity, shutdown) => {},
@@ -1418,6 +1715,7 @@ where
                     eprintln!("code-graph-mcp: daemon idle timeout reached for {}", root.display());
                 }
             },
+            _ = ownership_watchdog => {},
         }
     };
     serve_listener(listener, server.clone(), tcp_secret, shutdown_or_idle).await;
@@ -1426,11 +1724,40 @@ where
     Ok(())
 }
 
+/// Closes admission as soon as a visible ownership path diverges from its
+/// retained inode. Cache writes remain anchored through the daemon's retained
+/// root alias, so either kind of replacement can still drain safely.
+#[cfg(target_os = "linux")]
+async fn ownership_path_watchdog(paths: &DaemonPaths, server: &CodeGraphServer) {
+    loop {
+        tokio::time::sleep(OWNERSHIP_PATH_POLL).await;
+        match paths.ownership_path_change() {
+            OwnershipPathChange::Intact => {}
+            OwnershipPathChange::RuntimeReplaced => {
+                eprintln!(
+                    "code-graph-mcp: daemon runtime path changed for {}; shutting down",
+                    paths.root.display()
+                );
+                server.inner.persist.close_admission();
+                return;
+            }
+            OwnershipPathChange::RootReplaced => {
+                eprintln!(
+                    "code-graph-mcp: daemon project root path changed for {}; shutting down",
+                    paths.root.display()
+                );
+                server.inner.persist.close_admission();
+                return;
+            }
+        }
+    }
+}
+
 /// Drains graph mutation before runtime cleanup. Existing analyses finish and
 /// may persist; then the watcher and any watch reindex drain before one
-/// exclusive final cache save captures the current graph. The watcher task is
-/// awaited before the index lock, so no queued watch batch can mutate after
-/// that save.
+/// exclusive final cache save captures the current graph through the daemon's
+/// retained-root I/O path when available. The watcher task is awaited before
+/// the index lock, so no queued watch batch can mutate after that save.
 async fn graceful_shutdown(server: &CodeGraphServer, _daemon_root: &Path) {
     server.inner.persist.close_analyze_and_wait().await;
     let handle = { server.inner.watch.write().take() };
@@ -1460,7 +1787,21 @@ async fn graceful_shutdown(server: &CodeGraphServer, _daemon_root: &Path) {
     {
         if let Some(cache_root) = cache_root {
             let graph = server.inner.graph.read();
-            if let Err(error) = graph.save(&cache_root) {
+            let cache_io_root = server.inner.cache_io_root.read().clone();
+            let cache_io_root = match cache_io_root {
+                Some(alias) => alias,
+                None if server.inner.daemon_project_root.get().is_none() => cache_root,
+                #[cfg(not(target_os = "linux"))]
+                None => cache_root,
+                #[cfg(target_os = "linux")]
+                None => {
+                    eprintln!(
+                        "code-graph-mcp: skipped final daemon cache save because retained-root cache I/O is unavailable"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = graph.save(&cache_io_root) {
                 eprintln!("code-graph-mcp: final daemon cache save failed: {error}");
             }
         }
@@ -1742,9 +2083,32 @@ async fn acquire_or_detect_live_with_initial_file(
     paths: &DaemonPaths,
     mut initial_file: Option<std::fs::File>,
 ) -> anyhow::Result<Option<DaemonLock>> {
+    #[cfg(target_os = "linux")]
+    let root_file = match acquire_root_ownership(paths)? {
+        Some(file) => file,
+        // The root inode, not the mutable runtime directory, is the daemon
+        // namespace authority. A contender that cannot lock it must not inspect
+        // or publish state in a replacement `.code-graph` directory.
+        None => return Ok(None),
+    };
     loop {
         match DaemonLock::acquire(paths) {
-            Ok(lock) => return Ok(Some(lock)),
+            Ok(lock) => {
+                #[cfg(target_os = "linux")]
+                let lock = lock.with_root_ownership(root_file);
+                #[cfg(target_os = "linux")]
+                if paths.ownership_path_change() != OwnershipPathChange::Intact {
+                    lock.remove_if_owned();
+                    return Ok(None);
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(error) = paths.scavenge_metadata_temps(&lock) {
+                    lock.remove_if_owned();
+                    return Err(error)
+                        .context("scavenge daemon metadata temps after lock acquisition");
+                }
+                return Ok(Some(lock));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let file = match initial_file.take() {
                     Some(file) => file,
@@ -1789,14 +2153,79 @@ async fn acquire_or_detect_live_with_initial_file(
                     contents: format!("{}\n", serde_json::to_string(&identity)?),
                     identity,
                     file: Some(file),
+                    #[cfg(target_os = "linux")]
+                    root_file: None,
                 };
                 lock.write_identity(LockIdentity::current()?)
                     .context("replace stale daemon lock identity")?;
+                #[cfg(target_os = "linux")]
+                let lock = lock.with_root_ownership(root_file);
+                #[cfg(target_os = "linux")]
+                if paths.ownership_path_change() != OwnershipPathChange::Intact {
+                    lock.remove_if_owned();
+                    return Ok(None);
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(error) = paths.scavenge_metadata_temps(&lock) {
+                    lock.remove_if_owned();
+                    return Err(error)
+                        .context("scavenge daemon metadata temps after lock recovery");
+                }
                 return Ok(Some(lock));
             }
             Err(error) => return Err(error).context("create daemon lock"),
         }
     }
+}
+
+/// Acquires the crash-released daemon namespace lock from a fresh descriptor
+/// for the verified project-root inode. It is intentionally taken before any
+/// runtime `daemon.lock` create or recovery, and its caller keeps it across
+/// every detached-inode retry.
+#[cfg(target_os = "linux")]
+fn acquire_root_ownership(paths: &DaemonPaths) -> std::io::Result<Option<std::fs::File>> {
+    let root = paths.open_root_for_ownership()?;
+    match root.try_lock_exclusive() {
+        Ok(()) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_metadata_temp_name(name: &[u8]) -> bool {
+    let Some(name) = name
+        .strip_prefix(METADATA_TEMP_PREFIX.as_bytes())
+        .and_then(|name| name.strip_suffix(METADATA_TEMP_SUFFIX.as_bytes()))
+    else {
+        return false;
+    };
+    let Some(separator) = name.iter().position(|byte| *byte == b'-') else {
+        return false;
+    };
+    let (pid, nonce_with_separator) = name.split_at(separator);
+    let nonce = &nonce_with_separator[1..];
+    canonical_decimal_u32(pid) && canonical_decimal_u128(nonce)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_decimal_u32(value: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    value
+        .parse::<u32>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_decimal_u128(value: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    value
+        .parse::<u128>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
 }
 
 #[cfg(unix)]
@@ -2598,6 +3027,32 @@ mod tests {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    impl EnvVarGuard {
+        fn set_path(name: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
     fn test_root() -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -2606,6 +3061,38 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    #[tokio::test]
+    async fn run_until_starts_when_retained_root_cache_alias_is_unavailable() {
+        let root = test_root();
+        let _alias_failure =
+            EnvVarGuard::set_path("CODE_GRAPH_TEST_FAIL_ROOT_IO_ALIAS_ROOT", &root);
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        let observer = server.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(run_until(
+            server,
+            root.clone(),
+            Duration::ZERO,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        wait_for_path(&root.join(".code-graph").join(METADATA_FILE)).await;
+        assert!(
+            observer.inner.cache_io_root.read().is_none(),
+            "alias fallback keeps retained-root cache I/O unset"
+        );
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("alias-fallback daemon shuts down")
+            .unwrap()
+            .unwrap();
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2974,6 +3461,184 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_replacement_watchdog_exits_then_a_successor_reacquires() {
+        let root = test_root();
+        let runtime = root.join(".code-graph");
+        let old_server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        old_server
+            .inner
+            .indexed
+            .store(true, std::sync::atomic::Ordering::Release);
+        *old_server.inner.cache_root.write() = Some(root.clone());
+        let old = tokio::spawn(run_until(
+            old_server,
+            root.clone(),
+            Duration::ZERO,
+            std::future::pending(),
+        ));
+        wait_for_path(&runtime.join(METADATA_FILE)).await;
+
+        let displaced = root.join("displaced-runtime");
+        fs::rename(&runtime, &displaced).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), old)
+            .await
+            .expect("runtime watchdog shuts down the old daemon")
+            .unwrap()
+            .unwrap();
+        assert!(
+            code_graph_graph::cache_path(&root).exists(),
+            "a runtime-only replacement permits the old root's final cache save"
+        );
+
+        let successor_server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let successor = tokio::spawn(run_until(
+            successor_server,
+            root.clone(),
+            Duration::ZERO,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        wait_for_path(&runtime.join(METADATA_FILE)).await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), successor)
+            .await
+            .expect("successor daemon shuts down")
+            .unwrap()
+            .unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn root_replacement_watchdog_saves_only_through_the_retained_root_alias() {
+        let root = test_root();
+        let runtime = root.join(".code-graph");
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        server
+            .inner
+            .indexed
+            .store(true, std::sync::atomic::Ordering::Release);
+        *server.inner.cache_root.write() = Some(root.clone());
+        let daemon = tokio::spawn(run_until(
+            server,
+            root.clone(),
+            Duration::ZERO,
+            std::future::pending(),
+        ));
+        wait_for_path(&runtime.join(METADATA_FILE)).await;
+
+        let relocated = root.with_extension("relocated");
+        fs::rename(&root, &relocated).unwrap();
+        fs::create_dir(&root).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("root watchdog shuts down the old daemon")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !code_graph_graph::cache_path(&root).exists(),
+            "the old daemon never saves its cache through the replacement root path"
+        );
+        let mut retained_cache = code_graph_graph::Graph::new();
+        assert!(
+            retained_cache.load(&relocated).unwrap(),
+            "the final cache is written through the retained original root inode"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_refreshes_a_detached_runtime_descriptor_for_successor_metadata() {
+        let root = test_root();
+        let mut proxy_paths = DaemonPaths::for_root(&root);
+        proxy_paths.ensure_runtime_dir().unwrap();
+        let old_metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            LockIdentity::current().unwrap(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&proxy_paths, &old_metadata).unwrap();
+
+        let displaced = root.join("displaced-runtime");
+        fs::rename(&proxy_paths.runtime, &displaced).unwrap();
+        fs::create_dir(&proxy_paths.runtime).unwrap();
+        let successor_paths = DaemonPaths::for_root(&root);
+        successor_paths.ensure_runtime_dir().unwrap();
+        let successor_metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:2".to_owned(),
+            LockIdentity::current().unwrap(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&successor_paths, &successor_metadata).unwrap();
+
+        assert!(proxy_paths.proxy_capability_diverged());
+        assert!(refresh_proxy_paths(&mut proxy_paths, &root).unwrap());
+        assert_eq!(read_metadata(&proxy_paths).unwrap(), successor_metadata);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_namespace_refresh_reaps_contender_and_resets_spawn_state() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("start stale contender");
+        let pid = child.id().expect("child pid");
+        let start_time = process_start_time(pid).expect("child start time");
+        let mut contender = Some(child);
+        let mut replaced_owner = Some(LockIdentity::current().unwrap());
+        let mut next_spawn_at = std::time::Instant::now() + Duration::from_secs(30);
+        let mut spawn_backoff = PROXY_MAX_SPAWN_BACKOFF;
+
+        reset_proxy_after_namespace_change(
+            &mut contender,
+            &mut replaced_owner,
+            &mut next_spawn_at,
+            &mut spawn_backoff,
+        )
+        .await;
+
+        assert!(contender.is_none(), "detached contender is discarded");
+        assert!(replaced_owner.is_none(), "old namespace owner is discarded");
+        assert_eq!(spawn_backoff, PROXY_RETRY_INTERVAL);
+        assert!(
+            next_spawn_at <= std::time::Instant::now(),
+            "a successor is eligible immediately after namespace refresh"
+        );
+        assert!(
+            !identity_is_alive(&LockIdentity {
+                pid,
+                start_time,
+                nonce: String::new(),
+            }),
+            "reset reaps the stale contender process"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for daemon path {}", path.display());
+    }
+
     #[cfg(unix)]
     #[test]
     fn shutdown_request_requires_a_regular_file_and_exact_owner() {
@@ -3191,6 +3856,63 @@ mod tests {
         assert!(hardlinked.exists(), "hard-linked sentinel is retained");
 
         fs::remove_file(hardlinked).unwrap();
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn authoritative_lock_scavenges_only_exact_metadata_temps() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+
+        let leaked = paths.runtime.join(".daemon-123-456.tmp");
+        fs::write(&leaked, b"crashed metadata publication").unwrap();
+        let unrelated_names = [
+            ".daemon--456.tmp",
+            ".daemon-123-.tmp",
+            ".daemon-pid-456.tmp",
+            ".daemon-123-nonce.tmp",
+            ".daemon-001-456.tmp",
+            ".daemon-123-00456.tmp",
+            ".daemon-4294967296-456.tmp",
+            ".daemon-123-340282366920938463463374607431768211456.tmp",
+            ".daemon-123-456.tmp.bak",
+            ".daemon-123-456-789.tmp",
+        ];
+        for name in unrelated_names {
+            fs::write(paths.runtime.join(name), b"unrelated runtime entry").unwrap();
+        }
+        let directory = paths.runtime.join(".daemon-234-567.tmp");
+        fs::create_dir(&directory).unwrap();
+
+        let sentinel = outside.join("metadata-temp-sentinel");
+        let sentinel_contents = b"external metadata temp sentinel\n";
+        fs::write(&sentinel, sentinel_contents).unwrap();
+        let hardlinked = paths.runtime.join(".daemon-345-678.tmp");
+        fs::hard_link(&sentinel, &hardlinked).unwrap();
+        let symlinked = paths.runtime.join(".daemon-456-789.tmp");
+        std::os::unix::fs::symlink(&sentinel, &symlinked).unwrap();
+
+        let lock = acquire_or_detect_live(&paths).await.unwrap().unwrap();
+        assert!(!leaked.exists(), "exact single-link temp is scavenged");
+        for name in unrelated_names {
+            assert!(
+                paths.runtime.join(name).exists(),
+                "near miss {name} is retained"
+            );
+        }
+        assert!(directory.is_dir(), "matching directory is retained");
+        assert_eq!(fs::read(&sentinel).unwrap(), sentinel_contents);
+        assert!(hardlinked.exists(), "matching hard link is retained");
+        assert!(fs::symlink_metadata(&symlinked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
         lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
@@ -3972,6 +4694,97 @@ mod tests {
         fs::rename(displaced, &paths.runtime).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn root_ownership_refuses_a_recreated_runtime_namespace_until_crash_release() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let old = acquire_or_detect_live(&paths).await.unwrap().unwrap();
+        let old_metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            old.identity.clone(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&paths, &old_metadata).unwrap();
+        let cache = code_graph_graph::cache_path(&root);
+        let cache_contents = b"old daemon cache state\n";
+        fs::write(&cache, cache_contents).unwrap();
+
+        let displaced = root.join("displaced-runtime");
+        fs::rename(&paths.runtime, &displaced).unwrap();
+        fs::create_dir(&paths.runtime).unwrap();
+        let replacement_paths = DaemonPaths::for_root(&root);
+        replacement_paths.ensure_runtime_dir().unwrap();
+
+        assert!(
+            acquire_or_detect_live(&replacement_paths)
+                .await
+                .unwrap()
+                .is_none(),
+            "the old daemon's root lock rejects a replacement runtime namespace"
+        );
+        assert_eq!(read_metadata(&paths).unwrap(), old_metadata);
+        assert!(
+            read_metadata(&replacement_paths).is_err(),
+            "a refused contender cannot publish replacement metadata"
+        );
+        assert!(
+            !replacement_paths.lock.exists(),
+            "a refused contender does not create a replacement lock"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), cache_contents);
+
+        // Dropping models a crash: both the detached runtime lock and the root
+        // inode lock are released by the kernel, letting exactly one successor
+        // establish the replacement namespace.
+        drop(old);
+        let successor = acquire_or_detect_live(&replacement_paths)
+            .await
+            .unwrap()
+            .unwrap();
+        let successor_metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:2".to_owned(),
+            successor.identity.clone(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&replacement_paths, &successor_metadata).unwrap();
+        assert_eq!(
+            read_metadata(&replacement_paths).unwrap(),
+            successor_metadata
+        );
+        assert_eq!(fs::read(&cache).unwrap(), cache_contents);
+
+        successor.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn root_ownership_blocks_normal_runtime_lock_replacement_until_release() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let old = acquire_or_detect_live(&paths).await.unwrap().unwrap();
+
+        // The runtime lock handoff normally makes a fresh pathname available
+        // before the old descriptor closes. Root ownership keeps that window
+        // from becoming a second daemon namespace.
+        fs::remove_file(&paths.lock).unwrap();
+        assert!(
+            acquire_or_detect_live(&paths).await.unwrap().is_none(),
+            "the root lock remains authoritative after runtime lock unlink"
+        );
+        old.release();
+
+        let successor = acquire_or_detect_live(&paths).await.unwrap().unwrap();
+        assert!(successor.still_owned());
+        successor.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

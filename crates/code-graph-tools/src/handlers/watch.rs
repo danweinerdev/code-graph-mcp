@@ -183,6 +183,9 @@ pub async fn try_reindex_file(
     let Ok(_index_guard) = inner.index_lock.try_lock() else {
         return ReindexOutcome::LockContended;
     };
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        return ReindexOutcome::Error(error);
+    }
 
     // Canonical contract: the watch path uses the cached `inner.config`,
     // not a fresh `RootConfig::load(<root>/.code-graph.toml)` per event.
@@ -216,6 +219,9 @@ pub async fn try_reindex_file(
     }
 
     if is_remove {
+        if let Err(error) = inner.ensure_daemon_root_current() {
+            return ReindexOutcome::Error(error);
+        }
         let mut g = inner.graph.write();
         // Capture the file's pre-existing symbol IDs *before* dropping the
         // file from the graph — they're the truly-removed set for the
@@ -436,6 +442,9 @@ pub async fn try_reindex_file(
     // O(all edges). Inbound re-resolution (rebinding B's call to the new
     // name) is intentionally out of scope — that requires re-parsing B,
     // which the watch event for A doesn't warrant.
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        return ReindexOutcome::Error(error);
+    }
     let mut g = inner.graph.write();
     g.merge_file_graph(new_fg);
     g.prune_dangling_edges(&removed_ids);
@@ -601,6 +610,9 @@ async fn try_reindex_subtree_removal(inner: &Arc<ServerInner>, path: &Path) {
     let Ok(_index_guard) = inner.index_lock.try_lock() else {
         return;
     };
+    if inner.ensure_daemon_root_current().is_err() {
+        return;
+    }
     let mut g = inner.graph.write();
     let removed_ids = g.remove_files_under(path);
     if removed_ids.is_empty() {
@@ -893,6 +905,39 @@ mod tests {
         );
 
         drop(_held);
+        drop(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reindex_rejects_a_replaced_daemon_root_without_mutating_graph() {
+        let (server, dir) = indexed_server().await;
+        let inner = Arc::clone(&server.inner);
+        let root = dir.path().to_path_buf();
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+        let before = inner.graph.read().stats();
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let replacement = root.join("a.cpp");
+        std::fs::write(&replacement, b"void replacement() {}\n").unwrap();
+
+        let outcome = try_reindex_file(&inner, &replacement, false).await;
+        assert!(
+            matches!(outcome, ReindexOutcome::Error(message) if message.contains("project root was replaced")),
+            "replacement-root watch work must be rejected"
+        );
+        let after = inner.graph.read().stats();
+        assert_eq!(after.files, before.files);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
+
+        std::fs::remove_dir_all(&relocated).unwrap();
         drop(dir);
     }
 

@@ -41,6 +41,9 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
             "daemon shutdown in progress; new watches are not accepted".to_string(),
         ));
     }
+    inner
+        .ensure_daemon_root_current()
+        .map_err(crate::core::ToolError)?;
 
     let root_path = match inner.root_path.read().clone() {
         Some(p) => p,
@@ -78,6 +81,13 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
             root_path.display()
         )));
     }
+
+    // Root replacement may race watcher construction. Revalidate before the
+    // handle becomes observable; dropping `debouncer` tears down the
+    // uncommitted OS watch on failure.
+    inner
+        .ensure_daemon_root_current()
+        .map_err(crate::core::ToolError)?;
 
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
@@ -254,6 +264,32 @@ mod tests {
             "daemon shutdown in progress; new watches are not accepted"
         );
         assert!(server.inner.watch.read().is_none());
+        drop(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn watch_start_rejects_a_replaced_daemon_root() {
+        let (server, dir) = indexed_server().await;
+        let root = dir.path().to_path_buf();
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = match watch_start(&server.inner) {
+            Err(error) => error,
+            Ok(_) => panic!("replaced daemon root must reject watch_start"),
+        };
+        assert!(error.0.contains("project root was replaced"));
+        assert!(server.inner.watch.read().is_none());
+
+        std::fs::remove_dir_all(relocated).unwrap();
         drop(dir);
     }
 

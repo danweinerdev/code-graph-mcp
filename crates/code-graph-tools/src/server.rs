@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+
 use code_graph_core::RootConfig;
 use code_graph_graph::Graph;
 use code_graph_lang::LanguageRegistry;
@@ -177,6 +180,16 @@ impl PersistCoordinator {
     /// shutdown can close admission before taking that lock.
     pub fn analyze_admission_closed(&self) -> bool {
         self.state.lock().analyze_closed
+    }
+
+    /// Close connection and analyze admission without waiting for work that is
+    /// already in flight. Daemon ownership-path loss uses this before closing
+    /// its listener; the normal graceful-shutdown drain performs the waits.
+    pub fn close_admission(&self) {
+        let mut state = self.state.lock();
+        state.analyze_closed = true;
+        state.connection_closed = true;
+        self.changed.notify_waiters();
     }
 
     /// Wait for an uninterrupted idle interval, then atomically claim daemon
@@ -396,9 +409,20 @@ pub struct ServerInner {
     /// Project root owning the active cache. Unlike `root_path`, this is not
     /// the invocation/watch scope and may be an ancestor with nested config.
     pub cache_root: PlRwLock<Option<PathBuf>>,
+    /// Optional daemon-only I/O capability for the active cache root. It is
+    /// distinct from [`Self::cache_root`]: responses, config discovery, and
+    /// daemon root binding retain the canonical semantic path, while Linux
+    /// daemon saves use a retained-root procfd alias that survives pathname
+    /// replacement.
+    pub cache_io_root: PlRwLock<Option<PathBuf>>,
     /// Daemon-only immutable project-root boundary. Direct in-process servers
     /// leave this unset and may analyze any discovered project root.
     pub daemon_project_root: OnceLock<PathBuf>,
+    /// Linux-only identity of the project-root directory descriptor retained
+    /// by the daemon.  Keep only portable device/inode values here: query and
+    /// indexing paths remain the logical project-root path.
+    #[cfg(target_os = "linux")]
+    pub daemon_root_identity: OnceLock<DaemonRootIdentity>,
     /// Active watcher, if any. Populated by
     /// [`crate::handlers::watch::watch_start`] and cleared by
     /// [`crate::handlers::watch::watch_stop`].
@@ -458,7 +482,10 @@ impl CodeGraphServer {
                 index_lock: TokioMutex::new(()),
                 root_path: PlRwLock::new(None),
                 cache_root: PlRwLock::new(None),
+                cache_io_root: PlRwLock::new(None),
                 daemon_project_root: OnceLock::new(),
+                #[cfg(target_os = "linux")]
+                daemon_root_identity: OnceLock::new(),
                 watch: PlRwLock::new(None),
                 config: PlRwLock::new(RootConfig::default()),
                 index_built_at: AtomicU64::new(0),
@@ -490,6 +517,20 @@ impl CodeGraphServer {
     /// stdio servers intentionally leave the optional boundary unset.
     pub fn bind_daemon_project_root(&self, root: PathBuf) -> Result<(), PathBuf> {
         self.inner.daemon_project_root.set(root)
+    }
+
+    /// Bind the Linux root identity from daemon startup's already-verified
+    /// retained directory descriptor.  This is intentionally separate from
+    /// the logical root path: only filesystem safety checks use the inode.
+    #[cfg(target_os = "linux")]
+    pub fn bind_daemon_retained_root(
+        &self,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(), DaemonRootIdentity> {
+        self.inner.daemon_root_identity.set(DaemonRootIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
     }
 
     /// Returns `Ok(())` if a codebase has been indexed; otherwise returns
@@ -608,6 +649,51 @@ impl CodeGraphServer {
             }
         }
         Ok(Some(normalized.to_string_lossy().into_owned()))
+    }
+}
+
+/// Portable Linux directory identity retained by a daemon for its lifetime.
+/// It deliberately stores no file descriptor, so code-graph-tools remains
+/// free of platform I/O dependencies and all normal paths stay logical.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaemonRootIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl ServerInner {
+    /// Reject a daemon operation once the visible project-root path no longer
+    /// names the directory inode captured at daemon startup. Direct servers,
+    /// non-Linux targets, and unbound daemon instances intentionally remain
+    /// no-ops.
+    pub fn ensure_daemon_root_current(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let (Some(root), Some(identity)) = (
+                self.daemon_project_root.get(),
+                self.daemon_root_identity.get(),
+            ) else {
+                return Ok(());
+            };
+            let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+                format!(
+                    "daemon project root was replaced or is unavailable at {}: {error}",
+                    root.display()
+                )
+            })?;
+            if metadata.is_dir() && metadata.dev() == identity.dev && metadata.ino() == identity.ino
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "daemon project root was replaced at {}; refusing to publish into the replacement namespace",
+                    root.display()
+                ))
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(())
     }
 }
 

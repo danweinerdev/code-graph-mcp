@@ -1132,3 +1132,82 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn root_replacement_during_admitted_persist_uses_the_retained_cache_inode() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(false);
+    let root_string = root.0.to_string_lossy().into_owned();
+    let source = root.0.join("persist.rs");
+    let admitted_marker = root.0.join("persist-admitted.marker");
+    let admitted_marker_string = admitted_marker.to_string_lossy().into_owned();
+    let completion_marker = root.0.join("persist-complete.marker");
+    let completion_marker_string = completion_marker.to_string_lossy().into_owned();
+    fs::write(&source, "fn persisted_after_root_replace() {}\n").unwrap();
+    let mut client = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "3000"),
+            (
+                "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
+                &admitted_marker_string,
+            ),
+            ("CODE_GRAPH_TEST_PERSIST_MARKER", &completion_marker_string),
+        ],
+    )
+    .initialize();
+    client.tool(
+        "analyze_codebase_async",
+        json!({"path":root.0, "force":true}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while !admitted_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "analyze did not enter delayed admitted persistence"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let relocated = root.0.with_extension("relocated");
+    fs::rename(&root.0, &relocated).unwrap();
+    fs::create_dir(&root.0).unwrap();
+    client.close();
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !completion_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "retained-root persistence did not complete"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !code_graph_graph::cache_path(&root.0).exists(),
+        "the old daemon never writes its cache through the replacement root"
+    );
+    let mut graph = Graph::new();
+    assert!(
+        graph.load(&relocated).unwrap(),
+        "the retained original root receives a loadable admitted cache"
+    );
+
+    let mut successor = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        successor.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22,
+        "a new proxy client converges on the replacement-root daemon"
+    );
+    let new = wait_metadata(&root);
+    successor.close();
+    stop_daemon(&new);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+    fs::remove_dir_all(relocated).unwrap();
+}
