@@ -36,7 +36,7 @@ findings:
   - id: F-02
     severity: major
     title: "Lock and shutdown records use unbounded path-reopened reads"
-    status: open
+    status: fixed
   - id: F-03
     severity: major
     title: "UDS admission saturation masquerades as a successful attachment"
@@ -112,3 +112,6 @@ The quality lane correctly identified a possible last-writer-wins race, but the 
 
 ### F-01 — fixed (2026-08-11)
 Task 3.12 commit `201e2f7454a310393c6ef8c88d33b3759a8d0965` establishes `.code-graph` relative to a verified project-root descriptor, retains the runtime capability immutably, and routes ordinary runtime child operations and lock cleanup through descriptor-relative Rustix calls. Linux UDS uses a per-process descriptor alias only at Tokio's pathname API boundary. Root/runtime substitution regressions preserve external sentinels, and prior Windows validation remains intact.
+
+### F-02 — fixed (2026-08-11)
+Task 3.13 commit `2594f124e3954cd15393ef7b0650eab8b8d497d0` introduces one descriptor-validated bounded record reader for metadata, lock identity, shutdown request/ack, and the fixed-size TCP credential. It also bounds reads from an already-open recovery lock descriptor and pins oversized and substituted-record behavior without mutation.

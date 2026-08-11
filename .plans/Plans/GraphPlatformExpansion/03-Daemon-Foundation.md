@@ -81,7 +81,7 @@ tasks:
     depends_on: ["3.11"]
   - id: "3.13"
     title: "Bound every daemon runtime-record read"
-    status: planned
+    status: complete
     justifies: "NFR-06, AC-08. Metadata reads are bounded, but lock and shutdown request/ack records still use unbounded or check-then-reopen reads that can hang or exhaust memory."
     verification: "Use one bounded descriptor-based no-follow/nonblocking reader for lock, shutdown request, and shutdown acknowledgement records, including reads from an already-open lock descriptor. Oversized files and regular-to-FIFO/symlink substitutions fail within a bounded interval without mutation or memory growth. Run focused daemon tests, rustfmt, clippy, and `make verify`."
     depends_on: ["3.12"]
@@ -570,9 +570,9 @@ Revision boundary: Linux daemon runtime mutation remains anchored to the origina
 ## 3.13: Bound every daemon runtime-record read
 
 ### Subtasks
-- [ ] Generalize bounded no-follow/nonblocking runtime-record reads
-- [ ] Convert lock and shutdown request/ack readers, including open lock descriptors
-- [ ] Add oversized-record and substitution-race regressions
+- [x] Generalize bounded no-follow/nonblocking runtime-record reads
+- [x] Convert lock and shutdown request/ack readers, including open lock descriptors
+- [x] Add oversized-record and substitution-race regressions
 
 ### Notes
 
@@ -580,7 +580,26 @@ Revision boundary: every daemon-owned JSON record has the same bounded descripto
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `2594f124e3954cd15393ef7b0650eab8b8d497d0`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T17:27:17Z, matching `2594f124e3954cd15393ef7b0650eab8b8d497d0`
+- Focused review: `git show 2594f124e3954cd15393ef7b0650eab8b8d497d0`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `2594f124e3954cd15393ef7b0650eab8b8d497d0`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon:: -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 48 daemon tests passed, including oversized lock, shutdown, and credential records plus already-open descriptor substitution. |
+| `cargo test -p code-graph-mcp --test daemon_serve && cargo test -p code-graph-mcp --test daemon_proxy` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | All 8 explicit-daemon and 13 proxy process scenarios passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.13.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace, snapshot, and plugin-mirror verification passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 2594f124e3954cd15393ef7b0650eab8b8d497d0` | Complete task commit | PASS | One bounded reader validates opened descriptors and caps metadata, lock, shutdown, and credential records before parsing; open-lock recovery is bounded from its existing descriptor. |
+| Independent focused quality review | Complete task diff plus all runtime-record callers | PASS | The review-found unbounded credential and non-Unix lock-ownership reads were converted; remaining `read_to_end` is the shared `limit + 1` implementation and filesystem reads are test assertions or executable fingerprinting. |
 
 ## 3.14: Acknowledge connection admission and harden process fixtures
 
