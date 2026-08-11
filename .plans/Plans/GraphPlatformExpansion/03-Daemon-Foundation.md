@@ -105,7 +105,7 @@ tasks:
     depends_on: ["3.15"]
   - id: "3.17"
     title: "Anchor daemon ownership to the project root"
-    status: planned
+    status: complete
     justifies: "FR-13, AC-08, NFR-06. The cache-scavenging gate found that replacing `.code-graph` creates a second lock namespace while the original daemon continues serving through its retained descriptor; metadata publication temps also survive crashes."
     verification: "On Linux, hold a crash-released exclusive ownership lock on the verified project-root directory inode for the daemon lifetime in addition to the runtime-file identity, so replacing `.code-graph` cannot admit a second daemon. Contenders against a replaced runtime detect live root ownership and do not publish. After ownership acquisition, scavenge exact metadata-temp siblings descriptor-relatively while retaining symlink/hardlink/directory/unrelated sentinels. Tests pin runtime rename/recreate convergence, root-lock crash release, no split metadata/cache ownership, metadata-temp cleanup, and normal replacement. Run daemon suites, persistence tests, lint/format, and two `make verify` runs."
     depends_on: ["3.16"]
@@ -722,18 +722,41 @@ Revision boundary: each new save bounds crash residue by scavenging the reserved
 ## 3.17: Anchor daemon ownership to the project root
 
 ### Subtasks
-- [ ] Hold Linux daemon ownership on the verified project-root inode
-- [ ] Prevent runtime-directory replacement from creating a second daemon namespace
-- [ ] Scavenge exact abandoned metadata publication temps under ownership
-- [ ] Add root-lock, runtime-replacement, metadata-temp, sentinel, and replacement regressions
+- [x] Hold Linux daemon ownership on the verified project-root inode
+- [x] Prevent runtime-directory replacement from creating a second daemon namespace
+- [x] Scavenge exact abandoned metadata publication temps under ownership
+- [x] Add root-lock, runtime-replacement, metadata-temp, sentinel, and replacement regressions
 
 ### Notes
 
 Revision boundary: daemon single-instance authority survives replacement of its runtime child directory, and crash-abandoned metadata temps are bounded without widening direct-mode cache locking.
 
+The governing Linux MVP boundary is the spec's cross-UID local-user exclusion. Persistent root/runtime pathname divergence is detected and drained; an active same-UID actor that replaces, supplies files, and restores the root entirely between checks is not an additional isolation boundary because that actor already has direct authority to edit the repository's sources.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T23:30:46Z, matching `dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
+- Focused review: `git show dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon:: -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 64 daemon unit tests passed, covering root-inode ownership, runtime/root replacement watchdogs, metadata-temp scavenging, alias-unavailable startup, proxy namespace refresh, and sentinel preservation. |
+| `cargo test -p code-graph-mcp --test daemon_proxy -- --test-threads=1 && cargo test -p code-graph-mcp --test daemon_serve -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 15 proxy and 8 explicit-daemon process tests passed, including admitted persistence through the retained root and successor convergence. |
+| `cargo test -p code-graph-tools core::analyze::tests:: -- --test-threads=1 && cargo test -p code-graph-tools watch_start_rejects_a_replaced_daemon_root -- --test-threads=1 && cargo test -p code-graph-tools reindex_rejects_a_replaced_daemon_root_without_mutating_graph -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Four analyze/cache tests and the focused watch-start/reindex regressions passed; admitted work cannot publish persistent replacement-root data. |
+| `cargo test -p code-graph-graph persist` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 31 persistence tests passed, preserving task 3.16 cache-temp safety and loadability. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting, workspace lint with warnings denied, and whitespace validation passed. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.17-final-$$.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed; the output contained two `verify: all structural checks passed` markers after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show dfc3884c8d3ab23cae7d1fc85f559c0fb431924b` | Complete task commit | PASS | One Linux root-ownership slice: retained root locking and cache I/O, persistent namespace divergence shutdown, guarded analyze/watch publication, proxy capability refresh, exact metadata-temp cleanup, and focused regressions; deferred native platforms retain their prior behavior. |
+| Independent focused quality and blind-spots reviews | Complete task diff and immutable commit | PASS/Aligned | Concrete findings around admitted-work contamination, procfd startup regression, alias-less save TOCTOU, stale contenders, watch admission, proxy handoff, startup publication, and non-Linux persistence were fixed. The spec's NFR-06 cross-UID boundary does not treat an active same-UID transient replace-and-restore as a separate isolation guarantee. |
 
 ## Acceptance Criteria
 
