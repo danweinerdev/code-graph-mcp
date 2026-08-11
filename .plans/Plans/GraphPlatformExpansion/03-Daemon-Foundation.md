@@ -73,6 +73,24 @@ tasks:
     justifies: "FR-38, NFR-06, AC-08, AC-47. The final review found static FIFO/symlink/oversized metadata can block startup, spawned-daemon TCP fallback is hidden because stderr is null, and a contender waiting on an inode unlinked during owner cleanup can acquire it and delete a successor's state."
     verification: "Metadata reads reject symlinks/non-regular files and oversized payloads without blocking; FIFO/symlink/large-file tests prove bounded safe fallback. A normal stdio proxy reports metadata-selected TCP fallback after successful attachment. On Unix, after acquiring an existing lock inode, the contender compares its fd dev/inode with the current pathname and retries without cleanup if they differ; a deterministic pre-opened waiter/successor regression proves successor metadata and lock survive. Run full daemon tests and two `make verify` gates."
     depends_on: ["3.10"]
+  - id: "3.12"
+    title: "Anchor daemon runtime operations to a verified directory"
+    status: planned
+    justifies: "NFR-06. The final frozen review found a pathname substitution window after `.code-graph` validation, allowing later permission and child-entry operations to escape the repository-local runtime boundary."
+    verification: "On Linux, retain a no-follow verified handle to the runtime directory and perform owner-permission and fixed child-entry operations relative to that handle so renaming/replacing `.code-graph` cannot redirect mutation. Deterministic substitution tests preserve external sentinels and fail or retry safely. Run focused daemon tests, rustfmt, clippy, and `make verify`."
+    depends_on: ["3.11"]
+  - id: "3.13"
+    title: "Bound every daemon runtime-record read"
+    status: planned
+    justifies: "NFR-06, AC-08. Metadata reads are bounded, but lock and shutdown request/ack records still use unbounded or check-then-reopen reads that can hang or exhaust memory."
+    verification: "Use one bounded descriptor-based no-follow/nonblocking reader for lock, shutdown request, and shutdown acknowledgement records, including reads from an already-open lock descriptor. Oversized files and regular-to-FIFO/symlink substitutions fail within a bounded interval without mutation or memory growth. Run focused daemon tests, rustfmt, clippy, and `make verify`."
+    depends_on: ["3.12"]
+  - id: "3.14"
+    title: "Acknowledge connection admission and harden process fixtures"
+    status: planned
+    justifies: "FR-16, NFR-04. The final frozen review found that UDS saturation is accepted at transport level then silently dropped before MCP admission, and interrupted process tests can later reuse predictable stale roots."
+    verification: "For Linux UDS, complete an admission prelude only after both the service permit and lifecycle connection guard are secured; the proxy must not treat attachment as established before that acknowledgement. A saturation regression proves the 129th client retries or falls back rather than exiting successfully with no MCP response. Process-test roots are atomically fresh or collision-refusing and retain cleanup. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
+    depends_on: ["3.13"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -514,6 +532,51 @@ Revision boundary: static repository entries cannot block metadata discovery, fa
 |---|---|---|---|
 | `git show 061f414916835ecbfa664f59f8dc087181088586` | Complete task commit | PASS | One metadata/handoff slice: bounded no-follow reads at discovery, preparation, and cleanup; TCP fallback reporting; fd/path inode revalidation and deterministic successor-state regression. |
 | Focused final quality review | Exact task commit plus all metadata callers | PASS | Unsafe static metadata entries cannot block, fallback reporting reaches the client, and detached waiters retry without successor cleanup. |
+
+## 3.12: Anchor daemon runtime operations to a verified directory
+
+### Subtasks
+- [ ] Introduce a Linux no-follow runtime-directory handle
+- [ ] Route permission and fixed child-entry operations through the verified handle
+- [ ] Add deterministic directory-substitution and external-sentinel regressions
+
+### Notes
+
+Revision boundary: Linux daemon runtime mutation remains anchored to the originally validated repository-local directory even when its pathname is concurrently replaced.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 3.13: Bound every daemon runtime-record read
+
+### Subtasks
+- [ ] Generalize bounded no-follow/nonblocking runtime-record reads
+- [ ] Convert lock and shutdown request/ack readers, including open lock descriptors
+- [ ] Add oversized-record and substitution-race regressions
+
+### Notes
+
+Revision boundary: every daemon-owned JSON record has the same bounded descriptor-read safety contract established for metadata in task 3.11.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 3.14: Acknowledge connection admission and harden process fixtures
+
+### Subtasks
+- [ ] Add and validate a Linux UDS post-admission acknowledgement
+- [ ] Exercise connection-permit saturation through the normal proxy path
+- [ ] Make daemon process-test roots fresh and collision-safe
+
+### Notes
+
+Revision boundary: transport connection is not considered attached until daemon admission succeeds, and the saturation regression runs in a guaranteed-fresh process fixture.
+
+### Completion Evidence
+
+Pending — not complete.
 
 ## Acceptance Criteria
 
