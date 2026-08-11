@@ -6,6 +6,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
@@ -19,6 +21,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
+#[cfg(unix)]
+use rustix::fs::{self as rustix_fs, AtFlags, Mode, OFlags, CWD};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
@@ -54,12 +60,27 @@ const SHUTDOWN_REQUEST_POLL: Duration = Duration::from_millis(50);
 struct DaemonPaths {
     root: PathBuf,
     runtime: PathBuf,
+    #[allow(dead_code)]
     lock: PathBuf,
+    #[allow(dead_code)]
     metadata: PathBuf,
+    #[allow(dead_code)]
     secret: PathBuf,
     socket: PathBuf,
+    #[allow(dead_code)]
     shutdown_request: PathBuf,
+    #[allow(dead_code)]
     shutdown_ack: PathBuf,
+    /// The verified runtime directory is retained immutably so Unix child
+    /// operations do not resolve `.code-graph` again after validation.
+    #[cfg(unix)]
+    runtime_dir: Arc<OnceLock<RuntimeDir>>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct RuntimeDir {
+    file: std::fs::File,
 }
 
 impl DaemonPaths {
@@ -74,61 +95,246 @@ impl DaemonPaths {
             shutdown_request: runtime.join(SHUTDOWN_REQUEST_FILE),
             shutdown_ack: runtime.join(SHUTDOWN_ACK_FILE),
             runtime,
+            #[cfg(unix)]
+            runtime_dir: Arc::new(OnceLock::new()),
         }
     }
 
     fn ensure_runtime_dir(&self) -> anyhow::Result<()> {
-        let canonical_root = fs::canonicalize(&self.root)
-            .with_context(|| format!("canonicalize daemon project root {}", self.root.display()))?;
+        self.establish_runtime_dir(true)
+    }
+
+    /// Opens a pre-existing runtime directory for proxy-side operations. This
+    /// intentionally does not create runtime state before a contender owns it.
+    fn open_runtime_dir_if_present(&self) -> anyhow::Result<()> {
         match fs::symlink_metadata(&self.runtime) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                bail!(
-                    "daemon runtime path {} must be a real directory",
+            Ok(_) => self.establish_runtime_dir(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "inspect daemon runtime directory {}",
                     self.runtime.display()
                 )
+            }),
+        }
+    }
+
+    fn establish_runtime_dir(&self, create: bool) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if self.runtime_dir.get().is_some() {
+            return Ok(());
+        }
+        let canonical_root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize daemon project root {}", self.root.display()))?;
+        #[cfg(unix)]
+        {
+            // Establish the root capability first. Its inode must be the
+            // canonical root we discovered; `.code-graph` is then created and
+            // opened only relative to that verified descriptor.
+            let expected_root = fs::metadata(&canonical_root)?;
+            let root = rustix_fs::openat(
+                CWD,
+                &canonical_root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| format!("open daemon project root {}", canonical_root.display()))?;
+            let root = std::fs::File::from(root);
+            let opened_root = root.metadata()?;
+            if opened_root.dev() != expected_root.dev() || opened_root.ino() != expected_root.ino()
+            {
+                bail!(
+                    "daemon project root {} changed while establishing runtime state",
+                    canonical_root.display()
+                );
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&self.runtime).with_context(|| {
-                    format!("create daemon runtime directory {}", self.runtime.display())
-                })?;
+            if create {
+                match rustix_fs::mkdirat(&root, ".code-graph", Mode::from_bits_truncate(0o700)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error).context("create daemon runtime directory"),
+                }
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
+            let directory = rustix_fs::openat(
+                &root,
+                ".code-graph",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| format!("open daemon runtime directory {}", self.runtime.display()))?;
+            let directory = std::fs::File::from(directory);
+            if !directory
+                .metadata()
+                .with_context(|| {
                     format!(
                         "inspect daemon runtime directory {}",
                         self.runtime.display()
                     )
-                })
+                })?
+                .is_dir()
+            {
+                bail!(
+                    "daemon runtime path {} must be a real directory",
+                    self.runtime.display()
+                );
             }
-        }
-        let canonical_runtime = fs::canonicalize(&self.runtime).with_context(|| {
-            format!(
-                "canonicalize daemon runtime directory {}",
-                self.runtime.display()
-            )
-        })?;
-        if canonical_runtime != canonical_root.join(".code-graph")
-            || canonical_runtime.parent() != Some(canonical_root.as_path())
-        {
-            bail!(
-                "daemon runtime directory {} is not a direct child of project root {}",
-                canonical_runtime.display(),
-                canonical_root.display()
-            )
-        }
-        #[cfg(unix)]
-        fs::set_permissions(&self.runtime, std::fs::Permissions::from_mode(0o700)).with_context(
-            || {
+            rustix_fs::fchmod(&directory, Mode::from_bits_truncate(0o700)).with_context(|| {
                 format!(
                     "restrict daemon runtime directory {}",
                     self.runtime.display()
                 )
-            },
-        )?;
+            })?;
+            let _ = self.runtime_dir.set(RuntimeDir { file: directory });
+        }
         #[cfg(windows)]
-        restrict_windows_runtime_dir(&self.runtime)?;
+        {
+            match fs::symlink_metadata(&self.runtime) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    bail!(
+                        "daemon runtime path {} must be a real directory",
+                        self.runtime.display()
+                    )
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                    fs::create_dir(&self.runtime).with_context(|| {
+                        format!("create daemon runtime directory {}", self.runtime.display())
+                    })?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspect daemon runtime directory {}",
+                            self.runtime.display()
+                        )
+                    })
+                }
+            }
+            let canonical_runtime = fs::canonicalize(&self.runtime).with_context(|| {
+                format!(
+                    "canonicalize daemon runtime directory {}",
+                    self.runtime.display()
+                )
+            })?;
+            if canonical_runtime != canonical_root.join(".code-graph")
+                || canonical_runtime.parent() != Some(canonical_root.as_path())
+            {
+                bail!(
+                    "daemon runtime directory {} is not a direct child of project root {}",
+                    canonical_runtime.display(),
+                    canonical_root.display()
+                );
+            }
+            restrict_windows_runtime_dir(&self.runtime)?;
+        }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn runtime_dir_for_child(&self) -> std::io::Result<&RuntimeDir> {
+        if self.runtime_dir.get().is_none() {
+            self.open_runtime_dir_if_present()
+                .map_err(std::io::Error::other)?;
+        }
+        self.runtime_dir.get().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "daemon runtime directory is absent",
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    fn open_child(&self, name: &str, flags: OFlags, mode: Mode) -> std::io::Result<std::fs::File> {
+        let runtime = self.runtime_dir_for_child()?;
+        let file = rustix_fs::openat(
+            &runtime.file,
+            name,
+            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            mode,
+        )?;
+        Ok(std::fs::File::from(file))
+    }
+
+    #[cfg(unix)]
+    fn remove_child(&self, name: &str) -> std::io::Result<()> {
+        Ok(rustix_fs::unlinkat(
+            self.runtime_dir_for_child()?.file.try_clone()?,
+            name,
+            AtFlags::empty(),
+        )?)
+    }
+
+    #[cfg(unix)]
+    fn rename_child(&self, from: &str, to: &str) -> std::io::Result<()> {
+        let runtime = self.runtime_dir_for_child()?;
+        Ok(rustix_fs::renameat(&runtime.file, from, &runtime.file, to)?)
+    }
+
+    #[cfg(unix)]
+    fn read_child(&self, name: &str) -> std::io::Result<Vec<u8>> {
+        let mut file = self.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
+    }
+
+    #[cfg(unix)]
+    fn remove_regular_child(&self, name: &str) -> std::io::Result<()> {
+        let file = self.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other(format!(
+                "daemon runtime entry {name} is not a regular file"
+            )));
+        }
+        self.remove_child(name)
+    }
+
+    #[cfg(not(unix))]
+    fn ordinary_path(&self, name: &str) -> PathBuf {
+        match name {
+            LOCK_FILE => self.lock.clone(),
+            METADATA_FILE => self.metadata.clone(),
+            SECRET_FILE => self.secret.clone(),
+            SOCKET_FILE => self.socket.clone(),
+            SHUTDOWN_REQUEST_FILE => self.shutdown_request.clone(),
+            SHUTDOWN_ACK_FILE => self.shutdown_ack.clone(),
+            _ => self.runtime.join(name),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn read_child(&self, name: &str) -> std::io::Result<Vec<u8>> {
+        fs::read(self.ordinary_path(name))
+    }
+
+    #[cfg(not(unix))]
+    fn remove_regular_child(&self, name: &str) -> std::io::Result<()> {
+        fs::remove_file(self.ordinary_path(name))
+    }
+
+    /// Tokio's Unix socket API only accepts a pathname. The procfd alias is
+    /// used solely for that boundary; regular runtime files use `openat`.
+    #[cfg(target_os = "linux")]
+    fn uds_alias(&self) -> std::io::Result<PathBuf> {
+        let runtime = self.runtime_dir_for_child()?;
+        Ok(PathBuf::from(format!(
+            "/proc/{}/fd/{}/{}",
+            std::process::id(),
+            runtime.file.as_raw_fd(),
+            SOCKET_FILE
+        )))
+    }
+
+    #[cfg(unix)]
+    fn uds_bind_path(&self) -> std::io::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            self.uds_alias()
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(self.socket.clone())
     }
 }
 
@@ -141,6 +347,7 @@ impl DaemonPaths {
 /// competing daemon can publish between any two attempts.
 pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
     let paths = DaemonPaths::for_root(&root);
+    paths.open_runtime_dir_if_present()?;
     let fingerprint = executable_fingerprint()?;
     let mut deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
     let mut last_error = None;
@@ -283,15 +490,25 @@ fn sha_compatible_with(
 }
 
 fn read_metadata(paths: &DaemonPaths) -> anyhow::Result<DaemonMetadata> {
+    #[cfg(unix)]
+    let encoded = read_metadata_payload_file(
+        paths.open_child(
+            METADATA_FILE,
+            OFlags::RDONLY | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?,
+        &paths.metadata,
+    )?;
+    #[cfg(not(unix))]
     let encoded = read_metadata_payload(&paths.metadata)?;
-    serde_json::from_slice(&encoded)
-        .with_context(|| format!("parse daemon metadata {}", paths.metadata.display()))
+    serde_json::from_slice(&encoded).context("parse daemon metadata")
 }
 
 /// Reads daemon metadata only from a bounded, regular file. The initial
 /// symlink-metadata check rejects repository-planted special entries before an
 /// open can block; Unix opens also refuse a symlink substituted after that
 /// check. `O_NONBLOCK` keeps a racing FIFO from stalling daemon discovery.
+#[cfg_attr(unix, allow(dead_code))]
 fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
     let entry = fs::symlink_metadata(path)
         .with_context(|| format!("inspect daemon metadata {}", path.display()))?;
@@ -328,6 +545,22 @@ fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
         );
     }
 
+    read_metadata_payload_file(file, path)
+}
+
+fn read_metadata_payload_file(file: std::fs::File, path: &Path) -> anyhow::Result<Vec<u8>> {
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect opened daemon metadata {}", path.display()))?;
+    if !opened.is_file() {
+        bail!("daemon metadata {} is not a regular file", path.display());
+    }
+    if opened.len() > MAX_METADATA_BYTES as u64 {
+        bail!(
+            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
+            path.display()
+        );
+    }
     let mut encoded = Vec::with_capacity(opened.len() as usize);
     file.take((MAX_METADATA_BYTES + 1) as u64)
         .read_to_end(&mut encoded)
@@ -347,15 +580,7 @@ fn report_tcp_fallback(metadata: &DaemonMetadata) {
     }
 }
 
-fn remove_metadata_if_regular(path: &Path) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if !metadata.file_type().is_symlink() && metadata.is_file() {
-        let _ = fs::remove_file(path);
-    }
-}
-
+#[cfg_attr(unix, allow(dead_code))]
 fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect daemon lock {}", path.display()))?;
@@ -366,26 +591,47 @@ fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
         .with_context(|| format!("parse daemon lock {}", path.display()))
 }
 
+fn read_lock_identity_child(paths: &DaemonPaths) -> anyhow::Result<LockIdentity> {
+    #[cfg(unix)]
+    let encoded = paths.read_child(LOCK_FILE)?;
+    #[cfg(not(unix))]
+    let encoded = fs::read(&paths.lock)?;
+    serde_json::from_slice(&encoded).context("parse daemon lock")
+}
+
 fn metadata_owner_is_active(paths: &DaemonPaths, metadata: &DaemonMetadata) -> bool {
     // The before/after exact-identity checks around the actively-held lock
     // probe are the authorization: the metadata owner must still name the
     // lock owner after proving that lock is actively held.
-    metadata.pid == metadata.owner.pid
-        && read_lock_identity(&paths.lock).is_ok_and(|owner| owner == metadata.owner)
-        && identity_is_alive(&metadata.owner)
-        && lock_is_actively_held(&paths.lock)
-        && read_lock_identity(&paths.lock).is_ok_and(|owner| owner == metadata.owner)
-}
-
-fn lock_is_actively_held(path: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
+    let Ok(lock) = read_lock_identity_child(paths) else {
         return false;
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
-        return false;
+    metadata.pid == metadata.owner.pid
+        && lock == metadata.owner
+        && identity_is_alive(&metadata.owner)
+        && lock_is_actively_held(paths)
+        && read_lock_identity_child(paths).is_ok_and(|owner| owner == metadata.owner)
+}
+
+fn lock_is_actively_held(paths: &DaemonPaths) -> bool {
+    #[cfg(unix)]
+    let file = match paths.open_child(LOCK_FILE, OFlags::RDWR, Mode::empty()) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let path = &paths.lock;
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return false;
+        }
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+            return false;
+        };
+        file
     };
     match file.try_lock_exclusive() {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
@@ -458,16 +704,12 @@ fn replace_stale_shutdown_request(
     paths: &DaemonPaths,
     rejected: &LockIdentity,
 ) -> anyhow::Result<()> {
-    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_request) else {
-        return Ok(());
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "daemon shutdown request {} is not a regular file",
-            paths.shutdown_request.display()
-        );
-    }
-    let existing: LockIdentity = serde_json::from_slice(&fs::read(&paths.shutdown_request)?)
+    let existing: LockIdentity =
+        serde_json::from_slice(&match paths.read_child(SHUTDOWN_REQUEST_FILE) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        })
         .context("parse existing daemon shutdown request")?;
     if existing == *rejected {
         return Ok(());
@@ -476,17 +718,13 @@ fn replace_stale_shutdown_request(
     if active.as_ref() == Some(&existing) {
         bail!("daemon shutdown request belongs to a different active owner");
     }
-    fs::remove_file(&paths.shutdown_request).with_context(|| {
-        format!(
-            "remove stale daemon shutdown request {}",
-            paths.shutdown_request.display()
-        )
-    })
+    paths.remove_regular_child(SHUTDOWN_REQUEST_FILE)?;
+    Ok(())
 }
 
 fn active_lock_identity(paths: &DaemonPaths) -> Option<LockIdentity> {
-    let owner = read_lock_identity(&paths.lock).ok()?;
-    (identity_is_alive(&owner) && lock_is_actively_held(&paths.lock)).then_some(owner)
+    let owner = read_lock_identity_child(paths).ok()?;
+    (identity_is_alive(&owner) && lock_is_actively_held(paths)).then_some(owner)
 }
 
 fn kill_identity(identity: &LockIdentity) -> bool {
@@ -604,7 +842,7 @@ async fn connect_to_metadata(
         Transport::Uds => ClientStream::Uds(
             timeout(
                 connect_timeout,
-                tokio::net::UnixStream::connect(&metadata.endpoint),
+                tokio::net::UnixStream::connect(paths.uds_bind_path()?),
             )
             .await
             .context("connect daemon UDS timed out")??,
@@ -622,7 +860,7 @@ async fn connect_to_metadata(
             )
             .await
             .context("connect daemon TCP timed out")??;
-            let token = read_client_secret(&paths.secret)?;
+            let token = read_client_secret(paths)?;
             stream
                 .write_all(format!("CG-AUTH {token}\n").as_bytes())
                 .await
@@ -653,11 +891,15 @@ async fn connect_to_metadata(
     })
 }
 
-fn read_client_secret(path: &Path) -> anyhow::Result<String> {
+fn read_client_secret(paths: &DaemonPaths) -> anyhow::Result<String> {
     // The token is immediately copied into the auth prelude. Do not accept
     // whitespace or alternate encodings around the owner-only file contents.
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read daemon TCP secret {}", path.display()))?;
+    #[cfg(unix)]
+    let contents =
+        String::from_utf8(paths.read_child(SECRET_FILE)?).context("read daemon TCP secret")?;
+    #[cfg(not(unix))]
+    let contents = fs::read_to_string(&paths.secret)
+        .with_context(|| format!("read daemon TCP secret {}", paths.secret.display()))?;
     let token = match contents.as_bytes() {
         bytes if bytes.len() == 64 => contents.as_str(),
         bytes if bytes.len() == 65 && bytes[64] == b'\n' => &contents[..64],
@@ -801,7 +1043,9 @@ impl LockIdentity {
 }
 
 struct DaemonLock {
+    #[cfg(not(unix))]
     path: PathBuf,
+    paths: DaemonPaths,
     contents: String,
     identity: LockIdentity,
     file: Option<std::fs::File>,
@@ -821,6 +1065,13 @@ impl DaemonLock {
         options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         options.mode(0o600);
+        #[cfg(unix)]
+        let mut file = paths.open_child(
+            LOCK_FILE,
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        #[cfg(not(unix))]
         let mut file = options.open(&paths.lock)?;
         let initialize = (|| -> std::io::Result<()> {
             file.try_lock_exclusive()?;
@@ -833,7 +1084,9 @@ impl DaemonLock {
             return Err(error);
         }
         Ok(Self {
+            #[cfg(not(unix))]
             path: paths.lock.clone(),
+            paths: paths.clone(),
             contents,
             identity,
             file: Some(file),
@@ -841,8 +1094,18 @@ impl DaemonLock {
     }
 
     fn still_owned(&self) -> bool {
-        self.file.is_some()
-            && fs::read_to_string(&self.path).is_ok_and(|contents| contents == self.contents)
+        self.file.is_some() && {
+            #[cfg(unix)]
+            {
+                self.paths
+                    .read_child(LOCK_FILE)
+                    .is_ok_and(|contents| contents == self.contents.as_bytes())
+            }
+            #[cfg(not(unix))]
+            {
+                fs::read_to_string(&self.path).is_ok_and(|contents| contents == self.contents)
+            }
+        }
     }
 
     fn write_identity(&mut self, identity: LockIdentity) -> std::io::Result<()> {
@@ -880,7 +1143,7 @@ impl DaemonLock {
     fn remove_if_owned_before_release(self, after_unlink: impl FnOnce()) {
         let owned = self.still_owned();
         if owned {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.paths.remove_child(LOCK_FILE);
         }
         after_unlink();
         self.release();
@@ -997,7 +1260,7 @@ where
         return Ok(());
     }
 
-    if let Err(error) = write_metadata_atomically(&paths.metadata, &metadata) {
+    if let Err(error) = write_metadata_atomically_at(&paths, &metadata) {
         drop(listener);
         cleanup_owned(&paths, lock, &metadata).await;
         return Err(error);
@@ -1078,44 +1341,48 @@ where
 }
 
 fn clear_shutdown_request(paths: &DaemonPaths) -> anyhow::Result<()> {
-    clear_owner_file(&paths.shutdown_request, "request")
+    clear_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request")
 }
 
 fn clear_shutdown_ack(paths: &DaemonPaths) -> anyhow::Result<()> {
-    clear_owner_file(&paths.shutdown_ack, "acknowledgement")
+    clear_owner_file(paths, SHUTDOWN_ACK_FILE, "acknowledgement")
 }
 
-fn clear_owner_file(path: &Path, label: &str) -> anyhow::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => bail!(
-            "daemon shutdown {label} {} is not a regular file",
-            path.display()
-        ),
-        Ok(_) => fs::remove_file(path)
-            .with_context(|| format!("remove stale daemon shutdown {label} {}", path.display())),
+fn clear_owner_file(paths: &DaemonPaths, name: &str, label: &str) -> anyhow::Result<()> {
+    match paths.remove_regular_child(name) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("inspect daemon shutdown {label} {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("remove stale daemon shutdown {label}")),
     }
 }
 
 fn write_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::Result<()> {
-    write_owner_file(&paths.shutdown_request, "request", owner)
+    write_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request", owner)
 }
 
 fn write_shutdown_ack(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::Result<()> {
-    write_owner_file(&paths.shutdown_ack, "acknowledgement", owner)
+    write_owner_file(paths, SHUTDOWN_ACK_FILE, "acknowledgement", owner)
 }
 
-fn write_owner_file(path: &Path, label: &str, owner: &LockIdentity) -> anyhow::Result<()> {
+fn write_owner_file(
+    paths: &DaemonPaths,
+    name: &str,
+    label: &str,
+    owner: &LockIdentity,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    match options.open(path) {
+    let created = paths.open_child(
+        name,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+        Mode::from_bits_truncate(0o600),
+    );
+    #[cfg(not(unix))]
+    let created = {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        options.open(paths.ordinary_path(name))
+    };
+    match created {
         Ok(mut file) => {
             // Write directly to the final name. A concurrent publisher cannot
             // be overwritten, and a partial file is harmless: the daemon's
@@ -1125,32 +1392,15 @@ fn write_owner_file(path: &Path, label: &str, owner: &LockIdentity) -> anyhow::R
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path).with_context(|| {
-                format!(
-                    "inspect existing daemon shutdown {label} {}",
-                    path.display()
-                )
-            })?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                bail!(
-                    "daemon shutdown {label} {} is not a regular file",
-                    path.display()
-                );
-            }
-            let existing: LockIdentity = serde_json::from_slice(&fs::read(path)?)
+            let existing: LockIdentity = serde_json::from_slice(&paths.read_child(name)?)
                 .with_context(|| format!("parse existing daemon shutdown {label}"))?;
             if existing == *owner {
                 Ok(())
             } else {
-                bail!(
-                    "daemon shutdown {label} {} belongs to a different owner",
-                    path.display()
-                )
+                bail!("daemon shutdown {label} belongs to a different owner")
             }
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("create daemon shutdown {label} {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("create daemon shutdown {label}")),
     }
 }
 
@@ -1162,17 +1412,8 @@ fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
     {
         return false;
     }
-    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_request) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        eprintln!(
-            "code-graph-mcp: refusing non-regular daemon shutdown request {}",
-            paths.shutdown_request.display()
-        );
-        return false;
-    }
-    let matches = fs::read(&paths.shutdown_request)
+    let matches = paths
+        .read_child(SHUTDOWN_REQUEST_FILE)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|requested| requested == *owner);
@@ -1181,23 +1422,14 @@ fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
             eprintln!("code-graph-mcp: publish daemon shutdown acknowledgement: {error}");
             return false;
         }
-        let _ = fs::remove_file(&paths.shutdown_request);
+        let _ = paths.remove_regular_child(SHUTDOWN_REQUEST_FILE);
     }
     matches
 }
 
 fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_ack) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        eprintln!(
-            "code-graph-mcp: refusing non-regular daemon shutdown acknowledgement {}",
-            paths.shutdown_ack.display()
-        );
-        return false;
-    }
-    fs::read(&paths.shutdown_ack)
+    paths
+        .read_child(SHUTDOWN_ACK_FILE)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|acknowledged| acknowledged == *owner)
@@ -1219,7 +1451,7 @@ async fn acquire_or_detect_live_with_initial_file(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let file = match initial_file.take() {
                     Some(file) => file,
-                    None => open_existing_lock(&paths.lock).context("open existing daemon lock")?,
+                    None => open_existing_lock(paths).context("open existing daemon lock")?,
                 };
                 match file.try_lock_exclusive() {
                     Ok(()) => {}
@@ -1229,7 +1461,7 @@ async fn acquire_or_detect_live_with_initial_file(
                     Err(error) => return Err(error).context("lock existing daemon lock"),
                 }
                 #[cfg(unix)]
-                if !opened_lock_matches_path(&file, &paths.lock) {
+                if !opened_lock_matches_path(&file, paths) {
                     // The old owner may have unlinked this inode and a successor
                     // may now own the pathname. Never clean runtime state for
                     // the detached inode; restart from the current pathname.
@@ -1239,7 +1471,7 @@ async fn acquire_or_detect_live_with_initial_file(
                 }
                 #[cfg(unix)]
                 {
-                    fs::set_permissions(&paths.lock, std::fs::Permissions::from_mode(0o600))
+                    rustix_fs::fchmod(&file, Mode::from_bits_truncate(0o600))
                         .context("restrict recovered daemon lock permissions")?;
                 }
                 let previous_identity = read_lock_identity_from(&file);
@@ -1254,7 +1486,9 @@ async fn acquire_or_detect_live_with_initial_file(
                     nonce: "malformed".to_owned(),
                 });
                 let mut lock = DaemonLock {
+                    #[cfg(not(unix))]
                     path: paths.lock.clone(),
+                    paths: paths.clone(),
                     contents: format!("{}\n", serde_json::to_string(&identity)?),
                     identity,
                     file: Some(file),
@@ -1269,40 +1503,40 @@ async fn acquire_or_detect_live_with_initial_file(
 }
 
 #[cfg(unix)]
-fn opened_lock_matches_path(file: &std::fs::File, path: &Path) -> bool {
-    let Ok(current) = fs::symlink_metadata(path) else {
+fn opened_lock_matches_path(file: &std::fs::File, paths: &DaemonPaths) -> bool {
+    let Ok(current) = paths.open_child(LOCK_FILE, OFlags::RDONLY, Mode::empty()) else {
         return false;
     };
-    if current.file_type().is_symlink() || !current.is_file() {
-        return false;
-    }
     let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    let Ok(current) = current.metadata() else {
         return false;
     };
     opened.dev() == current.dev() && opened.ino() == current.ino()
 }
 
-fn open_existing_lock(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_existing_lock(paths: &DaemonPaths) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
+    let file = paths.open_child(LOCK_FILE, OFlags::RDWR, Mode::empty())?;
+    #[cfg(not(unix))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        options.open(&paths.lock)?
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::other(format!(
             "existing daemon lock {} is not a regular file",
-            path.display()
+            paths.lock.display()
         )));
     }
     #[cfg(unix)]
     if metadata.nlink() != 1 {
         return Err(std::io::Error::other(format!(
             "existing daemon lock {} has multiple links",
-            path.display()
+            paths.lock.display()
         )));
     }
     Ok(file)
@@ -1334,10 +1568,8 @@ async fn prepare_runtime_for_owner(paths: &DaemonPaths) -> bool {
         // can be removed. Unsafe entries are retained: they are unavailable to
         // this daemon, but must not redirect cleanup through a symlink or
         // mutate a non-regular repository entry.
-        remove_metadata_if_regular(&paths.metadata);
-        if paths.secret.exists() {
-            let _ = fs::remove_file(&paths.secret);
-        }
+        let _ = paths.remove_regular_child(METADATA_FILE);
+        let _ = paths.remove_regular_child(SECRET_FILE);
         return true;
     };
     // The caller already owns daemon.lock, so metadata identity is only
@@ -1352,8 +1584,8 @@ async fn cleanup_stale_runtime(paths: &DaemonPaths, _owner: Option<&LockIdentity
     // listener, while this locked identity is already known stale/malformed.
     // Metadata and TCP auth are daemon-instance state; a live UDS inode is
     // deliberately preserved for bind-time fallback handling.
-    let _ = fs::remove_file(&paths.metadata);
-    let _ = fs::remove_file(&paths.secret);
+    let _ = paths.remove_regular_child(METADATA_FILE);
+    let _ = paths.remove_regular_child(SECRET_FILE);
     let _ = clear_shutdown_request(paths);
     let _ = clear_shutdown_ack(paths);
 }
@@ -1414,7 +1646,7 @@ async fn bind_listener(
         .context("read loopback TCP daemon endpoint")?
         .to_string();
     let secret = generate_secret()?;
-    write_secret(&paths.secret, &secret)?;
+    write_secret_at(paths, &secret)?;
     Ok((
         Listener::Tcp(listener),
         DaemonMetadata::new(Transport::Tcp, endpoint, lock.identity.clone())?,
@@ -1431,17 +1663,21 @@ enum UdsBind {
 
 #[cfg(unix)]
 async fn bind_uds(paths: &DaemonPaths, lock: &DaemonLock) -> UdsBind {
-    match tokio::net::UnixListener::bind(&paths.socket) {
+    let socket = match paths.uds_bind_path() {
+        Ok(socket) => socket,
+        Err(error) => return UdsBind::Unavailable(error.into()),
+    };
+    match std::os::unix::net::UnixListener::bind(&socket) {
         Ok(listener) => secure_uds_listener(paths, listener).await,
         Err(first_error) => {
             // A pathname is never a liveness signal. Only a refused
             // connection proves that an existing socket inode is orphaned.
             let connection_refused = matches!(
-                tokio::net::UnixStream::connect(&paths.socket).await,
+                tokio::net::UnixStream::connect(&socket).await,
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused
             );
             if !connection_refused {
-                if tokio::net::UnixStream::connect(&paths.socket).await.is_ok() {
+                if tokio::net::UnixStream::connect(&socket).await.is_ok() {
                     return UdsBind::LiveListener;
                 }
                 return UdsBind::Unavailable(first_error.into());
@@ -1449,13 +1685,13 @@ async fn bind_uds(paths: &DaemonPaths, lock: &DaemonLock) -> UdsBind {
             if !lock.still_owned() {
                 return UdsBind::LiveListener;
             }
-            if !socket_inode(&paths.socket) {
+            if !socket_inode(&socket) {
                 return UdsBind::Unavailable(first_error.into());
             }
-            if let Err(error) = fs::remove_file(&paths.socket) {
+            if let Err(error) = fs::remove_file(&socket) {
                 return UdsBind::Unavailable(error.into());
             }
-            match tokio::net::UnixListener::bind(&paths.socket) {
+            match std::os::unix::net::UnixListener::bind(&socket) {
                 Ok(listener) => secure_uds_listener(paths, listener).await,
                 Err(error) => UdsBind::Unavailable(error.into()),
             }
@@ -1464,13 +1700,36 @@ async fn bind_uds(paths: &DaemonPaths, lock: &DaemonLock) -> UdsBind {
 }
 
 #[cfg(unix)]
-async fn secure_uds_listener(paths: &DaemonPaths, listener: tokio::net::UnixListener) -> UdsBind {
-    match fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600)) {
-        Ok(()) => UdsBind::Listener(listener),
+async fn secure_uds_listener(
+    paths: &DaemonPaths,
+    listener: std::os::unix::net::UnixListener,
+) -> UdsBind {
+    let result = (|| -> anyhow::Result<_> {
+        let runtime = paths.runtime_dir_for_child()?;
+        let socket = paths.uds_bind_path()?;
+        let metadata = fs::symlink_metadata(&socket)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+            bail!("daemon socket entry is no longer the bound socket");
+        }
+        // Binding has installed this path's socket inode. Capture that exact
+        // no-follow entry before chmod and require it to survive publication.
+        let before = rustix_fs::statat(&runtime.file, SOCKET_FILE, AtFlags::SYMLINK_NOFOLLOW)?;
+        // Linux does not support fchmod on an AF_UNIX listener. The no-follow
+        // entry check above rejects substitutions before this chmod; the inode
+        // comparison below rejects a replacement racing the permission step.
+        fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let after = rustix_fs::statat(&runtime.file, SOCKET_FILE, AtFlags::SYMLINK_NOFOLLOW)?;
+        if after.st_dev != before.st_dev || after.st_ino != before.st_ino {
+            bail!("daemon socket entry changed while permissions were secured");
+        }
+        listener.set_nonblocking(true)?;
+        Ok(tokio::net::UnixListener::from_std(listener)?)
+    })();
+    match result {
+        Ok(listener) => UdsBind::Listener(listener),
         Err(error) => {
-            drop(listener);
             remove_orphan_socket(paths).await;
-            UdsBind::Unavailable(error.into())
+            UdsBind::Unavailable(error)
         }
     }
 }
@@ -1482,13 +1741,16 @@ fn socket_inode(path: &Path) -> bool {
 
 #[cfg(unix)]
 async fn remove_orphan_socket(paths: &DaemonPaths) {
-    if socket_inode(&paths.socket)
+    let Ok(socket) = paths.uds_bind_path() else {
+        return;
+    };
+    if socket_inode(&socket)
         && matches!(
-            tokio::net::UnixStream::connect(&paths.socket).await,
+            tokio::net::UnixStream::connect(&socket).await,
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused
         )
     {
-        let _ = fs::remove_file(&paths.socket);
+        let _ = fs::remove_file(socket);
     }
 }
 
@@ -1515,6 +1777,7 @@ fn random_hex(byte_len: usize) -> std::io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+#[cfg_attr(unix, allow(dead_code))]
 fn write_secret(path: &Path, secret: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -1538,6 +1801,30 @@ fn write_secret(path: &Path, secret: &str) -> anyhow::Result<()> {
         let _ = fs::remove_file(path);
     }
     result
+}
+
+#[cfg(unix)]
+fn write_secret_at(paths: &DaemonPaths, secret: &str) -> anyhow::Result<()> {
+    let mut file = paths.open_child(
+        SECRET_FILE,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+        Mode::from_bits_truncate(0o600),
+    )?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(secret.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = paths.remove_child(SECRET_FILE);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_secret_at(paths: &DaemonPaths, secret: &str) -> anyhow::Result<()> {
+    write_secret(&paths.secret, secret)
 }
 
 #[cfg(windows)]
@@ -1575,6 +1862,7 @@ fn restrict_windows_path(path: &Path, permissions: &str, label: &str) -> anyhow:
     }
 }
 
+#[cfg_attr(unix, allow(dead_code))]
 fn write_metadata_atomically(path: &Path, metadata: &DaemonMetadata) -> anyhow::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -1604,6 +1892,42 @@ fn write_metadata_atomically(path: &Path, metadata: &DaemonMetadata) -> anyhow::
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(unix)]
+fn write_metadata_atomically_at(
+    paths: &DaemonPaths,
+    metadata: &DaemonMetadata,
+) -> anyhow::Result<()> {
+    let encoded = serde_json::to_vec(metadata).context("serialize daemon metadata")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = format!(".daemon-{}-{nonce}.tmp", std::process::id());
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = paths.open_child(
+            &temp,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        paths.rename_child(&temp, METADATA_FILE)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = paths.remove_child(&temp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_metadata_atomically_at(
+    paths: &DaemonPaths,
+    metadata: &DaemonMetadata,
+) -> anyhow::Result<()> {
+    write_metadata_atomically(&paths.metadata, metadata)
 }
 
 async fn serve_listener<F>(
@@ -1862,10 +2186,10 @@ async fn cleanup_owned(paths: &DaemonPaths, lock: DaemonLock, metadata: &DaemonM
         return;
     }
     if read_metadata(paths).is_ok_and(|current| current == *metadata) {
-        let _ = fs::remove_file(&paths.metadata);
+        let _ = paths.remove_regular_child(METADATA_FILE);
     }
     if metadata.transport == Transport::Tcp {
-        let _ = fs::remove_file(&paths.secret);
+        let _ = paths.remove_regular_child(SECRET_FILE);
     }
     remove_shutdown_request_if_owned(paths, &metadata.owner);
     remove_shutdown_ack_if_owned(paths, &metadata.owner);
@@ -1877,26 +2201,21 @@ async fn cleanup_owned(paths: &DaemonPaths, lock: DaemonLock, metadata: &DaemonM
 }
 
 fn remove_shutdown_request_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
-    remove_owner_file_if_owned(&paths.shutdown_request, owner);
+    remove_owner_file_if_owned(paths, SHUTDOWN_REQUEST_FILE, owner);
 }
 
 fn remove_shutdown_ack_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
-    remove_owner_file_if_owned(&paths.shutdown_ack, owner);
+    remove_owner_file_if_owned(paths, SHUTDOWN_ACK_FILE, owner);
 }
 
-fn remove_owner_file_if_owned(path: &Path, owner: &LockIdentity) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return;
-    }
-    let belongs_to_owner = fs::read(path)
+fn remove_owner_file_if_owned(paths: &DaemonPaths, name: &str, owner: &LockIdentity) {
+    let belongs_to_owner = paths
+        .read_child(name)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|requested| requested == *owner);
     if belongs_to_owner {
-        let _ = fs::remove_file(path);
+        let _ = paths.remove_regular_child(name);
     }
 }
 
@@ -2069,6 +2388,57 @@ mod tests {
         let _ = fs::remove_file(&paths.socket);
         lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uds_client_uses_its_own_runtime_descriptor_alias() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let (listener, metadata, secret) = bind_listener(&paths, &lock).await.unwrap();
+        assert_eq!(metadata.transport, Transport::Uds);
+        assert_eq!(metadata.endpoint, paths.socket.to_string_lossy());
+        assert!(paths
+            .uds_bind_path()
+            .unwrap()
+            .starts_with(format!("/proc/{}/fd/", std::process::id())));
+        let connection = connect_to_metadata(&paths, &metadata, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(connection.stream, ClientStream::Uds(_)));
+        drop(listener);
+        drop(secret);
+        let _ = paths.remove_child(SOCKET_FILE);
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_leaf_substitution_fails_without_touching_the_external_sentinel() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let socket = paths.uds_bind_path().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let sentinel = outside.join("socket-sentinel");
+        let contents = b"socket leaf sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+
+        paths.remove_child(SOCKET_FILE).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &paths.socket).unwrap();
+        assert!(matches!(
+            secure_uds_listener(&paths, listener).await,
+            UdsBind::Unavailable(_)
+        ));
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&paths.socket).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -2347,7 +2717,7 @@ mod tests {
             nonce: "old-inode".to_owned(),
         };
         fs::write(&paths.lock, serde_json::to_vec(&stale).unwrap()).unwrap();
-        let old_inode = open_existing_lock(&paths.lock).unwrap();
+        let old_inode = open_existing_lock(&paths).unwrap();
 
         fs::remove_file(&paths.lock).unwrap();
         let successor = DaemonLock::acquire(&paths).unwrap();
@@ -2740,6 +3110,112 @@ mod tests {
         fs::remove_file(&paths.runtime).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_runtime_handle_keeps_metadata_publication_out_of_a_symlink_replacement() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let sentinel = outside.join(METADATA_FILE);
+        let contents = b"external metadata sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let displaced = root.join("displaced-runtime");
+
+        fs::rename(&paths.runtime, &displaced).unwrap();
+        std::os::unix::fs::symlink(&outside, &paths.runtime).unwrap();
+
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            LockIdentity::current().unwrap(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&paths, &metadata).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&paths.runtime).unwrap();
+        fs::rename(displaced, &paths.runtime).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_runtime_descriptor_keeps_an_open_lock_out_of_a_replacement_directory() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let mut lock = DaemonLock::acquire(&paths).unwrap();
+        let sentinel = outside.join(LOCK_FILE);
+        let contents = b"external lock sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let displaced = root.join("displaced-runtime");
+
+        fs::rename(&paths.runtime, &displaced).unwrap();
+        std::os::unix::fs::symlink(&outside, &paths.runtime).unwrap();
+
+        lock.write_identity(LockIdentity::current().unwrap())
+            .unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        lock.remove_if_owned();
+        assert!(!displaced.join(LOCK_FILE).exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&paths.runtime).unwrap();
+        fs::rename(displaced, &paths.runtime).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_runtime_descriptor_survives_project_root_substitution_without_touching_external_metadata(
+    ) {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let sentinel = outside.join(METADATA_FILE);
+        let contents = b"external root substitution sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let relocated = root.with_extension("relocated");
+
+        fs::rename(&root, &relocated).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            LockIdentity::current().unwrap(),
+        )
+        .unwrap();
+        write_metadata_atomically_at(&paths, &metadata).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+
+        fs::remove_file(&root).unwrap();
+        fs::rename(&relocated, &root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_runtime_proxy_handle_is_acquired_from_the_verified_root_when_it_appears() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.open_runtime_dir_if_present().unwrap();
+        assert!(paths.runtime_dir.get().is_none());
+
+        fs::create_dir(&paths.runtime).unwrap();
+        let runtime = paths.runtime_dir_for_child().unwrap();
+        assert!(paths.runtime_dir.get().is_some());
+        assert!(runtime.file.metadata().unwrap().is_dir());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

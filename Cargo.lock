@@ -322,6 +322,7 @@ dependencies = [
  "getrandom",
  "libc",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sysinfo",
