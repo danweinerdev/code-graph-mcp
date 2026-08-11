@@ -55,6 +55,12 @@ tasks:
     justifies: "NFR-06, AC-08. The post-fix Phase 3 review found that opening a pre-existing lock follows a repository-planted symlink before truncation and that an unlocked stale identity naming a recycled live PID overrides the OS lock, enabling file overwrite and permanent recovery denial."
     verification: "On Linux, existing lock open refuses symlinks/non-regular files without touching their targets, validates the opened inode, and preserves owner-only mode; a malicious lock symlink to an external sentinel leaves the sentinel byte-identical and daemon startup fails safely. Once exclusive OS lock acquisition succeeds, stale on-disk lock/metadata identity never vetoes recovery solely because its pid/start-time appears live; tests pin unlocked-current-identity takeover while an actually held lock still returns no owner. Run daemon unit/process suites, rustfmt, clippy, and `make verify`."
     depends_on: ["3.7"]
+  - id: "3.9"
+    title: "Serialize daemon process integration tests"
+    status: complete
+    justifies: "NFR-04, AC-27. The final post-lock review reproduced metadata readiness timeouts and owner churn only when Cargo ran process-heavy daemon tests concurrently; isolated and `--test-threads=1` reruns passed, so the standard `make verify` gate is nondeterministic."
+    verification: "Add dependency-free per-test-binary serialization guards to the Linux `daemon_proxy` and `daemon_serve` process suites so their multi-process timing scenarios do not compete with sibling scenarios under Cargo's default runner. `cargo test -p code-graph-mcp --test daemon_proxy` and `--test daemon_serve` each pass repeatedly without `--test-threads=1`; full package tests and two consecutive `make verify` runs pass."
+    depends_on: ["3.8"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -391,6 +397,41 @@ Revision boundary: repository-planted lock entries cannot redirect writes outsid
 |---|---|---|---|
 | `git show 36c83ec2893850f0e8ae559cf978c653070072ad` | Complete task commit | PASS | One Linux lock-recovery slice: no-follow/regular/single-link validation, post-lock owner-mode repair, authoritative stale takeover, direct libc constant dependency, and regressions. |
 | Focused final quality review | Exact task commit plus lock callers/tests | PASS | Static repository-planted redirects and stale PID-reuse denial are closed under the owner-only runtime threat boundary; no unsafe code or native library was added. |
+
+## 3.9: Serialize daemon process integration tests
+
+### Subtasks
+- [x] Add one dependency-free serialization guard per daemon process-test binary
+- [x] Acquire the guard at every process-heavy test entry
+- [x] Run each integration binary repeatedly under Cargo's default runner
+- [x] Run full package tests and `make verify` twice
+
+### Notes
+Revision boundary: default `cargo test` and `make verify` no longer depend on host scheduling luck. Serialization is scoped to process integration binaries; unit tests remain parallel.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `18dfd7cd4dc98d278eeef68edb53ce011fbcf1da`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T06:07:04Z, matching `18dfd7cd4dc98d278eeef68edb53ce011fbcf1da`
+- Focused review: `git show 18dfd7cd4dc98d278eeef68edb53ce011fbcf1da`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `18dfd7cd4dc98d278eeef68edb53ce011fbcf1da`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp --test daemon_proxy` (three consecutive runs) | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0` each) | All 13 proxy scenarios passed under Cargo's default runner in 78.09s, 78.74s, and 77.99s. |
+| `cargo test -p code-graph-mcp --test daemon_serve` (three consecutive runs) | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0` each) | All 8 serve scenarios passed under Cargo's default runner in 66.17s, 66.12s, and 66.25s. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 32 daemon unit, 13 proxy process, 8 serve process, and 1 smoke test passed with the default runner. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.9.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 18dfd7cd4dc98d278eeef68edb53ce011fbcf1da` | Complete task commit | PASS | Only the two Linux process integration binaries changed; all 21 process tests acquire a full-scope per-binary mutex guard, with poison recovery and no production timeout/behavior edits. |
+| Focused final quality review | Exact task commit | PASS | Every process scenario is serialized as its first statement; unit tests remain parallel and no dependency was added. |
 
 ## Acceptance Criteria
 
