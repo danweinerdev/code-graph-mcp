@@ -154,6 +154,19 @@ pub(crate) async fn run_analyze_job(
             return;
         }
     };
+    if let Some(daemon_root) = inner.daemon_project_root.get() {
+        if daemon_root != &project_root {
+            finish_failed(
+                &job,
+                format!(
+                    "daemon is bound to project root {}; cannot analyze project root {}",
+                    daemon_root.display(),
+                    project_root.display()
+                ),
+            );
+            return;
+        }
+    }
     let mut warnings = cfg.resolve_concurrency();
 
     // Serialize against the watch reindex path; the slot already gates

@@ -313,6 +313,61 @@ fn child_pids(parent: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Every advertised tool must have an explicit route-valid fixture here. The
+/// exhaustive match deliberately fails to compile/test loudly when a new tool
+/// is added to `tools/list` without adding its process-level fallback route.
+fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &Path) {
+    let advertised = client.request("tools/list", json!({}));
+    let names: Vec<String> = advertised["result"]["tools"]
+        .as_array()
+        .expect("tools/list result array")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("advertised tool name")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(names.len(), 22, "expected every advertised tool");
+    let symbol = format!("{}:fallback_query", source.display());
+
+    for name in names {
+        let arguments = match name.as_str() {
+            "analyze_codebase" => json!({"path": root, "force": false}),
+            "analyze_codebase_async" => json!({"path": root, "force": false}),
+            "get_file_symbols" => json!({"file": source}),
+            "search_symbols" => json!({"query": "fallback_query"}),
+            "get_symbol_detail" => json!({"symbol": symbol}),
+            "get_symbol_summary" => json!({}),
+            "get_callers" => json!({"symbol": symbol}),
+            "get_callees" => json!({"symbol": symbol}),
+            "get_dependencies" => json!({"file": source}),
+            "detect_cycles" => json!({}),
+            "get_orphans" => json!({}),
+            "get_class_hierarchy" => json!({"class": "Missing"}),
+            "get_coupling" => json!({"file": source}),
+            "generate_diagram" => json!({"symbol": symbol}),
+            "watch_start" => json!({}),
+            "watch_stop" => json!({}),
+            "get_status" => json!({}),
+            "find_overrides" => json!({"symbol": symbol}),
+            "find_class_candidates" => json!({"name": "Missing"}),
+            "get_symbol_at" => json!({"file": source, "line": 1}),
+            "find_path" => json!({"from": symbol, "to": symbol}),
+            "detect_communities" => json!({}),
+            unexpected => panic!("new advertised tool {unexpected} needs fallback test arguments"),
+        };
+        let response = client.tool(&name, arguments);
+        assert!(
+            response["result"].is_object()
+                && response["result"]["content"].is_array()
+                && response.get("error").is_none(),
+            "{name} must route through tools/call rather than return method-not-found/unknown-tool: {response}"
+        );
+    }
+}
+
 #[cfg(debug_assertions)]
 fn process_is_alive(pid: u32) -> bool {
     Command::new("kill")
@@ -538,6 +593,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
     );
     let symbols = client.tool("get_file_symbols", json!({"file":fallback_source}));
     assert_eq!(Client::text(&symbols)["total"], 1, "fallback query works");
+    assert_all_advertised_tools_route(&mut client, &failed.0, &fallback_source);
     let stderr = client.close();
     assert_eq!(
         stderr.matches("daemon unavailable").count(),
@@ -545,6 +601,74 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
         "one fallback diagnostic"
     );
     assert!(stderr.contains("falling back to in-process stdio"));
+}
+
+#[test]
+fn daemon_project_roots_are_isolated_for_sync_and_async_analyze() {
+    let a_root = TestRoot::new(true);
+    let b_root = TestRoot::new(true);
+    let b_source = b_root.0.join("independent.rs");
+    fs::write(&b_source, "fn independently_owned() {}\n").unwrap();
+
+    let mut a = Client::spawn(&a_root.0, &[]);
+    let a_metadata = wait_metadata(&a_root);
+    let mut b = Client::spawn(&b_root.0, &[]);
+    let b_metadata = wait_metadata(&b_root);
+    assert_ne!(
+        a_metadata["pid"], b_metadata["pid"],
+        "separate configured roots have independent daemon owners"
+    );
+    let b_cache = b_root.0.join(".code-graph-cache.db");
+
+    let sync = a.tool("analyze_codebase", json!({"path": b_root.0, "force": true}));
+    assert_eq!(sync["result"]["isError"], true);
+    assert!(
+        sync["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("daemon is bound to project root")),
+        "cross-root sync analyze uses the normal user-visible failure shape: {sync}"
+    );
+    assert!(!b_cache.exists(), "daemon A must not create B's cache");
+
+    let async_kickoff = a.tool(
+        "analyze_codebase_async",
+        json!({"path": b_root.0, "force": true}),
+    );
+    assert!(async_kickoff["result"].is_object());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = Client::text(&a.tool("get_status", json!({})));
+        let job = &status["analyze_job"];
+        if job["status"] == "failed" {
+            assert!(
+                job["error"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("daemon is bound to project root")),
+                "cross-root async analyze exposes the same user-visible failure: {job}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cross-root async analyze did not reach failed terminal state"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!b_cache.exists(), "daemon A must not mutate B's cache");
+
+    let owned = b.tool("analyze_codebase", json!({"path": b_root.0, "force": true}));
+    assert!(owned["result"].is_object());
+    assert_eq!(Client::text(&owned)["files"], 1);
+    assert!(b_cache.exists(), "daemon B independently owns its cache");
+
+    a.close();
+    b.close();
+    stop_daemon(&a_metadata);
+    stop_daemon(&b_metadata);
+    wait_runtime_cleanup(&a_root.0);
+    wait_runtime_cleanup(&b_root.0);
+    a_root.disarm_daemon();
+    b_root.disarm_daemon();
 }
 
 #[cfg(debug_assertions)]

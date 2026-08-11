@@ -25,6 +25,31 @@ use serde_json::{json, Value};
 /// observed cold-start time and well below any CI watchdog.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Isolated process working directory for the direct-wire smoke. The test
+/// must never inspect or mutate the invoking user's current directory.
+struct TemporaryRoot(std::path::PathBuf);
+
+impl TemporaryRoot {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "code-graph-mcp-smoke-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create isolated smoke root");
+        Self(path)
+    }
+}
+
+impl Drop for TemporaryRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Read responses from the child stdout in a worker thread, forwarding one
 /// line at a time over a channel. Owning the reader on a single thread
 /// keeps `BufRead` semantics intact while letting the test apply a deadline
@@ -89,8 +114,11 @@ fn binary_advertises_twenty_two_tools() {
     // running this file via `rust-analyzer` directly) we fail fast with a
     // clear diagnostic rather than a generic "command not found".
     let bin = env!("CARGO_BIN_EXE_code-graph-mcp");
+    let root = TemporaryRoot::new();
 
     let mut child = Command::new(bin)
+        .arg("--no-daemon")
+        .current_dir(&root.0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -141,6 +169,10 @@ fn binary_advertises_twenty_two_tools() {
     // an orphan when the assertion fails.
     drop(stdin);
     let _ = child.wait_timeout_or_kill(Duration::from_secs(2));
+    assert!(
+        !root.0.join(".code-graph").exists(),
+        "the direct --no-daemon smoke must not leave daemon runtime state"
+    );
 
     let tools = list_resp
         .pointer("/result/tools")

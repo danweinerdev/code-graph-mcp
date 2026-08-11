@@ -854,6 +854,13 @@ async fn run_until<F>(
 where
     F: Future<Output = ()>,
 {
+    if let Err(existing_root) = server.bind_daemon_project_root(root.clone()) {
+        bail!(
+            "daemon server is already bound to project root {}; cannot start for {}",
+            existing_root.display(),
+            root.display()
+        );
+    }
     let paths = DaemonPaths::for_root(&root);
     paths.ensure_runtime_dir()?;
 
@@ -874,9 +881,9 @@ where
         return Err(error);
     }
 
-    // A stale metadata/token pair can outlive a crashed lock owner. A new
-    // lock owner removes it only after proving the recorded endpoint and
-    // process identity are both dead.
+    // A stale metadata/token pair can outlive a crashed lock owner. The OS
+    // lock is authoritative: after acquiring it, preserve runtime metadata
+    // only for a genuinely live recorded owner, never for a recycled endpoint.
     if !prepare_runtime_for_owner(&paths).await {
         lock.remove_if_owned();
         return Ok(());
@@ -1181,7 +1188,7 @@ async fn prepare_runtime_for_owner(paths: &DaemonPaths) -> bool {
         let _ = fs::remove_file(&paths.secret);
         return true;
     };
-    if probe_endpoint(&metadata).await || identity_is_alive(&metadata.owner) {
+    if identity_is_alive(&metadata.owner) {
         return false;
     }
     cleanup_stale_runtime(paths, Some(&metadata.owner)).await;
@@ -1198,26 +1205,6 @@ async fn cleanup_stale_runtime(paths: &DaemonPaths, _owner: Option<&LockIdentity
     let _ = fs::remove_file(&paths.secret);
     let _ = clear_shutdown_request(paths);
     let _ = clear_shutdown_ack(paths);
-}
-
-async fn probe_endpoint(metadata: &DaemonMetadata) -> bool {
-    match metadata.transport {
-        #[cfg(unix)]
-        Transport::Uds => tokio::net::UnixStream::connect(&metadata.endpoint)
-            .await
-            .is_ok(),
-        #[cfg(windows)]
-        Transport::Pipe => tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&metadata.endpoint)
-            .is_ok(),
-        Transport::Tcp => tokio::net::TcpStream::connect(&metadata.endpoint)
-            .await
-            .is_ok(),
-        #[cfg(not(unix))]
-        Transport::Uds => false,
-        #[cfg(not(windows))]
-        Transport::Pipe => false,
-    }
 }
 
 #[cfg(unix)]
@@ -2414,6 +2401,62 @@ mod tests {
         assert!(prepare_runtime_for_owner(&paths).await);
         assert!(!paths.metadata.exists());
         assert!(!paths.secret.exists());
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn locked_owner_discards_dead_metadata_with_a_recycled_tcp_endpoint() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let unrelated_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_owner = LockIdentity {
+            pid: 99_999_999,
+            start_time: 0,
+            nonce: "dead-owner".to_owned(),
+        };
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            unrelated_listener.local_addr().unwrap().to_string(),
+            dead_owner,
+        )
+        .unwrap();
+
+        // Simulate stale metadata arriving after this contender acquired the
+        // authoritative OS lock. The accepting TCP listener is unrelated and
+        // must not block stale runtime cleanup.
+        write_metadata_atomically(&paths.metadata, &metadata).unwrap();
+        fs::write(&paths.secret, b"stale token\n").unwrap();
+        assert!(prepare_runtime_for_owner(&paths).await);
+        assert!(!paths.metadata.exists());
+        assert!(!paths.secret.exists());
+
+        drop(unrelated_listener);
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn locked_owner_retains_metadata_for_a_genuinely_live_owner() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            lock.identity.clone(),
+        )
+        .unwrap();
+        write_metadata_atomically(&paths.metadata, &metadata).unwrap();
+        fs::write(&paths.secret, b"live token\n").unwrap();
+
+        assert!(!prepare_runtime_for_owner(&paths).await);
+        assert!(paths.metadata.exists());
+        assert!(paths.secret.exists());
+
         lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }

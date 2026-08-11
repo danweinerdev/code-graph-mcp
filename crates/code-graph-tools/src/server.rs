@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use code_graph_core::RootConfig;
 use code_graph_graph::Graph;
@@ -396,6 +396,9 @@ pub struct ServerInner {
     /// Project root owning the active cache. Unlike `root_path`, this is not
     /// the invocation/watch scope and may be an ancestor with nested config.
     pub cache_root: PlRwLock<Option<PathBuf>>,
+    /// Daemon-only immutable project-root boundary. Direct in-process servers
+    /// leave this unset and may analyze any discovered project root.
+    pub daemon_project_root: OnceLock<PathBuf>,
     /// Active watcher, if any. Populated by
     /// [`crate::handlers::watch::watch_start`] and cleared by
     /// [`crate::handlers::watch::watch_stop`].
@@ -455,6 +458,7 @@ impl CodeGraphServer {
                 index_lock: TokioMutex::new(()),
                 root_path: PlRwLock::new(None),
                 cache_root: PlRwLock::new(None),
+                daemon_project_root: OnceLock::new(),
                 watch: PlRwLock::new(None),
                 config: PlRwLock::new(RootConfig::default()),
                 index_built_at: AtomicU64::new(0),
@@ -479,6 +483,13 @@ impl CodeGraphServer {
     /// tests reach for this helper instead.
     pub fn tool_descriptors(&self) -> Vec<rmcp::model::Tool> {
         self.tool_router.list_all()
+    }
+
+    /// Bind this server instance to one daemon project root for its lifetime.
+    /// Daemon startup calls this once before accepting connections; direct
+    /// stdio servers intentionally leave the optional boundary unset.
+    pub fn bind_daemon_project_root(&self, root: PathBuf) -> Result<(), PathBuf> {
+        self.inner.daemon_project_root.set(root)
     }
 
     /// Returns `Ok(())` if a codebase has been indexed; otherwise returns
