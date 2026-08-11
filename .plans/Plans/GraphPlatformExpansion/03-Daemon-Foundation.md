@@ -75,7 +75,7 @@ tasks:
     depends_on: ["3.10"]
   - id: "3.12"
     title: "Anchor daemon runtime operations to a verified directory"
-    status: planned
+    status: complete
     justifies: "NFR-06. The final frozen review found a pathname substitution window after `.code-graph` validation, allowing later permission and child-entry operations to escape the repository-local runtime boundary."
     verification: "On Linux, retain a no-follow verified handle to the runtime directory and perform owner-permission and fixed child-entry operations relative to that handle so renaming/replacing `.code-graph` cannot redirect mutation. Deterministic substitution tests preserve external sentinels and fail or retry safely. Run focused daemon tests, rustfmt, clippy, and `make verify`."
     depends_on: ["3.11"]
@@ -536,9 +536,9 @@ Revision boundary: static repository entries cannot block metadata discovery, fa
 ## 3.12: Anchor daemon runtime operations to a verified directory
 
 ### Subtasks
-- [ ] Introduce a Linux no-follow runtime-directory handle
-- [ ] Route permission and fixed child-entry operations through the verified handle
-- [ ] Add deterministic directory-substitution and external-sentinel regressions
+- [x] Introduce a Linux no-follow runtime-directory handle
+- [x] Route permission and fixed child-entry operations through the verified handle
+- [x] Add deterministic directory-substitution and external-sentinel regressions
 
 ### Notes
 
@@ -546,7 +546,26 @@ Revision boundary: Linux daemon runtime mutation remains anchored to the origina
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `201e2f7454a310393c6ef8c88d33b3759a8d0965`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T17:00:45Z, matching `201e2f7454a310393c6ef8c88d33b3759a8d0965`
+- Focused review: `git show 201e2f7454a310393c6ef8c88d33b3759a8d0965`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `201e2f7454a310393c6ef8c88d33b3759a8d0965`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon:: -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 44 daemon tests passed, including absent-runtime lazy anchoring, project/runtime substitution, retained lock cleanup, metadata publication, UDS self-descriptor attachment, and socket sentinel preservation. |
+| `cargo test -p code-graph-mcp --test daemon_serve && cargo test -p code-graph-mcp --test daemon_proxy` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | All 8 explicit-daemon and 13 proxy process scenarios passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.12.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace, snapshot, and plugin-mirror verification passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 201e2f7454a310393c6ef8c88d33b3759a8d0965` | Complete task commit | PASS | Linux ordinary runtime files use a retained root-relative directory capability and descriptor-relative operations; procfd is confined to Tokio's UDS pathname boundary; prior Windows validation is preserved. |
+| Independent focused quality and blind-spots reviews | Complete task diff plus callers/tests | PASS | Root/runtime replacement, first-start lazy anchoring, lock cleanup, UDS self-aliasing, Windows cfg lint, and procfs-independent ordinary recovery findings were fixed. The remaining same-UID socket chmod race grants no capability beyond that UID's existing ownership; 0700 prevents the cross-UID scenario and inode revalidation prevents publication after replacement. |
 
 ## 3.13: Bound every daemon runtime-record read
 

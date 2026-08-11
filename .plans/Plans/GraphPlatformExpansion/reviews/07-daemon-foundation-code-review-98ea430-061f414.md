@@ -32,7 +32,7 @@ findings:
   - id: F-01
     severity: major
     title: "Runtime-directory validation is pathname-TOCTOU vulnerable"
-    status: open
+    status: fixed
   - id: F-02
     severity: major
     title: "Lock and shutdown records use unbounded path-reopened reads"
@@ -109,3 +109,6 @@ followups:
 
 ### F-04 — rejected (2026-08-11)
 The quality lane correctly identified a possible last-writer-wins race, but the approved daemon design explicitly excludes shared cache-file locking between daemon and direct/in-process processes. `--no-daemon` already permits the same coexistence, and Phase 3 did not introduce a second cache-ownership contract. Changing fallback persistence semantics would expand scope beyond the governing non-goal rather than repair drift in this phase.
+
+### F-01 — fixed (2026-08-11)
+Task 3.12 commit `201e2f7454a310393c6ef8c88d33b3759a8d0965` establishes `.code-graph` relative to a verified project-root descriptor, retains the runtime capability immutably, and routes ordinary runtime child operations and lock cleanup through descriptor-relative Rustix calls. Linux UDS uses a per-process descriptor alias only at Tokio's pathname API boundary. Root/runtime substitution regressions preserve external sentinels, and prior Windows validation remains intact.
