@@ -35,6 +35,9 @@ const SOCKET_FILE: &str = "daemon.sock";
 const SHUTDOWN_REQUEST_FILE: &str = "shutdown.request";
 const SHUTDOWN_ACK_FILE: &str = "shutdown.ack";
 const MAX_METADATA_BYTES: usize = 64 * 1024;
+const MAX_LOCK_RECORD_BYTES: usize = 4 * 1024;
+const MAX_SHUTDOWN_RECORD_BYTES: usize = 4 * 1024;
+const MAX_SECRET_RECORD_BYTES: usize = 65;
 const AUTH_PREFIX: &[u8] = b"CG-AUTH ";
 const AUTH_ACK: &[u8] = b"CG-OK\n";
 const AUTH_LINE_LEN: usize = 73;
@@ -272,12 +275,25 @@ impl DaemonPaths {
         Ok(rustix_fs::renameat(&runtime.file, from, &runtime.file, to)?)
     }
 
-    #[cfg(unix)]
-    fn read_child(&self, name: &str) -> std::io::Result<Vec<u8>> {
-        let mut file = self.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
-        Ok(contents)
+    /// Reads one daemon record through the retained runtime-directory
+    /// descriptor. The opened inode, rather than a path re-resolution, is the
+    /// object that is checked and read on Unix.
+    fn read_bounded_record(
+        &self,
+        name: &str,
+        max_bytes: usize,
+        require_single_link: bool,
+    ) -> anyhow::Result<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            let path = self.runtime.join(name);
+            let file = self.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
+            read_bounded_record_from(file, &path, max_bytes, require_single_link)
+        }
+        #[cfg(not(unix))]
+        {
+            read_bounded_record_path(&self.ordinary_path(name), max_bytes, require_single_link)
+        }
     }
 
     #[cfg(unix)]
@@ -302,11 +318,6 @@ impl DaemonPaths {
             SHUTDOWN_ACK_FILE => self.shutdown_ack.clone(),
             _ => self.runtime.join(name),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn read_child(&self, name: &str) -> std::io::Result<Vec<u8>> {
-        fs::read(self.ordinary_path(name))
     }
 
     #[cfg(not(unix))]
@@ -490,37 +501,29 @@ fn sha_compatible_with(
 }
 
 fn read_metadata(paths: &DaemonPaths) -> anyhow::Result<DaemonMetadata> {
-    #[cfg(unix)]
-    let encoded = read_metadata_payload_file(
-        paths.open_child(
-            METADATA_FILE,
-            OFlags::RDONLY | OFlags::NONBLOCK,
-            Mode::empty(),
-        )?,
-        &paths.metadata,
-    )?;
-    #[cfg(not(unix))]
-    let encoded = read_metadata_payload(&paths.metadata)?;
+    let encoded = paths.read_bounded_record(METADATA_FILE, MAX_METADATA_BYTES, false)?;
     serde_json::from_slice(&encoded).context("parse daemon metadata")
 }
 
-/// Reads daemon metadata only from a bounded, regular file. The initial
-/// symlink-metadata check rejects repository-planted special entries before an
-/// open can block; Unix opens also refuse a symlink substituted after that
-/// check. `O_NONBLOCK` keeps a racing FIFO from stalling daemon discovery.
+/// Path-based fallback used outside Unix and by the static-entry regression.
+/// Runtime callers on Unix instead open relative to the retained directory
+/// descriptor through [`DaemonPaths::read_bounded_record`].
 #[cfg_attr(unix, allow(dead_code))]
 fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
+    read_bounded_record_path(path, MAX_METADATA_BYTES, false)
+}
+
+/// Opens a record by path only where descriptor-relative opening is not
+/// available. The initial check avoids opening a static special entry; the
+/// descriptor reader repeats validation after open to close substitution races.
+fn read_bounded_record_path(
+    path: &Path,
+    max_bytes: usize,
+    require_single_link: bool,
+) -> anyhow::Result<Vec<u8>> {
     let entry = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect daemon metadata {}", path.display()))?;
-    if entry.file_type().is_symlink() || !entry.is_file() {
-        bail!("daemon metadata {} is not a regular file", path.display());
-    }
-    if entry.len() > MAX_METADATA_BYTES as u64 {
-        bail!(
-            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
-            path.display()
-        );
-    }
+        .with_context(|| format!("inspect daemon runtime record {}", path.display()))?;
+    validate_bounded_record_metadata(&entry, path, max_bytes, require_single_link)?;
 
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -531,47 +534,63 @@ fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options
         .open(path)
-        .with_context(|| format!("open daemon metadata {}", path.display()))?;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("inspect opened daemon metadata {}", path.display()))?;
-    if !opened.is_file() {
-        bail!("daemon metadata {} is not a regular file", path.display());
-    }
-    if opened.len() > MAX_METADATA_BYTES as u64 {
-        bail!(
-            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
-            path.display()
-        );
-    }
+        .with_context(|| format!("open daemon runtime record {}", path.display()))?;
 
-    read_metadata_payload_file(file, path)
+    read_bounded_record_from(file, path, max_bytes, require_single_link)
 }
 
-fn read_metadata_payload_file(file: std::fs::File, path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Reads at most `max_bytes + 1` bytes from an already-open daemon JSON
+/// record. The descriptor is validated after opening so a replacement cannot
+/// turn a validated pathname into a special file or an external target.
+fn read_bounded_record_from(
+    file: std::fs::File,
+    path: &Path,
+    max_bytes: usize,
+    require_single_link: bool,
+) -> anyhow::Result<Vec<u8>> {
     let opened = file
         .metadata()
-        .with_context(|| format!("inspect opened daemon metadata {}", path.display()))?;
-    if !opened.is_file() {
-        bail!("daemon metadata {} is not a regular file", path.display());
-    }
-    if opened.len() > MAX_METADATA_BYTES as u64 {
-        bail!(
-            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
-            path.display()
-        );
-    }
+        .with_context(|| format!("inspect opened daemon runtime record {}", path.display()))?;
+    validate_bounded_record_metadata(&opened, path, max_bytes, require_single_link)?;
     let mut encoded = Vec::with_capacity(opened.len() as usize);
-    file.take((MAX_METADATA_BYTES + 1) as u64)
+    file.take((max_bytes + 1) as u64)
         .read_to_end(&mut encoded)
-        .with_context(|| format!("read daemon metadata {}", path.display()))?;
-    if encoded.len() > MAX_METADATA_BYTES {
+        .with_context(|| format!("read daemon runtime record {}", path.display()))?;
+    if encoded.len() > max_bytes {
         bail!(
-            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
+            "daemon runtime record {} exceeds {max_bytes}-byte limit",
             path.display()
         );
     }
     Ok(encoded)
+}
+
+fn validate_bounded_record_metadata(
+    metadata: &fs::Metadata,
+    path: &Path,
+    max_bytes: usize,
+    require_single_link: bool,
+) -> anyhow::Result<()> {
+    if !metadata.is_file() {
+        bail!(
+            "daemon runtime record {} is not a regular file",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if require_single_link && metadata.nlink() != 1 {
+        bail!(
+            "daemon runtime record {} has multiple links",
+            path.display()
+        );
+    }
+    if metadata.len() > max_bytes as u64 {
+        bail!(
+            "daemon runtime record {} exceeds {max_bytes}-byte limit",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn report_tcp_fallback(metadata: &DaemonMetadata) {
@@ -582,20 +601,16 @@ fn report_tcp_fallback(metadata: &DaemonMetadata) {
 
 #[cfg_attr(unix, allow(dead_code))]
 fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect daemon lock {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("daemon lock {} is not a regular file", path.display());
-    }
-    serde_json::from_slice(&fs::read(path)?)
-        .with_context(|| format!("parse daemon lock {}", path.display()))
+    serde_json::from_slice(&read_bounded_record_path(
+        path,
+        MAX_LOCK_RECORD_BYTES,
+        true,
+    )?)
+    .with_context(|| format!("parse daemon lock {}", path.display()))
 }
 
 fn read_lock_identity_child(paths: &DaemonPaths) -> anyhow::Result<LockIdentity> {
-    #[cfg(unix)]
-    let encoded = paths.read_child(LOCK_FILE)?;
-    #[cfg(not(unix))]
-    let encoded = fs::read(&paths.lock)?;
+    let encoded = paths.read_bounded_record(LOCK_FILE, MAX_LOCK_RECORD_BYTES, true)?;
     serde_json::from_slice(&encoded).context("parse daemon lock")
 }
 
@@ -615,10 +630,17 @@ fn metadata_owner_is_active(paths: &DaemonPaths, metadata: &DaemonMetadata) -> b
 
 fn lock_is_actively_held(paths: &DaemonPaths) -> bool {
     #[cfg(unix)]
-    let file = match paths.open_child(LOCK_FILE, OFlags::RDWR, Mode::empty()) {
+    let file = match paths.open_child(LOCK_FILE, OFlags::RDWR | OFlags::NONBLOCK, Mode::empty()) {
         Ok(file) => file,
         Err(_) => return false,
     };
+    #[cfg(unix)]
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
+    {
+        return false;
+    }
     #[cfg(not(unix))]
     let file = {
         let path = &paths.lock;
@@ -704,13 +726,22 @@ fn replace_stale_shutdown_request(
     paths: &DaemonPaths,
     rejected: &LockIdentity,
 ) -> anyhow::Result<()> {
-    let existing: LockIdentity =
-        serde_json::from_slice(&match paths.read_child(SHUTDOWN_REQUEST_FILE) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        })
-        .context("parse existing daemon shutdown request")?;
+    let existing: LockIdentity = serde_json::from_slice(&match paths.read_bounded_record(
+        SHUTDOWN_REQUEST_FILE,
+        MAX_SHUTDOWN_RECORD_BYTES,
+        false,
+    ) {
+        Ok(contents) => contents,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    })
+    .context("parse existing daemon shutdown request")?;
     if existing == *rejected {
         return Ok(());
     }
@@ -894,12 +925,12 @@ async fn connect_to_metadata(
 fn read_client_secret(paths: &DaemonPaths) -> anyhow::Result<String> {
     // The token is immediately copied into the auth prelude. Do not accept
     // whitespace or alternate encodings around the owner-only file contents.
-    #[cfg(unix)]
-    let contents =
-        String::from_utf8(paths.read_child(SECRET_FILE)?).context("read daemon TCP secret")?;
-    #[cfg(not(unix))]
-    let contents = fs::read_to_string(&paths.secret)
-        .with_context(|| format!("read daemon TCP secret {}", paths.secret.display()))?;
+    let contents = String::from_utf8(paths.read_bounded_record(
+        SECRET_FILE,
+        MAX_SECRET_RECORD_BYTES,
+        false,
+    )?)
+    .context("read daemon TCP secret")?;
     let token = match contents.as_bytes() {
         bytes if bytes.len() == 64 => contents.as_str(),
         bytes if bytes.len() == 65 && bytes[64] == b'\n' => &contents[..64],
@@ -1094,18 +1125,11 @@ impl DaemonLock {
     }
 
     fn still_owned(&self) -> bool {
-        self.file.is_some() && {
-            #[cfg(unix)]
-            {
-                self.paths
-                    .read_child(LOCK_FILE)
-                    .is_ok_and(|contents| contents == self.contents.as_bytes())
-            }
-            #[cfg(not(unix))]
-            {
-                fs::read_to_string(&self.path).is_ok_and(|contents| contents == self.contents)
-            }
-        }
+        self.file.is_some()
+            && self
+                .paths
+                .read_bounded_record(LOCK_FILE, MAX_LOCK_RECORD_BYTES, true)
+                .is_ok_and(|contents| contents == self.contents.as_bytes())
     }
 
     fn write_identity(&mut self, identity: LockIdentity) -> std::io::Result<()> {
@@ -1392,8 +1416,12 @@ fn write_owner_file(
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing: LockIdentity = serde_json::from_slice(&paths.read_child(name)?)
-                .with_context(|| format!("parse existing daemon shutdown {label}"))?;
+            let existing: LockIdentity = serde_json::from_slice(&paths.read_bounded_record(
+                name,
+                MAX_SHUTDOWN_RECORD_BYTES,
+                false,
+            )?)
+            .with_context(|| format!("parse existing daemon shutdown {label}"))?;
             if existing == *owner {
                 Ok(())
             } else {
@@ -1413,7 +1441,7 @@ fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
         return false;
     }
     let matches = paths
-        .read_child(SHUTDOWN_REQUEST_FILE)
+        .read_bounded_record(SHUTDOWN_REQUEST_FILE, MAX_SHUTDOWN_RECORD_BYTES, false)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|requested| requested == *owner);
@@ -1429,7 +1457,7 @@ fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
 
 fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
     paths
-        .read_child(SHUTDOWN_ACK_FILE)
+        .read_bounded_record(SHUTDOWN_ACK_FILE, MAX_SHUTDOWN_RECORD_BYTES, false)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|acknowledged| acknowledged == *owner)
@@ -1504,7 +1532,8 @@ async fn acquire_or_detect_live_with_initial_file(
 
 #[cfg(unix)]
 fn opened_lock_matches_path(file: &std::fs::File, paths: &DaemonPaths) -> bool {
-    let Ok(current) = paths.open_child(LOCK_FILE, OFlags::RDONLY, Mode::empty()) else {
+    let Ok(current) = paths.open_child(LOCK_FILE, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())
+    else {
         return false;
     };
     let Ok(opened) = file.metadata() else {
@@ -1513,12 +1542,17 @@ fn opened_lock_matches_path(file: &std::fs::File, paths: &DaemonPaths) -> bool {
     let Ok(current) = current.metadata() else {
         return false;
     };
-    opened.dev() == current.dev() && opened.ino() == current.ino()
+    opened.is_file()
+        && opened.nlink() == 1
+        && current.is_file()
+        && current.nlink() == 1
+        && opened.dev() == current.dev()
+        && opened.ino() == current.ino()
 }
 
 fn open_existing_lock(paths: &DaemonPaths) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
-    let file = paths.open_child(LOCK_FILE, OFlags::RDWR, Mode::empty())?;
+    let file = paths.open_child(LOCK_FILE, OFlags::RDWR | OFlags::NONBLOCK, Mode::empty())?;
     #[cfg(not(unix))]
     let file = {
         let mut options = OpenOptions::new();
@@ -1545,8 +1579,8 @@ fn open_existing_lock(paths: &DaemonPaths) -> std::io::Result<std::fs::File> {
 fn read_lock_identity_from(file: &std::fs::File) -> Option<LockIdentity> {
     let mut file = file.try_clone().ok()?;
     file.seek(SeekFrom::Start(0)).ok()?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents).ok()?;
+    let contents =
+        read_bounded_record_from(file, Path::new(LOCK_FILE), MAX_LOCK_RECORD_BYTES, true).ok()?;
     serde_json::from_slice(&contents).ok()
 }
 
@@ -2210,7 +2244,7 @@ fn remove_shutdown_ack_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
 
 fn remove_owner_file_if_owned(paths: &DaemonPaths, name: &str, owner: &LockIdentity) {
     let belongs_to_owner = paths
-        .read_child(name)
+        .read_bounded_record(name, MAX_SHUTDOWN_RECORD_BYTES, false)
         .ok()
         .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|requested| requested == *owner);
@@ -2366,6 +2400,114 @@ mod tests {
         assert_eq!(fs::read(&paths.metadata).unwrap(), contents);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_lock_record_fails_bounded_without_mutation() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let contents = vec![b'x'; MAX_LOCK_RECORD_BYTES + 1];
+        fs::write(&paths.lock, &contents).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(read_lock_identity_child(&paths).is_err());
+        let opened = open_existing_lock(&paths).unwrap();
+        assert!(
+            read_lock_identity_from(&opened).is_none(),
+            "an already-open oversized lock is bounded too"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "oversized lock record fails without blocking"
+        );
+        assert_eq!(fs::read(&paths.lock).unwrap(), contents);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_shutdown_records_fail_bounded_without_mutation() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let owner = LockIdentity::current().unwrap();
+        let request = vec![b'r'; MAX_SHUTDOWN_RECORD_BYTES + 1];
+        let acknowledgement = vec![b'a'; MAX_SHUTDOWN_RECORD_BYTES + 1];
+        fs::write(&paths.shutdown_request, &request).unwrap();
+        fs::write(&paths.shutdown_ack, &acknowledgement).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(write_shutdown_request(&paths, &owner).is_err());
+        assert!(!accept_shutdown_request(&paths, &owner));
+        assert!(!shutdown_ack_matches(&paths, &owner));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "oversized shutdown records fail without blocking"
+        );
+        assert_eq!(fs::read(&paths.shutdown_request).unwrap(), request);
+        assert_eq!(fs::read(&paths.shutdown_ack).unwrap(), acknowledgement);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_secret_record_fails_bounded_without_mutation() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let contents = vec![b'a'; MAX_SECRET_RECORD_BYTES + 1];
+        fs::write(&paths.secret, &contents).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(read_client_secret(&paths).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "oversized secret record fails without blocking"
+        );
+        assert_eq!(fs::read(&paths.secret).unwrap(), contents);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_lock_record_descriptor_fails_without_touching_the_symlink_target() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let owner = LockIdentity::current().unwrap();
+        fs::write(&paths.lock, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let opened = paths
+            .open_child(LOCK_FILE, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())
+            .unwrap();
+        let sentinel = outside.join("lock-sentinel");
+        let contents = b"external lock record sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+
+        fs::remove_file(&paths.lock).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &paths.lock).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(
+            read_bounded_record_from(opened, &paths.lock, MAX_LOCK_RECORD_BYTES, true,).is_err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a substituted lock record fails without blocking"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        assert!(fs::symlink_metadata(&paths.lock)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[tokio::test]
