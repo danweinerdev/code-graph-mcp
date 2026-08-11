@@ -164,7 +164,7 @@ A consequence worth stating: because the proxy is byte-level, protocol version s
 
 **Context:** FR-38 – FR-40 and NFR-06/07. (Resolves the spec's OQ-02.)
 
-**Decision:** POSIX uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`; Windows uses a named pipe with the operating system's default ACL. If the preferred transport cannot be established, fall back to a TCP listener bound to `127.0.0.1:0`, and require clients to present a per-instance secret stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison, before the stream reaches rmcp's MCP codec; this is transport authentication, not a second graph-query protocol. On Windows the token file is restricted with built-in `icacls`. The transport in use is recorded in `daemon.json`, and the fallback is reported rather than silent.
+**Decision:** POSIX uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`; Windows uses a named pipe with the operating system's default ACL. If the preferred transport cannot be established, fall back to a TCP listener bound to `127.0.0.1:0`, and require clients to present a per-instance secret stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison; after successful validation, the daemon acknowledges with `CG-OK\n` before either side passes the stream to rmcp's MCP codec. Both lines are transport authentication, not a second graph-query protocol. On Windows the token file is restricted with built-in `icacls`. The transport in use is recorded in `daemon.json`, and the fallback is reported rather than silent.
 
 **Rationale:** A Unix socket and a named pipe both carry OS-level access control, so NFR-06 is satisfied by the filesystem/pipe ACL with no application-level auth. Loopback TCP does **not** — binding `127.0.0.1` excludes other machines but not other users on this machine — so the fallback must add a secret to hold the same property. The fallback exists because a socket file cannot always be created inside the repository: some network filesystems and container bind-mounts refuse it. Recording the transport in metadata rather than probing means the client connects on the first attempt and never rattles a door the daemon isn't serving (FR-40).
 
@@ -259,7 +259,7 @@ This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent se
 | Condition | Behaviour |
 |---|---|
 | No daemon and spawn fails | Serve in-process and report the fallback (FR-16). Never fail the session. |
-| Daemon dies mid-session | The client's socket read fails; surface as a tool error and fall back in-process for subsequent calls rather than terminating. |
+| Daemon dies mid-session | The established byte proxy reaches socket EOF/error and ends; a newly launched stdio session retries attachment and falls back in-process if the daemon remains unavailable. The proxy cannot synthesize a tool error or switch an already-initialized MCP session without parsing protocol frames, which Decision 2 deliberately forbids. |
 | `daemon.json` present, endpoint dead | Treat as absent, remove stale metadata, proceed to the spawn path. |
 | Lock held by a live starter | Retry connect with bounded backoff, then fall back in-process. |
 | Lock held by a dead pid | Remove and retry once. |

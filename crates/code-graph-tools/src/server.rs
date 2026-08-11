@@ -1801,7 +1801,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Start watching the indexed directory for file changes and auto-reindex modified files"
+        description = "Start watching the indexed directory for file changes and auto-reindex modified files. In daemon mode this watch is shared by every attached session; if another session already started it, the existing watch remains active."
     )]
     async fn watch_start(
         &self,

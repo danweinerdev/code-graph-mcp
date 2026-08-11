@@ -1,10 +1,11 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 131
 expression: "tool_entry(\"watch_start\")"
 ---
 {
   "name": "watch_start",
-  "description": "Start watching the indexed directory for file changes and auto-reindex modified files",
+  "description": "Start watching the indexed directory for file changes and auto-reindex modified files. In daemon mode this watch is shared by every attached session; if another session already started it, the existing watch remains active.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Empty parameter struct for tools that take no arguments\n(`detect_cycles`, `watch_start`, `watch_stop`). The empty `{}` JSON\nobject deserializes into this without error.",

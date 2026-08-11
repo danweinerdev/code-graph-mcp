@@ -21,7 +21,7 @@ tasks:
     depends_on: ["3.1"]
   - id: "3.3"
     title: "Proxy mode behind [daemon].enabled, default off"
-    status: planned
+    status: in-progress
     justifies: "FR-08, FR-09, FR-14, FR-15, FR-16, AC-04, AC-10, AC-30, AC-31. Shipping the proxy default-off is what lets the byte-pump and shared-state behaviour be exercised in the real harness before it becomes everyone's default path."
     verification: "Integration tests — with the flag on, two clients on one root share an index: one runs analyze_codebase and the other queries without indexing (AC-04); a file edit triggers exactly one watcher and both clients see it (AC-30); session B observes session A's analyze job in get_status including progress and terminal result (AC-31); with the daemon prevented from starting, every existing tool answers in-process and the fallback is reported (AC-10)."
     depends_on: ["3.2"]
@@ -110,7 +110,7 @@ Loopback TCP does **not** by itself restrict access to the invoking user — tha
 
 The amended implementation boundary uses daemon-owned locking, a pre-MCP TCP authentication prelude, binary-crate-only platform dependencies, tests under `code-graph-mcp`, Ctrl-C cleanup in this task, and contender-only concurrency here with real client convergence deferred to 3.3.
 
-The amended spec pins the remaining platform details: `CG-AUTH <64 lowercase hex>\n`, a 73-byte cap, a two-second timeout, constant-time comparison, safe `sysinfo` identity checks, crash-released `fs2` locking, default named-pipe ACLs, and built-in `icacls` for owner-only Windows token-file access. The binary uses `getrandom` / `sysinfo` / `fs2`, not direct unsafe `windows-sys` calls.
+The amended spec pins the remaining platform details: `CG-AUTH <64 lowercase hex>\n`, a 73-byte cap, a two-second timeout, constant-time comparison, and the daemon's successful transport-auth acknowledgement `CG-OK\n` before MCP framing begins. These lines are transport authentication, not a graph protocol. It also pins safe `sysinfo` identity checks, crash-released `fs2` locking, default named-pipe ACLs, and built-in `icacls` for owner-only Windows token-file access. The binary uses `getrandom` / `sysinfo` / `fs2`, not direct unsafe `windows-sys` calls.
 
 The Linux host has the Rust Windows target installed, but a cross-target check stops in the six tree-sitter grammar build scripts because native MSVC `lib.exe` is unavailable. Native Windows named-pipe and `icacls` runtime exercise remains assigned to task 3.5 / AC-42, matching the workspace's native-per-target build policy.
 

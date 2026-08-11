@@ -216,6 +216,11 @@ fn tcp_mcp(endpoint: &str, token: &str) {
     stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
     writeln!(stream, "CG-AUTH {token}").expect("write TCP authentication");
     stream.flush().expect("flush TCP authentication");
+    let mut acknowledgement = [0_u8; 6];
+    stream
+        .read_exact(&mut acknowledgement)
+        .expect("read TCP authentication acknowledgement");
+    assert_eq!(&acknowledgement, b"CG-OK\n");
     mcp_round_trip(stream.try_clone().unwrap(), stream);
 }
 

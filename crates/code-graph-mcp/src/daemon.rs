@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use fs2::FileExt;
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
@@ -26,9 +27,15 @@ const METADATA_FILE: &str = "daemon.json";
 const SECRET_FILE: &str = "secret";
 const SOCKET_FILE: &str = "daemon.sock";
 const AUTH_PREFIX: &[u8] = b"CG-AUTH ";
+const AUTH_ACK: &[u8] = b"CG-OK\n";
 const AUTH_LINE_LEN: usize = 73;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_CONNECTIONS: usize = 128;
+const PROXY_ATTACH_DEADLINE: Duration = Duration::from_secs(4);
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROXY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const PROXY_MAX_SPAWN_BACKOFF: Duration = Duration::from_secs(1);
+const PROXY_LOSER_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 struct DaemonPaths {
@@ -105,6 +112,278 @@ impl DaemonPaths {
         #[cfg(windows)]
         restrict_windows_runtime_dir(&self.runtime)?;
         Ok(())
+    }
+}
+
+/// Attaches the invoking stdio process to the repository-local daemon.
+///
+/// The caller has already discovered `root` with [`RootConfig::load`]. This
+/// function intentionally does not create `.code-graph`: disabled/direct
+/// invocations must remain indistinguishable from the pre-daemon binary.
+/// Every retry reads metadata and probes its recorded endpoint anew, because a
+/// competing daemon can publish between any two attempts.
+pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
+    let paths = DaemonPaths::for_root(&root);
+    let deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
+    let mut last_error = None;
+    let mut contender = None;
+    let mut next_spawn_at = std::time::Instant::now();
+    let mut spawn_backoff = PROXY_RETRY_INTERVAL;
+
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match connect_from_metadata(&paths, remaining.min(PROXY_CONNECT_TIMEOUT)).await {
+            Ok(connection) => {
+                settle_contender(contender, connection.pid).await;
+                return finish_proxy(connection.stream).await;
+            }
+            Err(error) => last_error = Some(error),
+        }
+
+        if contender.as_mut().is_some_and(contender_exited) {
+            // `try_wait` reaped the naturally exiting loser. Only now may a
+            // new contender be started; a slow starter is never killed just
+            // because its first metadata probe missed publication.
+            contender = None;
+            next_spawn_at = std::time::Instant::now() + spawn_backoff;
+            spawn_backoff = spawn_backoff.saturating_mul(2).min(PROXY_MAX_SPAWN_BACKOFF);
+        }
+        if contender.is_none() && std::time::Instant::now() >= next_spawn_at {
+            match spawn_contender(&root).await {
+                Ok(child) => {
+                    contender = Some(child);
+                    spawn_backoff = PROXY_RETRY_INTERVAL;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    next_spawn_at = std::time::Instant::now() + spawn_backoff;
+                    spawn_backoff = spawn_backoff.saturating_mul(2).min(PROXY_MAX_SPAWN_BACKOFF);
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let until_spawn = next_spawn_at.saturating_duration_since(std::time::Instant::now());
+        tokio::time::sleep(remaining.min(PROXY_RETRY_INTERVAL.max(until_spawn))).await;
+    }
+
+    // One final short probe closes the publication race at the deadline while
+    // keeping the total attach budget comfortably under five seconds.
+    if let Ok(connection) = connect_from_metadata(&paths, Duration::from_millis(250)).await {
+        settle_contender(contender, connection.pid).await;
+        return finish_proxy(connection.stream).await;
+    }
+    terminate_contender(contender).await;
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not publish metadata")))
+}
+
+async fn finish_proxy(stream: ClientStream) -> anyhow::Result<()> {
+    // Once connected, MCP framing may already be in flight. A second server
+    // cannot safely reconstruct that session, so an established-stream error
+    // ends this process rather than falling back to a new in-process server.
+    let _ = pump_connection(stream).await;
+    Ok(())
+}
+
+async fn spawn_contender(root: &Path) -> anyhow::Result<tokio::process::Child> {
+    let executable = std::env::current_exe().context("locate code-graph-mcp executable")?;
+    tokio::process::Command::new(executable)
+        .arg("--serve")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn repository-local daemon contender")
+}
+
+fn contender_exited(child: &mut tokio::process::Child) -> bool {
+    child.try_wait().is_ok_and(|status| status.is_some())
+}
+
+async fn settle_contender(contender: Option<tokio::process::Child>, owner_pid: u32) {
+    if let Some(mut child) = contender {
+        if child.id() != Some(owner_pid) {
+            // A successfully attached, different owner proves this child is
+            // a loser. Give it time to exit from lock loss; only this proven
+            // loser is terminated if it ignores that clean path. Never kill a
+            // still-starting child merely because one metadata probe missed.
+            if timeout(PROXY_LOSER_REAP_TIMEOUT, child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            return;
+        }
+        // The child is the long-lived owner. Keep a waiter alive after this
+        // proxy exits so its eventual termination is reaped.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+    }
+}
+
+async fn terminate_contender(contender: Option<tokio::process::Child>) {
+    let Some(mut child) = contender else {
+        return;
+    };
+    if child.try_wait().is_ok_and(|status| status.is_some()) {
+        return;
+    }
+
+    // Falling back starts an independent in-process server. A contender left
+    // running here could publish afterwards and race that fallback, so signal
+    // it before returning. Reaping remains bounded just like loser cleanup.
+    let _ = child.start_kill();
+    let _ = timeout(PROXY_LOSER_REAP_TIMEOUT, child.wait()).await;
+}
+
+struct ConnectedDaemon {
+    pid: u32,
+    stream: ClientStream,
+}
+
+#[cfg(unix)]
+enum ClientStream {
+    Uds(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+#[cfg(windows)]
+enum ClientStream {
+    Pipe(tokio::net::windows::named_pipe::NamedPipeClient),
+    Tcp(tokio::net::TcpStream),
+}
+
+async fn connect_from_metadata(
+    paths: &DaemonPaths,
+    connect_timeout: Duration,
+) -> anyhow::Result<ConnectedDaemon> {
+    let encoded = fs::read(&paths.metadata)
+        .with_context(|| format!("read daemon metadata {}", paths.metadata.display()))?;
+    let metadata: DaemonMetadata = serde_json::from_slice(&encoded)
+        .with_context(|| format!("parse daemon metadata {}", paths.metadata.display()))?;
+
+    let stream = match metadata.transport {
+        #[cfg(unix)]
+        Transport::Uds => ClientStream::Uds(
+            timeout(
+                connect_timeout,
+                tokio::net::UnixStream::connect(&metadata.endpoint),
+            )
+            .await
+            .context("connect daemon UDS timed out")??,
+        ),
+        #[cfg(windows)]
+        Transport::Pipe => ClientStream::Pipe(
+            tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&metadata.endpoint)
+                .with_context(|| format!("connect daemon pipe {}", metadata.endpoint))?,
+        ),
+        Transport::Tcp => {
+            let mut stream = timeout(
+                connect_timeout,
+                tokio::net::TcpStream::connect(&metadata.endpoint),
+            )
+            .await
+            .context("connect daemon TCP timed out")??;
+            let token = read_client_secret(&paths.secret)?;
+            stream
+                .write_all(format!("CG-AUTH {token}\n").as_bytes())
+                .await
+                .context("send daemon TCP authentication")?;
+            stream
+                .flush()
+                .await
+                .context("flush daemon TCP authentication")?;
+            let mut acknowledgement = [0_u8; AUTH_ACK.len()];
+            timeout(connect_timeout, stream.read_exact(&mut acknowledgement))
+                .await
+                .context("read daemon TCP authentication acknowledgement timed out")?
+                .context("read daemon TCP authentication acknowledgement")?;
+            if acknowledgement != AUTH_ACK {
+                bail!("invalid daemon TCP authentication acknowledgement")
+            }
+            ClientStream::Tcp(stream)
+        }
+        #[cfg(not(unix))]
+        Transport::Uds => bail!("daemon metadata selects unsupported UDS transport"),
+        #[cfg(not(windows))]
+        Transport::Pipe => bail!("daemon metadata selects unsupported pipe transport"),
+    };
+
+    Ok(ConnectedDaemon {
+        pid: metadata.pid,
+        stream,
+    })
+}
+
+fn read_client_secret(path: &Path) -> anyhow::Result<String> {
+    // The token is immediately copied into the auth prelude. Do not accept
+    // whitespace or alternate encodings around the owner-only file contents.
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read daemon TCP secret {}", path.display()))?;
+    let token = match contents.as_bytes() {
+        bytes if bytes.len() == 64 => contents.as_str(),
+        bytes if bytes.len() == 65 && bytes[64] == b'\n' => &contents[..64],
+        _ => "",
+    };
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("daemon TCP secret is not a 64-character lowercase hexadecimal token")
+    }
+    Ok(token.to_owned())
+}
+
+async fn pump_connection(stream: ClientStream) -> anyhow::Result<()> {
+    match stream {
+        #[cfg(unix)]
+        ClientStream::Uds(stream) => pump_bytes(stream).await,
+        #[cfg(windows)]
+        ClientStream::Pipe(stream) => pump_bytes(stream).await,
+        ClientStream::Tcp(stream) => pump_bytes(stream).await,
+    }
+}
+
+async fn pump_bytes<S>(stream: S) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut socket_read, mut socket_write) = tokio::io::split(stream);
+    let stdin_to_socket = async {
+        let mut stdin = tokio::io::stdin();
+        tokio::io::copy(&mut stdin, &mut socket_write)
+            .await
+            .context("proxy stdin to daemon")?;
+        socket_write
+            .shutdown()
+            .await
+            .context("shutdown daemon socket after stdin EOF")
+    };
+    let socket_to_stdout = async {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut socket_read, &mut stdout)
+            .await
+            .context("proxy daemon to stdout")?;
+        stdout.flush().await.context("flush proxy stdout")
+    };
+
+    tokio::pin!(stdin_to_socket);
+    tokio::pin!(socket_to_stdout);
+    // A broken established stream ends this proxy session immediately, even
+    // when the parent still holds stdin open. Conversely, EOF on stdin first
+    // half-closes the socket and then drains every daemon byte before exit.
+    tokio::select! {
+        biased;
+        output = &mut socket_to_stdout => output,
+        input = &mut stdin_to_socket => {
+            input?;
+            socket_to_stdout.await
+        }
     }
 }
 
@@ -241,11 +520,31 @@ pub async fn run(server: CodeGraphServer) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("read current directory for daemon root")?;
     let cwd = fs::canonicalize(&cwd).context("canonicalize daemon root")?;
     let (_, root) = RootConfig::load(&cwd).context("discover daemon project root")?;
+    slow_test_contender_start(&root).await;
     run_until(server, root, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
 }
+
+#[cfg(debug_assertions)]
+async fn slow_test_contender_start(root: &Path) {
+    let Ok(delay_root) = std::env::var("CODE_GRAPH_TEST_DAEMON_DELAY_ROOT") else {
+        return;
+    };
+    let Ok(delay_millis) = std::env::var("CODE_GRAPH_TEST_DAEMON_DELAY_MILLIS") else {
+        return;
+    };
+    let Ok(delay_millis) = delay_millis.parse::<u64>() else {
+        return;
+    };
+    if Path::new(&delay_root) == root {
+        tokio::time::sleep(Duration::from_millis(delay_millis)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn slow_test_contender_start(_root: &Path) {}
 
 async fn run_until<F>(server: CodeGraphServer, root: PathBuf, shutdown: F) -> anyhow::Result<()>
 where
@@ -823,7 +1122,7 @@ where
 
 async fn authenticate_tcp<S>(stream: &mut S, secret: &str) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut line = [0_u8; AUTH_LINE_LEN];
     timeout(AUTH_TIMEOUT, stream.read_exact(&mut line))
@@ -835,6 +1134,14 @@ where
     {
         bail!("invalid TCP daemon authentication prelude")
     }
+    stream
+        .write_all(AUTH_ACK)
+        .await
+        .context("write TCP daemon authentication acknowledgement")?;
+    stream
+        .flush()
+        .await
+        .context("flush TCP daemon authentication acknowledgement")?;
     Ok(())
 }
 
@@ -1161,7 +1468,40 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut acknowledgement = [0_u8; AUTH_ACK.len()];
+        stream.read_exact(&mut acknowledgement).await.unwrap();
+        assert_eq!(&acknowledgement, AUTH_ACK);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_proxy_attachment_requires_the_authentication_acknowledgement() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token = generate_secret().unwrap();
+        let metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            listener.local_addr().unwrap().to_string(),
+            LockIdentity::current().unwrap(),
+        );
+        write_metadata_atomically(&paths.metadata, &metadata).unwrap();
+        write_secret(&paths.secret, &token).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prelude = [0_u8; AUTH_LINE_LEN];
+            stream.read_exact(&mut prelude).await.unwrap();
+            assert!(valid_auth_line(&prelude));
+            stream.write_all(b"CG-NO\n").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert!(connect_from_metadata(&paths, Duration::from_secs(1))
+            .await
+            .is_err());
+        server.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
