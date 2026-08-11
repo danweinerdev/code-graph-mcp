@@ -23,7 +23,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Daemon Foundation"
-    status: in-progress
+    status: blocked
     doc: "03-Daemon-Foundation.md"
   - id: 4
     title: "Analyze Queue and Coalescing"
@@ -79,7 +79,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. The phase numbering is a 
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | in-progress | Tasks 3.1–3.4 complete: daemon attachment is default-on with executable-identity replacement, graceful analyze/persist/watch drain, final cache save, bounded hard-kill fallback, and unchanged 22-tool responses. **Next: 3.5**, idle lifecycle and warm-attach measurement. |
+| 3 Daemon Foundation | blocked | Task 3.5 implementation and two-corpus measurement are complete on Linux (`73c332f`), but native macOS/Windows transport evidence and a genuine second-UID access attempt remain unavailable. Phase certification cannot infer AC-25/AC-42 from Linux permissions or cross-compilation. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |

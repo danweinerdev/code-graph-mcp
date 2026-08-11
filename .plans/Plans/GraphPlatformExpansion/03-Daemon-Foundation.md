@@ -3,7 +3,7 @@ title: "Daemon Foundation"
 type: phase
 plan: GraphPlatformExpansion
 phase: 3
-status: in-progress
+status: blocked
 created: 2026-08-08
 updated: 2026-08-10
 deliverable: "A repository-local daemon holding one graph per project root, with the stdio binary attaching to it transparently, an idle timeout, and in-process fallback."
@@ -33,7 +33,7 @@ tasks:
     depends_on: ["3.3"]
   - id: "3.5"
     title: "Idle timeout and warm-attach measurement"
-    status: in-progress
+    status: blocked
     justifies: "FR-10, FR-11, NFR-09, AC-06, AC-07, AC-25, AC-26, AC-42. An always-resident daemon per repository is a resource leak users will notice; the measurement is what turns NFR-09's claimed benefit into a verified one rather than an assumption."
     verification: "Integration tests with a short timeout — exits with no clients, does not exit with a client attached, does not exit with an analyze in flight and no clients (AC-06); the timer restarts from zero rather than resuming after an analyze terminates; the cache reflects the last index after idle exit and the next start loads rather than re-indexes (AC-07); the endpoint is unreachable from another machine and unusable by another local user (AC-25); warm-attach time-to-first-query measured on external/ripgrep and external/abseil-cpp shows no corpus-size scaling while cold start does, all four numbers recorded in notes/ (AC-26); Linux, macOS, and Windows each exercised, including the POSIX-only stale-inode path (AC-42)."
     depends_on: ["3.4"]
@@ -231,11 +231,11 @@ Treating a `-dirty` SHA as sufficient identity. It looks correct — the strings
 ## 3.5: Idle timeout and warm-attach measurement
 
 ### Subtasks
-- [ ] Implement the idle timer: runs only at zero connections and no analyze in flight
-- [ ] Cancel on new attachment; restart from zero after an analyze terminates
-- [ ] Persist cache, remove metadata and lock, close the listener before exit
-- [ ] Add the security tests for endpoint reachability and permissions
-- [ ] Run and record the warm-attach benchmark on two corpora
+- [x] Implement the idle timer: runs only at zero connections and no analyze in flight
+- [x] Cancel on new attachment; restart from zero after an analyze terminates
+- [x] Persist cache, remove metadata and lock, close the listener before exit
+- [x] Add the security tests for endpoint reachability and permissions
+- [x] Run and record the warm-attach benchmark on two corpora
 - [ ] Exercise Linux, macOS, and Windows including the POSIX stale-inode path
 
 ### Notes
@@ -249,24 +249,26 @@ AC-26 is a recorded metric, not an automated gate. The pass condition is the *ab
 
 Pending — not complete.
 
+Implementation checkpoint `73c332f448c73b53f4bd6988e393928ea73fbb19` passes the Linux idle/security/process suites and full `make verify`. AC-26 measurements and exact reproduction commands are recorded in `notes/03-daemon-foundation.md`. Completion is blocked on native macOS/Windows transport exercise and a genuine second-local-UID access attempt; this Linux account has no passwordless privilege or remote native runner for those boundaries.
+
 ## Acceptance Criteria
 
 - [x] **AC-04**: Two clients on one daemon share an index; one indexes, the other queries without re-indexing (FR-09).
 - [x] **AC-05**: Spawning creates `.code-graph/` and nothing outside the repository (FR-06, FR-07, FR-08).
-- [ ] **AC-06**: Idle exit fires with no clients; not with a client attached; not with an analyze in flight (FR-10, FR-11).
-- [ ] **AC-07**: The cache reflects the last index after idle exit; the next start loads it (FR-11).
+- [x] **AC-06**: Idle exit fires with no clients; not with a client attached; not with an analyze in flight (FR-10, FR-11).
+- [x] **AC-07**: The cache reflects the last index after idle exit; the next start loads it (FR-11).
 - [x] **AC-08**: Simultaneous starts converge on one daemon with no orphans (FR-13).
 - [x] **AC-09**: A differently-built client does not attach; the daemon is replaced (FR-12).
 - [x] **AC-10**: With the daemon unavailable, every tool answers in-process and the fallback is reported (FR-16).
 - [ ] **AC-25**: The endpoint is unreachable remotely and unusable by another local user (NFR-06).
-- [ ] **AC-26**: Warm attach does not scale with corpus size; measured on two corpora and recorded (NFR-09).
+- [x] **AC-26**: Warm attach does not scale with corpus size; measured on two corpora and recorded (NFR-09).
 - [x] **AC-30**: One watcher serves all attached clients (FR-14).
 - [x] **AC-31**: The analyze job started by one session is observable by another (FR-15).
 - [ ] **AC-42**: Linux, macOS, and Windows each exercised, per-platform transport covered (NFR-07).
 - [x] **AC-47**: Named-pipe/UDS default with reported loopback-TCP fallback (FR-38).
 - [x] **AC-48**: TCP fallback requires a per-instance secret; file is owner-only (FR-39).
 - [x] **AC-49**: Clients read the transport from metadata and connect first try (FR-40).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
+- [x] **AC-27**: `make verify` passes (NFR-04).
 - [ ] FR-06 through FR-16 and FR-38 through FR-40 realized; NFR-06, NFR-07, NFR-09 satisfied; NFR-01 preserved.
 
 ## Phase Completion Evidence
