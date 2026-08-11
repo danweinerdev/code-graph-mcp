@@ -580,7 +580,14 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
         metadata["transport"], "tcp",
         "proxy read metadata and authenticated TCP"
     );
-    client.close();
+    let stderr = client.close();
+    assert_eq!(
+        stderr
+            .matches("local IPC was unavailable; loopback TCP fallback is active")
+            .count(),
+        1,
+        "the attaching proxy reports its metadata-selected TCP fallback"
+    );
     stop_daemon(&metadata);
     wait_runtime_cleanup(&tcp.0);
     tcp.disarm_daemon();

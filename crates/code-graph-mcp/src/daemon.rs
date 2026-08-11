@@ -20,7 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 const LOCK_FILE: &str = "daemon.lock";
 const METADATA_FILE: &str = "daemon.json";
@@ -28,6 +28,7 @@ const SECRET_FILE: &str = "secret";
 const SOCKET_FILE: &str = "daemon.sock";
 const SHUTDOWN_REQUEST_FILE: &str = "shutdown.request";
 const SHUTDOWN_ACK_FILE: &str = "shutdown.ack";
+const MAX_METADATA_BYTES: usize = 64 * 1024;
 const AUTH_PREFIX: &[u8] = b"CG-AUTH ";
 const AUTH_ACK: &[u8] = b"CG-OK\n";
 const AUTH_LINE_LEN: usize = 73;
@@ -172,6 +173,7 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
                             // lock ownership.
                             if metadata_owner_is_active(&paths, &metadata) {
                                 settle_contender(contender, connection.pid).await;
+                                report_tcp_fallback(&metadata);
                                 return finish_proxy(connection.stream).await;
                             }
                             drop(connection);
@@ -249,6 +251,7 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
             {
                 if metadata_owner_is_active(&paths, &metadata) {
                     settle_contender(contender, connection.pid).await;
+                    report_tcp_fallback(&metadata);
                     return finish_proxy(connection.stream).await;
                 }
             }
@@ -280,10 +283,77 @@ fn sha_compatible_with(
 }
 
 fn read_metadata(paths: &DaemonPaths) -> anyhow::Result<DaemonMetadata> {
-    let encoded = fs::read(&paths.metadata)
-        .with_context(|| format!("read daemon metadata {}", paths.metadata.display()))?;
+    let encoded = read_metadata_payload(&paths.metadata)?;
     serde_json::from_slice(&encoded)
         .with_context(|| format!("parse daemon metadata {}", paths.metadata.display()))
+}
+
+/// Reads daemon metadata only from a bounded, regular file. The initial
+/// symlink-metadata check rejects repository-planted special entries before an
+/// open can block; Unix opens also refuse a symlink substituted after that
+/// check. `O_NONBLOCK` keeps a racing FIFO from stalling daemon discovery.
+fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let entry = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect daemon metadata {}", path.display()))?;
+    if entry.file_type().is_symlink() || !entry.is_file() {
+        bail!("daemon metadata {} is not a regular file", path.display());
+    }
+    if entry.len() > MAX_METADATA_BYTES as u64 {
+        bail!(
+            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open daemon metadata {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect opened daemon metadata {}", path.display()))?;
+    if !opened.is_file() {
+        bail!("daemon metadata {} is not a regular file", path.display());
+    }
+    if opened.len() > MAX_METADATA_BYTES as u64 {
+        bail!(
+            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
+            path.display()
+        );
+    }
+
+    let mut encoded = Vec::with_capacity(opened.len() as usize);
+    file.take((MAX_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)
+        .with_context(|| format!("read daemon metadata {}", path.display()))?;
+    if encoded.len() > MAX_METADATA_BYTES {
+        bail!(
+            "daemon metadata {} exceeds {MAX_METADATA_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(encoded)
+}
+
+fn report_tcp_fallback(metadata: &DaemonMetadata) {
+    if metadata.transport == Transport::Tcp {
+        eprintln!("code-graph-mcp: local IPC was unavailable; loopback TCP fallback is active");
+    }
+}
+
+fn remove_metadata_if_regular(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_symlink() && metadata.is_file() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
@@ -1134,48 +1204,87 @@ fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
 }
 
 async fn acquire_or_detect_live(paths: &DaemonPaths) -> anyhow::Result<Option<DaemonLock>> {
-    match DaemonLock::acquire(paths) {
-        Ok(lock) => Ok(Some(lock)),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = open_existing_lock(&paths.lock).context("open existing daemon lock")?;
-            match file.try_lock_exclusive() {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) => return Err(error).context("lock existing daemon lock"),
-            };
-            #[cfg(unix)]
-            {
-                fs::set_permissions(&paths.lock, std::fs::Permissions::from_mode(0o600))
-                    .context("restrict recovered daemon lock permissions")?;
-            }
-            let previous_identity = read_lock_identity_from(&file);
+    acquire_or_detect_live_with_initial_file(paths, None).await
+}
 
-            // The OS lock is the single-instance authority. Once it is ours,
-            // lock-file contents cannot retain ownership, even if a stale
-            // identity happens to name a currently live process.
-            cleanup_stale_runtime(paths, previous_identity.as_ref()).await;
-            let identity = previous_identity.unwrap_or(LockIdentity {
-                pid: 0,
-                start_time: 0,
-                nonce: "malformed".to_owned(),
-            });
-            let mut lock = DaemonLock {
-                path: paths.lock.clone(),
-                contents: format!("{}\n", serde_json::to_string(&identity)?),
-                identity,
-                file: Some(file),
-            };
-            lock.write_identity(LockIdentity::current()?)
-                .context("replace stale daemon lock identity")?;
-            Ok(Some(lock))
+/// `initial_file` makes the unlinked-inode handoff regression deterministic;
+/// normal daemon acquisition always starts from the current pathname.
+async fn acquire_or_detect_live_with_initial_file(
+    paths: &DaemonPaths,
+    mut initial_file: Option<std::fs::File>,
+) -> anyhow::Result<Option<DaemonLock>> {
+    loop {
+        match DaemonLock::acquire(paths) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = match initial_file.take() {
+                    Some(file) => file,
+                    None => open_existing_lock(&paths.lock).context("open existing daemon lock")?,
+                };
+                match file.try_lock_exclusive() {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Ok(None)
+                    }
+                    Err(error) => return Err(error).context("lock existing daemon lock"),
+                }
+                #[cfg(unix)]
+                if !opened_lock_matches_path(&file, &paths.lock) {
+                    // The old owner may have unlinked this inode and a successor
+                    // may now own the pathname. Never clean runtime state for
+                    // the detached inode; restart from the current pathname.
+                    let _ = FileExt::unlock(&file);
+                    drop(file);
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    fs::set_permissions(&paths.lock, std::fs::Permissions::from_mode(0o600))
+                        .context("restrict recovered daemon lock permissions")?;
+                }
+                let previous_identity = read_lock_identity_from(&file);
+
+                // The OS lock is the single-instance authority. Once it is ours,
+                // lock-file contents cannot retain ownership, even if a stale
+                // identity happens to name a currently live process.
+                cleanup_stale_runtime(paths, previous_identity.as_ref()).await;
+                let identity = previous_identity.unwrap_or(LockIdentity {
+                    pid: 0,
+                    start_time: 0,
+                    nonce: "malformed".to_owned(),
+                });
+                let mut lock = DaemonLock {
+                    path: paths.lock.clone(),
+                    contents: format!("{}\n", serde_json::to_string(&identity)?),
+                    identity,
+                    file: Some(file),
+                };
+                lock.write_identity(LockIdentity::current()?)
+                    .context("replace stale daemon lock identity")?;
+                return Ok(Some(lock));
+            }
+            Err(error) => return Err(error).context("create daemon lock"),
         }
-        Err(error) => Err(error).context("create daemon lock"),
     }
+}
+
+#[cfg(unix)]
+fn opened_lock_matches_path(file: &std::fs::File, path: &Path) -> bool {
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if current.file_type().is_symlink() || !current.is_file() {
+        return false;
+    }
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    opened.dev() == current.dev() && opened.ino() == current.ino()
 }
 
 fn open_existing_lock(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
     options.read(true).write(true);
@@ -1220,18 +1329,15 @@ fn identity_is_alive(identity: &LockIdentity) -> bool {
 }
 
 async fn prepare_runtime_for_owner(paths: &DaemonPaths) -> bool {
-    let Ok(contents) = fs::read(&paths.metadata) else {
+    let Ok(metadata) = read_metadata(paths) else {
+        // Malformed and oversized regular files are stale instance state and
+        // can be removed. Unsafe entries are retained: they are unavailable to
+        // this daemon, but must not redirect cleanup through a symlink or
+        // mutate a non-regular repository entry.
+        remove_metadata_if_regular(&paths.metadata);
         if paths.secret.exists() {
             let _ = fs::remove_file(&paths.secret);
         }
-        return true;
-    };
-    let Ok(metadata) = serde_json::from_slice::<DaemonMetadata>(&contents) else {
-        // The caller has the OS lock. Without usable metadata there is no
-        // endpoint or owner that could still be live, so clear both files
-        // before Windows metadata publication and TCP token creation.
-        let _ = fs::remove_file(&paths.metadata);
-        let _ = fs::remove_file(&paths.secret);
         return true;
     };
     // The caller already owns daemon.lock, so metadata identity is only
@@ -1755,11 +1861,7 @@ async fn cleanup_owned(paths: &DaemonPaths, lock: DaemonLock, metadata: &DaemonM
     if !lock.still_owned() {
         return;
     }
-    if fs::read(&paths.metadata)
-        .ok()
-        .and_then(|contents| serde_json::from_slice::<DaemonMetadata>(&contents).ok())
-        .is_some_and(|current| current == *metadata)
-    {
+    if read_metadata(paths).is_ok_and(|current| current == *metadata) {
         let _ = fs::remove_file(&paths.metadata);
     }
     if metadata.transport == Transport::Tcp {
@@ -1879,6 +1981,72 @@ mod tests {
         assert_eq!(encoded["endpoint"], "127.0.0.1:1");
         assert!(encoded["started_at"].as_str().unwrap().ends_with('Z'));
         assert!(!encoded["binary_sha"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_payload_rejects_a_directory_without_opening_it() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        fs::create_dir(&paths.metadata).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(read_metadata_payload(&paths.metadata).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a non-regular metadata entry fails without blocking"
+        );
+        assert!(paths.metadata.is_dir(), "the directory remains untouched");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_payload_rejects_a_symlink_without_reading_its_target() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let target = outside.join("metadata-target");
+        let contents = b"external daemon metadata target\n";
+        fs::write(&target, contents).unwrap();
+        std::os::unix::fs::symlink(&target, &paths.metadata).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(read_metadata_payload(&paths.metadata).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a metadata symlink fails without blocking"
+        );
+        assert_eq!(fs::read(&target).unwrap(), contents, "target is untouched");
+        assert!(fs::symlink_metadata(&paths.metadata)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        fs::remove_file(&paths.metadata).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn metadata_payload_rejects_an_oversized_file_without_reading_it() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let contents = vec![b'x'; MAX_METADATA_BYTES + 1];
+        fs::write(&paths.metadata, &contents).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(read_metadata_payload(&paths.metadata).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "oversized metadata fails without blocking"
+        );
+        assert_eq!(fs::read(&paths.metadata).unwrap(), contents);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2164,6 +2332,54 @@ mod tests {
         );
 
         lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovered_detached_lock_does_not_cleanup_successor_runtime() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let stale = LockIdentity {
+            pid: 99_999_999,
+            start_time: 0,
+            nonce: "old-inode".to_owned(),
+        };
+        fs::write(&paths.lock, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let old_inode = open_existing_lock(&paths.lock).unwrap();
+
+        fs::remove_file(&paths.lock).unwrap();
+        let successor = DaemonLock::acquire(&paths).unwrap();
+        let successor_metadata = DaemonMetadata::new(
+            Transport::Tcp,
+            "127.0.0.1:1".to_owned(),
+            successor.identity.clone(),
+        )
+        .unwrap();
+        write_metadata_atomically(&paths.metadata, &successor_metadata).unwrap();
+
+        assert!(
+            acquire_or_detect_live_with_initial_file(&paths, Some(old_inode))
+                .await
+                .unwrap()
+                .is_none(),
+            "the detached inode is dropped and acquisition retries against the locked successor"
+        );
+        assert!(successor.still_owned(), "successor lock remains held");
+        assert_eq!(
+            read_lock_identity(&paths.lock).unwrap(),
+            successor.identity,
+            "the current lock pathname remains the successor"
+        );
+        assert_eq!(
+            read_metadata(&paths).unwrap(),
+            successor_metadata,
+            "successor metadata survives detached-inode recovery"
+        );
+
+        fs::remove_file(&paths.metadata).unwrap();
+        successor.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }
 
