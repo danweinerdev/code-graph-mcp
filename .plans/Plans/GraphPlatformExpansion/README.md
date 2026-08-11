@@ -90,7 +90,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | one review follow-up planned, phase `in-progress` | Linux daemon MVP is implemented through admission hardening (`5dfb170`), measured on two corpora, and fully gated by `make verify`. Task 3.15 closes interrupted owner-control publication; then rerun the final four-lane review. Native platform completion remains deferred to phases 10/11. |
+| 3 Daemon Foundation | tasks complete, phase `in-progress` | Linux daemon MVP is implemented through atomic owner-control publication (`62e1481`), measured on two corpora, and fully gated by `make verify`. **Next: fresh final four-lane Phase 3 review.** Native platform completion remains deferred to phases 10/11. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |

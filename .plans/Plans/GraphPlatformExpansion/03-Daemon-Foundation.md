@@ -93,7 +93,7 @@ tasks:
     depends_on: ["3.13"]
   - id: "3.15"
     title: "Atomically publish daemon owner-control records"
-    status: planned
+    status: complete
     justifies: "FR-12, FR-16. The post-hardening frozen review found that an interrupted direct write can leave a malformed final shutdown request or acknowledgement that neither the daemon nor later replacement attempts can recover."
     verification: "Publish shutdown request/ack records through owner-only create-new temporary children followed by descriptor-relative atomic rename. Malformed existing final records are removed only after active lock identity proves they cannot belong to another owner; exact-owner idempotence remains. Tests pin truncated request and acknowledgement recovery, concurrent publishers, external sentinel preservation, and successful binary replacement. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
     depends_on: ["3.14"]
@@ -643,9 +643,9 @@ Revision boundary: transport connection is not considered attached until daemon 
 ## 3.15: Atomically publish daemon owner-control records
 
 ### Subtasks
-- [ ] Publish request and acknowledgement through create-new temporary children and atomic rename
-- [ ] Recover malformed stale final records without clobbering another active owner
-- [ ] Add truncated-record, concurrent-publisher, sentinel, and replacement regressions
+- [x] Publish request and acknowledgement through create-new temporary children and atomic rename
+- [x] Recover malformed stale final records without clobbering another active owner
+- [x] Add truncated-record, concurrent-publisher, sentinel, and replacement regressions
 
 ### Notes
 
@@ -653,7 +653,25 @@ Revision boundary: interrupted owner-control publication cannot permanently obst
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `62e14811a184730f928316d19e349992e1a8adc1`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T19:59:30Z, matching `62e14811a184730f928316d19e349992e1a8adc1`
+- Focused review: `git show 62e14811a184730f928316d19e349992e1a8adc1`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `62e14811a184730f928316d19e349992e1a8adc1`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 56 daemon unit, 14 proxy process, 8 serve process, and 1 smoke test passed, including truncated-request binary replacement. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.15.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Two consecutive full workspace, snapshot, and plugin-mirror gates passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 62e14811a184730f928316d19e349992e1a8adc1` | Complete task commit | PASS | Linux request/ack mutations serialize on a persistent descriptor-validated control lock, publish complete temp records by atomic rename, and scavenge crash temps after every main-lock acquisition. |
+| Independent iterative quality and blind-spots reviews | Complete task diff plus lifecycle callers/tests | PASS | Findings around check-unlink races, owner transitions, unsupported rename features, temp poisoning, hardlink sentinels, lock ordering, and non-Linux cfg regressions were resolved; final Linux mutation paths are serialized and fully gated. |
 
 ## Acceptance Criteria
 

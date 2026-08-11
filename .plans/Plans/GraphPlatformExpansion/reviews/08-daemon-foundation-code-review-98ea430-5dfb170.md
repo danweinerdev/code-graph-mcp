@@ -1,7 +1,7 @@
 ---
 title: "Code Review: Daemon Foundation Post-Hardening Gate"
 type: review
-status: open
+status: resolved
 created: 2026-08-11
 updated: 2026-08-11
 tags: [review, daemon, phase-3, lifecycle]
@@ -19,7 +19,7 @@ findings:
   - id: F-02
     severity: major
     title: "Partial shutdown-record publication can wedge replacement"
-    status: open
+    status: fixed
   - id: F-03
     severity: major
     title: "Windows pipe attachment lacks admission acknowledgement"
@@ -89,3 +89,6 @@ The source already marks Windows handoff as deferred, and Phase 11 owns native p
 
 ### F-05 — rejected (2026-08-11)
 Phase 3's local-user boundary is cross-UID. The runtime directory is descriptor-chmodded 0700 before socket bind, preventing the relevant other-UID leaf race. A same-UID actor has equivalent direct authority over the alleged target; post-chmod inode comparison still refuses publication after replacement.
+
+### F-02 — fixed (2026-08-11)
+Task 3.15 commit `62e14811a184730f928316d19e349992e1a8adc1` serializes all Linux request/ack mutations through persistent owner-only `shutdown.control.lock`. Publishers write and sync unique descriptor-relative temps before atomic rename, revalidate the active target owner under the control lock, and scavenge crash temps after every main-lock acquisition. Truncated request/ack, concurrent publisher, owner-transition, symlink/hardlink sentinel, fresh-lock scavenging, and end-to-end binary-replacement regressions pass.
