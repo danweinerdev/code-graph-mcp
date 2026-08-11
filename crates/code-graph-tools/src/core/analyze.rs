@@ -135,6 +135,20 @@ pub(crate) async fn run_analyze_job(
         return;
     }
 
+    if let Some(daemon_root) = inner.daemon_project_root.get() {
+        if !abs_path.starts_with(daemon_root) {
+            finish_failed(
+                &job,
+                format!(
+                    "daemon is bound to project root {}; cannot analyze path {} outside that root",
+                    daemon_root.display(),
+                    abs_path.display()
+                ),
+            );
+            return;
+        }
+    }
+
     let (mut cfg, project_root) = match RootConfig::load(&abs_path) {
         Ok((c, root)) => (c, root),
         Err(ConfigError::Toml(e)) => {

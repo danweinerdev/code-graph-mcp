@@ -1051,6 +1051,110 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn daemon_root_boundary_precedes_foreign_config_and_accepts_owned_scopes() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("daemon-root");
+        let nested = root.join("nested");
+        let foreign = fixture.path().join("foreign");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(root.join(".code-graph.toml"), "").unwrap();
+        fs::write(root.join("root.cpp"), b"void root_symbol() {}\n").unwrap();
+        fs::write(nested.join("nested.cpp"), b"void nested_symbol() {}\n").unwrap();
+        fs::write(
+            foreign.join(".code-graph.toml"),
+            "[discovery\nmax_threads = nope\n",
+        )
+        .unwrap();
+
+        let canonical_root = paths::canonicalize(&root).unwrap();
+        let canonical_foreign = paths::canonicalize(&foreign).unwrap();
+        let server = server_with_cpp_parser();
+        server
+            .bind_daemon_project_root(canonical_root.clone())
+            .expect("bind daemon project root");
+
+        let foreign_result = analyze_codebase(
+            server.inner.clone(),
+            foreign.join(".").to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        let foreign_body = body_text(&foreign_result);
+        assert_eq!(foreign_result.is_error, Some(true));
+        assert!(
+            foreign_body.contains("daemon is bound to project root")
+                && foreign_body.contains("outside that root"),
+            "outside-root request must fail at the daemon boundary: {foreign_body}"
+        );
+        assert!(
+            !foreign_body.contains("failed to parse .code-graph.toml"),
+            "outside-root request must not inspect foreign configuration: {foreign_body}"
+        );
+        assert!(
+            !server.inner.indexed.load(Ordering::Relaxed),
+            "rejected foreign request must not mark the daemon indexed"
+        );
+        assert_eq!(server.inner.graph.read().stats().files, 0);
+        assert!(server.inner.root_path.read().is_none());
+        assert!(server.inner.cache_root.read().is_none());
+        assert!(
+            !canonical_root.join(".code-graph-cache.db").exists()
+                && !canonical_foreign.join(".code-graph-cache.db").exists(),
+            "rejected foreign request must not create either cache"
+        );
+
+        let same_root = analyze_codebase(
+            server.inner.clone(),
+            root.join(".").to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            same_root.is_error.is_none() || same_root.is_error == Some(false),
+            "daemon root must be accepted: {}",
+            body_text(&same_root)
+        );
+
+        let nested_scope = analyze_codebase(
+            server.inner.clone(),
+            nested.to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            nested_scope.is_error.is_none() || nested_scope.is_error == Some(false),
+            "nested scope sharing the daemon project root must be accepted: {}",
+            body_text(&nested_scope)
+        );
+
+        fs::write(nested.join(".code-graph.toml"), "").unwrap();
+        let nested_project = analyze_codebase(
+            server.inner.clone(),
+            nested.to_string_lossy().into_owned(),
+            true,
+            None,
+            None,
+        )
+        .await;
+        let nested_project_body = body_text(&nested_project);
+        assert_eq!(nested_project.is_error, Some(true));
+        assert!(
+            nested_project_body.contains("daemon is bound to project root")
+                && nested_project_body.contains(&canonical_root.display().to_string())
+                && nested_project_body
+                    .contains(&paths::canonicalize(&nested).unwrap().display().to_string()),
+            "nested project config must remain a distinct rejected root: {nested_project_body}"
+        );
+    }
+
     /// (Task 2.1 / a) Async kickoff returns in the kickoff window — not
     /// blocking on the indexing pipeline. The 100ms ceiling is a generous
     /// budget on the kickoff path (slot write + tokio::spawn); a regression

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
-use code_graph_core::RootConfig;
+use code_graph_core::{paths, RootConfig};
 use code_graph_tools::CodeGraphServer;
 use fs2::FileExt;
 use rmcp::ServiceExt;
@@ -812,7 +812,7 @@ impl DaemonLock {
 /// the project root, matching [`RootConfig::load`].
 pub async fn run(server: CodeGraphServer) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("read current directory for daemon root")?;
-    let cwd = fs::canonicalize(&cwd).context("canonicalize daemon root")?;
+    let cwd = paths::canonicalize(&cwd).context("canonicalize daemon root")?;
     let (config, root) = RootConfig::load(&cwd).context("discover daemon project root")?;
     slow_test_contender_start(&root).await;
     run_until(
