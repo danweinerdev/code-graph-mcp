@@ -91,6 +91,12 @@ tasks:
     justifies: "FR-16, NFR-04. The final frozen review found that UDS saturation is accepted at transport level then silently dropped before MCP admission, and interrupted process tests can later reuse predictable stale roots."
     verification: "For Linux UDS, complete an admission prelude only after both the service permit and lifecycle connection guard are secured; the proxy must not treat attachment as established before that acknowledgement. A saturation regression proves the 129th client retries or falls back rather than exiting successfully with no MCP response. Process-test roots are atomically fresh or collision-refusing and retain cleanup. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
     depends_on: ["3.13"]
+  - id: "3.15"
+    title: "Atomically publish daemon owner-control records"
+    status: planned
+    justifies: "FR-12, FR-16. The post-hardening frozen review found that an interrupted direct write can leave a malformed final shutdown request or acknowledgement that neither the daemon nor later replacement attempts can recover."
+    verification: "Publish shutdown request/ack records through owner-only create-new temporary children followed by descriptor-relative atomic rename. Malformed existing final records are removed only after active lock identity proves they cannot belong to another owner; exact-owner idempotence remains. Tests pin truncated request and acknowledgement recovery, concurrent publishers, external sentinel preservation, and successful binary replacement. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
+    depends_on: ["3.14"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -633,6 +639,21 @@ Revision boundary: transport connection is not considered attached until daemon 
 |---|---|---|---|
 | `git show 5dfb170c82c89d1fd5988235e9b41cd6e475c880` | Complete task commit | PASS | UDS emits `CG-OK` only after permit and lifecycle admission; clients consume it before MCP framing; both process suites allocate roots with atomic `create_dir` collision retry. |
 | Independent focused quality and blind-spots reviews | Complete task diff plus transport/lifecycle callers | PASS | No material findings: guard lifetime, idle race, acknowledgement timeout/error propagation, saturation fallback, framing, and fixture cleanup align. |
+
+## 3.15: Atomically publish daemon owner-control records
+
+### Subtasks
+- [ ] Publish request and acknowledgement through create-new temporary children and atomic rename
+- [ ] Recover malformed stale final records without clobbering another active owner
+- [ ] Add truncated-record, concurrent-publisher, sentinel, and replacement regressions
+
+### Notes
+
+Revision boundary: interrupted owner-control publication cannot permanently obstruct replacement, while exact-owner idempotence and active-owner isolation remain intact.
+
+### Completion Evidence
+
+Pending — not complete.
 
 ## Acceptance Criteria
 
