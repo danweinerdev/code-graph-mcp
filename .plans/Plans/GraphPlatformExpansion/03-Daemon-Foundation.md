@@ -97,6 +97,12 @@ tasks:
     justifies: "FR-12, FR-16. The post-hardening frozen review found that an interrupted direct write can leave a malformed final shutdown request or acknowledgement that neither the daemon nor later replacement attempts can recover."
     verification: "Publish shutdown request/ack records through owner-only create-new temporary children followed by descriptor-relative atomic rename. Malformed existing final records are removed only after active lock identity proves they cannot belong to another owner; exact-owner idempotence remains. Tests pin truncated request and acknowledgement recovery, concurrent publishers, external sentinel preservation, and successful binary replacement. Run daemon unit/process suites, rustfmt, clippy, and two `make verify` runs."
     depends_on: ["3.14"]
+  - id: "3.16"
+    title: "Scavenge abandoned unique cache temporaries"
+    status: planned
+    justifies: "NFR-06, AC-07. The final post-control review found that hard-killed cache writers leave uniquely named multi-megabyte temporaries that no later save removes, allowing project-disk growth across repeated crashes."
+    verification: "Serialize `Graph::save` calls within a process and, before allocating a new unique temp, remove reserved unique temp sibling entries left by prior writers plus the legacy fixed temp. Never follow symlinks or mutate hardlink targets; refuse/retain directories and unrelated names. Tests pin interrupted-temp cleanup, symlink/hardlink sentinel contents, same-process concurrent saves, no candidate leaks, and final cache loadability. Run persistence tests, daemon replacement tests, workspace lint/format, and two `make verify` runs."
+    depends_on: ["3.15"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -672,6 +678,21 @@ Revision boundary: interrupted owner-control publication cannot permanently obst
 |---|---|---|---|
 | `git show 62e14811a184730f928316d19e349992e1a8adc1` | Complete task commit | PASS | Linux request/ack mutations serialize on a persistent descriptor-validated control lock, publish complete temp records by atomic rename, and scavenge crash temps after every main-lock acquisition. |
 | Independent iterative quality and blind-spots reviews | Complete task diff plus lifecycle callers/tests | PASS | Findings around check-unlink races, owner transitions, unsupported rename features, temp poisoning, hardlink sentinels, lock ordering, and non-Linux cfg regressions were resolved; final Linux mutation paths are serialized and fully gated. |
+
+## 3.16: Scavenge abandoned unique cache temporaries
+
+### Subtasks
+- [ ] Serialize same-process cache saves
+- [ ] Remove reserved abandoned unique and legacy temp siblings before each save
+- [ ] Add crash-temp, sentinel, concurrency, leak, and loadability regressions
+
+### Notes
+
+Revision boundary: each new save bounds crash residue by scavenging the reserved temp namespace before writing, without adding cross-process cache locking outside the approved daemon ownership model.
+
+### Completion Evidence
+
+Pending — not complete.
 
 ## Acceptance Criteria
 
