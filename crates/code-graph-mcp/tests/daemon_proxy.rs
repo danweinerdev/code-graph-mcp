@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,14 @@ use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PROCESS_TEST_SERIALIZATION: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn process_test_guard() -> MutexGuard<'static, ()> {
+    PROCESS_TEST_SERIALIZATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct TestRoot(PathBuf, Arc<Mutex<Option<u32>>>);
 
@@ -380,6 +388,7 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[test]
 fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
+    let _guard = process_test_guard();
     let default_root = TestRoot::new(false);
     let mut client = Client::spawn(&default_root.0, &[]);
     assert_eq!(
@@ -442,6 +451,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
 #[cfg(debug_assertions)]
 #[test]
 fn root_and_nested_clients_share_index_watch_and_async_slot() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(true);
     let nested = root.0.join("nested");
     fs::create_dir_all(&nested).unwrap();
@@ -553,6 +563,7 @@ fn root_and_nested_clients_share_index_watch_and_async_slot() {
 
 #[test]
 fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
+    let _guard = process_test_guard();
     let tcp = TestRoot::new(true);
     fs::create_dir_all(tcp.0.join(".code-graph")).unwrap();
     fs::write(tcp.0.join(".code-graph/daemon.sock"), "force TCP").unwrap();
@@ -605,6 +616,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
 
 #[test]
 fn daemon_project_roots_are_isolated_for_sync_and_async_analyze() {
+    let _guard = process_test_guard();
     let a_root = TestRoot::new(true);
     let b_root = TestRoot::new(true);
     let b_source = b_root.0.join("independent.rs");
@@ -674,6 +686,7 @@ fn daemon_project_roots_are_isolated_for_sync_and_async_analyze() {
 #[cfg(debug_assertions)]
 #[test]
 fn forced_fallback_terminates_a_slow_contender_before_it_can_publish() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(true);
     let root_string = root.0.to_string_lossy().into_owned();
     let mut client = Client::launch_with_env(
@@ -721,6 +734,7 @@ fn forced_fallback_terminates_a_slow_contender_before_it_can_publish() {
 
 #[test]
 fn established_daemon_death_ends_proxy_while_stdin_remains_open() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(true);
     let mut client = Client::spawn(&root.0, &[]);
     let metadata = wait_metadata(&root);
@@ -743,6 +757,7 @@ fn established_daemon_death_ends_proxy_while_stdin_remains_open() {
 
 #[test]
 fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let launched: Vec<_> = (0..6).map(|_| Client::launch(&root.0, &[])).collect();
     let mut clients: Vec<_> = launched.into_iter().map(Client::initialize).collect();
@@ -776,6 +791,7 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
 
 #[test]
 fn clean_binary_metadata_mismatch_gracefully_replaces_the_old_owner() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let client = Client::spawn(&root.0, &[]);
     let old = wait_metadata(&root);
@@ -808,6 +824,7 @@ fn clean_binary_metadata_mismatch_gracefully_replaces_the_old_owner() {
 
 #[test]
 fn different_executable_content_replaces_even_when_build_sha_matches() {
+    let _guard = process_test_guard();
     use std::os::unix::fs::PermissionsExt;
 
     let root = TestRoot::new(false);
@@ -853,6 +870,7 @@ fn different_executable_content_replaces_even_when_build_sha_matches() {
 
 #[test]
 fn sequential_clients_keep_the_same_matching_executable_owner() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let first = Client::spawn(&root.0, &[]);
     let old = wait_metadata(&root);
@@ -875,6 +893,7 @@ fn sequential_clients_keep_the_same_matching_executable_owner() {
 
 #[test]
 fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let client = Client::spawn(&root.0, &[]);
     let old = wait_metadata(&root);
@@ -900,6 +919,7 @@ fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
 #[cfg(debug_assertions)]
 #[test]
 fn ignored_replacement_request_is_hard_killed_and_client_falls_back() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let root_string = root.0.to_string_lossy().into_owned();
     let client = Client::launch_with_env(
@@ -937,6 +957,7 @@ fn ignored_replacement_request_is_hard_killed_and_client_falls_back() {
 #[cfg(debug_assertions)]
 #[test]
 fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let root_string = root.0.to_string_lossy().into_owned();
     let source = root.0.join("persist.rs");

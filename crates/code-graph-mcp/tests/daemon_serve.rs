@@ -10,6 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,14 @@ use serde_json::{json, Value};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PROCESS_TEST_SERIALIZATION: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn process_test_guard() -> MutexGuard<'static, ()> {
+    PROCESS_TEST_SERIALIZATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Reaps a test daemon on every failure path. Successful tests explicitly
 /// wait for children before this guard is dropped, so it cannot hide leaks.
@@ -325,6 +334,7 @@ fn tcp_rejected(endpoint: &str, prelude: &[u8]) {
 
 #[test]
 fn serve_publishes_owner_only_uds_and_serves_mcp() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(0);
     let mut daemon = DaemonChild::spawn(&root.0, false);
     let metadata = wait_for_metadata(&root.0);
@@ -355,6 +365,7 @@ fn serve_publishes_owner_only_uds_and_serves_mcp() {
 
 #[test]
 fn simultaneous_serve_contenders_converge_twenty_times_without_leaks() {
+    let _guard = process_test_guard();
     for iteration in 0..20 {
         let root = TestRoot::new(iteration);
         let mut children: Vec<DaemonChild> =
@@ -383,6 +394,7 @@ fn simultaneous_serve_contenders_converge_twenty_times_without_leaks() {
 
 #[test]
 fn simultaneous_contenders_recover_one_stale_lock() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(2);
     let runtime = root.0.join(".code-graph");
     fs::create_dir_all(&runtime).unwrap();
@@ -413,6 +425,7 @@ fn simultaneous_contenders_recover_one_stale_lock() {
 
 #[test]
 fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
+    let _guard = process_test_guard();
     let root = TestRoot::new(1);
     let runtime = root.0.join(".code-graph");
     fs::create_dir_all(&runtime).unwrap();
@@ -481,6 +494,7 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
 
 #[test]
 fn idle_daemon_exits_at_zero_clients_and_zero_never_exits() {
+    let _guard = process_test_guard();
     let one_second = TestRoot::with_idle_timeout(3, 1);
     let mut daemon = DaemonChild::spawn(&one_second.0, false);
     wait_for_metadata(&one_second.0);
@@ -502,6 +516,7 @@ fn idle_daemon_exits_at_zero_clients_and_zero_never_exits() {
 
 #[test]
 fn attached_client_and_disconnect_restart_the_full_idle_timeout() {
+    let _guard = process_test_guard();
     let root = TestRoot::with_idle_timeout(5, 2);
     let mut daemon = DaemonChild::spawn(&root.0, false);
     let metadata = wait_for_metadata(&root.0);
@@ -519,6 +534,7 @@ fn attached_client_and_disconnect_restart_the_full_idle_timeout() {
 
 #[test]
 fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
+    let _guard = process_test_guard();
     let root = TestRoot::with_idle_timeout(6, 1);
     fs::write(root.0.join("main.rs"), "fn benchmark_idle() {}\n").unwrap();
     let marker = root.0.join("persist.marker");
@@ -584,6 +600,7 @@ fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
 
 #[test]
 fn unauthenticated_tcp_socket_does_not_hold_idle_daemon_alive() {
+    let _guard = process_test_guard();
     let root = TestRoot::with_idle_timeout(7, 1);
     let runtime = root.0.join(".code-graph");
     fs::create_dir_all(&runtime).unwrap();
