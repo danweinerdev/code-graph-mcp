@@ -103,6 +103,12 @@ tasks:
     justifies: "NFR-06, AC-07. The final post-control review found that hard-killed cache writers leave uniquely named multi-megabyte temporaries that no later save removes, allowing project-disk growth across repeated crashes."
     verification: "Serialize `Graph::save` calls within a process and, before allocating a new unique temp, remove reserved unique temp sibling entries left by prior writers plus the legacy fixed temp. Never follow symlinks or mutate hardlink targets; refuse/retain directories and unrelated names. Tests pin interrupted-temp cleanup, symlink/hardlink sentinel contents, same-process concurrent saves, no candidate leaks, and final cache loadability. Run persistence tests, daemon replacement tests, workspace lint/format, and two `make verify` runs."
     depends_on: ["3.15"]
+  - id: "3.17"
+    title: "Anchor daemon ownership to the project root"
+    status: planned
+    justifies: "FR-13, AC-08, NFR-06. The cache-scavenging gate found that replacing `.code-graph` creates a second lock namespace while the original daemon continues serving through its retained descriptor; metadata publication temps also survive crashes."
+    verification: "On Linux, hold a crash-released exclusive ownership lock on the verified project-root directory inode for the daemon lifetime in addition to the runtime-file identity, so replacing `.code-graph` cannot admit a second daemon. Contenders against a replaced runtime detect live root ownership and do not publish. After ownership acquisition, scavenge exact metadata-temp siblings descriptor-relatively while retaining symlink/hardlink/directory/unrelated sentinels. Tests pin runtime rename/recreate convergence, root-lock crash release, no split metadata/cache ownership, metadata-temp cleanup, and normal replacement. Run daemon suites, persistence tests, lint/format, and two `make verify` runs."
+    depends_on: ["3.16"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -712,6 +718,22 @@ Revision boundary: each new save bounds crash residue by scavenging the reserved
 |---|---|---|---|
 | `git show fc82fd00f3fd38663f9d09614d6ac3285c5999ff` | Complete task commit | PASS | `Graph::save` recovers a poisoned process-wide mutex, scavenges only exact `<pid>.<sequence>` reserved siblings, retains unsafe directories, and then performs the existing atomic save. |
 | Independent focused quality and blind-spots reviews | Complete task diff plus persistence callers/tests | PASS | Prefix-only deletion was narrowed to the generated numeric shape. Cross-process direct/daemon save coordination remains the approved explicit non-goal; same-process active temps are serialized and cannot be scavenged. |
+
+## 3.17: Anchor daemon ownership to the project root
+
+### Subtasks
+- [ ] Hold Linux daemon ownership on the verified project-root inode
+- [ ] Prevent runtime-directory replacement from creating a second daemon namespace
+- [ ] Scavenge exact abandoned metadata publication temps under ownership
+- [ ] Add root-lock, runtime-replacement, metadata-temp, sentinel, and replacement regressions
+
+### Notes
+
+Revision boundary: daemon single-instance authority survives replacement of its runtime child directory, and crash-abandoned metadata temps are bounded without widening direct-mode cache locking.
+
+### Completion Evidence
+
+Pending — not complete.
 
 ## Acceptance Criteria
 

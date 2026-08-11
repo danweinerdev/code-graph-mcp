@@ -84,13 +84,13 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 
 ## Current State
 
-*Written for a cold start. Last updated 2026-08-11 after daemon admission hardening revision `5dfb170`.*
+*Written for a cold start. Last updated 2026-08-11 after cache-temp hardening revision `fc82fd0`.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | tasks complete, phase `in-progress` | Linux daemon MVP is implemented through abandoned-temp scavenging (`fc82fd0`), measured on two corpora, and fully gated by `make verify`. **Next: fresh final four-lane Phase 3 review.** Native platform completion remains deferred to phases 10/11. |
+| 3 Daemon Foundation | one ownership follow-up planned, phase `in-progress` | Linux daemon MVP is implemented through abandoned-temp scavenging (`fc82fd0`), measured on two corpora, and fully gated by `make verify`. Task 3.17 anchors ownership above the replaceable runtime directory and cleans metadata temps; then rerun the final review. Native platform completion remains deferred to phases 10/11. |
 | 4 Analyze Queue | planned | Gated on 3. Now also carries task 4.4 (async job slot, FR-49). |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
