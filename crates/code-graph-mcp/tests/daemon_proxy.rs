@@ -290,6 +290,25 @@ fn wait_metadata(root: &TestRoot) -> Value {
     }
 }
 
+fn wait_replacement_metadata(root: &TestRoot, previous_owner: &Value) -> Value {
+    let path = root.0.join(".code-graph/daemon.json");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(bytes) = fs::read(&path) {
+            let metadata: Value = serde_json::from_slice(&bytes).expect("daemon metadata");
+            if metadata["owner"] != *previous_owner {
+                root.track_daemon(&metadata);
+                return metadata;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement daemon did not publish new metadata"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn stop_daemon(metadata: &Value) {
     let status = Command::new("kill")
         .args([
@@ -871,14 +890,17 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
     root.disarm_daemon();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn clean_binary_metadata_mismatch_gracefully_replaces_the_old_owner() {
+fn clean_binary_mismatch_recovers_a_truncated_request_and_replaces_the_old_owner() {
     let _guard = process_test_guard();
     let root = TestRoot::new(false);
     let client = Client::spawn(&root.0, &[]);
     let old = wait_metadata(&root);
     client.close();
     replace_metadata_sha(&root, &old, "different-clean-build".to_owned());
+    fs::write(root.0.join(".code-graph/shutdown.request"), b"{\"pid\":")
+        .expect("plant interrupted shutdown request");
 
     let started = Instant::now();
     let mut replacement = Client::spawn(&root.0, &[]);
@@ -889,7 +911,7 @@ fn clean_binary_metadata_mismatch_gracefully_replaces_the_old_owner() {
             .len(),
         22
     );
-    let new = wait_metadata(&root);
+    let new = wait_replacement_metadata(&root, &old["owner"]);
     assert_ne!(
         new["owner"], old["owner"],
         "replacement publishes a new owner"

@@ -34,6 +34,10 @@ const SECRET_FILE: &str = "secret";
 const SOCKET_FILE: &str = "daemon.sock";
 const SHUTDOWN_REQUEST_FILE: &str = "shutdown.request";
 const SHUTDOWN_ACK_FILE: &str = "shutdown.ack";
+#[cfg(target_os = "linux")]
+const SHUTDOWN_CONTROL_LOCK_FILE: &str = "shutdown.control.lock";
+#[cfg(target_os = "linux")]
+const OWNER_RECORD_TEMP_PREFIX: &str = ".daemon-owner-record-";
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_LOCK_RECORD_BYTES: usize = 4 * 1024;
 const MAX_SHUTDOWN_RECORD_BYTES: usize = 4 * 1024;
@@ -87,6 +91,21 @@ struct DaemonPaths {
 #[derive(Debug)]
 struct RuntimeDir {
     file: std::fs::File,
+}
+
+/// Persistent serialization lock for shutdown request/ack mutations. It is
+/// intentionally never unlinked: every daemon generation reuses the same
+/// owner-only inode through the retained runtime-directory descriptor.
+#[cfg(target_os = "linux")]
+struct ShutdownControlLock {
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ShutdownControlLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl DaemonPaths {
@@ -272,10 +291,53 @@ impl DaemonPaths {
         )?)
     }
 
+    #[cfg(not(unix))]
+    fn remove_child(&self, name: &str) -> std::io::Result<()> {
+        fs::remove_file(self.ordinary_path(name))
+    }
+
     #[cfg(unix)]
     fn rename_child(&self, from: &str, to: &str) -> std::io::Result<()> {
         let runtime = self.runtime_dir_for_child()?;
         Ok(rustix_fs::renameat(&runtime.file, from, &runtime.file, to)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_runtime_dir(&self) -> std::io::Result<()> {
+        self.runtime_dir_for_child()?.file.sync_all()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_shutdown_control_lock(&self) -> std::io::Result<ShutdownControlLock> {
+        for _ in 0..8 {
+            let file = self.open_child(
+                SHUTDOWN_CONTROL_LOCK_FILE,
+                OFlags::CREATE | OFlags::RDWR,
+                Mode::from_bits_truncate(0o600),
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(std::io::Error::other(
+                    "daemon shutdown control lock is not a single-link regular file",
+                ));
+            }
+            rustix_fs::fchmod(&file, Mode::from_bits_truncate(0o600))?;
+            file.lock_exclusive()?;
+            let current = self.open_child(
+                SHUTDOWN_CONTROL_LOCK_FILE,
+                OFlags::RDONLY | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?;
+            let current_metadata = current.metadata()?;
+            if metadata.dev() == current_metadata.dev() && metadata.ino() == current_metadata.ino()
+            {
+                return Ok(ShutdownControlLock { file });
+            }
+            let _ = FileExt::unlock(&file);
+        }
+        Err(std::io::Error::other(
+            "daemon shutdown control lock changed while acquiring it",
+        ))
     }
 
     /// Reads one daemon record through the retained runtime-directory
@@ -310,6 +372,51 @@ impl DaemonPaths {
         self.remove_child(name)
     }
 
+    /// Removes only a regular, unlinked-from-everywhere-else runtime record.
+    /// Recovery uses this stricter form so a repository entry hard-linked to
+    /// an external sentinel is never treated as an interrupted owner record.
+    #[cfg(unix)]
+    fn remove_single_link_regular_child(&self, name: &str) -> std::io::Result<()> {
+        let file = self.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(std::io::Error::other(format!(
+                "daemon runtime entry {name} is not a single-link regular file"
+            )));
+        }
+        self.remove_child(name)
+    }
+
+    /// A process can die after naming an exchange staging inode. A successor
+    /// holds the authoritative daemon lock before this runs, and scans through
+    /// the retained descriptor rather than resolving the mutable runtime path.
+    #[cfg(target_os = "linux")]
+    fn scavenge_owner_record_temps(&self) -> std::io::Result<()> {
+        let _control = self.acquire_shutdown_control_lock()?;
+        self.scavenge_owner_record_temps_locked()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scavenge_owner_record_temps_locked(&self) -> std::io::Result<()> {
+        let runtime = self.runtime_dir_for_child()?;
+        let mut entries = rustix_fs::Dir::read_from(&runtime.file)?;
+        for entry in &mut entries {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if !bytes.starts_with(OWNER_RECORD_TEMP_PREFIX.as_bytes()) {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            // Do not unlink a planted symlink or hard link just because it
+            // mimics our prefix. A genuine crashed staging entry is regular
+            // and has exactly one link.
+            let _ = self.remove_single_link_regular_child(name);
+        }
+        Ok(())
+    }
+
     #[cfg(not(unix))]
     fn ordinary_path(&self, name: &str) -> PathBuf {
         match name {
@@ -326,6 +433,11 @@ impl DaemonPaths {
     #[cfg(not(unix))]
     fn remove_regular_child(&self, name: &str) -> std::io::Result<()> {
         fs::remove_file(self.ordinary_path(name))
+    }
+
+    #[cfg(not(unix))]
+    fn remove_single_link_regular_child(&self, name: &str) -> std::io::Result<()> {
+        self.remove_regular_child(name)
     }
 
     /// Tokio's Unix socket API only accepts a pathname. The procfd alias is
@@ -729,12 +841,12 @@ fn replace_stale_shutdown_request(
     paths: &DaemonPaths,
     rejected: &LockIdentity,
 ) -> anyhow::Result<()> {
-    let existing: LockIdentity = serde_json::from_slice(&match paths.read_bounded_record(
-        SHUTDOWN_REQUEST_FILE,
-        MAX_SHUTDOWN_RECORD_BYTES,
-        false,
-    ) {
-        Ok(contents) => contents,
+    #[cfg(target_os = "linux")]
+    let _control = paths
+        .acquire_shutdown_control_lock()
+        .context("acquire daemon shutdown control lock")?;
+    let existing = match read_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request") {
+        Ok(existing) => existing,
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -742,9 +854,11 @@ fn replace_stale_shutdown_request(
         {
             return Ok(())
         }
-        Err(error) => return Err(error),
-    })
-    .context("parse existing daemon shutdown request")?;
+        // Publication performs the one atomic replacement below. Do not
+        // validate this pathname and then unlink it here: a replacement can
+        // race that split operation.
+        Err(_) => return Ok(()),
+    };
     if existing == *rejected {
         return Ok(());
     }
@@ -752,13 +866,15 @@ fn replace_stale_shutdown_request(
     if active.as_ref() == Some(&existing) {
         bail!("daemon shutdown request belongs to a different active owner");
     }
-    paths.remove_regular_child(SHUTDOWN_REQUEST_FILE)?;
     Ok(())
 }
 
 fn active_lock_identity(paths: &DaemonPaths) -> Option<LockIdentity> {
     let owner = read_lock_identity_child(paths).ok()?;
-    (identity_is_alive(&owner) && lock_is_actively_held(paths)).then_some(owner)
+    (identity_is_alive(&owner)
+        && lock_is_actively_held(paths)
+        && read_lock_identity_child(paths).is_ok_and(|current| current == owner))
+    .then_some(owner)
 }
 
 fn kill_identity(identity: &LockIdentity) -> bool {
@@ -1250,6 +1366,12 @@ where
         return Ok(());
     };
 
+    #[cfg(target_os = "linux")]
+    if let Err(error) = paths.scavenge_owner_record_temps() {
+        lock.remove_if_owned();
+        return Err(error).context("scavenge daemon owner-record temps after lock acquisition");
+    }
+
     if let Err(error) = clear_shutdown_request(&paths) {
         lock.remove_if_owned();
         return Err(error);
@@ -1371,7 +1493,11 @@ fn clear_shutdown_ack(paths: &DaemonPaths) -> anyhow::Result<()> {
 }
 
 fn clear_owner_file(paths: &DaemonPaths, name: &str, label: &str) -> anyhow::Result<()> {
-    match paths.remove_regular_child(name) {
+    #[cfg(target_os = "linux")]
+    let _control = paths
+        .acquire_shutdown_control_lock()
+        .with_context(|| format!("acquire daemon shutdown control lock for {label}"))?;
+    match paths.remove_single_link_regular_child(name) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove stale daemon shutdown {label}")),
@@ -1382,11 +1508,115 @@ fn write_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::
     write_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request", owner)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn write_shutdown_ack(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::Result<()> {
     write_owner_file(paths, SHUTDOWN_ACK_FILE, "acknowledgement", owner)
 }
 
 fn write_owner_file(
+    paths: &DaemonPaths,
+    name: &str,
+    label: &str,
+    owner: &LockIdentity,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        write_owner_file_linux(paths, name, label, owner)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        write_owner_file_portable(paths, name, label, owner)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_owner_file_linux(
+    paths: &DaemonPaths,
+    name: &str,
+    label: &str,
+    owner: &LockIdentity,
+) -> anyhow::Result<()> {
+    let _control = paths
+        .acquire_shutdown_control_lock()
+        .context("acquire daemon shutdown control lock")?;
+    write_owner_file_linux_locked(paths, name, label, owner)
+}
+
+#[cfg(target_os = "linux")]
+fn write_owner_file_linux_locked(
+    paths: &DaemonPaths,
+    name: &str,
+    label: &str,
+    owner: &LockIdentity,
+) -> anyhow::Result<()> {
+    let encoded =
+        serde_json::to_vec(owner).with_context(|| format!("serialize daemon shutdown {label}"))?;
+    match read_owner_file(paths, name, label) {
+        Ok(existing) if existing == *owner => return Ok(()),
+        Ok(existing) if active_lock_identity(paths).as_ref() == Some(&existing) => {
+            bail!("daemon shutdown {label} belongs to a different active owner")
+        }
+        Ok(_) | Err(_) => ensure_single_link_regular_owner_record_or_absent(paths, name, label)?,
+    }
+    if active_lock_identity(paths).as_ref() != Some(owner) {
+        bail!("daemon shutdown {label} target owner is not active")
+    }
+
+    let (temp, mut file) = create_owner_record_temp(paths, name)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&encoded)
+            .with_context(|| format!("write daemon shutdown {label} temp"))?;
+        file.sync_all()
+            .with_context(|| format!("sync daemon shutdown {label} temp"))?;
+        // The control lock serializes all final-name mutations, so ordinary
+        // descriptor-relative rename can atomically replace only authorized
+        // stale/malformed state or install an absent record.
+        if active_lock_identity(paths).as_ref() != Some(owner) {
+            bail!("daemon shutdown {label} target owner changed before publication")
+        }
+        paths
+            .rename_child(&temp, name)
+            .with_context(|| format!("publish daemon shutdown {label}"))?;
+        paths
+            .sync_runtime_dir()
+            .context("sync daemon shutdown runtime directory")
+    })();
+    if result.is_err() {
+        let _ = paths.remove_child(&temp);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn create_owner_record_temp(
+    paths: &DaemonPaths,
+    final_name: &str,
+) -> anyhow::Result<(String, std::fs::File)> {
+    for _ in 0..8 {
+        let name = format!(
+            "{OWNER_RECORD_TEMP_PREFIX}{final_name}-{}-{}.tmp",
+            std::process::id(),
+            random_hex(16)?
+        );
+        match paths.open_child(
+            &name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(file) => return Ok((name, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create daemon shutdown temp"),
+        }
+    }
+    bail!("could not allocate a unique daemon shutdown temp name")
+}
+
+/// Deferred native platforms retain the pre-hardening create-new publication
+/// semantics: no existing record is clobbered, an exact owner is idempotent,
+/// and reads remain bounded. Linux's stronger exchange protocol is deliberately
+/// isolated above until native atomic replacement is completed there.
+#[cfg(not(target_os = "linux"))]
+fn write_owner_file_portable(
     paths: &DaemonPaths,
     name: &str,
     label: &str,
@@ -1406,9 +1636,6 @@ fn write_owner_file(
     };
     match created {
         Ok(mut file) => {
-            // Write directly to the final name. A concurrent publisher cannot
-            // be overwritten, and a partial file is harmless: the daemon's
-            // polling reader ignores it until this completed write is synced.
             file.write_all(&serde_json::to_vec(owner)?)?;
             file.sync_all()?;
             Ok(())
@@ -1430,6 +1657,32 @@ fn write_owner_file(
     }
 }
 
+/// Reads a control record only when it is a normal owner-only file. A writer
+/// never adopts a hard-linked or symlinked entry as its own idempotent record.
+fn read_owner_file(paths: &DaemonPaths, name: &str, label: &str) -> anyhow::Result<LockIdentity> {
+    let encoded = paths.read_bounded_record(name, MAX_SHUTDOWN_RECORD_BYTES, true)?;
+    serde_json::from_slice(&encoded)
+        .with_context(|| format!("parse existing daemon shutdown {label}"))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_single_link_regular_owner_record_or_absent(
+    paths: &DaemonPaths,
+    name: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let file = match paths.open_child(name, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context(format!("inspect daemon shutdown {label}")),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        bail!("daemon shutdown {label} is not a single-link regular file");
+    }
+    Ok(())
+}
+
 fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var("CODE_GRAPH_TEST_DAEMON_IGNORE_REQUEST_ROOT")
@@ -1438,26 +1691,44 @@ fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
     {
         return false;
     }
-    let matches = paths
-        .read_bounded_record(SHUTDOWN_REQUEST_FILE, MAX_SHUTDOWN_RECORD_BYTES, false)
-        .ok()
-        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
-        .is_some_and(|requested| requested == *owner);
-    if matches {
-        if let Err(error) = write_shutdown_ack(paths, owner) {
-            eprintln!("code-graph-mcp: publish daemon shutdown acknowledgement: {error}");
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(_control) = paths.acquire_shutdown_control_lock() else {
             return false;
+        };
+        let matches = read_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request")
+            .ok()
+            .is_some_and(|requested| requested == *owner);
+        if matches {
+            if let Err(error) =
+                write_owner_file_linux_locked(paths, SHUTDOWN_ACK_FILE, "acknowledgement", owner)
+            {
+                eprintln!("code-graph-mcp: publish daemon shutdown acknowledgement: {error}");
+                return false;
+            }
+            let _ = paths.remove_single_link_regular_child(SHUTDOWN_REQUEST_FILE);
         }
-        let _ = paths.remove_regular_child(SHUTDOWN_REQUEST_FILE);
+        matches
     }
-    matches
+    #[cfg(not(target_os = "linux"))]
+    {
+        let matches = read_owner_file(paths, SHUTDOWN_REQUEST_FILE, "request")
+            .ok()
+            .is_some_and(|requested| requested == *owner);
+        if matches {
+            if let Err(error) = write_shutdown_ack(paths, owner) {
+                eprintln!("code-graph-mcp: publish daemon shutdown acknowledgement: {error}");
+                return false;
+            }
+            let _ = paths.remove_single_link_regular_child(SHUTDOWN_REQUEST_FILE);
+        }
+        matches
+    }
 }
 
 fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
-    paths
-        .read_bounded_record(SHUTDOWN_ACK_FILE, MAX_SHUTDOWN_RECORD_BYTES, false)
+    read_owner_file(paths, SHUTDOWN_ACK_FILE, "acknowledgement")
         .ok()
-        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|acknowledged| acknowledged == *owner)
 }
 
@@ -1620,6 +1891,8 @@ async fn cleanup_stale_runtime(paths: &DaemonPaths, _owner: Option<&LockIdentity
     let _ = paths.remove_regular_child(SECRET_FILE);
     let _ = clear_shutdown_request(paths);
     let _ = clear_shutdown_ack(paths);
+    #[cfg(target_os = "linux")]
+    let _ = paths.scavenge_owner_record_temps();
 }
 
 #[cfg(unix)]
@@ -2275,13 +2548,15 @@ fn remove_shutdown_ack_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
 }
 
 fn remove_owner_file_if_owned(paths: &DaemonPaths, name: &str, owner: &LockIdentity) {
-    let belongs_to_owner = paths
-        .read_bounded_record(name, MAX_SHUTDOWN_RECORD_BYTES, false)
+    #[cfg(target_os = "linux")]
+    let Ok(_control) = paths.acquire_shutdown_control_lock() else {
+        return;
+    };
+    let belongs_to_owner = read_owner_file(paths, name, "cleanup")
         .ok()
-        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
         .is_some_and(|requested| requested == *owner);
     if belongs_to_owner {
-        let _ = paths.remove_regular_child(name);
+        let _ = paths.remove_single_link_regular_child(name);
     }
 }
 
@@ -2716,7 +2991,11 @@ mod tests {
             start_time: lock.identity.start_time,
             nonce: "different".to_owned(),
         };
-        write_shutdown_request(&paths, &wrong_owner).unwrap();
+        fs::write(
+            &paths.shutdown_request,
+            serde_json::to_vec(&wrong_owner).unwrap(),
+        )
+        .unwrap();
         assert!(!accept_shutdown_request(&paths, &lock.identity));
         assert!(
             paths.shutdown_request.exists(),
@@ -2733,12 +3012,347 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn truncated_shutdown_request_and_ack_recover_for_the_active_owner() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        assert_eq!(active_lock_identity(&paths).as_ref(), Some(&lock.identity));
+
+        let truncated_request = b"{\"pid\":";
+        fs::write(&paths.shutdown_request, truncated_request).unwrap();
+        let different_owner = LockIdentity {
+            pid: lock.identity.pid,
+            start_time: lock.identity.start_time,
+            nonce: "different-owner".to_owned(),
+        };
+        assert!(write_shutdown_request(&paths, &different_owner).is_err());
+        assert_eq!(
+            fs::read(&paths.shutdown_request).unwrap(),
+            truncated_request,
+            "a malformed record remains when the target does not own the active lock"
+        );
+        assert_no_owner_record_temps(&paths);
+
+        write_shutdown_request(&paths, &lock.identity).unwrap();
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            lock.identity
+        );
+
+        fs::write(&paths.shutdown_ack, b"{\"start_time\":").unwrap();
+        write_owner_file_linux(&paths, SHUTDOWN_ACK_FILE, "acknowledgement", &lock.identity)
+            .unwrap();
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_ACK_FILE, "acknowledgement").unwrap(),
+            lock.identity
+        );
+        assert_no_owner_record_temps(&paths);
+
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_record_replacement_leaves_stale_state_until_serialized_publication() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let stale = LockIdentity {
+            pid: lock.identity.pid,
+            start_time: lock.identity.start_time,
+            nonce: "stale-owner".to_owned(),
+        };
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        fs::write(&paths.shutdown_request, &stale_bytes).unwrap();
+
+        replace_stale_shutdown_request(&paths, &lock.identity).unwrap();
+        assert_eq!(
+            fs::read(&paths.shutdown_request).unwrap(),
+            stale_bytes,
+            "authorization leaves stale final state for serialized publication"
+        );
+        write_shutdown_request(&paths, &lock.identity).unwrap();
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            lock.identity
+        );
+        assert_no_owner_record_temps(&paths);
+
+        assert!(write_shutdown_request(&paths, &lock.identity).is_ok());
+        assert!(write_shutdown_request(&paths, &stale).is_err());
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            lock.identity,
+            "a different owner cannot replace an active final record"
+        );
+        assert_no_owner_record_temps(&paths);
+
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_control_lock_serializes_publishers_and_blocks_owner_transition() {
+        use std::sync::mpsc;
+
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let mut lock = DaemonLock::acquire(&paths).unwrap();
+        let target = lock.identity.clone();
+        let control = paths.acquire_shutdown_control_lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let paths = paths.clone();
+            let owner = target.clone();
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(write_shutdown_request(&paths, &owner))
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a competing publisher waits on the persistent control lock"
+            );
+            drop(control);
+            done_rx.recv().unwrap().unwrap();
+        });
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            target
+        );
+        assert_no_owner_record_temps(&paths);
+
+        let stale = LockIdentity {
+            pid: target.pid,
+            start_time: target.start_time,
+            nonce: "stale-owner".to_owned(),
+        };
+        fs::write(&paths.shutdown_request, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let control = paths.acquire_shutdown_control_lock().unwrap();
+        let successor = LockIdentity {
+            pid: target.pid,
+            start_time: target.start_time,
+            nonce: "successor-owner".to_owned(),
+        };
+        lock.write_identity(successor).unwrap();
+        drop(control);
+        assert!(write_shutdown_request(&paths, &target).is_err());
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            stale,
+            "a target owner transition prevents stale-record overwrite"
+        );
+        assert_no_owner_record_temps(&paths);
+
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn locked_successor_scavenges_only_single_link_owner_record_temps() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let leaked = paths.runtime.join(format!(
+            "{OWNER_RECORD_TEMP_PREFIX}shutdown.request-crashed.tmp"
+        ));
+        fs::write(&leaked, b"completed but unexchanged").unwrap();
+
+        let sentinel = outside.join("owner-record-temp-sentinel");
+        let contents = b"external owner-record temp sentinel\n";
+        fs::write(&sentinel, contents).unwrap();
+        let hardlinked = paths.runtime.join(format!(
+            "{OWNER_RECORD_TEMP_PREFIX}shutdown.request-hardlink.tmp"
+        ));
+        fs::hard_link(&sentinel, &hardlinked).unwrap();
+
+        paths.scavenge_owner_record_temps().unwrap();
+        assert!(
+            !leaked.exists(),
+            "single-link crashed staging inode is removed"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        assert!(hardlinked.exists(), "hard-linked sentinel is retained");
+
+        fs::remove_file(hardlinked).unwrap();
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fresh_daemon_lock_scavenges_owner_record_temps_before_control_cleanup() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let leaked = paths.runtime.join(format!(
+            "{OWNER_RECORD_TEMP_PREFIX}shutdown.request-fresh-lock.tmp"
+        ));
+        fs::write(&leaked, b"crashed named staging record").unwrap();
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+
+        run_until(
+            server,
+            root.clone(),
+            Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !leaked.exists(),
+            "a fresh lock scavenges prefixed crash state before control cleanup"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_owner_record_publishers_converge_without_clobbering() {
+        use std::sync::{Arc, Barrier};
+
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let owner = lock.identity.clone();
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            let mut publishers = Vec::new();
+            for _ in 0..8 {
+                let paths = paths.clone();
+                let owner = owner.clone();
+                let barrier = barrier.clone();
+                publishers.push(scope.spawn(move || {
+                    barrier.wait();
+                    write_shutdown_request(&paths, &owner)
+                }));
+            }
+            for publisher in publishers {
+                publisher.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            read_owner_file(&paths, SHUTDOWN_REQUEST_FILE, "request").unwrap(),
+            owner
+        );
+        assert_no_owner_record_temps(&paths);
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_record_publication_preserves_external_symlink_and_hardlink_sentinels() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+
+        let symlink_sentinel = outside.join("shutdown-request-symlink-sentinel");
+        let symlink_contents = b"external shutdown request sentinel\n";
+        fs::write(&symlink_sentinel, symlink_contents).unwrap();
+        std::os::unix::fs::symlink(&symlink_sentinel, &paths.shutdown_request).unwrap();
+        assert!(write_shutdown_request(&paths, &lock.identity).is_err());
+        assert_eq!(fs::read(&symlink_sentinel).unwrap(), symlink_contents);
+        assert!(fs::symlink_metadata(&paths.shutdown_request)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_no_owner_record_temps(&paths);
+        fs::remove_file(&paths.shutdown_request).unwrap();
+
+        let hardlink_sentinel = outside.join("shutdown-request-hardlink-sentinel");
+        let hardlink_contents = b"external shutdown request hardlink sentinel\n";
+        fs::write(&hardlink_sentinel, hardlink_contents).unwrap();
+        fs::hard_link(&hardlink_sentinel, &paths.shutdown_request).unwrap();
+        assert!(write_shutdown_request(&paths, &lock.identity).is_err());
+        assert_eq!(fs::read(&hardlink_sentinel).unwrap(), hardlink_contents);
+        assert_eq!(
+            fs::metadata(&paths.shutdown_request).unwrap().nlink(),
+            2,
+            "hard-linked sentinel remains installed rather than being recovered"
+        );
+        assert_no_owner_record_temps(&paths);
+
+        fs::remove_file(&paths.shutdown_request).unwrap();
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_record_cleanup_refuses_linked_final_sentinels() {
+        let root = test_root();
+        let outside = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let encoded = serde_json::to_vec(&lock.identity).unwrap();
+
+        let symlink_sentinel = outside.join("cleanup-symlink-sentinel");
+        fs::write(&symlink_sentinel, &encoded).unwrap();
+        std::os::unix::fs::symlink(&symlink_sentinel, &paths.shutdown_request).unwrap();
+        remove_shutdown_request_if_owned(&paths, &lock.identity);
+        assert!(fs::symlink_metadata(&paths.shutdown_request)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&symlink_sentinel).unwrap(), encoded);
+        fs::remove_file(&paths.shutdown_request).unwrap();
+
+        let hardlink_sentinel = outside.join("cleanup-hardlink-sentinel");
+        fs::write(&hardlink_sentinel, &encoded).unwrap();
+        fs::hard_link(&hardlink_sentinel, &paths.shutdown_ack).unwrap();
+        remove_shutdown_ack_if_owned(&paths, &lock.identity);
+        assert!(paths.shutdown_ack.exists());
+        assert_eq!(fs::read(&hardlink_sentinel).unwrap(), encoded);
+
+        fs::remove_file(&paths.shutdown_ack).unwrap();
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_owner_record_temps(paths: &DaemonPaths) {
+        let leaked: Vec<_> = fs::read_dir(&paths.runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(OWNER_RECORD_TEMP_PREFIX))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "leaked owner-record temporary entries: {leaked:?}"
+        );
+    }
+
     #[test]
     fn shutdown_owner_publication_never_clobbers_another_owner() {
         let root = test_root();
         let paths = DaemonPaths::for_root(&root);
         paths.ensure_runtime_dir().unwrap();
-        let first = LockIdentity::current().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let first = lock.identity.clone();
         let second = LockIdentity {
             pid: first.pid,
             start_time: first.start_time,
@@ -2751,6 +3365,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&paths.shutdown_request).unwrap()).unwrap();
         assert_eq!(published, first);
 
+        lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3233,6 +3848,10 @@ mod tests {
         .unwrap();
         write_metadata_atomically(&paths.metadata, &metadata).unwrap();
         write_shutdown_request(&paths, &lock.identity).unwrap();
+        #[cfg(target_os = "linux")]
+        write_owner_file_linux(&paths, SHUTDOWN_ACK_FILE, "acknowledgement", &lock.identity)
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
         write_shutdown_ack(&paths, &lock.identity).unwrap();
 
         // This is the strongest Linux-runnable evidence available without
@@ -3243,14 +3862,17 @@ mod tests {
             fs::metadata(&paths.runtime).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        for path in [
-            &paths.lock,
-            &paths.metadata,
-            &paths.shutdown_request,
-            &paths.shutdown_ack,
-        ] {
+        let mut sensitive_paths = vec![
+            paths.lock.clone(),
+            paths.metadata.clone(),
+            paths.shutdown_request.clone(),
+            paths.shutdown_ack.clone(),
+        ];
+        #[cfg(target_os = "linux")]
+        sensitive_paths.push(paths.runtime.join(SHUTDOWN_CONTROL_LOCK_FILE));
+        for path in sensitive_paths {
             assert_eq!(
-                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "{} must be owner-only",
                 path.display()
