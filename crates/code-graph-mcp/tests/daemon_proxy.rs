@@ -1,8 +1,8 @@
-//! Process coverage for opt-in daemon proxy attachment.
+//! Process coverage for default-on daemon proxy attachment.
 
 #![cfg(unix)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+use code_graph_graph::Graph;
 use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -281,6 +283,16 @@ fn stop_daemon(metadata: &Value) {
     assert!(status.success(), "SIGINT daemon");
 }
 
+fn replace_metadata_sha(root: &TestRoot, metadata: &Value, binary_sha: String) {
+    let mut replacement = metadata.clone();
+    replacement["binary_sha"] = Value::String(binary_sha);
+    fs::write(
+        root.0.join(".code-graph/daemon.json"),
+        serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
+}
+
 fn wait_runtime_cleanup(root: &Path) {
     let lock = root.join(".code-graph/daemon.lock");
     let deadline = Instant::now() + TIMEOUT;
@@ -312,9 +324,9 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[test]
-fn disabled_and_no_daemon_clients_never_create_runtime_state() {
-    let absent = TestRoot::new(false);
-    let mut client = Client::spawn(&absent.0, &[]);
+fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
+    let default_root = TestRoot::new(false);
+    let mut client = Client::spawn(&default_root.0, &[]);
     assert_eq!(
         client.request("tools/list", json!({}))["result"]["tools"]
             .as_array()
@@ -323,7 +335,10 @@ fn disabled_and_no_daemon_clients_never_create_runtime_state() {
         22
     );
     client.close();
-    assert!(!absent.0.join(".code-graph").exists());
+    let metadata = wait_metadata(&default_root);
+    stop_daemon(&metadata);
+    wait_runtime_cleanup(&default_root.0);
+    default_root.disarm_daemon();
 
     let disabled = TestRoot::new(false);
     fs::write(
@@ -369,6 +384,7 @@ fn disabled_and_no_daemon_clients_never_create_runtime_state() {
     assert!(!forced.0.join(".code-graph").exists());
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn root_and_nested_clients_share_index_watch_and_async_slot() {
     let root = TestRoot::new(true);
@@ -377,8 +393,28 @@ fn root_and_nested_clients_share_index_watch_and_async_slot() {
     let source = root.0.join("sample.rs");
     fs::write(&source, "fn before() {}\n").unwrap();
 
-    let mut a = Client::spawn(&root.0, &[]);
-    let mut b = Client::spawn(&nested, &[]);
+    // During a dirty development build each contender must observe the
+    // genuinely absent runtime before the winner publishes, so both clients
+    // trust that newly published owner instead of replacing it mid-session.
+    let root_string = root.0.to_string_lossy().into_owned();
+    let a = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_DAEMON_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_DAEMON_DELAY_MILLIS", "300"),
+        ],
+    );
+    let b = Client::launch_with_env(
+        &nested,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_DAEMON_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_DAEMON_DELAY_MILLIS", "300"),
+        ],
+    );
+    let mut a = a.initialize();
+    let mut b = b.initialize();
     let metadata = wait_metadata(&root);
     assert!(
         !nested.join(".code-graph").exists(),
@@ -524,7 +560,7 @@ fn forced_fallback_terminates_a_slow_contender_before_it_can_publish() {
             ("CODE_GRAPH_TEST_DAEMON_DELAY_MILLIS", "5000"),
         ],
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
     let contender_pid = loop {
         if let Some(pid) = child_pids(client.child.id()).into_iter().next() {
             break pid;
@@ -583,7 +619,7 @@ fn established_daemon_death_ends_proxy_while_stdin_remains_open() {
 
 #[test]
 fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
-    let root = TestRoot::new(true);
+    let root = TestRoot::new(false);
     let launched: Vec<_> = (0..6).map(|_| Client::launch(&root.0, &[])).collect();
     let mut clients: Vec<_> = launched.into_iter().map(Client::initialize).collect();
     let metadata = wait_metadata(&root);
@@ -610,6 +646,226 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
         client.close();
     }
     stop_daemon(&metadata);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[test]
+fn clean_binary_metadata_mismatch_gracefully_replaces_the_old_owner() {
+    let root = TestRoot::new(false);
+    let client = Client::spawn(&root.0, &[]);
+    let old = wait_metadata(&root);
+    client.close();
+    replace_metadata_sha(&root, &old, "different-clean-build".to_owned());
+
+    let started = Instant::now();
+    let mut replacement = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        replacement.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    let new = wait_metadata(&root);
+    assert_ne!(
+        new["owner"], old["owner"],
+        "replacement publishes a new owner"
+    );
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "replacement stays within client bound"
+    );
+    replacement.close();
+    stop_daemon(&new);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[test]
+fn different_executable_content_replaces_even_when_build_sha_matches() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestRoot::new(false);
+    let copied = root.0.join("altered-code-graph-mcp");
+    fs::copy(env!("CARGO_BIN_EXE_code-graph-mcp"), &copied).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&copied)
+        .unwrap()
+        .write_all(b"code-graph-test-trailing-bytes")
+        .unwrap();
+    let mode = fs::metadata(env!("CARGO_BIN_EXE_code-graph-mcp"))
+        .unwrap()
+        .permissions()
+        .mode();
+    fs::set_permissions(&copied, fs::Permissions::from_mode(mode)).unwrap();
+    let mut altered = Command::new(&copied)
+        .arg("--serve")
+        .current_dir(&root.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let old = wait_metadata(&root);
+
+    let mut client = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        client.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    let new = wait_metadata(&root);
+    assert_ne!(new["owner"], old["owner"], "different executable replaced");
+    client.close();
+    let _ = altered.wait();
+    stop_daemon(&new);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[test]
+fn sequential_clients_keep_the_same_matching_executable_owner() {
+    let root = TestRoot::new(false);
+    let first = Client::spawn(&root.0, &[]);
+    let old = wait_metadata(&root);
+    let mut second = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        second.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    let current = wait_metadata(&root);
+    assert_eq!(current["owner"], old["owner"]);
+    first.close();
+    second.close();
+    stop_daemon(&current);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[test]
+fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
+    let root = TestRoot::new(false);
+    let client = Client::spawn(&root.0, &[]);
+    let old = wait_metadata(&root);
+    client.close();
+    replace_metadata_sha(&root, &old, "same-development-build-dirty".to_owned());
+
+    let mut replacement = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        replacement.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    let new = wait_metadata(&root);
+    assert_ne!(new["owner"], old["owner"], "dirty owner was replaced once");
+    replacement.close();
+    stop_daemon(&new);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn ignored_replacement_request_is_hard_killed_and_client_falls_back() {
+    let root = TestRoot::new(false);
+    let root_string = root.0.to_string_lossy().into_owned();
+    let client = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[("CODE_GRAPH_TEST_DAEMON_IGNORE_REQUEST_ROOT", &root_string)],
+    )
+    .initialize();
+    let old = wait_metadata(&root);
+    client.close();
+    replace_metadata_sha(&root, &old, "force-replacement-dirty".to_owned());
+
+    let started = Instant::now();
+    let mut fallback = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        fallback.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    fallback.close();
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "hard-kill fallback remains bounded"
+    );
+    assert!(
+        !process_is_alive(old["pid"].as_u64().unwrap() as u32),
+        "ignored daemon was hard-killed"
+    );
+    root.disarm_daemon();
+    let _ = fs::remove_file(root.0.join(".code-graph/daemon.json"));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
+    let root = TestRoot::new(false);
+    let root_string = root.0.to_string_lossy().into_owned();
+    let source = root.0.join("persist.rs");
+    let marker = root.0.join("persist-admitted.marker");
+    let marker_string = marker.to_string_lossy().into_owned();
+    fs::write(&source, "fn persisted() {}\n").unwrap();
+    let mut client = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "3000"),
+            ("CODE_GRAPH_TEST_PERSIST_MARKER", &marker_string),
+        ],
+    )
+    .initialize();
+    let old = wait_metadata(&root);
+    client.tool(
+        "analyze_codebase_async",
+        json!({"path":root.0, "force":true}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if marker.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "analyze did not enter an admitted delayed persist"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    replace_metadata_sha(&root, &old, "persist-replacement-dirty".to_owned());
+    let started = Instant::now();
+    let mut replacement = Client::spawn(&root.0, &[]);
+    assert_eq!(
+        replacement.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        22
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "acknowledged replacement waited past request grace for the admitted cache save"
+    );
+    let mut graph = Graph::new();
+    assert!(graph.load(&root.0).unwrap(), "drained cache is loadable");
+    assert_eq!(graph.stats().files, 1, "drained cache is current");
+    let new = wait_metadata(&root);
+    client.close();
+    replacement.close();
+    stop_daemon(&new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }

@@ -32,6 +32,15 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
             "watch mode is already active".to_string(),
         ));
     }
+    // Keep this check under the same watch write lock as the installation
+    // below. Graceful shutdown closes analyze admission before taking this
+    // lock, so it either observes and cancels this handle or this start
+    // observes the closed gate and rejects.
+    if inner.persist.analyze_admission_closed() {
+        return Err(crate::core::ToolError(
+            "daemon shutdown in progress; new watches are not accepted".to_string(),
+        ));
+    }
 
     let root_path = match inner.root_path.read().clone() {
         Some(p) => p,
@@ -72,11 +81,12 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
 
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(watch_loop(Arc::clone(inner), events_rx, cancel_rx));
+    let task = tokio::spawn(watch_loop(Arc::clone(inner), events_rx, cancel_rx));
 
     *watch_guard = Some(WatchHandle {
         debouncer,
         cancel: cancel_tx,
+        task,
     });
 
     Ok(ToolOk::Value(WatchResponse { watching: true }))
@@ -88,22 +98,38 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
 pub fn watch_stop(inner: &Arc<ServerInner>) -> ToolResult<WatchResponse> {
     require_indexed(inner.indexed.load(std::sync::atomic::Ordering::Acquire))?;
 
-    let handle = match inner.watch.write().take() {
-        Some(h) => h,
-        None => {
+    // Take the handle and admit its detached cleanup under one watch-state
+    // lock. Graceful shutdown takes this same lock before closing cleanup
+    // admission, making the handoff deterministic.
+    let (handle, cleanup_guard) = {
+        let mut watch_guard = inner.watch.write();
+        if watch_guard.is_none() {
             return Err(crate::core::ToolError(
                 "watch mode is not active".to_string(),
-            ))
+            ));
         }
+        let cleanup_guard = inner
+            .persist
+            .begin_watch_cleanup()
+            .map_err(|error| crate::core::ToolError(error.to_string()))?;
+        let handle = watch_guard.take().expect("watch state checked above");
+        (handle, cleanup_guard)
     };
 
-    let WatchHandle { debouncer, cancel } = handle;
-    // Best-effort: if the watch_loop task has already exited (e.g. its
-    // future was cancelled at runtime shutdown), the receiver is gone and
-    // `send` returns Err. That's fine — the goal is "stop watching", and
-    // dropping the debouncer below achieves that regardless.
+    let WatchHandle {
+        debouncer,
+        cancel,
+        task,
+    } = handle;
+    // Prompt response is preserved while cleanup cooperates: cancel wins the
+    // loop's biased select, the current batch finishes if already running,
+    // then the debouncer is dropped off the Tokio worker thread.
     let _ = cancel.send(());
-    drop(debouncer);
+    tokio::spawn(async move {
+        let _ = task.await;
+        let _ = tokio::task::spawn_blocking(move || drop(debouncer)).await;
+        drop(cleanup_guard);
+    });
 
     Ok(ToolOk::Value(WatchResponse { watching: false }))
 }
@@ -212,5 +238,39 @@ mod tests {
             ToolOk::Text(_) => panic!("expected Value(WatchResponse)"),
         }
         drop(dir);
+    }
+
+    #[tokio::test]
+    async fn watch_start_rejects_closed_daemon_admission() {
+        let (server, dir) = indexed_server().await;
+        server.inner.persist.close_analyze_and_wait().await;
+
+        let err = match watch_start(&server.inner) {
+            Err(err) => err,
+            Ok(_) => panic!("closed admission rejects watch_start"),
+        };
+        assert_eq!(
+            err.0,
+            "daemon shutdown in progress; new watches are not accepted"
+        );
+        assert!(server.inner.watch.read().is_none());
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn detached_watch_cleanup_blocks_shutdown_until_guard_drops() {
+        let coordinator = Arc::new(crate::server::PersistCoordinator::new());
+        let cleanup = coordinator
+            .begin_watch_cleanup()
+            .expect("watch cleanup admission");
+        let mut waiting = Box::pin(coordinator.close_watch_cleanup_and_wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "shutdown must wait for detached watch cleanup"
+        );
+        drop(cleanup);
+        waiting.await;
     }
 }

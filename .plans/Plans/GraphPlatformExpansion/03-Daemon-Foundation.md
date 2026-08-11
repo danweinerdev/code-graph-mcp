@@ -27,9 +27,9 @@ tasks:
     depends_on: ["3.2"]
   - id: "3.4"
     title: "Flip the default on, with binary-identity replacement"
-    status: planned
-    justifies: "FR-08, FR-12, NFR-01, AC-09. This is the commit where users get the feature; the binary-SHA gate has to land with it because a dirty SHA never changes between dev builds, so without it an edit-rebuild loop silently talks to the stale daemon."
-    verification: "Integration tests plus the full snapshot suite — the existing snapshot suite passes unchanged against a daemon-backed server, proving the proxy is transparent (NFR-01); a client built from a different binary does not attach and the daemon is replaced (AC-09); the replaced daemon persists its cache before exiting and a signal mid-persist completes the write; a daemon that ignores the signal is hard-killed after a bounded grace period and the client falls back in-process."
+    status: in-progress
+    justifies: "FR-08, FR-12, NFR-01, AC-09. This is the commit where users get the feature; the binary-identity gate has to land with it because a dirty SHA never changes between dev builds, so without the executable fingerprint an edit-rebuild loop silently talks to the stale daemon."
+    verification: "Integration tests plus the full snapshot suite — the existing snapshot suite passes unchanged with daemon mode default-on, proving the proxy does not change tool behavior (NFR-01); a client running a byte-distinct executable does not attach and the daemon is replaced (AC-09); the replaced daemon persists its active graph before exiting and an owner-bound control signal mid-persist completes the write; a daemon that ignores the signal is hard-killed after a bounded grace period and the client falls back in-process."
     depends_on: ["3.3"]
   - id: "3.5"
     title: "Idle timeout and warm-attach measurement"
@@ -187,23 +187,23 @@ Re-probing lock staleness on each backoff attempt matters: if the winner dies af
 
 ### Subtasks
 - [ ] Flip the `[daemon].enabled` default from false to true — the single line that makes the daemon everyone's path
-- [ ] Compare the client's build SHA against `daemon.json`; treat any `-dirty` SHA as always mismatching
-- [ ] On mismatch, signal the daemon and wait for exit, then respawn
-- [ ] Install a signal handler in the daemon routing to the same graceful shutdown as idle exit
+- [ ] Compare the client's build identity against `daemon.json`: clean/dirty SHA plus executable-content fingerprint; a dirty SHA alone never establishes compatibility
+- [ ] On mismatch, publish an owner-bound repository-local control signal and wait for exit, then respawn
+- [ ] Route the control signal through the same graceful shutdown path as Ctrl-C and future idle exit
 - [ ] Finish an in-flight cache persist before exiting; hard-kill after a bounded grace period
 - [ ] Run the full snapshot suite against a daemon-backed server
 
 ### Notes
 Revision boundary: the daemon is the default path, with a working replacement protocol.
 
-The shutdown mechanism is a signal, not an MCP call — a hidden control tool would contradict both the no-new-protocol decision and the unchanged-tool-surface guarantee. Because the dirty-SHA rule makes replacement fire on *every* rebuild during development, a bare kill would corrupt the cache routinely rather than rarely.
+The shutdown mechanism is an owner-bound file signal under `.code-graph/`, not an MCP call — a hidden control tool would contradict both the no-new-protocol decision and the unchanged-tool-surface guarantee. `shutdown.request`/`shutdown.ack` carry the exact lock identity, so the same mechanism works on POSIX and Windows without unsafe platform APIs. Because executable fingerprints make replacement fire on every byte-distinct rebuild during development, a bare kill would corrupt the cache routinely rather than rarely.
 
 ### Completion Evidence
 
 Pending — not complete.
 
 ### Trap
-Treating a `-dirty` SHA as matching itself. It looks correct — the strings are equal — but two different dirty builds share a SHA, so the client attaches to a daemon running code it no longer has. This is the highest-frequency failure in the whole phase and it manifests as "my change didn't take effect".
+Treating a `-dirty` SHA as sufficient identity. It looks correct — the strings are equal — but two different dirty builds share a SHA. Require the executable fingerprint too; sessions launched from the exact same dirty executable may share, while a byte-distinct rebuild replaces the daemon. Omitting that second discriminator manifests as "my change didn't take effect".
 
 ## 3.5: Idle timeout and warm-attach measurement
 

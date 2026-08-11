@@ -46,31 +46,34 @@ graph TD
     end
 
     subgraph repo["&lt;project_root&gt;/.code-graph/"]
-      SOCK["daemon.sock / named pipe"]
-      META["daemon.json<br/>pid, transport, endpoint,<br/>binary sha"]
+      SOCK["daemon.sock / named pipe<br/>or loopback TCP fallback"]
+      META["daemon.json<br/>pid, transport, endpoint,<br/>binary sha + executable fingerprint"]
       SECRET["secret (TCP fallback only,<br/>owner-only)"]
       LOCK["daemon.lock"]
+      SIGNAL["shutdown.request / shutdown.ack<br/>owner-bound control signal"]
     end
 
     subgraph daemon["Daemon (1 per root)"]
       ACC["accept loop"]
       RMCP["rmcp service per connection"]
-      INNER["Arc&lt;ServerInner&gt;<br/>graph, index_lock, watch,<br/>analyze slot, config"]
-      IDLE["idle timer"]
-      QUEUE["analyze queue<br/>+ coalescer"]
+      INNER["Arc&lt;ServerInner&gt;<br/>graph, index/watch/analyze state,<br/>cache root + lifecycle coordinator"]
+      IDLE["idle timer<br/>(task 3.5 planned)"]
+      QUEUE["analyze queue + coalescer<br/>(phase 4 planned)"]
     end
 
     C1 --> SOCK
     C2 --> SOCK
     C3 --> SOCK
     C1 -.reads.-> META
+    C1 -.writes replacement request.-> SIGNAL
+    SIGNAL -.polled / acknowledged.-> ACC
     ACC --> RMCP --> INNER
     QUEUE --> INNER
-    IDLE -.watches.-> ACC
-    IDLE -.watches.-> QUEUE
+    IDLE -.future lifecycle signal.-> ACC
+    IDLE -.future analyze guard.-> QUEUE
 ```
 
-`ServerInner` is unchanged — all eleven fields, same types, same semantics. What changes is that one `Arc<ServerInner>` is now shared by several rmcp services instead of one.
+The graph/query state in `ServerInner` keeps its existing semantics and one `Arc<ServerInner>` is shared by several rmcp services instead of one. Task 3.4 adds lifecycle-only state beside it: the active cache project root and an analyze/persist/watch-cleanup coordinator used to drain mutation before replacement exit. Phase 4 later adds the planned queue/coalescer.
 
 ### Data Flow
 
@@ -85,13 +88,17 @@ sequenceDiagram
 
     Cl->>Cl: discover project root (RootConfig::load walk)
     Cl->>M: read
-    alt metadata present and binary sha matches
+    alt metadata identity matches and exact owner holds the OS lock
         Cl->>D: connect on recorded endpoint
         alt connect succeeds
             D-->>Cl: attached
         else stale endpoint
             Cl->>Cl: treat as absent
         end
+    else metadata identity differs
+        Cl->>L: validate exact active owner
+        Cl->>D: publish owner-bound shutdown.request
+        D-->>Cl: publish shutdown.ack, drain, exit
     end
     alt no live daemon
         Cl->>D: spawn a daemon contender
@@ -109,7 +116,7 @@ sequenceDiagram
 
 ### Interfaces
 
-**Binary modes.** One binary, three modes, selected by argument — default preserves today's invocation exactly:
+**Binary modes.** One binary, three modes, selected by argument. The no-argument command spelling is unchanged, but task 3.4 makes its default behavior the transparent proxy path:
 
 | Invocation | Mode |
 |---|---|
@@ -121,9 +128,13 @@ sequenceDiagram
 **`<project_root>/.code-graph/daemon.json`** — the only discovery surface (FR-40):
 
 ```json
-{ "pid": 12345, "transport": "uds" | "pipe" | "tcp",
-  "endpoint": "/abs/path/daemon.sock" | "\\\\.\\pipe\\..." | "127.0.0.1:49812",
-  "binary_sha": "1db21d6-dirty", "started_at": "2026-08-08T12:00:00Z" }
+{ "pid": 12345, "transport": "uds",
+  "endpoint": "/abs/path/.code-graph/daemon.sock",
+  "binary_sha": "1db21d6-dirty",
+  "executable_fingerprint": "0000000001234567-89abcdef01234567",
+  "started_at": "2026-08-08T12:00:00Z",
+  "owner": { "pid": 12345, "start_time": 1786200000,
+             "nonce": "0123456789abcdef0123456789abcdef" } }
 ```
 
 **New config section**, added to `RootConfig` alongside the existing five:
@@ -131,7 +142,7 @@ sequenceDiagram
 ```toml
 [daemon]
 enabled = true           # false => always in-process
-idle_timeout_secs = 1800 # 0 = never exit
+idle_timeout_secs = 1800 # task 3.5: 0 = never exit; parsed but not applied before then
 ```
 
 ## Design Decisions
@@ -192,19 +203,19 @@ Named pipes and TCP do not have this problem — a pipe vanishes with its owning
 
 **Context:** FR-12. A developer rebuilds the binary while a daemon from the previous build is running.
 
-**Decision:** `daemon.json` records the same build SHA `get_status` already reports (`CODE_GRAPH_GIT_SHA`, stamped by `code-graph-tools/build.rs`, with a `-dirty` suffix). A client whose own SHA differs asks the daemon to shut down and replaces it.
+**Decision:** `daemon.json` records the same build SHA `get_status` already reports (`CODE_GRAPH_GIT_SHA`, stamped by `code-graph-tools/build.rs`, with a `-dirty` suffix) plus a deterministic fingerprint of the executable bytes. Attachment requires both fields to match. A client whose identity differs asks the daemon to shut down and replaces it. Metadata written by an older binary without a fingerprint is incompatible by construction.
 
-**Rationale:** The proxy is byte-level, so there is no protocol version to compare — the only thing that can differ is behaviour, and the build SHA is exactly that. It already exists and is already surfaced, so this costs a field. The `-dirty` suffix matters more than it looks: during active development every build is dirty and the SHA does not change between them, so a dirty SHA must be treated as *always* mismatching. Otherwise an edit-rebuild-rerun loop silently keeps talking to the old daemon — the single most likely way this feature wastes someone's afternoon.
+**Rationale:** The proxy is byte-level, so there is no protocol version to compare — the relevant question is whether the daemon runs the same executable behavior. A clean build SHA is useful but a dirty SHA is never sufficient evidence of identity: during active development different rebuilt binaries share the same `<sha>-dirty` string. The executable fingerprint distinguishes those rebuilds while allowing two sessions launched from the exact same dirty executable to share one daemon. It is a local compatibility discriminator, not a cryptographic integrity primitive; active lock ownership remains the process-authorization boundary.
 
-**The shutdown mechanism is a signal, and it must route through the graceful path.** "Ask the daemon to exit" cannot be an MCP call: Decision 2 declines to add any graph-query protocol, and a hidden control tool would contradict both that and the unchanged-tool-surface guarantee. Task 3.2 establishes the graceful cleanup path for Ctrl-C — remove metadata, lock, secret, and local endpoint. Task 3.4 extends the same path so a client can signal a binary-mismatched daemon, wait for any cache persist, and escalate after a bounded grace period. A bare kill would violate Decision 6's persist-before-exit invariant, and because the dirty-SHA rule makes this path fire on *every rebuild during development*, a torn `.code-graph-cache.db` would be a routine occurrence rather than an edge case.
+**The shutdown mechanism is an owner-bound repository-local control signal, and it routes through the graceful path.** "Ask the daemon to exit" is not an MCP call: Decision 2 declines to add any graph-query protocol, and a hidden control tool would contradict both that and the unchanged-tool-surface guarantee. After validating metadata against the live OS-lock owner, the client publishes `.code-graph/shutdown.request` containing that exact pid/start-time/nonce identity. The daemon accepts only its own identity, publishes `shutdown.ack`, and enters the same graceful cleanup path as Ctrl-C. Both files are owner-only regular files under the already owner-restricted runtime directory, use no graph-query wire protocol, and are removed by owner/stale cleanup. This uniform file signal avoids unsafe or platform-specific process-control APIs on the graceful path; safe `sysinfo` hard kill remains the bounded last resort.
 
-Two details that follow: if the daemon is mid-`Persisting` when signalled it finishes that write before exiting rather than aborting it, since a partial rkyv archive is worse than a stale one; and if it does not exit within a bounded grace period the client escalates to a hard kill, accepts that the cache may be stale, and falls back in-process. A refusal to die must not wedge the session.
+Two details that follow: after acknowledgement, the daemon closes new analyze/watch admission, drains admitted analyses and cache writes, joins watcher cleanup, and performs one final save to the active cache project root before removing runtime state. The client allows a longer bounded acknowledged-drain window than the initial request-ack window. If the exact OS-lock owner still does not exit, the client revalidates ownership, escalates to a hard kill, accepts that the cache may be stale, and falls back in-process. A refusal to die must not wedge the session, and one proxy invocation replaces at most one incompatible owner so competing builds cannot oscillate forever.
 
 ### Decision 6: Idle timer counts only when there is nothing to lose
 
 **Context:** FR-10, FR-11.
 
-**Decision:** `[daemon].idle_timeout_secs`, default 1800, `0` meaning never. The timer runs only when attached connections are zero **and** no analyze job is in flight. A new attachment cancels it. When an analyze reaches a terminal state with no connections attached, the timer starts again **from zero**, not from where it paused. Before exiting, the daemon persists the cache, removes `daemon.json` and the lock, and closes the listener.
+**Decision (implemented in task 3.5):** `[daemon].idle_timeout_secs`, default 1800, `0` meaning never. Before task 3.5 the field parses but no idle timer consumes it. Once implemented, the timer runs only when attached connections are zero **and** no analyze job is in flight. A new attachment cancels it. When an analyze reaches a terminal state with no connections attached, the timer starts again **from zero**, not from where it paused. Before exiting, the daemon persists the cache, removes `daemon.json` and the lock, and closes the listener.
 
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 
@@ -264,7 +275,7 @@ This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent se
 | Lock held by a live starter | Retry connect with bounded backoff, then fall back in-process. |
 | Lock held by a dead pid | Remove and retry once. |
 | TCP fallback, wrong or missing secret | Refuse the connection. Never downgrade to unauthenticated. |
-| Binary SHA mismatch | Ask the daemon to exit, wait, respawn. If it will not exit, fall back in-process and report. |
+| Binary identity mismatch | Publish an owner-bound shutdown request, wait for acknowledgement and bounded drain, then respawn. If the exact owner will not exit, hard-kill, fall back in-process, and report. |
 | `[daemon].enabled = false` | In-process, no metadata written. |
 | Cache write fails on idle exit | Log via `eprintln!` and exit anyway — the cache is a warm-start optimisation, and refusing to exit would leak a process. |
 | Orphaned socket inode blocking bind (POSIX) | Unlink only while holding the lock and only after a connection attempt is refused (Decision 4). Never on file existence alone. |
@@ -284,7 +295,7 @@ All user-visible failures remain `CallToolResult` with the error flag. Diagnosti
 - Short idle timeout: exits with no clients; does not exit with a client attached; does not exit with an analyze in flight and no clients (AC-06).
 - Cache reflects the last index after idle exit; next start loads rather than re-indexes (AC-07).
 - Task 3.2: N simultaneous `--serve` contenders produce one daemon owner and no leaked contender processes, repeated to exercise the race. Task 3.3 completes AC-08 with simultaneous real clients that attach to that winner.
-- Mismatched binary SHA does not attach (AC-09).
+- Mismatched binary identity (including a byte-distinct executable with the same dirty SHA) does not attach (AC-09).
 - Daemon prevented from starting: every existing tool still answers in-process (AC-10).
 
 **Wire compatibility** — the existing snapshot suite must pass unchanged against a daemon-backed server, which is the concrete check that the proxy is transparent (NFR-01).
@@ -305,12 +316,12 @@ All user-visible failures remain `CallToolResult` with the error flag. Diagnosti
 
 ## Migration / Rollout
 
-Additive and reversible at every step. The default invocation is unchanged, and `--no-daemon` restores today's behaviour exactly.
+Additive and reversible at every step. The configured command spelling is unchanged; from step 4 the no-argument process proxies by default, and `--no-daemon` restores direct in-process behavior exactly.
 
 1. **`[daemon]` config section**, parsed and ignored. Zero behaviour change.
 2. **Daemon mode + transport + metadata + lock.** Reachable only via `--serve`; nothing attaches yet.
 3. **Proxy mode**, default off behind `[daemon].enabled = false`. Opt-in testing.
-4. **Flip the default to on**, with in-process fallback proven by AC-10. The first user-visible change.
+4. **Flip the default to on with binary identity replacement**, graceful drain, and in-process fallback proven by AC-10. The first user-visible change.
 5. **Idle timeout.**
 6. **Analyze queue and coalescing** — replaces the contention error. The largest behaviour change in the track: it retires a documented error, adds a `"queued"` status to `AnalyzeJobView`, adds the optional coalescing field (OQ-B3), and changes when sync `analyze_codebase` blocks. All four need CLAUDE.md and the tool descriptions updated in the same commit.
 7. **CLI** — after Track A, with its own interface design (Decision 8).

@@ -138,18 +138,17 @@ pub struct ParsingConfig {
     pub max_threads: usize,
 }
 
-/// Daemon lifecycle settings reserved for the repository-local daemon.
+/// Daemon lifecycle settings for the repository-local daemon.
 ///
-/// This configuration is parsed and retained but is currently inert: no
-/// runtime code reads or acts on it. Future daemon state is scoped to one
-/// daemon per project root and remains inside that repository.
+/// Daemon state is scoped to one daemon per project root and remains inside
+/// that repository.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DaemonConfig {
-    /// Whether the repository-local daemon is enabled. Defaults to `false`.
-    #[serde(default)]
+    /// Whether the repository-local daemon is enabled. Defaults to `true`.
+    #[serde(default = "default_daemon_enabled")]
     pub enabled: bool,
-    /// Seconds of inactivity before the daemon exits. Defaults to `1800`;
-    /// `0` is the never-exit sentinel.
+    /// Reserved idle-lifecycle interval. Defaults to `1800`; task 3.5 will
+    /// apply it and interpret `0` as the never-exit sentinel.
     #[serde(default = "default_daemon_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 }
@@ -158,10 +157,14 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_daemon_enabled(),
             idle_timeout_secs: default_daemon_idle_timeout_secs(),
         }
     }
+}
+
+const fn default_daemon_enabled() -> bool {
+    true
 }
 
 /// C++-specific knobs. `macro_strip` is whole-word identifier replacement;
@@ -1503,7 +1506,7 @@ disabled = [""]
 
         let (cfg, _root) =
             RootConfig::load(dir.path()).expect("config without [daemon] section must load");
-        assert!(!cfg.daemon.enabled, "daemon must default to disabled");
+        assert!(cfg.daemon.enabled, "daemon must default to enabled");
         assert_eq!(
             cfg.daemon.idle_timeout_secs, 1_800,
             "daemon idle timeout must default to 1800 seconds"

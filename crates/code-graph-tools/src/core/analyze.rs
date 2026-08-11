@@ -273,6 +273,7 @@ pub(crate) async fn run_analyze_job(
                     *g = probe;
                 }
                 *inner.root_path.write() = Some(project_root.clone());
+                *inner.cache_root.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
                 inner
@@ -288,7 +289,7 @@ pub(crate) async fn run_analyze_job(
                     // phase stays at `Discovering`, matching what
                     // actually happened.
                     job.set_phase(AnalyzePhase::Persisting);
-                    if let Err(e) = save_cache(&inner.graph, &project_root) {
+                    if let Err(e) = save_cache(&inner, &project_root) {
                         fast_path_warnings.push(format!("cache save failed: {e}"));
                     }
                 }
@@ -516,6 +517,7 @@ pub(crate) async fn run_analyze_job(
                 };
 
                 *inner.root_path.write() = Some(project_root.clone());
+                *inner.cache_root.write() = Some(project_root.clone());
                 *inner.config.write() = cfg;
                 inner.indexed.store(true, Ordering::Release);
                 inner
@@ -563,7 +565,7 @@ pub(crate) async fn run_analyze_job(
                 .transition_to(AnalyzePhase::Persisting);
 
                 let save_start = std::time::Instant::now();
-                if let Err(e) = save_cache(&inner.graph, &project_root) {
+                if let Err(e) = save_cache(&inner, &project_root) {
                     warnings.push(format!("cache save failed: {e}"));
                     eprintln!(
                         "[code-graph] phase: save FAILED ({:.1}s)",
@@ -643,6 +645,10 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
+    let _analyze_guard = inner
+        .persist
+        .begin_analyze()
+        .map_err(|message| ToolError(message.to_string()))?;
 
     let job = {
         let mut slot = inner.analyze_slot.write();
@@ -699,7 +705,7 @@ pub async fn analyze_codebase_async(
 
     enum Kickoff {
         Existing { job_id: String, started_at: u64 },
-        New(Arc<AnalyzeJob>),
+        New(Arc<AnalyzeJob>, crate::server::AnalyzeGuard),
     }
 
     let kickoff = {
@@ -713,12 +719,20 @@ pub async fn analyze_codebase_async(
                 drop(slot);
                 existing
             } else {
+                let guard = inner
+                    .persist
+                    .begin_analyze()
+                    .map_err(|message| ToolError(message.to_string()))?;
                 let job = install_new_running(&mut slot, path_raw.clone(), force);
-                Kickoff::New(job)
+                Kickoff::New(job, guard)
             }
         } else {
+            let guard = inner
+                .persist
+                .begin_analyze()
+                .map_err(|message| ToolError(message.to_string()))?;
             let job = install_new_running(&mut slot, path_raw.clone(), force);
-            Kickoff::New(job)
+            Kickoff::New(job, guard)
         }
     };
 
@@ -730,7 +744,7 @@ pub async fn analyze_codebase_async(
             existing: true,
             note: "analyze already in progress — args ignored; poll get_status for progress",
         })),
-        Kickoff::New(job) => {
+        Kickoff::New(job, analyze_guard) => {
             let response = AsyncKickoffResponse {
                 job_id: job.job_id.clone(),
                 status: "running",
@@ -741,11 +755,15 @@ pub async fn analyze_codebase_async(
             // Detach: the JoinHandle is dropped intentionally so the
             // worker outlives this call. Terminal state flows back
             // through `job.state`, observable via get_status.
-            tokio::spawn(run_analyze_job(
-                Arc::clone(&inner),
-                Arc::clone(&job),
-                Arc::new(NoopProgressSink),
-            ));
+            tokio::spawn(async move {
+                let _analyze_guard = analyze_guard;
+                run_analyze_job(
+                    Arc::clone(&inner),
+                    Arc::clone(&job),
+                    Arc::new(NoopProgressSink),
+                )
+                .await;
+            });
             Ok(ToolOk::Value(response))
         }
     }
@@ -773,10 +791,28 @@ fn install_new_running(
 /// Save the graph to `<dir>/.code-graph-cache.db`. Lifted to a helper so
 /// the lock is held for the minimum span needed to serialize the cache —
 /// a long save under the write lock would block all queries.
-pub(crate) fn save_cache(
-    graph: &parking_lot::RwLock<Graph>,
-    dir: &std::path::Path,
-) -> Result<(), code_graph_graph::PersistError> {
-    let g = graph.read();
-    g.save(dir)
+pub(crate) fn save_cache(inner: &ServerInner, dir: &std::path::Path) -> Result<(), String> {
+    let _persist = inner.persist.begin_persist().map_err(str::to_owned)?;
+    #[cfg(debug_assertions)]
+    debug_delay_persist(dir);
+    let g = inner.graph.read();
+    g.save(dir).map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn debug_delay_persist(dir: &std::path::Path) {
+    if let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_MARKER") {
+        let _ = std::fs::write(marker, b"persist admitted\n");
+    }
+    let Ok(root) = std::env::var("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT") else {
+        return;
+    };
+    let Ok(delay_millis) = std::env::var("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS") else {
+        return;
+    };
+    if std::path::Path::new(&root) == dir {
+        if let Ok(delay_millis) = delay_millis.parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(delay_millis));
+        }
+    }
 }

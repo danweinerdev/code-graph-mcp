@@ -49,11 +49,11 @@ extra_ignore = ["build/", "node_modules/", "vendor/"]
 max_threads = 0
 
 [daemon]
-# Reserved configuration for exactly one repository-local daemon per project
-# root. It is parsed but inert in this release: no runtime code reads or acts
-# on these values. Future daemon state remains inside that repository.
-enabled = false
-# Seconds of inactivity before a future daemon exits. 0 = never exit.
+# Exactly one repository-local daemon serves this project root by default. Its
+# runtime state remains inside that repository. Set false to serve in-process.
+enabled = true
+# Reserved for task 3.5: current daemons do not idle-exit yet. 0 will mean
+# never exit when idle lifecycle support lands.
 idle_timeout_secs = 1800
 
 [response]

@@ -497,6 +497,7 @@ pub(crate) async fn watch_loop(
     tokio::pin!(cancel);
     loop {
         tokio::select! {
+            biased;
             _ = &mut cancel => return,
             maybe_evts = events.recv() => match maybe_evts {
                 Some(evts) => {

@@ -173,8 +173,8 @@ max_threads = 0           # 0 = num_cpus
 max_threads = 0           # 0 = num_cpus; indexer caps discovery+parse sum at num_cpus
 
 [daemon]
-enabled = false           # parsed but inert; no runtime code reads or acts on it yet.
-idle_timeout_secs = 1800  # seconds; 0 = never exit.
+enabled = true            # default: attach to/start one repository-local daemon.
+idle_timeout_secs = 1800  # reserved for task 3.5; current daemons do not idle-exit.
 
 [response]
 max_bytes = 102400        # byte cap on paginated MCP responses; mid-page truncation
@@ -241,10 +241,11 @@ csharp = []
 java = []
 ```
 
-`[daemon]` reserves lifecycle settings for exactly one repository-local daemon
-per project root, with all future runtime state inside that repository. It is
-parsed but inert in the current release: no runtime code reads or acts on
-`enabled` or `idle_timeout_secs`.
+`[daemon]` controls exactly one repository-local daemon per project root, with
+all runtime state inside that repository. It is enabled by default; set
+`enabled = false` (or pass `--no-daemon`) for direct in-process serving.
+`idle_timeout_secs` is reserved for task 3.5 and is not applied by the current
+daemon lifecycle.
 
 `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (TOML NOT re-read per query).
 

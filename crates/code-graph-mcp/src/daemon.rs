@@ -14,7 +14,7 @@ use code_graph_tools::CodeGraphServer;
 use fs2::FileExt;
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use sysinfo::{Signal, System};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -26,6 +26,8 @@ const LOCK_FILE: &str = "daemon.lock";
 const METADATA_FILE: &str = "daemon.json";
 const SECRET_FILE: &str = "secret";
 const SOCKET_FILE: &str = "daemon.sock";
+const SHUTDOWN_REQUEST_FILE: &str = "shutdown.request";
+const SHUTDOWN_ACK_FILE: &str = "shutdown.ack";
 const AUTH_PREFIX: &[u8] = b"CG-AUTH ";
 const AUTH_ACK: &[u8] = b"CG-OK\n";
 const AUTH_LINE_LEN: usize = 73;
@@ -36,6 +38,16 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROXY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PROXY_MAX_SPAWN_BACKOFF: Duration = Duration::from_secs(1);
 const PROXY_LOSER_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+/// An unacknowledged replacement remains below the client's four-second
+/// attach budget: two seconds for cooperative drain, then a half-second
+/// confirmation after a safe hard kill. This excludes the acknowledged,
+/// bounded 30-second drain exception below.
+const REPLACEMENT_GRACE: Duration = Duration::from_secs(2);
+const REPLACEMENT_KILL_WAIT: Duration = Duration::from_millis(500);
+/// Once the owner acknowledges shutdown it gets a bounded 30-second drain
+/// window for admitted indexing and cache persistence before escalation.
+const REPLACEMENT_DRAIN_GRACE: Duration = Duration::from_secs(30);
+const SHUTDOWN_REQUEST_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 struct DaemonPaths {
@@ -45,6 +57,8 @@ struct DaemonPaths {
     metadata: PathBuf,
     secret: PathBuf,
     socket: PathBuf,
+    shutdown_request: PathBuf,
+    shutdown_ack: PathBuf,
 }
 
 impl DaemonPaths {
@@ -56,6 +70,8 @@ impl DaemonPaths {
             metadata: runtime.join(METADATA_FILE),
             secret: runtime.join(SECRET_FILE),
             socket: runtime.join(SOCKET_FILE),
+            shutdown_request: runtime.join(SHUTDOWN_REQUEST_FILE),
+            shutdown_ack: runtime.join(SHUTDOWN_ACK_FILE),
             runtime,
         }
     }
@@ -124,18 +140,74 @@ impl DaemonPaths {
 /// competing daemon can publish between any two attempts.
 pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
     let paths = DaemonPaths::for_root(&root);
-    let deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
+    let fingerprint = executable_fingerprint()?;
+    let mut deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
     let mut last_error = None;
     let mut contender = None;
+    let mut replaced_owner: Option<LockIdentity> = None;
     let mut next_spawn_at = std::time::Instant::now();
     let mut spawn_backoff = PROXY_RETRY_INTERVAL;
 
     while std::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match connect_from_metadata(&paths, remaining.min(PROXY_CONNECT_TIMEOUT)).await {
-            Ok(connection) => {
-                settle_contender(contender, connection.pid).await;
-                return finish_proxy(connection.stream).await;
+        match read_metadata(&paths) {
+            Ok(metadata) if metadata_compatible(&metadata, &fingerprint) => {
+                if !metadata_owner_is_active(&paths, &metadata) {
+                    last_error = Some(anyhow::anyhow!(
+                        "daemon metadata owner is not the active lock owner"
+                    ));
+                } else {
+                    match connect_to_metadata(
+                        &paths,
+                        &metadata,
+                        remaining.min(PROXY_CONNECT_TIMEOUT),
+                    )
+                    .await
+                    {
+                        Ok(connection) => {
+                            // Authentication/connect success does not prove the
+                            // owner remained active while the connection was
+                            // being established. Do not hand an established
+                            // proxy stream to a daemon that has since lost its
+                            // lock ownership.
+                            if metadata_owner_is_active(&paths, &metadata) {
+                                settle_contender(contender, connection.pid).await;
+                                return finish_proxy(connection.stream).await;
+                            }
+                            drop(connection);
+                            last_error = Some(anyhow::anyhow!(
+                                "daemon metadata owner changed while connecting"
+                            ));
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+            }
+            Ok(metadata) => {
+                if !metadata_owner_is_active(&paths, &metadata) {
+                    last_error = Some(anyhow::anyhow!(
+                        "daemon metadata owner does not match a live lock owner"
+                    ));
+                } else {
+                    if replaced_owner
+                        .as_ref()
+                        .is_some_and(|owner| owner != &metadata.owner)
+                    {
+                        terminate_contender(contender).await;
+                        return Err(anyhow::anyhow!(
+                            "daemon replacement encountered a second incompatible active owner; serving in-process"
+                        ));
+                    }
+                    if let Err(error) = request_replacement(&paths, &metadata).await {
+                        terminate_contender(contender).await;
+                        return Err(error);
+                    }
+                    // A cooperative owner may have spent its full drain
+                    // grace persisting. Give the normal spawn/probe loop a
+                    // fresh budget once it has actually exited.
+                    deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
+                    replaced_owner = Some(metadata.owner.clone());
+                }
             }
             Err(error) => last_error = Some(error),
         }
@@ -168,12 +240,199 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
 
     // One final short probe closes the publication race at the deadline while
     // keeping the total attach budget comfortably under five seconds.
-    if let Ok(connection) = connect_from_metadata(&paths, Duration::from_millis(250)).await {
-        settle_contender(contender, connection.pid).await;
-        return finish_proxy(connection.stream).await;
+    if let Ok(metadata) = read_metadata(&paths) {
+        if metadata_compatible(&metadata, &fingerprint)
+            && metadata_owner_is_active(&paths, &metadata)
+        {
+            if let Ok(connection) =
+                connect_to_metadata(&paths, &metadata, Duration::from_millis(250)).await
+            {
+                if metadata_owner_is_active(&paths, &metadata) {
+                    settle_contender(contender, connection.pid).await;
+                    return finish_proxy(connection.stream).await;
+                }
+            }
+        }
     }
     terminate_contender(contender).await;
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not publish metadata")))
+}
+
+fn metadata_compatible(metadata: &DaemonMetadata, fingerprint: &str) -> bool {
+    sha_compatible_with(
+        env!("CODE_GRAPH_GIT_SHA"),
+        &metadata.binary_sha,
+        fingerprint,
+        &metadata.executable_fingerprint,
+    )
+}
+
+fn sha_compatible_with(
+    current_sha: &str,
+    daemon_sha: &str,
+    current_fingerprint: &str,
+    daemon_fingerprint: &str,
+) -> bool {
+    !current_fingerprint.is_empty()
+        && !daemon_fingerprint.is_empty()
+        && current_fingerprint == daemon_fingerprint
+        && current_sha == daemon_sha
+}
+
+fn read_metadata(paths: &DaemonPaths) -> anyhow::Result<DaemonMetadata> {
+    let encoded = fs::read(&paths.metadata)
+        .with_context(|| format!("read daemon metadata {}", paths.metadata.display()))?;
+    serde_json::from_slice(&encoded)
+        .with_context(|| format!("parse daemon metadata {}", paths.metadata.display()))
+}
+
+fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect daemon lock {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("daemon lock {} is not a regular file", path.display());
+    }
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("parse daemon lock {}", path.display()))
+}
+
+fn metadata_owner_is_active(paths: &DaemonPaths, metadata: &DaemonMetadata) -> bool {
+    // The before/after exact-identity checks around the actively-held lock
+    // probe are the authorization: the metadata owner must still name the
+    // lock owner after proving that lock is actively held.
+    metadata.pid == metadata.owner.pid
+        && read_lock_identity(&paths.lock).is_ok_and(|owner| owner == metadata.owner)
+        && identity_is_alive(&metadata.owner)
+        && lock_is_actively_held(&paths.lock)
+        && read_lock_identity(&paths.lock).is_ok_and(|owner| owner == metadata.owner)
+}
+
+fn lock_is_actively_held(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+async fn request_replacement(paths: &DaemonPaths, metadata: &DaemonMetadata) -> anyhow::Result<()> {
+    // Revalidate immediately before publication. Metadata is untrusted and a
+    // competing replacement can change the owner between probe and request.
+    if !metadata_owner_is_active(paths, metadata) {
+        return Ok(());
+    }
+    replace_stale_shutdown_request(paths, &metadata.owner)?;
+    write_shutdown_request(paths, &metadata.owner)?;
+    // If the owner changed while publishing, leave the request in place. A
+    // stale requester must not race a new owner by deleting a newly-published
+    // request after a read-then-remove ownership check.
+    if !metadata_owner_is_active(paths, metadata) {
+        return Ok(());
+    }
+    let grace_deadline = std::time::Instant::now() + REPLACEMENT_GRACE;
+    while std::time::Instant::now() < grace_deadline {
+        if !metadata_owner_is_active(paths, metadata) {
+            return Ok(());
+        }
+        if shutdown_ack_matches(paths, &metadata.owner) {
+            break;
+        }
+        tokio::time::sleep(SHUTDOWN_REQUEST_POLL).await;
+    }
+
+    // No acknowledgement within the short request grace: a request can only
+    // escalate when its exact owner still owns the lock and
+    // still has the original PID/start-time identity. Never kill from stale or
+    // owner-mismatched discovery metadata.
+    if !metadata_owner_is_active(paths, metadata) {
+        return Ok(());
+    }
+    if shutdown_ack_matches(paths, &metadata.owner) {
+        let drain_deadline = std::time::Instant::now() + REPLACEMENT_DRAIN_GRACE;
+        while std::time::Instant::now() < drain_deadline {
+            if !metadata_owner_is_active(paths, metadata) {
+                return Ok(());
+            }
+            tokio::time::sleep(SHUTDOWN_REQUEST_POLL).await;
+        }
+    }
+    if !metadata_owner_is_active(paths, metadata) {
+        return Ok(());
+    }
+    if !kill_identity(&metadata.owner) {
+        bail!("daemon replacement request was ignored and safe hard-kill failed");
+    }
+    let kill_deadline = std::time::Instant::now() + REPLACEMENT_KILL_WAIT;
+    while std::time::Instant::now() < kill_deadline {
+        if !identity_is_alive(&metadata.owner) {
+            bail!("daemon replacement required hard-kill; serving this invocation in-process");
+        }
+        tokio::time::sleep(SHUTDOWN_REQUEST_POLL).await;
+    }
+    bail!("daemon replacement hard-kill did not exit within bounded wait")
+}
+
+fn replace_stale_shutdown_request(
+    paths: &DaemonPaths,
+    rejected: &LockIdentity,
+) -> anyhow::Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_request) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "daemon shutdown request {} is not a regular file",
+            paths.shutdown_request.display()
+        );
+    }
+    let existing: LockIdentity = serde_json::from_slice(&fs::read(&paths.shutdown_request)?)
+        .context("parse existing daemon shutdown request")?;
+    if existing == *rejected {
+        return Ok(());
+    }
+    let active = active_lock_identity(paths);
+    if active.as_ref() == Some(&existing) {
+        bail!("daemon shutdown request belongs to a different active owner");
+    }
+    fs::remove_file(&paths.shutdown_request).with_context(|| {
+        format!(
+            "remove stale daemon shutdown request {}",
+            paths.shutdown_request.display()
+        )
+    })
+}
+
+fn active_lock_identity(paths: &DaemonPaths) -> Option<LockIdentity> {
+    let owner = read_lock_identity(&paths.lock).ok()?;
+    (identity_is_alive(&owner) && lock_is_actively_held(&paths.lock)).then_some(owner)
+}
+
+fn kill_identity(identity: &LockIdentity) -> bool {
+    // Safe Rust has no portable pidfd/process-handle primitive here. The
+    // caller immediately revalidates metadata + actively-held lock, and this
+    // final sysinfo start-time check narrows PID reuse without unsafe or
+    // platform-specific APIs.
+    let mut system = System::new_all();
+    system.refresh_all();
+    let Some(process) = system.process(sysinfo::Pid::from_u32(identity.pid)) else {
+        return false;
+    };
+    if process.start_time() != identity.start_time {
+        return false;
+    }
+    process.kill_with(Signal::Kill).unwrap_or(false)
 }
 
 async fn finish_proxy(stream: ClientStream) -> anyhow::Result<()> {
@@ -244,6 +503,15 @@ struct ConnectedDaemon {
     stream: ClientStream,
 }
 
+#[cfg(test)]
+async fn connect_from_metadata(
+    paths: &DaemonPaths,
+    connect_timeout: Duration,
+) -> anyhow::Result<ConnectedDaemon> {
+    let metadata = read_metadata(paths)?;
+    connect_to_metadata(paths, &metadata, connect_timeout).await
+}
+
 #[cfg(unix)]
 enum ClientStream {
     Uds(tokio::net::UnixStream),
@@ -256,15 +524,11 @@ enum ClientStream {
     Tcp(tokio::net::TcpStream),
 }
 
-async fn connect_from_metadata(
+async fn connect_to_metadata(
     paths: &DaemonPaths,
+    metadata: &DaemonMetadata,
     connect_timeout: Duration,
 ) -> anyhow::Result<ConnectedDaemon> {
-    let encoded = fs::read(&paths.metadata)
-        .with_context(|| format!("read daemon metadata {}", paths.metadata.display()))?;
-    let metadata: DaemonMetadata = serde_json::from_slice(&encoded)
-        .with_context(|| format!("parse daemon metadata {}", paths.metadata.display()))?;
-
     let stream = match metadata.transport {
         #[cfg(unix)]
         Transport::Uds => ClientStream::Uds(
@@ -401,21 +665,48 @@ struct DaemonMetadata {
     transport: Transport,
     endpoint: String,
     binary_sha: String,
+    /// Stable fingerprint of the executable bytes that published this record.
+    /// It is a compatibility discriminator, not a cryptographic integrity or
+    /// security primitive; the length-prefixed FNV-style hash can collide.
+    #[serde(default)]
+    executable_fingerprint: String,
     started_at: String,
     owner: LockIdentity,
 }
 
 impl DaemonMetadata {
-    fn new(transport: Transport, endpoint: String, owner: LockIdentity) -> Self {
-        Self {
+    fn new(transport: Transport, endpoint: String, owner: LockIdentity) -> anyhow::Result<Self> {
+        Ok(Self {
             pid: std::process::id(),
             transport,
             endpoint,
             binary_sha: env!("CODE_GRAPH_GIT_SHA").to_owned(),
+            executable_fingerprint: executable_fingerprint()?,
             started_at: rfc3339_now(),
             owner,
-        }
+        })
     }
+}
+
+/// Computes a deterministic, dependency-free content fingerprint for the
+/// current executable. Including the byte length prevents simple prefix
+/// ambiguity; this is deliberately non-cryptographic and only separates local
+/// daemon build identities.
+fn executable_fingerprint() -> anyhow::Result<String> {
+    let path = std::env::current_exe().context("locate current executable for daemon identity")?;
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "read current executable for daemon identity {}",
+            path.display()
+        )
+    })?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let length = bytes.len();
+    for byte in (length as u64).to_le_bytes().into_iter().chain(bytes) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(format!("{length:016x}-{hash:016x}"))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -561,6 +852,15 @@ where
         return Ok(());
     };
 
+    if let Err(error) = clear_shutdown_request(&paths) {
+        lock.remove_if_owned();
+        return Err(error);
+    }
+    if let Err(error) = clear_shutdown_ack(&paths) {
+        lock.remove_if_owned();
+        return Err(error);
+    }
+
     // A stale metadata/token pair can outlive a crashed lock owner. A new
     // lock owner removes it only after proving the recorded endpoint and
     // process identity are both dead.
@@ -590,9 +890,200 @@ where
         return Err(error);
     }
 
-    serve_listener(listener, server, tcp_secret, shutdown).await;
+    serve_listener(
+        listener,
+        server.clone(),
+        tcp_secret,
+        shutdown_with_request(&paths, &lock.identity, shutdown),
+    )
+    .await;
+    graceful_shutdown(&server, &root).await;
     cleanup_owned(&paths, lock, &metadata).await;
     Ok(())
+}
+
+/// Drains graph mutation before runtime cleanup without implementing the
+/// separate idle-lifecycle policy. Existing analyses finish and may persist;
+/// then the watcher and any watch reindex drain before one exclusive final
+/// cache save captures the current graph. The watcher task is awaited before
+/// the index lock, so no queued watch batch can mutate after that save.
+async fn graceful_shutdown(server: &CodeGraphServer, _daemon_root: &Path) {
+    server.inner.persist.close_analyze_and_wait().await;
+    let handle = { server.inner.watch.write().take() };
+    if let Some(handle) = handle {
+        let code_graph_tools::WatchHandle {
+            debouncer,
+            cancel,
+            task,
+        } = handle;
+        // Cancel first; the loop prioritizes cancellation once it reaches its
+        // select, then release the OS watcher off this Tokio worker.
+        let _ = cancel.send(());
+        let _ = task.await;
+        let _ = tokio::task::spawn_blocking(move || drop(debouncer)).await;
+    }
+    // A normal `watch_stop` may already have moved its handle into detached
+    // cooperative cleanup. Wait for that handoff before taking index_lock so
+    // no queued watch batch can mutate after the final save.
+    server.inner.persist.close_watch_cleanup_and_wait().await;
+    let _index_guard = server.inner.index_lock.lock().await;
+    server.inner.persist.close_persist_and_wait().await;
+    let cache_root = server.inner.cache_root.read().clone();
+    if server
+        .inner
+        .indexed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        if let Some(cache_root) = cache_root {
+            let graph = server.inner.graph.read();
+            if let Err(error) = graph.save(&cache_root) {
+                eprintln!("code-graph-mcp: final daemon cache save failed: {error}");
+            }
+        }
+    }
+}
+
+async fn shutdown_with_request<F>(paths: &DaemonPaths, owner: &LockIdentity, shutdown: F)
+where
+    F: Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(SHUTDOWN_REQUEST_POLL) => {
+                if accept_shutdown_request(paths, owner) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn clear_shutdown_request(paths: &DaemonPaths) -> anyhow::Result<()> {
+    clear_owner_file(&paths.shutdown_request, "request")
+}
+
+fn clear_shutdown_ack(paths: &DaemonPaths) -> anyhow::Result<()> {
+    clear_owner_file(&paths.shutdown_ack, "acknowledgement")
+}
+
+fn clear_owner_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => bail!(
+            "daemon shutdown {label} {} is not a regular file",
+            path.display()
+        ),
+        Ok(_) => fs::remove_file(path)
+            .with_context(|| format!("remove stale daemon shutdown {label} {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect daemon shutdown {label} {}", path.display())),
+    }
+}
+
+fn write_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::Result<()> {
+    write_owner_file(&paths.shutdown_request, "request", owner)
+}
+
+fn write_shutdown_ack(paths: &DaemonPaths, owner: &LockIdentity) -> anyhow::Result<()> {
+    write_owner_file(&paths.shutdown_ack, "acknowledgement", owner)
+}
+
+fn write_owner_file(path: &Path, label: &str, owner: &LockIdentity) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            // Write directly to the final name. A concurrent publisher cannot
+            // be overwritten, and a partial file is harmless: the daemon's
+            // polling reader ignores it until this completed write is synced.
+            file.write_all(&serde_json::to_vec(owner)?)?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).with_context(|| {
+                format!(
+                    "inspect existing daemon shutdown {label} {}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "daemon shutdown {label} {} is not a regular file",
+                    path.display()
+                );
+            }
+            let existing: LockIdentity = serde_json::from_slice(&fs::read(path)?)
+                .with_context(|| format!("parse existing daemon shutdown {label}"))?;
+            if existing == *owner {
+                Ok(())
+            } else {
+                bail!(
+                    "daemon shutdown {label} {} belongs to a different owner",
+                    path.display()
+                )
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("create daemon shutdown {label} {}", path.display()))
+        }
+    }
+}
+
+fn accept_shutdown_request(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODE_GRAPH_TEST_DAEMON_IGNORE_REQUEST_ROOT")
+        .ok()
+        .is_some_and(|root| Path::new(&root) == paths.root)
+    {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_request) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        eprintln!(
+            "code-graph-mcp: refusing non-regular daemon shutdown request {}",
+            paths.shutdown_request.display()
+        );
+        return false;
+    }
+    let matches = fs::read(&paths.shutdown_request)
+        .ok()
+        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
+        .is_some_and(|requested| requested == *owner);
+    if matches {
+        if let Err(error) = write_shutdown_ack(paths, owner) {
+            eprintln!("code-graph-mcp: publish daemon shutdown acknowledgement: {error}");
+            return false;
+        }
+        let _ = fs::remove_file(&paths.shutdown_request);
+    }
+    matches
+}
+
+fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(&paths.shutdown_ack) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        eprintln!(
+            "code-graph-mcp: refusing non-regular daemon shutdown acknowledgement {}",
+            paths.shutdown_ack.display()
+        );
+        return false;
+    }
+    fs::read(&paths.shutdown_ack)
+        .ok()
+        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
+        .is_some_and(|acknowledged| acknowledged == *owner)
 }
 
 async fn acquire_or_detect_live(paths: &DaemonPaths) -> anyhow::Result<Option<DaemonLock>> {
@@ -688,6 +1179,8 @@ async fn cleanup_stale_runtime(paths: &DaemonPaths, _owner: Option<&LockIdentity
     // deliberately preserved for bind-time fallback handling.
     let _ = fs::remove_file(&paths.metadata);
     let _ = fs::remove_file(&paths.secret);
+    let _ = clear_shutdown_request(paths);
+    let _ = clear_shutdown_ack(paths);
 }
 
 async fn probe_endpoint(metadata: &DaemonMetadata) -> bool {
@@ -732,7 +1225,7 @@ async fn bind_listener(
             let endpoint = paths.socket.to_string_lossy().into_owned();
             return Ok((
                 Listener::Uds(listener),
-                DaemonMetadata::new(Transport::Uds, endpoint, lock.identity.clone()),
+                DaemonMetadata::new(Transport::Uds, endpoint, lock.identity.clone())?,
                 None,
             ));
         }
@@ -749,7 +1242,7 @@ async fn bind_listener(
         Ok((listener, endpoint)) => {
             return Ok((
                 Listener::Pipe(listener, endpoint.clone()),
-                DaemonMetadata::new(Transport::Pipe, endpoint, lock.identity.clone()),
+                DaemonMetadata::new(Transport::Pipe, endpoint, lock.identity.clone())?,
                 None,
             ));
         }
@@ -769,7 +1262,7 @@ async fn bind_listener(
     write_secret(&paths.secret, &secret)?;
     Ok((
         Listener::Tcp(listener),
-        DaemonMetadata::new(Transport::Tcp, endpoint, lock.identity.clone()),
+        DaemonMetadata::new(Transport::Tcp, endpoint, lock.identity.clone())?,
         Some(secret),
     ))
 }
@@ -1178,11 +1671,37 @@ async fn cleanup_owned(paths: &DaemonPaths, lock: DaemonLock, metadata: &DaemonM
     if metadata.transport == Transport::Tcp {
         let _ = fs::remove_file(&paths.secret);
     }
+    remove_shutdown_request_if_owned(paths, &metadata.owner);
+    remove_shutdown_ack_if_owned(paths, &metadata.owner);
     #[cfg(unix)]
     if metadata.transport == Transport::Uds {
         remove_orphan_socket(paths).await;
     }
     lock.remove_if_owned();
+}
+
+fn remove_shutdown_request_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
+    remove_owner_file_if_owned(&paths.shutdown_request, owner);
+}
+
+fn remove_shutdown_ack_if_owned(paths: &DaemonPaths, owner: &LockIdentity) {
+    remove_owner_file_if_owned(&paths.shutdown_ack, owner);
+}
+
+fn remove_owner_file_if_owned(path: &Path, owner: &LockIdentity) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return;
+    }
+    let belongs_to_owner = fs::read(path)
+        .ok()
+        .and_then(|encoded| serde_json::from_slice::<LockIdentity>(&encoded).ok())
+        .is_some_and(|requested| requested == *owner);
+    if belongs_to_owner {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn rfc3339_now() -> String {
@@ -1259,12 +1778,124 @@ mod tests {
             Transport::Tcp,
             "127.0.0.1:1".to_owned(),
             LockIdentity::current().unwrap(),
-        );
+        )
+        .unwrap();
         let encoded = serde_json::to_value(&metadata).unwrap();
         assert_eq!(encoded["transport"], "tcp");
         assert_eq!(encoded["endpoint"], "127.0.0.1:1");
         assert!(encoded["started_at"].as_str().unwrap().ends_with('Z'));
         assert!(!encoded["binary_sha"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn binary_sha_gate_accepts_only_equal_clean_builds() {
+        assert!(sha_compatible_with("clean-a", "clean-a", "fp-a", "fp-a"));
+        assert!(!sha_compatible_with("clean-a", "clean-b", "fp-a", "fp-a"));
+        assert!(!sha_compatible_with(
+            "dirty-a-dirty",
+            "dirty-a-dirty",
+            "fp-a",
+            "fp-b"
+        ));
+        assert!(sha_compatible_with(
+            "dirty-a-dirty",
+            "dirty-a-dirty",
+            "fp-a",
+            "fp-a"
+        ));
+        assert!(!sha_compatible_with("clean-a", "clean-a", "", ""));
+    }
+
+    #[test]
+    fn matching_metadata_without_an_actively_held_lock_is_not_attachable() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let owner = LockIdentity::current().unwrap();
+        fs::write(&paths.lock, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let metadata = DaemonMetadata {
+            pid: owner.pid,
+            transport: Transport::Tcp,
+            endpoint: "127.0.0.1:1".to_owned(),
+            binary_sha: env!("CODE_GRAPH_GIT_SHA").to_owned(),
+            executable_fingerprint: executable_fingerprint().unwrap(),
+            started_at: rfc3339_now(),
+            owner,
+        };
+        assert!(!metadata_owner_is_active(&paths, &metadata));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_saves_only_the_active_cache_project_root() {
+        let daemon_root = test_root();
+        let active_project = test_root();
+        let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        server
+            .inner
+            .indexed
+            .store(true, std::sync::atomic::Ordering::Release);
+        *server.inner.cache_root.write() = Some(active_project.clone());
+        graceful_shutdown(&server, &daemon_root).await;
+        assert!(code_graph_graph::cache_path(&active_project).exists());
+        assert!(!code_graph_graph::cache_path(&daemon_root).exists());
+        fs::remove_dir_all(daemon_root).unwrap();
+        fs::remove_dir_all(active_project).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_request_requires_a_regular_file_and_exact_owner() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        std::os::unix::fs::symlink("outside", &paths.shutdown_request).unwrap();
+        assert!(write_shutdown_request(&paths, &lock.identity).is_err());
+        assert!(clear_shutdown_request(&paths).is_err());
+        fs::remove_file(&paths.shutdown_request).unwrap();
+
+        let wrong_owner = LockIdentity {
+            pid: lock.identity.pid,
+            start_time: lock.identity.start_time,
+            nonce: "different".to_owned(),
+        };
+        write_shutdown_request(&paths, &wrong_owner).unwrap();
+        assert!(!accept_shutdown_request(&paths, &lock.identity));
+        assert!(
+            paths.shutdown_request.exists(),
+            "foreign request is retained"
+        );
+        clear_shutdown_request(&paths).unwrap();
+        write_shutdown_request(&paths, &lock.identity).unwrap();
+        assert!(accept_shutdown_request(&paths, &lock.identity));
+        assert!(
+            !paths.shutdown_request.exists(),
+            "owned request is consumed"
+        );
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_owner_publication_never_clobbers_another_owner() {
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let first = LockIdentity::current().unwrap();
+        let second = LockIdentity {
+            pid: first.pid,
+            start_time: first.start_time,
+            nonce: "second-owner".to_owned(),
+        };
+
+        write_shutdown_request(&paths, &first).unwrap();
+        assert!(write_shutdown_request(&paths, &second).is_err());
+        let published: LockIdentity =
+            serde_json::from_slice(&fs::read(&paths.shutdown_request).unwrap()).unwrap();
+        assert_eq!(published, first);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1316,7 +1947,8 @@ mod tests {
             Transport::Tcp,
             listener.local_addr().unwrap().to_string(),
             stale,
-        );
+        )
+        .unwrap();
         write_metadata_atomically(&paths.metadata, &metadata).unwrap();
         fs::write(&paths.secret, b"stale token\n").unwrap();
 
@@ -1485,7 +2117,8 @@ mod tests {
             Transport::Tcp,
             listener.local_addr().unwrap().to_string(),
             LockIdentity::current().unwrap(),
-        );
+        )
+        .unwrap();
         write_metadata_atomically(&paths.metadata, &metadata).unwrap();
         write_secret(&paths.secret, &token).unwrap();
 
@@ -1563,7 +2196,8 @@ mod tests {
             Transport::Tcp,
             "127.0.0.1:1".to_owned(),
             lock.identity.clone(),
-        );
+        )
+        .unwrap();
         write_metadata_atomically(&paths.metadata, &metadata).unwrap();
         fs::write(&paths.secret, "secret\n").unwrap();
         cleanup_owned(&paths, lock, &metadata).await;

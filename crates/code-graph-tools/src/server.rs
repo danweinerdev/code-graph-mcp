@@ -38,8 +38,9 @@ use rmcp::service::RoleServer;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{oneshot, Notify};
+use tokio::task::JoinHandle;
 
 use crate::analyze_job::AnalyzeSlot;
 use crate::handlers;
@@ -62,6 +63,203 @@ pub struct WatchHandle {
     /// Cancel signal for the watch_loop task. `watch_stop` sends `()` so
     /// the loop's `tokio::select!` cancel arm fires and the task drops.
     pub cancel: oneshot::Sender<()>,
+    /// Running watch-loop task. Graceful daemon shutdown awaits this after
+    /// closing the debouncer and sending cancellation, so no queued batch can
+    /// mutate the graph after its final cache save.
+    pub task: JoinHandle<()>,
+}
+
+/// Coordinates cache writes with daemon shutdown without coupling persistence
+/// correctness to analyze-job phase reporting.
+pub struct PersistCoordinator {
+    state: parking_lot::Mutex<PersistState>,
+    changed: Notify,
+}
+
+struct PersistState {
+    analyze_closed: bool,
+    persist_closed: bool,
+    watch_cleanup_closed: bool,
+    analyses: u32,
+    persists: u32,
+    watch_cleanups: u32,
+}
+
+impl PersistCoordinator {
+    pub fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(PersistState {
+                analyze_closed: false,
+                persist_closed: false,
+                watch_cleanup_closed: false,
+                analyses: 0,
+                persists: 0,
+                watch_cleanups: 0,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Atomically admit an analyze pipeline. Detached workers retain the
+    /// owned guard until their full parse/resolve/persist pipeline ends.
+    pub fn begin_analyze(self: &Arc<Self>) -> Result<AnalyzeGuard, &'static str> {
+        let mut state = self.state.lock();
+        if state.analyze_closed {
+            return Err("daemon shutdown in progress; new analyze jobs are not accepted");
+        }
+        state.analyses += 1;
+        Ok(AnalyzeGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Atomically admit one cache save unless graceful shutdown has closed
+    /// persistence admission. The guard releases on normal return, error, or
+    /// unwind.
+    pub fn begin_persist(self: &Arc<Self>) -> Result<PersistGuard, &'static str> {
+        let mut state = self.state.lock();
+        if state.persist_closed {
+            return Err("cache persistence is closed during daemon shutdown");
+        }
+        state.persists += 1;
+        Ok(PersistGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Admit detached cooperative watch cleanup. `watch_stop` obtains this
+    /// while it still holds the shared watch-state lock, so daemon shutdown
+    /// either takes the live handle itself or waits for this cleanup.
+    pub fn begin_watch_cleanup(self: &Arc<Self>) -> Result<WatchCleanupGuard, &'static str> {
+        let mut state = self.state.lock();
+        if state.watch_cleanup_closed {
+            return Err("watch cleanup is closed during daemon shutdown");
+        }
+        state.watch_cleanups += 1;
+        Ok(WatchCleanupGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Whether graceful shutdown has closed admission for analyze pipelines.
+    /// `watch_start` checks this while holding its watch-state write lock so
+    /// shutdown can close admission before taking that lock.
+    pub fn analyze_admission_closed(&self) -> bool {
+        self.state.lock().analyze_closed
+    }
+
+    /// Close new analyze admission and wait for every previously-admitted
+    /// pipeline. A notified future is created before inspecting state so a
+    /// final guard drop cannot be lost between the check and await.
+    pub async fn close_analyze_and_wait(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                state.analyze_closed = true;
+                if state.analyses == 0 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Close new ordinary saves and wait for already-active saves. The daemon
+    /// performs its final exclusive save only after this returns.
+    pub async fn close_persist_and_wait(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                state.persist_closed = true;
+                if state.persists == 0 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Close detached watch-cleanup admission and wait for cleanups already
+    /// detached by `watch_stop`. The notified future is armed before checking
+    /// the count so the final guard drop cannot be lost.
+    pub async fn close_watch_cleanup_and_wait(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                state.watch_cleanup_closed = true;
+                if state.watch_cleanups == 0 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for PersistCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII admission for an entire analyze pipeline.
+pub struct AnalyzeGuard {
+    coordinator: Arc<PersistCoordinator>,
+}
+
+impl Drop for AnalyzeGuard {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock();
+        debug_assert!(state.analyses > 0, "analyze guard must hold an active slot");
+        state.analyses -= 1;
+        if state.analyses == 0 {
+            self.coordinator.changed.notify_waiters();
+        }
+    }
+}
+
+/// RAII admission for one cache save.
+pub struct PersistGuard {
+    coordinator: Arc<PersistCoordinator>,
+}
+
+impl Drop for PersistGuard {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock();
+        debug_assert!(state.persists > 0, "persist guard must hold an active slot");
+        state.persists -= 1;
+        if state.persists == 0 {
+            self.coordinator.changed.notify_waiters();
+        }
+    }
+}
+
+/// RAII admission for a detached `watch_stop` cleanup task.
+pub struct WatchCleanupGuard {
+    coordinator: Arc<PersistCoordinator>,
+}
+
+impl Drop for WatchCleanupGuard {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock();
+        debug_assert!(
+            state.watch_cleanups > 0,
+            "watch cleanup guard must hold an active slot"
+        );
+        state.watch_cleanups -= 1;
+        if state.watch_cleanups == 0 {
+            self.coordinator.changed.notify_waiters();
+        }
+    }
 }
 
 /// Shared state owned by the running MCP server.
@@ -91,6 +289,9 @@ pub struct ServerInner {
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
+    /// Project root owning the active cache. Unlike `root_path`, this is not
+    /// the invocation/watch scope and may be an ancestor with nested config.
+    pub cache_root: PlRwLock<Option<PathBuf>>,
     /// Active watcher, if any. Populated by
     /// [`crate::handlers::watch::watch_start`] and cleared by
     /// [`crate::handlers::watch::watch_stop`].
@@ -110,6 +311,9 @@ pub struct ServerInner {
     /// "this index is the result of a force-rebuild" vs "this is the
     /// incremental result". `false` until the first analyze completes.
     pub index_force_built: AtomicBool,
+    /// Admission gate for cache writes during graceful daemon replacement.
+    /// Direct-mode servers never close it, preserving their existing behavior.
+    pub persist: Arc<PersistCoordinator>,
     /// Single-flight slot for analyze jobs (sync + async). Holds at
     /// most one `Running` job plus the previous terminal job for the
     /// grace-window read pattern. Read by 1.2's worker (next commit).
@@ -146,10 +350,12 @@ impl CodeGraphServer {
                 indexed: AtomicBool::new(false),
                 index_lock: TokioMutex::new(()),
                 root_path: PlRwLock::new(None),
+                cache_root: PlRwLock::new(None),
                 watch: PlRwLock::new(None),
                 config: PlRwLock::new(RootConfig::default()),
                 index_built_at: AtomicU64::new(0),
                 index_force_built: AtomicBool::new(false),
+                persist: Arc::new(PersistCoordinator::new()),
                 analyze_slot: PlRwLock::new(AnalyzeSlot::default()),
             }),
             tool_router: Self::tool_router(),
@@ -1878,9 +2084,74 @@ impl ServerHandler for CodeGraphServer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn empty_server() -> CodeGraphServer {
         CodeGraphServer::new(LanguageRegistry::new())
+    }
+
+    #[tokio::test]
+    async fn persist_coordinator_waits_for_active_save() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let guard = coordinator.begin_persist().unwrap();
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.close_persist_and_wait().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "shutdown waits for admitted save");
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("guard release wakes shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persist_coordinator_has_no_lost_wake_race() {
+        for _ in 0..32 {
+            let coordinator = Arc::new(PersistCoordinator::new());
+            let guard = coordinator.begin_persist().unwrap();
+            let waiter = tokio::spawn({
+                let coordinator = Arc::clone(&coordinator);
+                async move { coordinator.close_persist_and_wait().await }
+            });
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("close observes a concurrent final drop")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_coordinator_denies_saves_after_shutdown_begins() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        coordinator.close_persist_and_wait().await;
+        assert!(coordinator.begin_persist().is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_coordinator_multi_close_and_analyze_admission_are_safe() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let guard = coordinator.begin_analyze().unwrap();
+        let first = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.close_analyze_and_wait().await }
+        });
+        let second = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.close_analyze_and_wait().await }
+        });
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("multiple close callers drain together");
+        assert!(coordinator.begin_analyze().is_err());
     }
 
     /// `tools/list` must surface exactly 22 tools. If a future change adds
