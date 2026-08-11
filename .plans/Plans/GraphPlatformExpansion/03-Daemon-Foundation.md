@@ -49,6 +49,12 @@ tasks:
     justifies: "NFR-06, NFR-07. Task 3.6 prevents cross-root mutation, but focused review found that it reads a foreign root's config before rejection and compares roots produced by different canonicalizers, which can reject an equivalent Windows path form."
     verification: "Canonicalize the daemon root through the same `code_graph_core::paths` helper used by analyze requests. Reject an analyze path outside the bound daemon root before loading foreign config, while retaining the post-discovery equality check that rejects nested project configs. Linux tests prove an outside malformed config still returns the root-boundary error without parsing it and same-root/nested-scope requests continue to work; relevant native Windows normalization coverage remains assigned to Phase 11. Run focused daemon tests, rustfmt, clippy, and `make verify`."
     depends_on: ["3.6"]
+  - id: "3.8"
+    title: "Harden authoritative daemon lock recovery"
+    status: complete
+    justifies: "NFR-06, AC-08. The post-fix Phase 3 review found that opening a pre-existing lock follows a repository-planted symlink before truncation and that an unlocked stale identity naming a recycled live PID overrides the OS lock, enabling file overwrite and permanent recovery denial."
+    verification: "On Linux, existing lock open refuses symlinks/non-regular files without touching their targets, validates the opened inode, and preserves owner-only mode; a malicious lock symlink to an external sentinel leaves the sentinel byte-identical and daemon startup fails safely. Once exclusive OS lock acquisition succeeds, stale on-disk lock/metadata identity never vetoes recovery solely because its pid/start-time appears live; tests pin unlocked-current-identity takeover while an actually held lock still returns no owner. Run daemon unit/process suites, rustfmt, clippy, and `make verify`."
+    depends_on: ["3.7"]
 ---
 
 # Phase 3: Daemon Foundation
@@ -351,6 +357,40 @@ Revision boundary: root isolation is enforced before foreign reads and compares 
 |---|---|---|---|
 | `git show ae2a3d3b202be25de6049000dd13085ddeb6b6db` | Complete task commit | PASS | One focused boundary slice: shared canonicalizer at daemon startup, pre-config outside-root rejection, retained nested-project equality gate, and regression coverage. |
 | Focused final quality review | Exact task commit plus callers/tests | PASS | Linux MVP root ordering and canonicalization behavior aligned. Native Windows long-path representation remains explicitly deferred to Phase 11 rather than inferred from Linux. |
+
+## 3.8: Harden authoritative daemon lock recovery
+
+### Subtasks
+- [x] Open existing Linux lockfiles without following symlinks and reject non-regular or multiply-linked inodes
+- [x] Reapply owner-only mode after acquiring the lock and before rewriting recovered state
+- [x] Make successfully acquired OS lock ownership authoritative over stale pid/start-time contents and metadata
+- [x] Add malicious symlink/hardlink/nonregular, unlocked-live-identity, and held-lock regressions
+
+### Notes
+Revision boundary: repository-planted lock entries cannot redirect writes outside `.code-graph/`, and crash-released OS ownership — not stale process identity text — decides recovery. A direct `libc` crate use for `O_NOFOLLOW` is allowed only in the binary crate; it adds no native library and does not widen unsafe code.
+
+### Completion Evidence
+
+- Verified: 2026-08-11
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `36c83ec2893850f0e8ae559cf978c653070072ad`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-11T05:38:17Z, matching `36c83ec2893850f0e8ae559cf978c653070072ad`
+- Focused review: `git show 36c83ec2893850f0e8ae559cf978c653070072ad`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `36c83ec2893850f0e8ae559cf978c653070072ad`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp daemon:: -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 32 daemon unit tests passed, including symlink/hardlink/nonregular refusal with untouched sentinels, mode repair, current-looking stale identity takeover, held-lock exclusion, and stale/live UDS handling. |
+| `cargo test -p code-graph-mcp -- --test-threads=1` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 32 daemon unit, 13 proxy process, 8 serve process, and 1 smoke test passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting and workspace lint passed with warnings denied. |
+| `tmp="/tmp/opencode/code-graph-testdata-cpp-cache-3.8.db"; mv "testdata/cpp/.code-graph-cache.db" "$tmp" && trap 'mv "$tmp" "testdata/cpp/.code-graph-cache.db"' EXIT && make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace tests, snapshots, and plugin mirror checks passed after relocating and restoring the pre-existing ignored fixture cache. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git show 36c83ec2893850f0e8ae559cf978c653070072ad` | Complete task commit | PASS | One Linux lock-recovery slice: no-follow/regular/single-link validation, post-lock owner-mode repair, authoritative stale takeover, direct libc constant dependency, and regressions. |
+| Focused final quality review | Exact task commit plus lock callers/tests | PASS | Static repository-planted redirects and stale PID-reuse denial are closed under the owner-only runtime threat boundary; no unsafe code or native library was added. |
 
 ## Acceptance Criteria
 
