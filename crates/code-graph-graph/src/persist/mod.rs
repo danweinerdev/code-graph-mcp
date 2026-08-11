@@ -21,6 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 use crate::graph::Graph;
@@ -30,6 +31,16 @@ pub mod packed;
 
 const CACHE_FILE_NAME: &str = ".code-graph-cache.db";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Serializes saves in this process so a new save cannot scavenge an active
+/// unique temporary created by another save. This intentionally does not
+/// provide cross-process cache locking.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_save() -> MutexGuard<'static, ()> {
+    SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 // v3: include entries now carry the source line of the `#include`
 // directive (was a bare path list) so the dependency query can report
 // where each include was declared. The shape change is not
@@ -167,6 +178,43 @@ fn remove_stale_tmp_entry(tmp_path: &Path) -> io::Result<()> {
     }
 }
 
+/// Remove unique cache temporary entries abandoned by a prior writer.
+///
+/// Only direct children of `dir` whose names begin with this cache file's
+/// reserved unique-temp prefix are considered. `remove_stale_tmp_entry` uses
+/// no-follow metadata and unlinks directory entries, so symlink targets and
+/// hard-link targets are never opened or changed. A directory or other
+/// non-file entry in the reserved namespace is deliberately retained and
+/// aborts the save.
+fn scavenge_unique_tmp_entries(dir: &Path) -> io::Result<()> {
+    let prefix = format!("{CACHE_FILE_NAME}.tmp.");
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if is_unique_tmp_name(&entry.file_name(), &prefix) {
+            remove_stale_tmp_entry(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn is_unique_tmp_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = suffix.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(sequence), None)
+            if !pid.is_empty()
+                && !sequence.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
 /// Derive one process-unique temporary pathname for a cache save.
 fn unique_tmp_path(dir: &Path, sequence: u64) -> PathBuf {
     dir.join(format!(
@@ -204,9 +252,9 @@ fn create_unique_tmp(dir: &Path) -> io::Result<(File, PathBuf)> {
 impl Graph {
     /// Atomically write the graph to `<dir>/.code-graph-cache.db`.
     ///
-    /// Strategy: remove any stale legacy `.tmp` entry, then rkyv-serialize
-    /// into a unique sibling temporary file with the 8-byte header (endian
-    /// probe + version) prepended,
+    /// Strategy: serialize same-process saves, remove abandoned unique and
+    /// legacy `.tmp` entries, then rkyv-serialize into a unique sibling
+    /// temporary file with the 8-byte header (endian probe + version) prepended,
     /// `File::sync_all`, then `fs::rename` to swap over the final
     /// path. The rename is atomic on POSIX and on Windows since
     /// Rust 1.84.
@@ -218,6 +266,9 @@ impl Graph {
     ///   simplicity; a serialization failure here represents a code
     ///   bug, not a recoverable on-disk state).
     pub fn save(&self, dir: &Path) -> Result<(), PersistError> {
+        // A panicking writer must not permanently disable persistence. The
+        // recovered guard still serializes later saves after the panic unwinds.
+        let _save_guard = lock_save();
         let final_path = cache_path(dir);
         let legacy_tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
 
@@ -233,8 +284,10 @@ impl Graph {
         let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
             .map_err(|e| io::Error::other(format!("rkyv serialize: {e}")))?;
 
-        // Preserve safe recovery for the pre-unique-name temporary path, but
-        // never use that shared pathname for an active write.
+        // Scavenging runs under SAVE_LOCK, so it cannot remove another thread's
+        // active temp. Preserve safe recovery for the pre-unique-name path too,
+        // but never use that shared pathname for an active write.
+        scavenge_unique_tmp_entries(dir)?;
         remove_stale_tmp_entry(&legacy_tmp_path)?;
 
         let (file, tmp_path) = create_unique_tmp(dir)?;
@@ -732,6 +785,22 @@ mod tests {
         assert!(loaded.load(dir.path()).unwrap());
     }
 
+    #[test]
+    fn save_scavenges_unique_tmp_left_by_a_crashed_writer() {
+        let dir = TempDir::new().unwrap();
+        let abandoned = unique_tmp_path(dir.path(), 7);
+        fs::write(&abandoned, b"partial cache from a crashed writer").unwrap();
+
+        build_sample_graph().save(dir.path()).unwrap();
+
+        assert!(
+            !abandoned.exists(),
+            "a successful save must remove abandoned unique temporary entries"
+        );
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_unlinks_stale_tmp_symlink_without_touching_its_target() {
@@ -770,6 +839,30 @@ mod tests {
         assert!(loaded.load(dir.path()).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_unlinks_unique_tmp_links_without_touching_their_targets() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let symlink_target = outside.path().join("symlink-sentinel");
+        let hardlink_target = outside.path().join("hardlink-sentinel");
+        let symlink_contents = b"external unique symlink sentinel\n";
+        let hardlink_contents = b"external unique hardlink sentinel\n";
+        fs::write(&symlink_target, symlink_contents).unwrap();
+        fs::write(&hardlink_target, hardlink_contents).unwrap();
+        let symlink_tmp = unique_tmp_path(dir.path(), 8);
+        let hardlink_tmp = unique_tmp_path(dir.path(), 9);
+        std::os::unix::fs::symlink(&symlink_target, &symlink_tmp).unwrap();
+        fs::hard_link(&hardlink_target, &hardlink_tmp).unwrap();
+
+        build_sample_graph().save(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&symlink_target).unwrap(), symlink_contents);
+        assert_eq!(fs::read(&hardlink_target).unwrap(), hardlink_contents);
+        assert!(!symlink_tmp.exists());
+        assert!(!hardlink_tmp.exists());
+    }
+
     #[test]
     fn save_rejects_directory_at_tmp_path() {
         let dir = TempDir::new().unwrap();
@@ -781,6 +874,39 @@ mod tests {
         assert!(matches!(error, PersistError::Io(_)));
         assert!(tmp.is_dir(), "non-file temporary entry is retained");
         assert!(!cache_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn save_refuses_and_retains_directory_in_unique_tmp_namespace() {
+        let dir = TempDir::new().unwrap();
+        let temp_dir = unique_tmp_path(dir.path(), 10);
+        fs::create_dir(&temp_dir).unwrap();
+
+        let error = build_sample_graph().save(dir.path()).unwrap_err();
+
+        assert!(matches!(error, PersistError::Io(_)));
+        assert!(
+            temp_dir.is_dir(),
+            "reserved temporary directory is retained"
+        );
+        assert!(!cache_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn save_preserves_unrelated_sibling_entries() {
+        let dir = TempDir::new().unwrap();
+        let unrelated_file = dir.path().join(".code-graph-cache.db.tmpx.11");
+        let backup_file = dir.path().join(".code-graph-cache.db.tmp.backup");
+        let unrelated_dir = dir.path().join("unrelated-directory");
+        fs::write(&unrelated_file, b"do not scavenge").unwrap();
+        fs::write(&backup_file, b"also do not scavenge").unwrap();
+        fs::create_dir(&unrelated_dir).unwrap();
+
+        build_sample_graph().save(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&unrelated_file).unwrap(), b"do not scavenge");
+        assert_eq!(fs::read(&backup_file).unwrap(), b"also do not scavenge");
+        assert!(unrelated_dir.is_dir());
     }
 
     #[test]
@@ -805,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_saves_use_distinct_temps_and_leave_a_loadable_cache() {
+    fn concurrent_saves_serialize_and_leave_a_loadable_cache() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_path_buf();
         let start = Arc::new(Barrier::new(3));
@@ -841,6 +967,75 @@ mod tests {
                 .starts_with(&prefix)),
             "successful concurrent saves must not leak unique temporary files"
         );
+    }
+
+    #[test]
+    fn save_waits_for_an_active_same_process_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let _guard = lock_save();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let save = thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            done_tx.send(build_sample_graph().save(&path)).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second save must wait for the active save's mutex"
+        );
+
+        drop(_guard);
+        save.join().expect("blocked save thread must not panic");
+        assert!(
+            done_rx.recv().unwrap().is_ok(),
+            "blocked save must complete after the active save releases the mutex"
+        );
+    }
+
+    #[test]
+    fn repeated_saves_leave_no_unique_temps_and_keep_the_last_cache_loadable() {
+        let dir = TempDir::new().unwrap();
+        let first = build_sample_graph();
+        first.save(dir.path()).unwrap();
+
+        let mut last = Graph::new();
+        last.merge_file_graph(make_fg(
+            "/last.cpp",
+            Language::Cpp,
+            vec![sym("last", SymbolKind::Function, "/last.cpp")],
+            vec![],
+        ));
+        for _ in 0..3 {
+            last.save(dir.path()).unwrap();
+        }
+
+        let prefix = format!("{CACHE_FILE_NAME}.tmp.");
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&prefix)));
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        assert!(loaded.nodes.contains_key("/last.cpp:last"));
+    }
+
+    #[test]
+    fn save_recovers_after_the_process_save_mutex_is_poisoned() {
+        let poisoner = thread::spawn(|| {
+            let _guard = SAVE_LOCK.lock().unwrap();
+            panic!("deliberately poison the save mutex");
+        });
+        assert!(poisoner.join().is_err());
+
+        let dir = TempDir::new().unwrap();
+        build_sample_graph().save(dir.path()).unwrap();
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
     }
 
     // ---- stale_paths ----
