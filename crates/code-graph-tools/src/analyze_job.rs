@@ -12,6 +12,7 @@
 //!   or Failed(msg).
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
@@ -65,13 +66,30 @@ pub(crate) struct PendingAnalyze {
 
 pub(crate) struct AnalyzeJob {
     pub(crate) job_id: String,
+    /// The caller-supplied path, retained for status and diagnostics.
     pub(crate) path: String,
+    /// Coverage identity captured at admission. Besides coalescing coverage,
+    /// its invocation path is the stable execution path: a queued symlink
+    /// request must index the target it named when admitted even if the
+    /// symlink is retargeted before promotion. `None` means the request did
+    /// not name a valid existing project and the worker must validate the raw
+    /// path/config to preserve its established error behavior.
+    pub(crate) coverage: Option<CoverageIdentity>,
     pub(crate) force: bool,
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
     /// Wakes sync callers waiting for this job's terminal state. Callers arm
     /// this before checking state, so a terminal transition cannot be lost.
     pub(crate) terminal_changed: tokio::sync::Notify,
+}
+
+/// Stable identity used to decide whether one admitted analyze can reuse
+/// another. Both paths are canonical: invocation containment is meaningful
+/// only within one discovered project root.
+#[derive(Clone, Debug)]
+pub(crate) struct CoverageIdentity {
+    pub(crate) invocation_path: PathBuf,
+    pub(crate) project_root: PathBuf,
 }
 
 #[derive(Default)]
@@ -155,15 +173,27 @@ pub enum AnalyzePhase {
 }
 
 impl AnalyzeJob {
+    #[cfg(test)]
     pub(crate) fn new_running(
         job_id: String,
         path: String,
         force: bool,
         started_at: u64,
     ) -> Arc<Self> {
+        Self::new_running_with_coverage(job_id, path, force, started_at, None)
+    }
+
+    pub(crate) fn new_running_with_coverage(
+        job_id: String,
+        path: String,
+        force: bool,
+        started_at: u64,
+        coverage: Option<CoverageIdentity>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
             path,
+            coverage,
             force,
             started_at,
             state: PlRwLock::new(JobMutableState::default()),
@@ -171,15 +201,27 @@ impl AnalyzeJob {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_queued(
         job_id: String,
         path: String,
         force: bool,
         started_at: u64,
     ) -> Arc<Self> {
+        Self::new_queued_with_coverage(job_id, path, force, started_at, None)
+    }
+
+    pub(crate) fn new_queued_with_coverage(
+        job_id: String,
+        path: String,
+        force: bool,
+        started_at: u64,
+        coverage: Option<CoverageIdentity>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
             path,
+            coverage,
             force,
             started_at,
             state: PlRwLock::new(JobMutableState {
@@ -254,9 +296,69 @@ impl AnalyzeJob {
     }
 }
 
+/// Whether an already-admitted request covers a later request.
+///
+/// Project roots must match before invocation containment is considered.
+/// `Path::starts_with` compares components rather than bytes, so `/repo/a`
+/// covers `/repo/a/file` but not `/repo/ab`. A forced request can cover either
+/// kind of request; a non-forcing request must never absorb a forced request.
+pub(crate) fn covers(
+    coverer: (&CoverageIdentity, bool),
+    covered: (&CoverageIdentity, bool),
+) -> bool {
+    coverer.0.project_root == covered.0.project_root
+        && covered
+            .0
+            .invocation_path
+            .starts_with(&coverer.0.invocation_path)
+        && (coverer.1 || !covered.1)
+}
+
 impl JobMutableState {
     #[allow(dead_code)]
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self.status, JobStatus::Completed(_) | JobStatus::Failed(_))
+    }
+}
+
+#[cfg(test)]
+mod coalesce {
+    use super::{covers, CoverageIdentity};
+    use std::path::PathBuf;
+
+    fn identity(path: &str, project_root: &str) -> CoverageIdentity {
+        CoverageIdentity {
+            invocation_path: PathBuf::from(path),
+            project_root: PathBuf::from(project_root),
+        }
+    }
+
+    #[test]
+    fn pure_component_aware_coverage_force_matrix() {
+        let root = identity("/repo/a", "/repo");
+        let child = identity("/repo/a/child", "/repo");
+        let sibling_prefix = identity("/repo/ab", "/repo");
+        let shadowing_child = identity("/repo/a/child", "/repo/a/child");
+
+        // Same-scope force matrix.
+        assert!(covers((&root, false), (&root, false)));
+        assert!(!covers((&root, false), (&root, true)));
+        assert!(covers((&root, true), (&root, false)));
+        assert!(covers((&root, true), (&root, true)));
+
+        // Nested requests retain the same force asymmetry.
+        assert!(covers((&root, false), (&child, false)));
+        assert!(covers((&root, true), (&child, false)));
+        assert!(covers((&root, true), (&child, true)));
+        assert!(
+            !covers((&root, false), (&child, true)),
+            "a non-force parent must not absorb a force child"
+        );
+        assert!(!covers((&child, false), (&root, false)));
+        assert!(!covers((&root, false), (&sibling_prefix, false)));
+        assert!(
+            !covers((&root, true), (&shadowing_child, false)),
+            "a nested config creates a distinct project boundary"
+        );
     }
 }

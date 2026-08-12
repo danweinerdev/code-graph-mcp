@@ -1488,7 +1488,7 @@ mod tests {
     /// step atomic. NO sleep knob: indexing time is irrelevant; the
     /// synchronization happens entirely in the slot.
     #[tokio::test]
-    async fn concurrent_async_kickoffs_admit_distinct_fifo_jobs() {
+    async fn concurrent_async_kickoffs_coalesce_covered_requests() {
         let _guard = ParseSleepGuard::set(50);
         let dir = tempdir_with_n_rec(20);
         fs::write(
@@ -1539,12 +1539,11 @@ mod tests {
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            2,
-            "4.1 admits every request distinctly; duplicate arguments must not coalesce"
+            1,
+            "covered duplicate requests must share one job"
         );
-        assert!(parsed.iter().all(|v| v["existing"] == false));
-        assert!(parsed.iter().any(|v| v["status"] == "running"));
-        assert!(parsed.iter().any(|v| v["status"] == "queued"));
+        assert!(parsed.iter().any(|v| v["existing"] == true));
+        assert!(parsed.iter().all(|v| v["status"] == "running"));
         for job_id in &job_ids {
             wait_for_job_terminal(inner.clone(), job_id).await;
         }
@@ -1554,7 +1553,7 @@ mod tests {
     /// The parse-delay guard keeps the first worker running long enough for
     /// the second kickoff to be admitted behind it with a different job ID.
     #[tokio::test]
-    async fn async_duplicate_kickoff_after_first_started_returns_distinct_queued_job() {
+    async fn async_duplicate_kickoff_after_first_started_reuses_running_job() {
         let _guard = ParseSleepGuard::set(50);
         let dir = tempdir_with_n_rec(5);
         let (server, _calls) = server_with_recording_plugin();
@@ -1571,14 +1570,13 @@ mod tests {
         let second = analyze_codebase_async(inner.clone(), path.clone(), true).await;
         let second_parsed: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
         let second_job_id = second_parsed["job_id"].as_str().unwrap().to_string();
-        assert_eq!(second_parsed["existing"], serde_json::json!(false));
-        assert_eq!(second_parsed["status"], serde_json::json!("queued"));
-        assert_ne!(
+        assert_eq!(second_parsed["existing"], serde_json::json!(true));
+        assert_eq!(second_parsed["status"], serde_json::json!("running"));
+        assert_eq!(
             second_job_id, first_job_id,
-            "4.1 must not coalesce duplicate args"
+            "covered duplicate requests must reuse the running job"
         );
         wait_for_job_terminal(inner.clone(), &first_job_id).await;
-        wait_for_job_terminal(inner, &second_job_id).await;
     }
 
     /// A sync request admitted behind an async job waits for its own result.
@@ -1606,10 +1604,7 @@ mod tests {
         tokio::task::yield_now().await;
         let status: serde_json::Value =
             serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
-        assert_eq!(
-            status["analyze_job_pending_count"], 1,
-            "sync request must be admitted into FIFO rather than rejected"
-        );
+        assert_eq!(status["analyze_job_pending_count"], 0);
         let sync_r = sync.await.expect("sync queued task panicked");
         assert!(sync_r.is_error.is_none() || sync_r.is_error == Some(false));
         wait_for_job_terminal(inner, &kickoff_id).await;
@@ -1710,6 +1705,7 @@ mod tests {
         let second = analyze_codebase_async(inner.clone(), path.clone(), true).await;
         let second: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
         let second_id = second["job_id"].as_str().unwrap().to_string();
+        assert_eq!(second_id, first_id, "running coverer must be reused");
 
         reached_rx
             .await
@@ -1717,13 +1713,18 @@ mod tests {
         let third = analyze_codebase_async(inner.clone(), path.clone(), true).await;
         let third: serde_json::Value = serde_json::from_str(&body_text(&third)).unwrap();
         let third_id = third["job_id"].as_str().unwrap().to_string();
+        assert_eq!(third["existing"], false);
+        assert_eq!(
+            third["status"], "queued",
+            "a terminal coverer must retry admission rather than report running"
+        );
         let gap: serde_json::Value =
             serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
         assert_eq!(gap["analyze_job"]["job_id"], first_id);
         assert_eq!(gap["analyze_job"]["status"], "completed");
         assert_eq!(
             gap["analyze_job_pending_ids"],
-            serde_json::json!([second_id, third_id])
+            serde_json::json!([third_id])
         );
 
         proceed_tx.send(()).unwrap();
@@ -1735,25 +1736,22 @@ mod tests {
             );
             let status: serde_json::Value =
                 serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
-            if status["analyze_job"]["job_id"] == second_id
+            if status["analyze_job"]["job_id"] == third_id
                 && status["analyze_job"]["status"] == "running"
             {
                 assert_eq!(status["analyze_job_previous_terminal"]["job_id"], first_id);
-                assert_eq!(
-                    status["analyze_job_pending_ids"],
-                    serde_json::json!([third_id])
-                );
+                assert_eq!(status["analyze_job_pending_ids"], serde_json::json!([]));
                 break;
             }
             tokio::task::yield_now().await;
         }
-        for job_id in [&first_id, &second_id, &third_id] {
+        for job_id in [&first_id, &third_id] {
             wait_for_job_terminal(inner.clone(), job_id).await;
         }
         assert_eq!(
             calls.lock().unwrap().len(),
-            3,
-            "each FIFO admission runs exactly once; no overtaking worker was spawned"
+            2,
+            "the covered duplicate must not start a second pipeline"
         );
     }
 
@@ -1763,14 +1761,15 @@ mod tests {
     #[tokio::test]
     async fn aborting_sync_waiter_does_not_strand_queued_successor() {
         let _guard = ParseSleepGuard::set(50);
-        let dir = tempdir_with_n_rec(5);
+        let running_dir = tempdir_with_n_rec(5);
+        let successor_dir = tempdir_with_n_rec(5);
         let (server, _calls) = server_with_recording_plugin();
         let inner = server.inner.clone();
-        let path = dir.path().to_string_lossy().into_owned();
+        let running_path = running_dir.path().to_string_lossy().into_owned();
+        let successor_path = successor_dir.path().to_string_lossy().into_owned();
         let sync = tokio::spawn({
             let inner = inner.clone();
-            let path = path.clone();
-            async move { analyze_codebase(inner, path, false, None, None).await }
+            async move { analyze_codebase(inner, running_path, false, None, None).await }
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -1783,10 +1782,20 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        let queued = analyze_codebase_async(inner.clone(), path, false).await;
+        let running_id = inner
+            .analyze_slot
+            .read()
+            .current
+            .as_ref()
+            .unwrap()
+            .job_id
+            .clone();
+        let queued = analyze_codebase_async(inner.clone(), successor_path, false).await;
         let queued: serde_json::Value = serde_json::from_str(&body_text(&queued)).unwrap();
         let queued_id = queued["job_id"].as_str().unwrap().to_string();
+        assert_eq!(queued["existing"], false);
         assert_eq!(queued["status"], "queued");
+        assert_ne!(queued_id, running_id);
         sync.abort();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1799,6 +1808,10 @@ mod tests {
             if status["analyze_job"]["job_id"] == queued_id
                 && status["analyze_job"]["status"] == "completed"
             {
+                assert_eq!(
+                    status["analyze_job_previous_terminal"]["job_id"], running_id,
+                    "the queued successor must be promoted after the aborted sync waiter's job"
+                );
                 break;
             }
             tokio::task::yield_now().await;
@@ -1858,15 +1871,18 @@ mod tests {
     #[tokio::test]
     async fn sync_kickoff_queues_async_kickoff() {
         let _guard = ParseSleepGuard::set(50);
-        let dir = tempdir_with_n_rec(20);
+        let running_dir = tempdir_with_n_rec(20);
+        let successor_dir = tempdir_with_n_rec(5);
         let (server, _calls) = server_with_recording_plugin();
         let inner = server.inner.clone();
-        let path = dir.path().to_string_lossy().into_owned();
+        let running_path = running_dir.path().to_string_lossy().into_owned();
+        let successor_path = successor_dir.path().to_string_lossy().into_owned();
 
         let sync_handle = {
             let inner = inner.clone();
-            let path = path.clone();
-            tokio::spawn(async move { analyze_codebase(inner, path, false, None, None).await })
+            tokio::spawn(
+                async move { analyze_codebase(inner, running_path, false, None, None).await },
+            )
         };
 
         // Spin-yield until the slot's current job is Running. Bounded at
@@ -1892,17 +1908,32 @@ mod tests {
             tokio::task::yield_now().await;
         };
 
-        let async_r = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let async_r = analyze_codebase_async(inner.clone(), successor_path, false).await;
         let async_parsed: serde_json::Value = serde_json::from_str(&body_text(&async_r)).unwrap();
+        let successor_id = async_parsed["job_id"].as_str().unwrap();
         assert_eq!(async_parsed["existing"], serde_json::json!(false));
         assert_eq!(async_parsed["status"], serde_json::json!("queued"));
-        assert_ne!(async_parsed["job_id"].as_str().unwrap(), sync_job_id);
+        assert_ne!(successor_id, sync_job_id);
+        let queued_status: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+        assert_eq!(
+            queued_status["analyze_job_pending_ids"],
+            serde_json::json!([successor_id])
+        );
 
         // Drain the sync handler so the worker completes inside this test's
         // runtime — avoids the worker future being dropped mid-flight when
         // the test's runtime tears down.
         let _ = sync_handle.await.expect("sync handler task panicked");
-        wait_for_job_terminal(inner, async_parsed["job_id"].as_str().unwrap()).await;
+        wait_for_job_terminal(inner.clone(), successor_id).await;
+        let completed: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner))).unwrap();
+        assert_eq!(completed["analyze_job"]["job_id"], successor_id);
+        assert_eq!(completed["analyze_job"]["status"], "completed");
+        assert_eq!(
+            completed["analyze_job_previous_terminal"]["job_id"],
+            sync_job_id
+        );
     }
 
     // ----- Task 2.3: slot rotation, failure-path, and progress tests --------

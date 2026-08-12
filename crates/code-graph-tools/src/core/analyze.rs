@@ -34,7 +34,8 @@ use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::Graph;
 
 use crate::analyze_job::{
-    AnalyzeJob, AnalyzePhase, AnalyzeSlot, JobStatus, PendingAnalyze, TERMINAL_HISTORY_LIMIT,
+    covers, AnalyzeJob, AnalyzePhase, AnalyzeSlot, CoverageIdentity, JobStatus, PendingAnalyze,
+    TERMINAL_HISTORY_LIMIT,
 };
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
@@ -130,12 +131,20 @@ pub(crate) async fn run_analyze_job(
         return;
     }
 
-    let abs_path = match paths::canonicalize(std::path::Path::new(&path_raw)) {
-        Ok(p) => p,
-        Err(_) => {
-            finish_failed(&job, format!("directory does not exist: {path_raw}"));
-            return;
-        }
+    // An existing directory was canonicalized at admission for coverage.
+    // Reuse that identity for execution so a queued symlink cannot be
+    // retargeted into a different indexing scope before promotion. Requests
+    // without admission identity retain the established worker-time raw-path
+    // canonicalization and validation errors.
+    let abs_path = match job.coverage.as_ref() {
+        Some(coverage) => coverage.invocation_path.clone(),
+        None => match paths::canonicalize(std::path::Path::new(&path_raw)) {
+            Ok(path) => path,
+            Err(_) => {
+                finish_failed(&job, format!("directory does not exist: {path_raw}"));
+                return;
+            }
+        },
     };
     if !abs_path.is_dir() {
         finish_failed(
@@ -698,35 +707,27 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
+    // Coverage canonicalization performs filesystem lookups. A bound daemon
+    // must reject a substituted root before doing that work, including before
+    // a request can reuse an existing covering job.
+    inner.ensure_daemon_root_current().map_err(ToolError)?;
+    let coverage = coverage_identity(&path_raw);
     let job = {
         let mut slot = inner.analyze_slot.write();
-        let analyze_guard = inner
-            .persist
-            .begin_analyze()
-            .map_err(|message| ToolError(message.to_string()))?;
-        if slot.current.is_some()
-            && !(slot.pending.is_empty()
-                && !slot.current_completion_pending
-                && slot
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.state.read().is_terminal()))
-        {
-            // A terminal current with pending work is still occupied: its
-            // supervisor alone owns the terminal->promotion transition. This
-            // closes the terminal-visible/admission race without allowing a
-            // later request to overtake the FIFO head.
-            let job = install_new_queued(&mut slot, path_raw, force);
-            slot.pending.push_back(PendingAnalyze {
-                job: Arc::clone(&job),
-                analyze_guard,
-                sink: Arc::clone(&sink),
-            });
-            job
-        } else {
-            let job = install_new_running(&mut slot, path_raw, force);
-            spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, analyze_guard);
-            job
+        match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
+            Admission::Covered { job, .. } => job,
+            Admission::Queued { job, analyze_guard } => {
+                slot.pending.push_back(PendingAnalyze {
+                    job: Arc::clone(&job),
+                    analyze_guard,
+                    sink: Arc::clone(&sink),
+                });
+                job
+            }
+            Admission::Running { job, analyze_guard } => {
+                spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, analyze_guard);
+                job
+            }
         }
     };
 
@@ -766,45 +767,40 @@ pub async fn analyze_codebase_async(
         return Err(ToolError("'path' is required".to_string()));
     }
 
+    // Keep this before coverage canonicalization: it performs filesystem
+    // lookups and could otherwise coalesce work in a replacement namespace.
+    inner.ensure_daemon_root_current().map_err(ToolError)?;
+    let coverage = coverage_identity(&path_raw);
     let kickoff = {
         let mut slot = inner.analyze_slot.write();
-        let guard = inner
-            .persist
-            .begin_analyze()
-            .map_err(|message| ToolError(message.to_string()))?;
-        if slot.current.is_some()
-            && !(slot.pending.is_empty()
-                && !slot.current_completion_pending
-                && slot
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.state.read().is_terminal()))
-        {
-            let job = install_new_queued(&mut slot, path_raw, force);
-            slot.pending.push_back(PendingAnalyze {
-                job: Arc::clone(&job),
-                analyze_guard: guard,
-                sink: Arc::new(NoopProgressSink),
-            });
-            (job, "queued")
-        } else {
-            let job = install_new_running(&mut slot, path_raw, force);
-            spawn_supervised_job(
-                Arc::clone(&inner),
-                Arc::clone(&job),
-                Arc::new(NoopProgressSink),
-                guard,
-            );
-            (job, "running")
+        match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
+            Admission::Covered { job, status } => (job, status, true),
+            Admission::Queued { job, analyze_guard } => {
+                slot.pending.push_back(PendingAnalyze {
+                    job: Arc::clone(&job),
+                    analyze_guard,
+                    sink: Arc::new(NoopProgressSink),
+                });
+                (job, "queued", false)
+            }
+            Admission::Running { job, analyze_guard } => {
+                spawn_supervised_job(
+                    Arc::clone(&inner),
+                    Arc::clone(&job),
+                    Arc::new(NoopProgressSink),
+                    analyze_guard,
+                );
+                (job, "running", false)
+            }
         }
     };
 
-    let (job, status) = kickoff;
+    let (job, status, existing) = kickoff;
     Ok(ToolOk::Value(AsyncKickoffResponse {
         job_id: job.job_id.clone(),
         status,
         started_at: format_unix_nanos_rfc3339(job.started_at),
-        existing: false,
+        existing,
         note: if status == "running" {
             "analyze kicked off — poll get_job_status(job_id) for progress and the terminal result"
         } else {
@@ -813,10 +809,123 @@ pub async fn analyze_codebase_async(
     }))
 }
 
+enum Admission {
+    Covered {
+        job: Arc<AnalyzeJob>,
+        /// Snapshot taken under the slot lock and job state lock. It is never
+        /// a terminal state disguised as `running`.
+        status: &'static str,
+    },
+    Running {
+        job: Arc<AnalyzeJob>,
+        analyze_guard: crate::server::AnalyzeGuard,
+    },
+    Queued {
+        job: Arc<AnalyzeJob>,
+        analyze_guard: crate::server::AnalyzeGuard,
+    },
+}
+
+/// Admit an analyze request while the caller holds the slot write lock.
+///
+/// The coverage identity is deliberately computed only for canonical existing
+/// directories with a successfully discovered config root. Invalid paths and
+/// config errors retain no identity and proceed to their worker, preserving
+/// established execution-time validation errors.
+fn admit_job(
+    inner: &ServerInner,
+    slot: &mut AnalyzeSlot,
+    path_raw: String,
+    force: bool,
+    coverage: Option<CoverageIdentity>,
+) -> Result<Admission, ToolError> {
+    // Every request participates in closed admission before it can be
+    // coalesced. Covered requests drop this temporary guard below; only newly
+    // admitted queued/running jobs retain one through their supervisor.
+    let analyze_guard = inner
+        .persist
+        .begin_analyze()
+        .map_err(|message| ToolError(message.to_string()))?;
+
+    if let Some(coverage) = coverage.as_ref() {
+        if let Some((job, status)) = covering_job(slot, coverage, force) {
+            drop(analyze_guard);
+            return Ok(Admission::Covered { job, status });
+        }
+    }
+
+    if slot_is_occupied(slot) {
+        let job = install_new_queued(slot, path_raw, force, coverage);
+        Ok(Admission::Queued { job, analyze_guard })
+    } else {
+        let job = install_new_running(slot, path_raw, force, coverage);
+        Ok(Admission::Running { job, analyze_guard })
+    }
+}
+
+fn coverage_identity(path_raw: &str) -> Option<CoverageIdentity> {
+    let path = paths::canonicalize(std::path::Path::new(path_raw)).ok()?;
+    if !path.is_dir() {
+        return None;
+    }
+    let (_, project_root) = RootConfig::load(&path).ok()?;
+    Some(CoverageIdentity {
+        invocation_path: path,
+        project_root,
+    })
+}
+
+/// Find a covering request and snapshot its nonterminal status. The current
+/// job is checked first, then every pending job in FIFO order, under one slot
+/// write lock. This follows promotion's slot-then-state lock order, while
+/// terminal writers take only the state lock, so no lock cycle is possible.
+fn covering_job(
+    slot: &AnalyzeSlot,
+    coverage: &CoverageIdentity,
+    force: bool,
+) -> Option<(Arc<AnalyzeJob>, &'static str)> {
+    let mut candidates = slot
+        .current
+        .iter()
+        .chain(slot.pending.iter().map(|pending| &pending.job));
+    candidates.find_map(|job| {
+        let state = job.state.read();
+        let status = match &state.status {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Completed(_) | JobStatus::Failed(_) => return None,
+        };
+        let covers_request = job
+            .coverage
+            .as_ref()
+            .is_some_and(|coverer| covers((coverer, job.force), (coverage, force)));
+        if covers_request {
+            Some((Arc::clone(job), status))
+        } else {
+            None
+        }
+    })
+}
+
+fn slot_is_occupied(slot: &AnalyzeSlot) -> bool {
+    slot.current.is_some()
+        && !(slot.pending.is_empty()
+            && !slot.current_completion_pending
+            && slot
+                .current
+                .as_ref()
+                .is_some_and(|current| current.state.read().is_terminal()))
+}
+
 /// Install an immediately-running job. Caller holds the slot write guard.
-fn install_new_running(slot: &mut AnalyzeSlot, path: String, force: bool) -> Arc<AnalyzeJob> {
+fn install_new_running(
+    slot: &mut AnalyzeSlot,
+    path: String,
+    force: bool,
+    coverage: Option<CoverageIdentity>,
+) -> Arc<AnalyzeJob> {
     let (job_id, started_at) = issue_job_id(slot);
-    let job = AnalyzeJob::new_running(job_id, path, force, started_at);
+    let job = AnalyzeJob::new_running_with_coverage(job_id, path, force, started_at, coverage);
     if let Some(prev) = slot.current.take() {
         archive_terminal(slot, Arc::clone(&prev));
         slot.previous_terminal = Some(prev);
@@ -827,9 +936,14 @@ fn install_new_running(slot: &mut AnalyzeSlot, path: String, force: bool) -> Arc
 }
 
 /// Install an admitted queued job. Caller holds the slot write guard.
-fn install_new_queued(slot: &mut AnalyzeSlot, path: String, force: bool) -> Arc<AnalyzeJob> {
+fn install_new_queued(
+    slot: &mut AnalyzeSlot,
+    path: String,
+    force: bool,
+    coverage: Option<CoverageIdentity>,
+) -> Arc<AnalyzeJob> {
     let (job_id, started_at) = issue_job_id(slot);
-    AnalyzeJob::new_queued(job_id, path, force, started_at)
+    AnalyzeJob::new_queued_with_coverage(job_id, path, force, started_at, coverage)
 }
 
 fn issue_job_id(slot: &mut AnalyzeSlot) -> (String, u64) {
@@ -1011,6 +1125,365 @@ fn debug_write_before_index_lock_marker(path: &std::path::Path) {
     }
 }
 
+#[cfg(test)]
+mod coalesce {
+    use super::*;
+    use code_graph_core::paths;
+    use code_graph_lang::LanguageRegistry;
+
+    fn server() -> crate::server::CodeGraphServer {
+        crate::server::CodeGraphServer::new(LanguageRegistry::new())
+    }
+
+    fn job(id: &str, path: &std::path::Path, force: bool, queued: bool) -> Arc<AnalyzeJob> {
+        let coverage = coverage_identity(&path.display().to_string());
+        if queued {
+            AnalyzeJob::new_queued_with_coverage(
+                id.into(),
+                path.display().to_string(),
+                force,
+                0,
+                coverage,
+            )
+        } else {
+            AnalyzeJob::new_running_with_coverage(
+                id.into(),
+                path.display().to_string(),
+                force,
+                0,
+                coverage,
+            )
+        }
+    }
+
+    fn pending(inner: &ServerInner, job: Arc<AnalyzeJob>) -> PendingAnalyze {
+        PendingAnalyze {
+            job,
+            analyze_guard: inner.persist.begin_analyze().unwrap(),
+            sink: Arc::new(NoopProgressSink),
+        }
+    }
+
+    #[test]
+    fn running_coverer_reuses_arc_without_pending_growth() {
+        let root = tempfile::TempDir::new().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        let server = server();
+        let coverer = job("current", root.path(), false, false);
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(Arc::clone(&coverer));
+
+        let admitted = admit_job(
+            &server.inner,
+            &mut slot,
+            child.display().to_string(),
+            false,
+            coverage_identity(&child.display().to_string()),
+        )
+        .unwrap();
+        assert!(
+            matches!(admitted, Admission::Covered { ref job, status: "running" } if Arc::ptr_eq(job, &coverer))
+        );
+        assert!(slot.pending.is_empty());
+        assert_eq!(
+            slot.next_job_id, 0,
+            "covered requests do not issue a new job"
+        );
+    }
+
+    #[test]
+    fn pending_coverer_including_non_head_reuses_arc_without_queue_growth() {
+        let root = tempfile::TempDir::new().unwrap();
+        let child = root.path().join("child");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        let server = server();
+        let current = job("current", &other, false, false);
+        let first = job("first", &other, false, true);
+        let coverer = job("coverer", root.path(), false, true);
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(current);
+        slot.pending.push_back(pending(&server.inner, first));
+        slot.pending
+            .push_back(pending(&server.inner, Arc::clone(&coverer)));
+
+        let admitted = admit_job(
+            &server.inner,
+            &mut slot,
+            child.display().to_string(),
+            false,
+            coverage_identity(&child.display().to_string()),
+        )
+        .unwrap();
+        assert!(
+            matches!(admitted, Admission::Covered { ref job, status: "queued" } if Arc::ptr_eq(job, &coverer))
+        );
+        assert_eq!(slot.pending.len(), 2);
+        assert_eq!(slot.pending[0].job.job_id, "first");
+        assert_eq!(slot.pending[1].job.job_id, "coverer");
+    }
+
+    #[test]
+    fn reverse_containment_and_disjoint_requests_do_not_coalesce() {
+        let root = tempfile::TempDir::new().unwrap();
+        let child = root.path().join("child");
+        let disjoint = root.path().join("disjoint");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&disjoint).unwrap();
+        let first_server = server();
+        {
+            let mut slot = first_server.inner.analyze_slot.write();
+            slot.current = Some(job("current", &child, false, false));
+            let raw = root.path().display().to_string();
+            assert!(matches!(
+                admit_job(
+                    &first_server.inner,
+                    &mut slot,
+                    raw.clone(),
+                    false,
+                    coverage_identity(&raw)
+                )
+                .unwrap(),
+                Admission::Queued { .. }
+            ));
+        }
+
+        let server = server();
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(job("current", &child, false, false));
+        {
+            let path = disjoint.as_path();
+            let raw = path.display().to_string();
+            assert!(matches!(
+                admit_job(
+                    &server.inner,
+                    &mut slot,
+                    raw.clone(),
+                    false,
+                    coverage_identity(&raw)
+                )
+                .unwrap(),
+                Admission::Queued { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_current_is_excluded_from_coalescing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let server = server();
+        let terminal = job("terminal", root.path(), false, false);
+        finish_failed(&terminal, "done".into());
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(Arc::clone(&terminal));
+        let raw = root.path().display().to_string();
+
+        let admitted = admit_job(
+            &server.inner,
+            &mut slot,
+            raw.clone(),
+            false,
+            coverage_identity(&raw),
+        )
+        .unwrap();
+        assert!(
+            matches!(admitted, Admission::Running { ref job, .. } if !Arc::ptr_eq(job, &terminal))
+        );
+    }
+
+    #[test]
+    fn invalid_paths_do_not_coalesce() {
+        let root = tempfile::TempDir::new().unwrap();
+        let missing = root.path().join("missing");
+        let server = server();
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(job("current", root.path(), false, false));
+        let raw = missing.display().to_string();
+        assert!(coverage_identity(&raw).is_none());
+        assert!(matches!(
+            admit_job(&server.inner, &mut slot, raw, false, None).unwrap(),
+            Admission::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_config_request_is_queued_instead_of_coalescing_with_parent() {
+        let root = tempfile::TempDir::new().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        std::fs::write(child.join(".code-graph.toml"), "").unwrap();
+        let server = server();
+        let parent = job("parent", root.path(), false, false);
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(Arc::clone(&parent));
+
+        let admitted = admit_job(
+            &server.inner,
+            &mut slot,
+            child.display().to_string(),
+            false,
+            coverage_identity(&child.display().to_string()),
+        )
+        .unwrap();
+        assert!(
+            matches!(admitted, Admission::Queued { ref job, .. } if !Arc::ptr_eq(job, &parent)),
+            "a child config shadows the parent project and must receive its own queued job"
+        );
+    }
+
+    #[test]
+    fn malformed_child_config_does_not_coalesce_with_parent() {
+        let root = tempfile::TempDir::new().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        std::fs::write(
+            child.join(".code-graph.toml"),
+            "[response]\nmax_bytes = 0\n",
+        )
+        .unwrap();
+        let server = server();
+        let parent = job("parent", root.path(), false, false);
+        let mut slot = server.inner.analyze_slot.write();
+        slot.current = Some(Arc::clone(&parent));
+        let child_raw = child.display().to_string();
+
+        assert!(
+            coverage_identity(&child_raw).is_none(),
+            "invalid child config must not produce a coalescing identity"
+        );
+        assert!(matches!(
+            admit_job(&server.inner, &mut slot, child_raw, false, None).unwrap(),
+            Admission::Queued { .. }
+        ));
+    }
+
+    /// A queued symlink request captures its target at admission. Retargeting
+    /// the link before promotion must neither change the work it performs nor
+    /// make a later request for the original target coalesce with work on the
+    /// new target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_symlink_executes_its_admission_target_after_retarget() {
+        use code_graph_lang_cpp::CppParser;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let target_a = root.path().join("target-a");
+        let target_b = root.path().join("target-b");
+        let link = root.path().join("queued-link");
+        let blocker = root.path().join("blocker");
+        std::fs::create_dir(&target_a).unwrap();
+        std::fs::create_dir(&target_b).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(target_a.join("a.cpp"), b"void from_a() {}\n").unwrap();
+        std::fs::write(target_b.join("b.cpp"), b"void from_b() {}\n").unwrap();
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().unwrap()))
+            .unwrap();
+        let server = crate::server::CodeGraphServer::new(registry);
+        let inner = Arc::clone(&server.inner);
+        let raw_link = link.to_string_lossy().into_owned();
+        let admitted_target = coverage_identity(&raw_link).unwrap();
+        let target_a_identity = paths::canonicalize(&target_a).unwrap();
+        assert_eq!(admitted_target.invocation_path, target_a_identity);
+
+        let (blocker_job, queued) = {
+            let mut slot = inner.analyze_slot.write();
+            // A non-covering current job is enough to make the symlink job
+            // queue; the test drives that queued job directly below.
+            let blocker_job = AnalyzeJob::new_running(
+                "blocker".into(),
+                blocker.to_string_lossy().into_owned(),
+                false,
+                0,
+            );
+            slot.current = Some(Arc::clone(&blocker_job));
+            let admission =
+                admit_job(&inner, &mut slot, raw_link, false, Some(admitted_target)).unwrap();
+            let Admission::Queued { job, analyze_guard } = admission else {
+                panic!("symlink request must queue behind the current job");
+            };
+            slot.pending.push_back(PendingAnalyze {
+                job: Arc::clone(&job),
+                analyze_guard,
+                sink: Arc::new(NoopProgressSink),
+            });
+            (blocker_job, job)
+        };
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+
+        // A later request for A still coalesces with the queued job. This
+        // proves the coverer's stable identity is A, not the retargeted link.
+        {
+            let mut slot = inner.analyze_slot.write();
+            let admission = admit_job(
+                &inner,
+                &mut slot,
+                target_a.to_string_lossy().into_owned(),
+                false,
+                coverage_identity(&target_a.to_string_lossy()),
+            )
+            .unwrap();
+            assert!(
+                matches!(admission, Admission::Covered { ref job, status: "queued" } if Arc::ptr_eq(job, &queued))
+            );
+        }
+
+        finish_completed(
+            &blocker_job,
+            AnalyzeResult {
+                files: 0,
+                symbols: 0,
+                edges: 0,
+                root_path: blocker.to_string_lossy().into_owned(),
+                warnings: Vec::new(),
+            },
+        );
+        let successor = promote_pending(&inner, &blocker_job)
+            .expect("the queued symlink job must be promoted after the blocker completes");
+        assert!(Arc::ptr_eq(&successor.job, &queued));
+        run_analyze_job(
+            Arc::clone(&inner),
+            Arc::clone(&successor.job),
+            Arc::new(NoopProgressSink),
+        )
+        .await;
+        drop(successor.analyze_guard);
+
+        let state = queued.state.read();
+        let JobStatus::Completed(result) = &state.status else {
+            panic!("queued job must complete against its admission target");
+        };
+        assert_eq!(result.root_path, target_a_identity.to_string_lossy());
+        drop(state);
+
+        let a_source = paths::canonicalize(&target_a.join("a.cpp")).unwrap();
+        let b_source = paths::canonicalize(&target_b.join("b.cpp")).unwrap();
+        let graph = inner.graph.read();
+        assert!(
+            graph
+                .file_symbols(&a_source)
+                .iter()
+                .any(|symbol| symbol.name == "from_a"),
+            "the coalesced queued job must index target A"
+        );
+        assert!(
+            graph.file_symbols(&b_source).is_empty(),
+            "the retargeted symlink target B must not be indexed"
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1054,7 +1527,9 @@ mod tests {
         use code_graph_lang_cpp::CppParser;
 
         let root = tempfile::TempDir::new().unwrap();
+        let successor_root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("a.cpp"), b"void f() {}\n").unwrap();
+        std::fs::write(successor_root.path().join("b.cpp"), b"void g() {}\n").unwrap();
         let mut registry = code_graph_lang::LanguageRegistry::new();
         registry
             .register(Box::new(CppParser::new().unwrap()))
@@ -1081,9 +1556,13 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        let successor = analyze_codebase_async(Arc::clone(&inner), path, false)
-            .await
-            .unwrap();
+        let successor = analyze_codebase_async(
+            Arc::clone(&inner),
+            successor_root.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await
+        .unwrap();
         let ToolOk::Value(successor) = successor else {
             panic!("async kickoff must return a response")
         };
@@ -1227,6 +1706,71 @@ mod tests {
             !code_graph_graph::cache_path(&relocated).exists(),
             "replacement symbols must not be persisted into the retained root"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    /// Admission must reject a substituted daemon root before coverage
+    /// canonicalization can reuse a live job for the replacement pathname.
+    #[tokio::test]
+    async fn replaced_daemon_root_is_rejected_before_coverage_coalescing() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-analyze-coverage-replaced-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let server = crate::server::CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let coverage = coverage_identity(&root.to_string_lossy()).unwrap();
+        let coverer = AnalyzeJob::new_running_with_coverage(
+            "coverer".into(),
+            root.to_string_lossy().into_owned(),
+            false,
+            0,
+            Some(coverage),
+        );
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&coverer));
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement.cpp"), b"void replacement() {}\n").unwrap();
+
+        let path = root.to_string_lossy().into_owned();
+        let sync = analyze_codebase(
+            Arc::clone(&server.inner),
+            path.clone(),
+            false,
+            Arc::new(NoopProgressSink),
+        )
+        .await;
+        assert!(
+            matches!(&sync, Err(ToolError(message)) if message.contains("project root was replaced")),
+            "sync admission must reject before it can wait on the would-be coverer"
+        );
+
+        let asynchronous = analyze_codebase_async(Arc::clone(&server.inner), path, false).await;
+        assert!(
+            matches!(&asynchronous, Err(ToolError(message)) if message.contains("project root was replaced")),
+            "async admission must reject before it can return the would-be coverer"
+        );
+        let slot = server.inner.analyze_slot.read();
+        assert!(
+            Arc::ptr_eq(slot.current.as_ref().unwrap(), &coverer),
+            "rejected requests must not inspect coverage to replace or enqueue work"
+        );
+        assert!(slot.pending.is_empty());
+        assert_eq!(slot.next_job_id, 0);
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(relocated).unwrap();
