@@ -788,7 +788,7 @@ The governing Linux MVP boundary is the spec's cross-UID local-user exclusion. P
 - Focused review: `git diff 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
 - Reviewed candidate / final: `diff: 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
 - Review result: PASS/Aligned
-- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-2b60b18.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
+- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-dfc3884.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
 
 | Command | Working directory | Result | Observable evidence |
 |---|---|---|---|
