@@ -443,9 +443,9 @@ impl Graph {
             // makes it into the top-N heap. The exact total is what the
             // pagination envelope's `total` field surfaces.
             total = total.saturating_add(1);
-            if cap == 0 {
-                continue;
-            }
+            // `cap` is never 0 here: `limit` is normalized 0 -> default before
+            // this loop, and the `count_only` path returned earlier.
+            debug_assert_ne!(cap, 0);
             let id = symbol_id(s);
             if top.len() < cap {
                 top.push(TopEntry { id, sym: s });

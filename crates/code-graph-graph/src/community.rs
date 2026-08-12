@@ -365,7 +365,7 @@ fn detect_degeneracy(node_count: u32, communities: &[FileCommunity]) -> Option<D
         }
     }
 
-    if node_count > 1 && communities.len() as u32 == node_count {
+    if communities.len() as u32 == node_count {
         return Some(Degeneracy::Atomized);
     }
 
