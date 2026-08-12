@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-10
+updated: 2026-08-12
 tags: [decisions]
 related: []
 decisions:
@@ -136,6 +136,23 @@ decisions:
       - Designs/RepoLocalDaemon
       - Designs/VcsHistory
     tags: [validation, implementation, legacy-artifacts, workflow]
+    reversibility: two-way
+  - id: D-0009
+    kind: answered-question
+    status: accepted
+    date: 2026-08-12
+    decided_by: user
+    statement: "Generic long-running jobs are exposed additively in get_status through job, job_previous_terminal, job_pending_count, and job_pending_ids, while the existing analyze_job fields remain analyze-only compatibility projections."
+    question: "How should get_status expose detect_communities_async jobs without changing the meaning of the existing analyze_job fields?"
+    rejected:
+      - "Overloading analyze_job fields to report non-analyze query jobs"
+      - "Keeping query jobs invisible from get_status"
+    rationale: "A shared FIFO and polling vocabulary should be observable without making existing clients interpret a community query as an analysis. Additive generic fields expose the actual global job slot, while analyze-only projections preserve the established contract."
+    confirmation: "get_status snapshots contain both generic job fields and unchanged analyze_job projections; a running community job appears in job but not analyze_job."
+    scope:
+      - Plans/GraphPlatformExpansion
+      - Designs/RepoLocalDaemon
+    tags: [jobs, status, wire-contract, detect-communities, compatibility]
     reversibility: two-way
 ---
 

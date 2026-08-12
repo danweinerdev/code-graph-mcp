@@ -27,7 +27,7 @@ tasks:
     depends_on: ["4.2"]
   - id: "4.4"
     title: "Generalize the job slot to long-running queries and add detect_communities_async"
-    status: planned
+    status: complete
     justifies: "FR-49, AC-58, review follow-up FU-01. detect_communities runs whole-graph label propagation while holding the read lock, and the client tool timeout is wall-clock — spawn_blocking does not extend it, so at UE4 scale the server can finish and the caller still see a timeout with no way to recover the result. Landing it here reuses the slot being reshaped by 4.1 rather than touching AnalyzeSlot and AnalyzeJobView a second time."
     verification: "cargo test -p code-graph-tools job:: — a whole-graph query started asynchronously returns a job id sub-second and reports progress; get_status exposes it under the same polling vocabulary as an analyze job; the terminal result is retrievable and byte-identical to the synchronous response; every individual call is short enough that a wall-clock timeout cannot fire; the synchronous detect_communities still works unchanged for small graphs."
     depends_on: ["4.1"]
@@ -166,12 +166,12 @@ Letting sync `analyze_codebase` block behind the queue because "that's what a qu
 ## 4.4: Generalize the job slot to long-running queries and add detect_communities_async
 
 ### Subtasks
-- [ ] Widen the job slot from analyze-specific to a job kind that covers long-running queries
-- [ ] Keep `analyze_job` in `get_status` reporting analyze jobs, so no existing client breaks
-- [ ] Add an async form of `detect_communities` on that machinery
-- [ ] Ensure the async result is byte-identical to the synchronous response for the same inputs
-- [ ] Leave synchronous `detect_communities` working unchanged — it is the right call on a small graph
-- [ ] Document both forms and when to reach for each (NFR-11)
+- [x] Widen the job slot from analyze-specific to a job kind that covers long-running queries
+- [x] Keep `analyze_job` in `get_status` reporting analyze jobs, so no existing client breaks
+- [x] Add an async form of `detect_communities` on that machinery
+- [x] Ensure the async result is byte-identical to the synchronous response for the same inputs
+- [x] Leave synchronous `detect_communities` working unchanged — it is the right call on a small graph
+- [x] Document both forms and when to reach for each (NFR-11)
 
 ### Notes
 Revision boundary: any whole-graph query can run as a job, and `detect_communities` uses it.
@@ -180,9 +180,29 @@ This arrives from phase 1's review as FU-01. The measured cost is 177 ms on 841 
 
 Generalize rather than special-case. A second job mechanism beside the analyze one means two vocabularies for the same concept and two things to keep in sync.
 
+`get_status` exposes the generalized slot through additive `job`, `job_previous_terminal`, `job_pending_count`, and `job_pending_ids` fields. Existing `analyze_job*` fields remain analyze-only compatibility projections (D-0009).
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-12
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`
+- Identity recheck: `git rev-parse HEAD && git show --quiet --format=%H 8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`, 2026-08-12T16:53:17-07:00; both matched `8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`
+- Focused review: `git show 8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | 498 library/integration tests passed with one timing benchmark ignored; async community result equality, progress, mixed FIFO, panic promotion, retention, and compatibility projections passed. |
+| `cargo test -p code-graph-mcp` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Binary, daemon, proxy, serve, and 24-tool smoke tests passed. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make plugin-sync-check && make snapshot-clean && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting, deny-warnings lint, plugin mirrors, snapshots, and whitespace were clean. |
+| `make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace gate passed after isolated confirmation of the known flaky daemon idle-future test. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused intent-blind quality review | Complete task 4.4 diff | PASS | Generic job compatibility, D-0009 projections, mixed-kind lifecycle, result identity, progress, descriptions, and task boundary were aligned. |
 
 ### Trap
 Reaching for `spawn_blocking` and considering it solved. It moves the work off the async worker and does nothing about the client's wall-clock timeout, which is the actual failure. Only a return-immediately-and-poll shape fixes that.
