@@ -783,12 +783,12 @@ The governing Linux MVP boundary is the spec's cross-UID local-user exclusion. P
 - Verified: 2026-08-11
 - Repository: `/home/daniel/Development/Code/code-graph-mcp`
 - VCS: `git`
-- Revision / checkpoint: `2b60b18789dcd1d92641f1eff2d26cb817504b41`
-- Identity recheck: `git rev-parse 2b60b18789dcd1d92641f1eff2d26cb817504b41` at 2026-08-12T00:30:07Z, matching `2b60b18789dcd1d92641f1eff2d26cb817504b41`
-- Focused review: `git diff 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
-- Reviewed candidate / final: `diff: 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
+- Revision / checkpoint: `ddc09b424263e99ca90ba7ee5d17e3447bc62924`
+- Identity recheck: `git rev-parse ddc09b4` at 2026-08-12T00:37:32Z, matching `ddc09b424263e99ca90ba7ee5d17e3447bc62924`
+- Focused review: `git diff 98ea430b69d733726b9f7f02aae93c48ac5c5336..ddc09b424263e99ca90ba7ee5d17e3447bc62924`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
+- Reviewed candidate / final: `diff: 98ea430b69d733726b9f7f02aae93c48ac5c5336..ddc09b424263e99ca90ba7ee5d17e3447bc62924`
 - Review result: PASS/Aligned
-- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-dfc3884.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
+- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-dfc3884.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..ddc09b424263e99ca90ba7ee5d17e3447bc62924`
 
 | Command | Working directory | Result | Observable evidence |
 |---|---|---|---|
