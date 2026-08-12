@@ -15,7 +15,7 @@ tasks:
     verification: "cargo test -p code-graph-tools analyze_job:: — an analyze issued while another is in flight is queued and eventually runs rather than returning 'indexing already in progress' (AC-50); get_status keeps analyze_job as the single running job and exposes pending count plus FIFO ids, while queued kickoff responses report status queued; get_job_status(job_id) retrieves queued, running, and retained terminal jobs so a fast FIFO cannot rotate an async caller's result out of reach; the head of pending is promoted on termination under the existing rotation; previous_terminal still preserves exactly one prior job."
   - id: "4.2"
     title: "Path-containment coverage rule with force asymmetry"
-    status: planned
+    status: complete
     justifies: "FR-42, AC-51. Containment alone is not sufficient — a forced request absorbed into a non-forcing one silently skips the invalidation the caller asked for, which surfaces only as 'force didn't work' long after the fact."
     verification: "cargo test -p code-graph-tools coalesce:: — exhaustive over the four cases: non-forcing nested under queued non-forcing coalesces; non-forcing nested under queued forcing coalesces; forcing nested under queued non-forcing does NOT coalesce and runs in its own right; disjoint paths never coalesce (AC-51). Also covers the reverse-containment direction where the new request is broader than a queued one."
     depends_on: ["4.1"]
@@ -86,10 +86,10 @@ Job-addressable lookup is the retrieval counterpart: pending IDs would otherwise
 ## 4.2: Path-containment coverage rule with force asymmetry
 
 ### Subtasks
-- [ ] Implement `covers(x, y)` as a pure function over `(path, force)` pairs
-- [ ] Run admission against the running job and every pending entry
-- [ ] Attach a coalesced request to its coverer rather than appending it
-- [ ] Exhaustive unit tests over the four force/containment cases plus disjoint and reverse-containment
+- [x] Implement `covers(x, y)` as a pure function over `(path, force)` pairs
+- [x] Run admission against the running job and every pending entry
+- [x] Attach a coalesced request to its coverer rather than appending it
+- [x] Exhaustive unit tests over the four force/containment cases plus disjoint and reverse-containment
 
 ### Notes
 Revision boundary: coalescing is live and correct; how a coalesced caller learns about it lands in 4.3.
@@ -98,7 +98,25 @@ The rule: **X covers Y when Y's path is at or under X's path, and (X forces or Y
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-12
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `6144a9fc640adb9786e32862f675cc753fd174e5`
+- Identity recheck: `git rev-parse HEAD && git show --quiet --format=%H 6144a9fc640adb9786e32862f675cc753fd174e5`, 2026-08-12T12:49:48-07:00; both matched `6144a9fc640adb9786e32862f675cc753fd174e5`
+- Focused review: `git show 6144a9fc640adb9786e32862f675cc753fd174e5`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `6144a9fc640adb9786e32862f675cc753fd174e5`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools coalesce` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Pure component-aware force matrix and admission-level running, pending, invalid-path, reverse-containment, project-boundary, symlink-retarget, and daemon-root coalescing regressions passed. |
+| `cargo test -p code-graph-tools --lib && cargo test -p code-graph-tools --test integration && cargo test -p code-graph-tools --test analyze_async_lifecycle` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Library queue/promotion/cancellation coverage, handler integration, and async kickoff-poll-query lifecycle passed. |
+| `make fmt-check && make lint && make snapshot-clean && make plugin-sync-check && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting, deny-warnings clippy, snapshot hygiene, generated plugin parity, and whitespace checks passed. |
+| `make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace structural gate passed on the final reviewed implementation. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused intent-blind quality review | Complete task 4.2 implementation diff | PASS | Coverage and force semantics, canonical execution identity, nested project boundaries, daemon lifecycle checks, guard ownership, FIFO regressions, async reporting, and task boundary were judged correct and bisectable. |
 
 ### Trap
 Implementing coverage as path containment alone. It reads as obviously correct and passes any test that does not vary the force flag. The failure it produces — a forced re-index silently absorbed into a plain one, so stale entries survive — appears much later and looks like a cache bug, not a queue bug.

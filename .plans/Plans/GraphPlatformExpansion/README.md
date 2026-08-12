@@ -91,7 +91,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
 | 3 Daemon Foundation | implementation complete, phase `in-progress` | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and fully gated by two consecutive `make verify` runs. The remaining gate is a fresh frozen four-lane phase review. Native platform completion remains deferred to phases 10/11. |
-| 4 Analyze Queue | task 4.1 complete; phase `in-progress` | FIFO queued analyze admission, promotion, supervision, pending visibility, and job-addressable retrieval shipped in `6b5302e`; coalescing, reporting evolution, and whole-graph query jobs follow in tasks 4.2–4.4. |
+| 4 Analyze Queue | tasks 4.1–4.2 complete; phase `in-progress` | FIFO queueing shipped in `6b5302e`; project-aware path-containment coalescing with force asymmetry shipped in `6144a9f`. Reporting evolution and whole-graph query jobs follow in tasks 4.3–4.4. |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
 | 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
