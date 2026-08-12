@@ -2,7 +2,7 @@
 //! query pipelines.
 //!
 //! These tests focus on observable behavior at the handler boundary:
-//! - Concurrent analyze_codebase: second call gets the single-flight error.
+//! - Concurrent analyze_codebase calls are admitted and complete in FIFO order.
 //! - Bad-path errors: nonexistent / file-instead-of-dir / empty-string.
 //! - Cache lifecycle: hit on second call, force=true rebuild, stale-mtime
 //!   triggers re-parse.
@@ -128,13 +128,13 @@ async fn analyze_then_query_pipeline() {
     );
 }
 
-// -------- concurrent analyze single-flight ------------------------------
+// -------- concurrent analyze FIFO admission -----------------------------
 
 #[tokio::test]
-async fn concurrent_analyze_returns_indexing_in_progress() {
+async fn concurrent_analyze_requests_are_admitted_and_complete() {
     // Build two servers sharing the same `Arc<ServerInner>` so the
-    // index_lock is the actual shared lock under test. (Two distinct
-    // servers would each hold their own lock and the test would race
+    // analyze slot is the actual shared admission state under test. (Two
+    // distinct servers would each hold their own slot and the test would race
     // its way to a passing pair of Ok results.)
     let dir = TempDir::new().unwrap();
     copy_testdata(dir.path());
@@ -150,34 +150,18 @@ async fn concurrent_analyze_returns_indexing_in_progress() {
     let inner_b = inner.clone();
     let path_b = path.clone();
 
-    // Drive both calls concurrently. The handler holds index_lock across
-    // its full async path, so whichever call grabs the lock first
-    // succeeds; the other immediately errors.
+    // Drive both calls concurrently. The slot admits both; the second waits
+    // for FIFO promotion rather than failing on worker contention.
     let (a, b) = tokio::join!(
         async move { analyze_codebase(inner_a, path_a, true, None, None).await },
         async move { analyze_codebase(inner_b, path_b, true, None, None).await }
     );
 
-    let a_err = a.is_error == Some(true);
-    let b_err = b.is_error == Some(true);
-    let errored = if a_err { &a } else { &b };
-    let succeeded = if a_err { &b } else { &a };
-
-    // Exactly one error and one success. A reverse outcome (both Ok or
-    // both errors) means the single-flight gate failed.
-    assert!(
-        a_err ^ b_err,
-        "exactly one call must error; got a_err={a_err} b_err={b_err}",
-    );
-
-    // The error must carry the single-flight wording byte-for-byte.
-    let body = first_text(errored);
-    assert_eq!(body, "indexing already in progress", "got: {body}");
-
-    // The successful call returns a populated AnalyzeResult.
-    let body = first_text(succeeded);
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(parsed["files"].as_u64().unwrap() > 0);
+    for response in [&a, &b] {
+        assert!(response.is_error.is_none() || response.is_error == Some(false));
+        let parsed: serde_json::Value = serde_json::from_str(&first_text(response)).unwrap();
+        assert!(parsed["files"].as_u64().unwrap() > 0);
+    }
 }
 
 // -------- bad-path errors ------------------------------------------------

@@ -99,6 +99,11 @@ pub struct StatusResult {
     /// once a second analyze terminates and rotates the slot. Same
     /// explicit-`null` serialization rule as `analyze_job`.
     pub analyze_job_previous_terminal: Option<AnalyzeJobView>,
+    /// Number of FIFO-admitted jobs waiting behind `analyze_job`. Pending
+    /// jobs are represented by IDs only in this phase.
+    pub analyze_job_pending_count: u32,
+    /// Pending job IDs in FIFO promotion order.
+    pub analyze_job_pending_ids: Vec<String>,
 }
 
 /// Wire shape for one `AnalyzeJob` in a `get_status` response.
@@ -107,16 +112,16 @@ pub struct StatusResult {
 /// its associated payload (`error` for Failed, `result` for Completed)
 /// are mutually consistent — see [`AnalyzeJobView::from_job`].
 ///
-/// `status` serializes as the lowercase string `"running"`,
+/// `status` serializes as the lowercase string `"running"`, `"queued"`,
 /// `"completed"`, or `"failed"` — NOT the enum tag. `error` is
 /// populated ONLY when `status == "failed"`; `result` is populated
 /// ONLY when `status == "completed"`. The two never co-occur.
 #[derive(Debug, Serialize)]
 pub struct AnalyzeJobView {
-    /// 20-char zero-padded decimal nanosecond timestamp from
-    /// kickoff. Unique-by-construction under single-flight.
+    /// 20-char zero-padded decimal identifier, issued uniquely even when
+    /// several jobs are admitted within the same clock tick.
     pub job_id: String,
-    /// `"running"` | `"completed"` | `"failed"`.
+    /// `"running"` | `"queued"` | `"completed"` | `"failed"`.
     pub status: String,
     /// User-supplied path that was indexed (as passed to the
     /// originating `analyze_codebase` / `analyze_codebase_async`).
@@ -126,7 +131,7 @@ pub struct AnalyzeJobView {
     /// RFC3339 UTC timestamp of kickoff.
     pub started_at: String,
     /// RFC3339 UTC timestamp of terminal transition; `null` while
-    /// `status == "running"`.
+    /// `status` is `"running"` or `"queued"`.
     pub finished_at: Option<String>,
     /// Files processed in the current phase. Monotonic non-decreasing
     /// **within a phase**; resets when the worker crosses a phase
@@ -171,6 +176,7 @@ impl AnalyzeJobView {
         let state = job.state.read();
         let (status, error, result) = match &state.status {
             JobStatus::Running => ("running".to_string(), None, None),
+            JobStatus::Queued => ("queued".to_string(), None, None),
             JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
             JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
         };
@@ -195,6 +201,11 @@ impl AnalyzeJobView {
 /// wrapper only converts the typed result to the rmcp wire type.
 pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::status::get_status(inner))
+}
+
+/// `get_job_status` adapter. The typed core owns lookup and error wording.
+pub fn get_job_status(inner: Arc<ServerInner>, job_id: String) -> CallToolResult {
+    crate::core::to_call_tool_result(crate::core::status::get_job_status(inner, job_id))
 }
 
 /// Format `nanos` since UNIX_EPOCH as an RFC3339 UTC string of the

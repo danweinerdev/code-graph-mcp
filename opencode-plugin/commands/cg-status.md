@@ -5,9 +5,9 @@ description: Diagnose the code-graph MCP server — indexed root, graph stats, c
 
 # cg-status — is code-graph healthy and current?
 
-Call `get_status()` and interpret it. Use this when a code-graph tool returns something
-surprising, when an async analyze is in flight, or before trusting a query on a repo you have
-been editing.
+Call `get_status()` for the server/current-FIFO diagnostic. For an async analyze, retain its
+`job_id` and call `get_job_status(job_id)` as the primary queued/running/terminal poll and result
+retrieval endpoint.
 
 ## What to check, in order
 
@@ -19,20 +19,22 @@ been editing.
    which for a C++ engine tree means macro-prefixed classes silently did not extract.
 4. **Last analyze timestamp + force flag.** Older than your edits, and with no watcher running,
    the graph is stale.
-5. **`analyze_job`** — present once any analyze has ever run:
-   - `status: "running"` → report `progress` / `progress_total` / `progress_message` and poll
-     again. `progress` is monotonic **within a phase** and resets at each phase boundary
-     (parse → resolve → merge); phase identity rides on `progress_message`, so do not report a
-     reset as a regression.
-   - `status: "completed"` → `result` holds the analyze body (`files`, `symbols`, `edges`,
-     `root_path`, `warnings`), shape-identical to sync `analyze_codebase`.
-   - `status: "failed"` → `error` holds why.
-   - `error` and `result` are mutually exclusive and both `null` while running.
-6. **`analyze_job_previous_terminal`** — the prior job, preserved across exactly one further
-   kickoff. Two analyses back-to-back without reading the first lose the oldest.
+5. **Per-job async lifecycle.** Call `get_job_status(job_id)`:
+    - `status: "queued"` or `"running"` → report `progress` / `progress_total` /
+      `progress_message` and poll again. Progress is monotonic **within a phase** and resets at
+      phase boundaries.
+    - `status: "completed"` → `result` holds the analyze body (`files`, `symbols`, `edges`,
+      `root_path`, `warnings`), shape-identical to sync `analyze_codebase`.
+    - `status: "failed"` → `error` holds why. `error` and `result` are mutually exclusive.
+    - Displaced terminal jobs remain retrievable by ID for a bounded 32-job history; an unknown
+      or expired ID is a tool error.
+6. **FIFO diagnostic.** `get_status.analyze_job` is only the single current job;
+    `analyze_job_pending_count` and `analyze_job_pending_ids` show queued jobs in promotion
+    order. `analyze_job_previous_terminal` is the prior terminal job preserved across one
+    rotation for compatibility.
 
-Both job fields serialize as explicit `null` when absent, so a `null` means "no analyze yet",
-while a missing field means an older server.
+The two `get_status` job-view fields serialize as explicit `null` when absent, so a `null` means
+"no analyze yet", while a missing field means an older server.
 
 ## Diagnostic: analyze "failed" but the server looks fine
 

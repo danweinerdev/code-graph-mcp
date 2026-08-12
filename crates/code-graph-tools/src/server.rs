@@ -387,8 +387,8 @@ impl Drop for WatchCleanupGuard {
 ///   for the duration of the query and serialize the response.
 /// - [`Self::index_lock`] uses `tokio::sync::Mutex` because
 ///   `analyze_codebase` is async and the lock guard must cross await
-///   points. `try_lock` returns "indexing already in progress" matching
-///   Go behavior.
+///   points. It serializes workers and watch reindexing; the analyze slot
+///   admits competing analyze requests into its FIFO queue.
 /// - [`Self::indexed`] is an `AtomicBool` so [`CodeGraphServer::require_indexed`]
 ///   can check the flag with no lock acquisition.
 pub struct ServerInner {
@@ -399,9 +399,7 @@ pub struct ServerInner {
     /// `true` after at least one successful `analyze_codebase`. Read by
     /// [`CodeGraphServer::require_indexed`] without taking a lock.
     pub indexed: AtomicBool,
-    /// Single-flight guard for `analyze_codebase`. `try_lock` returns
-    /// "indexing already in progress" identical to the Go behavior; the
-    /// watch loop's `reindex_file` also acquires this lock to
+    /// Serializes active analyze workers and the watch loop's `reindex_file` to
     /// close the analyze-vs-watch merge race the Go implementation has.
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
@@ -445,14 +443,13 @@ pub struct ServerInner {
     /// Admission gate for cache writes during graceful daemon replacement.
     /// Direct-mode servers never close it, preserving their existing behavior.
     pub persist: Arc<PersistCoordinator>,
-    /// Single-flight slot for analyze jobs (sync + async). Holds at
-    /// most one `Running` job plus the previous terminal job for the
-    /// grace-window read pattern. Read by 1.2's worker (next commit).
+    /// FIFO slot for analyze jobs (sync + async): one current job, admitted
+    /// pending jobs, and the previous terminal grace-window entry.
     #[allow(dead_code)]
     pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
-/// MCP server exposing the code graph through 22 tools.
+/// MCP server exposing the code graph through 23 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -730,6 +727,12 @@ pub struct AnalyzeCodebaseAsyncArgs {
     #[schemars(description = "Force full re-index, ignoring any cache (default false)")]
     #[serde(default)]
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetJobStatusArgs {
+    #[schemars(description = "Required analyze job identifier returned by analyze_codebase_async")]
+    pub job_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1197,49 +1200,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Kick off `analyze_codebase` on a background task and return \
-                       immediately (< 1KB, sub-second) with a job handle. The indexing \
-                       pipeline runs detached on the tokio runtime; agents observe \
-                       progress and the terminal result by polling `get_status`. \
-                       Prefer this over the sync `analyze_codebase` for large \
-                       codebases (UE / LLVM-scale, ~130-200s wall time) or any case \
-                       where the client's `MCP_TOOL_TIMEOUT` could fire on a long \
-                       sync call — every individual tool call is sub-second, so the \
-                       per-call timer never fires. Args: `path` (required, absolute \
-                       path to index — same wording as `analyze_codebase`), `force` \
-                       (optional, default false — full re-index ignoring the cache). \
-                       Response shape: \
-                       `{ job_id, status, started_at, existing, note }`. `job_id` is \
-                       a 20-char zero-padded nanosecond timestamp unique-by-construction \
-                       under single-flight; `status` is always the literal \
-                       `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
-                       `existing` is the duplicate-call discriminator (see below); \
-                       `note` is a short human-readable hint. **Polling pattern:** \
-                       call `get_status` and read the `analyze_job` field. Poll \
-                       while `analyze_job.status == \"running\"`; once it flips to \
-                       `\"completed\"` read `analyze_job.result` (byte-identical \
-                       shape to `analyze_codebase`'s success body — `{ files, \
-                       symbols, edges, root_path, warnings }`); on `\"failed\"` \
-                       read `analyze_job.error`. A poll cadence of 250-1000ms is \
-                       a reasonable starting point — the slot and inner state \
-                       locks are held only for `Arc::clone` and a small struct \
-                       read on each poll, so polling does not contend with the \
-                       worker meaningfully. **Grace window:** after a job \
-                       terminates its result is preserved in \
-                       `analyze_job_previous_terminal` for exactly ONE additional \
-                       kickoff — if you start a new analyze before reading the \
-                       prior terminal, the prior result is still recoverable for \
-                       that one rotation, after which it is gone. **Duplicate \
-                       kickoff (`existing: true`):** if a job is already in \
-                       flight when this is called, the response returns that \
-                       job's `job_id` and `started_at` with `existing: true` \
-                       (NOT a new job_id; NOT an error). Args of the duplicate \
-                       call — including `path` and `force` — are IGNORED; if \
-                       `force` is required, wait for the in-flight job to \
-                       terminate (poll `get_status`) and call again. Sync \
-                       `analyze_codebase` called against a `Running` slot \
-                       continues to error with `\"indexing already in progress\"` \
-                       — only async kickoff returns the duplicate-as-success."
+        description = "Kick off `analyze_codebase` on a background task and return immediately (< 1KB, sub-second) with `{ job_id, status, started_at, existing, note }`. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze; every request is admitted distinctly and `existing` is false. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is byte-identical to `analyze_codebase`'s success body and terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire."
     )]
     async fn analyze_codebase_async(
         &self,
@@ -2242,7 +2203,7 @@ impl CodeGraphServer {
                        actually running before debugging behaviour, and to confirm config discovery picked \
                        up the toml you expected. \
                        \
-                       When an analyze is in flight or recently terminated, `analyze_job` carries \
+                        When an analyze is in flight or recently terminated, `analyze_job` carries \
                        `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
                        progress_message, error?, result?, current_phase }`. \
                        `current_phase` names the indexing phase the worker is currently in: \
@@ -2259,14 +2220,14 @@ impl CodeGraphServer {
                        historical value on terminal jobs (the phase that was active when the worker \
                        reached terminal); for terminal liveness use `status` not `current_phase`. \
                        Emits explicit `null` until the worker enters its first phase. \
-                       Poll this tool while `analyze_job.status == \
-                       \"running\"` (a 250-1000ms cadence is reasonable — poll locks are constant-time); \
-                       read `analyze_job.result` once `status` flips to `\"completed\"` (shape: \
-                       `{ files, symbols, edges, root_path, warnings }`, byte-identical to \
-                       `analyze_codebase`'s success body), or `analyze_job.error` on `\"failed\"`. If \
-                       you've kicked off a new analyze before reading the previous terminal, \
-                       `analyze_job_previous_terminal` carries the prior terminal job for exactly one \
-                       grace-window kickoff (gone after the next rotation). Both fields are `null` \
+                        `analyze_job` remains the single current/running job; FIFO-admitted \
+                        waiting jobs are exposed only by `analyze_job_pending_count` and \
+                        `analyze_job_pending_ids` (in promotion order). A queued job's kickoff \
+                        response reports `status: \"queued\"`; queued jobs do not have full views \
+                         in this response. Use `get_job_status(job_id)` as the primary per-job \
+                         polling/retrieval endpoint for queued, running, and terminal jobs; this tool \
+                         remains the current-slot and queue diagnostic. `analyze_job_previous_terminal` \
+                         carries the prior terminal job for exactly one grace-window rotation. Both job-view fields are `null` \
                        before any analyze has ever run, and emit explicit `null` (not absent) so \
                        clients can distinguish \"no analyze ever\" from \"missing field on an old \
                        server\"."
@@ -2276,6 +2237,19 @@ impl CodeGraphServer {
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
         Ok(handlers::status::get_status(self.inner.clone()))
+    }
+
+    #[tool(
+        description = "Return the status for one analyze job by required `job_id`. Response is the bare `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }` AnalyzeJobView — not a Page or wrapper. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is byte-identical to `analyze_codebase`'s success body and terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
+    )]
+    async fn get_job_status(
+        &self,
+        Parameters(args): Parameters<GetJobStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(handlers::status::get_job_status(
+            self.inner.clone(),
+            args.job_id,
+        ))
     }
 }
 
@@ -2353,6 +2327,30 @@ mod tests {
         .await
         .expect("multiple close callers drain together");
         assert!(coordinator.begin_analyze().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_analyze_guard_blocks_shutdown_drain_and_closed_admission() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let queued_guard = coordinator.begin_analyze().unwrap();
+        let drain = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.close_analyze_and_wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "an admitted queued job's retained guard must keep graceful drain open"
+        );
+        assert!(
+            coordinator.begin_analyze().is_err(),
+            "closed admission must reject new queue entries while queued work drains"
+        );
+        drop(queued_guard);
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("releasing the queued guard wakes drain")
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -2484,16 +2482,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 22 tools. If a future change adds
+    /// `tools/list` must surface exactly 23 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_two_tools() {
+    fn tool_router_registers_twenty_three_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            22,
-            "expected 22 registered tools, got {}",
+            23,
+            "expected 23 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2528,6 +2526,7 @@ mod tests {
             "watch_start",
             "watch_stop",
             "get_status",
+            "get_job_status",
             "find_overrides",
             "find_class_candidates",
             "get_symbol_at",

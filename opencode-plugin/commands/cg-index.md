@@ -27,13 +27,14 @@ a UE4/LLVM-scale sync analyze can surface as `"[Tool result missing due to inter
 while the server runs happily to completion:
 
 ```text
-analyze_codebase_async(path: "…")   → { job_id, status: "running", … }
-get_status()                        → poll analyze_job.progress / .progress_message
-                                    → analyze_job.result once status == "completed"
+analyze_codebase_async(path: "…")   → { job_id, status, … }
+get_job_status(job_id: "…")          → poll progress / progress_message
+                                     → result once status == "completed"
 ```
 
-Every poll is sub-second, so the per-call timer never fires. `analyze_job.result` is
-shape-identical to sync `analyze_codebase`'s body.
+Every poll is sub-second, so the per-call timer never fires. `get_job_status.result` is
+shape-identical to sync `analyze_codebase`'s body. Use `get_status()` for current-job and FIFO
+queue diagnostics.
 
 ## Arguments
 

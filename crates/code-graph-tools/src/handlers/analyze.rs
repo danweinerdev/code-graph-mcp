@@ -981,11 +981,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analyze_concurrent_call_returns_indexing_in_progress() {
-        // Per Design Decision 9 the slot is the single-flight gate, not
-        // `index_lock` — installing a synthetic Running job is the way to
-        // simulate a concurrent in-flight analyze. The wire wording is the
-        // load-bearing assertion and stays byte-identical.
+    async fn async_admission_behind_running_job_is_queued_and_visible() {
+        // A synthetic current job pins admission without timing: this test is
+        // about queue admission and the status projection, not index speed.
         let server = server_with_cpp_parser();
         let inner = server.inner.clone();
         let synthetic = AnalyzeJob::new_running(
@@ -996,15 +994,21 @@ mod tests {
         );
         inner.analyze_slot.write().current = Some(synthetic);
 
-        let r = analyze_codebase(inner.clone(), "/tmp".to_string(), false, None, None).await;
-        assert_eq!(r.is_error, Some(true));
-        let body = r
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.to_string())
-            .unwrap_or_default();
-        assert_eq!(body, "indexing already in progress");
+        let r = analyze_codebase_async(inner.clone(), "/tmp".to_string(), false).await;
+        assert!(r.is_error.is_none() || r.is_error == Some(false));
+        let body: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["existing"], false);
+        assert_ne!(body["job_id"], "00000000000000000001");
+
+        let status: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner))).unwrap();
+        assert_eq!(status["analyze_job"]["job_id"], "00000000000000000001");
+        assert_eq!(status["analyze_job_pending_count"], 1);
+        assert_eq!(
+            status["analyze_job_pending_ids"],
+            serde_json::json!([body["job_id"]])
+        );
     }
 
     #[tokio::test]
@@ -1189,6 +1193,7 @@ mod tests {
             !parsed["job_id"].as_str().unwrap().is_empty(),
             "job_id must be non-empty"
         );
+        wait_for_job_terminal(server.inner.clone(), parsed["job_id"].as_str().unwrap()).await;
     }
 
     /// (Task 2.1 / b) After async kickoff, polling `get_status` eventually
@@ -1239,6 +1244,7 @@ mod tests {
             serde_json::json!(1),
             "result.files should be 1 for the 1-file fixture"
         );
+        wait_for_job_terminal(inner, &job_id).await;
     }
 
     /// (Task 2.1 / c) The sync `analyze_codebase` handler installs a
@@ -1276,6 +1282,9 @@ mod tests {
             }
             JobStatus::Running => {
                 panic!("sync analyze returned with slot still Running — terminal write missed")
+            }
+            JobStatus::Queued => {
+                panic!("sync analyze returned with slot still Queued — terminal write missed")
             }
             JobStatus::Failed(msg) => {
                 panic!("sync analyze ended Failed unexpectedly: {msg}")
@@ -1382,26 +1391,21 @@ mod tests {
         // Sanity floor — the fixture has a function, so symbols can't be 0.
         assert_eq!(async_result["files"], serde_json::json!(1));
         assert!(async_result["symbols"].as_u64().unwrap() >= 1);
+        wait_for_job_terminal(inner_a, &job_id).await;
     }
 
-    // ----- Task 2.2: single-flight race tests -------------------------------
+    // ----- Analyze admission and FIFO race tests ---------------------------
     //
-    // These tests verify the slot is the single-flight gate (Design Decision
-    // 1), duplicate kickoff against a Running slot returns the existing
-    // job_id (Decision 3), and sync vs. async exclude each other symmetrically
-    // (Decision 9). They use the recording plugin's `SLEEP_PER_PARSE_MS` knob
-    // (where required) to stretch the indexing window wide enough for a
-    // second handler call to land on the slot while the first is still
-    // Running.
+    // These tests verify that the slot admits distinct jobs, serializes their
+    // workers through FIFO promotion, and preserves sync/async outcomes. They
+    // use the recording plugin's `SLEEP_PER_PARSE_MS` knob to stretch the
+    // indexing window wide enough for later calls to enter the pending queue.
     //
     // **Knob hygiene.** Every test that sets `SLEEP_PER_PARSE_MS` does so
     // through the `ParseSleepGuard` RAII helper below. If two tests in this
     // binary ran concurrently and one leaked a non-zero value, the other
     // would silently slow down — Cargo's default is parallel test execution
-    // within a binary. The first two tests below (`concurrent_async_*`,
-    // `async_duplicate_*`) do NOT touch the knob; their synchronization
-    // primitive is the `Barrier` / `yield_now` pair, not stretched indexing
-    // time. The third and fourth do, and clean up via the guard.
+    // within a binary. Tests using the knob clean up via the guard.
 
     use crate::test_recording_plugin::{Log, RecordingPlugin, SLEEP_PER_PARSE_MS};
     use code_graph_core::Language;
@@ -1475,7 +1479,7 @@ mod tests {
         dir
     }
 
-    /// (Task 2.2 / a) Two `analyze_codebase_async` calls released
+    /// (Task 4.1) Two `analyze_codebase_async` calls released
     /// simultaneously via a `Barrier` both hit the slot write lock at the
     /// same instant; the `PlRwLock` serializes them so one observes the
     /// other's `Running` write. Determinism comes from the barrier — both
@@ -1484,9 +1488,15 @@ mod tests {
     /// step atomic. NO sleep knob: indexing time is irrelevant; the
     /// synchronization happens entirely in the slot.
     #[tokio::test]
-    async fn concurrent_async_kickoffs_only_one_spawns_worker() {
-        let dir = tempdir_with_one_cpp();
-        let server = server_with_cpp_parser();
+    async fn concurrent_async_kickoffs_admit_distinct_fifo_jobs() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(20);
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[parsing]\nmax_threads = 1\n",
+        )
+        .unwrap();
+        let (server, _calls) = server_with_recording_plugin();
         let inner = server.inner.clone();
         let path = dir.path().to_string_lossy().into_owned();
 
@@ -1525,67 +1535,55 @@ mod tests {
             .map(|v| v["job_id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(
-            job_ids[0], job_ids[1],
-            "both concurrent kickoffs must surface the same job_id (the slot's installed Running job)"
+            job_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2,
+            "4.1 admits every request distinctly; duplicate arguments must not coalesce"
         );
-
-        let mut existing_flags: Vec<bool> = parsed
-            .iter()
-            .map(|v| v["existing"].as_bool().unwrap())
-            .collect();
-        existing_flags.sort();
-        assert_eq!(
-            existing_flags,
-            vec![false, true],
-            "exactly one kickoff must report existing=false (the winner that installed the job) \
-             and the other existing=true (observer of the winner's write)"
-        );
+        assert!(parsed.iter().all(|v| v["existing"] == false));
+        assert!(parsed.iter().any(|v| v["status"] == "running"));
+        assert!(parsed.iter().any(|v| v["status"] == "queued"));
+        for job_id in &job_ids {
+            wait_for_job_terminal(inner.clone(), job_id).await;
+        }
     }
 
-    /// (Task 2.2 / b) Sequential kickoff with a `yield_now` between calls.
-    /// The yield is a scheduling primitive — it surrenders the current task
-    /// to the runtime, giving the slot write a chance to commit visibly
-    /// before the second handler reads `slot.current.state.status`. The
-    /// in-flight job satisfies `Running`, so the second kickoff returns the
-    /// first's `job_id` with `existing: true`. NO sleep knob.
+    /// (Task 4.1) Sequential kickoff creates a distinct FIFO queued job.
+    /// The parse-delay guard keeps the first worker running long enough for
+    /// the second kickoff to be admitted behind it with a different job ID.
     #[tokio::test]
-    async fn async_duplicate_kickoff_after_first_started_returns_existing_job_id() {
-        let dir = tempdir_with_one_cpp();
-        let server = server_with_cpp_parser();
+    async fn async_duplicate_kickoff_after_first_started_returns_distinct_queued_job() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
         let inner = server.inner.clone();
         let path = dir.path().to_string_lossy().into_owned();
 
-        let first = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let first = analyze_codebase_async(inner.clone(), path.clone(), true).await;
         let first_parsed: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
         let first_job_id = first_parsed["job_id"].as_str().unwrap().to_string();
         assert_eq!(first_parsed["existing"], serde_json::json!(false));
 
         tokio::task::yield_now().await;
 
-        let second = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let second = analyze_codebase_async(inner.clone(), path.clone(), true).await;
         let second_parsed: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
         let second_job_id = second_parsed["job_id"].as_str().unwrap().to_string();
-        assert_eq!(
-            second_parsed["existing"],
-            serde_json::json!(true),
-            "second kickoff against a Running slot must report existing=true; got: {second_parsed}"
-        );
-        assert_eq!(
+        assert_eq!(second_parsed["existing"], serde_json::json!(false));
+        assert_eq!(second_parsed["status"], serde_json::json!("queued"));
+        assert_ne!(
             second_job_id, first_job_id,
-            "duplicate kickoff must surface the in-flight job's job_id, not mint a new one"
+            "4.1 must not coalesce duplicate args"
         );
+        wait_for_job_terminal(inner.clone(), &first_job_id).await;
+        wait_for_job_terminal(inner, &second_job_id).await;
     }
 
-    /// (Task 2.2 / c) An async kickoff that is still indexing must block a
-    /// subsequent sync `analyze_codebase` with the same byte-identical error
-    /// the wire snapshot has always carried ("indexing already in
-    /// progress"). The 5-file × 50ms-per-parse fixture guarantees ≥ 250ms
-    /// of in-progress window — comfortably longer than any sync handler's
-    /// slot-check + spawn fast path. No yield between the async and sync
-    /// calls: the slot write happens before `analyze_codebase_async`
-    /// returns, so by the time we call sync the slot is already Running.
+    /// A sync request admitted behind an async job waits for its own result.
     #[tokio::test]
-    async fn async_kickoff_blocks_sync_analyze() {
+    async fn async_kickoff_queues_sync_analyze_until_its_own_terminal_result() {
         let _guard = ParseSleepGuard::set(50);
         let dir = tempdir_with_n_rec(5);
         let (server, _calls) = server_with_recording_plugin();
@@ -1593,23 +1591,257 @@ mod tests {
         let path = dir.path().to_string_lossy().into_owned();
 
         let kickoff = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+        let kickoff: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+        let kickoff_id = kickoff["job_id"].as_str().unwrap().to_string();
         assert!(
-            kickoff.is_error.is_none() || kickoff.is_error == Some(false),
-            "async kickoff itself must not error: {kickoff:?}"
+            kickoff["status"] == "running",
+            "async kickoff must start the first job"
         );
 
-        let sync_r = analyze_codebase(inner.clone(), path.clone(), false, None, None).await;
-        assert_eq!(sync_r.is_error, Some(true));
+        let sync = tokio::spawn({
+            let inner = inner.clone();
+            let path = path.clone();
+            async move { analyze_codebase(inner, path, false, None, None).await }
+        });
+        tokio::task::yield_now().await;
+        let status: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
         assert_eq!(
-            body_text(&sync_r),
-            "indexing already in progress",
-            "sync handler must reject byte-identically when slot.current is Running"
+            status["analyze_job_pending_count"], 1,
+            "sync request must be admitted into FIFO rather than rejected"
+        );
+        let sync_r = sync.await.expect("sync queued task panicked");
+        assert!(sync_r.is_error.is_none() || sync_r.is_error == Some(false));
+        wait_for_job_terminal(inner, &kickoff_id).await;
+    }
+
+    /// FIFO promotion continues after a queued terminal failure: A runs, B
+    /// fails during config load, then C must become current and complete.
+    #[tokio::test]
+    async fn queued_failure_promotes_the_next_fifo_job_and_rotates_previous_terminal() {
+        let _guard = ParseSleepGuard::set(50);
+        let running_dir = tempdir_with_n_rec(5);
+        let bad_dir = tempdir_with_malformed_toml();
+        let good_dir = tempdir_with_n_rec(1);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+
+        let first = analyze_codebase_async(
+            inner.clone(),
+            running_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let first_id: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_id = first_id["job_id"].as_str().unwrap().to_string();
+        let failed = analyze_codebase_async(
+            inner.clone(),
+            bad_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let failed: serde_json::Value = serde_json::from_str(&body_text(&failed)).unwrap();
+        let failed_id = failed["job_id"].as_str().unwrap().to_string();
+        let third = analyze_codebase_async(
+            inner.clone(),
+            good_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let third: serde_json::Value = serde_json::from_str(&body_text(&third)).unwrap();
+        let third_id = third["job_id"].as_str().unwrap().to_string();
+
+        let initial: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+        assert_eq!(initial["analyze_job"]["job_id"], first_id);
+        assert_eq!(
+            initial["analyze_job_pending_ids"],
+            serde_json::json!([failed_id, third_id])
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "third queued job did not complete"
+            );
+            let status: serde_json::Value =
+                serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+            if status["analyze_job"]["job_id"] == third_id
+                && status["analyze_job"]["status"] == "completed"
+            {
+                assert_eq!(status["analyze_job_previous_terminal"]["job_id"], failed_id);
+                assert_eq!(status["analyze_job_previous_terminal"]["status"], "failed");
+                assert_eq!(status["analyze_job_pending_count"], 0);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for job_id in [&first_id, &failed_id, &third_id] {
+            wait_for_job_terminal(inner.clone(), job_id).await;
+        }
+    }
+
+    /// The terminal write precedes slot rotation. While the supervisor is
+    /// deliberately paused in that gap, later admissions must remain FIFO
+    /// behind both the terminal current and the existing pending head.
+    #[tokio::test]
+    async fn terminal_rotation_gap_keeps_later_admission_behind_fifo_head() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(20);
+        fs::write(
+            dir.path().join(".code-graph.toml"),
+            "[parsing]\nmax_threads = 1\n",
+        )
+        .unwrap();
+        let (server, calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+        inner.analyze_slot.write().completion_hook = Some(crate::analyze_job::CompletionHook {
+            reached: reached_tx,
+            proceed: proceed_rx,
+        });
+
+        let first = analyze_codebase_async(inner.clone(), path.clone(), true).await;
+        let first: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_id = first["job_id"].as_str().unwrap().to_string();
+        let second = analyze_codebase_async(inner.clone(), path.clone(), true).await;
+        let second: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
+        let second_id = second["job_id"].as_str().unwrap().to_string();
+
+        reached_rx
+            .await
+            .expect("first supervisor must pause after terminal state before slot rotation");
+        let third = analyze_codebase_async(inner.clone(), path.clone(), true).await;
+        let third: serde_json::Value = serde_json::from_str(&body_text(&third)).unwrap();
+        let third_id = third["job_id"].as_str().unwrap().to_string();
+        let gap: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+        assert_eq!(gap["analyze_job"]["job_id"], first_id);
+        assert_eq!(gap["analyze_job"]["status"], "completed");
+        assert_eq!(
+            gap["analyze_job_pending_ids"],
+            serde_json::json!([second_id, third_id])
+        );
+
+        proceed_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "FIFO head never promoted after terminal gap"
+            );
+            let status: serde_json::Value =
+                serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+            if status["analyze_job"]["job_id"] == second_id
+                && status["analyze_job"]["status"] == "running"
+            {
+                assert_eq!(status["analyze_job_previous_terminal"]["job_id"], first_id);
+                assert_eq!(
+                    status["analyze_job_pending_ids"],
+                    serde_json::json!([third_id])
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for job_id in [&first_id, &second_id, &third_id] {
+            wait_for_job_terminal(inner.clone(), job_id).await;
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "each FIFO admission runs exactly once; no overtaking worker was spawned"
         );
     }
 
-    /// (Task 2.2 / d) An in-flight sync `analyze_codebase` (Running slot,
-    /// inline await) must surface to a subsequent `analyze_codebase_async`
-    /// as `existing: true` carrying the sync job's `job_id`. The 20-file ×
+    /// A sync request owns only its terminal wait. Aborting that request's MCP
+    /// task must not cancel its detached supervisor or strand an admitted
+    /// queued successor.
+    #[tokio::test]
+    async fn aborting_sync_waiter_does_not_strand_queued_successor() {
+        let _guard = ParseSleepGuard::set(50);
+        let dir = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+        let sync = tokio::spawn({
+            let inner = inner.clone();
+            let path = path.clone();
+            async move { analyze_codebase(inner, path, false, None, None).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if inner.analyze_slot.read().current.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sync request never installed current job"
+            );
+            tokio::task::yield_now().await;
+        }
+        let queued = analyze_codebase_async(inner.clone(), path, false).await;
+        let queued: serde_json::Value = serde_json::from_str(&body_text(&queued)).unwrap();
+        let queued_id = queued["job_id"].as_str().unwrap().to_string();
+        assert_eq!(queued["status"], "queued");
+        sync.abort();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "queued successor was stranded after sync cancellation"
+            );
+            let status: serde_json::Value =
+                serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+            if status["analyze_job"]["job_id"] == queued_id
+                && status["analyze_job"]["status"] == "completed"
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        wait_for_job_terminal(inner, &queued_id).await;
+    }
+
+    /// Addressable terminal retention outlives the legacy one-rotation view:
+    /// 33 archived terminals keep the newest 32 while the active current job
+    /// remains independently retrievable.
+    #[tokio::test]
+    async fn job_status_history_evicts_only_oldest_archived_terminal() {
+        let dir = tempdir_with_one_cpp();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let path = dir.path().to_string_lossy().into_owned();
+        let mut ids = Vec::new();
+
+        for _ in 0..34 {
+            let kickoff = analyze_codebase_async(inner.clone(), path.clone(), false).await;
+            let kickoff: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+            ids.push(kickoff["job_id"].as_str().unwrap().to_string());
+            let _ = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
+        }
+
+        {
+            let slot = inner.analyze_slot.read();
+            assert_eq!(slot.terminal_history.len(), 32);
+            assert_eq!(slot.terminal_history.front().unwrap().job_id, ids[1]);
+            assert_eq!(slot.terminal_history.back().unwrap().job_id, ids[32]);
+            assert_eq!(slot.current.as_ref().unwrap().job_id, ids[33]);
+        }
+        assert!(crate::core::status::get_job_status(inner.clone(), ids[0].clone()).is_err());
+        for id in ids.iter().skip(1) {
+            let result = crate::core::status::get_job_status(inner.clone(), id.clone());
+            assert!(
+                result.is_ok(),
+                "retained/current job {id} must remain addressable"
+            );
+        }
+    }
+
+    /// An in-flight sync `analyze_codebase` admits an async queued job. The 20-file ×
     /// 50ms-per-parse fixture guarantees ≥ 1s of in-progress window —
     /// abundant headroom for the spin-yield loop to land while sync is
     /// still in `run_analyze_job`'s parse phase.
@@ -1624,7 +1856,7 @@ mod tests {
     /// runtime (avoids any "destructor running during runtime shutdown"
     /// noise from a dangling handle).
     #[tokio::test]
-    async fn sync_kickoff_blocks_async_kickoff() {
+    async fn sync_kickoff_queues_async_kickoff() {
         let _guard = ParseSleepGuard::set(50);
         let dir = tempdir_with_n_rec(20);
         let (server, _calls) = server_with_recording_plugin();
@@ -1662,21 +1894,15 @@ mod tests {
 
         let async_r = analyze_codebase_async(inner.clone(), path.clone(), false).await;
         let async_parsed: serde_json::Value = serde_json::from_str(&body_text(&async_r)).unwrap();
-        assert_eq!(
-            async_parsed["existing"],
-            serde_json::json!(true),
-            "async kickoff against a Running sync slot must report existing=true; got: {async_parsed}"
-        );
-        assert_eq!(
-            async_parsed["job_id"].as_str().unwrap(),
-            sync_job_id,
-            "async kickoff must surface the in-flight sync job's job_id"
-        );
+        assert_eq!(async_parsed["existing"], serde_json::json!(false));
+        assert_eq!(async_parsed["status"], serde_json::json!("queued"));
+        assert_ne!(async_parsed["job_id"].as_str().unwrap(), sync_job_id);
 
         // Drain the sync handler so the worker completes inside this test's
         // runtime — avoids the worker future being dropped mid-flight when
         // the test's runtime tears down.
         let _ = sync_handle.await.expect("sync handler task panicked");
+        wait_for_job_terminal(inner, async_parsed["job_id"].as_str().unwrap()).await;
     }
 
     // ----- Task 2.3: slot rotation, failure-path, and progress tests --------
@@ -1734,6 +1960,37 @@ mod tests {
         }
     }
 
+    /// Drain a specific admitted job before test fixture teardown. Terminal
+    /// state alone is insufficient: the detached supervisor still owns slot
+    /// rotation and its `AnalyzeGuard` until it clears completion-pending.
+    async fn wait_for_job_terminal(inner: Arc<ServerInner>, job_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "job {job_id} did not reach terminal before test teardown"
+            );
+            let result = crate::core::status::get_job_status(inner.clone(), job_id.to_string())
+                .expect("admitted job must remain addressable while draining");
+            let crate::core::ToolOk::Value(view) = result else {
+                panic!("get_job_status must return an AnalyzeJobView")
+            };
+            if view.status == "completed" || view.status == "failed" {
+                let supervisor_finished = {
+                    let slot = inner.analyze_slot.read();
+                    slot.current
+                        .as_ref()
+                        .is_none_or(|current| current.job_id != job_id)
+                        || !slot.current_completion_pending
+                };
+                if supervisor_finished {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// (Task 2.3 / a) After a terminal job, the next kickoff rotates the
     /// previous `current` into `previous_terminal` and installs a fresh
     /// `Running` job in `current`. This is the load-bearing behavior of the
@@ -1771,27 +2028,31 @@ mod tests {
             "T2 kickoff after T1 terminal must mint a fresh job_id; rotation requires distinct ids"
         );
 
-        let slot = inner.analyze_slot.read();
-        let previous = slot
-            .previous_terminal
-            .as_ref()
-            .expect("previous_terminal must carry T1 after T2 kickoff");
-        assert_eq!(
-            previous.job_id, t1_job_id,
-            "previous_terminal must hold T1's job_id post-rotation"
-        );
-        let current = slot
-            .current
-            .as_ref()
-            .expect("current must carry T2 after kickoff");
-        assert_eq!(
-            current.job_id, t2_job_id,
-            "current must hold T2's job_id post-rotation"
-        );
-        assert!(
-            matches!(current.state.read().status, JobStatus::Running),
-            "current (T2) must be Running immediately after kickoff — read happens before worker terminal"
-        );
+        {
+            let slot = inner.analyze_slot.read();
+            let previous = slot
+                .previous_terminal
+                .as_ref()
+                .expect("previous_terminal must carry T1 after T2 kickoff");
+            assert_eq!(
+                previous.job_id, t1_job_id,
+                "previous_terminal must hold T1's job_id post-rotation"
+            );
+            let current = slot
+                .current
+                .as_ref()
+                .expect("current must carry T2 after kickoff");
+            assert_eq!(
+                current.job_id, t2_job_id,
+                "current must hold T2's job_id post-rotation"
+            );
+            assert!(
+                matches!(current.state.read().status, JobStatus::Running),
+                "current (T2) must be Running immediately after kickoff — read happens before worker terminal"
+            );
+        }
+        wait_for_job_terminal(inner.clone(), &t1_job_id).await;
+        wait_for_job_terminal(inner, &t2_job_id).await;
     }
 
     /// (Task 2.3 / b) The grace window is bounded at one terminal. T1 →
@@ -1818,19 +2079,22 @@ mod tests {
         let t3_parsed: serde_json::Value = serde_json::from_str(&body_text(&t3)).unwrap();
         let t3_job_id = t3_parsed["job_id"].as_str().unwrap().to_string();
 
-        let slot = inner.analyze_slot.read();
-        let previous_id = slot
-            .previous_terminal
-            .as_ref()
-            .expect("previous_terminal must hold T2 after T3 kickoff")
-            .job_id
-            .clone();
-        let current_id = slot
-            .current
-            .as_ref()
-            .expect("current must hold T3 after kickoff")
-            .job_id
-            .clone();
+        let (previous_id, current_id) = {
+            let slot = inner.analyze_slot.read();
+            let previous_id = slot
+                .previous_terminal
+                .as_ref()
+                .expect("previous_terminal must hold T2 after T3 kickoff")
+                .job_id
+                .clone();
+            let current_id = slot
+                .current
+                .as_ref()
+                .expect("current must hold T3 after kickoff")
+                .job_id
+                .clone();
+            (previous_id, current_id)
+        };
         assert_eq!(
             previous_id, t2_job_id,
             "previous_terminal must rotate to T2 after T3 kickoff (T1 falls off the back)"
@@ -1847,6 +2111,9 @@ mod tests {
             current_id, t1_job_id,
             "T1's job_id must no longer appear in current"
         );
+        for job_id in [&t1_job_id, &t2_job_id, &t3_job_id] {
+            wait_for_job_terminal(inner.clone(), job_id).await;
+        }
     }
 
     /// (Task 2.3 / c) A malformed `.code-graph.toml` drives the worker into
@@ -1860,12 +2127,14 @@ mod tests {
         let server = server_with_cpp_parser();
         let inner = server.inner.clone();
 
-        let _ = analyze_codebase_async(
+        let kickoff = analyze_codebase_async(
             inner.clone(),
             dir.path().to_string_lossy().into_owned(),
             false,
         )
         .await;
+        let kickoff: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+        let kickoff_id = kickoff["job_id"].as_str().unwrap().to_string();
 
         let terminal = poll_until_terminal(inner.clone(), Duration::from_secs(5)).await;
         assert_eq!(
@@ -1880,6 +2149,7 @@ mod tests {
             err.starts_with("failed to parse .code-graph.toml"),
             "failed-async error must start with the same prefix the sync handler emits; got: {err:?}"
         );
+        wait_for_job_terminal(inner, &kickoff_id).await;
     }
 
     /// (Task 2.3 / d) Failed counts as terminal for rotation purposes
@@ -1918,33 +2188,37 @@ mod tests {
         let t2_parsed: serde_json::Value = serde_json::from_str(&body_text(&t2)).unwrap();
         let t2_job_id = t2_parsed["job_id"].as_str().unwrap().to_string();
 
-        let slot = inner.analyze_slot.read();
-        let previous = slot
-            .previous_terminal
-            .as_ref()
-            .expect("previous_terminal must carry the failed T1 after T2 kickoff");
-        assert_eq!(
-            previous.job_id, t1_job_id,
-            "previous_terminal must hold T1's job_id even when T1 ended Failed"
-        );
-        match &previous.state.read().status {
-            JobStatus::Failed(msg) => assert!(
-                msg.starts_with("failed to parse .code-graph.toml"),
-                "Failed message must survive rotation byte-identically; got: {msg:?}"
-            ),
-            other => panic!(
+        {
+            let slot = inner.analyze_slot.read();
+            let previous = slot
+                .previous_terminal
+                .as_ref()
+                .expect("previous_terminal must carry the failed T1 after T2 kickoff");
+            assert_eq!(
+                previous.job_id, t1_job_id,
+                "previous_terminal must hold T1's job_id even when T1 ended Failed"
+            );
+            match &previous.state.read().status {
+                JobStatus::Failed(msg) => assert!(
+                    msg.starts_with("failed to parse .code-graph.toml"),
+                    "Failed message must survive rotation byte-identically; got: {msg:?}"
+                ),
+                other => panic!(
                 "previous_terminal status must be Failed(_) after rotating a failed T1; got: {:?}",
                 std::mem::discriminant(other)
             ),
+            }
+            let current = slot
+                .current
+                .as_ref()
+                .expect("current must hold T2 after kickoff");
+            assert_eq!(
+                current.job_id, t2_job_id,
+                "current must hold T2's job_id post-rotation"
+            );
         }
-        let current = slot
-            .current
-            .as_ref()
-            .expect("current must hold T2 after kickoff");
-        assert_eq!(
-            current.job_id, t2_job_id,
-            "current must hold T2's job_id post-rotation"
-        );
+        wait_for_job_terminal(inner.clone(), &t1_job_id).await;
+        wait_for_job_terminal(inner, &t2_job_id).await;
     }
 
     /// (Task 2.3 / e) Progress is fan-out (Decision 8) — the inner-lock
@@ -1988,7 +2262,9 @@ mod tests {
         let inner = server.inner.clone();
         let path = dir.path().to_string_lossy().into_owned();
 
-        let _ = analyze_codebase_async(inner.clone(), path, false).await;
+        let kickoff = analyze_codebase_async(inner.clone(), path, false).await;
+        let kickoff: serde_json::Value = serde_json::from_str(&body_text(&kickoff)).unwrap();
+        let kickoff_id = kickoff["job_id"].as_str().unwrap().to_string();
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut parse_values: Vec<u32> = Vec::new();
@@ -2043,5 +2319,6 @@ mod tests {
              transition — a production bug in the fan-out sink.",
             distinct.len()
         );
+        wait_for_job_terminal(inner, &kickoff_id).await;
     }
 }

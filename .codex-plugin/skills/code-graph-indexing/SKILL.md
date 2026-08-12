@@ -27,10 +27,10 @@ MCP client's per-call timeout and surface as a tool error *even though the serve
 finishes*. Avoid this:
 
 1. `mcp__code-graph__analyze_codebase_async(path=…)` → returns sub-second with a
-   `job_id` and `status: "running"`.
-2. Poll `mcp__code-graph__get_status` — read `analyze_job.progress` /
-   `progress_message` for live progress, and `analyze_job.result` (or `.error`)
-   once `status` becomes `"completed"` / `"failed"`.
+   `job_id` and `status` (`"running"` or `"queued"`).
+2. Poll `mcp__code-graph__get_job_status(job_id=…)` — read `progress` /
+   `progress_message` for live progress, and `result` (or `.error`) once `status`
+   becomes `"completed"` / `"failed"`.
 
 Because each call is sub-second, the per-call timeout never fires. (If you must use
 sync analyze on a large tree, raising `MCP_TOOL_TIMEOUT` to ~900000 is the
@@ -72,6 +72,6 @@ The cases worth flagging to the user:
 
 - Small/medium repo, interactive → `analyze_codebase`.
 - Large repo, or you've hit a tool timeout → `analyze_codebase_async` + poll
-  `get_status`.
+  `get_job_status(job_id)`.
 - Actively editing and querying → `watch_start` once, then just query.
 - Changed `.code-graph.toml` → `analyze_codebase(force=true)`.

@@ -33,7 +33,9 @@ use std::sync::Arc;
 use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::Graph;
 
-use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+use crate::analyze_job::{
+    AnalyzeJob, AnalyzePhase, AnalyzeSlot, JobStatus, PendingAnalyze, TERMINAL_HISTORY_LIMIT,
+};
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
 use crate::handlers::status::format_unix_nanos_rfc3339;
@@ -661,6 +663,8 @@ pub(crate) fn finish_completed(job: &AnalyzeJob, result: AnalyzeResult) {
     s.progress_message = "Analyze complete".to_string();
     s.status = JobStatus::Completed(result);
     s.finished_at = Some(now_nanos_u64());
+    drop(s);
+    job.terminal_changed.notify_waiters();
 }
 
 pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
@@ -672,14 +676,16 @@ pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
     let mut s = job.state.write();
     s.status = JobStatus::Failed(msg);
     s.finished_at = Some(now_nanos_u64());
+    drop(s);
+    job.terminal_changed.notify_waiters();
 }
 
 /// `analyze_codebase` body.
 ///
 /// Slot-protocol coordination only — the heavy lifting (cache fast-path,
 /// parse pipeline, merge, persist) lives in [`run_analyze_job`]. The slot
-/// is the single-flight gate (Design Decision 1); `index_lock` moves
-/// into the worker.
+/// is the FIFO admission gate; `index_lock` serializes promoted workers and
+/// watch reindex work.
 ///
 /// Ungated by design (Decision 8 / plan task 2.2 notes): this is what
 /// creates the index, so there is no core `require_indexed` call here.
@@ -692,30 +698,42 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
-    let _analyze_guard = inner
-        .persist
-        .begin_analyze()
-        .map_err(|message| ToolError(message.to_string()))?;
-
     let job = {
         let mut slot = inner.analyze_slot.write();
-        if let Some(cur) = &slot.current {
-            if matches!(cur.state.read().status, JobStatus::Running) {
-                drop(slot);
-                return Err(ToolError("indexing already in progress".to_string()));
-            }
+        let analyze_guard = inner
+            .persist
+            .begin_analyze()
+            .map_err(|message| ToolError(message.to_string()))?;
+        if slot.current.is_some()
+            && !(slot.pending.is_empty()
+                && !slot.current_completion_pending
+                && slot
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.state.read().is_terminal()))
+        {
+            // A terminal current with pending work is still occupied: its
+            // supervisor alone owns the terminal->promotion transition. This
+            // closes the terminal-visible/admission race without allowing a
+            // later request to overtake the FIFO head.
+            let job = install_new_queued(&mut slot, path_raw, force);
+            slot.pending.push_back(PendingAnalyze {
+                job: Arc::clone(&job),
+                analyze_guard,
+                sink: Arc::clone(&sink),
+            });
+            job
+        } else {
+            let job = install_new_running(&mut slot, path_raw, force);
+            spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, analyze_guard);
+            job
         }
-        let started_at = now_nanos_u64();
-        let job_id = format!("{started_at:020}");
-        let job = AnalyzeJob::new_running(job_id, path_raw.clone(), force, started_at);
-        if let Some(prev) = slot.current.take() {
-            slot.previous_terminal = Some(prev);
-        }
-        slot.current = Some(Arc::clone(&job));
-        job
     };
 
-    run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink).await;
+    // The worker is detached before this call reaches an await point. A sync
+    // caller therefore only observes its job and can be cancelled without
+    // cancelling or stranding the worker/successors.
+    wait_for_terminal(&job).await;
 
     let state = job.state.read();
     match &state.status {
@@ -724,17 +742,15 @@ pub async fn analyze_codebase(
         JobStatus::Running => {
             unreachable!("run_analyze_job must write a terminal JobStatus before returning")
         }
+        JobStatus::Queued => unreachable!("queued sync analyze must wait for its terminal state"),
     }
 }
 
 /// `analyze_codebase_async` body — kickoff that returns in milliseconds
 /// regardless of indexing duration.
 ///
-/// Identical slot protocol to [`analyze_codebase`] (Design Decision 1)
-/// except the worker is `tokio::spawn`ed and detached instead of
-/// `await`ed inline, and a duplicate kickoff against a `Running` slot is
-/// a SUCCESS (not an error — Design Decision 3) carrying the in-flight
-/// job's `job_id` with `existing: true`.
+/// Identical FIFO slot protocol to [`analyze_codebase`] except the worker is
+/// `tokio::spawn`ed and detached instead of awaited inline.
 ///
 /// No progress sink parameter — async kickoff has no client-side
 /// progress channel; agents observe progress by polling `get_status`.
@@ -750,89 +766,173 @@ pub async fn analyze_codebase_async(
         return Err(ToolError("'path' is required".to_string()));
     }
 
-    enum Kickoff {
-        Existing { job_id: String, started_at: u64 },
-        New(Arc<AnalyzeJob>, crate::server::AnalyzeGuard),
-    }
-
     let kickoff = {
         let mut slot = inner.analyze_slot.write();
-        if let Some(cur) = &slot.current {
-            if matches!(cur.state.read().status, JobStatus::Running) {
-                let existing = Kickoff::Existing {
-                    job_id: cur.job_id.clone(),
-                    started_at: cur.started_at,
-                };
-                drop(slot);
-                existing
-            } else {
-                let guard = inner
-                    .persist
-                    .begin_analyze()
-                    .map_err(|message| ToolError(message.to_string()))?;
-                let job = install_new_running(&mut slot, path_raw.clone(), force);
-                Kickoff::New(job, guard)
-            }
+        let guard = inner
+            .persist
+            .begin_analyze()
+            .map_err(|message| ToolError(message.to_string()))?;
+        if slot.current.is_some()
+            && !(slot.pending.is_empty()
+                && !slot.current_completion_pending
+                && slot
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.state.read().is_terminal()))
+        {
+            let job = install_new_queued(&mut slot, path_raw, force);
+            slot.pending.push_back(PendingAnalyze {
+                job: Arc::clone(&job),
+                analyze_guard: guard,
+                sink: Arc::new(NoopProgressSink),
+            });
+            (job, "queued")
         } else {
-            let guard = inner
-                .persist
-                .begin_analyze()
-                .map_err(|message| ToolError(message.to_string()))?;
-            let job = install_new_running(&mut slot, path_raw.clone(), force);
-            Kickoff::New(job, guard)
+            let job = install_new_running(&mut slot, path_raw, force);
+            spawn_supervised_job(
+                Arc::clone(&inner),
+                Arc::clone(&job),
+                Arc::new(NoopProgressSink),
+                guard,
+            );
+            (job, "running")
         }
     };
 
-    match kickoff {
-        Kickoff::Existing { job_id, started_at } => Ok(ToolOk::Value(AsyncKickoffResponse {
-            job_id,
-            status: "running",
-            started_at: format_unix_nanos_rfc3339(started_at),
-            existing: true,
-            note: "analyze already in progress — args ignored; poll get_status for progress",
-        })),
-        Kickoff::New(job, analyze_guard) => {
-            let response = AsyncKickoffResponse {
-                job_id: job.job_id.clone(),
-                status: "running",
-                started_at: format_unix_nanos_rfc3339(job.started_at),
-                existing: false,
-                note: "analyze kicked off — poll get_status for progress and the terminal result",
-            };
-            // Detach: the JoinHandle is dropped intentionally so the
-            // worker outlives this call. Terminal state flows back
-            // through `job.state`, observable via get_status.
-            tokio::spawn(async move {
-                let _analyze_guard = analyze_guard;
-                run_analyze_job(
-                    Arc::clone(&inner),
-                    Arc::clone(&job),
-                    Arc::new(NoopProgressSink),
-                )
-                .await;
-            });
-            Ok(ToolOk::Value(response))
-        }
-    }
+    let (job, status) = kickoff;
+    Ok(ToolOk::Value(AsyncKickoffResponse {
+        job_id: job.job_id.clone(),
+        status,
+        started_at: format_unix_nanos_rfc3339(job.started_at),
+        existing: false,
+        note: if status == "running" {
+            "analyze kicked off — poll get_job_status(job_id) for progress and the terminal result"
+        } else {
+            "analyze queued — poll get_job_status(job_id) for progress and the terminal result; use get_status for FIFO position"
+        },
+    }))
 }
 
-/// Slot-rotation primitive shared by the async kickoff and (potentially)
-/// future callers. Caller holds the slot write guard; this helper moves
-/// any terminal `current` into `previous_terminal`, installs a fresh
-/// `Running` job, and returns the Arc.
-fn install_new_running(
-    slot: &mut crate::analyze_job::AnalyzeSlot,
-    path: String,
-    force: bool,
-) -> Arc<AnalyzeJob> {
-    let started_at = now_nanos_u64();
-    let job_id = format!("{started_at:020}");
+/// Install an immediately-running job. Caller holds the slot write guard.
+fn install_new_running(slot: &mut AnalyzeSlot, path: String, force: bool) -> Arc<AnalyzeJob> {
+    let (job_id, started_at) = issue_job_id(slot);
     let job = AnalyzeJob::new_running(job_id, path, force, started_at);
     if let Some(prev) = slot.current.take() {
+        archive_terminal(slot, Arc::clone(&prev));
         slot.previous_terminal = Some(prev);
     }
     slot.current = Some(Arc::clone(&job));
+    slot.current_completion_pending = true;
     job
+}
+
+/// Install an admitted queued job. Caller holds the slot write guard.
+fn install_new_queued(slot: &mut AnalyzeSlot, path: String, force: bool) -> Arc<AnalyzeJob> {
+    let (job_id, started_at) = issue_job_id(slot);
+    AnalyzeJob::new_queued(job_id, path, force, started_at)
+}
+
+fn issue_job_id(slot: &mut AnalyzeSlot) -> (String, u64) {
+    let issued = now_nanos_u64().max(slot.next_job_id);
+    slot.next_job_id = issued.saturating_add(1);
+    (format!("{issued:020}"), issued)
+}
+
+/// Detach a supervised worker. The supervisor, not any MCP handler, owns both
+/// terminal recovery and promotion, so handler cancellation cannot orphan the
+/// current slot entry.
+fn spawn_supervised_job(
+    inner: Arc<ServerInner>,
+    job: Arc<AnalyzeJob>,
+    sink: Arc<dyn ProgressSink>,
+    analyze_guard: crate::server::AnalyzeGuard,
+) {
+    tokio::spawn(async move {
+        let worker = tokio::spawn(run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink));
+        if let Err(error) = worker.await {
+            finish_failed_if_nonterminal(&job, format!("indexing worker terminated: {error}"));
+        }
+        #[cfg(test)]
+        pause_before_completion_rotation(&inner).await;
+        let successor = promote_pending(&inner, &job);
+        drop(analyze_guard);
+        if let Some(successor) = successor {
+            spawn_supervised_job(
+                inner,
+                successor.job,
+                successor.sink,
+                successor.analyze_guard,
+            );
+        }
+    });
+}
+
+fn promote_pending(inner: &ServerInner, job: &AnalyzeJob) -> Option<PendingAnalyze> {
+    let mut slot = inner.analyze_slot.write();
+    assert!(
+        slot.current
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), job)),
+        "only the current job's supervisor may promote the analyze FIFO"
+    );
+    slot.current_completion_pending = false;
+    if slot.pending.is_empty() {
+        return None;
+    }
+    let next = slot
+        .pending
+        .pop_front()
+        .expect("non-empty pending queue must yield its FIFO head");
+    let previous = slot
+        .current
+        .take()
+        .expect("current job identity was checked");
+    archive_terminal(&mut slot, Arc::clone(&previous));
+    slot.previous_terminal = Some(previous);
+    next.job.mark_running();
+    slot.current = Some(Arc::clone(&next.job));
+    slot.current_completion_pending = true;
+    Some(next)
+}
+
+fn archive_terminal(slot: &mut AnalyzeSlot, job: Arc<AnalyzeJob>) {
+    debug_assert!(job.state.read().is_terminal());
+    slot.terminal_history.push_back(job);
+    if slot.terminal_history.len() > TERMINAL_HISTORY_LIMIT {
+        let _ = slot.terminal_history.pop_front();
+    }
+}
+
+fn finish_failed_if_nonterminal(job: &AnalyzeJob, msg: String) {
+    let mut state = job.state.write();
+    if state.is_terminal() {
+        return;
+    }
+    state.status = JobStatus::Failed(msg);
+    state.finished_at = Some(now_nanos_u64());
+    drop(state);
+    job.terminal_changed.notify_waiters();
+}
+
+#[cfg(test)]
+async fn pause_before_completion_rotation(inner: &ServerInner) {
+    let hook = inner.analyze_slot.write().completion_hook.take();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let _ = hook.proceed.await;
+    }
+}
+
+async fn wait_for_terminal(job: &AnalyzeJob) {
+    loop {
+        let notified = job.terminal_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if job.state.read().is_terminal() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// Save the graph to `<dir>/.code-graph-cache.db`. Lifted to a helper so
@@ -914,6 +1014,7 @@ fn debug_write_before_index_lock_marker(path: &std::path::Path) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::indexer::ProgressSink;
     use std::os::fd::AsRawFd;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -938,6 +1039,74 @@ mod tests {
                 std::env::remove_var(self.name);
             }
         }
+    }
+
+    struct PanicSink;
+
+    impl ProgressSink for PanicSink {
+        fn report(&self, _progress: u32, _total: u32, _message: &str) {
+            panic!("test progress sink panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_worker_is_failed_and_promotes_queued_successor() {
+        use code_graph_lang_cpp::CppParser;
+
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("a.cpp"), b"void f() {}\n").unwrap();
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().unwrap()))
+            .unwrap();
+        let server = crate::server::CodeGraphServer::new(registry);
+        let inner = Arc::clone(&server.inner);
+        let path = root.path().to_string_lossy().into_owned();
+        let held_index_lock = inner.index_lock.lock().await;
+
+        let failed = tokio::spawn(analyze_codebase(
+            Arc::clone(&inner),
+            path.clone(),
+            false,
+            Arc::new(PanicSink),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if inner.analyze_slot.read().current.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "panicking job was not admitted before successor kickoff"
+            );
+            tokio::task::yield_now().await;
+        }
+        let successor = analyze_codebase_async(Arc::clone(&inner), path, false)
+            .await
+            .unwrap();
+        let ToolOk::Value(successor) = successor else {
+            panic!("async kickoff must return a response")
+        };
+        assert_eq!(successor.status, "queued");
+        drop(held_index_lock);
+        let failed = failed.await.unwrap();
+        assert!(
+            failed.is_err(),
+            "supervisor must surface a panicked worker as Failed"
+        );
+
+        let successor_job = inner.analyze_slot.read().current.clone().unwrap();
+        wait_for_terminal(&successor_job).await;
+        let slot = inner.analyze_slot.read();
+        assert_eq!(slot.current.as_ref().unwrap().job_id, successor.job_id);
+        assert!(matches!(
+            slot.current.as_ref().unwrap().state.read().status,
+            JobStatus::Completed(_)
+        ));
+        assert!(matches!(
+            slot.previous_terminal.as_ref().unwrap().state.read().status,
+            JobStatus::Failed(_)
+        ));
     }
 
     #[test]

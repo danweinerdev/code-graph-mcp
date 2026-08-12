@@ -1,21 +1,27 @@
-//! Slot + job types for the single-flight analyze model.
+//! Slot + job types for the FIFO analyze model.
 //!
-//! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds at
-//!   most one `Running` job (`current`) plus at most one terminal job
-//!   from the previous run (`previous_terminal`).
+//! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds one
+//!   current job, a FIFO of admitted queued jobs, and at most one terminal
+//!   job from the previous run (`previous_terminal`).
 //! - `AnalyzeJob` is immutable in shape after construction; only its
 //!   inner `state` (a single `PlRwLock<JobMutableState>`) mutates. All
 //!   mutable state lives behind that one lock — no atomics. Held only
 //!   via `Arc<AnalyzeJob>`; `pub(crate)` fields + no `Clone` derive
 //!   keep the Arc-only invariant compiler-enforced.
-//! - `JobStatus` tags the state machine: Running → Completed(result)
+//! - `JobStatus` tags the state machine: Queued → Running → Completed(result)
 //!   or Failed(msg).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
 
 use crate::handlers::analyze::AnalyzeResult;
+use crate::indexer::ProgressSink;
+use crate::server::AnalyzeGuard;
+
+/// Number of displaced terminal jobs retained for job-addressable polling.
+pub(crate) const TERMINAL_HISTORY_LIMIT: usize = 32;
 
 // `is_terminal` is the rotation helper retained for callers who want
 // the predicate without pattern-matching on `JobStatus` directly —
@@ -25,6 +31,36 @@ use crate::handlers::analyze::AnalyzeResult;
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
+    /// Terminal jobs displaced from `current`, oldest first. This retention is
+    /// independent of `previous_terminal`'s one-rotation compatibility view.
+    pub(crate) terminal_history: VecDeque<Arc<AnalyzeJob>>,
+    /// Admitted jobs that have not started, in FIFO admission order. Each
+    /// retains its shutdown-drain guard and original progress sink until a
+    /// terminal current job promotes it.
+    pub(crate) pending: VecDeque<PendingAnalyze>,
+    /// Monotonic issuance floor for job IDs. Wall-clock nanoseconds alone can
+    /// collide when several requests arrive in one clock tick.
+    pub(crate) next_job_id: u64,
+    /// True from installing/promoting `current` until its supervisor has
+    /// performed the terminal slot transition. It prevents admissions from
+    /// racing a terminal-visible worker before that authoritative transition.
+    pub(crate) current_completion_pending: bool,
+    /// Deterministic test-only pause after a worker has written terminal state
+    /// but before its supervisor acquires the slot to rotate/promote.
+    #[cfg(test)]
+    pub(crate) completion_hook: Option<CompletionHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct CompletionHook {
+    pub(crate) reached: tokio::sync::oneshot::Sender<()>,
+    pub(crate) proceed: tokio::sync::oneshot::Receiver<()>,
+}
+
+pub(crate) struct PendingAnalyze {
+    pub(crate) job: Arc<AnalyzeJob>,
+    pub(crate) analyze_guard: AnalyzeGuard,
+    pub(crate) sink: Arc<dyn ProgressSink>,
 }
 
 pub(crate) struct AnalyzeJob {
@@ -33,6 +69,9 @@ pub(crate) struct AnalyzeJob {
     pub(crate) force: bool,
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
+    /// Wakes sync callers waiting for this job's terminal state. Callers arm
+    /// this before checking state, so a terminal transition cannot be lost.
+    pub(crate) terminal_changed: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -66,6 +105,7 @@ pub(crate) struct JobMutableState {
 pub(crate) enum JobStatus {
     #[default]
     Running,
+    Queued,
     Completed(AnalyzeResult),
     Failed(String),
 }
@@ -127,6 +167,26 @@ impl AnalyzeJob {
             force,
             started_at,
             state: PlRwLock::new(JobMutableState::default()),
+            terminal_changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn new_queued(
+        job_id: String,
+        path: String,
+        force: bool,
+        started_at: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            job_id,
+            path,
+            force,
+            started_at,
+            state: PlRwLock::new(JobMutableState {
+                status: JobStatus::Queued,
+                ..JobMutableState::default()
+            }),
+            terminal_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -185,6 +245,12 @@ impl AnalyzeJob {
                 "Analyze complete".to_string()
             }
         };
+    }
+
+    pub(crate) fn mark_running(&self) {
+        let mut s = self.state.write();
+        debug_assert!(matches!(s.status, JobStatus::Queued));
+        s.status = JobStatus::Running;
     }
 }
 
