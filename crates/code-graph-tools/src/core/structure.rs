@@ -703,14 +703,7 @@ pub fn detect_communities(
 ) -> ToolResult<DetectCommunitiesResponse> {
     require_indexed(indexed)?;
 
-    let resolved_granularity = match granularity.filter(|s| !s.is_empty()) {
-        None | Some("file") => "file",
-        Some(other) => {
-            return Err(ToolError(format!(
-                "invalid granularity: {other:?}; expected \"file\""
-            )))
-        }
-    };
+    let resolved_granularity = validate_detect_communities_args(granularity)?;
 
     let resolved_max_iterations = max_iterations.filter(|&n| n != 0).unwrap_or(50).min(500);
     let resolved_members_cap = members_per_community
@@ -786,6 +779,20 @@ pub fn detect_communities(
         degenerate,
     };
     Ok(ToolOk::Value(response))
+}
+
+/// Validate the only fallible community argument before an async kickoff
+/// allocates a job ID. Numeric values retain the synchronous zero/default and
+/// ceiling semantics and therefore need no rejection.
+pub(crate) fn validate_detect_communities_args(
+    granularity: Option<&str>,
+) -> Result<&'static str, ToolError> {
+    match granularity.filter(|s| !s.is_empty()) {
+        None | Some("file") => Ok("file"),
+        Some(other) => Err(ToolError(format!(
+            "invalid granularity: {other:?}; expected \"file\""
+        ))),
+    }
 }
 
 #[cfg(test)]

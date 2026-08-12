@@ -21,7 +21,7 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 
-use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+use crate::analyze_job::{Job, JobKind, JobPhase, JobRequest, JobResult, JobStatus};
 use crate::handlers::analyze::AnalyzeResult;
 use crate::server::ServerInner;
 
@@ -87,6 +87,15 @@ pub struct StatusResult {
     /// full rebuild result" — the difference matters when the user
     /// is verifying a fix that requires a force-reindex to surface.
     pub index_force_built: Option<bool>,
+    /// Snapshot of the global long-running-job slot. Unlike the analyze
+    /// compatibility projection below, this can be any supported job kind.
+    pub job: Option<JobView>,
+    /// Prior terminal in the global slot's one-rotation grace window.
+    pub job_previous_terminal: Option<JobView>,
+    /// Number of all job kinds waiting in FIFO promotion order.
+    pub job_pending_count: u32,
+    /// Pending IDs for all job kinds in FIFO promotion order.
+    pub job_pending_ids: Vec<String>,
     /// Snapshot of the current `analyze_slot.current` job, when any
     /// analyze has ever run (sync or async). `null` before the first
     /// analyze. Serializes as explicit `null` (no
@@ -162,7 +171,91 @@ pub struct AnalyzeJobView {
     /// `finish_completed` / `finish_failed`, treated as historical.
     /// Serializes as an explicit `null` when `None` so clients can
     /// distinguish "no phase yet" from "missing field on an old server".
-    pub current_phase: Option<AnalyzePhase>,
+    pub current_phase: Option<JobPhase>,
+}
+
+/// Generic wire shape for one long-running job. `result` is intentionally
+/// untagged: its JSON is exactly the synchronous response for the job kind.
+#[derive(Debug, Serialize)]
+pub struct JobView {
+    pub job_id: String,
+    pub status: String,
+    /// Analyze compatibility fields remain top-level for every job view.
+    /// Community jobs use their empty/false sentinel values; their actual
+    /// optional arguments are exposed by the additive fields below.
+    pub path: String,
+    pub force: bool,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub progress: u32,
+    pub progress_total: u32,
+    pub progress_message: String,
+    pub error: Option<String>,
+    pub result: Option<JobResult>,
+    pub current_phase: Option<JobPhase>,
+    /// Additive discriminator for generic polling consumers.
+    pub kind: JobKind,
+    /// Community-only request arguments. They remain absent for analyze jobs
+    /// so legacy analyze payloads differ only by the additive `kind` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members_per_community: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+impl JobView {
+    pub(crate) fn from_job(job: &Job) -> Self {
+        let state = job.state.read();
+        let (status, error, result) = match &state.status {
+            JobStatus::Running => ("running".to_string(), None, None),
+            JobStatus::Queued => ("queued".to_string(), None, None),
+            JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
+            JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
+        };
+        let (granularity, max_iterations, members_per_community, limit, offset) = match &job.request
+        {
+            JobRequest::Analyze { .. } => (None, None, None, None, None),
+            JobRequest::DetectCommunities {
+                granularity,
+                max_iterations,
+                members_per_community,
+                limit,
+                offset,
+            } => (
+                granularity.clone(),
+                *max_iterations,
+                *members_per_community,
+                *limit,
+                *offset,
+            ),
+        };
+        Self {
+            job_id: job.job_id.clone(),
+            status,
+            path: job.path.clone(),
+            force: job.force,
+            started_at: format_unix_nanos_rfc3339(job.started_at),
+            finished_at: state.finished_at.map(format_unix_nanos_rfc3339),
+            progress: state.progress,
+            progress_total: state.progress_total,
+            progress_message: state.progress_message.clone(),
+            error,
+            result,
+            current_phase: state.current_phase,
+            kind: job.kind,
+            granularity,
+            max_iterations,
+            members_per_community,
+            limit,
+            offset,
+        }
+    }
 }
 
 impl AnalyzeJobView {
@@ -172,12 +265,17 @@ impl AnalyzeJobView {
     /// are mutually consistent with `progress` / `finished_at`. The
     /// guard is dropped at the end of this scope; the returned view
     /// owns its data and outlives the lock.
-    pub(crate) fn from_job(job: &AnalyzeJob) -> Self {
+    pub(crate) fn from_job(job: &Job) -> Self {
         let state = job.state.read();
         let (status, error, result) = match &state.status {
             JobStatus::Running => ("running".to_string(), None, None),
             JobStatus::Queued => ("queued".to_string(), None, None),
-            JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
+            JobStatus::Completed(JobResult::Analyze(r)) => {
+                ("completed".to_string(), None, Some(r.clone()))
+            }
+            JobStatus::Completed(JobResult::DetectCommunities(_)) => {
+                unreachable!("AnalyzeJobView only projects analyze jobs")
+            }
             JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
         };
         Self {
@@ -300,9 +398,9 @@ mod tests {
     /// snapshot during phase transitions.
     #[test]
     fn analyze_job_view_propagates_current_phase() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+        use crate::analyze_job::{Job, JobPhase};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         let view = AnalyzeJobView::from_job(&job);
         // No phase set yet → `None` (serializes as explicit `null`).
         assert!(
@@ -326,9 +424,9 @@ mod tests {
             st.progress_total = 100;
             st.progress_message = "Parsing: foo.cpp".to_string();
         }
-        job.set_phase(AnalyzePhase::Resolving);
+        job.set_phase(JobPhase::Resolving);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(AnalyzePhase::Resolving));
+        assert_eq!(view.current_phase, Some(JobPhase::Resolving));
         assert_eq!(view.progress, 0, "set_phase resets progress to 0");
         assert_eq!(
             view.progress_total, 100,
@@ -349,9 +447,9 @@ mod tests {
     /// `ProgressSink::report` during cache serialization).
     #[test]
     fn set_phase_persisting_overrides_message_and_total() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+        use crate::analyze_job::{Job, JobPhase};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         // Simulate the tail state of the Resolving phase.
         {
             let mut st = job.state.write();
@@ -359,9 +457,9 @@ mod tests {
             st.progress_total = 63784;
             st.progress_message = "Resolving edges: foo.cpp".to_string();
         }
-        job.set_phase(AnalyzePhase::Persisting);
+        job.set_phase(JobPhase::Persisting);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(AnalyzePhase::Persisting));
+        assert_eq!(view.current_phase, Some(JobPhase::Persisting));
         assert_eq!(view.progress, 0, "persisting starts at 0");
         assert_eq!(
             view.progress_total, 1,
@@ -383,21 +481,21 @@ mod tests {
     /// per phase.
     #[test]
     fn set_phase_sets_default_message_per_phase() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+        use crate::analyze_job::{Job, JobPhase};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         {
             let mut st = job.state.write();
             st.progress_message = "stale".to_string();
         }
 
         for (phase, expected) in [
-            (AnalyzePhase::LoadingCache, "Loading cache from disk"),
-            (AnalyzePhase::Discovering, "Discovering source files"),
-            (AnalyzePhase::Parsing, "Parsing source files"),
-            (AnalyzePhase::Resolving, "Resolving cross-file edges"),
-            (AnalyzePhase::Persisting, "Persisting cache to disk"),
-            (AnalyzePhase::Completed, "Analyze complete"),
+            (JobPhase::LoadingCache, "Loading cache from disk"),
+            (JobPhase::Discovering, "Discovering source files"),
+            (JobPhase::Parsing, "Parsing source files"),
+            (JobPhase::Resolving, "Resolving cross-file edges"),
+            (JobPhase::Persisting, "Persisting cache to disk"),
+            (JobPhase::Completed, "Analyze complete"),
         ] {
             job.set_phase(phase);
             let view = AnalyzeJobView::from_job(&job);
@@ -416,17 +514,17 @@ mod tests {
     /// rendering a progress bar.
     #[test]
     fn set_phase_loading_cache_overrides_total_to_one() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        use crate::analyze_job::{Job, JobPhase};
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         {
             let mut s = job.state.write();
             s.progress = 100;
             s.progress_total = 100;
             s.progress_message = "stale".to_string();
         }
-        job.set_phase(AnalyzePhase::LoadingCache);
+        job.set_phase(JobPhase::LoadingCache);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(AnalyzePhase::LoadingCache));
+        assert_eq!(view.current_phase, Some(JobPhase::LoadingCache));
         assert_eq!(view.progress, 0);
         assert_eq!(view.progress_total, 1);
         assert_eq!(view.progress_message, "Loading cache from disk");
@@ -437,14 +535,14 @@ mod tests {
     /// rule without re-deriving the test from the JSON each time.
     #[test]
     fn analyze_phase_serializes_as_snake_case() {
-        use crate::analyze_job::AnalyzePhase;
+        use crate::analyze_job::JobPhase;
         let cases = [
-            (AnalyzePhase::LoadingCache, "loading_cache"),
-            (AnalyzePhase::Discovering, "discovering"),
-            (AnalyzePhase::Parsing, "parsing"),
-            (AnalyzePhase::Resolving, "resolving"),
-            (AnalyzePhase::Persisting, "persisting"),
-            (AnalyzePhase::Completed, "completed"),
+            (JobPhase::LoadingCache, "loading_cache"),
+            (JobPhase::Discovering, "discovering"),
+            (JobPhase::Parsing, "parsing"),
+            (JobPhase::Resolving, "resolving"),
+            (JobPhase::Persisting, "persisting"),
+            (JobPhase::Completed, "completed"),
         ];
         for (variant, expected) in cases {
             let s = serde_json::to_value(variant).unwrap();
@@ -462,10 +560,10 @@ mod tests {
     /// (not via the worker) so the test stays unit-level.
     #[test]
     fn analyze_job_view_retains_phase_on_failed_terminal() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+        use crate::analyze_job::{Job, JobPhase, JobStatus};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
-        job.set_phase(AnalyzePhase::Parsing);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(JobPhase::Parsing);
         {
             let mut s = job.state.write();
             s.status = JobStatus::Failed("simulated failure".to_string());
@@ -475,7 +573,7 @@ mod tests {
         assert_eq!(view.status, "failed");
         assert_eq!(
             view.current_phase,
-            Some(AnalyzePhase::Parsing),
+            Some(JobPhase::Parsing),
             "failed terminal must retain the last in-flight phase as historical"
         );
         assert_eq!(view.error.as_deref(), Some("simulated failure"));

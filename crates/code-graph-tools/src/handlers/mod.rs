@@ -219,7 +219,7 @@ pub struct Cycle {
 /// `handlers` module's response payloads and tests; clients consume it as
 /// JSON via `CallToolResult`, never as a Rust type. Derive set matches
 /// [`Cycle`] (`Debug`, `Serialize` only — no `Deserialize`).
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Community {
     pub label: String,
     pub size: u32,
@@ -243,7 +243,7 @@ pub struct Community {
 /// Field order after the flattened `Page` fields —
 /// `granularity`, `termination`, `iterations`, `node_count`,
 /// `edge_count`, `degenerate` — is the wire-format contract.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DetectCommunitiesResponse {
     #[serde(flatten)]
     pub page: Page<Community>,
@@ -259,7 +259,7 @@ pub struct DetectCommunitiesResponse {
 /// `"atomized"`; `share_permille` is `Some` only on `"giant"` (absent —
 /// not `null` — on `"atomized"` via `skip_serializing_if`, since an
 /// atomized partition has no single dominant share to report).
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DegenerateInfo {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,7 +302,7 @@ pub struct CouplingBoth {
 /// `skip_serializing_if`) so MCP clients can rely on a stable envelope
 /// shape: `truncated: false` and `next_offset: null` are emitted explicitly
 /// when no truncation occurred.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Page<T: Serialize> {
     pub results: Vec<T>,
     pub total: u32,

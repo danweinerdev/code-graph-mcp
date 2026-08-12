@@ -5,7 +5,7 @@ description: Diagnose the code-graph MCP server — indexed root, graph stats, c
 
 # cg-status — is code-graph healthy and current?
 
-Call `get_status()` for the server/current-FIFO diagnostic. For an async analyze, retain its
+Call `get_status()` for the server/current-FIFO diagnostic. For any async job, retain its
 `job_id` and call `get_job_status(job_id)` as the primary queued/running/terminal poll and result
 retrieval endpoint.
 
@@ -23,16 +23,13 @@ retrieval endpoint.
     - `status: "queued"` or `"running"` → report `progress` / `progress_total` /
       `progress_message` and poll again. Progress is monotonic **within a phase** and resets at
       phase boundaries.
-    - `status: "completed"` → `result` holds the analyze body (`files`, `symbols`, `edges`,
-      `root_path`, `warnings`), structurally/deserializer-compatible and byte-identical to a
-      non-coalesced sync `analyze_codebase` body; a coalesced sync response adds `coalesced_by`.
+    - `status: "completed"` → `result` holds the matching synchronous response: the analyze
+      body (`files`, `symbols`, `edges`, `root_path`, `warnings`) or `DetectCommunitiesResponse`.
     - `status: "failed"` → `error` holds why. `error` and `result` are mutually exclusive.
     - Displaced terminal jobs remain retrievable by ID for a bounded 32-job history; an unknown
       or expired ID is a tool error.
-6. **FIFO diagnostic.** `get_status.analyze_job` is only the single current job;
-    `analyze_job_pending_count` and `analyze_job_pending_ids` show queued jobs in promotion
-    order. `analyze_job_previous_terminal` is the prior terminal job preserved across one
-    rotation for compatibility.
+6. **FIFO diagnostic.** Generic `get_status.job`, `job_pending_count`, and `job_pending_ids`
+     cover every job kind. `analyze_job*` remains the analyze-only compatibility projection.
 
 The two `get_status` job-view fields serialize as explicit `null` when absent, so a `null` means
 "no analyze yet", while a missing field means an older server.

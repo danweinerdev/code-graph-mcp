@@ -42,7 +42,7 @@ pub(crate) use crate::core::analyze::{finish_completed, finish_failed, JobAwareP
 // Gated to test builds only so a normal build doesn't warn on unused
 // imports.
 #[cfg(test)]
-use crate::analyze_job::{AnalyzeJob, JobStatus};
+use crate::analyze_job::{Job, JobStatus};
 #[cfg(test)]
 use code_graph_core::paths;
 #[cfg(test)]
@@ -206,16 +206,19 @@ pub async fn analyze_codebase_async(
     )
 }
 
-/// Wire shape of the `analyze_codebase_async` kickoff response.
+/// Shared wire shape for long-running-job kickoff responses.
 /// `< 1KB` by construction — five fields, no nested payload.
 #[derive(Debug, Serialize)]
-pub struct AsyncKickoffResponse {
+pub struct JobKickoffResponse {
     pub job_id: String,
     pub status: &'static str,
     pub started_at: String,
     pub existing: bool,
     pub note: &'static str,
 }
+
+/// Analyze compatibility name for the shared kickoff response.
+pub type AsyncKickoffResponse = JobKickoffResponse;
 
 /// `analyze_codebase` normally returns its established result body. A sync
 /// request admitted behind already-pending work returns the bounded async
@@ -272,9 +275,9 @@ mod tests {
     /// `get_status` polling.
     #[tokio::test]
     async fn transition_to_emits_phase_boundary_notification() {
-        use crate::analyze_job::AnalyzePhase;
+        use crate::analyze_job::JobPhase;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::indexer::ProgressEvent>(8);
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         // Seed prior phase state to verify set_phase's reset
         // semantics carry through transition_to.
         {
@@ -288,11 +291,11 @@ mod tests {
             job: Arc::clone(&job),
         };
 
-        sink.transition_to(AnalyzePhase::Resolving);
+        sink.transition_to(JobPhase::Resolving);
 
         // Post-condition 1: job state reflects the phase transition.
         let s = job.state.read();
-        assert_eq!(s.current_phase, Some(AnalyzePhase::Resolving));
+        assert_eq!(s.current_phase, Some(JobPhase::Resolving));
         assert_eq!(s.progress, 0, "set_phase resets progress");
         assert_eq!(
             s.progress_total, 100,
@@ -321,9 +324,9 @@ mod tests {
     /// stream during cache serialization.
     #[tokio::test]
     async fn transition_to_persisting_emits_synthetic_one_of_one() {
-        use crate::analyze_job::AnalyzePhase;
+        use crate::analyze_job::JobPhase;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::indexer::ProgressEvent>(8);
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         {
             let mut s = job.state.write();
             s.progress = 63784;
@@ -335,7 +338,7 @@ mod tests {
             job: Arc::clone(&job),
         };
 
-        sink.transition_to(AnalyzePhase::Persisting);
+        sink.transition_to(JobPhase::Persisting);
 
         let evt = rx
             .try_recv()
@@ -570,7 +573,7 @@ mod tests {
         // `current_phase: Completed`.
         assert_eq!(
             state.current_phase,
-            Some(crate::analyze_job::AnalyzePhase::Completed),
+            Some(crate::analyze_job::JobPhase::Completed),
             "successful terminal must carry the explicit Completed indicator; got {:?}",
             state.current_phase
         );
@@ -611,7 +614,7 @@ mod tests {
     /// much, to assert this.
     #[tokio::test]
     async fn analyze_force_root_scope_skips_cache_load_phase() {
-        use crate::analyze_job::AnalyzePhase;
+        use crate::analyze_job::JobPhase;
 
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.cpp"), b"void f() {}\n").unwrap();
@@ -649,7 +652,7 @@ mod tests {
         // the analyze is done.
         assert_eq!(
             state.current_phase,
-            Some(AnalyzePhase::Completed),
+            Some(JobPhase::Completed),
             "successful terminal must land on Completed; got {:?}",
             state.current_phase
         );
@@ -664,12 +667,12 @@ mod tests {
     /// cross-field coherence check needed.
     #[test]
     fn finish_completed_atomically_stamps_completed_phase() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+        use crate::analyze_job::{Job, JobPhase, JobStatus};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
         // Seed mid-flight state to verify finish_completed overrides
         // everything cleanly.
-        job.set_phase(AnalyzePhase::Persisting);
+        job.set_phase(JobPhase::Persisting);
         {
             let mut s = job.state.write();
             s.progress = 0;
@@ -688,7 +691,7 @@ mod tests {
 
         let s = job.state.read();
         assert!(matches!(s.status, JobStatus::Completed(_)));
-        assert_eq!(s.current_phase, Some(AnalyzePhase::Completed));
+        assert_eq!(s.current_phase, Some(JobPhase::Completed));
         assert_eq!(s.progress, 1);
         assert_eq!(s.progress_total, 1);
         assert_eq!(s.progress_message, "Analyze complete");
@@ -701,10 +704,10 @@ mod tests {
     /// localize the failure to its originating phase.
     #[test]
     fn finish_failed_preserves_in_flight_phase() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+        use crate::analyze_job::{Job, JobPhase, JobStatus};
 
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
-        job.set_phase(AnalyzePhase::Parsing);
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(JobPhase::Parsing);
 
         finish_failed(&job, "boom".to_string());
 
@@ -712,7 +715,7 @@ mod tests {
         assert!(matches!(s.status, JobStatus::Failed(_)));
         assert_eq!(
             s.current_phase,
-            Some(AnalyzePhase::Parsing),
+            Some(JobPhase::Parsing),
             "failed terminal must NOT stamp Completed; should retain Parsing"
         );
     }
@@ -738,7 +741,7 @@ mod tests {
     /// signal that the optimization fired.
     #[tokio::test]
     async fn analyze_slow_path_with_stale_file_reuses_probe() {
-        use crate::analyze_job::{AnalyzePhase, JobStatus};
+        use crate::analyze_job::{JobPhase, JobStatus};
 
         let dir = TempDir::new().unwrap();
         let a_cpp = dir.path().join("a.cpp");
@@ -783,7 +786,7 @@ mod tests {
             .expect("analyze must install a slot.current entry");
         let state = current.state.read();
         assert!(matches!(state.status, JobStatus::Completed(_)));
-        assert_eq!(state.current_phase, Some(AnalyzePhase::Completed));
+        assert_eq!(state.current_phase, Some(JobPhase::Completed));
         drop(state);
         drop(slot);
 
@@ -990,9 +993,9 @@ mod tests {
     /// CI failure with a clear pointer.
     #[test]
     fn loading_cache_phase_message_pinned() {
-        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
-        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
-        job.set_phase(AnalyzePhase::LoadingCache);
+        use crate::analyze_job::{Job, JobPhase};
+        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(JobPhase::LoadingCache);
         let s = job.state.read();
         assert_eq!(s.progress_message, "Loading cache from disk");
         assert_eq!(s.progress_total, 1);
@@ -1005,7 +1008,7 @@ mod tests {
         // about queue admission and the status projection, not index speed.
         let server = server_with_cpp_parser();
         let inner = server.inner.clone();
-        let synthetic = AnalyzeJob::new_running(
+        let synthetic = Job::new_running(
             "00000000000000000001".to_string(),
             "/tmp".to_string(),
             false,
@@ -1293,11 +1296,14 @@ mod tests {
             .expect("sync analyze must install a slot.current entry");
         let state = current.state.read();
         match &state.status {
-            JobStatus::Completed(result) => {
+            JobStatus::Completed(crate::analyze_job::JobResult::Analyze(result)) => {
                 assert_eq!(
                     result.files, 1,
                     "Completed result.files should match the 1-file fixture"
                 );
+            }
+            JobStatus::Completed(crate::analyze_job::JobResult::DetectCommunities(_)) => {
+                panic!("analyze fixture must not retain a community result")
             }
             JobStatus::Running => {
                 panic!("sync analyze returned with slot still Running — terminal write missed")
@@ -1652,7 +1658,10 @@ mod tests {
             panic!("coverer status must be structured")
         };
         assert_eq!(
-            stored.result.and_then(|result| result.coalesced_by),
+            stored.result.and_then(|result| match result {
+                crate::analyze_job::JobResult::Analyze(result) => result.coalesced_by,
+                crate::analyze_job::JobResult::DetectCommunities(_) => None,
+            }),
             None,
             "coalesced_by belongs only to the synchronous caller's cloned result"
         );
@@ -1707,7 +1716,13 @@ mod tests {
         let crate::core::ToolOk::Value(stored) = stored else {
             panic!("pending coverer status must be structured")
         };
-        assert_eq!(stored.result.and_then(|result| result.coalesced_by), None);
+        assert_eq!(
+            stored.result.and_then(|result| match result {
+                crate::analyze_job::JobResult::Analyze(result) => result.coalesced_by,
+                crate::analyze_job::JobResult::DetectCommunities(_) => None,
+            }),
+            None
+        );
         wait_for_job_terminal(inner.clone(), &first_id).await;
         wait_for_job_terminal(inner, &pending_id).await;
     }
@@ -1848,7 +1863,7 @@ mod tests {
             invocation_path: canonical.clone(),
             project_root: canonical,
         };
-        let coverer = AnalyzeJob::new_running_with_coverage(
+        let coverer = Job::new_running_with_coverage(
             "coverer".to_string(),
             dir.path().to_string_lossy().into_owned(),
             false,

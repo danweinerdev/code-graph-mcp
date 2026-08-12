@@ -1,12 +1,12 @@
-//! Slot + job types for the FIFO analyze model.
+//! Shared FIFO slot + job types for long-running server work.
 //!
-//! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds one
+//! - `JobSlot` lives in a `PlRwLock` on `ServerInner` and holds one
 //!   current job, a FIFO of admitted queued jobs, and at most one terminal
 //!   job from the previous run (`previous_terminal`).
-//! - `AnalyzeJob` is immutable in shape after construction; only its
+//! - `Job` is immutable in shape after construction; only its
 //!   inner `state` (a single `PlRwLock<JobMutableState>`) mutates. All
 //!   mutable state lives behind that one lock — no atomics. Held only
-//!   via `Arc<AnalyzeJob>`; `pub(crate)` fields + no `Clone` derive
+//!   via `Arc<Job>`; `pub(crate)` fields + no `Clone` derive
 //!   keep the Arc-only invariant compiler-enforced.
 //! - `JobStatus` tags the state machine: Queued → Running → Completed(result)
 //!   or Failed(msg).
@@ -18,8 +18,44 @@ use std::sync::Arc;
 use parking_lot::RwLock as PlRwLock;
 
 use crate::handlers::analyze::AnalyzeResult;
+use crate::handlers::DetectCommunitiesResponse;
 use crate::indexer::ProgressSink;
-use crate::server::AnalyzeGuard;
+use crate::server::JobGuard;
+
+/// The operation a retained job executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Analyze,
+    DetectCommunities,
+}
+
+/// Typed, public-safe request retained with a job. Runtime-only settings such
+/// as the configured response byte budget deliberately do not appear here.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "request_kind", rename_all = "snake_case")]
+pub enum JobRequest {
+    Analyze {
+        path: String,
+        force: bool,
+    },
+    DetectCommunities {
+        granularity: Option<String>,
+        max_iterations: Option<u32>,
+        members_per_community: Option<u32>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    },
+}
+
+/// Terminal payload retained for generic polling. Untagged serialization keeps
+/// each `result` value byte-for-byte the synchronous tool response shape.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum JobResult {
+    Analyze(AnalyzeResult),
+    DetectCommunities(DetectCommunitiesResponse),
+}
 
 /// Number of displaced terminal jobs retained for job-addressable polling.
 pub(crate) const TERMINAL_HISTORY_LIMIT: usize = 32;
@@ -29,16 +65,16 @@ pub(crate) const TERMINAL_HISTORY_LIMIT: usize = 32;
 // kept for future use even though both handlers currently inline the
 // `matches!` check at their call sites.
 #[derive(Default)]
-pub(crate) struct AnalyzeSlot {
-    pub(crate) current: Option<Arc<AnalyzeJob>>,
-    pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
+pub(crate) struct JobSlot {
+    pub(crate) current: Option<Arc<Job>>,
+    pub(crate) previous_terminal: Option<Arc<Job>>,
     /// Terminal jobs displaced from `current`, oldest first. This retention is
     /// independent of `previous_terminal`'s one-rotation compatibility view.
-    pub(crate) terminal_history: VecDeque<Arc<AnalyzeJob>>,
+    pub(crate) terminal_history: VecDeque<Arc<Job>>,
     /// Admitted jobs that have not started, in FIFO admission order. Each
     /// retains its shutdown-drain guard and original progress sink until a
     /// terminal current job promotes it.
-    pub(crate) pending: VecDeque<PendingAnalyze>,
+    pub(crate) pending: VecDeque<PendingJob>,
     /// Monotonic issuance floor for job IDs. Wall-clock nanoseconds alone can
     /// collide when several requests arrive in one clock tick.
     pub(crate) next_job_id: u64,
@@ -50,6 +86,10 @@ pub(crate) struct AnalyzeSlot {
     /// but before its supervisor acquires the slot to rotate/promote.
     #[cfg(test)]
     pub(crate) completion_hook: Option<CompletionHook>,
+    /// Deterministic worker-panic injection for the generic community-job
+    /// supervisor regression test. Consumed once by the worker.
+    #[cfg(test)]
+    pub(crate) panic_next_community_job: bool,
 }
 
 #[cfg(test)]
@@ -58,14 +98,16 @@ pub(crate) struct CompletionHook {
     pub(crate) proceed: tokio::sync::oneshot::Receiver<()>,
 }
 
-pub(crate) struct PendingAnalyze {
-    pub(crate) job: Arc<AnalyzeJob>,
-    pub(crate) analyze_guard: AnalyzeGuard,
+pub(crate) struct PendingJob {
+    pub(crate) job: Arc<Job>,
+    pub(crate) job_guard: JobGuard,
     pub(crate) sink: Arc<dyn ProgressSink>,
 }
 
-pub(crate) struct AnalyzeJob {
+pub(crate) struct Job {
     pub(crate) job_id: String,
+    pub(crate) kind: JobKind,
+    pub(crate) request: JobRequest,
     /// The caller-supplied path, retained for status and diagnostics.
     pub(crate) path: String,
     /// Coverage identity captured at admission. Besides coalescing coverage,
@@ -76,6 +118,9 @@ pub(crate) struct AnalyzeJob {
     /// path/config to preserve its established error behavior.
     pub(crate) coverage: Option<CoverageIdentity>,
     pub(crate) force: bool,
+    /// Response budget captured at community-job admission so queued work has
+    /// the same inputs it had at kickoff, even if a later analyze reloads TOML.
+    pub(crate) max_bytes: usize,
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
     /// Wakes sync callers waiting for this job's terminal state. Callers arm
@@ -116,7 +161,7 @@ pub(crate) struct JobMutableState {
     /// `ProgressSink::report`. Terminal jobs leave the field at whatever
     /// the last set value was — clients reading `status == "completed"`
     /// (or "failed") should treat `current_phase` as historical.
-    pub(crate) current_phase: Option<AnalyzePhase>,
+    pub(crate) current_phase: Option<JobPhase>,
 }
 
 #[derive(Default)]
@@ -124,7 +169,7 @@ pub(crate) enum JobStatus {
     #[default]
     Running,
     Queued,
-    Completed(AnalyzeResult),
+    Completed(JobResult),
     Failed(String),
 }
 
@@ -137,7 +182,7 @@ pub(crate) enum JobStatus {
 /// duplicated here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AnalyzePhase {
+pub enum JobPhase {
     /// rkyv cache file is being deserialized from disk before the
     /// real work begins. On UE-scale projects the cache is multi-GB
     /// and this can take minutes; without a distinct phase polling
@@ -170,9 +215,11 @@ pub enum AnalyzePhase {
     /// failure happened; `Completed` is reserved for successful
     /// terminals.
     Completed,
+    /// Whole-graph label propagation for `detect_communities_async`.
+    DetectingCommunities,
 }
 
-impl AnalyzeJob {
+impl Job {
     #[cfg(test)]
     pub(crate) fn new_running(
         job_id: String,
@@ -192,9 +239,15 @@ impl AnalyzeJob {
     ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
+            kind: JobKind::Analyze,
+            request: JobRequest::Analyze {
+                path: path.clone(),
+                force,
+            },
             path,
             coverage,
             force,
+            max_bytes: 0,
             started_at,
             state: PlRwLock::new(JobMutableState::default()),
             terminal_changed: tokio::sync::Notify::new(),
@@ -220,9 +273,15 @@ impl AnalyzeJob {
     ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
+            kind: JobKind::Analyze,
+            request: JobRequest::Analyze {
+                path: path.clone(),
+                force,
+            },
             path,
             coverage,
             force,
+            max_bytes: 0,
             started_at,
             state: PlRwLock::new(JobMutableState {
                 status: JobStatus::Queued,
@@ -230,6 +289,37 @@ impl AnalyzeJob {
             }),
             terminal_changed: tokio::sync::Notify::new(),
         })
+    }
+
+    pub(crate) fn new_running_communities(
+        job_id: String,
+        request: JobRequest,
+        started_at: u64,
+        max_bytes: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            job_id,
+            kind: JobKind::DetectCommunities,
+            request,
+            path: String::new(),
+            coverage: None,
+            force: false,
+            max_bytes,
+            started_at,
+            state: PlRwLock::new(JobMutableState::default()),
+            terminal_changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn new_queued_communities(
+        job_id: String,
+        request: JobRequest,
+        started_at: u64,
+        max_bytes: usize,
+    ) -> Arc<Self> {
+        let job = Self::new_running_communities(job_id, request, started_at, max_bytes);
+        job.state.write().status = JobStatus::Queued;
+        job
     }
 
     /// Transition the job into a new indexing phase atomically with
@@ -254,12 +344,12 @@ impl AnalyzeJob {
     /// Without this special-case, the client would see the stale
     /// `"Resolving edges: <last file>"` message and the resolving
     /// counter for the entire persist window.
-    pub(crate) fn set_phase(&self, phase: AnalyzePhase) {
+    pub(crate) fn set_phase(&self, phase: JobPhase) {
         let mut s = self.state.write();
         s.current_phase = Some(phase);
         s.progress = 0;
         s.progress_message = match phase {
-            AnalyzePhase::LoadingCache => {
+            JobPhase::LoadingCache => {
                 // No per-step report fires during rkyv deserialization,
                 // so this is the only message the client sees for the
                 // duration of the load. Synthetic `(0, 1)` totals
@@ -269,14 +359,14 @@ impl AnalyzeJob {
                 s.progress_total = 1;
                 "Loading cache from disk".to_string()
             }
-            AnalyzePhase::Discovering => "Discovering source files".to_string(),
-            AnalyzePhase::Parsing => "Parsing source files".to_string(),
-            AnalyzePhase::Resolving => "Resolving cross-file edges".to_string(),
-            AnalyzePhase::Persisting => {
+            JobPhase::Discovering => "Discovering source files".to_string(),
+            JobPhase::Parsing => "Parsing source files".to_string(),
+            JobPhase::Resolving => "Resolving cross-file edges".to_string(),
+            JobPhase::Persisting => {
                 s.progress_total = 1;
                 "Persisting cache to disk".to_string()
             }
-            AnalyzePhase::Completed => {
+            JobPhase::Completed => {
                 // Terminal stamp. Set both numerator and denominator
                 // to 1 so a progress-bar UI renders 100%; the message
                 // names the terminal explicitly so clients reading
@@ -285,6 +375,10 @@ impl AnalyzeJob {
                 s.progress = 1;
                 s.progress_total = 1;
                 "Analyze complete".to_string()
+            }
+            JobPhase::DetectingCommunities => {
+                s.progress_total = 1;
+                "Detecting file communities".to_string()
             }
         };
     }

@@ -45,7 +45,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::analyze_job::AnalyzeSlot;
+use crate::analyze_job::JobSlot;
 use crate::handlers;
 
 /// Active filesystem-watcher state stored on [`ServerInner::watch`].
@@ -80,7 +80,7 @@ pub struct PersistCoordinator {
 }
 
 struct PersistState {
-    analyze_closed: bool,
+    job_closed: bool,
     connection_closed: bool,
     persist_closed: bool,
     watch_cleanup_closed: bool,
@@ -91,7 +91,7 @@ struct PersistState {
     /// Every connection/analyze begin and drop advances this value. The idle
     /// waiter uses it as an epoch so any activity restarts its full interval.
     lifecycle_generation: u64,
-    analyses: u32,
+    jobs: u32,
     connections: u32,
     persists: u32,
     watch_cleanups: u32,
@@ -101,13 +101,13 @@ impl PersistCoordinator {
     pub fn new() -> Self {
         Self {
             state: parking_lot::Mutex::new(PersistState {
-                analyze_closed: false,
+                job_closed: false,
                 connection_closed: false,
                 persist_closed: false,
                 watch_cleanup_closed: false,
                 idle_claimed: false,
                 lifecycle_generation: 0,
-                analyses: 0,
+                jobs: 0,
                 connections: 0,
                 persists: 0,
                 watch_cleanups: 0,
@@ -116,19 +116,27 @@ impl PersistCoordinator {
         }
     }
 
-    /// Atomically admit an analyze pipeline. Detached workers retain the
-    /// owned guard until their full parse/resolve/persist pipeline ends.
-    pub fn begin_analyze(self: &Arc<Self>) -> Result<AnalyzeGuard, &'static str> {
+    /// Atomically admit a long-running job. Detached workers retain the owned
+    /// guard until their full pipeline ends.
+    pub fn begin_job(self: &Arc<Self>) -> Result<JobGuard, &'static str> {
         let mut state = self.state.lock();
-        if state.analyze_closed {
-            return Err("daemon shutdown in progress; new analyze jobs are not accepted");
+        if state.job_closed {
+            return Err("daemon shutdown in progress; new jobs are not accepted");
         }
-        state.analyses += 1;
+        state.jobs += 1;
         state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
         self.changed.notify_waiters();
-        Ok(AnalyzeGuard {
+        Ok(JobGuard {
             coordinator: Arc::clone(self),
         })
+    }
+
+    /// Compatibility admission wrapper for analyze-only callers. New generic
+    /// job machinery uses [`Self::begin_job`]; preserve this established error
+    /// wording for existing analyze call paths.
+    pub fn begin_analyze(self: &Arc<Self>) -> Result<JobGuard, &'static str> {
+        self.begin_job()
+            .map_err(|_| "daemon shutdown in progress; new analyze jobs are not accepted")
     }
 
     /// Atomically admit an MCP connection. The returned guard spans the
@@ -179,7 +187,7 @@ impl PersistCoordinator {
     /// `watch_start` checks this while holding its watch-state write lock so
     /// shutdown can close admission before taking that lock.
     pub fn analyze_admission_closed(&self) -> bool {
-        self.state.lock().analyze_closed
+        self.state.lock().job_closed
     }
 
     /// Close connection and analyze admission without waiting for work that is
@@ -187,7 +195,7 @@ impl PersistCoordinator {
     /// its listener; the normal graceful-shutdown drain performs the waits.
     pub fn close_admission(&self) {
         let mut state = self.state.lock();
-        state.analyze_closed = true;
+        state.job_closed = true;
         state.connection_closed = true;
         self.changed.notify_waiters();
     }
@@ -216,7 +224,7 @@ impl PersistCoordinator {
                 if state.idle_claimed {
                     return false;
                 }
-                if state.connections != 0 || state.analyses != 0 {
+                if state.connections != 0 || state.jobs != 0 {
                     None
                 } else {
                     Some(state.lifecycle_generation)
@@ -233,12 +241,12 @@ impl PersistCoordinator {
                     let mut state = self.state.lock();
                     if !state.idle_claimed
                         && state.connections == 0
-                        && state.analyses == 0
+                        && state.jobs == 0
                         && state.lifecycle_generation == generation
                     {
                         state.idle_claimed = true;
                         state.connection_closed = true;
-                        state.analyze_closed = true;
+                        state.job_closed = true;
                         self.changed.notify_waiters();
                         return true;
                     }
@@ -257,9 +265,9 @@ impl PersistCoordinator {
             notified.as_mut().enable();
             {
                 let mut state = self.state.lock();
-                state.analyze_closed = true;
+                state.job_closed = true;
                 state.connection_closed = true;
-                if state.analyses == 0 {
+                if state.jobs == 0 {
                     return;
                 }
             }
@@ -311,16 +319,16 @@ impl Default for PersistCoordinator {
     }
 }
 
-/// RAII admission for an entire analyze pipeline.
-pub struct AnalyzeGuard {
+/// RAII admission for one long-running job.
+pub struct JobGuard {
     coordinator: Arc<PersistCoordinator>,
 }
 
-impl Drop for AnalyzeGuard {
+impl Drop for JobGuard {
     fn drop(&mut self) {
         let mut state = self.coordinator.state.lock();
-        debug_assert!(state.analyses > 0, "analyze guard must hold an active slot");
-        state.analyses -= 1;
+        debug_assert!(state.jobs > 0, "job guard must hold an active slot");
+        state.jobs -= 1;
         state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
         self.coordinator.changed.notify_waiters();
     }
@@ -446,10 +454,10 @@ pub struct ServerInner {
     /// FIFO slot for analyze jobs (sync + async): one current job, admitted
     /// pending jobs, and the previous terminal grace-window entry.
     #[allow(dead_code)]
-    pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
+    pub(crate) analyze_slot: PlRwLock<JobSlot>,
 }
 
-/// MCP server exposing the code graph through 23 tools.
+/// MCP server exposing the code graph through 24 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -488,7 +496,7 @@ impl CodeGraphServer {
                 index_built_at: AtomicU64::new(0),
                 index_force_built: AtomicBool::new(false),
                 persist: Arc::new(PersistCoordinator::new()),
-                analyze_slot: PlRwLock::new(AnalyzeSlot::default()),
+                analyze_slot: PlRwLock::new(JobSlot::default()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -731,7 +739,7 @@ pub struct AnalyzeCodebaseAsyncArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetJobStatusArgs {
-    #[schemars(description = "Required analyze job identifier returned by analyze_codebase_async")]
+    #[schemars(description = "Required long-running job identifier returned by an async kickoff")]
     pub job_id: String,
 }
 
@@ -2091,6 +2099,28 @@ impl CodeGraphServer {
     }
 
     #[tool(
+        description = "Kick off whole-graph file community detection and return immediately (< 1KB, sub-second). Args match `detect_communities`: `granularity` defaults to \"file\" (the only supported value); `max_iterations` defaults to 50 (max 500, 0 uses default); `members_per_community` defaults to 10 (max 100, 0 uses default); `limit` defaults to 100 (max 1000, 0 uses default); `offset` defaults to 0. Requires an index and validates arguments before issuing a job. Returns `{ job_id, status, started_at, existing, note }`, where status is `\"running\"` or `\"queued\"`. Poll `get_job_status(job_id)` for the bare generic JobView and its terminal `result`, which is byte-identical to synchronous `DetectCommunitiesResponse`; use `get_status` for the shared FIFO diagnostic. Prefer this form on large graphs where a synchronous client wall-clock timeout could fire."
+    )]
+    async fn detect_communities_async(
+        &self,
+        Parameters(args): Parameters<DetectCommunitiesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(crate::core::to_call_tool_result(
+            crate::core::analyze::detect_communities_async(
+                self.inner.clone(),
+                args.granularity,
+                args.max_iterations,
+                args.members_per_community,
+                args.limit,
+                args.offset,
+            ),
+        ))
+    }
+
+    #[tool(
         description = "Generate a graph diagram: call graph (`symbol=`), file dependencies \
                        (`file=`), or inheritance tree (`class=`). Provide EXACTLY ONE of \
                        `symbol`/`file`/`class` (empty strings count as absent); zero or more \
@@ -2203,6 +2233,9 @@ impl CodeGraphServer {
                        actually running before debugging behaviour, and to confirm config discovery picked \
                        up the toml you expected. \
                        \
+                        Generic `job` / `job_previous_terminal` / `job_pending_count` / \
+                        `job_pending_ids` expose the shared FIFO for every long-running kind. \
+                        Existing `analyze_job*` fields are analyze-only compatibility projections. \
                         When an analyze is in flight or recently terminated, `analyze_job` carries \
                        `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
                        progress_message, error?, result?, current_phase }`. \
@@ -2220,14 +2253,14 @@ impl CodeGraphServer {
                        historical value on terminal jobs (the phase that was active when the worker \
                        reached terminal); for terminal liveness use `status` not `current_phase`. \
                        Emits explicit `null` until the worker enters its first phase. \
-                        `analyze_job` remains the single current/running job; FIFO-admitted \
-                        waiting jobs are exposed only by `analyze_job_pending_count` and \
+                         `analyze_job` is the current job only when the shared slot's current kind is analyze; \
+                         it is null while a non-analyze job is current. FIFO-admitted analyze jobs are exposed by `analyze_job_pending_count` and \
                         `analyze_job_pending_ids` (in promotion order). A queued job's kickoff \
                         response reports `status: \"queued\"`; queued jobs do not have full views \
                          in this response. Use `get_job_status(job_id)` as the primary per-job \
                          polling/retrieval endpoint for queued, running, and terminal jobs; this tool \
-                         remains the current-slot and queue diagnostic. `analyze_job_previous_terminal` \
-                         carries the prior terminal job for exactly one grace-window rotation. Both job-view fields are `null` \
+                          remains the current-slot and queue diagnostic. `analyze_job_previous_terminal` \
+                          carries the latest retained analyze terminal even across intervening non-analyze jobs. Both job-view fields are `null` \
                        before any analyze has ever run, and emit explicit `null` (not absent) so \
                        clients can distinguish \"no analyze ever\" from \"missing field on an old \
                        server\"."
@@ -2240,7 +2273,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Return the status for one analyze job by required `job_id`. Response is the bare `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }` AnalyzeJobView — not a Page or wrapper. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
+        description = "Return the status for one long-running job by required `job_id`. Response is the bare generic `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase, kind, ...community_args }` JobView — not a Page or wrapper. `path` and `force` retain their existing top-level analyze meaning; `kind` is additive (`\"analyze\"` or `\"detect_communities\"`), and optional `granularity`, `max_iterations`, `members_per_community`, `limit`, and `offset` appear only for community jobs. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async` or `detect_communities_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is byte-identical to that kind's synchronous success body. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
     )]
     async fn get_job_status(
         &self,
@@ -2350,6 +2383,34 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), drain)
             .await
             .expect("releasing the queued guard wakes drain")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn community_job_guard_blocks_drain_and_generic_admission() {
+        let coordinator = Arc::new(PersistCoordinator::new());
+        let community_guard = coordinator.begin_job().unwrap();
+        let drain = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move { coordinator.close_analyze_and_wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "an admitted community job must keep graceful daemon drain open"
+        );
+        assert!(matches!(
+            coordinator.begin_job(),
+            Err("daemon shutdown in progress; new jobs are not accepted")
+        ));
+        assert!(matches!(
+            coordinator.begin_analyze(),
+            Err("daemon shutdown in progress; new analyze jobs are not accepted")
+        ));
+        drop(community_guard);
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("releasing the community guard wakes drain")
             .unwrap();
     }
 
@@ -2482,16 +2543,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 23 tools. If a future change adds
+    /// `tools/list` must surface exactly 24 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_three_tools() {
+    fn tool_router_registers_twenty_four_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            23,
-            "expected 23 registered tools, got {}",
+            24,
+            "expected 24 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2532,6 +2593,7 @@ mod tests {
             "get_symbol_at",
             "find_path",
             "detect_communities",
+            "detect_communities_async",
         ] {
             assert!(
                 names.contains(expected),

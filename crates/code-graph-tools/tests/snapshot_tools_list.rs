@@ -1,7 +1,7 @@
 //! Wire-format snapshots of every tool's `tools/list` entry.
 //!
 //! Captures the descriptor returned by
-//! `CodeGraphServer::tool_router().list_all()` for each of the 23 registered
+//! `CodeGraphServer::tool_router().list_all()` for each of the 24 registered
 //! tools. Each entry includes:
 //!
 //! - `name` — the tool name string used by `tools/call` dispatch.
@@ -24,7 +24,7 @@ use code_graph_tools::CodeGraphServer;
 use rmcp::model::Tool;
 
 /// Find a tool descriptor by name. Panics if the tool is missing — the
-/// 23-tool count is locked in by `tool_router_registers_twenty_three_tools`,
+/// 24-tool count is locked in by `tool_router_registers_twenty_four_tools`,
 /// so a missing tool here means a regression.
 fn tool_entry(name: &str) -> Tool {
     let server = CodeGraphServer::new(LanguageRegistry::new());
@@ -117,6 +117,11 @@ fn tools_list_get_coupling() {
 #[test]
 fn tools_list_detect_communities() {
     insta::assert_json_snapshot!(tool_entry("detect_communities"));
+}
+
+#[test]
+fn tools_list_detect_communities_async() {
+    insta::assert_json_snapshot!(tool_entry("detect_communities_async"));
 }
 
 #[test]

@@ -1,15 +1,16 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 153
 expression: "tool_entry(\"get_job_status\")"
 ---
 {
   "name": "get_job_status",
-  "description": "Return the status for one analyze job by required `job_id`. Response is the bare `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }` AnalyzeJobView — not a Page or wrapper. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics.",
+  "description": "Return the status for one long-running job by required `job_id`. Response is the bare generic `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase, kind, ...community_args }` JobView — not a Page or wrapper. `path` and `force` retain their existing top-level analyze meaning; `kind` is additive (`\"analyze\"` or `\"detect_communities\"`), and optional `granularity`, `max_iterations`, `members_per_community`, `limit`, and `offset` appear only for community jobs. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async` or `detect_communities_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is byte-identical to that kind's synchronous success body. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
       "job_id": {
-        "description": "Required analyze job identifier returned by analyze_codebase_async",
+        "description": "Required long-running job identifier returned by an async kickoff",
         "type": "string"
       }
     },

@@ -7,8 +7,9 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::analyze_job::JobKind;
 use crate::core::{ToolError, ToolOk, ToolResult};
-use crate::handlers::status::{format_unix_nanos_rfc3339, AnalyzeJobView, StatusResult};
+use crate::handlers::status::{format_unix_nanos_rfc3339, AnalyzeJobView, JobView, StatusResult};
 use crate::server::ServerInner;
 
 /// `get_status` body. Pure read — no locks held across the return.
@@ -65,22 +66,47 @@ pub fn get_status(inner: Arc<ServerInner>) -> ToolResult<StatusResult> {
     // then drop the guard before walking the job state. Building views
     // outside the slot lock keeps progress writes from contending with
     // polls beyond the constant-time Arc::clone window.
-    let (current_job, previous_terminal_job, analyze_job_pending_count, analyze_job_pending_ids) = {
+    let (current_job, previous_terminal_job, terminal_history, pending) = {
         let slot = inner.analyze_slot.read();
         (
             slot.current.clone(),
             slot.previous_terminal.clone(),
-            u32::try_from(slot.pending.len()).unwrap_or(u32::MAX),
+            slot.terminal_history.iter().cloned().collect::<Vec<_>>(),
             slot.pending
                 .iter()
-                .map(|pending| pending.job.job_id.clone())
-                .collect(),
+                .map(|pending| Arc::clone(&pending.job))
+                .collect::<Vec<_>>(),
         )
     };
-    let analyze_job = current_job.as_deref().map(AnalyzeJobView::from_job);
-    let analyze_job_previous_terminal = previous_terminal_job
+    let job = current_job.as_deref().map(JobView::from_job);
+    let job_previous_terminal = previous_terminal_job.as_deref().map(JobView::from_job);
+    let job_pending_count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+    let job_pending_ids = pending.iter().map(|job| job.job_id.clone()).collect();
+    let analyze_job = current_job
         .as_deref()
+        .filter(|job| job.kind == JobKind::Analyze)
         .map(AnalyzeJobView::from_job);
+    // Compatibility projection is intentionally not merely the generic
+    // one-rotation terminal: community jobs may intervene between analyses.
+    // Retention is oldest-first, so scan newest-first after the immediate
+    // generic terminal to locate the latest retained analyze terminal.
+    let analyze_job_previous_terminal = previous_terminal_job
+        .iter()
+        .chain(terminal_history.iter().rev())
+        .find(|job| job.kind == JobKind::Analyze)
+        .map(|job| AnalyzeJobView::from_job(job));
+    let analyze_job_pending_count = u32::try_from(
+        pending
+            .iter()
+            .filter(|job| job.kind == JobKind::Analyze)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let analyze_job_pending_ids = pending
+        .iter()
+        .filter(|job| job.kind == JobKind::Analyze)
+        .map(|job| job.job_id.clone())
+        .collect();
 
     let result = StatusResult {
         binary_version,
@@ -96,6 +122,10 @@ pub fn get_status(inner: Arc<ServerInner>) -> ToolResult<StatusResult> {
         index_edges: stats.edges,
         index_built_at,
         index_force_built,
+        job,
+        job_previous_terminal,
+        job_pending_count,
+        job_pending_ids,
         analyze_job,
         analyze_job_previous_terminal,
         analyze_job_pending_count,
@@ -107,7 +137,7 @@ pub fn get_status(inner: Arc<ServerInner>) -> ToolResult<StatusResult> {
 
 /// Return one addressable analyze job. The slot is read once so a displacement
 /// cannot leave a lookup between `current` and terminal retention.
-pub fn get_job_status(inner: Arc<ServerInner>, job_id: String) -> ToolResult<AnalyzeJobView> {
+pub fn get_job_status(inner: Arc<ServerInner>, job_id: String) -> ToolResult<JobView> {
     if job_id.is_empty() {
         return Err(ToolError("'job_id' is required".to_string()));
     }
@@ -140,13 +170,15 @@ pub fn get_job_status(inner: Arc<ServerInner>, job_id: String) -> ToolResult<Ana
     let Some(job) = job else {
         return Err(ToolError(format!("job not found or expired: {job_id:?}")));
     };
-    Ok(ToolOk::Value(AnalyzeJobView::from_job(&job)))
+    Ok(ToolOk::Value(JobView::from_job(&job)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze_job::{AnalyzeJob, JobStatus, PendingAnalyze, TERMINAL_HISTORY_LIMIT};
+    use crate::analyze_job::{
+        Job, JobKind, JobRequest, JobStatus, PendingJob, TERMINAL_HISTORY_LIMIT,
+    };
     use crate::handlers::analyze::AnalyzeResult;
     use crate::server::CodeGraphServer;
     use code_graph_lang::LanguageRegistry;
@@ -179,17 +211,18 @@ mod tests {
         }
     }
 
-    fn completed_job(id: &str) -> std::sync::Arc<AnalyzeJob> {
-        let job = AnalyzeJob::new_running(id.into(), "/completed".into(), false, 1);
+    fn completed_job(id: &str) -> std::sync::Arc<Job> {
+        let job = Job::new_running(id.into(), "/completed".into(), false, 1);
         let mut state = job.state.write();
-        state.status = JobStatus::Completed(AnalyzeResult {
-            files: 1,
-            symbols: 1,
-            edges: 0,
-            root_path: "/completed".into(),
-            warnings: Vec::new(),
-            coalesced_by: None,
-        });
+        state.status =
+            JobStatus::Completed(crate::analyze_job::JobResult::Analyze(AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/completed".into(),
+                warnings: Vec::new(),
+                coalesced_by: None,
+            }));
         state.finished_at = Some(2);
         drop(state);
         job
@@ -198,18 +231,18 @@ mod tests {
     #[test]
     fn get_job_status_finds_queued_running_and_retained_terminals() {
         let server = CodeGraphServer::new(LanguageRegistry::new());
-        let running = AnalyzeJob::new_running("running".into(), "/running".into(), false, 1);
-        let queued = AnalyzeJob::new_queued("queued".into(), "/queued".into(), false, 1);
+        let running = Job::new_running("running".into(), "/running".into(), false, 1);
+        let queued = Job::new_queued("queued".into(), "/queued".into(), false, 1);
         let completed = completed_job("completed");
-        let failed = AnalyzeJob::new_running("failed".into(), "/failed".into(), false, 1);
+        let failed = Job::new_running("failed".into(), "/failed".into(), false, 1);
         failed.state.write().status = JobStatus::Failed("broken".into());
         let guard = server.inner.persist.begin_analyze().unwrap();
         {
             let mut slot = server.inner.analyze_slot.write();
             slot.current = Some(running);
-            slot.pending.push_back(PendingAnalyze {
+            slot.pending.push_back(PendingJob {
                 job: queued,
-                analyze_guard: guard,
+                job_guard: guard,
                 sink: std::sync::Arc::new(crate::indexer::NoopProgressSink),
             });
             slot.previous_terminal = Some(failed);
@@ -277,5 +310,92 @@ mod tests {
             slot.current = None;
         }
         assert!(get_job_status(server.inner.clone(), "atomic".into()).is_ok());
+    }
+
+    fn community_job(id: &str) -> std::sync::Arc<Job> {
+        Job::new_running_communities(
+            id.into(),
+            JobRequest::DetectCommunities {
+                granularity: None,
+                max_iterations: None,
+                members_per_community: None,
+                limit: None,
+                offset: None,
+            },
+            1,
+            1024,
+        )
+    }
+
+    #[test]
+    fn analyze_previous_terminal_skips_intervening_community_job() {
+        let server = CodeGraphServer::new(LanguageRegistry::new());
+        let analyze_previous = completed_job("analyze-previous");
+        let community_previous = community_job("community-previous");
+        community_previous.state.write().status = JobStatus::Failed("community failed".into());
+        let analyze_current =
+            Job::new_running("analyze-current".into(), "/current".into(), true, 3);
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            slot.current = Some(analyze_current);
+            slot.previous_terminal = Some(community_previous);
+            slot.terminal_history.push_back(analyze_previous);
+        }
+
+        let ToolOk::Value(status) = get_status(server.inner.clone()).unwrap() else {
+            panic!("status must return a value")
+        };
+        assert_eq!(
+            status.job_previous_terminal.as_ref().map(|job| job.kind),
+            Some(JobKind::DetectCommunities),
+            "generic projection remains the immediate generic terminal"
+        );
+        assert_eq!(
+            status
+                .analyze_job_previous_terminal
+                .as_ref()
+                .map(|job| job.job_id.as_str()),
+            Some("analyze-previous"),
+            "analyze compatibility projection finds the latest retained analyze terminal"
+        );
+    }
+
+    #[test]
+    fn community_current_is_generic_only_but_keeps_analyze_terminal_projection() {
+        let server = CodeGraphServer::new(LanguageRegistry::new());
+        let analyze_previous = completed_job("analyze-previous");
+        let community_current = community_job("community-current");
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            slot.current = Some(community_current);
+            slot.previous_terminal = Some(analyze_previous);
+        }
+
+        let ToolOk::Value(status) = get_status(server.inner.clone()).unwrap() else {
+            panic!("status must return a value")
+        };
+        assert_eq!(
+            status.job.as_ref().map(|job| job.kind),
+            Some(JobKind::DetectCommunities)
+        );
+        assert!(status.analyze_job.is_none());
+        assert_eq!(
+            status
+                .analyze_job_previous_terminal
+                .as_ref()
+                .map(|job| job.job_id.as_str()),
+            Some("analyze-previous")
+        );
+    }
+
+    #[test]
+    fn generic_job_view_preserves_analyze_top_level_field_order() {
+        let job = Job::new_running("job".into(), "/path".into(), true, 1);
+        let json = serde_json::to_string(&JobView::from_job(&job)).unwrap();
+        let expected_prefix = r#"{"job_id":"job","status":"running","path":"/path","force":true,"started_at":"1970-01-01T00:00:00Z","finished_at":null,"progress":0,"progress_total":0,"progress_message":"","error":null,"result":null,"current_phase":null,"kind":"analyze""#;
+        assert!(
+            json.starts_with(expected_prefix),
+            "analyze fields must remain top-level and ordered before additive generic fields: {json}"
+        );
     }
 }

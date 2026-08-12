@@ -50,7 +50,13 @@ alternative.)
 - Without watch, just call `analyze_codebase` again — mtime incremental keeps it fast.
 - If results look stale right after edits and no watch is running, re-run
   `analyze_codebase` (add `force=true` only if a *config* change is involved;
-  ordinary edits don't need it).
+   ordinary edits don't need it).
+
+## Large whole-graph queries
+
+`detect_communities_async` accepts the same arguments as `detect_communities` but returns a
+sub-second job kickoff. Prefer it for large graphs; poll `get_job_status(job_id)` and use its
+terminal `result`, which is byte-identical to the synchronous community response.
 
 ## Check state
 

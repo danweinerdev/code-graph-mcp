@@ -34,8 +34,8 @@ use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::Graph;
 
 use crate::analyze_job::{
-    covers, AnalyzeJob, AnalyzePhase, AnalyzeSlot, CoverageIdentity, JobStatus, PendingAnalyze,
-    TERMINAL_HISTORY_LIMIT,
+    covers, CoverageIdentity, Job, JobKind, JobPhase, JobRequest, JobResult, JobSlot, JobStatus,
+    PendingJob, TERMINAL_HISTORY_LIMIT,
 };
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{
@@ -49,7 +49,7 @@ use crate::indexer::{
 use crate::server::ServerInner;
 
 /// Wraps any [`ProgressSink`] so each `report()` ALSO writes the latest
-/// progress triple into the owning [`AnalyzeJob`]'s mutable state.
+/// progress triple into the owning [`Job`]'s mutable state.
 /// Fan-out per Design Decision 8: the wrapped sink keeps the existing
 /// throttled peer-notification path intact for sync mode, while the slot
 /// write makes progress observable to `get_status` for both sync and
@@ -61,7 +61,7 @@ use crate::server::ServerInner;
 /// the concrete sinks unit tests construct directly.
 pub(crate) struct JobAwareProgressSink<S: ProgressSink> {
     pub(crate) inner: S,
-    pub(crate) job: Arc<AnalyzeJob>,
+    pub(crate) job: Arc<Job>,
 }
 
 impl<S: ProgressSink> ProgressSink for JobAwareProgressSink<S> {
@@ -81,7 +81,7 @@ impl<S: ProgressSink> ProgressSink for JobAwareProgressSink<S> {
 
 impl<S: ProgressSink> JobAwareProgressSink<S> {
     /// Atomic phase transition + inner-sink emission. Calls
-    /// `AnalyzeJob::set_phase` to mutate job state (which sets the
+    /// `Job::set_phase` to mutate job state (which sets the
     /// phase-specific message and resets `progress`), then pushes a
     /// snapshot of that state through the inner sink so a peer-forwarding
     /// sink observes the phase boundary. Without this push, a peer
@@ -95,7 +95,7 @@ impl<S: ProgressSink> JobAwareProgressSink<S> {
     /// values to `job.state` that `set_phase` already wrote (the read
     /// snapshot ensures the pushed event exactly matches what
     /// `get_status` would return at this instant).
-    pub(crate) fn transition_to(&self, phase: AnalyzePhase) {
+    pub(crate) fn transition_to(&self, phase: JobPhase) {
         self.job.set_phase(phase);
         let (progress, total, message) = {
             let s = self.job.state.read();
@@ -105,7 +105,7 @@ impl<S: ProgressSink> JobAwareProgressSink<S> {
     }
 }
 
-/// Run the analyze pipeline to terminal state on a shared `AnalyzeJob`.
+/// Run the analyze pipeline to terminal state on a shared [`Job`].
 ///
 /// Writes `JobStatus::Completed(AnalyzeResult)` or `JobStatus::Failed(msg)`
 /// into `job.state` before returning; the return type is `()` because all
@@ -119,7 +119,7 @@ impl<S: ProgressSink> JobAwareProgressSink<S> {
 /// vs. watch reindex (Design Decision 1).
 pub(crate) async fn run_analyze_job(
     inner: Arc<ServerInner>,
-    job: Arc<AnalyzeJob>,
+    job: Arc<Job>,
     sink: Arc<dyn ProgressSink>,
 ) {
     let path_raw = job.path.clone();
@@ -236,9 +236,9 @@ pub(crate) async fn run_analyze_job(
     let scope_is_project_root = abs_path == project_root;
     let cache_load_skipped = force && scope_is_project_root;
     if cache_load_skipped {
-        job.set_phase(AnalyzePhase::Discovering);
+        job.set_phase(JobPhase::Discovering);
     } else {
-        job.set_phase(AnalyzePhase::LoadingCache);
+        job.set_phase(JobPhase::LoadingCache);
     }
 
     if project_root != abs_path {
@@ -346,7 +346,7 @@ pub(crate) async fn run_analyze_job(
                     // is false (no save_cache call) so the terminal
                     // phase stays at `Discovering`, matching what
                     // actually happened.
-                    job.set_phase(AnalyzePhase::Persisting);
+                    job.set_phase(JobPhase::Persisting);
                     if let Err(e) = save_cache(&inner, &project_root) {
                         fast_path_warnings.push(format!("cache save failed: {e}"));
                     }
@@ -433,7 +433,7 @@ pub(crate) async fn run_analyze_job(
             // accurate "Loading cache from disk" signal instead of
             // sitting at `discovering, 0/0` for the entire load
             // window — which on multi-GB caches can be minutes.
-            sink.transition_to(AnalyzePhase::LoadingCache);
+            sink.transition_to(JobPhase::LoadingCache);
             eprintln!(
                 "[code-graph] phase: loading cache from {}",
                 project_root_for_pool.display()
@@ -477,7 +477,7 @@ pub(crate) async fn run_analyze_job(
             "[code-graph] phase: discovering + parsing under {}",
             abs_path_for_pool.display()
         );
-        sink.transition_to(AnalyzePhase::Discovering);
+        sink.transition_to(JobPhase::Discovering);
         let phase_start = std::time::Instant::now();
         // `index_directory` starts with a file-walk (Discovering) and
         // then runs the rayon parse pool (Parsing). The first
@@ -491,7 +491,7 @@ pub(crate) async fn run_analyze_job(
         // file-walk. Each `transition_to` ALSO pushes an event
         // through the inner sink, so a peer-forwarding sink observes
         // the phase boundary in addition to the per-file events.
-        sink.transition_to(AnalyzePhase::Parsing);
+        sink.transition_to(JobPhase::Parsing);
         let (mut fresh_graphs, parse_warnings) =
             match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
                 Ok(v) => v,
@@ -505,7 +505,7 @@ pub(crate) async fn run_analyze_job(
         );
 
         eprintln!("[code-graph] phase: resolving edges");
-        sink.transition_to(AnalyzePhase::Resolving);
+        sink.transition_to(JobPhase::Resolving);
         let phase_start = std::time::Instant::now();
         let cached_snapshot = merged_graph.file_graphs_snapshot();
         let mut symbol_index = build_symbol_index(&cached_snapshot);
@@ -623,7 +623,7 @@ pub(crate) async fn run_analyze_job(
                     inner: Arc::clone(&sink),
                     job: Arc::clone(&job),
                 }
-                .transition_to(AnalyzePhase::Persisting);
+                .transition_to(JobPhase::Persisting);
 
                 let save_start = std::time::Instant::now();
                 if let Err(e) = save_cache(&inner, &project_root) {
@@ -668,19 +668,19 @@ pub(crate) async fn run_analyze_job(
 /// message `"Analyze complete"` atomically with the status flip so a
 /// polling client observing `current_phase == "completed"` can treat
 /// the analyze as finished without separately consulting `status`.
-pub(crate) fn finish_completed(job: &AnalyzeJob, result: AnalyzeResult) {
+pub(crate) fn finish_completed(job: &Job, result: AnalyzeResult) {
     let mut s = job.state.write();
-    s.current_phase = Some(AnalyzePhase::Completed);
+    s.current_phase = Some(JobPhase::Completed);
     s.progress = 1;
     s.progress_total = 1;
     s.progress_message = "Analyze complete".to_string();
-    s.status = JobStatus::Completed(result);
+    s.status = JobStatus::Completed(JobResult::Analyze(result));
     s.finished_at = Some(now_nanos_u64());
     drop(s);
     job.terminal_changed.notify_waiters();
 }
 
-pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
+pub(crate) fn finish_failed(job: &Job, msg: String) {
     // Intentionally do NOT touch `current_phase` — leave it at the
     // last in-flight phase so polling clients see WHERE the failure
     // happened (e.g. `current_phase: "parsing"` + `error: "..."`
@@ -725,10 +725,10 @@ pub async fn analyze_codebase(
         let pending_before_admission = !slot.pending.is_empty();
         match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
             Admission::Covered { job, .. } => SyncAdmission::Covered(job),
-            Admission::Queued { job, analyze_guard } => {
-                slot.pending.push_back(PendingAnalyze {
+            Admission::Queued { job, job_guard } => {
+                slot.pending.push_back(PendingJob {
                     job: Arc::clone(&job),
-                    analyze_guard,
+                    job_guard,
                     sink: if pending_before_admission {
                         Arc::new(NoopProgressSink)
                     } else {
@@ -741,8 +741,8 @@ pub async fn analyze_codebase(
                     SyncAdmission::QueuedBlocking(job)
                 }
             }
-            Admission::Running { job, analyze_guard } => {
-                spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, analyze_guard);
+            Admission::Running { job, job_guard } => {
+                spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, job_guard);
                 SyncAdmission::Running(job)
             }
         }
@@ -766,11 +766,12 @@ pub async fn analyze_codebase(
 
     let state = job.state.read();
     match &state.status {
-        JobStatus::Completed(result) => {
+        JobStatus::Completed(JobResult::Analyze(result)) => {
             let mut result = result.clone();
             result.coalesced_by = coalesced_by;
             Ok(ToolOk::Value(SyncAnalyzeResponse::Result(result)))
         }
+        JobStatus::Completed(_) => unreachable!("analyze jobs always retain Analyze results"),
         JobStatus::Failed(msg) => {
             let message = match coalesced_by {
                 Some(coverer_job_id) => format!("{msg} (coalesced_by: {coverer_job_id})"),
@@ -786,10 +787,10 @@ pub async fn analyze_codebase(
 }
 
 enum SyncAdmission {
-    Covered(Arc<AnalyzeJob>),
-    Running(Arc<AnalyzeJob>),
-    QueuedBlocking(Arc<AnalyzeJob>),
-    QueuedImmediate(Arc<AnalyzeJob>),
+    Covered(Arc<Job>),
+    Running(Arc<Job>),
+    QueuedBlocking(Arc<Job>),
+    QueuedImmediate(Arc<Job>),
 }
 
 /// `analyze_codebase_async` body — kickoff that returns in milliseconds
@@ -820,20 +821,20 @@ pub async fn analyze_codebase_async(
         let mut slot = inner.analyze_slot.write();
         match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
             Admission::Covered { job, status } => (job, status, true),
-            Admission::Queued { job, analyze_guard } => {
-                slot.pending.push_back(PendingAnalyze {
+            Admission::Queued { job, job_guard } => {
+                slot.pending.push_back(PendingJob {
                     job: Arc::clone(&job),
-                    analyze_guard,
+                    job_guard,
                     sink: Arc::new(NoopProgressSink),
                 });
                 (job, "queued", false)
             }
-            Admission::Running { job, analyze_guard } => {
+            Admission::Running { job, job_guard } => {
                 spawn_supervised_job(
                     Arc::clone(&inner),
                     Arc::clone(&job),
                     Arc::new(NoopProgressSink),
-                    analyze_guard,
+                    job_guard,
                 );
                 (job, "running", false)
             }
@@ -856,7 +857,84 @@ pub async fn analyze_codebase_async(
     }))
 }
 
-fn queued_kickoff_response(job: &AnalyzeJob) -> AsyncKickoffResponse {
+/// Kick off whole-graph community detection on the shared FIFO. Validation is
+/// complete before admission so bad input never consumes an ID or appears in
+/// status. The server adapter has already enforced indexed state.
+pub(crate) fn detect_communities_async(
+    inner: Arc<ServerInner>,
+    granularity: Option<String>,
+    max_iterations: Option<u32>,
+    members_per_community: Option<u32>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> ToolResult<AsyncKickoffResponse> {
+    crate::core::structure::validate_detect_communities_args(granularity.as_deref())?;
+    let request = JobRequest::DetectCommunities {
+        granularity,
+        max_iterations,
+        members_per_community,
+        limit,
+        offset,
+    };
+    let max_bytes = inner.config.read().response.max_bytes;
+    let job = {
+        let mut slot = inner.analyze_slot.write();
+        let guard = inner
+            .persist
+            .begin_job()
+            .map_err(|message| ToolError(message.to_string()))?;
+        let queued = slot_is_occupied(&slot);
+        let (job_id, started_at) = issue_job_id(&mut slot);
+        let job = if queued {
+            Job::new_queued_communities(job_id, request, started_at, max_bytes)
+        } else {
+            Job::new_running_communities(job_id, request, started_at, max_bytes)
+        };
+        if queued {
+            slot.pending.push_back(PendingJob {
+                job: Arc::clone(&job),
+                job_guard: guard,
+                sink: Arc::new(NoopProgressSink),
+            });
+        } else {
+            // Publish the sole community-work phase before detaching the
+            // worker, so immediate polling has a meaningful nonterminal
+            // progress snapshot rather than a scheduling-dependent null.
+            job.set_phase(JobPhase::DetectingCommunities);
+            if let Some(previous) = slot.current.take() {
+                archive_terminal(&mut slot, Arc::clone(&previous));
+                slot.previous_terminal = Some(previous);
+            }
+            slot.current = Some(Arc::clone(&job));
+            slot.current_completion_pending = true;
+            spawn_supervised_job(
+                Arc::clone(&inner),
+                Arc::clone(&job),
+                Arc::new(NoopProgressSink),
+                guard,
+            );
+        }
+        job
+    };
+    let status = if matches!(job.state.read().status, JobStatus::Queued) {
+        "queued"
+    } else {
+        "running"
+    };
+    Ok(ToolOk::Value(AsyncKickoffResponse {
+        job_id: job.job_id.clone(),
+        status,
+        started_at: format_unix_nanos_rfc3339(job.started_at),
+        existing: false,
+        note: if status == "queued" {
+            "community detection queued — poll get_job_status(job_id) for progress and the terminal result; use get_status for FIFO position"
+        } else {
+            "community detection kicked off — poll get_job_status(job_id) for progress and the terminal result"
+        },
+    }))
+}
+
+fn queued_kickoff_response(job: &Job) -> AsyncKickoffResponse {
     AsyncKickoffResponse {
         job_id: job.job_id.clone(),
         status: "queued",
@@ -868,18 +946,18 @@ fn queued_kickoff_response(job: &AnalyzeJob) -> AsyncKickoffResponse {
 
 enum Admission {
     Covered {
-        job: Arc<AnalyzeJob>,
+        job: Arc<Job>,
         /// Snapshot taken under the slot lock and job state lock. It is never
         /// a terminal state disguised as `running`.
         status: &'static str,
     },
     Running {
-        job: Arc<AnalyzeJob>,
-        analyze_guard: crate::server::AnalyzeGuard,
+        job: Arc<Job>,
+        job_guard: crate::server::JobGuard,
     },
     Queued {
-        job: Arc<AnalyzeJob>,
-        analyze_guard: crate::server::AnalyzeGuard,
+        job: Arc<Job>,
+        job_guard: crate::server::JobGuard,
     },
 }
 
@@ -891,7 +969,7 @@ enum Admission {
 /// established execution-time validation errors.
 fn admit_job(
     inner: &ServerInner,
-    slot: &mut AnalyzeSlot,
+    slot: &mut JobSlot,
     path_raw: String,
     force: bool,
     coverage: Option<CoverageIdentity>,
@@ -899,24 +977,24 @@ fn admit_job(
     // Every request participates in closed admission before it can be
     // coalesced. Covered requests drop this temporary guard below; only newly
     // admitted queued/running jobs retain one through their supervisor.
-    let analyze_guard = inner
+    let job_guard = inner
         .persist
         .begin_analyze()
         .map_err(|message| ToolError(message.to_string()))?;
 
     if let Some(coverage) = coverage.as_ref() {
         if let Some((job, status)) = covering_job(slot, coverage, force) {
-            drop(analyze_guard);
+            drop(job_guard);
             return Ok(Admission::Covered { job, status });
         }
     }
 
     if slot_is_occupied(slot) {
         let job = install_new_queued(slot, path_raw, force, coverage);
-        Ok(Admission::Queued { job, analyze_guard })
+        Ok(Admission::Queued { job, job_guard })
     } else {
         let job = install_new_running(slot, path_raw, force, coverage);
-        Ok(Admission::Running { job, analyze_guard })
+        Ok(Admission::Running { job, job_guard })
     }
 }
 
@@ -937,10 +1015,10 @@ fn coverage_identity(path_raw: &str) -> Option<CoverageIdentity> {
 /// write lock. This follows promotion's slot-then-state lock order, while
 /// terminal writers take only the state lock, so no lock cycle is possible.
 fn covering_job(
-    slot: &AnalyzeSlot,
+    slot: &JobSlot,
     coverage: &CoverageIdentity,
     force: bool,
-) -> Option<(Arc<AnalyzeJob>, &'static str)> {
+) -> Option<(Arc<Job>, &'static str)> {
     let mut candidates = slot
         .current
         .iter()
@@ -964,7 +1042,7 @@ fn covering_job(
     })
 }
 
-fn slot_is_occupied(slot: &AnalyzeSlot) -> bool {
+fn slot_is_occupied(slot: &JobSlot) -> bool {
     slot.current.is_some()
         && !(slot.pending.is_empty()
             && !slot.current_completion_pending
@@ -976,13 +1054,13 @@ fn slot_is_occupied(slot: &AnalyzeSlot) -> bool {
 
 /// Install an immediately-running job. Caller holds the slot write guard.
 fn install_new_running(
-    slot: &mut AnalyzeSlot,
+    slot: &mut JobSlot,
     path: String,
     force: bool,
     coverage: Option<CoverageIdentity>,
-) -> Arc<AnalyzeJob> {
+) -> Arc<Job> {
     let (job_id, started_at) = issue_job_id(slot);
-    let job = AnalyzeJob::new_running_with_coverage(job_id, path, force, started_at, coverage);
+    let job = Job::new_running_with_coverage(job_id, path, force, started_at, coverage);
     if let Some(prev) = slot.current.take() {
         archive_terminal(slot, Arc::clone(&prev));
         slot.previous_terminal = Some(prev);
@@ -994,16 +1072,16 @@ fn install_new_running(
 
 /// Install an admitted queued job. Caller holds the slot write guard.
 fn install_new_queued(
-    slot: &mut AnalyzeSlot,
+    slot: &mut JobSlot,
     path: String,
     force: bool,
     coverage: Option<CoverageIdentity>,
-) -> Arc<AnalyzeJob> {
+) -> Arc<Job> {
     let (job_id, started_at) = issue_job_id(slot);
-    AnalyzeJob::new_queued_with_coverage(job_id, path, force, started_at, coverage)
+    Job::new_queued_with_coverage(job_id, path, force, started_at, coverage)
 }
 
-fn issue_job_id(slot: &mut AnalyzeSlot) -> (String, u64) {
+fn issue_job_id(slot: &mut JobSlot) -> (String, u64) {
     let issued = now_nanos_u64().max(slot.next_job_id);
     slot.next_job_id = issued.saturating_add(1);
     (format!("{issued:020}"), issued)
@@ -1014,31 +1092,102 @@ fn issue_job_id(slot: &mut AnalyzeSlot) -> (String, u64) {
 /// current slot entry.
 fn spawn_supervised_job(
     inner: Arc<ServerInner>,
-    job: Arc<AnalyzeJob>,
+    job: Arc<Job>,
     sink: Arc<dyn ProgressSink>,
-    analyze_guard: crate::server::AnalyzeGuard,
+    job_guard: crate::server::JobGuard,
 ) {
     tokio::spawn(async move {
-        let worker = tokio::spawn(run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink));
+        let worker = tokio::spawn(run_job(Arc::clone(&inner), Arc::clone(&job), sink));
         if let Err(error) = worker.await {
-            finish_failed_if_nonterminal(&job, format!("indexing worker terminated: {error}"));
+            finish_failed_if_nonterminal(
+                &job,
+                format!("{} worker terminated: {error}", job_kind_name(job.kind)),
+            );
         }
         #[cfg(test)]
         pause_before_completion_rotation(&inner).await;
         let successor = promote_pending(&inner, &job);
-        drop(analyze_guard);
+        drop(job_guard);
         if let Some(successor) = successor {
-            spawn_supervised_job(
-                inner,
-                successor.job,
-                successor.sink,
-                successor.analyze_guard,
-            );
+            spawn_supervised_job(inner, successor.job, successor.sink, successor.job_guard);
         }
     });
 }
 
-fn promote_pending(inner: &ServerInner, job: &AnalyzeJob) -> Option<PendingAnalyze> {
+async fn run_job(inner: Arc<ServerInner>, job: Arc<Job>, sink: Arc<dyn ProgressSink>) {
+    match job.kind {
+        JobKind::Analyze => run_analyze_job(inner, job, sink).await,
+        JobKind::DetectCommunities => run_detect_communities_job(inner, job).await,
+    }
+}
+
+async fn run_detect_communities_job(inner: Arc<ServerInner>, job: Arc<Job>) {
+    #[cfg(test)]
+    {
+        let should_panic = {
+            let mut slot = inner.analyze_slot.write();
+            std::mem::take(&mut slot.panic_next_community_job)
+        };
+        assert!(!should_panic, "test community worker panic");
+    }
+    let JobRequest::DetectCommunities {
+        granularity,
+        max_iterations,
+        members_per_community,
+        limit,
+        offset,
+    } = &job.request
+    else {
+        finish_failed(
+            &job,
+            "community job has invalid request payload".to_string(),
+        );
+        return;
+    };
+    job.set_phase(JobPhase::DetectingCommunities);
+    let request = (
+        granularity.clone(),
+        *max_iterations,
+        *members_per_community,
+        *limit,
+        *offset,
+    );
+    let worker_inner = Arc::clone(&inner);
+    let worker_job = Arc::clone(&job);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::core::structure::detect_communities(
+            &worker_inner.graph,
+            true,
+            request.0.as_deref(),
+            request.1,
+            request.2,
+            request.3,
+            request.4,
+            worker_job.max_bytes,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(ToolOk::Value(response))) => {
+            let mut state = job.state.write();
+            state.progress = 1;
+            state.progress_total = 1;
+            state.progress_message = "Community detection complete".to_string();
+            state.status = JobStatus::Completed(JobResult::DetectCommunities(response));
+            state.finished_at = Some(now_nanos_u64());
+            drop(state);
+            job.terminal_changed.notify_waiters();
+        }
+        Ok(Ok(ToolOk::Text(_))) => finish_failed(
+            &job,
+            "community detection returned unexpected text".to_string(),
+        ),
+        Ok(Err(error)) => finish_failed(&job, error.0),
+        Err(error) => finish_failed(&job, format!("community worker terminated: {error}")),
+    }
+}
+
+fn promote_pending(inner: &ServerInner, job: &Job) -> Option<PendingJob> {
     let mut slot = inner.analyze_slot.write();
     assert!(
         slot.current
@@ -1066,7 +1215,7 @@ fn promote_pending(inner: &ServerInner, job: &AnalyzeJob) -> Option<PendingAnaly
     Some(next)
 }
 
-fn archive_terminal(slot: &mut AnalyzeSlot, job: Arc<AnalyzeJob>) {
+fn archive_terminal(slot: &mut JobSlot, job: Arc<Job>) {
     debug_assert!(job.state.read().is_terminal());
     slot.terminal_history.push_back(job);
     if slot.terminal_history.len() > TERMINAL_HISTORY_LIMIT {
@@ -1074,7 +1223,7 @@ fn archive_terminal(slot: &mut AnalyzeSlot, job: Arc<AnalyzeJob>) {
     }
 }
 
-fn finish_failed_if_nonterminal(job: &AnalyzeJob, msg: String) {
+fn finish_failed_if_nonterminal(job: &Job, msg: String) {
     let mut state = job.state.write();
     if state.is_terminal() {
         return;
@@ -1094,7 +1243,7 @@ async fn pause_before_completion_rotation(inner: &ServerInner) {
     }
 }
 
-async fn wait_for_terminal(job: &AnalyzeJob) {
+async fn wait_for_terminal(job: &Job) {
     loop {
         let notified = job.terminal_changed.notified();
         tokio::pin!(notified);
@@ -1103,6 +1252,13 @@ async fn wait_for_terminal(job: &AnalyzeJob) {
             return;
         }
         notified.await;
+    }
+}
+
+fn job_kind_name(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Analyze => "indexing",
+        JobKind::DetectCommunities => "community",
     }
 }
 
@@ -1192,18 +1348,209 @@ mod coalesce {
         crate::server::CodeGraphServer::new(LanguageRegistry::new())
     }
 
-    fn job(id: &str, path: &std::path::Path, force: bool, queued: bool) -> Arc<AnalyzeJob> {
+    #[tokio::test]
+    async fn community_async_kickoff_poll_and_result_match_sync() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        let ToolOk::Value(sync) = crate::core::structure::detect_communities(
+            &server.inner.graph,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            server.inner.config.read().response.max_bytes,
+        )
+        .unwrap() else {
+            panic!("communities must return JSON")
+        };
+        let start = std::time::Instant::now();
+        let ToolOk::Value(kickoff) =
+            detect_communities_async(server.inner.clone(), None, None, None, None, None).unwrap()
+        else {
+            panic!("kickoff must return JSON")
+        };
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let view = loop {
+            let ToolOk::Value(view) =
+                crate::core::status::get_job_status(server.inner.clone(), kickoff.job_id.clone())
+                    .unwrap()
+            else {
+                panic!("job status must return JSON")
+            };
+            if view.status == "completed" || view.status == "failed" {
+                break view;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "community job timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(view.kind, JobKind::DetectCommunities);
+        assert_eq!(view.current_phase, Some(JobPhase::DetectingCommunities));
+        let Some(JobResult::DetectCommunities(result)) = view.result else {
+            panic!("expected completed community result: {view:?}")
+        };
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            serde_json::to_string(&sync).unwrap(),
+            "terminal result must be byte-identical to sync output"
+        );
+        let ToolOk::Value(status) = crate::core::status::get_status(server.inner.clone()).unwrap()
+        else {
+            panic!("status must return JSON")
+        };
+        assert_eq!(
+            status.job.as_ref().map(|job| job.kind),
+            Some(JobKind::DetectCommunities)
+        );
+        assert!(status.analyze_job.is_none());
+    }
+
+    #[tokio::test]
+    async fn community_progress_is_observable_while_running() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        let ToolOk::Value(kickoff) =
+            detect_communities_async(server.inner.clone(), None, None, None, None, None).unwrap()
+        else {
+            panic!("kickoff must return JSON")
+        };
+        // The kickoff publishes this phase before it detaches the worker, so
+        // this immediate poll is a deterministic nonterminal observation.
+        let ToolOk::Value(view) =
+            crate::core::status::get_job_status(server.inner.clone(), kickoff.job_id).unwrap()
+        else {
+            panic!("job status must return JSON")
+        };
+        assert_eq!(view.status, "running");
+        assert_eq!(view.kind, JobKind::DetectCommunities);
+        assert_eq!(view.current_phase, Some(JobPhase::DetectingCommunities));
+        assert_eq!(view.progress_total, 1);
+    }
+
+    #[test]
+    fn invalid_community_async_input_does_not_issue_job() {
+        let server = server();
+        assert!(detect_communities_async(
+            server.inner.clone(),
+            Some("symbol".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        let ToolOk::Value(status) = crate::core::status::get_status(server.inner.clone()).unwrap()
+        else {
+            panic!("status must return JSON")
+        };
+        assert!(status.job.is_none());
+        assert_eq!(status.job_pending_count, 0);
+    }
+
+    #[test]
+    fn mixed_kind_fifo_promotion_never_overtakes() {
+        let server = server();
+        let inner = Arc::clone(&server.inner);
+        let current = Job::new_running("current".into(), "/current".into(), false, 1);
+        finish_failed(&current, "done".into());
+        let community = Job::new_queued_communities(
+            "community".into(),
+            JobRequest::DetectCommunities {
+                granularity: None,
+                max_iterations: None,
+                members_per_community: None,
+                limit: None,
+                offset: None,
+            },
+            2,
+            1024,
+        );
+        let analyze = Job::new_queued("analyze".into(), "/analyze".into(), false, 3);
+        {
+            let mut slot = inner.analyze_slot.write();
+            slot.current = Some(Arc::clone(&current));
+            slot.current_completion_pending = true;
+            slot.pending.push_back(PendingJob {
+                job: Arc::clone(&community),
+                job_guard: inner.persist.begin_job().unwrap(),
+                sink: Arc::new(NoopProgressSink),
+            });
+            slot.pending.push_back(PendingJob {
+                job: Arc::clone(&analyze),
+                job_guard: inner.persist.begin_job().unwrap(),
+                sink: Arc::new(NoopProgressSink),
+            });
+        }
+
+        let first = promote_pending(&inner, &current).expect("FIFO head must promote");
+        assert!(Arc::ptr_eq(&first.job, &community));
+        assert_eq!(inner.analyze_slot.read().pending[0].job.job_id, "analyze");
+        finish_failed(&community, "done".into());
+        let second = promote_pending(&inner, &community).expect("second FIFO head must promote");
+        assert!(Arc::ptr_eq(&second.job, &analyze));
+        drop(first.job_guard);
+        drop(second.job_guard);
+    }
+
+    #[tokio::test]
+    async fn panicking_community_job_fails_and_promotes_analyze_successor() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        let inner = Arc::clone(&server.inner);
+        inner.analyze_slot.write().panic_next_community_job = true;
+        let held_index_lock = inner.index_lock.lock().await;
+        let analyze_dir = tempfile::TempDir::new().unwrap();
+        let ToolOk::Value(community) =
+            detect_communities_async(Arc::clone(&inner), None, None, None, None, None).unwrap()
+        else {
+            panic!("community kickoff must return JSON")
+        };
+        let ToolOk::Value(analyze) = analyze_codebase_async(
+            Arc::clone(&inner),
+            analyze_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await
+        .unwrap() else {
+            panic!("analyze kickoff must return JSON")
+        };
+        assert_eq!(analyze.status, "queued");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let ToolOk::Value(view) = crate::core::status::get_job_status(
+                    Arc::clone(&inner),
+                    community.job_id.clone(),
+                )
+                .unwrap() else {
+                    panic!("community status must return JSON")
+                };
+                if view.status == "failed" {
+                    assert!(view.error.unwrap().contains("community worker terminated"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("community panic must be surfaced by the generic supervisor");
+        assert_eq!(
+            inner.analyze_slot.read().current.as_ref().unwrap().job_id,
+            analyze.job_id
+        );
+        drop(held_index_lock);
+    }
+
+    fn job(id: &str, path: &std::path::Path, force: bool, queued: bool) -> Arc<Job> {
         let coverage = coverage_identity(&path.display().to_string());
         if queued {
-            AnalyzeJob::new_queued_with_coverage(
-                id.into(),
-                path.display().to_string(),
-                force,
-                0,
-                coverage,
-            )
+            Job::new_queued_with_coverage(id.into(), path.display().to_string(), force, 0, coverage)
         } else {
-            AnalyzeJob::new_running_with_coverage(
+            Job::new_running_with_coverage(
                 id.into(),
                 path.display().to_string(),
                 force,
@@ -1213,10 +1560,10 @@ mod coalesce {
         }
     }
 
-    fn pending(inner: &ServerInner, job: Arc<AnalyzeJob>) -> PendingAnalyze {
-        PendingAnalyze {
+    fn pending(inner: &ServerInner, job: Arc<Job>) -> PendingJob {
+        PendingJob {
             job,
-            analyze_guard: inner.persist.begin_analyze().unwrap(),
+            job_guard: inner.persist.begin_job().unwrap(),
             sink: Arc::new(NoopProgressSink),
         }
     }
@@ -1456,7 +1803,7 @@ mod coalesce {
             let mut slot = inner.analyze_slot.write();
             // A non-covering current job is enough to make the symlink job
             // queue; the test drives that queued job directly below.
-            let blocker_job = AnalyzeJob::new_running(
+            let blocker_job = Job::new_running(
                 "blocker".into(),
                 blocker.to_string_lossy().into_owned(),
                 false,
@@ -1465,12 +1812,12 @@ mod coalesce {
             slot.current = Some(Arc::clone(&blocker_job));
             let admission =
                 admit_job(&inner, &mut slot, raw_link, false, Some(admitted_target)).unwrap();
-            let Admission::Queued { job, analyze_guard } = admission else {
+            let Admission::Queued { job, job_guard } = admission else {
                 panic!("symlink request must queue behind the current job");
             };
-            slot.pending.push_back(PendingAnalyze {
+            slot.pending.push_back(PendingJob {
                 job: Arc::clone(&job),
-                analyze_guard,
+                job_guard,
                 sink: Arc::new(NoopProgressSink),
             });
             (blocker_job, job)
@@ -1516,10 +1863,10 @@ mod coalesce {
             Arc::new(NoopProgressSink),
         )
         .await;
-        drop(successor.analyze_guard);
+        drop(successor.job_guard);
 
         let state = queued.state.read();
-        let JobStatus::Completed(result) = &state.status else {
+        let JobStatus::Completed(JobResult::Analyze(result)) = &state.status else {
             panic!("queued job must complete against its admission target");
         };
         assert_eq!(result.root_path, target_a_identity.to_string_lossy());
@@ -1790,7 +2137,7 @@ mod tests {
             .unwrap();
 
         let coverage = coverage_identity(&root.to_string_lossy()).unwrap();
-        let coverer = AnalyzeJob::new_running_with_coverage(
+        let coverer = Job::new_running_with_coverage(
             "coverer".into(),
             root.to_string_lossy().into_owned(),
             false,
