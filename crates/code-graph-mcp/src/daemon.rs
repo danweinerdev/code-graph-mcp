@@ -1,6 +1,6 @@
 //! Repository-local daemon transport, ownership, and lifecycle.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use code_graph_core::{paths, RootConfig};
 use code_graph_tools::CodeGraphServer;
-use fs2::FileExt;
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
 use sysinfo::{Signal, System};
@@ -126,7 +125,7 @@ struct ShutdownControlLock {
 #[cfg(target_os = "linux")]
 impl Drop for ShutdownControlLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -390,7 +389,7 @@ impl DaemonPaths {
                 ));
             }
             rustix_fs::fchmod(&file, Mode::from_bits_truncate(0o600))?;
-            file.lock_exclusive()?;
+            file.lock()?;
             let current = self.open_child(
                 SHUTDOWN_CONTROL_LOCK_FILE,
                 OFlags::RDONLY | OFlags::NONBLOCK,
@@ -401,7 +400,7 @@ impl DaemonPaths {
             {
                 return Ok(ShutdownControlLock { file });
             }
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
         }
         Err(std::io::Error::other(
             "daemon shutdown control lock changed while acquiring it",
@@ -994,10 +993,10 @@ fn lock_is_actively_held(paths: &DaemonPaths) -> bool {
         };
         file
     };
-    match file.try_lock_exclusive() {
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+    match file.try_lock() {
+        Err(TryLockError::WouldBlock) => true,
         Ok(()) => {
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
             false
         }
         Err(_) => false,
@@ -1453,12 +1452,12 @@ impl DaemonLock {
         #[cfg(not(unix))]
         let mut file = options.open(&paths.lock)?;
         let initialize = (|| -> std::io::Result<()> {
-            file.try_lock_exclusive()?;
+            file.try_lock()?;
             file.write_all(contents.as_bytes())?;
             file.sync_all()
         })();
         if let Err(error) = initialize {
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
             drop(file);
             return Err(error);
         }
@@ -1511,12 +1510,12 @@ impl DaemonLock {
 
     fn release_files(&mut self) {
         if let Some(file) = self.file.take() {
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
             drop(file);
         }
         #[cfg(target_os = "linux")]
         if let Some(root_file) = self.root_file.take() {
-            let _ = FileExt::unlock(&root_file);
+            let _ = root_file.unlock();
             drop(root_file);
         }
     }
@@ -2119,19 +2118,19 @@ async fn acquire_or_detect_live_with_initial_file(
                     Some(file) => file,
                     None => open_existing_lock(paths).context("open existing daemon lock")?,
                 };
-                match file.try_lock_exclusive() {
+                match file.try_lock() {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        return Ok(None)
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(TryLockError::Error(error)) => {
+                        return Err(error).context("lock existing daemon lock")
                     }
-                    Err(error) => return Err(error).context("lock existing daemon lock"),
                 }
                 #[cfg(unix)]
                 if !opened_lock_matches_path(&file, paths) {
                     // The old owner may have unlinked this inode and a successor
                     // may now own the pathname. Never clean runtime state for
                     // the detached inode; restart from the current pathname.
-                    let _ = FileExt::unlock(&file);
+                    let _ = file.unlock();
                     drop(file);
                     continue;
                 }
@@ -2190,10 +2189,10 @@ async fn acquire_or_detect_live_with_initial_file(
 #[cfg(target_os = "linux")]
 fn acquire_root_ownership(paths: &DaemonPaths) -> std::io::Result<Option<std::fs::File>> {
     let root = paths.open_root_for_ownership()?;
-    match root.try_lock_exclusive() {
+    match root.try_lock() {
         Ok(()) => Ok(Some(root)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(error),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 

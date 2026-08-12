@@ -257,7 +257,7 @@ fn skip_quoted(content: &[u8], i: usize, closer: u8) -> usize {
                     break;
                 }
             }
-            if backslashes % 2 == 0 {
+            if backslashes.is_multiple_of(2) {
                 return k + 1;
             }
         }

@@ -318,7 +318,6 @@ dependencies = [
  "code-graph-lang-python",
  "code-graph-lang-rust",
  "code-graph-tools",
- "fs2",
  "getrandom",
  "libc",
  "rmcp",
@@ -569,16 +568,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
 
 [[package]]
 name = "fsevent-sys"

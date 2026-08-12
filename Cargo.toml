@@ -20,7 +20,7 @@ members = [
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/danweinerdev/code-graph-mcp"
-rust-version = "1.84"
+rust-version = "1.89"
 
 [workspace.lints.rust]
 # Workspace default: `deny` (not `forbid`) so a single audited crate

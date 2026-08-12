@@ -24,7 +24,6 @@ code-graph-tools = { path = "../code-graph-tools" }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-fs2 = "0.4"
 getrandom = "0.3"
 libc = "0.2"
 rustix = { version = "1.1.4", features = ["fs"] }
