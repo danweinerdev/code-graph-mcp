@@ -249,6 +249,44 @@ active; every connection/analyze transition restarts the full interval. `0`
 disables automatic idle exit. Idle shutdown closes admission, saves the active
 cache, and removes its repository-local runtime files before exit.
 
+### Repository-local daemon (runtime model)
+
+Implementation: `crates/code-graph-mcp/src/daemon.rs`. The stdio binary
+default-runs as a byte-pump proxy to the daemon; `--serve` runs the daemon
+itself; `--no-daemon` wins over `--serve` if both are passed.
+
+- **Runtime files** live under `<project_root>/.code-graph/` (gitignored):
+  `daemon.lock` (exclusive-create + OS file lock; crash recovery via the OS
+  lock, inode-revalidated), `daemon.json` (discovery metadata: pid,
+  transport endpoint, binary identity), `secret` (TCP auth token, 0600),
+  `daemon.sock` (UDS), `shutdown.request`/`shutdown.ack` (replacement
+  protocol), plus Linux-only `shutdown.control.lock`.
+- **Transport fallback:** Unix binds UDS first (0600, inode-swap guard);
+  Windows uses a named pipe; both fall back to loopback TCP (`127.0.0.1:0`)
+  with a `CG-AUTH <token>` / `CG-OK` line handshake, constant-time token
+  compare. Every fallback prints an `eprintln!` breadcrumb. Linux uses a
+  `/proc/<pid>/fd/…` short alias to dodge the 108-byte `sun_path` limit;
+  **macOS has no equivalent**, so deeply nested checkouts (> ~104-byte
+  socket path) routinely degrade to loopback TCP there — logged, not
+  silent, and functionally equivalent (revisit in Phase 10).
+- **Binary-compatibility gate:** a client attaches only when the daemon's
+  published identity matches (`metadata_compatible`: build SHA via
+  `CODE_GRAPH_GIT_SHA` + `executable_fingerprint`, a 64-bit non-cryptographic
+  content hash — collision-tolerant by design, both sides may report SHA
+  `"unknown"` on git-less builds). An incompatible daemon triggers the
+  replacement protocol: grace → drain → hard-kill, with owner-identity
+  (pid + process start-time) revalidation at every step.
+- **Failure surface:** pre-attach daemon unavailability falls back to
+  in-process stdio with an `eprintln!`. A mid-session daemon death ends the
+  proxy with exit 0 (the host would misread nonzero as a tool failure) plus
+  a `daemon connection ended mid-session` stderr breadcrumb — no in-process
+  fallback is attempted mid-session because MCP framing already in flight
+  cannot be reconstructed.
+- **Path discipline:** `main.rs` and `daemon::run` must canonicalize the
+  project root through the same `code_graph_core::paths::canonicalize`;
+  divergent forms (e.g. `\\?\`-verbatim vs. stripped on Windows) would
+  split `.code-graph` into two directories and silently defeat attach.
+
 `[response].max_bytes` is consulted from the cached `RootConfig` on each tool call (TOML NOT re-read per query).
 
 ### Cache invalidation
