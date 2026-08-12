@@ -3,16 +3,16 @@ title: "Analyze Queue and Coalescing"
 type: phase
 plan: GraphPlatformExpansion
 phase: 4
-status: planned
+status: in-progress
 created: 2026-08-08
 updated: 2026-08-09
 deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, the wire format evolves additively, and the job slot generalizes to cover long-running whole-graph queries."
 tasks:
   - id: "4.1"
     title: "Pending queue in AnalyzeSlot and the queued job status"
-    status: planned
+    status: complete
     justifies: "FR-41, AC-50. AnalyzeSlot holds exactly one current job and one previous_terminal — there is nowhere to put 'admitted but not started', so FR-41's queueing requirement cannot be met by reinterpreting the existing fields."
-    verification: "cargo test -p code-graph-tools analyze_job:: — an analyze issued while another is in flight is queued and eventually runs rather than returning 'indexing already in progress' (AC-50); get_status.analyze_job reports status queued for a pending job with progress absent until it starts; the head of pending is promoted on termination under the existing rotation; previous_terminal still preserves exactly one prior job."
+    verification: "cargo test -p code-graph-tools analyze_job:: — an analyze issued while another is in flight is queued and eventually runs rather than returning 'indexing already in progress' (AC-50); get_status keeps analyze_job as the single running job and exposes pending count plus FIFO ids, while queued kickoff responses report status queued; get_job_status(job_id) retrieves queued, running, and retained terminal jobs so a fast FIFO cannot rotate an async caller's result out of reach; the head of pending is promoted on termination under the existing rotation; previous_terminal still preserves exactly one prior job."
   - id: "4.2"
     title: "Path-containment coverage rule with force asymmetry"
     status: planned
@@ -45,22 +45,43 @@ Depends on phase 3. Separated from it so a bisect through daemon bring-up does n
 ## 4.1: Pending queue in AnalyzeSlot and the queued job status
 
 ### Subtasks
-- [ ] Add `pending: Vec<Arc<AnalyzeJob>>` to `AnalyzeSlot`, ordered by admission
-- [ ] Add a `Queued` variant to the job status and map it to the wire string `"queued"`
-- [ ] Promote the head of `pending` to `current` when the running job terminates, reusing the existing rotation
-- [ ] Expose pending entries as a count plus ids rather than widening `analyze_job` into a list
-- [ ] Tests for admission, promotion, rotation, and the queued view
+- [x] Add `pending: Vec<Arc<AnalyzeJob>>` to `AnalyzeSlot`, ordered by admission
+- [x] Add a `Queued` variant to the job status and map it to the wire string `"queued"`
+- [x] Promote the head of `pending` to `current` when the running job terminates, reusing the existing rotation
+- [x] Expose pending entries as a count plus ids rather than widening `analyze_job` into a list
+- [x] Add job-addressable status/result lookup so queued async outcomes remain retrievable after slot rotation
+- [x] Tests for admission, promotion, rotation, and the queued view
 
 ### Notes
 Revision boundary: the queue exists and jobs move through it; the coverage rule is not applied yet, so every admitted request runs.
 
 Keeping `analyze_job` a single job matters — every current client reads it as one object, and widening it into a list would break them for no benefit. A count plus ids is enough for a caller to understand the backlog.
 
+Job-addressable lookup is the retrieval counterpart: pending IDs would otherwise become dead handles once fast jobs rotate beyond the one-entry `previous_terminal` grace window. `get_job_status(job_id)` preserves the existing `get_status` shape while making each issued ID actionable; terminal retention is bounded and oldest-terminal-only eviction never removes queued or running work.
+
 `AnalyzeJobView.status` gaining a fourth value is an additive change to a documented enum. Clients matching exhaustively on three values exist by assumption, so CLAUDE.md and the tool description must call it out in this phase, not later.
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-12
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `6b5302ee40a700bdb0372b1475833d8bc1676806`
+- Identity recheck: `git show 6b5302ee40a700bdb0372b1475833d8bc1676806 >/dev/null && git rev-parse HEAD`, 2026-08-12T00:19:21-07:00; matched `6b5302ee40a700bdb0372b1475833d8bc1676806`
+- Focused review: `git show 6b5302ee40a700bdb0372b1475833d8bc1676806`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `6b5302ee40a700bdb0372b1475833d8bc1676806`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools analyze_job:: && cargo test -p code-graph-tools --test integration && cargo test -p code-graph-tools --test snapshot_tools_list && cargo test -p code-graph-mcp --test smoke && make plugin-sync-check && make snapshot-clean && make fmt-check && make lint` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Focused queue/status, integration, tool-snapshot, 23-tool smoke, mirror, snapshot, formatting, and deny-warnings lint gates passed. |
+| `cargo test -p code-graph-mcp --test daemon_proxy && cargo test -p code-graph-mcp --test daemon_serve` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Process-level proxy and serve routes accepted all 23 tools, including `get_job_status`. |
+| `make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace structural gate passed after removing the generated ignored project cache that polluted scoped baseline state. |
+| `make fmt-check && make lint && cargo test -p code-graph-tools analyze_job:: && cargo test -p code-graph-tools --test integration && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Post-review comment/documentation fixes remained formatted, warning-free, behaviorally covered, and whitespace-clean. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused intent-blind quality review | Complete task 4.1 diff excluding lifecycle-only plan files | PASS | Queue, promotion, cancellation/panic supervision, bounded terminal retention, polling route, tests, and documentation were judged correct, scoped, maintainable, and bisectable after stale-comment fixes. |
 
 ## 4.2: Path-containment coverage rule with force asymmetry
 
