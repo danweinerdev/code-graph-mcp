@@ -731,6 +731,8 @@ Revision boundary: each new save bounds crash residue by scavenging the reserved
 
 Revision boundary: daemon single-instance authority survives replacement of its runtime child directory, and crash-abandoned metadata temps are bounded without widening direct-mode cache locking.
 
+The governing Linux MVP boundary is the spec's cross-UID local-user exclusion. Persistent root/runtime pathname divergence is detected and drained; an active same-UID actor that replaces, supplies files, and restores the root entirely between checks is not an additional isolation boundary because that actor already has direct authority to edit the repository's sources.
+
 ### Completion Evidence
 
 - Verified: 2026-08-11
@@ -781,12 +783,12 @@ Revision boundary: daemon single-instance authority survives replacement of its 
 - Verified: 2026-08-11
 - Repository: `/home/daniel/Development/Code/code-graph-mcp`
 - VCS: `git`
-- Revision / checkpoint: `dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
-- Identity recheck: `git rev-parse dfc3884c8d3ab23cae7d1fc85f559c0fb431924b` at 2026-08-12T00:00:49Z, matching `dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
-- Focused review: `git diff 98ea430b69d733726b9f7f02aae93c48ac5c5336..dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
-- Reviewed candidate / final: `diff: 98ea430b69d733726b9f7f02aae93c48ac5c5336..dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
+- Revision / checkpoint: `2b60b18789dcd1d92641f1eff2d26cb817504b41`
+- Identity recheck: `git rev-parse 2b60b18789dcd1d92641f1eff2d26cb817504b41` at 2026-08-12T00:30:07Z, matching `2b60b18789dcd1d92641f1eff2d26cb817504b41`
+- Focused review: `git diff 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
+- Reviewed candidate / final: `diff: 98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
 - Review result: PASS/Aligned
-- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-dfc3884.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..dfc3884c8d3ab23cae7d1fc85f559c0fb431924b`
+- Final aligned review: `Plans/GraphPlatformExpansion/reviews/11-daemon-foundation-final-code-review-98ea430-2b60b18.md`; frozen: `98ea430b69d733726b9f7f02aae93c48ac5c5336..2b60b18789dcd1d92641f1eff2d26cb817504b41`
 
 | Command | Working directory | Result | Observable evidence |
 |---|---|---|---|
