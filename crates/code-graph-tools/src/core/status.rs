@@ -188,6 +188,7 @@ mod tests {
             edges: 0,
             root_path: "/completed".into(),
             warnings: Vec::new(),
+            coalesced_by: None,
         });
         state.finished_at = Some(2);
         drop(state);

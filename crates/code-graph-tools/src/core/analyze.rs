@@ -38,7 +38,9 @@ use crate::analyze_job::{
     TERMINAL_HISTORY_LIMIT,
 };
 use crate::core::{ToolError, ToolOk, ToolResult};
-use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
+use crate::handlers::analyze::{
+    now_nanos_u64, AnalyzeResult, AsyncKickoffResponse, SyncAnalyzeResponse,
+};
 use crate::handlers::status::format_unix_nanos_rfc3339;
 use crate::indexer::{
     build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
@@ -356,6 +358,7 @@ pub(crate) async fn run_analyze_job(
                     edges: stats.edges,
                     root_path: project_root.to_string_lossy().into_owned(),
                     warnings,
+                    coalesced_by: None,
                 };
                 finish_completed(&job, result);
                 return;
@@ -642,6 +645,7 @@ pub(crate) async fn run_analyze_job(
                     edges: stats.edges,
                     root_path: project_root.to_string_lossy().into_owned(),
                     warnings,
+                    coalesced_by: None,
                 })
             }
         }
@@ -703,7 +707,7 @@ pub async fn analyze_codebase(
     path_raw: String,
     force: bool,
     sink: Arc<dyn ProgressSink>,
-) -> ToolResult<AnalyzeResult> {
+) -> ToolResult<SyncAnalyzeResponse> {
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
@@ -712,23 +716,47 @@ pub async fn analyze_codebase(
     // a request can reuse an existing covering job.
     inner.ensure_daemon_root_current().map_err(ToolError)?;
     let coverage = coverage_identity(&path_raw);
-    let job = {
+    let admission = {
         let mut slot = inner.analyze_slot.write();
+        // Decision 7 only lets a sync request escape the FIFO when another
+        // request was already waiting before this admission. The first
+        // distinct request behind a running worker keeps normal synchronous
+        // semantics (including its real progress sink) and waits for itself.
+        let pending_before_admission = !slot.pending.is_empty();
         match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
-            Admission::Covered { job, .. } => job,
+            Admission::Covered { job, .. } => SyncAdmission::Covered(job),
             Admission::Queued { job, analyze_guard } => {
                 slot.pending.push_back(PendingAnalyze {
                     job: Arc::clone(&job),
                     analyze_guard,
-                    sink: Arc::clone(&sink),
+                    sink: if pending_before_admission {
+                        Arc::new(NoopProgressSink)
+                    } else {
+                        sink
+                    },
                 });
-                job
+                if pending_before_admission {
+                    SyncAdmission::QueuedImmediate(job)
+                } else {
+                    SyncAdmission::QueuedBlocking(job)
+                }
             }
             Admission::Running { job, analyze_guard } => {
                 spawn_supervised_job(Arc::clone(&inner), Arc::clone(&job), sink, analyze_guard);
-                job
+                SyncAdmission::Running(job)
             }
         }
+    };
+
+    let (job, coalesced_by) = match admission {
+        SyncAdmission::Covered(job) => (Arc::clone(&job), Some(job.job_id.clone())),
+        SyncAdmission::Running(job) => (job, None),
+        SyncAdmission::QueuedImmediate(job) => {
+            return Ok(ToolOk::Value(SyncAnalyzeResponse::Queued(
+                queued_kickoff_response(&job),
+            )));
+        }
+        SyncAdmission::QueuedBlocking(job) => (job, None),
     };
 
     // The worker is detached before this call reaches an await point. A sync
@@ -738,13 +766,30 @@ pub async fn analyze_codebase(
 
     let state = job.state.read();
     match &state.status {
-        JobStatus::Completed(result) => Ok(ToolOk::Value(result.clone())),
-        JobStatus::Failed(msg) => Err(ToolError(msg.clone())),
+        JobStatus::Completed(result) => {
+            let mut result = result.clone();
+            result.coalesced_by = coalesced_by;
+            Ok(ToolOk::Value(SyncAnalyzeResponse::Result(result)))
+        }
+        JobStatus::Failed(msg) => {
+            let message = match coalesced_by {
+                Some(coverer_job_id) => format!("{msg} (coalesced_by: {coverer_job_id})"),
+                None => msg.clone(),
+            };
+            Err(ToolError(message))
+        }
         JobStatus::Running => {
             unreachable!("run_analyze_job must write a terminal JobStatus before returning")
         }
-        JobStatus::Queued => unreachable!("queued sync analyze must wait for its terminal state"),
+        JobStatus::Queued => unreachable!("queued sync analyze cannot complete its terminal wait"),
     }
+}
+
+enum SyncAdmission {
+    Covered(Arc<AnalyzeJob>),
+    Running(Arc<AnalyzeJob>),
+    QueuedBlocking(Arc<AnalyzeJob>),
+    QueuedImmediate(Arc<AnalyzeJob>),
 }
 
 /// `analyze_codebase_async` body — kickoff that returns in milliseconds
@@ -801,12 +846,24 @@ pub async fn analyze_codebase_async(
         status,
         started_at: format_unix_nanos_rfc3339(job.started_at),
         existing,
-        note: if status == "running" {
+        note: if existing {
+            "analyze request coalesced into an existing job — poll get_job_status(job_id) for progress and the terminal result"
+        } else if status == "running" {
             "analyze kicked off — poll get_job_status(job_id) for progress and the terminal result"
         } else {
             "analyze queued — poll get_job_status(job_id) for progress and the terminal result; use get_status for FIFO position"
         },
     }))
+}
+
+fn queued_kickoff_response(job: &AnalyzeJob) -> AsyncKickoffResponse {
+    AsyncKickoffResponse {
+        job_id: job.job_id.clone(),
+        status: "queued",
+        started_at: format_unix_nanos_rfc3339(job.started_at),
+        existing: false,
+        note: "analyze queued — poll get_job_status(job_id) for progress and the terminal result; use get_status for FIFO position",
+    }
 }
 
 enum Admission {
@@ -1447,6 +1504,7 @@ mod coalesce {
                 edges: 0,
                 root_path: blocker.to_string_lossy().into_owned(),
                 warnings: Vec::new(),
+                coalesced_by: None,
             },
         );
         let successor = promote_pending(&inner, &blocker_job)

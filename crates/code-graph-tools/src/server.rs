@@ -1180,7 +1180,7 @@ impl CodeGraphServer {
     // -- P0 -----------------------------------------------------------------
 
     #[tool(
-        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools."
+        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). Usually returns `{ files, symbols, edges, root_path, warnings? }`; a coalesced request waits for its covering job and adds `coalesced_by` with that job ID (otherwise absent), while a distinct request admitted behind work already pending returns immediately with `{ job_id, status: \"queued\", started_at, existing: false, note }` — poll `get_job_status(job_id)`. Must be called before query tools."
     )]
     async fn analyze_codebase(
         &self,
@@ -1200,7 +1200,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Kick off `analyze_codebase` on a background task and return immediately (< 1KB, sub-second) with `{ job_id, status, started_at, existing, note }`. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze. A request reuses a nonterminal job when its canonical existing directory is covered by that job and the coverer is forced or this request is not; it returns the coverer's `job_id` with `existing=true`. Other requests are FIFO-admitted with `existing=false`. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is byte-identical to `analyze_codebase`'s success body and terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire."
+        description = "Kick off `analyze_codebase` on a background task and return immediately (< 1KB, sub-second) with `{ job_id, status, started_at, existing, note }`. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze. A request reuses a nonterminal job when its canonical existing directory is covered by that job and the coverer is forced or this request is not; it returns the coverer's `job_id` with `existing=true` and a coalescing note. Other requests are FIFO-admitted with `existing=false`. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire."
     )]
     async fn analyze_codebase_async(
         &self,
@@ -2240,7 +2240,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Return the status for one analyze job by required `job_id`. Response is the bare `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }` AnalyzeJobView — not a Page or wrapper. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is byte-identical to `analyze_codebase`'s success body and terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
+        description = "Return the status for one analyze job by required `job_id`. Response is the bare `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }` AnalyzeJobView — not a Page or wrapper. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
     )]
     async fn get_job_status(
         &self,

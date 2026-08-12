@@ -14,6 +14,12 @@ the gotchas on large or specially-configured codebases.
 `mcp__code-graph__analyze_codebase(path="<abs dir>")` parses the tree and builds
 the graph. It uses an on-disk rkyv cache at `<project_root>/.code-graph-cache.db`
 plus mtime-based incremental re-index, so repeat calls are cheap.
+- If another analyze covers the same scope, sync waits for that outcome and adds
+  `coalesced_by` with the covering job ID (or its error ends with
+  `(coalesced_by: <job_id>)`). The first distinct request behind a running job blocks to its own
+  terminal result. If distinct work is already queued, sync returns
+  `{ job_id, status: "queued", started_at, existing: false, note }` immediately; poll
+  `get_job_status(job_id)` rather than waiting on the call.
 - `force=true` bypasses the cache and fully rebuilds — use it after changing
   `.code-graph.toml` (macro config, extensions) or when the graph looks wrong.
 - **Scoping:** `analyze_codebase("<subtree>")` indexes only that subtree and
@@ -27,7 +33,8 @@ MCP client's per-call timeout and surface as a tool error *even though the serve
 finishes*. Avoid this:
 
 1. `mcp__code-graph__analyze_codebase_async(path=…)` → returns sub-second with a
-   `job_id` and `status` (`"running"` or `"queued"`).
+   `job_id` and `status` (`"running"` or `"queued"`). A reused covering job has
+   `existing: true` and a coalescing note.
 2. Poll `mcp__code-graph__get_job_status(job_id=…)` — read `progress` /
    `progress_message` for live progress, and `result` (or `.error`) once `status`
    becomes `"completed"` / `"failed"`.

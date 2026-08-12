@@ -24,7 +24,8 @@ retrieval endpoint.
       `progress_message` and poll again. Progress is monotonic **within a phase** and resets at
       phase boundaries.
     - `status: "completed"` → `result` holds the analyze body (`files`, `symbols`, `edges`,
-      `root_path`, `warnings`), shape-identical to sync `analyze_codebase`.
+      `root_path`, `warnings`), structurally/deserializer-compatible and byte-identical to a
+      non-coalesced sync `analyze_codebase` body; a coalesced sync response adds `coalesced_by`.
     - `status: "failed"` → `error` holds why. `error` and `result` are mutually exclusive.
     - Displaced terminal jobs remain retrievable by ID for a bounded 32-job history; an unknown
       or expired ID is a tool error.

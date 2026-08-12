@@ -33,8 +33,15 @@ get_job_status(job_id: "…")          → poll progress / progress_message
 ```
 
 Every poll is sub-second, so the per-call timer never fires. `get_job_status.result` is
-shape-identical to sync `analyze_codebase`'s body. Use `get_status()` for current-job and FIFO
-queue diagnostics.
+structurally/deserializer-compatible and byte-identical to a non-coalesced sync
+`analyze_codebase` body; a coalesced sync response adds `coalesced_by`. Use `get_status()` for
+current-job and FIFO queue diagnostics.
+
+When a sync request is covered by an existing analyze, it waits for that outcome and its result
+adds `coalesced_by` with the covering job ID (or its error ends with `(coalesced_by: <job_id>)`).
+The first distinct request behind a running job blocks to its own terminal result. If distinct work
+is already pending, sync returns a queued `{ job_id, status, started_at, existing, note }` response
+immediately; poll that job.
 
 ## Arguments
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::RoleServer;
 use rmcp::Peer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::indexer::{NoopProgressSink, ProgressEvent, ProgressSink};
 use crate::server::ServerInner;
@@ -50,14 +50,16 @@ use std::sync::atomic::Ordering;
 
 /// JSON-shape mirror of Go's `analyzeResult` in `internal/tools/analyze.go`.
 /// Field order, names, and `omitempty` semantics match the Go struct exactly.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AnalyzeResult {
     pub files: u32,
     pub symbols: u32,
     pub edges: u32,
     pub root_path: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coalesced_by: Option<String>,
 }
 
 /// Wall-clock nanoseconds since UNIX_EPOCH, suitable for cache mtimes
@@ -213,6 +215,16 @@ pub struct AsyncKickoffResponse {
     pub started_at: String,
     pub existing: bool,
     pub note: &'static str,
+}
+
+/// `analyze_codebase` normally returns its established result body. A sync
+/// request admitted behind already-pending work returns the bounded async
+/// kickoff body instead.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum SyncAnalyzeResponse {
+    Result(AnalyzeResult),
+    Queued(AsyncKickoffResponse),
 }
 
 #[cfg(test)]
@@ -440,6 +452,12 @@ mod tests {
         assert_eq!(parsed["files"], serde_json::json!(3));
         assert!(parsed["symbols"].as_u64().unwrap() >= 3);
         assert!(!parsed["root_path"].as_str().unwrap().is_empty());
+        assert!(
+            !parsed.as_object().unwrap().contains_key("coalesced_by"),
+            "ordinary analyze responses must omit coalesced_by rather than emit null"
+        );
+        let _: AnalyzeResult = serde_json::from_str(&body)
+            .expect("ordinary analyze body must deserialize through the shared result type");
         // Indexed flag is now set.
         assert!(server.inner.indexed.load(Ordering::Acquire));
         // Root path stored.
@@ -664,6 +682,7 @@ mod tests {
             edges: 20,
             root_path: "/x".to_string(),
             warnings: Vec::new(),
+            coalesced_by: None,
         };
         finish_completed(&job, dummy_result.clone());
 
@@ -1450,6 +1469,17 @@ mod tests {
         }
     }
 
+    /// Records progress reports from the core-only sync path. This pins the
+    /// Decision 7 distinction: the first queued sync request retains its real
+    /// sink, whereas an immediately-returning queued sync request uses Noop.
+    struct CountingProgressSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ProgressSink for CountingProgressSink {
+        fn report(&self, _progress: u32, _total: u32, _message: &str) {
+            self.0.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
     /// Build a `CodeGraphServer` whose only registered plugin is the
     /// `RecordingPlugin` claiming `.rec` files. Routing through the recording
     /// plugin is what makes `SLEEP_PER_PARSE_MS` effective — the real
@@ -1579,9 +1609,10 @@ mod tests {
         wait_for_job_terminal(inner.clone(), &first_job_id).await;
     }
 
-    /// A sync request admitted behind an async job waits for its own result.
+    /// A sync request covered by a running job waits for the coverer's outcome,
+    /// annotates only its response, and leaves the stored result pristine.
     #[tokio::test]
-    async fn async_kickoff_queues_sync_analyze_until_its_own_terminal_result() {
+    async fn sync_running_coverer_returns_coalesced_result_without_mutating_stored_result() {
         let _guard = ParseSleepGuard::set(50);
         let dir = tempdir_with_n_rec(5);
         let (server, _calls) = server_with_recording_plugin();
@@ -1607,7 +1638,234 @@ mod tests {
         assert_eq!(status["analyze_job_pending_count"], 0);
         let sync_r = sync.await.expect("sync queued task panicked");
         assert!(sync_r.is_error.is_none() || sync_r.is_error == Some(false));
+        let sync_body = body_text(&sync_r);
+        let sync_result: AnalyzeResult =
+            serde_json::from_str(&sync_body).expect("coalesced body must use AnalyzeResult");
+        assert_eq!(
+            sync_result.coalesced_by.as_deref(),
+            Some(kickoff_id.as_str())
+        );
+
+        let stored = crate::core::status::get_job_status(inner.clone(), kickoff_id.clone())
+            .expect("coverer must remain addressable");
+        let crate::core::ToolOk::Value(stored) = stored else {
+            panic!("coverer status must be structured")
+        };
+        assert_eq!(
+            stored.result.and_then(|result| result.coalesced_by),
+            None,
+            "coalesced_by belongs only to the synchronous caller's cloned result"
+        );
         wait_for_job_terminal(inner, &kickoff_id).await;
+    }
+
+    /// A coverer can itself be pending behind unrelated work. The sync caller
+    /// still waits for that coverer rather than getting its own queued job.
+    #[tokio::test]
+    async fn sync_pending_coverer_returns_coalesced_result_without_mutating_stored_result() {
+        let _guard = ParseSleepGuard::set(50);
+        let running = tempdir_with_n_rec(20);
+        let coverer = tempdir_with_n_rec(5);
+        let child = coverer.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("child.rec"), b"// rec\n").unwrap();
+        fs::write(coverer.path().join(".code-graph.toml"), "").unwrap();
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+
+        let first = analyze_codebase_async(
+            inner.clone(),
+            running.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let first: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_id = first["job_id"].as_str().unwrap().to_string();
+        let pending = analyze_codebase_async(
+            inner.clone(),
+            coverer.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let pending: serde_json::Value = serde_json::from_str(&body_text(&pending)).unwrap();
+        let pending_id = pending["job_id"].as_str().unwrap().to_string();
+        assert_eq!(pending["status"], "queued");
+
+        let sync = analyze_codebase(
+            inner.clone(),
+            child.to_string_lossy().into_owned(),
+            false,
+            None,
+            None,
+        )
+        .await;
+        let result: AnalyzeResult = serde_json::from_str(&body_text(&sync)).unwrap();
+        assert_eq!(result.coalesced_by.as_deref(), Some(pending_id.as_str()));
+
+        let stored = crate::core::status::get_job_status(inner.clone(), pending_id.clone())
+            .expect("pending coverer must remain addressable");
+        let crate::core::ToolOk::Value(stored) = stored else {
+            panic!("pending coverer status must be structured")
+        };
+        assert_eq!(stored.result.and_then(|result| result.coalesced_by), None);
+        wait_for_job_terminal(inner.clone(), &first_id).await;
+        wait_for_job_terminal(inner, &pending_id).await;
+    }
+
+    /// Decision 7 preserves blocking synchronous semantics for the first
+    /// distinct request behind a running job: no request was pending before
+    /// admission, so it waits for its own terminal result.
+    #[tokio::test]
+    async fn sync_first_queued_behind_running_waits_for_its_own_terminal_result() {
+        let _guard = ParseSleepGuard::set(50);
+        let running = tempdir_with_n_rec(20);
+        let queued = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let first = analyze_codebase_async(
+            inner.clone(),
+            running.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let first: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_id = first["job_id"].as_str().unwrap().to_string();
+
+        let progress_reports = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sync = tokio::spawn({
+            let inner = inner.clone();
+            let path = queued.path().to_string_lossy().into_owned();
+            let sink = std::sync::Arc::new(CountingProgressSink(std::sync::Arc::clone(
+                &progress_reports,
+            )));
+            async move { crate::core::analyze::analyze_codebase(inner, path, false, sink).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let queued_id = loop {
+            let pending = inner
+                .analyze_slot
+                .read()
+                .pending
+                .front()
+                .map(|pending| pending.job.job_id.clone());
+            if let Some(id) = pending {
+                break id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first distinct sync request must enter the FIFO"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_ne!(queued_id, first_id);
+        wait_for_job_terminal(inner.clone(), &first_id).await;
+        wait_for_job_terminal(inner.clone(), &queued_id).await;
+        let sync = sync.await.expect("blocking sync task panicked");
+        assert!(matches!(
+            sync,
+            Ok(crate::core::ToolOk::Value(SyncAnalyzeResponse::Result(_)))
+        ));
+        assert!(
+            progress_reports.load(AtomicOrdering::Relaxed) > 0,
+            "the first queued sync request must preserve its real progress sink"
+        );
+        let stored = crate::core::status::get_job_status(inner, queued_id).unwrap();
+        let crate::core::ToolOk::Value(stored) = stored else {
+            panic!("queued sync job must be retrievable")
+        };
+        assert_eq!(stored.status, "completed");
+    }
+
+    /// Decision 7 lets a sync request return its queued kickoff immediately
+    /// only when another FIFO entry already existed before its admission.
+    #[tokio::test]
+    async fn sync_queued_behind_pending_preserves_fifo_and_is_retrievable() {
+        let _guard = ParseSleepGuard::set(50);
+        let running = tempdir_with_n_rec(20);
+        let ahead = tempdir_with_n_rec(5);
+        let sync_dir = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let first = analyze_codebase_async(
+            inner.clone(),
+            running.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let first: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_id = first["job_id"].as_str().unwrap().to_string();
+        let ahead = analyze_codebase_async(
+            inner.clone(),
+            ahead.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let ahead: serde_json::Value = serde_json::from_str(&body_text(&ahead)).unwrap();
+        let ahead_id = ahead["job_id"].as_str().unwrap().to_string();
+
+        let started = Instant::now();
+        let sync = analyze_codebase(
+            inner.clone(),
+            sync_dir.path().to_string_lossy().into_owned(),
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "sync request behind pending work must return its queued kickoff immediately"
+        );
+        let kickoff: serde_json::Value = serde_json::from_str(&body_text(&sync)).unwrap();
+        let sync_id = kickoff["job_id"].as_str().unwrap().to_string();
+        assert_eq!(kickoff["status"], "queued");
+        let status: serde_json::Value =
+            serde_json::from_str(&body_text(&get_status(inner.clone()))).unwrap();
+        assert_eq!(
+            status["analyze_job_pending_ids"],
+            serde_json::json!([ahead_id, sync_id])
+        );
+        for id in [&first_id, &ahead_id, &sync_id] {
+            wait_for_job_terminal(inner.clone(), id).await;
+        }
+        let stored = crate::core::status::get_job_status(inner, sync_id).unwrap();
+        let crate::core::ToolOk::Value(stored) = stored else {
+            panic!("queued sync job must be retrievable")
+        };
+        assert_eq!(stored.status, "completed");
+    }
+
+    /// A covered sync caller propagates the coverer's original terminal error
+    /// with stable attribution rather than manufacturing a success response.
+    #[tokio::test]
+    async fn sync_coalesced_failure_propagates_coverer_error() {
+        let dir = tempdir_with_one_cpp();
+        fs::write(dir.path().join(".code-graph.toml"), "").unwrap();
+        let server = server_with_cpp_parser();
+        let inner = server.inner.clone();
+        let canonical = paths::canonicalize(dir.path()).expect("fixture path canonicalizes");
+        let coverage = crate::analyze_job::CoverageIdentity {
+            invocation_path: canonical.clone(),
+            project_root: canonical,
+        };
+        let coverer = AnalyzeJob::new_running_with_coverage(
+            "coverer".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+            false,
+            0,
+            Some(coverage),
+        );
+        inner.analyze_slot.write().current = Some(coverer.clone());
+        let waiter = tokio::spawn({
+            let inner = inner.clone();
+            let path = dir.path().to_string_lossy().into_owned();
+            async move { analyze_codebase(inner, path, false, None, None).await }
+        });
+        tokio::task::yield_now().await;
+        finish_failed(&coverer, "coverer failed".to_string());
+        let result = waiter.await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(body_text(&result), "coverer failed (coalesced_by: coverer)");
     }
 
     /// FIFO promotion continues after a queued terminal failure: A runs, B
@@ -1817,6 +2075,55 @@ mod tests {
             tokio::task::yield_now().await;
         }
         wait_for_job_terminal(inner, &queued_id).await;
+    }
+
+    /// Cancelling the first blocking sync request after it enters the FIFO
+    /// must not cancel its admitted job or strand that job behind its coverer.
+    #[tokio::test]
+    async fn aborting_first_queued_sync_waiter_does_not_strand_its_job() {
+        let _guard = ParseSleepGuard::set(50);
+        let running_dir = tempdir_with_n_rec(5);
+        let queued_dir = tempdir_with_n_rec(5);
+        let (server, _calls) = server_with_recording_plugin();
+        let inner = server.inner.clone();
+        let running = analyze_codebase_async(
+            inner.clone(),
+            running_dir.path().to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        let running: serde_json::Value = serde_json::from_str(&body_text(&running)).unwrap();
+        let running_id = running["job_id"].as_str().unwrap().to_string();
+        let sync = tokio::spawn({
+            let inner = inner.clone();
+            let path = queued_dir.path().to_string_lossy().into_owned();
+            async move { analyze_codebase(inner, path, false, None, None).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let queued_id = loop {
+            let pending = inner
+                .analyze_slot
+                .read()
+                .pending
+                .front()
+                .map(|pending| pending.job.job_id.clone());
+            if let Some(id) = pending {
+                break id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first sync request must enter the FIFO before cancellation"
+            );
+            tokio::task::yield_now().await;
+        };
+        sync.abort();
+        wait_for_job_terminal(inner.clone(), &running_id).await;
+        wait_for_job_terminal(inner.clone(), &queued_id).await;
+        let stored = crate::core::status::get_job_status(inner, queued_id).unwrap();
+        let crate::core::ToolOk::Value(stored) = stored else {
+            panic!("cancelled sync request's queued job must remain retrievable")
+        };
+        assert_eq!(stored.status, "completed");
     }
 
     /// Addressable terminal retention outlives the legacy one-rotation view:
