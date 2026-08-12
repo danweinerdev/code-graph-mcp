@@ -65,7 +65,7 @@ The absolute warm figure (~279 ms) includes process spawn, executable fingerprin
 | macOS UDS + stale inode | Deferred to Phase 10 / AC-59 | The seam remains explicit; no support claim is made by the Linux MVP. |
 | Windows named pipe + ACL + TCP fallback | Deferred to Phase 11 / AC-60 | Named-pipe/path/ACL branches may remain ignored or best-effort until native completion. |
 
-Task 3.5 is complete for the Linux MVP. Phase 3 still needs its final four-lane review; native macOS/Windows evidence is no longer part of that gate.
+Phase 3 is complete for the Linux MVP. Tasks 3.6-3.17 closed the successive isolation, admission, persistence, runtime-anchoring, cache-temp, and project-root ownership findings. The final frozen four-lane review is Aligned; native macOS/Windows evidence remains assigned to phases 10/11.
 
 ## Decisions Made
 

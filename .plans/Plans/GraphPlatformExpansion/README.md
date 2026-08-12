@@ -23,7 +23,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Daemon Foundation"
-    status: in-progress
+    status: complete
     doc: "03-Daemon-Foundation.md"
   - id: 4
     title: "Analyze Queue and Coalescing"
