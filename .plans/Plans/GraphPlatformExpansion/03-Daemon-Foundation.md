@@ -731,8 +731,6 @@ Revision boundary: each new save bounds crash residue by scavenging the reserved
 
 Revision boundary: daemon single-instance authority survives replacement of its runtime child directory, and crash-abandoned metadata temps are bounded without widening direct-mode cache locking.
 
-The governing Linux MVP boundary is the spec's cross-UID local-user exclusion. Persistent root/runtime pathname divergence is detected and drained; an active same-UID actor that replaces, supplies files, and restores the root entirely between checks is not an additional isolation boundary because that actor already has direct authority to edit the repository's sources.
-
 ### Completion Evidence
 
 - Verified: 2026-08-11
