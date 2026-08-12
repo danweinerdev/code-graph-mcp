@@ -1121,7 +1121,12 @@ async fn finish_proxy(stream: ClientStream) -> anyhow::Result<()> {
     // Once connected, MCP framing may already be in flight. A second server
     // cannot safely reconstruct that session, so an established-stream error
     // ends this process rather than falling back to a new in-process server.
-    let _ = pump_connection(stream).await;
+    // The exit still reports success (the host would misread a nonzero code
+    // as a tool failure), so a mid-session daemon death must at least leave
+    // a stderr breadcrumb to distinguish it from a graceful shutdown.
+    if let Err(error) = pump_connection(stream).await {
+        eprintln!("code-graph-mcp: daemon connection ended mid-session ({error}); exiting");
+    }
     Ok(())
 }
 

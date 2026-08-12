@@ -30,7 +30,11 @@ async fn main() -> anyhow::Result<()> {
         // Proxy selection must happen before constructing the MCP transport:
         // when enabled, stdin/stdout are byte-pumped directly to the daemon.
         if let Ok(cwd) = std::env::current_dir() {
-            if let Ok(cwd) = std::fs::canonicalize(&cwd) {
+            // Must match daemon::run's canonicalization: both sides derive
+            // DaemonPaths from this root, and a `\\?\`-verbatim client path
+            // against a dunce-stripped daemon path would split the runtime
+            // directory and defeat attach on Windows.
+            if let Ok(cwd) = code_graph_core::paths::canonicalize(&cwd) {
                 match RootConfig::load(&cwd) {
                     Ok((config, root)) if config.daemon.enabled => match daemon::proxy(root.clone()).await {
                         // `tokio::io::stdin` uses a blocking reader. After the daemon
