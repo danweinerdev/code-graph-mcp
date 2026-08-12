@@ -21,7 +21,7 @@ tasks:
     depends_on: ["4.1"]
   - id: "4.3"
     title: "Coalesced-caller reporting and sync non-blocking rule"
-    status: planned
+    status: complete
     justifies: "FR-43, NFR-01, AC-52. A caller whose request vanished into another needs its outcome, and a sync caller queued behind N jobs would hit MCP_TOOL_TIMEOUT on any corpus — turning a documented large-repo hazard into an everyday one."
     verification: "cargo test -p code-graph-tools analyze:: plus the snapshot suite — a coalesced caller receives the covering request's outcome with an additive optional field naming it (AC-52); that field is absent, not null, when no coalescing occurred, so non-coalesced bodies stay byte-identical (NFR-01); analyze_codebase's body and analyze_job.result remain structurally identical under one deserializer; a sync request admitted behind pending jobs returns immediately with job_id and status queued rather than blocking."
     depends_on: ["4.2"]
@@ -124,12 +124,12 @@ Implementing coverage as path containment alone. It reads as obviously correct a
 ## 4.3: Coalesced-caller reporting and sync non-blocking rule
 
 ### Subtasks
-- [ ] Add the optional coalescing field to the shared analyze result shape with `skip_serializing_if`
-- [ ] Return the coverer's outcome to the coalesced caller
-- [ ] Make a sync `analyze_codebase` admitted behind pending jobs return immediately with `job_id` and queued status
-- [ ] Preserve immediate-start and coalesced sync behaviour unchanged
-- [ ] Update CLAUDE.md and the tool descriptions: retired error, new status value, new field, changed sync blocking
-- [ ] Snapshot verification that non-coalesced bodies are byte-identical
+- [x] Add the optional coalescing field to the shared analyze result shape with `skip_serializing_if`
+- [x] Return the coverer's outcome to the coalesced caller
+- [x] Make a sync `analyze_codebase` admitted behind pending jobs return immediately with `job_id` and queued status
+- [x] Preserve immediate-start and coalesced sync behaviour unchanged
+- [x] Update CLAUDE.md and the tool descriptions: retired error, new status value, new field, changed sync blocking
+- [x] Snapshot verification that non-coalesced bodies are byte-identical
 
 ### Notes
 Revision boundary: the queue is fully observable and the phase's wire evolution is complete and documented.
@@ -140,7 +140,25 @@ Adding it to the *shared* shape keeps `analyze_codebase`'s body and `analyze_job
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-12
+- Repository: `/home/daniel/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`
+- Identity recheck: `git rev-parse HEAD && git show --quiet --format=%H 0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`, 2026-08-12T13:44:17-07:00; both matched `0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`
+- Focused review: `git show 0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools analyze::` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Covered success/failure attribution, first queued sync blocking, already-pending immediate return, cancellation, FIFO, and stored-result compatibility passed. |
+| `cargo test -p code-graph-tools --test integration && cargo test -p code-graph-tools --test snapshot_responses && cargo test -p code-graph-tools --test snapshot_tools_list` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Integration and response/tool-description snapshots passed; ordinary analyze bodies remained unchanged and omit `coalesced_by`. |
+| `make fmt-check && make lint && make plugin-sync-check && make snapshot-clean && git diff --check` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Formatting, deny-warnings clippy, generated plugin parity, snapshot hygiene, and whitespace checks passed. |
+| `make verify` | `/home/daniel/Development/Code/code-graph-mcp` | PASS (`exit 0`) | Full workspace gate passed after one isolated daemon idle-timer retry succeeded. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused intent-blind quality review | Complete task 4.3 diff | PASS | Additive wire compatibility, coalesced success/failure attribution, exact sync blocking boundary, sink ownership, descriptions, and task boundary were aligned. |
 
 ### Trap
 Letting sync `analyze_codebase` block behind the queue because "that's what a queue means". CLAUDE.md already documents `MCP_TOOL_TIMEOUT` killing long sync analyses on large trees; queueing makes wall-clock depend on other sessions' work, so a small repo can now time out because someone else started an index. Return queued instead.
