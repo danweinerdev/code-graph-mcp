@@ -2214,6 +2214,26 @@ mod coalesce {
             assert_eq!(force_mismatch.0, error.0);
             assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
             assert_eq!(slot.next_job_id, next_id_before);
+
+            std::fs::write(
+                root.path().join(".code-graph.toml"),
+                "[cpp]\nmacro_strip = [\"REPLACED_API\"]\n",
+            )
+            .unwrap();
+            let Err(config_mismatch) = admit_job(
+                &server.inner,
+                &mut slot,
+                blocker_raw.clone(),
+                false,
+                coverage_identity(&blocker_raw),
+            ) else {
+                panic!(
+                    "a config-distinct analyze must stay distinct and be rejected at queue capacity"
+                );
+            };
+            assert_eq!(config_mismatch.0, error.0);
+            assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
+            assert_eq!(slot.next_job_id, next_id_before);
         }
 
         let Err(community_error) =
