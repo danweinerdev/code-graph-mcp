@@ -50,16 +50,21 @@ fn default_macro_define_type_keyword() -> String {
     "struct".to_string()
 }
 
-/// Custom deserializer for `[response].max_bytes`. Every non-negative value,
-/// including zero, is accepted: an irreducibly large envelope must remain
-/// structurally valid even when no row can fit its configured budget.
-/// Negative integers and non-integer values are rejected by `toml`/`serde`
-/// at the type-coercion layer (the field is `usize`).
+/// Custom deserializer for `[response].max_bytes`. The budget must be
+/// positive so byte-budgeted pagination always has a nonzero configured
+/// budget. Negative integers and non-integer values are rejected by
+/// `toml`/`serde` at the type-coercion layer (the field is `usize`).
 fn deserialize_response_max_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
     D: Deserializer<'de>,
 {
-    usize::deserialize(deserializer)
+    let max_bytes = usize::deserialize(deserializer)?;
+    if max_bytes == 0 {
+        return Err(serde::de::Error::custom(
+            "`[response].max_bytes` must be > 0",
+        ));
+    }
+    Ok(max_bytes)
 }
 
 /// Top-level project configuration loaded from `<root>/.code-graph.toml`.
@@ -425,9 +430,10 @@ impl ExtensionsConfig {
 /// can absorb without forcing summarization.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResponseConfig {
-    /// Per-response byte budget consulted by paginated handlers. Default
-    /// `102_400` (100 KB). Tiny values may return an empty resumable page
-    /// when the response envelope itself leaves no room for a row.
+    /// Per-response byte budget consulted by paginated handlers. Must be
+    /// greater than zero; default `102_400` (100 KB). Tiny positive values
+    /// may return an empty resumable page when the response envelope itself
+    /// leaves no room for a row.
     #[serde(
         default = "default_response_max_bytes",
         deserialize_with = "deserialize_response_max_bytes"
@@ -1652,19 +1658,20 @@ disabled = [""]
     }
 
     #[test]
-    fn response_max_bytes_zero_preserves_irresolvable_envelope_policy() {
-        // A zero budget cannot fit any response wrapper, but it remains a
-        // valid configuration: paginated handlers return an empty resumable
-        // envelope rather than rejecting a policy the response layer handles.
+    fn response_max_bytes_zero_is_rejected() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".code-graph.toml"),
             "[response]\nmax_bytes = 0\n",
         )
         .unwrap();
-        let (config, _) = RootConfig::load(dir.path())
-            .expect("max_bytes = 0 must preserve the irreducible-envelope policy");
-        assert_eq!(config.response.max_bytes, 0);
+        let err = RootConfig::load(dir.path()).expect_err("zero max_bytes must be rejected");
+        assert!(matches!(err, ConfigError::Toml(_)));
+        assert!(
+            err.to_string()
+                .contains("`[response].max_bytes` must be > 0"),
+            "zero rejection must identify the invalid setting: {err}"
+        );
     }
 
     #[test]
