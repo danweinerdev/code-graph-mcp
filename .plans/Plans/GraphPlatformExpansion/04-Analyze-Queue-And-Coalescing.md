@@ -55,6 +55,12 @@ tasks:
     justifies: "D-0010. An unbounded shared queue lets disconnected or bursty clients retain arbitrary shutdown-drain guards and makes daemon shutdown latency unbounded."
     verification: "cargo test -p code-graph-tools pending_limit_rejects_distinct_jobs_but_keeps_covered_analyzes && cargo test -p code-graph-tools queue_full_rejection_does_not_extend_shutdown_drain — the shared FIFO holds at most 32 pending jobs, covered analyzes still coalesce at capacity, distinct analyze/community overflow is rejected without an ID, guard, or queue mutation, promotion frees one slot, and rejected work does not extend shutdown drain."
     depends_on: ["4.4"]
+  - id: "4.9"
+    title: "Reject zero response byte budgets"
+    status: complete
+    justifies: "Phase-review follow-up. A zero `[response].max_bytes` budget lets generic paginated tools return empty, non-progressing pages forever."
+    verification: "Prospective: cargo test -p code-graph-core; cargo test -p code-graph-tools async_community_budget; cargo test -p code-graph-tools; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make snapshot-clean; make plugin-sync-check; git diff --check — zero is rejected with the established message, negative and non-integer values remain rejected, positive values remain accepted, and positive irreducibly tiny async-community budgets retain their start-fresh behavior."
+    depends_on: ["4.6"]
 
 ---
 
@@ -345,6 +351,37 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 | Tool / inspection | Context | Result | Observable evidence |
 |---|---|---|---|
 | Four-lane focused review | Complete task 4.8 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
+
+## 4.9: Reject zero response byte budgets
+
+### Subtasks
+
+- [x] Restore `[response].max_bytes > 0` validation in the core configuration deserializer
+- [x] Preserve rejection of negative and non-integer values and acceptance of positive values
+- [x] Retain the positive tiny-budget async-community start-fresh behavior
+- [x] Run the prospective focused, full, and repository hygiene verification
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `5886dc732e85207e4b21df9ecfeb0f08b3241733`
+- Identity recheck: `git rev-parse 5886dc732e85207e4b21df9ecfeb0f08b3241733`, 2026-08-13; matched `5886dc732e85207e4b21df9ecfeb0f08b3241733`
+- Focused review: `git show 5886dc732e85207e4b21df9ecfeb0f08b3241733`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `5886dc732e85207e4b21df9ecfeb0f08b3241733` / `5886dc732e85207e4b21df9ecfeb0f08b3241733`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-core` | `.` | PASS (`exit 0`) | Core configuration validation tests passed: zero is rejected; negative and non-integer values remain rejected; positive values remain accepted. |
+| `cargo test -p code-graph-tools async_community_budget` | `.` | PASS (`exit 0`) | Async-community budget coverage passed, including positive irreducibly tiny-budget start-fresh behavior. |
+| `cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | Full tools suite passed for the committed implementation. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make snapshot-clean && make plugin-sync-check && git diff --check` | `.` | PASS (`exit 0`) | Formatting, deny-warnings lint, snapshot hygiene, plugin parity, and whitespace checks passed. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused quality review | Complete task 4.9 diff | PASS/Aligned | Complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary; zero budgets are rejected and positive tiny budgets remain unchanged. |
 
 ## Acceptance Criteria
 
