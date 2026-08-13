@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 4
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-13
 deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, the wire format evolves additively, and the job slot generalizes to cover long-running whole-graph queries."
 tasks:
   - id: "4.1"
@@ -29,8 +29,32 @@ tasks:
     title: "Generalize the job slot to long-running queries and add detect_communities_async"
     status: complete
     justifies: "FR-49, AC-58, review follow-up FU-01. detect_communities runs whole-graph label propagation while holding the read lock, and the client tool timeout is wall-clock — spawn_blocking does not extend it, so at UE4 scale the server can finish and the caller still see a timeout with no way to recover the result. Landing it here reuses the slot being reshaped by 4.1 rather than touching AnalyzeSlot and AnalyzeJobView a second time."
-    verification: "cargo test -p code-graph-tools job:: — a whole-graph query started asynchronously returns a job id sub-second and reports progress; get_status exposes it under the same polling vocabulary as an analyze job; the terminal result is retrievable and byte-identical to the synchronous response; every individual call is short enough that a wall-clock timeout cannot fire; the synchronous detect_communities still works unchanged for small graphs."
+    verification: "cargo test -p code-graph-tools job:: — a whole-graph query started asynchronously returns a job id sub-second and reports progress; get_status exposes it under the same polling vocabulary as an analyze job; the terminal result has the same DetectCommunitiesResponse shape and semantics as sync, though the JobView wrapper reserve can reduce rows or change next_offset (a nonbinding budget can match sync); every individual call after admission is short enough that a wall-clock timeout cannot fire; the synchronous detect_communities still works unchanged for small graphs."
     depends_on: ["4.1"]
+  - id: "4.5"
+    title: "Freeze admitted analyze config identity through execution"
+    status: complete
+    justifies: "Phase-review blind spot. A queued request can be admitted under one nested-config/project-root boundary and execute under another if `.code-graph.toml` changes while it waits, invalidating the identity used for coalescing."
+    verification: "cargo test -p code-graph-tools config_identity:: — queued and covered analyzes retain or revalidate the admitted project/config identity across nested config creation, removal, and replacement, so no coalesced caller receives a result from a different project boundary."
+    depends_on: ["4.4"]
+  - id: "4.6"
+    title: "Budget async community job envelopes"
+    status: complete
+    justifies: "Phase-review blind spot. The community result currently consumes the full response budget before JobView metadata wraps it, allowing get_job_status to exceed [response].max_bytes."
+    verification: "cargo test -p code-graph-tools async_community_budget:: — terminal get_job_status serialization, including JobView metadata and request fields, stays within the configured response budget while preserving resumable community pagination."
+    depends_on: ["4.4"]
+  - id: "4.7"
+    title: "Move analyze admission filesystem probes off Tokio workers"
+    status: complete
+    justifies: "Phase-review blind spot. Canonicalization and config discovery currently run synchronously before async kickoff detaches, so slow network filesystems can violate the sub-second-call contract and block a Tokio worker."
+    verification: "cargo test -p code-graph-tools admission_probe:: — blocking dispatch protects the Tokio scheduler while preserving validation/coalescing behavior and unrelated Tokio-task responsiveness; analyze kickoff can still wait during admission when filesystem canonicalization/config discovery is slow."
+    depends_on: ["4.5"]
+  - id: "4.8"
+    title: "Bound shared pending FIFO"
+    status: complete
+    justifies: "D-0010. An unbounded shared queue lets disconnected or bursty clients retain arbitrary shutdown-drain guards and makes daemon shutdown latency unbounded."
+    verification: "cargo test -p code-graph-tools pending_limit_rejects_distinct_jobs_but_keeps_covered_analyzes && cargo test -p code-graph-tools queue_full_rejection_does_not_extend_shutdown_drain — the shared FIFO holds at most 32 pending jobs, covered analyzes still coalesce at capacity, distinct analyze/community overflow is rejected without an ID, guard, or queue mutation, promotion frees one slot, and rejected work does not extend shutdown drain."
+    depends_on: ["4.4"]
 
 ---
 
@@ -169,7 +193,7 @@ Letting sync `analyze_codebase` block behind the queue because "that's what a qu
 - [x] Widen the job slot from analyze-specific to a job kind that covers long-running queries
 - [x] Keep `analyze_job` in `get_status` reporting analyze jobs, so no existing client breaks
 - [x] Add an async form of `detect_communities` on that machinery
-- [x] Ensure the async result is byte-identical to the synchronous response for the same inputs
+- [x] Ensure the async terminal result has the same `DetectCommunitiesResponse` shape and semantics as sync; the JobView wrapper reserve can reduce rows or change `next_offset`, while a nonbinding budget can match sync
 - [x] Leave synchronous `detect_communities` working unchanged — it is the right call on a small graph
 - [x] Document both forms and when to reach for each (NFR-11)
 
@@ -207,17 +231,133 @@ Generalize rather than special-case. A second job mechanism beside the analyze o
 ### Trap
 Reaching for `spawn_blocking` and considering it solved. It moves the work off the async worker and does nothing about the client's wall-clock timeout, which is the actual failure. Only a return-immediately-and-poll shape fixes that.
 
+## 4.5: Freeze admitted analyze config identity through execution
+
+### Subtasks
+- [x] Carry the admitted project/config identity into queued and running jobs
+- [x] Prevent execution from silently crossing a changed nested-config boundary
+- [x] Cover nested config creation, removal, and replacement while queued
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Identity recheck: `git rev-parse b2f48f6f972a3c4488571668f1e8448992791cdf`, 2026-08-13; matched `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Focused review: `git show b2f48f6f972a3c4488571668f1e8448992791cdf`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b2f48f6f972a3c4488571668f1e8448992791cdf` / `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools config_identity::` | `.` | PASS (`exit 0`) | Queued and covered analyzes retain or revalidate admitted project/config identity across nested-config creation, removal, and replacement. |
+| `make verify` | `.` | PASS (`exit 0`) | Latest full workspace gate was green for the committed implementation. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Four-lane focused review | Complete task 4.5 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
+
+## 4.6: Budget async community job envelopes
+
+### Subtasks
+- [x] Reserve generic JobView wrapper overhead before community result budgeting
+- [x] Verify terminal polling stays within `[response].max_bytes`
+- [x] Preserve pagination resume semantics under the reduced nested-result budget
+
+### Notes
+
+The async terminal result has the same `DetectCommunitiesResponse` shape and semantics as sync, but the JobView wrapper reserve can reduce rows or change `next_offset`; a nonbinding budget can match sync. Under a pathological tiny async budget, an empty `truncated` page with an unchanged `next_offset` is a start-fresh marker, not pagination progress: do not retry unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry.
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Identity recheck: `git rev-parse b2f48f6f972a3c4488571668f1e8448992791cdf`, 2026-08-13; matched `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Focused review: `git show b2f48f6f972a3c4488571668f1e8448992791cdf`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b2f48f6f972a3c4488571668f1e8448992791cdf` / `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools async_community_budget` | `.` | PASS (`exit 0`) | Terminal `get_job_status` serialization, including JobView metadata and request fields, stayed within the configured response budget with resumable pagination preserved. |
+| `make verify` | `.` | PASS (`exit 0`) | Latest full workspace gate was green for the committed implementation. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Four-lane focused review | Complete task 4.6 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
+
+## 4.7: Move analyze admission filesystem probes off Tokio workers
+
+### Subtasks
+- [x] Dispatch canonicalization and config discovery through blocking execution
+- [x] Preserve sync and async validation/coalescing semantics
+- [x] Add scheduler-responsiveness regression coverage
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Identity recheck: `git rev-parse b2f48f6f972a3c4488571668f1e8448992791cdf`, 2026-08-13; matched `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Focused review: `git show b2f48f6f972a3c4488571668f1e8448992791cdf`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b2f48f6f972a3c4488571668f1e8448992791cdf` / `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools admission_probe::` | `.` | PASS (`exit 0`) | Focused admission-probe coverage confirmed blocking dispatch preserves admission behavior and Tokio responsiveness. |
+| `cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | Full tools suite passed for the committed implementation. |
+| `make verify` | `.` | PASS (`exit 0`) | Latest full workspace gate was green for the committed implementation. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Four-lane focused review | Complete task 4.7 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
+
+## 4.8: Bound shared pending FIFO
+
+### Subtasks
+- [x] Cap the shared pending FIFO at 32 entries, excluding the current job and retained terminal history
+- [x] Evaluate analyze coverage before rejecting a distinct overflow, so covered analyzes still coalesce at capacity
+- [x] Reject distinct analyze and community overflow without issuing an ID, retaining a guard, or mutating the queue
+- [x] Verify promotion frees exactly one pending slot and rejected work does not extend shutdown drain
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Identity recheck: `git rev-parse b2f48f6f972a3c4488571668f1e8448992791cdf`, 2026-08-13; matched `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Focused review: `git show b2f48f6f972a3c4488571668f1e8448992791cdf`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b2f48f6f972a3c4488571668f1e8448992791cdf` / `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools pending_limit_rejects_distinct_jobs_but_keeps_covered_analyzes` | `.` | PASS (`exit 0`) | Prospective verification confirmed the 32-entry cap rejects distinct work while covered analyzes still coalesce. |
+| `cargo test -p code-graph-tools queue_full_rejection_does_not_extend_shutdown_drain` | `.` | PASS (`exit 0`) | Prospective verification confirmed rejected work does not extend shutdown drain. |
+| `make verify` | `.` | PASS (`exit 0`) | Latest full workspace gate was green for the committed implementation. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Four-lane focused review | Complete task 4.8 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
+
 ## Acceptance Criteria
 
-- [ ] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
-- [ ] **AC-51**: The coverage rule holds across all four force/containment cases and never coalesces disjoint paths (FR-42).
-- [ ] **AC-52**: A coalesced caller receives the covering request's outcome, and the response identifies the coalescing (FR-43).
-- [ ] Non-coalesced analyze bodies remain byte-identical; one deserializer still covers both shapes (NFR-01).
-- [ ] CLAUDE.md and tool descriptions updated for the retired error, the `"queued"` status, the new optional field, and the sync blocking change (NFR-11).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
-- [ ] **AC-58**: A whole-graph query runs asynchronously with sub-second calls throughout, so a wall-clock client timeout cannot fire (FR-49).
-- [ ] FR-41, FR-42, FR-43, FR-49 realized.
+- [x] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
+- [x] **AC-51**: The coverage rule holds across all four force/containment cases and never coalesces disjoint paths (FR-42).
+- [x] **AC-52**: A coalesced caller receives the covering request's outcome, and the response identifies the coalescing (FR-43).
+- [x] Non-coalesced analyze bodies remain byte-identical; one deserializer still covers both shapes (NFR-01).
+- [x] CLAUDE.md and tool descriptions updated for the retired error, the `"queued"` status, the new optional field, and the sync blocking change (NFR-11).
+- [x] **AC-27**: `make verify` passes (NFR-04).
+- [x] **AC-58**: A whole-graph query runs asynchronously with sub-second calls throughout, so a wall-clock client timeout cannot fire (FR-49).
+- [x] **D-0010**: The shared FIFO has at most 32 pending jobs; covered analyzes still coalesce at capacity, while distinct analyze or community overflow receives the retryable queue-full error without extending shutdown drain. (Depends on 4.8.)
+- [x] FR-41, FR-42, FR-43, FR-49, D-0010 realized.
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+All acceptance criteria are met by committed tasks through `b2f48f6f972a3c4488571668f1e8448992791cdf` and the latest green `make verify`. The phase remains `in-progress`; Phase Completion Evidence is pending until the frozen phase review is complete.

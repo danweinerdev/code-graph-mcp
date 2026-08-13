@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-11
+updated: 2026-08-13
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -84,14 +84,14 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 
 ## Current State
 
-*Written for a cold start. Last updated 2026-08-11 after cache-temp hardening revision `fc82fd0`.*
+*Written for a cold start. Last updated 2026-08-13.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
 | 3 Daemon Foundation | implementation complete, phase `in-progress` | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and fully gated by two consecutive `make verify` runs. The remaining gate is a fresh frozen four-lane phase review. Native platform completion remains deferred to phases 10/11. |
-| 4 Analyze Queue | tasks complete; phase `in-progress` | FIFO analyze queue/coalescing plus the generic long-job engine and `detect_communities_async` shipped through `8aaac0a`. Phase acceptance and final four-lane review remain. |
+| 4 Analyze Queue | tasks 4.1–4.8 complete; phase `in-progress` | FIFO analyze queue/coalescing, the generic long-job engine, `detect_communities_async`, admitted-config identity, async-community budgeting, blocking admission probes, and D-0010's shared pending-FIFO bound are committed through `b2f48f6f972a3c4488571668f1e8448992791cdf`. All phase acceptance criteria are met; only the frozen phase review remains. |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
 | 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
