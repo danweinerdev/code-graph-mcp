@@ -519,13 +519,16 @@ pub fn get_coupling(
             .saturating_sub(COUPLING_BOTH_WRAPPER_OVERHEAD);
 
         let outgoing = if remaining == 0 {
+            // No outgoing row was emitted. Preserve the caller's requested
+            // offset so this is the generic non-advancing start-fresh marker,
+            // including on later pages (not only offset zero).
             Page::<CouplingEntry> {
                 results: vec![],
                 total: outgoing_total,
                 offset: resolved_offset,
                 limit: resolved_limit,
                 truncated: true,
-                next_offset: Some(0),
+                next_offset: Some(resolved_offset),
             }
         } else {
             let (out_results, _out_kept, out_truncated, out_next) =

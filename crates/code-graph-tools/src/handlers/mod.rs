@@ -275,8 +275,8 @@ pub struct DegenerateInfo {
 /// against the full budget, and outgoing receives whatever remains after
 /// the incoming page plus a fixed outer-wrapper overhead is subtracted.
 /// If incoming exhausts the budget, outgoing is an empty page flagged
-/// `truncated: true` with `next_offset: Some(0)` so a client knows to
-/// re-request the outgoing side fresh.
+/// `truncated: true` with `next_offset` equal to the request offset, the
+/// start-fresh marker.
 #[derive(Debug, Serialize)]
 pub struct CouplingBoth {
     pub incoming: Page<CouplingEntry>,
@@ -295,10 +295,14 @@ pub struct CouplingBoth {
 /// is the source of truth, not the snapshots. Integer fields stay `u32`
 /// (not `usize`) so JSON output is byte-identical across platforms.
 ///
-/// `truncated` is `true` when the handler stopped emitting results before
-/// reaching `limit` due to a byte-budget cap. `next_offset` is `Some(n)` when a
-/// client should re-request with `offset = n` to continue paging — `None`
-/// when there is no further page. The fields always serialize (no
+/// `truncated` is `true` whenever matching records remain after the emitted
+/// prefix, because the count limit or a byte-budget cap stopped this page.
+/// Ordinarily `next_offset` is strictly past the emitted prefix and a client
+/// re-requests with `offset = next_offset`; `None` means there is no further
+/// page. The sole byte-starvation exception is an empty, truncated page whose
+/// `next_offset` equals its requested `offset`: it is a start-fresh marker,
+/// not progress. Raise `[response].max_bytes`, rerun `analyze_codebase` to
+/// refresh cached config, then retry. The fields always serialize (no
 /// `skip_serializing_if`) so MCP clients can rely on a stable envelope
 /// shape: `truncated: false` and `next_offset: null` are emitted explicitly
 /// when no truncation occurred.
@@ -555,14 +559,17 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// - If a candidate would push the total over budget, it is NOT included,
 ///   the function returns early with `truncated = true` and
 ///   `next_offset = Some(offset + kept_count)`.
-/// - If `limit` is reached, or `iter` is exhausted, before the budget
-///   bites, the function returns `truncated = false` and `next_offset = None`.
+/// - If `limit` is reached before iterator exhaustion, the function returns
+///   `truncated = true` and a strict `next_offset`; if exhaustion coincides
+///   with the limit, it returns `truncated = false` and `next_offset = None`.
 /// - Pathological case: if the very first candidate alone exceeds the
 ///   budget, the helper returns 0 records, `truncated = true`, and
 ///   `next_offset = Some(offset)` — never panics, never makes forward
 ///   progress impossible. Callers should treat `next_offset == Some(offset)`
 ///   with an empty `results` as "budget too tight for any record at this
-///   position" and surface a meaningful error if needed.
+///   position" and must raise `[response].max_bytes`, rerun
+///   `analyze_codebase` to refresh cached config, then retry rather than
+///   repeat the unchanged request.
 ///
 /// Return tuple is `(kept_records, total_kept, truncated, next_offset)`
 /// where `total_kept == kept_records.len() as u32`.
@@ -627,14 +634,13 @@ pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
     let mut kept: Vec<T> = Vec::new();
     let mut running_bytes: usize = 0;
 
-    for item in iter.into_iter().skip(offset as usize) {
-        if (kept.len() as u32) >= limit {
-            // Hit the count cap before the byte budget — clean page, no
-            // continuation token. Anything beyond `limit` is the next call's
-            // responsibility, signalled by the caller-supplied `offset+limit`,
-            // not by the helper.
-            return (kept, limit, false, None);
-        }
+    let mut items = iter.into_iter().skip(offset as usize).peekable();
+    while (kept.len() as u32) < limit {
+        let Some(item) = items.next() else {
+            // Iterator exhausted before either trigger fired. No continuation.
+            let kept_len = kept.len() as u32;
+            return (kept, kept_len, false, None);
+        };
         // Production `T` types (SymbolResult, CallChain) are infallible
         // serializers — they hold only plain owned data with no cycles or
         // custom Serialize impls that can error. The `unwrap_or(0)` fallback
@@ -659,9 +665,16 @@ pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
         kept.push(item);
     }
 
-    // Iterator exhausted before either trigger fired. No continuation.
+    // The count cap is not itself evidence of a continuation: exactly `limit`
+    // records is a natural end, while `limit + 1` needs a resumable offset.
+    // Peek rather than consume so the next call's fresh iterator starts at the
+    // un-emitted record.
     let kept_len = kept.len() as u32;
-    (kept, kept_len, false, None)
+    if items.peek().is_some() {
+        (kept, kept_len, true, Some(offset.saturating_add(kept_len)))
+    } else {
+        (kept, kept_len, false, None)
+    }
 }
 
 /// Test-only helpers shared across handler submodules. Lifted out of each
@@ -964,11 +977,12 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_take_first_record_exceeds_budget() {
+    fn byte_budget_take_empty_non_advancing_page_is_start_fresh_marker() {
         // Single record whose serialized form alone blows past the
         // envelope-overhead-adjusted budget. With budget = 5 bytes (after
         // subtracting overhead), an 8-byte record cannot fit. Expected:
-        // 0 records kept, truncated=true, next_offset=Some(offset).
+        // 0 records kept, truncated=true, next_offset=Some(offset): this is
+        // the generic start-fresh marker, not a resumable continuation.
         //
         // Uses offset=3 with enough records that skip(3) lands on a real
         // candidate — proves the "first post-skip candidate too big" path,
@@ -998,15 +1012,52 @@ mod tests {
 
     #[test]
     fn byte_budget_take_limit_cap_before_budget() {
-        // limit caps before budget bites. 5 records, limit=2, generous
-        // budget → exactly 2 kept, truncated=false (caller decides whether
-        // to re-page via offset+limit).
+        // Limit-plus-one must advertise a continuation even when the byte
+        // budget does not bind.
         let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 2, 10_000);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(total_kept, 2);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(2));
+    }
+
+    #[test]
+    fn byte_budget_take_exact_limit_is_a_natural_end() {
+        // The count cap alone must not manufacture a continuation when the
+        // source has exactly that many records.
+        let items: Vec<Rec> = (0..2).map(|id| Rec { id }).collect();
         let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 2, 10_000);
         assert_eq!(kept.len(), 2);
         assert_eq!(total_kept, 2);
         assert!(!truncated);
         assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_count_limited_pages_resume_without_gaps_or_duplicates() {
+        // Each handler call creates a fresh source iterator. Lookahead may
+        // inspect but must not consume the first un-emitted record.
+        let mut offset = 0;
+        let mut actual = Vec::new();
+        loop {
+            let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+            let (kept, _total_kept, truncated, next_offset) =
+                byte_budget_take(items, offset, 2, 10_000);
+            actual.extend(kept.into_iter().map(|record| record.id));
+            match next_offset {
+                Some(next) => {
+                    assert!(truncated);
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => {
+                    assert!(!truncated);
+                    break;
+                }
+            }
+        }
+        assert_eq!(actual, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

@@ -23,43 +23,51 @@ pub fn get_status(inner: Arc<ServerInner>) -> ToolResult<StatusResult> {
     let package_version = env!("CARGO_PKG_VERSION").to_string();
     let release_build = !cfg!(debug_assertions);
 
-    // Project root + config path: both derive from `root_path` (set by
-    // the most recent analyze). If never indexed, both are None.
-    let project_root = inner.root_path.read().clone();
-    let config_path = project_root.as_ref().and_then(|root| {
-        let p = root.join(".code-graph.toml");
-        if p.exists() {
-            Some(p.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    });
-    let indexed_root = project_root.map(|p| p.to_string_lossy().into_owned());
-
-    // Config counts: cheap read of the cached `RootConfig`. The TOML
-    // file is NOT re-read here — these are exactly the values that
-    // applied during the most recent analyze.
-    let (macro_strip_count, macro_strip_with_args_count) = {
-        let cfg = inner.config.read();
+    // Root, config provenance, and config counts come from one successful
+    // analyze snapshot. Do not probe `.code-graph.toml` here: creation or
+    // removal after indexing must not rewrite the provenance of the active
+    // graph, and queued/failed analyzes must not replace it either.
+    // Lock order is status_publication -> graph/applied-index. Successful
+    // analyze and watch mutations take the matching write guard, so this
+    // snapshot cannot mix a newly replaced graph with prior provenance.
+    let (
+        config_path,
+        indexed_root,
+        macro_strip_count,
+        macro_strip_with_args_count,
+        indexed,
+        stats,
+        index_built_at,
+        index_force_built,
+    ) = {
+        let _publication = inner.status_publication.read();
+        let applied = inner.applied_index.read();
+        let config_path = applied
+            .config_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let indexed_root = applied
+            .root_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let macro_strip_count = applied.config.cpp.macro_strip.len();
+        let macro_strip_with_args_count = applied.config.cpp.macro_strip_with_args.len();
+        let indexed = inner.indexed.load(Ordering::Acquire);
+        let stats = inner.graph.read().stats();
+        let built_at_nanos = inner.index_built_at.load(Ordering::Acquire);
+        let index_built_at =
+            (built_at_nanos != 0).then(|| format_unix_nanos_rfc3339(built_at_nanos));
+        let index_force_built = indexed.then(|| inner.index_force_built.load(Ordering::Acquire));
         (
-            cfg.cpp.macro_strip.len(),
-            cfg.cpp.macro_strip_with_args.len(),
+            config_path,
+            indexed_root,
+            macro_strip_count,
+            macro_strip_with_args_count,
+            indexed,
+            stats,
+            index_built_at,
+            index_force_built,
         )
-    };
-
-    let indexed = inner.indexed.load(Ordering::Acquire);
-    let stats = inner.graph.read().stats();
-
-    let built_at_nanos = inner.index_built_at.load(Ordering::Acquire);
-    let index_built_at = if built_at_nanos == 0 {
-        None
-    } else {
-        Some(format_unix_nanos_rfc3339(built_at_nanos))
-    };
-    let index_force_built = if indexed {
-        Some(inner.index_force_built.load(Ordering::Acquire))
-    } else {
-        None
     };
 
     // Snapshot the slot under the read lock — job Arcs plus the FIFO IDs —

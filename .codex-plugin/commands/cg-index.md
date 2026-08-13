@@ -38,7 +38,8 @@ per-call timeout during indexing. `get_job_status.result` is structurally/deseri
 `analyze_codebase` body; a coalesced sync response adds `coalesced_by`. Use `get_status()` for
 current-job and FIFO queue diagnostics.
 
-When a sync request is covered by an existing analyze, it waits for that outcome and its result
+When a sync request first matches an existing analyze's admitted project root and effective-config
+identity/provenance, then is covered by its scope with compatible force, it waits for that outcome and its result
 adds `coalesced_by` with the covering job ID (or its error ends with `(coalesced_by: <job_id>)`).
 The first distinct request behind a running job blocks to its own terminal result. If distinct work
 is already pending, sync returns a queued `{ job_id, status, started_at, existing, note }` response
@@ -60,9 +61,10 @@ Wait for queued work to complete and retry, or poll `get_status()` for FIFO diag
 
 `[response].max_bytes` changes do **not** need `force=true` — just re-run `analyze_codebase`.
 
-For `detect_communities_async`, an empty `truncated` terminal page with an unchanged
-`next_offset` is a start-fresh marker, not a continuation. Do **not** retry it unchanged: raise
-`[response].max_bytes`, re-run `analyze_codebase` to refresh cached config, then retry.
+For any byte-budgeted page (including an async community terminal result), empty `results` with
+`truncated: true` and `next_offset` equal to the requested `offset` is a start-fresh marker, not a
+continuation. Do **not** retry unchanged: raise `[response].max_bytes`, re-run
+`analyze_codebase` to refresh cached config, then retry. `detect_cycles` is count-paginated only.
 
 ## Notes
 

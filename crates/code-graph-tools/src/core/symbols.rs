@@ -330,7 +330,6 @@ pub fn search_symbols(
     let mut results: Vec<SymbolResult> = Vec::with_capacity(page.len());
     let mut running_bytes: usize = 0;
     let mut truncated = false;
-    let mut next_offset: Option<u32> = None;
 
     for record in page {
         let serialized_len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
@@ -338,22 +337,27 @@ pub fn search_symbols(
             .saturating_add(serialized_len)
             .saturating_add(1);
         if projected > budget {
-            let k = results.len() as u32;
             truncated = true;
-            next_offset = Some(resolved_offset.saturating_add(k));
             break;
         }
         running_bytes = projected;
         results.push(record);
     }
 
+    // `Graph::search` returns at most `resolved_limit` rows, so this path
+    // cannot delegate its already-sliced page to `byte_budget_take`. Whether
+    // the handler stopped at that count cap or its local byte budget, the
+    // common Page contract is the same: advertise a continuation whenever a
+    // matching record remains beyond the emitted prefix.
+    let emitted = results.len() as u32;
+    let has_remaining = sr.total > resolved_offset.saturating_add(emitted);
     let page = Page::<SymbolResult> {
         results,
         total: sr.total,
         offset: resolved_offset,
         limit: resolved_limit,
-        truncated,
-        next_offset,
+        truncated: truncated || has_remaining,
+        next_offset: has_remaining.then_some(resolved_offset.saturating_add(emitted)),
     };
 
     let suggestions: Vec<String> = if page.total == 0

@@ -57,6 +57,11 @@ use super::{Page, SymbolResult};
 /// deliberate exception to the "envelope echoes resolved limit" contract
 /// (documented in CLAUDE.md).
 ///
+/// For every byte-budgeted `Page`, an empty `results` page with
+/// `truncated: true` and `next_offset` equal to the requested `offset` is a
+/// start-fresh marker, not pagination progress. Raise `[response].max_bytes`,
+/// rerun `analyze_codebase` to refresh cached config, then retry unchanged.
+///
 /// `#[allow(clippy::too_many_arguments)]`: the existing call-site
 /// convention for `get_file_symbols` (and `get_orphans`) is positional
 /// args. `count_only` is the 8th positional parameter, preserving that
@@ -192,10 +197,10 @@ pub struct SearchSymbolsInput<'a> {
 ///
 /// Truncation distinction matters: `sr.symbols.len() < resolved_limit` is
 /// normal end-of-match-set (Graph::search exhausted the underlying match
-/// set at this offset); we report `truncated=false` in that case. Only set
-/// `truncated=true` when the byte-budget trim DROPS records from the page
-/// returned by `Graph::search`. `total` always carries `sr.total` (the
-/// pre-pagination match count from `Graph::search`).
+/// set at this offset). Otherwise, set `truncated=true` whenever matching
+/// rows remain after the emitted prefix, whether the count limit or the
+/// byte-budget trim stopped this page. `total` always carries `sr.total`
+/// (the pre-pagination match count from `Graph::search`).
 pub fn search_symbols(
     graph: &RwLock<Graph>,
     input: SearchSymbolsInput<'_>,
@@ -773,10 +778,8 @@ mod tests {
 
     #[test]
     fn file_symbols_byte_budget_no_truncation_with_no_budget() {
-        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the handler's
-        // existing behavior is preserved exactly — no truncation, no
-        // next_offset. Locks the contract that byte-budget wiring doesn't
-        // affect callers that opt out.
+        // With NO_BYTE_BUDGET (= usize::MAX), byte accounting cannot truncate
+        // the page, but remaining count-limited rows still need continuation.
         let g = locked(graph_with_n_file_symbols(30));
         let r = get_file_symbols(
             &g,
@@ -792,8 +795,8 @@ mod tests {
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 30);
-        assert!(!truncated);
-        assert_eq!(next_offset, None);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(20));
     }
 
     #[test]
@@ -2317,11 +2320,10 @@ mod tests {
     }
 
     #[test]
-    fn search_symbols_byte_budget_no_truncation_with_no_budget() {
-        // Anti-regression: with NO_BYTE_BUDGET (= usize::MAX) the handler
-        // returns the full page from `Graph::search` unchanged —
-        // `truncated=false`, `next_offset=None`. Locks the contract that
-        // byte-budget wiring doesn't affect callers that opt out.
+    fn search_symbols_count_limited_page_exposes_continuation_without_byte_cap() {
+        // A generous byte budget does not turn a full count-limited page into
+        // natural completion: the remaining matches must stay reachable via
+        // the strict continuation offset.
         let g = locked(graph_with_n_broad_matches(100));
         let r = search_symbols(
             &g,
@@ -2345,13 +2347,79 @@ mod tests {
             50,
             "NO_BYTE_BUDGET must return the full page from Graph::search",
         );
-        assert!(!truncated, "NO_BYTE_BUDGET must never set truncated=true");
+        assert!(
+            truncated,
+            "unreturned count-limited matches must set truncated=true"
+        );
         assert_eq!(
             next_offset,
-            serde_json::Value::Null,
-            "NO_BYTE_BUDGET must set next_offset=null",
+            serde_json::json!(50),
+            "next_offset must point strictly past the 50 emitted rows",
         );
         assert_eq!(total, 100, "total is the pre-pagination match count");
+    }
+
+    #[test]
+    fn search_symbols_count_limited_pages_resume_without_gaps_or_duplicates() {
+        // Use a generous budget to isolate count-limit pagination from the
+        // handler's separate byte-budget trim. The second page must begin at
+        // the first row not emitted by page one, then complete the set.
+        let g = locked(graph_with_n_broad_matches(5));
+        let first = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("match"),
+                limit: Some(2),
+                offset: Some(0),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let first: serde_json::Value = serde_json::from_str(&body_text(&first)).unwrap();
+        let first_ids: Vec<&str> = first["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        let next = first["next_offset"].as_u64().unwrap() as u32;
+        assert!(first["truncated"].as_bool().unwrap());
+        assert_eq!(next, 2, "continuation must be strictly past page one");
+
+        let second = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                subtree: None,
+                query: Some("match"),
+                limit: Some(10),
+                offset: Some(next),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let second: serde_json::Value = serde_json::from_str(&body_text(&second)).unwrap();
+        let second_ids: Vec<&str> = second["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(!second["truncated"].as_bool().unwrap());
+        assert!(second["next_offset"].is_null());
+
+        let ids: Vec<&str> = first_ids.into_iter().chain(second_ids).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "/broad.cpp:match_000",
+                "/broad.cpp:match_001",
+                "/broad.cpp:match_002",
+                "/broad.cpp:match_003",
+                "/broad.cpp:match_004",
+            ],
+            "resumed pages must recover every matching row exactly once",
+        );
     }
 
     #[test]
@@ -3184,10 +3252,10 @@ mod tests {
         assert_eq!(p1_rows.len(), 4);
         assert_eq!(p1_offset, 0);
         assert_eq!(p1_limit, 4);
-        // Hit the limit cap before any byte cap fires; truncated stays false
-        // and next_offset stays None — caller pages via offset+limit.
-        assert!(!p1_truncated);
-        assert_eq!(p1_next, None);
+        // The first count-limited page has remaining rows, so it exposes the
+        // strict continuation rather than requiring callers to infer it.
+        assert!(p1_truncated);
+        assert_eq!(p1_next, Some(4));
 
         let p2 = get_symbol_summary(&g, None, Some(4), Some(4), false, NO_BYTE_BUDGET);
         let (p2_rows, p2_total, p2_offset, p2_limit) = page_parts(&p2);
@@ -3195,6 +3263,7 @@ mod tests {
         assert_eq!(p2_rows.len(), 4);
         assert_eq!(p2_offset, 4);
         assert_eq!(p2_limit, 4);
+        assert_eq!(page_extras(&p2), (false, None));
 
         // page 1 + page 2 must equal the full sorted result, row-for-row.
         let mut concat = p1_rows.clone();
@@ -3266,11 +3335,8 @@ mod tests {
         //   {"namespace":"ns_0123","kind":"function","count":1}
         // ≈ 55 bytes. 100KB budget minus ENVELOPE_OVERHEAD_BYTES (512)
         // leaves room for ~1800 rows by byte budget alone — so the count
-        // cap (limit=100) bites first. `truncated` is false on this path
-        // (byte_budget_take only sets truncated when the BYTE budget
-        // bites, not when the count cap hits) and `next_offset` is null;
-        // the caller pages via `offset + limit` per the documented
-        // `Page<T>` envelope contract.
+        // cap (limit=100) bites first. Because unreturned rows remain, this
+        // count-limited page is truncated and exposes its next offset.
         let g = locked(multi_namespace_graph(1200));
 
         // Use the production default `max_bytes` to mirror real callers.
@@ -3283,9 +3349,8 @@ mod tests {
         assert_eq!(rows.len(), 100, "default page must cap at limit=100");
         assert_eq!(limit, 100);
         assert_eq!(offset, 0);
-        // Count cap path: limit reached cleanly, byte budget not consulted.
-        assert!(!truncated, "count-cap path returns truncated=false");
-        assert_eq!(next, None, "count-cap path returns next_offset=null");
+        assert!(truncated, "count-cap path exposes continuation");
+        assert_eq!(next, Some(100), "count-cap path returns strict next_offset");
     }
 
     #[test]

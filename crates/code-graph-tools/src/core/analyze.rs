@@ -332,23 +332,28 @@ pub(crate) async fn run_analyze_job(
                     }
                     probe.set_last_sweep_at(now_nanos);
                 }
-                let stats = probe.stats();
                 if let Err(error) = inner.ensure_daemon_root_current() {
                     finish_failed(&job, error);
                     return;
                 }
-                {
+                let stats = {
+                    // Lock order: status_publication is outermost, followed by
+                    // graph and applied-index/config locks. Never await while
+                    // this guard is held.
+                    let _publication = inner.status_publication.write();
                     let mut g = inner.graph.write();
                     *g = probe;
-                }
-                *inner.root_path.write() = Some(project_root.clone());
-                *inner.cache_root.write() = Some(project_root.clone());
-                *inner.config.write() = cfg;
-                inner.indexed.store(true, Ordering::Release);
-                inner
-                    .index_built_at
-                    .store(now_nanos_u64(), Ordering::Release);
-                inner.index_force_built.store(force, Ordering::Release);
+                    let stats = g.stats();
+                    drop(g);
+                    pause_after_graph_replacement_before_metadata(&inner);
+                    publish_applied_index_state(&inner, &project_root, config_present, cfg);
+                    inner.indexed.store(true, Ordering::Release);
+                    inner
+                        .index_built_at
+                        .store(now_nanos_u64(), Ordering::Release);
+                    inner.index_force_built.store(force, Ordering::Release);
+                    stats
+                };
                 if sweep_ran {
                     // The sweep introduces a cache write — bump the
                     // phase so a polling client doesn't see the
@@ -583,19 +588,23 @@ pub(crate) async fn run_analyze_job(
                 Err(error)
             } else {
                 let stats = {
+                    // Lock order: status_publication is outermost, followed by
+                    // graph and applied-index/config locks. Never await while
+                    // this guard is held.
+                    let _publication = inner.status_publication.write();
                     let mut g = inner.graph.write();
                     *g = merged_graph;
-                    g.stats()
+                    let stats = g.stats();
+                    drop(g);
+                    pause_after_graph_replacement_before_metadata(&inner);
+                    publish_applied_index_state(&inner, &project_root, config_present, cfg);
+                    inner.indexed.store(true, Ordering::Release);
+                    inner
+                        .index_built_at
+                        .store(now_nanos_u64(), Ordering::Release);
+                    inner.index_force_built.store(force, Ordering::Release);
+                    stats
                 };
-
-                *inner.root_path.write() = Some(project_root.clone());
-                *inner.cache_root.write() = Some(project_root.clone());
-                *inner.config.write() = cfg;
-                inner.indexed.store(true, Ordering::Release);
-                inner
-                    .index_built_at
-                    .store(now_nanos_u64(), Ordering::Release);
-                inner.index_force_built.store(force, Ordering::Release);
 
                 if abs_path != project_root {
                     let in_scope_count = {
@@ -669,6 +678,45 @@ pub(crate) async fn run_analyze_job(
         Err(msg) => finish_failed(&job, msg),
     }
 }
+
+/// Publish the configuration snapshot that governs the newly applied graph.
+///
+/// Call only while holding `inner.status_publication` after a successful
+/// fast-path or merge has replaced `inner.graph`.
+/// In particular, queued jobs and failed analyzes must not alter this snapshot:
+/// `get_status` describes the active index, not the most recently admitted
+/// request or the filesystem's current `.code-graph.toml` state.
+fn publish_applied_index_state(
+    inner: &ServerInner,
+    project_root: &std::path::Path,
+    config_present: bool,
+    cfg: RootConfig,
+) {
+    let project_root = project_root.to_path_buf();
+    let config_path = config_present.then(|| project_root.join(".code-graph.toml"));
+    *inner.root_path.write() = Some(project_root.clone());
+    *inner.cache_root.write() = Some(project_root.clone());
+    *inner.config.write() = cfg.clone();
+    *inner.applied_index.write() = crate::server::AppliedIndexState {
+        root_path: Some(project_root),
+        config_path,
+        config: cfg,
+    };
+}
+
+/// Invoke the deterministic test handoff while the publication write guard is
+/// held. This is synchronous by design: the lock-order contract forbids an
+/// `.await` while `status_publication` is held.
+#[cfg(test)]
+fn pause_after_graph_replacement_before_metadata(inner: &ServerInner) {
+    if let Some(hook) = inner.publication_hook.lock().take() {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_graph_replacement_before_metadata(_inner: &ServerInner) {}
 
 /// Stamp terminal state under a single `state.write()` so an observer
 /// (the sync handler reading after `await`, or polled `get_status`)
@@ -1859,7 +1907,7 @@ mod coalesce {
         let server = server();
         server.inner.indexed.store(true, Ordering::Release);
         *server.inner.graph.write() = graph_with_isolated_community_files(8, 120);
-        server.inner.config.write().response.max_bytes = 1_500;
+        server.inner.config.write().response.max_bytes = 100_000;
 
         let expected = match crate::core::structure::detect_communities(
             &server.inner.graph,
@@ -1886,7 +1934,7 @@ mod coalesce {
         let mut actual = Vec::new();
         loop {
             let ToolOk::Value(kickoff) =
-                detect_communities_async(server.inner.clone(), None, None, None, None, offset)
+                detect_communities_async(server.inner.clone(), None, None, None, Some(2), offset)
                     .await
                     .unwrap()
             else {
@@ -1904,6 +1952,7 @@ mod coalesce {
             let Some(JobResult::DetectCommunities(response)) = view.result else {
                 panic!("expected completed community result")
             };
+            assert!(response.page.total > response.page.limit);
             actual.extend(
                 response
                     .page
@@ -1912,8 +1961,11 @@ mod coalesce {
                     .map(|community| community.label),
             );
             let Some(next_offset) = response.page.next_offset else {
+                assert!(!response.page.truncated);
                 break;
             };
+            assert!(response.page.truncated);
+            assert!(next_offset > response.page.offset);
             offset = Some(next_offset);
         }
         assert_eq!(actual, expected);
@@ -2923,6 +2975,167 @@ mod coalesce {
             assert_ne!(
                 first_config, second_config,
                 "the FIFO order must retain the old snapshot before the newer config snapshot"
+            );
+        }
+    }
+
+    mod config_path {
+        use super::*;
+        use code_graph_lang_cpp::CppParser;
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        fn server() -> crate::server::CodeGraphServer {
+            let mut registry = code_graph_lang::LanguageRegistry::new();
+            registry
+                .register(Box::new(CppParser::new().unwrap()))
+                .unwrap();
+            crate::server::CodeGraphServer::new(registry)
+        }
+
+        async fn apply_analyze(server: &crate::server::CodeGraphServer, root: &std::path::Path) {
+            let job = Job::new_running(
+                "status-config".into(),
+                root.to_string_lossy().into_owned(),
+                false,
+                0,
+            );
+            run_analyze_job(
+                Arc::clone(&server.inner),
+                job.clone(),
+                Arc::new(NoopProgressSink),
+            )
+            .await;
+            assert!(
+                matches!(
+                    job.state.read().status,
+                    JobStatus::Completed(JobResult::Analyze(_))
+                ),
+                "fixture analyze must succeed"
+            );
+        }
+
+        fn status_config_path(server: &crate::server::CodeGraphServer) -> Option<String> {
+            let ToolOk::Value(status) =
+                crate::core::status::get_status(server.inner.clone()).expect("status must succeed")
+            else {
+                panic!("status must return a value")
+            };
+            status.config_path
+        }
+
+        #[tokio::test]
+        async fn status_config_path_stays_none_when_created_after_successful_analyze() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = paths::canonicalize(temp.path()).unwrap();
+            std::fs::write(root.join("subject.cpp"), "void subject() {}\n").unwrap();
+            let server = server();
+
+            apply_analyze(&server, &root).await;
+            assert_eq!(status_config_path(&server), None);
+
+            std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+            assert_eq!(
+                status_config_path(&server),
+                None,
+                "a config created after indexing must not claim to have governed the active graph"
+            );
+        }
+
+        #[tokio::test]
+        async fn status_config_path_survives_removal_after_successful_analyze() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = paths::canonicalize(temp.path()).unwrap();
+            let config_path = root.join(".code-graph.toml");
+            std::fs::write(root.join("subject.cpp"), "void subject() {}\n").unwrap();
+            std::fs::write(&config_path, "[cpp]\nmacro_strip = []\n").unwrap();
+            let server = server();
+
+            apply_analyze(&server, &root).await;
+            let expected = config_path.to_string_lossy().into_owned();
+            assert_eq!(status_config_path(&server), Some(expected.clone()));
+
+            std::fs::remove_file(&config_path).unwrap();
+            assert_eq!(
+                status_config_path(&server),
+                Some(expected),
+                "removing the applied config must not erase active-index provenance"
+            );
+        }
+
+        /// The cache fast-path's publication guard must cover the gap between
+        /// replacing the graph and writing the matching status metadata. The
+        /// hook pauses exactly in that gap; a concurrent status read must
+        /// remain blocked until release, then observe the complete snapshot.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn status_blocks_during_graph_publication_then_sees_complete_new_snapshot() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = paths::canonicalize(temp.path()).unwrap();
+            let source = root.join("subject.cpp");
+            std::fs::write(&source, "void old_symbol() {}\n").unwrap();
+            let server = server();
+            apply_analyze(&server, &root).await;
+
+            let config_path = root.join(".code-graph.toml");
+            std::fs::write(&config_path, "[cpp]\nmacro_strip = []\n").unwrap();
+
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let proceed = Arc::new(Barrier::new(2));
+            *server.inner.publication_hook.lock() = Some(crate::server::PublicationHook {
+                reached: reached_tx,
+                proceed: Arc::clone(&proceed),
+            });
+
+            let job = Job::new_running(
+                "publication-consistency".into(),
+                root.to_string_lossy().into_owned(),
+                false,
+                0,
+            );
+            let worker = tokio::spawn(run_analyze_job(
+                Arc::clone(&server.inner),
+                Arc::clone(&job),
+                Arc::new(NoopProgressSink),
+            ));
+            reached_rx
+                .await
+                .expect("analyze must pause after graph replacement");
+
+            let (status_tx, status_rx) = mpsc::channel();
+            let status_inner = Arc::clone(&server.inner);
+            let status_reader = std::thread::spawn(move || {
+                status_tx
+                    .send(crate::core::status::get_status(status_inner))
+                    .expect("status receiver remains live");
+            });
+            assert!(
+                status_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "get_status must wait for the in-progress publication"
+            );
+
+            proceed.wait();
+            worker.await.expect("analyze worker must not panic");
+            let status = status_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("get_status must complete after publication")
+                .expect("get_status must succeed");
+            status_reader.join().expect("status reader must not panic");
+            let ToolOk::Value(status) = status else {
+                panic!("status must return a value")
+            };
+            assert!(status.indexed);
+            assert_eq!(status.index_symbols, 1);
+            assert_eq!(
+                status.config_path,
+                Some(config_path.to_string_lossy().into_owned()),
+                "status must pair the new graph with its applied config provenance"
+            );
+            assert!(
+                matches!(
+                    job.state.read().status,
+                    JobStatus::Completed(JobResult::Analyze(_))
+                ),
+                "publication test analyze must complete"
             );
         }
     }

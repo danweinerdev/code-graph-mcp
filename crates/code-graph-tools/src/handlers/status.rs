@@ -44,12 +44,11 @@ pub struct StatusResult {
     /// (i.e. release profile). Bisects the obvious "is this a debug
     /// build?" question without a separate flag.
     pub release_build: bool,
-    /// Absolute path to the discovered `.code-graph.toml`, or `null`
-    /// when no toml was found at any ancestor (project-root fallback
-    /// to the invocation path). Surfaces the load-bearing answer to
-    /// "which config actually applied" — the bug the upward-walk
-    /// work in commit `c06fc73` fixed and that
-    /// `get_status` makes self-evident going forward.
+    /// Absolute path to the `.code-graph.toml` that produced the active
+    /// index, or `null` when that successful analyze used built-in defaults.
+    /// This is applied provenance, not a current filesystem probe: it remains
+    /// present if the file is later removed and remains null if one is created
+    /// after indexing, until a successful later analyze applies it.
     pub config_path: Option<String>,
     /// Count of entries in `[cpp].macro_strip` after load-time
     /// filtering (drained empties + duplicates). `0` means no
