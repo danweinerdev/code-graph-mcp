@@ -67,6 +67,18 @@ tasks:
     justifies: "Phase 4 review follow-up. Path-and-force coverage wording omits the already-reviewed admitted effective-config identity/provenance gate; removing config_identity/config_present would reintroduce a wrong-result TOCTOU."
     verification: "cargo test -p code-graph-tools config_identity::; cargo test -p code-graph-tools coalesce::; cargo test -p code-graph-core; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make plugin-sync-check; make snapshot-clean; git diff --check — config creation, removal, and replacement prevent coalescing even when path/force otherwise cover; same admitted identity still coalesces; a config-distinct request at capacity is queue-full rather than wrong-result coalesced; response.max_bytes rejects zero and documents tiny positive start-fresh pages."
     depends_on: ["4.5"]
+  - id: "4.11"
+    title: "Preserve continuation at the count limit"
+    status: complete
+    justifies: "Frozen phase-review follow-up. A full count-limited page currently reports natural completion without checking whether another result exists, making later rows unreachable through next_offset."
+    verification: "Prospective: cargo test -p code-graph-tools byte_budget_take; cargo test -p code-graph-tools async_community_budget; cargo test -p code-graph-tools; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make snapshot-clean; make plugin-sync-check; git diff --check — exact-limit pages end naturally, limit-plus-one pages expose a strict continuation, and resumed pages recover all rows without gaps or duplicates."
+    depends_on: ["4.6"]
+  - id: "4.12"
+    title: "Report the applied config provenance in status"
+    status: complete
+    justifies: "Frozen phase-review follow-up. get_status currently probes config-path existence at query time, so config creation/removal after admission can misreport which configuration produced the active index."
+    verification: "Prospective: cargo test -p code-graph-tools config_path; cargo test -p code-graph-tools; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make snapshot-clean; make plugin-sync-check; git diff --check — status config_path derives from the admitted/applied config provenance and remains stable across post-admission config creation/removal."
+    depends_on: ["4.5"]
 
 ---
 
@@ -426,6 +438,68 @@ This review follow-up corrects governing-document wording; it does not remove `c
 |---|---|---|---|
 | Focused spec-compliance review | Complete task 4.10 diff | PASS/Aligned | The admitted effective-config identity/provenance gate precedes containment and force; config transitions remain distinct, capacity rejects distinct work, and positive tiny-budget start-fresh recovery remains documented. |
 
+## 4.11: Preserve continuation at the count limit
+
+### Subtasks
+
+- [x] Distinguish exact-limit natural completion from limit-plus-one continuation
+- [x] Return a strict `next_offset` when unreturned rows remain
+- [x] Prove resumed sync and async-community pages recover all rows without gaps or duplicates
+- [x] Correct agent-facing config-aware coalescing wording found by the same frozen review
+- [x] Document the generic empty non-advancing start-fresh marker for byte-starved pages
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Identity recheck: `git rev-parse 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`, 2026-08-13; matched `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Focused review: `git show 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc` / `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools byte_budget_take` | `.` | PASS (`exit 0`) | Count-limit pagination distinguishes exact-limit completion from limit-plus-one continuation and emits a strict continuation offset when rows remain. |
+| `cargo test -p code-graph-tools async_community_budget` | `.` | PASS (`exit 0`) | Async-community pagination preserves continuation and the byte-starved start-fresh marker without gaps or duplicates. |
+| `cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | Full tools suite passed for the committed implementation. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make snapshot-clean && make plugin-sync-check && git diff --check` | `.` | PASS (`exit 0`) | Formatting, deny-warnings lint, snapshot hygiene, plugin parity, and whitespace checks passed. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused quality review | Complete task 4.11 diff | PASS/Aligned | Count-limit continuation, search pagination, and byte-starved start-fresh recovery were reviewed for correctness, scope, tests, maintainability, and task boundary. |
+
+## 4.12: Report the applied config provenance in status
+
+### Subtasks
+
+- [x] Store the applied config path/provenance with indexed server state
+- [x] Make `get_status.config_path` report applied state rather than current filesystem existence
+- [x] Cover config creation and removal after admission/indexing
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Identity recheck: `git rev-parse 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`, 2026-08-13; matched `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Focused review: `git show 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc` / `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools config_path` | `.` | PASS (`exit 0`) | Applied config provenance remains stable when configuration files are created or removed after admission/indexing. |
+| `cargo test -p code-graph-tools status::` | `.` | PASS (`exit 0`) | Status publication reports the applied config path from indexed server state. |
+| `cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | Full tools suite passed for the committed implementation. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make snapshot-clean && make plugin-sync-check && git diff --check` | `.` | PASS (`exit 0`) | Formatting, deny-warnings lint, snapshot hygiene, plugin parity, and whitespace checks passed. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused quality review | Complete task 4.12 diff | PASS/Aligned | Applied-config publication locking and ordering were reviewed for correctness, scope, tests, maintainability, and task boundary. |
+
 ## Acceptance Criteria
 
 - [x] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
@@ -440,4 +514,4 @@ This review follow-up corrects governing-document wording; it does not remove `c
 
 ## Phase Completion Evidence
 
-All acceptance criteria are met by committed tasks through `b6716a0`. The phase remains `in-progress`; the frozen phase review is pending.
+All acceptance criteria are met by committed tasks through `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`. The phase remains `in-progress`; the frozen phase review is pending.
