@@ -14,10 +14,10 @@ tasks:
     justifies: "FR-41, AC-50. AnalyzeSlot holds exactly one current job and one previous_terminal — there is nowhere to put 'admitted but not started', so FR-41's queueing requirement cannot be met by reinterpreting the existing fields."
     verification: "cargo test -p code-graph-tools analyze_job:: — an analyze issued while another is in flight is queued and eventually runs rather than returning 'indexing already in progress' (AC-50); get_status keeps analyze_job as the single running job and exposes pending count plus FIFO ids, while queued kickoff responses report status queued; get_job_status(job_id) retrieves queued, running, and retained terminal jobs so a fast FIFO cannot rotate an async caller's result out of reach; the head of pending is promoted on termination under the existing rotation; previous_terminal still preserves exactly one prior job."
   - id: "4.2"
-    title: "Path-containment coverage rule with force asymmetry"
+    title: "Admitted-identity, path-containment coverage rule with force asymmetry"
     status: complete
     justifies: "FR-42, AC-51. Containment alone is not sufficient — a forced request absorbed into a non-forcing one silently skips the invalidation the caller asked for, which surfaces only as 'force didn't work' long after the fact."
-    verification: "cargo test -p code-graph-tools coalesce:: — exhaustive over the four cases: non-forcing nested under queued non-forcing coalesces; non-forcing nested under queued forcing coalesces; forcing nested under queued non-forcing does NOT coalesce and runs in its own right; disjoint paths never coalesce (AC-51). Also covers the reverse-containment direction where the new request is broader than a queued one."
+    verification: "cargo test -p code-graph-tools coalesce:: && cargo test -p code-graph-tools config_identity:: — requests coalesce only after same discovered project root plus admitted effective-config identity/provenance; then the four force/containment cases apply: non-forcing nested under queued non-forcing coalesces; non-forcing nested under queued forcing coalesces; forcing nested under queued non-forcing does NOT coalesce and runs in its own right; disjoint paths never coalesce (AC-51). Config creation, removal, and replacement make a later request distinct even when path/force otherwise cover; matching identity still coalesces. Also covers the reverse-containment direction where the new request is broader than a queued one."
     depends_on: ["4.1"]
   - id: "4.3"
     title: "Coalesced-caller reporting and sync non-blocking rule"
@@ -61,6 +61,12 @@ tasks:
     justifies: "Phase-review follow-up. A zero `[response].max_bytes` budget lets generic paginated tools return empty, non-progressing pages forever."
     verification: "Prospective: cargo test -p code-graph-core; cargo test -p code-graph-tools async_community_budget; cargo test -p code-graph-tools; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make snapshot-clean; make plugin-sync-check; git diff --check — zero is rejected with the established message, negative and non-integer values remain rejected, positive values remain accepted, and positive irreducibly tiny async-community budgets retain their start-fresh behavior."
     depends_on: ["4.6"]
+  - id: "4.10"
+    title: "Reconcile coalescing contract with admitted config identity"
+    status: complete
+    justifies: "Phase 4 review follow-up. Path-and-force coverage wording omits the already-reviewed admitted effective-config identity/provenance gate; removing config_identity/config_present would reintroduce a wrong-result TOCTOU."
+    verification: "cargo test -p code-graph-tools config_identity::; cargo test -p code-graph-tools coalesce::; cargo test -p code-graph-core; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make plugin-sync-check; make snapshot-clean; git diff --check — config creation, removal, and replacement prevent coalescing even when path/force otherwise cover; same admitted identity still coalesces; a config-distinct request at capacity is queue-full rather than wrong-result coalesced; response.max_bytes rejects zero and documents tiny positive start-fresh pages."
+    depends_on: ["4.5"]
 
 ---
 
@@ -68,7 +74,7 @@ tasks:
 
 ## Overview
 
-The largest behaviour change in the plan. Today `analyze_codebase` returns `"indexing already in progress"` on contention — rare with one session, routine with a shared daemon. This phase replaces that with a queue that coalesces requests by path containment, and evolves the wire format additively to report it.
+The largest behaviour change in the plan. Today `analyze_codebase` returns `"indexing already in progress"` on contention — rare with one session, routine with a shared daemon. This phase replaces that with a queue that coalesces requests with matching admitted project/config identity by path containment and force, and evolves the wire format additively to report it.
 
 Depends on phase 3. Separated from it so a bisect through daemon bring-up does not also cross this change.
 
@@ -113,18 +119,18 @@ Job-addressable lookup is the retrieval counterpart: pending IDs would otherwise
 |---|---|---|---|
 | Focused intent-blind quality review | Complete task 4.1 diff excluding lifecycle-only plan files | PASS | Queue, promotion, cancellation/panic supervision, bounded terminal retention, polling route, tests, and documentation were judged correct, scoped, maintainable, and bisectable after stale-comment fixes. |
 
-## 4.2: Path-containment coverage rule with force asymmetry
+## 4.2: Admitted-identity, path-containment coverage rule with force asymmetry
 
 ### Subtasks
-- [x] Implement `covers(x, y)` as a pure function over `(path, force)` pairs
+- [x] Implement `covers(x, y)` as a pure function over admitted project/config identity plus `(path, force)`
 - [x] Run admission against the running job and every pending entry
 - [x] Attach a coalesced request to its coverer rather than appending it
-- [x] Exhaustive unit tests over the four force/containment cases plus disjoint and reverse-containment
+- [x] Unit tests over same-identity force/containment plus disjoint and reverse-containment, and config-identity tests for creation, removal, replacement, and same-identity coalescing
 
 ### Notes
 Revision boundary: coalescing is live and correct; how a coalesced caller learns about it lands in 4.3.
 
-The rule: **X covers Y when Y's path is at or under X's path, and (X forces or Y does not force).** Writing it as a pure function over pairs is deliberate — it makes the four cases trivially testable without constructing jobs or a daemon.
+The rule: **X covers Y only when both requests have the same discovered project root and the same admitted effective-config identity and provenance; then Y's path is at or under X's path, and (X forces or Y does not force).** A configuration created, removed, or replaced between admissions makes the later request distinct even if containment and force would otherwise cover it; at capacity that distinct request receives queue-full rather than a wrong-result coalescing. Writing the final containment/force predicate as a pure function is deliberate — it makes the four force cases trivially testable without constructing jobs or a daemon, while the admitted-identity tests pin the TOCTOU guard.
 
 ### Completion Evidence
 
@@ -149,7 +155,7 @@ The rule: **X covers Y when Y's path is at or under X's path, and (X forces or Y
 | Focused intent-blind quality review | Complete task 4.2 implementation diff | PASS | Coverage and force semantics, canonical execution identity, nested project boundaries, daemon lifecycle checks, guard ownership, FIFO regressions, async reporting, and task boundary were judged correct and bisectable. |
 
 ### Trap
-Implementing coverage as path containment alone. It reads as obviously correct and passes any test that does not vary the force flag. The failure it produces — a forced re-index silently absorbed into a plain one, so stale entries survive — appears much later and looks like a cache bug, not a queue bug.
+Implementing coverage as path containment alone. It reads as obviously correct and passes any test that does not vary the force flag or configuration snapshot. The failures it produces are a forced re-index silently absorbed into a plain one, so stale entries survive, or a caller admitted after a config change receiving an older job's result; both appear much later and look like cache bugs, not queue bugs.
 
 ## 4.3: Coalesced-caller reporting and sync non-blocking rule
 
@@ -383,10 +389,47 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 |---|---|---|---|
 | Focused quality review | Complete task 4.9 diff | PASS/Aligned | Complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary; zero budgets are rejected and positive tiny budgets remain unchanged. |
 
+## 4.10: Reconcile coalescing contract with admitted config identity
+
+### Subtasks
+
+- [x] Reconcile FR-42, AC-51, and Decision 7 with the admitted effective-config identity/provenance gate
+- [x] Update task 4.2 wording and verification to name identity before containment and force
+- [x] Document that config creation, removal, or replacement makes a later request distinct and can yield queue-full at capacity
+- [x] Document `[response].max_bytes > 0` and the tiny-positive start-fresh recovery in the example configuration
+- [x] Add/retain `config_identity::` and `coalesce::` coverage proving config differences do not coalesce, matching identity does coalesce, and a config-distinct request is queue-full at capacity
+- [x] Run the prospective verification
+
+### Notes
+
+This review follow-up corrects governing-document wording; it does not remove `config_identity` or `config_present`. Those admission-snapshot checks prevent a caller admitted after a configuration transition from receiving a coverer's stale project/config result.
+
+### Completion Evidence
+
+- Verified: 2026-08-13
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `b6716a04f430fa9a7cdea4a4d5402d645f9b1007`
+- Identity recheck: `git rev-parse b6716a04f430fa9a7cdea4a4d5402d645f9b1007`, 2026-08-13; matched `b6716a04f430fa9a7cdea4a4d5402d645f9b1007`
+- Focused review: `git show b6716a04f430fa9a7cdea4a4d5402d645f9b1007`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b6716a04f430fa9a7cdea4a4d5402d645f9b1007` / `b6716a04f430fa9a7cdea4a4d5402d645f9b1007`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools config_identity::` | `.` | PASS (`exit 0`) | Config creation, removal, and replacement prevent coalescing; matching admitted identity still coalesces. |
+| `cargo test -p code-graph-tools coalesce::` | `.` | PASS (`exit 0`) | Same-identity containment and force coverage passed; a config-distinct request at capacity is queue-full rather than wrong-result coalesced. |
+| `cargo test -p code-graph-core` | `.` | PASS (`exit 0`) | Core configuration validation passed: `response.max_bytes` rejects zero while positive values remain accepted. |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make plugin-sync-check && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | Formatting, deny-warnings lint, plugin parity, snapshot hygiene, and whitespace checks passed. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| Focused spec-compliance review | Complete task 4.10 diff | PASS/Aligned | The admitted effective-config identity/provenance gate precedes containment and force; config transitions remain distinct, capacity rejects distinct work, and positive tiny-budget start-fresh recovery remains documented. |
+
 ## Acceptance Criteria
 
 - [x] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
-- [x] **AC-51**: The coverage rule holds across all four force/containment cases and never coalesces disjoint paths (FR-42).
+- [x] **AC-51**: The coverage rule first requires matching admitted project/config identity, then holds across all four force/containment cases and never coalesces disjoint paths; config transitions remain distinct. (FR-42.)
 - [x] **AC-52**: A coalesced caller receives the covering request's outcome, and the response identifies the coalescing (FR-43).
 - [x] Non-coalesced analyze bodies remain byte-identical; one deserializer still covers both shapes (NFR-01).
 - [x] CLAUDE.md and tool descriptions updated for the retired error, the `"queued"` status, the new optional field, and the sync blocking change (NFR-11).
@@ -397,4 +440,4 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 
 ## Phase Completion Evidence
 
-All acceptance criteria are met by committed tasks through `b2f48f6f972a3c4488571668f1e8448992791cdf` and the latest green `make verify`. The phase remains `in-progress`; Phase Completion Evidence is pending until the frozen phase review is complete.
+All acceptance criteria are met by committed tasks through `b6716a0`. The phase remains `in-progress`; the frozen phase review is pending.
