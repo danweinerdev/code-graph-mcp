@@ -35,13 +35,14 @@ use code_graph_graph::Graph;
 
 use crate::analyze_job::{
     covers, CoverageIdentity, Job, JobKind, JobPhase, JobRequest, JobResult, JobSlot, JobStatus,
-    PendingJob, TERMINAL_HISTORY_LIMIT,
+    PendingJob, JOB_PENDING_LIMIT, TERMINAL_HISTORY_LIMIT,
 };
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{
     now_nanos_u64, AnalyzeResult, AsyncKickoffResponse, SyncAnalyzeResponse,
 };
-use crate::handlers::status::format_unix_nanos_rfc3339;
+use crate::handlers::status::{format_unix_nanos_rfc3339, JobView};
+use crate::handlers::ENVELOPE_OVERHEAD_BYTES;
 use crate::indexer::{
     build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
     resolve_edges_with_indexes, NoopProgressSink, ProgressSink,
@@ -170,24 +171,36 @@ pub(crate) async fn run_analyze_job(
         }
     }
 
-    let (mut cfg, project_root) = match RootConfig::load(&abs_path) {
-        Ok((c, root)) => (c, root),
-        Err(ConfigError::Toml(e)) => {
-            finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
-            return;
-        }
-        Err(ConfigError::Io(e)) => {
-            finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
-            return;
-        }
-        Err(e @ ConfigError::ExtensionMissingDot { .. })
-        | Err(e @ ConfigError::ExtensionConflict { .. })
-        | Err(e @ ConfigError::MacroStripConflict { .. })
-        | Err(e @ ConfigError::MacroDefineTypeEmptyName)
-        | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
-            finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
-            return;
-        }
+    // A valid admission identity carries the exact config/root pair used for
+    // coverage. Re-discovering here would let a queued job cross a newly
+    // created, removed, or replaced nested `.code-graph.toml` boundary. Jobs
+    // with no admitted identity still load here so nonexistent and malformed
+    // config requests retain their established execution-time errors.
+    let (mut cfg, project_root, config_present) = match job.coverage.as_ref() {
+        Some(coverage) => (
+            coverage.config.clone(),
+            coverage.project_root.clone(),
+            coverage.config_present,
+        ),
+        None => match RootConfig::load_with_presence(&abs_path) {
+            Ok((c, root, config_present)) => (c, root, config_present),
+            Err(ConfigError::Toml(e)) => {
+                finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
+                return;
+            }
+            Err(ConfigError::Io(e)) => {
+                finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
+                return;
+            }
+            Err(e @ ConfigError::ExtensionMissingDot { .. })
+            | Err(e @ ConfigError::ExtensionConflict { .. })
+            | Err(e @ ConfigError::MacroStripConflict { .. })
+            | Err(e @ ConfigError::MacroDefineTypeEmptyName)
+            | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
+                finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
+                return;
+            }
+        },
     };
     if let Some(daemon_root) = inner.daemon_project_root.get() {
         if daemon_root != &project_root {
@@ -242,8 +255,7 @@ pub(crate) async fn run_analyze_job(
     }
 
     if project_root != abs_path {
-        let toml_at_root = project_root.join(".code-graph.toml");
-        if toml_at_root.exists() {
+        if config_present {
             warnings.push(format!(
                 "using .code-graph.toml found at {} (parent of indexed root {}); \
                  cache lives at the project root, indexing scope stays at the invocation path",
@@ -260,8 +272,7 @@ pub(crate) async fn run_analyze_job(
             ));
         }
     } else {
-        let toml_at_invocation = abs_path.join(".code-graph.toml");
-        if !toml_at_invocation.exists() {
+        if !config_present {
             warnings.push(format!(
                 "no .code-graph.toml found between {} and filesystem root; \
                  using built-in defaults. C++ classes prefixed with API-export macros \
@@ -711,12 +722,15 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
-    // Coverage canonicalization performs filesystem lookups. A bound daemon
-    // must reject a substituted root before doing that work, including before
-    // a request can reuse an existing covering job.
-    inner.ensure_daemon_root_current().map_err(ToolError)?;
-    let coverage = coverage_identity(&path_raw);
     let admission = {
+        // Coverage/config discovery performs filesystem reads. Keep this
+        // async gate while its blocking probe runs so the snapshot and later
+        // FIFO admission remain one linearizable operation, but never take a
+        // parking_lot slot/persistence lock across that await.
+        let _admission_lock = inner.admission_lock.lock().await;
+        let coverage = probe_analyze_admission(Arc::clone(&inner), path_raw.clone()).await?;
+        #[cfg(test)]
+        pause_after_coverage_probe(&inner).await;
         let mut slot = inner.analyze_slot.write();
         // Decision 7 only lets a sync request escape the FIFO when another
         // request was already waiting before this admission. The first
@@ -793,8 +807,9 @@ enum SyncAdmission {
     QueuedImmediate(Arc<Job>),
 }
 
-/// `analyze_codebase_async` body — kickoff that returns in milliseconds
-/// regardless of indexing duration.
+/// `analyze_codebase_async` body — kickoff that returns before indexing begins.
+/// Admission normally completes quickly, but its canonicalization and config
+/// discovery can wait on a slow filesystem.
 ///
 /// Identical FIFO slot protocol to [`analyze_codebase`] except the worker is
 /// `tokio::spawn`ed and detached instead of awaited inline.
@@ -813,11 +828,14 @@ pub async fn analyze_codebase_async(
         return Err(ToolError("'path' is required".to_string()));
     }
 
-    // Keep this before coverage canonicalization: it performs filesystem
-    // lookups and could otherwise coalesce work in a replacement namespace.
-    inner.ensure_daemon_root_current().map_err(ToolError)?;
-    let coverage = coverage_identity(&path_raw);
     let kickoff = {
+        // See synchronous admission: this lock intentionally covers the
+        // blocking snapshot plus slot insertion, not a parking_lot slot or
+        // persistence lock across the probe await.
+        let _admission_lock = inner.admission_lock.lock().await;
+        let coverage = probe_analyze_admission(Arc::clone(&inner), path_raw.clone()).await?;
+        #[cfg(test)]
+        pause_after_coverage_probe(&inner).await;
         let mut slot = inner.analyze_slot.write();
         match admit_job(&inner, &mut slot, path_raw, force, coverage)? {
             Admission::Covered { job, status } => (job, status, true),
@@ -857,10 +875,11 @@ pub async fn analyze_codebase_async(
     }))
 }
 
-/// Kick off whole-graph community detection on the shared FIFO. Validation is
-/// complete before admission so bad input never consumes an ID or appears in
-/// status. The server adapter has already enforced indexed state.
-pub(crate) fn detect_communities_async(
+/// Kick off whole-graph community detection on the shared FIFO. Indexed state
+/// and validation are checked before admission so rejected requests never
+/// consume an ID or appear in status. The server adapter enforces the same
+/// indexed-state guard on the MCP path.
+pub(crate) async fn detect_communities_async(
     inner: Arc<ServerInner>,
     granularity: Option<String>,
     max_iterations: Option<u32>,
@@ -868,6 +887,7 @@ pub(crate) fn detect_communities_async(
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> ToolResult<AsyncKickoffResponse> {
+    crate::core::require_indexed(inner.indexed.load(Ordering::Acquire))?;
     crate::core::structure::validate_detect_communities_args(granularity.as_deref())?;
     let request = JobRequest::DetectCommunities {
         granularity,
@@ -876,14 +896,21 @@ pub(crate) fn detect_communities_async(
         limit,
         offset,
     };
-    let max_bytes = inner.config.read().response.max_bytes;
     let job = {
+        // `analyze_slot` is the shared FIFO's linearization point. Community
+        // jobs have already validated and need no coverage snapshot, so they
+        // enter it directly rather than waiting for an analyze filesystem
+        // probe that has not yet linearized.
+        let max_bytes = inner.config.read().response.max_bytes;
         let mut slot = inner.analyze_slot.write();
         let guard = inner
             .persist
             .begin_job()
             .map_err(|message| ToolError(message.to_string()))?;
         let queued = slot_is_occupied(&slot);
+        if queued && slot.pending.len() >= JOB_PENDING_LIMIT {
+            return Err(queue_full_error());
+        }
         let (job_id, started_at) = issue_job_id(&mut slot);
         let job = if queued {
             Job::new_queued_communities(job_id, request, started_at, max_bytes)
@@ -990,6 +1017,9 @@ fn admit_job(
     }
 
     if slot_is_occupied(slot) {
+        if slot.pending.len() >= JOB_PENDING_LIMIT {
+            return Err(queue_full_error());
+        }
         let job = install_new_queued(slot, path_raw, force, coverage);
         Ok(Admission::Queued { job, job_guard })
     } else {
@@ -998,16 +1028,76 @@ fn admit_job(
     }
 }
 
+fn queue_full_error() -> ToolError {
+    ToolError(format!(
+        "job queue is full ({JOB_PENDING_LIMIT} pending jobs); wait for queued work to complete and retry, or poll get_status for FIFO diagnostics"
+    ))
+}
+
 fn coverage_identity(path_raw: &str) -> Option<CoverageIdentity> {
     let path = paths::canonicalize(std::path::Path::new(path_raw)).ok()?;
     if !path.is_dir() {
         return None;
     }
-    let (_, project_root) = RootConfig::load(&path).ok()?;
+    let (config, project_root, config_present) = RootConfig::load_with_presence(&path).ok()?;
+    let config_identity = serde_json::to_string(&config).ok()?;
     Some(CoverageIdentity {
         invocation_path: path,
         project_root,
+        config,
+        config_identity,
+        config_present,
     })
+}
+
+/// Run admission's filesystem snapshot on Tokio's blocking pool. The caller
+/// deliberately holds only `admission_lock` while awaiting this task: that
+/// preserves snapshot-to-FIFO ordering without stalling a runtime worker or
+/// holding the slot/persistence locks across an await.
+async fn probe_analyze_admission(
+    inner: Arc<ServerInner>,
+    path_raw: String,
+) -> Result<Option<CoverageIdentity>, ToolError> {
+    // Move the owned permit into the detached blocking closure rather than
+    // retaining it in this MCP future. A cancelled request drops this future,
+    // but the filesystem probe keeps the sole permit until it has returned.
+    let permit = Arc::clone(&inner.admission_probe_permits)
+        .acquire_owned()
+        .await
+        .map_err(|error| ToolError(format!("analyze admission probe semaphore closed: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // A bound daemon must reject a substituted root before coverage
+        // canonicalization, including before a request can reuse a coverer.
+        inner.ensure_daemon_root_current().map_err(ToolError)?;
+        #[cfg(test)]
+        pause_during_blocking_coverage_probe(&inner);
+        Ok(coverage_identity(&path_raw))
+    })
+    .await
+    .map_err(|error| ToolError(format!("analyze admission probe terminated: {error}")))?
+}
+
+#[cfg(test)]
+fn pause_during_blocking_coverage_probe(inner: &ServerInner) {
+    let hook = inner
+        .admission_blocking_probe_hook
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
+#[cfg(test)]
+async fn pause_after_coverage_probe(inner: &ServerInner) {
+    let hook = inner.admission_probe_hook.lock().await.take();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let _ = hook.proceed.await;
+    }
 }
 
 /// Find a covering request and snapshot its nonterminal status. The current
@@ -1155,7 +1245,8 @@ async fn run_detect_communities_job(inner: Arc<ServerInner>, job: Arc<Job>) {
     let worker_inner = Arc::clone(&inner);
     let worker_job = Arc::clone(&job);
     let result = tokio::task::spawn_blocking(move || {
-        crate::core::structure::detect_communities(
+        let mut finished_at = 0;
+        let result = crate::core::structure::detect_communities_with_response_budget(
             &worker_inner.graph,
             true,
             request.0.as_deref(),
@@ -1163,26 +1254,59 @@ async fn run_detect_communities_job(inner: Arc<ServerInner>, job: Arc<Job>) {
             request.2,
             request.3,
             request.4,
-            worker_job.max_bytes,
-        )
+            |empty_response| {
+                // Measure the actual generic fields while pessimistically
+                // reserving the longest possible pagination continuation.
+                // The real row list is intentionally not involved, avoiding
+                // a row-budget/wrapper-size circular dependency.
+                let mut response_for_measurement = empty_response.clone();
+                response_for_measurement.page.truncated = true;
+                response_for_measurement.page.next_offset = Some(u32::MAX);
+                let nested_bytes = serde_json::to_string(&response_for_measurement)
+                    .expect("community response must serialize")
+                    .len();
+                finished_at = now_nanos_u64();
+                let wrapped_bytes = serde_json::to_string(&JobView::completed_community(
+                    &worker_job,
+                    response_for_measurement,
+                    finished_at,
+                ))
+                .expect("community job view must serialize")
+                .len();
+                // `byte_budget_take` reserves ENVELOPE_OVERHEAD_BYTES from
+                // its input before admitting rows. Give it a budget whose
+                // remaining row allowance is exactly the outer JobView's
+                // available space: `max_bytes - wrapped_empty`. This keeps
+                // the nested response's real metadata (which need not fit
+                // the generic envelope reserve) and all JobView fields in
+                // the total. Saturation preserves the irreducible tiny-budget
+                // start-fresh response when the wrapper alone cannot fit.
+                let wrapper_overhead = wrapped_bytes.saturating_sub(nested_bytes);
+                let fixed_overhead = wrapper_overhead.saturating_add(nested_bytes);
+                worker_job
+                    .max_bytes
+                    .saturating_sub(fixed_overhead.saturating_sub(ENVELOPE_OVERHEAD_BYTES))
+            },
+        );
+        (result, finished_at)
     })
     .await;
     match result {
-        Ok(Ok(ToolOk::Value(response))) => {
+        Ok((Ok(ToolOk::Value(response)), finished_at)) => {
             let mut state = job.state.write();
             state.progress = 1;
             state.progress_total = 1;
             state.progress_message = "Community detection complete".to_string();
             state.status = JobStatus::Completed(JobResult::DetectCommunities(response));
-            state.finished_at = Some(now_nanos_u64());
+            state.finished_at = Some(finished_at);
             drop(state);
             job.terminal_changed.notify_waiters();
         }
-        Ok(Ok(ToolOk::Text(_))) => finish_failed(
+        Ok((Ok(ToolOk::Text(_)), _)) => finish_failed(
             &job,
             "community detection returned unexpected text".to_string(),
         ),
-        Ok(Err(error)) => finish_failed(&job, error.0),
+        Ok((Err(error), _)) => finish_failed(&job, error.0),
         Err(error) => finish_failed(&job, format!("community worker terminated: {error}")),
     }
 }
@@ -1348,8 +1472,261 @@ mod coalesce {
         crate::server::CodeGraphServer::new(LanguageRegistry::new())
     }
 
+    fn graph_with_isolated_community_files(count: usize, path_padding: usize) -> Graph {
+        let mut graph = Graph::new();
+        for index in 0..count {
+            graph.merge_file_graph(code_graph_core::FileGraph {
+                path: format!("/communities/{index:02}/{}.cpp", "x".repeat(path_padding)),
+                language: code_graph_core::Language::Cpp,
+                symbols: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+        graph
+    }
+
+    mod admission_probe {
+        use super::*;
+
+        #[test]
+        fn keeps_current_thread_runtime_responsive() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let fixture = tempfile::TempDir::new().unwrap();
+                let server = server();
+                let inner = Arc::clone(&server.inner);
+                inner.analyze_slot.write().current = Some(Job::new_running(
+                    "blocker".into(),
+                    "/blocker".into(),
+                    false,
+                    0,
+                ));
+
+                let (probe_reached_tx, probe_reached_rx) = tokio::sync::oneshot::channel();
+                let release_probe = Arc::new(std::sync::Barrier::new(2));
+                *inner.admission_blocking_probe_hook.lock().unwrap() =
+                    Some(crate::server::BlockingAdmissionProbeHook {
+                        reached: probe_reached_tx,
+                        proceed: Arc::clone(&release_probe),
+                    });
+
+                let path = fixture.path().to_string_lossy().into_owned();
+                let kickoff_inner = Arc::clone(&inner);
+                let kickoff = tokio::spawn(async move {
+                    analyze_codebase_async(kickoff_inner, path, false).await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), probe_reached_rx)
+                    .await
+                    .expect("blocking probe must start")
+                    .expect("blocking probe must signal its barrier");
+
+                let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _ = timer_tx.send(());
+                });
+                tokio::time::timeout(std::time::Duration::from_millis(250), timer_rx)
+                    .await
+                    .expect("independent timer must progress while filesystem probe blocks")
+                    .expect("timer task must complete");
+
+                release_probe.wait();
+                let ToolOk::Value(kickoff) = kickoff.await.unwrap().unwrap() else {
+                    panic!("analyze kickoff must return JSON")
+                };
+                assert_eq!(kickoff.status, "queued");
+            });
+        }
+
+        #[tokio::test]
+        async fn community_linearizes_before_analyze_blocked_in_filesystem_probe() {
+            let fixture = tempfile::TempDir::new().unwrap();
+            let server = server();
+            let inner = Arc::clone(&server.inner);
+            inner.indexed.store(true, Ordering::Release);
+
+            let (probe_reached_tx, probe_reached_rx) = tokio::sync::oneshot::channel();
+            let release_probe = Arc::new(std::sync::Barrier::new(2));
+            *inner.admission_blocking_probe_hook.lock().unwrap() =
+                Some(crate::server::BlockingAdmissionProbeHook {
+                    reached: probe_reached_tx,
+                    proceed: Arc::clone(&release_probe),
+                });
+            let (completion_reached_tx, completion_reached_rx) = tokio::sync::oneshot::channel();
+            let (completion_proceed_tx, completion_proceed_rx) = tokio::sync::oneshot::channel();
+            inner.analyze_slot.write().completion_hook = Some(crate::analyze_job::CompletionHook {
+                reached: completion_reached_tx,
+                proceed: completion_proceed_rx,
+            });
+
+            let analyze_inner = Arc::clone(&inner);
+            let analyze_path = fixture.path().to_string_lossy().into_owned();
+            let analyze = tokio::spawn(async move {
+                analyze_codebase_async(analyze_inner, analyze_path, false).await
+            });
+            probe_reached_rx
+                .await
+                .expect("analyze probe must block before it can linearize");
+
+            let ToolOk::Value(community) = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                detect_communities_async(Arc::clone(&inner), None, None, None, None, None),
+            )
+            .await
+            .expect("community kickoff must not wait for the blocked analyze probe")
+            .unwrap() else {
+                panic!("community kickoff must return JSON")
+            };
+            assert_eq!(community.status, "running");
+            completion_reached_rx
+                .await
+                .expect("community worker must reach completion rotation");
+
+            // Keep the completed community as the slot occupant until the
+            // analyze has linearized, making the expected FIFO order explicit.
+            release_probe.wait();
+            let ToolOk::Value(analyze) = analyze.await.unwrap().unwrap() else {
+                panic!("analyze kickoff must return JSON")
+            };
+            assert_eq!(analyze.status, "queued");
+            let analyze_job = {
+                let slot = inner.analyze_slot.read();
+                assert_eq!(slot.current.as_ref().unwrap().job_id, community.job_id);
+                assert_eq!(slot.pending.len(), 1);
+                assert_eq!(slot.pending[0].job.job_id, analyze.job_id);
+                Arc::clone(&slot.pending[0].job)
+            };
+
+            completion_proceed_tx
+                .send(())
+                .expect("community supervisor must be waiting to rotate");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_terminal(&analyze_job),
+            )
+            .await
+            .expect("queued analyze must run after community rotation");
+            assert!(analyze_job.state.read().is_terminal());
+            assert!(inner.analyze_slot.read().pending.is_empty());
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn cancelled_probe_keeps_blocking_capacity_until_its_closure_returns() {
+            let fixture = tempfile::TempDir::new().unwrap();
+            let server = server();
+            let inner = Arc::clone(&server.inner);
+            inner.indexed.store(true, Ordering::Release);
+            inner.analyze_slot.write().current = Some(Job::new_running(
+                "blocker".into(),
+                "/blocker".into(),
+                false,
+                0,
+            ));
+
+            let (first_reached_tx, first_reached_rx) = tokio::sync::oneshot::channel();
+            let release_first = Arc::new(std::sync::Barrier::new(2));
+            *inner.admission_blocking_probe_hook.lock().unwrap() =
+                Some(crate::server::BlockingAdmissionProbeHook {
+                    reached: first_reached_tx,
+                    proceed: Arc::clone(&release_first),
+                });
+
+            let path = fixture.path().to_string_lossy().into_owned();
+            let first = tokio::spawn(analyze_codebase_async(
+                Arc::clone(&inner),
+                path.clone(),
+                false,
+            ));
+            first_reached_rx
+                .await
+                .expect("first filesystem probe must start");
+            first.abort();
+            assert!(first.await.is_err(), "first MCP future must be cancelled");
+
+            let (second_reached_tx, mut second_reached_rx) = tokio::sync::oneshot::channel();
+            let release_second = Arc::new(std::sync::Barrier::new(2));
+            *inner.admission_blocking_probe_hook.lock().unwrap() =
+                Some(crate::server::BlockingAdmissionProbeHook {
+                    reached: second_reached_tx,
+                    proceed: Arc::clone(&release_second),
+                });
+            let second = tokio::spawn(analyze_codebase_async(Arc::clone(&inner), path, false));
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if inner.admission_lock.try_lock().is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second request must await the occupied probe permit");
+            assert!(matches!(
+                second_reached_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let _ = timer_tx.send(());
+            });
+            tokio::time::timeout(std::time::Duration::from_millis(250), timer_rx)
+                .await
+                .expect("Tokio scheduling must remain responsive")
+                .expect("independent timer must complete");
+            let ToolOk::Value(community) = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                detect_communities_async(Arc::clone(&inner), None, None, None, None, None),
+            )
+            .await
+            .expect("community kickoff must not wait for analyze probe capacity")
+            .unwrap() else {
+                panic!("community kickoff must return JSON")
+            };
+            assert_eq!(community.status, "queued");
+
+            release_first.wait();
+            second_reached_rx
+                .await
+                .expect("second probe must launch only after first closure releases");
+            release_second.wait();
+            let ToolOk::Value(second) = second.await.unwrap().unwrap() else {
+                panic!("second analyze kickoff must return JSON")
+            };
+            assert_eq!(second.status, "queued");
+        }
+    }
+
+    async fn terminal_community_view(
+        inner: Arc<ServerInner>,
+        kickoff: AsyncKickoffResponse,
+    ) -> JobView {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ToolOk::Value(view) =
+                crate::core::status::get_job_status(Arc::clone(&inner), kickoff.job_id.clone())
+                    .unwrap()
+            else {
+                panic!("community status must return JSON")
+            };
+            if view.status == "completed" || view.status == "failed" {
+                return view;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "community job timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn community_async_kickoff_poll_and_result_match_sync() {
+    async fn community_async_kickoff_poll_and_result_matches_sync_when_budget_does_not_bind() {
         let server = server();
         server.inner.indexed.store(true, Ordering::Release);
         let ToolOk::Value(sync) = crate::core::structure::detect_communities(
@@ -1367,7 +1744,9 @@ mod coalesce {
         };
         let start = std::time::Instant::now();
         let ToolOk::Value(kickoff) =
-            detect_communities_async(server.inner.clone(), None, None, None, None, None).unwrap()
+            detect_communities_async(server.inner.clone(), None, None, None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("kickoff must return JSON")
         };
@@ -1397,7 +1776,7 @@ mod coalesce {
         assert_eq!(
             serde_json::to_string(&result).unwrap(),
             serde_json::to_string(&sync).unwrap(),
-            "terminal result must be byte-identical to sync output"
+            "terminal result must match sync output when the budget does not bind"
         );
         let ToolOk::Value(status) = crate::core::status::get_status(server.inner.clone()).unwrap()
         else {
@@ -1411,11 +1790,143 @@ mod coalesce {
     }
 
     #[tokio::test]
+    async fn async_community_budget_boundary_search_keeps_every_feasible_terminal_within_limit() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        *server.inner.graph.write() = graph_with_isolated_community_files(8, 80);
+        let mut feasible_cases = 0;
+
+        // Sweep tight budgets around the first-row boundary. Each feasible
+        // result must fit as a standalone terminal JobView, not merely as its
+        // nested DetectCommunitiesResponse.
+        for max_bytes in (700..=1_400).step_by(5) {
+            server.inner.config.write().response.max_bytes = max_bytes;
+            let ToolOk::Value(kickoff) =
+                detect_communities_async(server.inner.clone(), None, None, None, None, None)
+                    .await
+                    .unwrap()
+            else {
+                panic!("community kickoff must return JSON")
+            };
+            let view = terminal_community_view(server.inner.clone(), kickoff).await;
+            let Some(JobResult::DetectCommunities(result)) = &view.result else {
+                panic!("expected completed community result")
+            };
+            if !result.page.results.is_empty() {
+                feasible_cases += 1;
+                assert!(
+                    serde_json::to_string(&view).unwrap().len() <= max_bytes,
+                    "terminal JobView with rows must fit max_bytes={max_bytes}"
+                );
+            }
+        }
+        assert!(
+            feasible_cases > 0,
+            "boundary search must encounter at least one budget that admits a community row"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_community_budget_tiny_limit_returns_only_resumable_envelope() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        *server.inner.graph.write() = graph_with_isolated_community_files(2, 80);
+        server.inner.config.write().response.max_bytes = 1;
+
+        let ToolOk::Value(kickoff) =
+            detect_communities_async(server.inner.clone(), None, None, None, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("community kickoff must return JSON")
+        };
+        let view = terminal_community_view(server.inner.clone(), kickoff).await;
+        let serialized_view = serde_json::to_string(&view).unwrap();
+        let Some(JobResult::DetectCommunities(result)) = view.result else {
+            panic!("expected completed community result")
+        };
+        assert!(result.page.results.is_empty());
+        assert!(result.page.truncated);
+        assert_eq!(result.page.next_offset, Some(0));
+        // The one-byte configuration is below the irreducible generic JobView
+        // plus nested response envelope. The result contains no community row,
+        // so that unavoidable wrapper is the only cap exceedance.
+        assert!(serialized_view.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn async_community_budget_paging_recovers_every_community_once() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        *server.inner.graph.write() = graph_with_isolated_community_files(8, 120);
+        server.inner.config.write().response.max_bytes = 1_500;
+
+        let expected = match crate::core::structure::detect_communities(
+            &server.inner.graph,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            usize::MAX,
+        )
+        .unwrap()
+        {
+            ToolOk::Value(response) => response
+                .page
+                .results
+                .into_iter()
+                .map(|community| community.label)
+                .collect::<Vec<_>>(),
+            ToolOk::Text(_) => panic!("communities must return JSON"),
+        };
+
+        let mut offset = None;
+        let mut actual = Vec::new();
+        loop {
+            let ToolOk::Value(kickoff) =
+                detect_communities_async(server.inner.clone(), None, None, None, None, offset)
+                    .await
+                    .unwrap()
+            else {
+                panic!("community kickoff must return JSON")
+            };
+            let view = terminal_community_view(server.inner.clone(), kickoff).await;
+            let repeated = serde_json::to_string(&view).unwrap();
+            let ToolOk::Value(polled_again) =
+                crate::core::status::get_job_status(server.inner.clone(), view.job_id.clone())
+                    .unwrap()
+            else {
+                panic!("community status must return JSON")
+            };
+            assert_eq!(repeated, serde_json::to_string(&polled_again).unwrap());
+            let Some(JobResult::DetectCommunities(response)) = view.result else {
+                panic!("expected completed community result")
+            };
+            actual.extend(
+                response
+                    .page
+                    .results
+                    .into_iter()
+                    .map(|community| community.label),
+            );
+            let Some(next_offset) = response.page.next_offset else {
+                break;
+            };
+            offset = Some(next_offset);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn community_progress_is_observable_while_running() {
         let server = server();
         server.inner.indexed.store(true, Ordering::Release);
         let ToolOk::Value(kickoff) =
-            detect_communities_async(server.inner.clone(), None, None, None, None, None).unwrap()
+            detect_communities_async(server.inner.clone(), None, None, None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("kickoff must return JSON")
         };
@@ -1432,9 +1943,44 @@ mod coalesce {
         assert_eq!(view.progress_total, 1);
     }
 
-    #[test]
-    fn invalid_community_async_input_does_not_issue_job() {
+    #[tokio::test]
+    async fn unindexed_community_async_rejects_before_validation_or_admission() {
         let server = server();
+        let before = {
+            let slot = server.inner.analyze_slot.read();
+            (
+                slot.current.is_none(),
+                slot.previous_terminal.is_none(),
+                slot.pending.len(),
+                slot.next_job_id,
+            )
+        };
+
+        let result = detect_communities_async(
+            server.inner.clone(),
+            Some("not-file".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("unindexed core entry must reject before argument validation");
+        };
+        assert_eq!(error.0, "no codebase indexed — call analyze_codebase first");
+
+        let slot = server.inner.analyze_slot.read();
+        assert_eq!(slot.current.is_none(), before.0);
+        assert_eq!(slot.previous_terminal.is_none(), before.1);
+        assert_eq!(slot.pending.len(), before.2);
+        assert_eq!(slot.next_job_id, before.3);
+    }
+
+    #[tokio::test]
+    async fn invalid_community_async_input_does_not_issue_job() {
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
         assert!(detect_communities_async(
             server.inner.clone(),
             Some("symbol".to_string()),
@@ -1443,6 +1989,7 @@ mod coalesce {
             None,
             None,
         )
+        .await
         .is_err());
         let ToolOk::Value(status) = crate::core::status::get_status(server.inner.clone()).unwrap()
         else {
@@ -1504,12 +2051,23 @@ mod coalesce {
         let inner = Arc::clone(&server.inner);
         inner.analyze_slot.write().panic_next_community_job = true;
         let held_index_lock = inner.index_lock.lock().await;
+        let (completion_reached_tx, completion_reached_rx) = tokio::sync::oneshot::channel();
+        let (completion_proceed_tx, completion_proceed_rx) = tokio::sync::oneshot::channel();
+        inner.analyze_slot.write().completion_hook = Some(crate::analyze_job::CompletionHook {
+            reached: completion_reached_tx,
+            proceed: completion_proceed_rx,
+        });
         let analyze_dir = tempfile::TempDir::new().unwrap();
         let ToolOk::Value(community) =
-            detect_communities_async(Arc::clone(&inner), None, None, None, None, None).unwrap()
+            detect_communities_async(Arc::clone(&inner), None, None, None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("community kickoff must return JSON")
         };
+        completion_reached_rx
+            .await
+            .expect("panicking community worker must pause before rotation");
         let ToolOk::Value(analyze) = analyze_codebase_async(
             Arc::clone(&inner),
             analyze_dir.path().to_string_lossy().into_owned(),
@@ -1520,6 +2078,9 @@ mod coalesce {
             panic!("analyze kickoff must return JSON")
         };
         assert_eq!(analyze.status, "queued");
+        completion_proceed_tx
+            .send(())
+            .expect("community supervisor must await rotation release");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let ToolOk::Value(view) = crate::core::status::get_job_status(
@@ -1538,10 +2099,19 @@ mod coalesce {
         })
         .await
         .expect("community panic must be surfaced by the generic supervisor");
-        assert_eq!(
-            inner.analyze_slot.read().current.as_ref().unwrap().job_id,
-            analyze.job_id
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while inner
+                .analyze_slot
+                .read()
+                .current
+                .as_ref()
+                .is_some_and(|current| current.job_id != analyze.job_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("community supervisor must promote its queued analyze successor");
         drop(held_index_lock);
     }
 
@@ -1566,6 +2136,165 @@ mod coalesce {
             job_guard: inner.persist.begin_job().unwrap(),
             sink: Arc::new(NoopProgressSink),
         }
+    }
+
+    fn fill_pending_to_limit(inner: &ServerInner, slot: &mut JobSlot) {
+        for index in 0..JOB_PENDING_LIMIT {
+            slot.pending.push_back(pending(
+                inner,
+                Job::new_queued(
+                    format!("pending-{index}"),
+                    format!("/pending-{index}"),
+                    false,
+                    index as u64,
+                ),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_limit_rejects_distinct_jobs_but_keeps_covered_analyzes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let blocker = root.path().join("blocker");
+        let distinct = root.path().join("distinct");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::create_dir(&distinct).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        let server = server();
+        server.inner.indexed.store(true, Ordering::Release);
+        let current = job("current", &blocker, false, false);
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            slot.current = Some(Arc::clone(&current));
+            slot.current_completion_pending = true;
+            fill_pending_to_limit(&server.inner, &mut slot);
+            let next_id_before = slot.next_job_id;
+
+            let distinct_raw = distinct.to_string_lossy().into_owned();
+            let Err(error) = admit_job(
+                &server.inner,
+                &mut slot,
+                distinct_raw.clone(),
+                false,
+                coverage_identity(&distinct_raw),
+            ) else {
+                panic!("a 33rd distinct analyze must be rejected");
+            };
+            assert_eq!(
+                error.0,
+                "job queue is full (32 pending jobs); wait for queued work to complete and retry, or poll get_status for FIFO diagnostics"
+            );
+            assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
+            assert_eq!(slot.next_job_id, next_id_before);
+
+            let blocker_raw = blocker.to_string_lossy().into_owned();
+            let covered = admit_job(
+                &server.inner,
+                &mut slot,
+                blocker_raw.clone(),
+                false,
+                coverage_identity(&blocker_raw),
+            )
+            .unwrap();
+            assert!(
+                matches!(covered, Admission::Covered { ref job, .. } if Arc::ptr_eq(job, &current))
+            );
+            assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
+            assert_eq!(slot.next_job_id, next_id_before);
+
+            let Err(force_mismatch) = admit_job(
+                &server.inner,
+                &mut slot,
+                blocker_raw.clone(),
+                true,
+                coverage_identity(&blocker_raw),
+            ) else {
+                panic!("a force-mismatched analyze must stay distinct and be rejected");
+            };
+            assert_eq!(force_mismatch.0, error.0);
+            assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
+            assert_eq!(slot.next_job_id, next_id_before);
+        }
+
+        let Err(community_error) =
+            detect_communities_async(Arc::clone(&server.inner), None, None, None, None, None).await
+        else {
+            panic!("a 33rd distinct community job must be rejected");
+        };
+        assert_eq!(
+            community_error.0,
+            "job queue is full (32 pending jobs); wait for queued work to complete and retry, or poll get_status for FIFO diagnostics"
+        );
+        assert_eq!(
+            server.inner.analyze_slot.read().pending.len(),
+            JOB_PENDING_LIMIT
+        );
+        assert_eq!(
+            server.inner.analyze_slot.read().next_job_id,
+            0,
+            "rejected community work must not issue an ID"
+        );
+
+        finish_failed(&current, "done".into());
+        let promoted = promote_pending(&server.inner, &current)
+            .expect("promotion must free exactly one pending slot");
+        drop(promoted.job_guard);
+        let mut slot = server.inner.analyze_slot.write();
+        assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT - 1);
+        let next_id_before = slot.next_job_id;
+        let distinct_raw = distinct.to_string_lossy().into_owned();
+        let admitted = admit_job(
+            &server.inner,
+            &mut slot,
+            distinct_raw.clone(),
+            false,
+            coverage_identity(&distinct_raw),
+        )
+        .expect("one promoted entry must reopen one pending admission slot");
+        let Admission::Queued { job, job_guard } = admitted else {
+            panic!("distinct request must queue behind the promoted current job");
+        };
+        slot.pending.push_back(PendingJob {
+            job,
+            job_guard,
+            sink: Arc::new(NoopProgressSink),
+        });
+        assert_eq!(slot.pending.len(), JOB_PENDING_LIMIT);
+        assert!(slot.next_job_id > next_id_before);
+    }
+
+    #[tokio::test]
+    async fn queue_full_rejection_does_not_extend_shutdown_drain() {
+        let root = tempfile::TempDir::new().unwrap();
+        let blocker = root.path().join("blocker");
+        let distinct = root.path().join("distinct");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::create_dir(&distinct).unwrap();
+        std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
+        let server = server();
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            slot.current = Some(job("current", &blocker, false, false));
+            fill_pending_to_limit(&server.inner, &mut slot);
+            let distinct_raw = distinct.to_string_lossy().into_owned();
+            assert!(matches!(
+                admit_job(
+                    &server.inner,
+                    &mut slot,
+                    distinct_raw.clone(),
+                    false,
+                    coverage_identity(&distinct_raw),
+                ),
+                Err(ToolError(message)) if message.starts_with("job queue is full")
+            ));
+            slot.pending.clear();
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.inner.persist.close_analyze_and_wait(),
+        )
+        .await
+        .expect("a rejected request must not retain a shutdown-drain guard");
     }
 
     #[test]
@@ -1748,7 +2477,7 @@ mod coalesce {
         std::fs::write(root.path().join(".code-graph.toml"), "").unwrap();
         std::fs::write(
             child.join(".code-graph.toml"),
-            "[response]\nmax_bytes = 0\n",
+            "[response]\nmax_bytes = -1\n",
         )
         .unwrap();
         let server = server();
@@ -1886,6 +2615,296 @@ mod coalesce {
             graph.file_symbols(&b_source).is_empty(),
             "the retargeted symlink target B must not be indexed"
         );
+    }
+
+    mod config_identity {
+        use super::*;
+        use code_graph_lang_cpp::CppParser;
+
+        fn server() -> crate::server::CodeGraphServer {
+            let mut registry = code_graph_lang::LanguageRegistry::new();
+            registry
+                .register(Box::new(CppParser::new().unwrap()))
+                .unwrap();
+            crate::server::CodeGraphServer::new(registry)
+        }
+
+        fn queued_analyze(
+            server: &crate::server::CodeGraphServer,
+            path: &std::path::Path,
+        ) -> Arc<Job> {
+            let raw = path.to_string_lossy().into_owned();
+            let coverage = coverage_identity(&raw).expect("fixture config must admit");
+            let blocker = Job::new_running("blocker".into(), "/blocker".into(), false, 0);
+            let mut slot = server.inner.analyze_slot.write();
+            slot.current = Some(blocker);
+            let Admission::Queued { job, job_guard } =
+                admit_job(&server.inner, &mut slot, raw, true, Some(coverage)).unwrap()
+            else {
+                panic!("fixture analyze must queue behind blocker");
+            };
+            slot.pending.push_back(PendingJob {
+                job: Arc::clone(&job),
+                job_guard,
+                sink: Arc::new(NoopProgressSink),
+            });
+            job
+        }
+
+        async fn run_queued(inner: &Arc<ServerInner>, job: &Arc<Job>) -> AnalyzeResult {
+            job.mark_running();
+            run_analyze_job(
+                Arc::clone(inner),
+                Arc::clone(job),
+                Arc::new(NoopProgressSink),
+            )
+            .await;
+            let state = job.state.read();
+            let JobStatus::Completed(JobResult::Analyze(result)) = &state.status else {
+                panic!("queued analyze must succeed");
+            };
+            result.clone()
+        }
+
+        #[tokio::test]
+        async fn nested_config_created_while_queued_keeps_admitted_parent_boundary() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let outer = paths::canonicalize(temp.path()).unwrap();
+            let child = outer.join("child");
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(
+                outer.join(".code-graph.toml"),
+                "[cpp]\nmacro_strip = [\"OUTER_API\"]\n",
+            )
+            .unwrap();
+            let source = child.join("subject.cpp");
+            std::fs::write(&source, "class OUTER_API FromParent {};\n").unwrap();
+
+            let server = server();
+            let job = queued_analyze(&server, &child);
+            std::fs::write(
+                child.join(".code-graph.toml"),
+                "[cpp]\nmacro_strip = [\"INNER_API\"]\n",
+            )
+            .unwrap();
+
+            let result = run_queued(&server.inner, &job).await;
+            assert_eq!(result.root_path, outer.to_string_lossy());
+            assert!(code_graph_graph::cache_path(&outer).exists());
+            assert!(!code_graph_graph::cache_path(&child).exists());
+            assert!(server
+                .inner
+                .graph
+                .read()
+                .file_symbols(&source)
+                .iter()
+                .any(|symbol| symbol.name == "FromParent"));
+        }
+
+        #[test]
+        fn same_root_config_provenance_change_prevents_coalescing() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = paths::canonicalize(temp.path()).unwrap();
+            let raw = root.to_string_lossy().into_owned();
+            let without_file = coverage_identity(&raw).expect("default config identity");
+            assert!(!without_file.config_present);
+
+            std::fs::write(root.join(".code-graph.toml"), "").unwrap();
+            let with_file = coverage_identity(&raw).expect("empty config identity");
+            assert!(with_file.config_present);
+            assert!(!covers((&without_file, false), (&with_file, false)));
+            assert!(!covers((&with_file, false), (&without_file, false)));
+
+            std::fs::remove_file(root.join(".code-graph.toml")).unwrap();
+            let removed = coverage_identity(&raw).expect("restored default identity");
+            assert!(!removed.config_present);
+            assert!(covers((&without_file, false), (&removed, false)));
+        }
+
+        #[tokio::test]
+        async fn nested_config_removed_while_queued_keeps_admitted_child_boundary() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let outer = paths::canonicalize(temp.path()).unwrap();
+            let child = outer.join("child");
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(outer.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+            let child_config = child.join(".code-graph.toml");
+            std::fs::write(&child_config, "[cpp]\nmacro_strip = [\"INNER_API\"]\n").unwrap();
+            let source = child.join("subject.cpp");
+            std::fs::write(&source, "class INNER_API FromChild {};\n").unwrap();
+
+            let server = server();
+            let job = queued_analyze(&server, &child);
+            std::fs::remove_file(child_config).unwrap();
+
+            // A request admitted after removal belongs to the outer project,
+            // so it must not receive this queued child's eventual result.
+            {
+                let mut slot = server.inner.analyze_slot.write();
+                let raw = child.to_string_lossy().into_owned();
+                assert!(matches!(
+                    admit_job(
+                        &server.inner,
+                        &mut slot,
+                        raw.clone(),
+                        true,
+                        coverage_identity(&raw),
+                    )
+                    .unwrap(),
+                    Admission::Queued { .. }
+                ));
+            }
+
+            let result = run_queued(&server.inner, &job).await;
+            assert_eq!(result.root_path, child.to_string_lossy());
+            assert!(code_graph_graph::cache_path(&child).exists());
+            assert!(!code_graph_graph::cache_path(&outer).exists());
+            assert!(server
+                .inner
+                .graph
+                .read()
+                .file_symbols(&source)
+                .iter()
+                .any(|symbol| symbol.name == "FromChild"));
+        }
+
+        #[tokio::test]
+        async fn nested_config_replaced_after_coverage_keeps_coverers_admitted_config() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let outer = paths::canonicalize(temp.path()).unwrap();
+            let child = outer.join("child");
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(outer.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
+            let child_config = child.join(".code-graph.toml");
+            std::fs::write(&child_config, "[cpp]\nmacro_strip = [\"FIRST_API\"]\n").unwrap();
+            let source = child.join("subject.cpp");
+            std::fs::write(&source, "class FIRST_API FirstConfig {};\n").unwrap();
+
+            let server = server();
+            let job = queued_analyze(&server, &child);
+            {
+                let mut slot = server.inner.analyze_slot.write();
+                let raw = child.to_string_lossy().into_owned();
+                assert!(matches!(
+                    admit_job(
+                        &server.inner,
+                        &mut slot,
+                        raw.clone(),
+                        true,
+                        coverage_identity(&raw),
+                    )
+                    .unwrap(),
+                    Admission::Covered { job: ref coverer, status: "queued" }
+                        if Arc::ptr_eq(coverer, &job)
+                ));
+            }
+            std::fs::write(&child_config, "[cpp]\nmacro_strip = [\"SECOND_API\"]\n").unwrap();
+
+            // Same root but a different admitted effective config must not
+            // coalesce into the queued FIRST_API job.
+            {
+                let mut slot = server.inner.analyze_slot.write();
+                let raw = child.to_string_lossy().into_owned();
+                assert!(matches!(
+                    admit_job(
+                        &server.inner,
+                        &mut slot,
+                        raw.clone(),
+                        true,
+                        coverage_identity(&raw),
+                    )
+                    .unwrap(),
+                    Admission::Queued { .. }
+                ));
+            }
+
+            let result = run_queued(&server.inner, &job).await;
+            assert_eq!(result.root_path, child.to_string_lossy());
+            assert!(code_graph_graph::cache_path(&child).exists());
+            assert!(!code_graph_graph::cache_path(&outer).exists());
+            assert!(server
+                .inner
+                .graph
+                .read()
+                .file_symbols(&source)
+                .iter()
+                .any(|symbol| symbol.name == "FirstConfig"));
+        }
+
+        #[tokio::test]
+        async fn coverage_snapshot_and_fifo_admission_are_linearizable() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = paths::canonicalize(temp.path()).unwrap();
+            let config_path = root.join(".code-graph.toml");
+            std::fs::write(&config_path, "[cpp]\nmacro_strip = [\"OLD_API\"]\n").unwrap();
+
+            let server = server();
+            let inner = Arc::clone(&server.inner);
+            inner.analyze_slot.write().current = Some(Job::new_running(
+                "blocker".into(),
+                "/blocker".into(),
+                false,
+                0,
+            ));
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+            *inner.admission_probe_hook.lock().await = Some(crate::server::AdmissionProbeHook {
+                reached: reached_tx,
+                proceed: proceed_rx,
+            });
+
+            let path = root.to_string_lossy().into_owned();
+            let first_inner = Arc::clone(&inner);
+            let first_path = path.clone();
+            let first =
+                tokio::spawn(
+                    async move { analyze_codebase_async(first_inner, first_path, true).await },
+                );
+            reached_rx
+                .await
+                .expect("first request snapshots old config");
+
+            std::fs::write(&config_path, "[cpp]\nmacro_strip = [\"NEW_API\"]\n").unwrap();
+            let second_inner = Arc::clone(&inner);
+            let second =
+                tokio::spawn(async move { analyze_codebase_async(second_inner, path, true).await });
+            tokio::task::yield_now().await;
+            assert!(
+                inner.analyze_slot.read().pending.is_empty(),
+                "the newer snapshot must not enter FIFO while the older snapshot owns admission"
+            );
+
+            proceed_tx.send(()).unwrap();
+            let ToolOk::Value(first) = first.await.unwrap().unwrap() else {
+                panic!("first kickoff must return JSON")
+            };
+            let ToolOk::Value(second) = second.await.unwrap().unwrap() else {
+                panic!("second kickoff must return JSON")
+            };
+
+            let slot = inner.analyze_slot.read();
+            assert_eq!(slot.pending.len(), 2);
+            assert_eq!(slot.pending[0].job.job_id, first.job_id);
+            assert_eq!(slot.pending[1].job.job_id, second.job_id);
+            let first_config = slot.pending[0]
+                .job
+                .coverage
+                .as_ref()
+                .unwrap()
+                .config_identity
+                .clone();
+            let second_config = slot.pending[1]
+                .job
+                .coverage
+                .as_ref()
+                .unwrap()
+                .config_identity
+                .clone();
+            assert_ne!(
+                first_config, second_config,
+                "the FIFO order must retain the old snapshot before the newer config snapshot"
+            );
+        }
     }
 }
 

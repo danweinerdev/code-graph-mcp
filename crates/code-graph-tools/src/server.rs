@@ -42,7 +42,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerH
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::analyze_job::JobSlot;
@@ -410,6 +410,18 @@ pub struct ServerInner {
     /// Serializes active analyze workers and the watch loop's `reindex_file` to
     /// close the analyze-vs-watch merge race the Go implementation has.
     pub index_lock: TokioMutex<()>,
+    /// Serializes analyze-only coverage/config snapshots through their later
+    /// FIFO admission. The `analyze_slot` write lock is the linearization
+    /// point for every long-running job: community jobs validate and acquire
+    /// that slot directly, so they may linearize ahead of an analyze still in
+    /// its filesystem probe. Never acquire this after `analyze_slot`, job
+    /// state, or the persistence coordinator: its only nested acquisition is
+    /// the slot write lock during analyze admission.
+    pub(crate) admission_lock: TokioMutex<()>,
+    /// Limits filesystem-backed analyze admission probes to one per server.
+    /// The owned permit moves into the blocking closure, so aborting its MCP
+    /// future cannot free capacity before the filesystem operation returns.
+    pub(crate) admission_probe_permits: Arc<Semaphore>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
     /// Project root owning the active cache. Unlike `root_path`, this is not
@@ -455,6 +467,34 @@ pub struct ServerInner {
     /// pending jobs, and the previous terminal grace-window entry.
     #[allow(dead_code)]
     pub(crate) analyze_slot: PlRwLock<JobSlot>,
+    /// Deterministic pause after an analyze coverage snapshot while the
+    /// analyze-only admission lock remains held. This pins analyze-to-analyze
+    /// snapshot ordering without making production admission depend on test
+    /// instrumentation.
+    #[cfg(test)]
+    pub(crate) admission_probe_hook: TokioMutex<Option<AdmissionProbeHook>>,
+    /// Test-only synchronous handoff performed inside analyze admission's
+    /// blocking probe. This lets a current-thread runtime prove that waiting
+    /// on a slow filesystem probe does not stall independent Tokio tasks.
+    #[cfg(test)]
+    pub(crate) admission_blocking_probe_hook: std::sync::Mutex<Option<BlockingAdmissionProbeHook>>,
+}
+
+/// Test-only handoff used to prove that config identity snapshot and FIFO
+/// admission are one linearizable operation.
+#[cfg(test)]
+pub(crate) struct AdmissionProbeHook {
+    pub(crate) reached: oneshot::Sender<()>,
+    pub(crate) proceed: oneshot::Receiver<()>,
+}
+
+/// Test-only barrier installed before an analyze admission probe starts.
+/// `Barrier::wait` is intentionally synchronous because it runs only inside
+/// the probe's `spawn_blocking` closure.
+#[cfg(test)]
+pub(crate) struct BlockingAdmissionProbeHook {
+    pub(crate) reached: oneshot::Sender<()>,
+    pub(crate) proceed: Arc<std::sync::Barrier>,
 }
 
 /// MCP server exposing the code graph through 24 tools.
@@ -485,6 +525,8 @@ impl CodeGraphServer {
                 registry,
                 indexed: AtomicBool::new(false),
                 index_lock: TokioMutex::new(()),
+                admission_lock: TokioMutex::new(()),
+                admission_probe_permits: Arc::new(Semaphore::new(1)),
                 root_path: PlRwLock::new(None),
                 cache_root: PlRwLock::new(None),
                 cache_io_root: PlRwLock::new(None),
@@ -497,6 +539,10 @@ impl CodeGraphServer {
                 index_force_built: AtomicBool::new(false),
                 persist: Arc::new(PersistCoordinator::new()),
                 analyze_slot: PlRwLock::new(JobSlot::default()),
+                #[cfg(test)]
+                admission_probe_hook: TokioMutex::new(None),
+                #[cfg(test)]
+                admission_blocking_probe_hook: std::sync::Mutex::new(None),
             }),
             tool_router: Self::tool_router(),
         }
@@ -1188,7 +1234,7 @@ impl CodeGraphServer {
     // -- P0 -----------------------------------------------------------------
 
     #[tool(
-        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). Usually returns `{ files, symbols, edges, root_path, warnings? }`; a coalesced request waits for its covering job and adds `coalesced_by` with that job ID (otherwise absent), while a distinct request admitted behind work already pending returns immediately with `{ job_id, status: \"queued\", started_at, existing: false, note }` — poll `get_job_status(job_id)`. Must be called before query tools."
+        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). Usually returns `{ files, symbols, edges, root_path, warnings? }`; a coalesced request waits for its covering job and adds `coalesced_by` with that job ID (otherwise absent), while a distinct request admitted behind work already pending returns immediately with `{ job_id, status: \"queued\", started_at, existing: false, note }` — poll `get_job_status(job_id)`. The shared FIFO holds at most 32 pending jobs; covered requests still coalesce at capacity, but a distinct request beyond that limit returns a retryable queue-full tool error. Must be called before query tools."
     )]
     async fn analyze_codebase(
         &self,
@@ -1208,7 +1254,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Kick off `analyze_codebase` on a background task and return immediately (< 1KB, sub-second) with `{ job_id, status, started_at, existing, note }`. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze. A request reuses a nonterminal job when its canonical existing directory is covered by that job and the coverer is forced or this request is not; it returns the coverer's `job_id` with `existing=true` and a coalescing note. Other requests are FIFO-admitted with `existing=false`. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire."
+        description = "Kick off `analyze_codebase` on a background task and return before indexing begins (normally quickly) with `{ job_id, status, started_at, existing, note }`. Admission canonicalization and config discovery may wait on a slow filesystem. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze. A request reuses a nonterminal job when its canonical existing directory is covered by that job and the coverer is forced or this request is not; it returns the coverer's `job_id` with `existing=true` and a coalescing note. Other requests are FIFO-admitted with `existing=false` until the shared 32-pending-job limit; a distinct request beyond the limit gets a retryable queue-full tool error, while covered requests still coalesce. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire during indexing."
     )]
     async fn analyze_codebase_async(
         &self,
@@ -2099,7 +2145,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Kick off whole-graph file community detection and return immediately (< 1KB, sub-second). Args match `detect_communities`: `granularity` defaults to \"file\" (the only supported value); `max_iterations` defaults to 50 (max 500, 0 uses default); `members_per_community` defaults to 10 (max 100, 0 uses default); `limit` defaults to 100 (max 1000, 0 uses default); `offset` defaults to 0. Requires an index and validates arguments before issuing a job. Returns `{ job_id, status, started_at, existing, note }`, where status is `\"running\"` or `\"queued\"`. Poll `get_job_status(job_id)` for the bare generic JobView and its terminal `result`, which is byte-identical to synchronous `DetectCommunitiesResponse`; use `get_status` for the shared FIFO diagnostic. Prefer this form on large graphs where a synchronous client wall-clock timeout could fire."
+        description = "Kick off whole-graph file community detection and return immediately (< 1KB, sub-second). Args match `detect_communities`: `granularity` defaults to \"file\" (the only supported value); `max_iterations` defaults to 50 (max 500, 0 uses default); `members_per_community` defaults to 10 (max 100, 0 uses default); `limit` defaults to 100 (max 1000, 0 uses default); `offset` defaults to 0. Requires an index and validates arguments before issuing a job. Returns `{ job_id, status, started_at, existing, note }`, where status is `\"running\"` or `\"queued\"`. The shared FIFO holds at most 32 pending jobs; a distinct community job beyond that limit gets a retryable queue-full tool error. Poll `get_job_status(job_id)` for the bare generic JobView and its terminal `result`, which has the same `DetectCommunitiesResponse` shape and semantics as sync. The JobView wrapper reserves bytes from the captured `max_bytes`, so it can contain fewer rows and a different `next_offset` than sync; resume with `offset = next_offset`, except an empty `truncated` page whose `next_offset` is unchanged is a start-fresh marker: do NOT retry unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry. Use `get_status` for the shared FIFO diagnostic. Prefer this form on large graphs where a synchronous client wall-clock timeout could fire."
     )]
     async fn detect_communities_async(
         &self,
@@ -2116,7 +2162,8 @@ impl CodeGraphServer {
                 args.members_per_community,
                 args.limit,
                 args.offset,
-            ),
+            )
+            .await,
         ))
     }
 
@@ -2273,7 +2320,7 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Return the status for one long-running job by required `job_id`. Response is the bare generic `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase, kind, ...community_args }` JobView — not a Page or wrapper. `path` and `force` retain their existing top-level analyze meaning; `kind` is additive (`\"analyze\"` or `\"detect_communities\"`), and optional `granularity`, `max_iterations`, `members_per_community`, `limit`, and `offset` appear only for community jobs. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async` or `detect_communities_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`; terminal `result` is byte-identical to that kind's synchronous success body. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
+        description = "Return the status for one long-running job by required `job_id`. Response is the bare generic `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase, kind, ...community_args }` JobView — not a Page or wrapper. `path` and `force` retain their existing top-level analyze meaning; `kind` is additive (`\"analyze\"` or `\"detect_communities\"`), and optional `granularity`, `max_iterations`, `members_per_community`, `limit`, and `offset` appear only for community jobs. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async` or `detect_communities_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`. An analyze terminal `result` is byte-identical to its synchronous success body. A community terminal `result` has the same `DetectCommunitiesResponse` shape and semantics as sync, but the JobView wrapper reserves bytes from captured `max_bytes`, so it can contain fewer rows and a different `next_offset`; resume with `offset = next_offset`, except an empty `truncated` page whose `next_offset` is unchanged is a start-fresh marker: do NOT retry unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
     )]
     async fn get_job_status(
         &self,

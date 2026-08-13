@@ -103,10 +103,8 @@ pub struct StatusResult {
     /// ever" from "missing field on an old server" — matches the
     /// `index_force_built` precedent above.
     pub analyze_job: Option<AnalyzeJobView>,
-    /// Snapshot of the previous terminal job preserved across a single
-    /// grace-window kickoff (Design Decision 4). Becomes `null` again
-    /// once a second analyze terminates and rotates the slot. Same
-    /// explicit-`null` serialization rule as `analyze_job`.
+    /// Latest retained terminal analyze job across the bounded generic job
+    /// history. Same explicit-`null` serialization rule as `analyze_job`.
     pub analyze_job_previous_terminal: Option<AnalyzeJobView>,
     /// Number of FIFO-admitted jobs waiting behind `analyze_job`. Pending
     /// jobs are represented by IDs only in this phase.
@@ -254,6 +252,48 @@ impl JobView {
             members_per_community,
             limit,
             offset,
+        }
+    }
+
+    /// Build the terminal community-job shape before its nested response has
+    /// been finalized. This lets the worker measure the real wrapper (job ID,
+    /// timestamps, escaped request strings, and optional request fields) and
+    /// reserve it from the captured response budget without changing the wire
+    /// shape returned by `get_job_status`.
+    pub(crate) fn completed_community(
+        job: &Job,
+        result: crate::handlers::DetectCommunitiesResponse,
+        finished_at: u64,
+    ) -> Self {
+        let JobRequest::DetectCommunities {
+            granularity,
+            max_iterations,
+            members_per_community,
+            limit,
+            offset,
+        } = &job.request
+        else {
+            unreachable!("community budget view requires a community job");
+        };
+        Self {
+            job_id: job.job_id.clone(),
+            status: "completed".to_string(),
+            path: job.path.clone(),
+            force: job.force,
+            started_at: format_unix_nanos_rfc3339(job.started_at),
+            finished_at: Some(format_unix_nanos_rfc3339(finished_at)),
+            progress: 1,
+            progress_total: 1,
+            progress_message: "Community detection complete".to_string(),
+            error: None,
+            result: Some(JobResult::DetectCommunities(result)),
+            current_phase: Some(JobPhase::DetectingCommunities),
+            kind: JobKind::DetectCommunities,
+            granularity: granularity.clone(),
+            max_iterations: *max_iterations,
+            members_per_community: *members_per_community,
+            limit: *limit,
+            offset: *offset,
         }
     }
 }

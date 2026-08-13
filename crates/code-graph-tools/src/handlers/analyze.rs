@@ -44,7 +44,7 @@ pub(crate) use crate::core::analyze::{finish_completed, finish_failed, JobAwareP
 #[cfg(test)]
 use crate::analyze_job::{Job, JobStatus};
 #[cfg(test)]
-use code_graph_core::paths;
+use code_graph_core::{paths, RootConfig};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -1859,9 +1859,14 @@ mod tests {
         let server = server_with_cpp_parser();
         let inner = server.inner.clone();
         let canonical = paths::canonicalize(dir.path()).expect("fixture path canonicalizes");
+        let (config, project_root, config_present) =
+            RootConfig::load_with_presence(&canonical).unwrap();
         let coverage = crate::analyze_job::CoverageIdentity {
             invocation_path: canonical.clone(),
-            project_root: canonical,
+            project_root,
+            config_identity: serde_json::to_string(&config).unwrap(),
+            config,
+            config_present,
         };
         let coverer = Job::new_running_with_coverage(
             "coverer".to_string(),
@@ -1871,12 +1876,19 @@ mod tests {
             Some(coverage),
         );
         inner.analyze_slot.write().current = Some(coverer.clone());
+        let coverer_refs_before_waiter = Arc::strong_count(&coverer);
         let waiter = tokio::spawn({
             let inner = inner.clone();
             let path = dir.path().to_string_lossy().into_owned();
             async move { analyze_codebase(inner, path, false, None, None).await }
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while Arc::strong_count(&coverer) == coverer_refs_before_waiter {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("covered waiter must retain the coverer before its terminal failure");
         finish_failed(&coverer, "coverer failed".to_string());
         let result = waiter.await.unwrap();
         assert_eq!(result.is_error, Some(true));

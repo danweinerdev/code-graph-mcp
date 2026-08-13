@@ -219,15 +219,15 @@ Two details that follow: after acknowledgement, the daemon closes new analyze/wa
 
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 
-### Decision 7: Analyze requests queue and coalesce by path containment (FR-41, FR-42, FR-43)
+### Decision 7: Analyze requests queue and coalesce by path containment (FR-41, FR-42, FR-43, D-0010)
 
 **Context:** FR-41 – FR-43. Today `analyze_codebase` inspects the slot and returns `"indexing already in progress"` on contention. With N attached sessions, that error goes from rare to routine.
 
-**Decision:** Replace the error with a queue. A request is admitted, and before running is tested against the queue: **X covers Y when Y's path is equal to or nested under X's path, and X forces or Y does not force.** A covered request does not run; its caller receives the covering request's outcome, flagged as coalesced.
+**Decision:** Replace the error with a queue. A request is admitted, and before running is tested against the queue: **X covers Y when Y's path is equal to or nested under X's path, and X forces or Y does not force.** A covered request does not run; its caller receives the covering request's outcome, flagged as coalesced. Per D-0010, the shared queue has at most 32 pending entries (not counting current or terminal history): coverage is evaluated before the cap so covered analyzes still coalesce, while an additional distinct analyze or community job is rejected with a retryable queue-full tool error and does not retain an admission guard.
 
 **Rationale:** The force asymmetry is the whole subtlety. A non-forcing run skips unchanged mtimes, so it does *not* perform the invalidation a forcing request asked for — a forced `/a/b/c` absorbed into a plain `/a/b` would silently no-op the very thing the caller wanted. Containment alone is not sufficient and would produce a bug that only shows up as "force didn't work". The four cases are enumerated as a test in AC-51.
 
-**The queue is a new structure, not a reinterpretation of the existing slot.** `AnalyzeSlot` today holds exactly `current: Option<Arc<AnalyzeJob>>` and `previous_terminal: Option<Arc<AnalyzeJob>>` — there is nowhere to put "admitted but not yet started". This design adds a third field, `pending: Vec<Arc<AnalyzeJob>>`, ordered by admission. Admission runs the coverage rule against the running job **and** every pending entry; a covered request is not appended and is instead attached to its coverer. When the running job terminates, the head of `pending` is promoted to `current` under the same rotation that exists today.
+**The queue is a new structure, not a reinterpretation of the existing slot.** `AnalyzeSlot` today holds exactly `current: Option<Arc<AnalyzeJob>>` and `previous_terminal: Option<Arc<AnalyzeJob>>` — there is nowhere to put "admitted but not yet started". This design adds a third field, `pending: Vec<Arc<AnalyzeJob>>`, ordered by admission and capped at 32 by D-0010. Admission runs the coverage rule against the running job **and** every pending entry before enforcing that cap; a covered request is not appended and is instead attached to its coverer. When the running job terminates, the head of `pending` is promoted to `current` under the same rotation that exists today, freeing exactly one admission slot.
 
 Three consequences the coverage rule alone does not settle:
 

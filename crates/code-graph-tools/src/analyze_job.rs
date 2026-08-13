@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
 
+use code_graph_core::RootConfig;
+
 use crate::handlers::analyze::AnalyzeResult;
 use crate::handlers::DetectCommunitiesResponse;
 use crate::indexer::ProgressSink;
@@ -59,6 +61,13 @@ pub enum JobResult {
 
 /// Number of displaced terminal jobs retained for job-addressable polling.
 pub(crate) const TERMINAL_HISTORY_LIMIT: usize = 32;
+
+/// Maximum number of admitted jobs waiting behind the current shared job.
+///
+/// This bounds only `JobSlot::pending`; the current job and retained terminal
+/// history do not consume pending capacity. Covered analyze requests do not
+/// enter this queue and therefore continue to coalesce when it is full.
+pub(crate) const JOB_PENDING_LIMIT: usize = 32;
 
 // `is_terminal` is the rotation helper retained for callers who want
 // the predicate without pattern-matching on `JobStatus` directly —
@@ -135,6 +144,20 @@ pub(crate) struct Job {
 pub(crate) struct CoverageIdentity {
     pub(crate) invocation_path: PathBuf,
     pub(crate) project_root: PathBuf,
+    /// Validated configuration captured with the project boundary at
+    /// admission. Analyze workers must use this rather than rediscovering
+    /// TOML after queueing, because a nested config can appear, disappear, or
+    /// change while a job waits for promotion.
+    pub(crate) config: RootConfig,
+    /// Canonical serialization of the admitted validated config. This is
+    /// runtime-only admission data: two requests at the same project root can
+    /// coalesce only when their effective configs match, preventing a caller
+    /// admitted after a config replacement from receiving older job results.
+    pub(crate) config_identity: String,
+    /// Whether the admitted configuration came from an on-disk TOML file.
+    /// This keeps no-config warnings tied to the same admission snapshot as
+    /// the configuration and cache root, without rereading TOML at execution.
+    pub(crate) config_present: bool,
 }
 
 #[derive(Default)]
@@ -401,6 +424,8 @@ pub(crate) fn covers(
     covered: (&CoverageIdentity, bool),
 ) -> bool {
     coverer.0.project_root == covered.0.project_root
+        && coverer.0.config_identity == covered.0.config_identity
+        && coverer.0.config_present == covered.0.config_present
         && covered
             .0
             .invocation_path
@@ -418,12 +443,16 @@ impl JobMutableState {
 #[cfg(test)]
 mod coalesce {
     use super::{covers, CoverageIdentity};
+    use code_graph_core::RootConfig;
     use std::path::PathBuf;
 
     fn identity(path: &str, project_root: &str) -> CoverageIdentity {
         CoverageIdentity {
             invocation_path: PathBuf::from(path),
             project_root: PathBuf::from(project_root),
+            config: RootConfig::default(),
+            config_identity: String::new(),
+            config_present: false,
         }
     }
 

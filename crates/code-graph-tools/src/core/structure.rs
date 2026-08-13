@@ -701,6 +701,36 @@ pub fn detect_communities(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> ToolResult<DetectCommunitiesResponse> {
+    detect_communities_with_response_budget(
+        graph,
+        indexed,
+        granularity,
+        max_iterations,
+        members_per_community,
+        limit,
+        offset,
+        |_| max_bytes,
+    )
+}
+
+/// Variant used by an outer response envelope to reserve its exact serialized
+/// overhead before this response budgets community rows. The callback receives
+/// a structurally valid empty response with the actual metadata; callers use
+/// it only to measure their wrapper, never to make row-selection decisions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn detect_communities_with_response_budget<F>(
+    graph: &RwLock<Graph>,
+    indexed: bool,
+    granularity: Option<&str>,
+    max_iterations: Option<u32>,
+    members_per_community: Option<u32>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    response_budget: F,
+) -> ToolResult<DetectCommunitiesResponse>
+where
+    F: FnOnce(&DetectCommunitiesResponse) -> usize,
+{
     require_indexed(indexed)?;
 
     let resolved_granularity = validate_detect_communities_args(granularity)?;
@@ -741,9 +771,6 @@ pub fn detect_communities(
         })
         .collect();
 
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
-
     let (termination, iterations) = match result.termination {
         code_graph_graph::Termination::Converged { iterations } => ("converged", iterations),
         code_graph_graph::Termination::IterationCeiling { iterations } => {
@@ -762,6 +789,27 @@ pub fn detect_communities(
         },
     });
 
+    let has_remaining = total > resolved_offset;
+    let response_metadata = DetectCommunitiesResponse {
+        page: Page::<Community> {
+            results: Vec::new(),
+            total,
+            offset: resolved_offset,
+            limit: resolved_limit,
+            truncated: has_remaining,
+            next_offset: has_remaining.then_some(resolved_offset),
+        },
+        granularity: resolved_granularity,
+        termination,
+        iterations,
+        node_count: result.node_count,
+        edge_count: result.edge_count,
+        degenerate,
+    };
+    let max_bytes = response_budget(&response_metadata);
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
+
     let response = DetectCommunitiesResponse {
         page: Page::<Community> {
             results,
@@ -771,12 +819,12 @@ pub fn detect_communities(
             truncated,
             next_offset,
         },
-        granularity: resolved_granularity,
-        termination,
-        iterations,
-        node_count: result.node_count,
-        edge_count: result.edge_count,
-        degenerate,
+        granularity: response_metadata.granularity,
+        termination: response_metadata.termination,
+        iterations: response_metadata.iterations,
+        node_count: response_metadata.node_count,
+        edge_count: response_metadata.edge_count,
+        degenerate: response_metadata.degenerate,
     };
     Ok(ToolOk::Value(response))
 }

@@ -154,6 +154,23 @@ decisions:
       - Designs/RepoLocalDaemon
     tags: [jobs, status, wire-contract, detect-communities, compatibility]
     reversibility: two-way
+  - id: D-0010
+    kind: answered-question
+    status: accepted
+    date: 2026-08-12
+    decided_by: user
+    statement: "The shared long-running-job FIFO admits at most 32 pending jobs; covered analyze requests still coalesce at capacity, while additional distinct analyze or community jobs are rejected with a retryable queue-full tool error."
+    question: "Should the shared FIFO remain unbounded to preserve FR-41 literally, or be capped at 32 pending jobs?"
+    rejected:
+      - "An unbounded pending-job FIFO"
+    rationale: "A fixed bound prevents hostile or accidental memory growth and prevents graceful daemon shutdown from being delayed by an unlimited amount of admitted work. Thirty-two matches the existing terminal-history bound and leaves useful burst capacity."
+    confirmation: "Specs/GraphPlatformExpansion FR-41 and AC-50, Designs/RepoLocalDaemon Decision 7, and Plans/GraphPlatformExpansion phase 4 cite this decision. Tests fill all 32 pending slots, prove a 33rd distinct job is rejected without consuming an ID or guard, prove covered requests still coalesce, and prove promotion reopens capacity."
+    scope:
+      - Specs/GraphPlatformExpansion
+      - Designs/RepoLocalDaemon
+      - Plans/GraphPlatformExpansion
+    tags: [jobs, queue, backpressure, daemon, availability]
+    reversibility: two-way
 ---
 
 # Decision Ledger
