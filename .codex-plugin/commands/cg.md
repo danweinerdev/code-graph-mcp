@@ -47,12 +47,9 @@ instead of hand-picking a tool when you just want the answer.
   `/cg-index` first — do not fall back to grep.
 - Answer with **paths, line numbers, and signatures**. Read source only after a tool has pinned
   the exact span, and read that span, not the file.
-- Byte-budgeted paginated tools return `{results, total, offset, limit, truncated, next_offset}`.
-  `truncated` means matching records remain after the count limit or byte cap; re-call with
-  `offset = next_offset` — raising `limit` alone will not get you the rest. Exception: empty
-  `results` with `truncated: true` and `next_offset` equal to the requested offset is a
-  start-fresh marker, not a continuation. Do **not** retry unchanged: raise `[response].max_bytes`,
-  rerun `analyze_codebase` to refresh cached config, then retry. `detect_cycles` is count-paginated.
+- Paginated tools return `{results, total, offset, limit, truncated, next_offset}`. When
+  `truncated` is true, re-call with `offset = next_offset` — raising `limit` alone will not get
+  you the rest.
 - Call resolution is **syntactic, not semantic**, in all six languages. Overloads can misresolve;
   pass `min_confidence: "resolved"` on `get_callers`/`get_callees` when a clean edge set matters
   more than coverage.

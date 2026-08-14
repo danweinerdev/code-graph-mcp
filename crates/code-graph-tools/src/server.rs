@@ -33,8 +33,6 @@ use code_graph_graph::Graph;
 use code_graph_lang::LanguageRegistry;
 use notify_debouncer_full::notify::RecommendedWatcher;
 use notify_debouncer_full::{Debouncer, RecommendedCache};
-#[cfg(test)]
-use parking_lot::Mutex as PlMutex;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -44,10 +42,10 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerH
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::{oneshot, Notify, Semaphore};
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::analyze_job::JobSlot;
+use crate::analyze_job::AnalyzeSlot;
 use crate::handlers;
 
 /// Active filesystem-watcher state stored on [`ServerInner::watch`].
@@ -82,7 +80,7 @@ pub struct PersistCoordinator {
 }
 
 struct PersistState {
-    job_closed: bool,
+    analyze_closed: bool,
     connection_closed: bool,
     persist_closed: bool,
     watch_cleanup_closed: bool,
@@ -93,7 +91,7 @@ struct PersistState {
     /// Every connection/analyze begin and drop advances this value. The idle
     /// waiter uses it as an epoch so any activity restarts its full interval.
     lifecycle_generation: u64,
-    jobs: u32,
+    analyses: u32,
     connections: u32,
     persists: u32,
     watch_cleanups: u32,
@@ -103,13 +101,13 @@ impl PersistCoordinator {
     pub fn new() -> Self {
         Self {
             state: parking_lot::Mutex::new(PersistState {
-                job_closed: false,
+                analyze_closed: false,
                 connection_closed: false,
                 persist_closed: false,
                 watch_cleanup_closed: false,
                 idle_claimed: false,
                 lifecycle_generation: 0,
-                jobs: 0,
+                analyses: 0,
                 connections: 0,
                 persists: 0,
                 watch_cleanups: 0,
@@ -118,27 +116,19 @@ impl PersistCoordinator {
         }
     }
 
-    /// Atomically admit a long-running job. Detached workers retain the owned
-    /// guard until their full pipeline ends.
-    pub fn begin_job(self: &Arc<Self>) -> Result<JobGuard, &'static str> {
+    /// Atomically admit an analyze pipeline. Detached workers retain the
+    /// owned guard until their full parse/resolve/persist pipeline ends.
+    pub fn begin_analyze(self: &Arc<Self>) -> Result<AnalyzeGuard, &'static str> {
         let mut state = self.state.lock();
-        if state.job_closed {
-            return Err("daemon shutdown in progress; new jobs are not accepted");
+        if state.analyze_closed {
+            return Err("daemon shutdown in progress; new analyze jobs are not accepted");
         }
-        state.jobs += 1;
+        state.analyses += 1;
         state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
         self.changed.notify_waiters();
-        Ok(JobGuard {
+        Ok(AnalyzeGuard {
             coordinator: Arc::clone(self),
         })
-    }
-
-    /// Compatibility admission wrapper for analyze-only callers. New generic
-    /// job machinery uses [`Self::begin_job`]; preserve this established error
-    /// wording for existing analyze call paths.
-    pub fn begin_analyze(self: &Arc<Self>) -> Result<JobGuard, &'static str> {
-        self.begin_job()
-            .map_err(|_| "daemon shutdown in progress; new analyze jobs are not accepted")
     }
 
     /// Atomically admit an MCP connection. The returned guard spans the
@@ -189,7 +179,7 @@ impl PersistCoordinator {
     /// `watch_start` checks this while holding its watch-state write lock so
     /// shutdown can close admission before taking that lock.
     pub fn analyze_admission_closed(&self) -> bool {
-        self.state.lock().job_closed
+        self.state.lock().analyze_closed
     }
 
     /// Close connection and analyze admission without waiting for work that is
@@ -197,7 +187,7 @@ impl PersistCoordinator {
     /// its listener; the normal graceful-shutdown drain performs the waits.
     pub fn close_admission(&self) {
         let mut state = self.state.lock();
-        state.job_closed = true;
+        state.analyze_closed = true;
         state.connection_closed = true;
         self.changed.notify_waiters();
     }
@@ -226,7 +216,7 @@ impl PersistCoordinator {
                 if state.idle_claimed {
                     return false;
                 }
-                if state.connections != 0 || state.jobs != 0 {
+                if state.connections != 0 || state.analyses != 0 {
                     None
                 } else {
                     Some(state.lifecycle_generation)
@@ -243,12 +233,12 @@ impl PersistCoordinator {
                     let mut state = self.state.lock();
                     if !state.idle_claimed
                         && state.connections == 0
-                        && state.jobs == 0
+                        && state.analyses == 0
                         && state.lifecycle_generation == generation
                     {
                         state.idle_claimed = true;
                         state.connection_closed = true;
-                        state.job_closed = true;
+                        state.analyze_closed = true;
                         self.changed.notify_waiters();
                         return true;
                     }
@@ -267,9 +257,9 @@ impl PersistCoordinator {
             notified.as_mut().enable();
             {
                 let mut state = self.state.lock();
-                state.job_closed = true;
+                state.analyze_closed = true;
                 state.connection_closed = true;
-                if state.jobs == 0 {
+                if state.analyses == 0 {
                     return;
                 }
             }
@@ -321,16 +311,16 @@ impl Default for PersistCoordinator {
     }
 }
 
-/// RAII admission for one long-running job.
-pub struct JobGuard {
+/// RAII admission for an entire analyze pipeline.
+pub struct AnalyzeGuard {
     coordinator: Arc<PersistCoordinator>,
 }
 
-impl Drop for JobGuard {
+impl Drop for AnalyzeGuard {
     fn drop(&mut self) {
         let mut state = self.coordinator.state.lock();
-        debug_assert!(state.jobs > 0, "job guard must hold an active slot");
-        state.jobs -= 1;
+        debug_assert!(state.analyses > 0, "analyze guard must hold an active slot");
+        state.analyses -= 1;
         state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
         self.coordinator.changed.notify_waiters();
     }
@@ -397,15 +387,10 @@ impl Drop for WatchCleanupGuard {
 ///   for the duration of the query and serialize the response.
 /// - [`Self::index_lock`] uses `tokio::sync::Mutex` because
 ///   `analyze_codebase` is async and the lock guard must cross await
-///   points. It serializes workers and watch reindexing; the analyze slot
-///   admits competing analyze requests into its FIFO queue.
+///   points. `try_lock` returns "indexing already in progress" matching
+///   Go behavior.
 /// - [`Self::indexed`] is an `AtomicBool` so [`CodeGraphServer::require_indexed`]
 ///   can check the flag with no lock acquisition.
-/// - [`Self::status_publication`] makes the graph and its status-facing
-///   provenance one publication unit. It is always the outermost lock when
-///   combined with graph, applied-index, or operational-config locks; never
-///   hold it across an `.await`. `get_status` takes it for read, successful
-///   analyze publication and watch graph mutations take it for write.
 pub struct ServerInner {
     /// In-memory code graph populated by `analyze_codebase`.
     pub graph: PlRwLock<Graph>,
@@ -414,31 +399,13 @@ pub struct ServerInner {
     /// `true` after at least one successful `analyze_codebase`. Read by
     /// [`CodeGraphServer::require_indexed`] without taking a lock.
     pub indexed: AtomicBool,
-    /// Serializes publication of graph contents and the metadata reported with
-    /// them by `get_status`. See the lock-order rule on [`ServerInner`].
-    pub(crate) status_publication: PlRwLock<()>,
-    /// Serializes active analyze workers and the watch loop's `reindex_file` to
+    /// Single-flight guard for `analyze_codebase`. `try_lock` returns
+    /// "indexing already in progress" identical to the Go behavior; the
+    /// watch loop's `reindex_file` also acquires this lock to
     /// close the analyze-vs-watch merge race the Go implementation has.
     pub index_lock: TokioMutex<()>,
-    /// Serializes analyze-only coverage/config snapshots through their later
-    /// FIFO admission. The `analyze_slot` write lock is the linearization
-    /// point for every long-running job: community jobs validate and acquire
-    /// that slot directly, so they may linearize ahead of an analyze still in
-    /// its filesystem probe. Never acquire this after `analyze_slot`, job
-    /// state, or the persistence coordinator: its only nested acquisition is
-    /// the slot write lock during analyze admission.
-    pub(crate) admission_lock: TokioMutex<()>,
-    /// Limits filesystem-backed analyze admission probes to one per server.
-    /// The owned permit moves into the blocking closure, so aborting its MCP
-    /// future cannot free capacity before the filesystem operation returns.
-    pub(crate) admission_probe_permits: Arc<Semaphore>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
-    /// Status-facing snapshot of the root and configuration that produced the
-    /// active indexed state. Analyze replaces this only after it has
-    /// successfully applied its admitted configuration; watch reindexing keeps
-    /// the snapshot intact because it uses that cached configuration.
-    pub(crate) applied_index: PlRwLock<AppliedIndexState>,
     /// Project root owning the active cache. Unlike `root_path`, this is not
     /// the invocation/watch scope and may be an ancestor with nested config.
     pub cache_root: PlRwLock<Option<PathBuf>>,
@@ -478,54 +445,14 @@ pub struct ServerInner {
     /// Admission gate for cache writes during graceful daemon replacement.
     /// Direct-mode servers never close it, preserving their existing behavior.
     pub persist: Arc<PersistCoordinator>,
-    /// FIFO slot for analyze jobs (sync + async): one current job, admitted
-    /// pending jobs, and the previous terminal grace-window entry.
+    /// Single-flight slot for analyze jobs (sync + async). Holds at
+    /// most one `Running` job plus the previous terminal job for the
+    /// grace-window read pattern. Read by 1.2's worker (next commit).
     #[allow(dead_code)]
-    pub(crate) analyze_slot: PlRwLock<JobSlot>,
-    /// Deterministic pause after an analyze coverage snapshot while the
-    /// analyze-only admission lock remains held. This pins analyze-to-analyze
-    /// snapshot ordering without making production admission depend on test
-    /// instrumentation.
-    #[cfg(test)]
-    pub(crate) admission_probe_hook: TokioMutex<Option<AdmissionProbeHook>>,
-    /// Test-only synchronous handoff performed inside analyze admission's
-    /// blocking probe. This lets a current-thread runtime prove that waiting
-    /// on a slow filesystem probe does not stall independent Tokio tasks.
-    #[cfg(test)]
-    pub(crate) admission_blocking_probe_hook: std::sync::Mutex<Option<BlockingAdmissionProbeHook>>,
-    /// Test-only synchronous barrier after an analyze replaces `graph` and
-    /// before it publishes the corresponding status metadata. It intentionally
-    /// uses no async wait because `status_publication` is held at that point.
-    #[cfg(test)]
-    pub(crate) publication_hook: PlMutex<Option<PublicationHook>>,
+    pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
 }
 
-/// Test-only handoff used to prove that config identity snapshot and FIFO
-/// admission are one linearizable operation.
-#[cfg(test)]
-pub(crate) struct AdmissionProbeHook {
-    pub(crate) reached: oneshot::Sender<()>,
-    pub(crate) proceed: oneshot::Receiver<()>,
-}
-
-/// Test-only barrier installed before an analyze admission probe starts.
-/// `Barrier::wait` is intentionally synchronous because it runs only inside
-/// the probe's `spawn_blocking` closure.
-#[cfg(test)]
-pub(crate) struct BlockingAdmissionProbeHook {
-    pub(crate) reached: oneshot::Sender<()>,
-    pub(crate) proceed: Arc<std::sync::Barrier>,
-}
-
-/// Test-only barrier proving that `get_status` cannot observe a newly
-/// replaced graph before its applied-index metadata is published.
-#[cfg(test)]
-pub(crate) struct PublicationHook {
-    pub(crate) reached: oneshot::Sender<()>,
-    pub(crate) proceed: Arc<std::sync::Barrier>,
-}
-
-/// MCP server exposing the code graph through 24 tools.
+/// MCP server exposing the code graph through 22 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -552,12 +479,8 @@ impl CodeGraphServer {
                 graph: PlRwLock::new(Graph::new()),
                 registry,
                 indexed: AtomicBool::new(false),
-                status_publication: PlRwLock::new(()),
                 index_lock: TokioMutex::new(()),
-                admission_lock: TokioMutex::new(()),
-                admission_probe_permits: Arc::new(Semaphore::new(1)),
                 root_path: PlRwLock::new(None),
-                applied_index: PlRwLock::new(AppliedIndexState::default()),
                 cache_root: PlRwLock::new(None),
                 cache_io_root: PlRwLock::new(None),
                 daemon_project_root: OnceLock::new(),
@@ -568,13 +491,7 @@ impl CodeGraphServer {
                 index_built_at: AtomicU64::new(0),
                 index_force_built: AtomicBool::new(false),
                 persist: Arc::new(PersistCoordinator::new()),
-                analyze_slot: PlRwLock::new(JobSlot::default()),
-                #[cfg(test)]
-                admission_probe_hook: TokioMutex::new(None),
-                #[cfg(test)]
-                admission_blocking_probe_hook: std::sync::Mutex::new(None),
-                #[cfg(test)]
-                publication_hook: PlMutex::new(None),
+                analyze_slot: PlRwLock::new(AnalyzeSlot::default()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -735,19 +652,6 @@ impl CodeGraphServer {
     }
 }
 
-/// Root and configuration provenance atomically published to `get_status`.
-///
-/// This is deliberately separate from the operational `root_path` and
-/// `config` locks: those fields are consumed by watch and query paths, while
-/// status must report one self-consistent successful-analyze snapshot without
-/// probing the filesystem again.
-#[derive(Default)]
-pub(crate) struct AppliedIndexState {
-    pub(crate) root_path: Option<PathBuf>,
-    pub(crate) config_path: Option<PathBuf>,
-    pub(crate) config: RootConfig,
-}
-
 /// Portable Linux directory identity retained by a daemon for its lifetime.
 /// It deliberately stores no file descriptor, so code-graph-tools remains
 /// free of platform I/O dependencies and all normal paths stay logical.
@@ -826,12 +730,6 @@ pub struct AnalyzeCodebaseAsyncArgs {
     #[schemars(description = "Force full re-index, ignoring any cache (default false)")]
     #[serde(default)]
     pub force: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetJobStatusArgs {
-    #[schemars(description = "Required long-running job identifier returned by an async kickoff")]
-    pub job_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1279,7 +1177,7 @@ impl CodeGraphServer {
     // -- P0 -----------------------------------------------------------------
 
     #[tool(
-        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). Usually returns `{ files, symbols, edges, root_path, warnings? }`; a coalesced request waits for its covering job and adds `coalesced_by` with that job ID (otherwise absent), while a distinct request admitted behind work already pending returns immediately with `{ job_id, status: \"queued\", started_at, existing: false, note }` — poll `get_job_status(job_id)`. The shared FIFO holds at most 32 pending jobs; covered requests still coalesce at capacity, but a distinct request beyond that limit returns a retryable queue-full tool error. Must be called before query tools."
+        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools."
     )]
     async fn analyze_codebase(
         &self,
@@ -1299,7 +1197,49 @@ impl CodeGraphServer {
     }
 
     #[tool(
-        description = "Kick off `analyze_codebase` on a background task and return before indexing begins (normally quickly) with `{ job_id, status, started_at, existing, note }`. Admission canonicalization and config discovery may wait on a slow filesystem. Args: required absolute `path`; optional `force` (default false; true bypasses cached entries within the requested scope). `status` is `\"running\"` when started immediately or `\"queued\"` behind another analyze. A request reuses a nonterminal job only when its admitted project root and effective-config identity/provenance match first, then its canonical existing directory is covered by that job and the coverer is forced or this request is not; it returns the coverer's `job_id` with `existing=true` and a coalescing note. Other requests are FIFO-admitted with `existing=false` until the shared 32-pending-job limit; a distinct request beyond the limit gets a retryable queue-full tool error, while covered requests still coalesce. **Primary polling:** call `get_job_status(job_id)` while status is `\"queued\"` or `\"running\"`; its terminal `result` is structurally/deserializer-compatible and byte-identical to a non-coalesced `analyze_codebase` success body; a coalesced sync response adds `coalesced_by`. Terminal `error` carries failures. `get_status` is instead the current-job and FIFO queue diagnostic (`analyze_job_pending_count`, `analyze_job_pending_ids`). Prefer async on large codebases where the client's wall-clock `MCP_TOOL_TIMEOUT` could fire during indexing."
+        description = "Kick off `analyze_codebase` on a background task and return \
+                       immediately (< 1KB, sub-second) with a job handle. The indexing \
+                       pipeline runs detached on the tokio runtime; agents observe \
+                       progress and the terminal result by polling `get_status`. \
+                       Prefer this over the sync `analyze_codebase` for large \
+                       codebases (UE / LLVM-scale, ~130-200s wall time) or any case \
+                       where the client's `MCP_TOOL_TIMEOUT` could fire on a long \
+                       sync call — every individual tool call is sub-second, so the \
+                       per-call timer never fires. Args: `path` (required, absolute \
+                       path to index — same wording as `analyze_codebase`), `force` \
+                       (optional, default false — full re-index ignoring the cache). \
+                       Response shape: \
+                       `{ job_id, status, started_at, existing, note }`. `job_id` is \
+                       a 20-char zero-padded nanosecond timestamp unique-by-construction \
+                       under single-flight; `status` is always the literal \
+                       `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
+                       `existing` is the duplicate-call discriminator (see below); \
+                       `note` is a short human-readable hint. **Polling pattern:** \
+                       call `get_status` and read the `analyze_job` field. Poll \
+                       while `analyze_job.status == \"running\"`; once it flips to \
+                       `\"completed\"` read `analyze_job.result` (byte-identical \
+                       shape to `analyze_codebase`'s success body — `{ files, \
+                       symbols, edges, root_path, warnings }`); on `\"failed\"` \
+                       read `analyze_job.error`. A poll cadence of 250-1000ms is \
+                       a reasonable starting point — the slot and inner state \
+                       locks are held only for `Arc::clone` and a small struct \
+                       read on each poll, so polling does not contend with the \
+                       worker meaningfully. **Grace window:** after a job \
+                       terminates its result is preserved in \
+                       `analyze_job_previous_terminal` for exactly ONE additional \
+                       kickoff — if you start a new analyze before reading the \
+                       prior terminal, the prior result is still recoverable for \
+                       that one rotation, after which it is gone. **Duplicate \
+                       kickoff (`existing: true`):** if a job is already in \
+                       flight when this is called, the response returns that \
+                       job's `job_id` and `started_at` with `existing: true` \
+                       (NOT a new job_id; NOT an error). Args of the duplicate \
+                       call — including `path` and `force` — are IGNORED; if \
+                       `force` is required, wait for the in-flight job to \
+                       terminate (poll `get_status`) and call again. Sync \
+                       `analyze_codebase` called against a `Running` slot \
+                       continues to error with `\"indexing already in progress\"` \
+                       — only async kickoff returns the duplicate-as-success."
     )]
     async fn analyze_codebase_async(
         &self,
@@ -1326,15 +1266,11 @@ impl CodeGraphServer {
                        specific symbol. `count_only=true` returns the match total with \
                        an empty `results` array in a < 1KB bounded response — use it for \
                        sizing queries before paging. Responses are also capped by \
-                        `[response].max_bytes` (default 100KB); when matching records remain \
-                        because the count limit or byte budget stops the page, \
+                       `[response].max_bytes` (default 100KB); when the byte budget bites, \
                        `truncated` is true and `next_offset` points at the first \
                        un-emitted record — re-call with `offset = next_offset` to resume. \
                        `truncated=false` plus `next_offset=null` means the page is \
-                        complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` when the byte \
+                       complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
                        pages. Path is resolved against the indexed graph; `\\\\?\\` \
                        extended-path prefix is handled automatically, and relative \
@@ -1422,15 +1358,11 @@ impl CodeGraphServer {
                        block), so clients counting matches must use plain \
                        `query` (no anchors) or call again without `count_only` to \
                        receive suggestions. Responses are also capped by \
-                        `[response].max_bytes` (default 100KB); when matching records remain \
-                        because the count limit or byte budget stops the page, `truncated` is \
-                        true and `next_offset` points at the first \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
                        un-emitted record — re-call with `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
-                        is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` when the \
+                       is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
     )]
@@ -1508,15 +1440,11 @@ impl CodeGraphServer {
                        count (NOT the sum of individual symbols) and an empty `results` \
                        array in a < 1KB bounded response — use it to size the row set \
                        before paging. Responses are also capped by \
-                        `[response].max_bytes` (default 100KB); when matching rows remain \
-                        because the count limit or byte budget stops the page, `truncated` is \
-                        true and `next_offset` points at the first \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
                        un-emitted row — re-call with `offset = next_offset` to resume. \
                        `truncated=false` plus `next_offset=null` means the page is \
-                        complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` when the byte \
+                       complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
                        pages."
     )]
@@ -1564,14 +1492,10 @@ impl CodeGraphServer {
                        silently — the echoed `limit` reflects the resolved value); raise \
                        `limit` for deeply-nested spans, or use `offset` to page through. \
                        Responses are also capped by `[response].max_bytes` (default 100KB); \
-                        when matching records remain because the count limit or byte budget \
-                        stops the page, `truncated` is true and `next_offset` \
+                       when the byte budget bites, `truncated` is true and `next_offset` \
                        points at the first un-emitted record — re-call with `offset = \
-                        next_offset` to resume. `truncated=false` plus `next_offset=null` \
-                        means the page is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry."
+                       next_offset` to resume. `truncated=false` plus `next_offset=null` \
+                       means the page is complete."
     )]
     async fn get_symbol_at(
         &self,
@@ -1647,15 +1571,11 @@ impl CodeGraphServer {
                        the remainder, or narrow by lowering `depth`. `offset` defaults \
                        to 0; raise `offset` to skip past previous results, or set \
                        `offset = next_offset` to resume. Responses are also capped by \
-                        `[response].max_bytes` (default 100KB); when matching records remain \
-                        because the count limit or byte budget stops the page, `truncated` is \
-                        true and `next_offset` points at the first \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the first \
                        un-emitted record — re-call with `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
-                        is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` when the \
+                       is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
     )]
@@ -1730,15 +1650,11 @@ impl CodeGraphServer {
                        or narrow by lowering `depth` to scope a specific subtree. \
                        `offset` defaults to 0; raise `offset` to skip past previous \
                        results, or set `offset = next_offset` to resume. Responses are \
-                        also capped by `[response].max_bytes` (default 100KB); when matching \
-                        records remain because the count limit or byte budget stops the page, \
-                        `truncated` is true and `next_offset` points \
+                       also capped by `[response].max_bytes` (default 100KB); when the \
+                       byte budget bites, `truncated` is true and `next_offset` points \
                        at the first un-emitted record — re-call with `offset = \
                        next_offset` to resume. `truncated=false` plus `next_offset=null` \
-                        means the page is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than \
+                       means the page is complete. `results.length` may be less than \
                        `limit` when the byte cap fires, so consult `truncated`, not \
                        length, to detect partial pages."
     )]
@@ -1842,10 +1758,8 @@ impl CodeGraphServer {
                        Inherits edges); other languages always return empty until their \
                        extractors are extended. `limit` defaults to 100 (max 1000, clamped \
                        silently); `offset` defaults to 0. Response capped at \
-                        `[response].max_bytes` (default 100KB); resume with `offset = next_offset`. \
-                        An empty `results` page with `truncated=true` and `next_offset` equal to \
-                        the requested `offset` is a start-fresh marker: do NOT retry unchanged; \
-                        raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry."
+                       `[response].max_bytes` (default 100KB); `truncated`/`next_offset` \
+                       resume contract identical to the other paginated tools."
     )]
     async fn find_overrides(
         &self,
@@ -1883,15 +1797,11 @@ impl CodeGraphServer {
                        `limit` defaults to 100 (max 1000, clamped silently — the echoed \
                        `limit` reflects the resolved value); raise `limit` for files with \
                        many includes, or use `offset` to page through. Responses are also \
-                        capped by `[response].max_bytes` (default 100KB); when matching \
-                        records remain because the count limit or byte budget stops the page, \
-                        `truncated` is true and `next_offset` points at the \
+                       capped by `[response].max_bytes` (default 100KB); when the byte \
+                       budget bites, `truncated` is true and `next_offset` points at the \
                        first un-emitted record — re-call with `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
-                        is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` when the \
+                       is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
     )]
@@ -1961,15 +1871,11 @@ impl CodeGraphServer {
                        `count_only=true` returns the orphan total with an empty \
                        `results` array in a < 1KB bounded response — use it to size \
                        the orphan set before paging. Responses are also capped by \
-                        `[response].max_bytes` (default 100KB); when matching records remain \
-                        because the count limit or byte budget stops the page, `truncated` is \
-                        true and `next_offset` points at the \
+                       `[response].max_bytes` (default 100KB); when the byte budget \
+                       bites, `truncated` is true and `next_offset` points at the \
                        first un-emitted record — re-call with `offset = next_offset` \
                        to resume. `truncated=false` plus `next_offset=null` means the \
-                        page is complete. An empty `results` page with `truncated=true` and \
-                        `next_offset` equal to the requested `offset` is a start-fresh marker: \
-                        do NOT retry unchanged; raise `[response].max_bytes`, rerun \
-                        `analyze_codebase` to refresh cached config, then retry. `results.length` may be less than `limit` \
+                       page is complete. `results.length` may be less than `limit` \
                        when the byte cap fires, so consult `truncated`, not length, \
                        to detect partial pages.")]
     async fn get_orphans(
@@ -2098,14 +2004,10 @@ impl CodeGraphServer {
                        SEQUENTIALLY: the incoming page is sized first against the full \
                        budget, then the outgoing page receives only what remains after \
                        the incoming page plus a fixed wrapper reserve; if incoming \
-                        consumes the whole budget the outgoing page comes back empty \
-                        with `truncated:true` and `next_offset` equal to the requested `offset` \
-                        (a start-fresh marker). An empty `results` page with `truncated:true` and `next_offset` \
-                        equal to its requested `offset` is never a continuation: do NOT retry \
-                        unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then \
-                        retry. Otherwise, `truncated` on \
-                        either side means matching rows remain because the count limit or byte \
-                        budget stopped that page — re-call with that single \
+                       consumes the whole budget the outgoing page comes back empty \
+                       with `truncated:true` and `next_offset:0` (a start-fresh \
+                       marker). When `truncated` is true on either side, that side was \
+                       cut by the byte budget — re-call with that single \
                        `direction=\"incoming\"` (or `\"outgoing\"`) and `offset = \
                        next_offset` from the truncated page to resume; `truncated=false` \
                        plus `next_offset=null` means that page is complete. \
@@ -2188,10 +2090,8 @@ impl CodeGraphServer {
                        `limit`. `limit` defaults to 100 (max 1000, clamped silently); raise \
                        `limit` for more communities per page, use `offset` to page through \
                        the rest. Responses are capped by `[response].max_bytes` (default \
-                        100KB); resume with `offset = next_offset`. An empty `results` page with \
-                        `truncated=true` and `next_offset` equal to the requested `offset` is a \
-                        start-fresh marker: do NOT retry unchanged; raise `[response].max_bytes`, \
-                        rerun `analyze_codebase` to refresh cached config, then retry."
+                       100KB); `truncated`/`next_offset` resume contract identical to the \
+                       other paginated tools."
     )]
     async fn detect_communities(
         &self,
@@ -2227,29 +2127,6 @@ impl CodeGraphServer {
             Ok(r) => r,
             Err(e) => handlers::tool_error(format!("detect_communities task panicked: {e}")),
         })
-    }
-
-    #[tool(
-        description = "Kick off whole-graph file community detection and return immediately (< 1KB, sub-second). Args match `detect_communities`: `granularity` defaults to \"file\" (the only supported value); `max_iterations` defaults to 50 (max 500, 0 uses default); `members_per_community` defaults to 10 (max 100, 0 uses default); `limit` defaults to 100 (max 1000, 0 uses default); `offset` defaults to 0. Requires an index and validates arguments before issuing a job. Returns `{ job_id, status, started_at, existing, note }`, where status is `\"running\"` or `\"queued\"`. The shared FIFO holds at most 32 pending jobs; a distinct community job beyond that limit gets a retryable queue-full tool error. Poll `get_job_status(job_id)` for the bare generic JobView and its terminal `result`, which has the same `DetectCommunitiesResponse` shape and semantics as sync. The JobView wrapper reserves bytes from the captured `max_bytes`, so it can contain fewer rows and a different `next_offset` than sync; resume with `offset = next_offset`, except empty `results` with `truncated=true` and `next_offset` equal to the requested `offset` is a start-fresh marker: do NOT retry unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry. Use `get_status` for the shared FIFO diagnostic. Prefer this form on large graphs where a synchronous client wall-clock timeout could fire."
-    )]
-    async fn detect_communities_async(
-        &self,
-        Parameters(args): Parameters<DetectCommunitiesArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Err(r) = self.require_indexed() {
-            return Ok(r);
-        }
-        Ok(crate::core::to_call_tool_result(
-            crate::core::analyze::detect_communities_async(
-                self.inner.clone(),
-                args.granularity,
-                args.max_iterations,
-                args.members_per_community,
-                args.limit,
-                args.offset,
-            )
-            .await,
-        ))
     }
 
     #[tool(
@@ -2365,10 +2242,7 @@ impl CodeGraphServer {
                        actually running before debugging behaviour, and to confirm config discovery picked \
                        up the toml you expected. \
                        \
-                        Generic `job` / `job_previous_terminal` / `job_pending_count` / \
-                        `job_pending_ids` expose the shared FIFO for every long-running kind. \
-                        Existing `analyze_job*` fields are analyze-only compatibility projections. \
-                        When an analyze is in flight or recently terminated, `analyze_job` carries \
+                       When an analyze is in flight or recently terminated, `analyze_job` carries \
                        `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, \
                        progress_message, error?, result?, current_phase }`. \
                        `current_phase` names the indexing phase the worker is currently in: \
@@ -2385,14 +2259,14 @@ impl CodeGraphServer {
                        historical value on terminal jobs (the phase that was active when the worker \
                        reached terminal); for terminal liveness use `status` not `current_phase`. \
                        Emits explicit `null` until the worker enters its first phase. \
-                         `analyze_job` is the current job only when the shared slot's current kind is analyze; \
-                         it is null while a non-analyze job is current. FIFO-admitted analyze jobs are exposed by `analyze_job_pending_count` and \
-                        `analyze_job_pending_ids` (in promotion order). A queued job's kickoff \
-                        response reports `status: \"queued\"`; queued jobs do not have full views \
-                         in this response. Use `get_job_status(job_id)` as the primary per-job \
-                         polling/retrieval endpoint for queued, running, and terminal jobs; this tool \
-                          remains the current-slot and queue diagnostic. `analyze_job_previous_terminal` \
-                          carries the latest retained analyze terminal even across intervening non-analyze jobs. Both job-view fields are `null` \
+                       Poll this tool while `analyze_job.status == \
+                       \"running\"` (a 250-1000ms cadence is reasonable — poll locks are constant-time); \
+                       read `analyze_job.result` once `status` flips to `\"completed\"` (shape: \
+                       `{ files, symbols, edges, root_path, warnings }`, byte-identical to \
+                       `analyze_codebase`'s success body), or `analyze_job.error` on `\"failed\"`. If \
+                       you've kicked off a new analyze before reading the previous terminal, \
+                       `analyze_job_previous_terminal` carries the prior terminal job for exactly one \
+                       grace-window kickoff (gone after the next rotation). Both fields are `null` \
                        before any analyze has ever run, and emit explicit `null` (not absent) so \
                        clients can distinguish \"no analyze ever\" from \"missing field on an old \
                        server\"."
@@ -2402,19 +2276,6 @@ impl CodeGraphServer {
         Parameters(_args): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, McpError> {
         Ok(handlers::status::get_status(self.inner.clone()))
-    }
-
-    #[tool(
-        description = "Return the status for one long-running job by required `job_id`. Response is the bare generic `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase, kind, ...community_args }` JobView — not a Page or wrapper. `path` and `force` retain their existing top-level analyze meaning; `kind` is additive (`\"analyze\"` or `\"detect_communities\"`), and optional `granularity`, `max_iterations`, `members_per_community`, `limit`, and `offset` appear only for community jobs. Use this as the primary polling/retrieval endpoint after `analyze_codebase_async` or `detect_communities_async`: status is `\"queued\"`, `\"running\"`, `\"completed\"`, or `\"failed\"`. An analyze terminal `result` is byte-identical to its synchronous success body. A community terminal `result` has the same `DetectCommunitiesResponse` shape and semantics as sync, but the JobView wrapper reserves bytes from captured `max_bytes`, so it can contain fewer rows and a different `next_offset`; resume with `offset = next_offset`, except empty `results` with `truncated=true` and `next_offset` equal to the requested `offset` is a start-fresh marker: do NOT retry unchanged; raise `[response].max_bytes`, rerun `analyze_codebase` to refresh cached config, then retry. Terminal `error` carries failures. Queued/running jobs remain addressable, and displaced terminal jobs are retained up to 32 entries; unknown or expired IDs are tool errors. Use `get_status` instead for the current job and FIFO queue diagnostics."
-    )]
-    async fn get_job_status(
-        &self,
-        Parameters(args): Parameters<GetJobStatusArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(handlers::status::get_job_status(
-            self.inner.clone(),
-            args.job_id,
-        ))
     }
 }
 
@@ -2492,58 +2353,6 @@ mod tests {
         .await
         .expect("multiple close callers drain together");
         assert!(coordinator.begin_analyze().is_err());
-    }
-
-    #[tokio::test]
-    async fn queued_analyze_guard_blocks_shutdown_drain_and_closed_admission() {
-        let coordinator = Arc::new(PersistCoordinator::new());
-        let queued_guard = coordinator.begin_analyze().unwrap();
-        let drain = tokio::spawn({
-            let coordinator = Arc::clone(&coordinator);
-            async move { coordinator.close_analyze_and_wait().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !drain.is_finished(),
-            "an admitted queued job's retained guard must keep graceful drain open"
-        );
-        assert!(
-            coordinator.begin_analyze().is_err(),
-            "closed admission must reject new queue entries while queued work drains"
-        );
-        drop(queued_guard);
-        tokio::time::timeout(Duration::from_secs(1), drain)
-            .await
-            .expect("releasing the queued guard wakes drain")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn community_job_guard_blocks_drain_and_generic_admission() {
-        let coordinator = Arc::new(PersistCoordinator::new());
-        let community_guard = coordinator.begin_job().unwrap();
-        let drain = tokio::spawn({
-            let coordinator = Arc::clone(&coordinator);
-            async move { coordinator.close_analyze_and_wait().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !drain.is_finished(),
-            "an admitted community job must keep graceful daemon drain open"
-        );
-        assert!(matches!(
-            coordinator.begin_job(),
-            Err("daemon shutdown in progress; new jobs are not accepted")
-        ));
-        assert!(matches!(
-            coordinator.begin_analyze(),
-            Err("daemon shutdown in progress; new analyze jobs are not accepted")
-        ));
-        drop(community_guard);
-        tokio::time::timeout(Duration::from_secs(1), drain)
-            .await
-            .expect("releasing the community guard wakes drain")
-            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -2675,16 +2484,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 24 tools. If a future change adds
+    /// `tools/list` must surface exactly 22 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_four_tools() {
+    fn tool_router_registers_twenty_two_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            24,
-            "expected 24 registered tools, got {}",
+            22,
+            "expected 22 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2719,13 +2528,11 @@ mod tests {
             "watch_start",
             "watch_stop",
             "get_status",
-            "get_job_status",
             "find_overrides",
             "find_class_candidates",
             "get_symbol_at",
             "find_path",
             "detect_communities",
-            "detect_communities_async",
         ] {
             assert!(
                 names.contains(expected),

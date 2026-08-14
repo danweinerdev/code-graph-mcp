@@ -309,9 +309,8 @@ pub(crate) fn is_unreliable_orphan(sym: &Symbol, mode: ReliabilityMode, graph: &
 /// (incoming first against the full `max_bytes`, outgoing against the
 /// remainder after the incoming page plus a fixed wrapper overhead).
 /// When incoming exhausts the budget, outgoing is an empty page flagged
-/// `truncated: true` with `next_offset` equal to the requested offset: the
-/// generic start-fresh marker, so raise `[response].max_bytes`, rerun
-/// `analyze_codebase` to refresh cached config, then retry.
+/// `truncated: true` with `next_offset: Some(0)` so a client can
+/// re-request the outgoing side fresh via `direction=outgoing offset=0`.
 ///
 /// Defaults: `limit = 50` per side (zero-or-missing resolves to the
 /// default; mirrors `get_orphans` / `search_symbols`), clamped at 1000;
@@ -2138,8 +2137,10 @@ mod tests {
 
     #[test]
     fn orphans_byte_budget_no_truncation_with_no_budget() {
-        // With NO_BYTE_BUDGET (= usize::MAX), byte accounting cannot truncate
-        // the page, but remaining count-limited rows still need continuation.
+        // Mirror anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the
+        // handler's existing behavior is preserved exactly — no truncation,
+        // no next_offset. Locks the contract that the byte-budget wiring
+        // does not affect callers that opt out.
         let g = locked(graph_with_n_orphan_functions(30));
         let r = get_orphans(
             &g,
@@ -2156,8 +2157,8 @@ mod tests {
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 30);
-        assert!(truncated);
-        assert_eq!(next_offset, Some(20));
+        assert!(!truncated);
+        assert_eq!(next_offset, None);
     }
 
     // --- count_only invariants --------------------------------------------
@@ -2841,8 +2842,7 @@ mod tests {
     /// `max_bytes`) consumes essentially all of it, the remaining budget
     /// after subtracting the serialized incoming page plus the 48-byte
     /// wrapper overhead floors at 0, so outgoing must be the empty
-    /// start-fresh page: `truncated: true, next_offset` equal to the request
-    /// offset.
+    /// start-fresh page: `truncated: true, next_offset: Some(0)`.
     ///
     /// Byte math: `ENVELOPE_OVERHEAD_BYTES` is 512 (mod.rs), and the
     /// incoming page wrapper itself is ~100 bytes. We set `max_bytes =

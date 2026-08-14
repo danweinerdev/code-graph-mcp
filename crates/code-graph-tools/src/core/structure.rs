@@ -519,16 +519,13 @@ pub fn get_coupling(
             .saturating_sub(COUPLING_BOTH_WRAPPER_OVERHEAD);
 
         let outgoing = if remaining == 0 {
-            // No outgoing row was emitted. Preserve the caller's requested
-            // offset so this is the generic non-advancing start-fresh marker,
-            // including on later pages (not only offset zero).
             Page::<CouplingEntry> {
                 results: vec![],
                 total: outgoing_total,
                 offset: resolved_offset,
                 limit: resolved_limit,
                 truncated: true,
-                next_offset: Some(resolved_offset),
+                next_offset: Some(0),
             }
         } else {
             let (out_results, _out_kept, out_truncated, out_next) =
@@ -704,39 +701,16 @@ pub fn detect_communities(
     offset: Option<u32>,
     max_bytes: usize,
 ) -> ToolResult<DetectCommunitiesResponse> {
-    detect_communities_with_response_budget(
-        graph,
-        indexed,
-        granularity,
-        max_iterations,
-        members_per_community,
-        limit,
-        offset,
-        |_| max_bytes,
-    )
-}
-
-/// Variant used by an outer response envelope to reserve its exact serialized
-/// overhead before this response budgets community rows. The callback receives
-/// a structurally valid empty response with the actual metadata; callers use
-/// it only to measure their wrapper, never to make row-selection decisions.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn detect_communities_with_response_budget<F>(
-    graph: &RwLock<Graph>,
-    indexed: bool,
-    granularity: Option<&str>,
-    max_iterations: Option<u32>,
-    members_per_community: Option<u32>,
-    limit: Option<u32>,
-    offset: Option<u32>,
-    response_budget: F,
-) -> ToolResult<DetectCommunitiesResponse>
-where
-    F: FnOnce(&DetectCommunitiesResponse) -> usize,
-{
     require_indexed(indexed)?;
 
-    let resolved_granularity = validate_detect_communities_args(granularity)?;
+    let resolved_granularity = match granularity.filter(|s| !s.is_empty()) {
+        None | Some("file") => "file",
+        Some(other) => {
+            return Err(ToolError(format!(
+                "invalid granularity: {other:?}; expected \"file\""
+            )))
+        }
+    };
 
     let resolved_max_iterations = max_iterations.filter(|&n| n != 0).unwrap_or(50).min(500);
     let resolved_members_cap = members_per_community
@@ -774,6 +748,9 @@ where
         })
         .collect();
 
+    let (results, _total_kept, truncated, next_offset) =
+        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
+
     let (termination, iterations) = match result.termination {
         code_graph_graph::Termination::Converged { iterations } => ("converged", iterations),
         code_graph_graph::Termination::IterationCeiling { iterations } => {
@@ -792,27 +769,6 @@ where
         },
     });
 
-    let has_remaining = total > resolved_offset;
-    let response_metadata = DetectCommunitiesResponse {
-        page: Page::<Community> {
-            results: Vec::new(),
-            total,
-            offset: resolved_offset,
-            limit: resolved_limit,
-            truncated: has_remaining,
-            next_offset: has_remaining.then_some(resolved_offset),
-        },
-        granularity: resolved_granularity,
-        termination,
-        iterations,
-        node_count: result.node_count,
-        edge_count: result.edge_count,
-        degenerate,
-    };
-    let max_bytes = response_budget(&response_metadata);
-    let (results, _total_kept, truncated, next_offset) =
-        byte_budget_take(communities, resolved_offset, resolved_limit, max_bytes);
-
     let response = DetectCommunitiesResponse {
         page: Page::<Community> {
             results,
@@ -822,28 +778,14 @@ where
             truncated,
             next_offset,
         },
-        granularity: response_metadata.granularity,
-        termination: response_metadata.termination,
-        iterations: response_metadata.iterations,
-        node_count: response_metadata.node_count,
-        edge_count: response_metadata.edge_count,
-        degenerate: response_metadata.degenerate,
+        granularity: resolved_granularity,
+        termination,
+        iterations,
+        node_count: result.node_count,
+        edge_count: result.edge_count,
+        degenerate,
     };
     Ok(ToolOk::Value(response))
-}
-
-/// Validate the only fallible community argument before an async kickoff
-/// allocates a job ID. Numeric values retain the synchronous zero/default and
-/// ceiling semantics and therefore need no rejection.
-pub(crate) fn validate_detect_communities_args(
-    granularity: Option<&str>,
-) -> Result<&'static str, ToolError> {
-    match granularity.filter(|s| !s.is_empty()) {
-        None | Some("file") => Ok("file"),
-        Some(other) => Err(ToolError(format!(
-            "invalid granularity: {other:?}; expected \"file\""
-        ))),
-    }
 }
 
 #[cfg(test)]

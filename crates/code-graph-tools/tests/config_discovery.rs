@@ -73,7 +73,6 @@ fn parse_result(r: &rmcp::model::CallToolResult) -> AnalyzeResult {
         edges,
         root_path,
         warnings,
-        coalesced_by: parsed["coalesced_by"].as_str().map(str::to_string),
     }
 }
 

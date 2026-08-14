@@ -27,27 +27,13 @@ a UE4/LLVM-scale sync analyze can surface as `"[Tool result missing due to inter
 while the server runs happily to completion:
 
 ```text
-analyze_codebase_async(path: "…")   → { job_id, status, … }
-get_job_status(job_id: "…")          → poll progress / progress_message
-                                     → result once status == "completed"
+analyze_codebase_async(path: "…")   → { job_id, status: "running", … }
+get_status()                        → poll analyze_job.progress / .progress_message
+                                    → analyze_job.result once status == "completed"
 ```
 
-`analyze_codebase_async` returns before indexing and normally quickly, but admission
-canonicalization/config discovery may wait on a slow filesystem. It still avoids the
-per-call timeout during indexing. `get_job_status.result` is structurally/deserializer-compatible and byte-identical to a non-coalesced sync
-`analyze_codebase` body; a coalesced sync response adds `coalesced_by`. Use `get_status()` for
-current-job and FIFO queue diagnostics.
-
-When a sync request first matches an existing analyze's admitted project root and effective-config
-identity/provenance, then is covered by its scope with compatible force, it waits for that outcome and its result
-adds `coalesced_by` with the covering job ID (or its error ends with `(coalesced_by: <job_id>)`).
-The first distinct request behind a running job blocks to its own terminal result. If distinct work
-is already pending, sync returns a queued `{ job_id, status, started_at, existing, note }` response
-immediately; poll that job.
-
-The shared FIFO accepts at most 32 pending jobs. A covered analyze still coalesces when it is full;
-an additional distinct analyze or community request instead returns the retryable queue-full error.
-Wait for queued work to complete and retry, or poll `get_status()` for FIFO diagnostics.
+Every poll is sub-second, so the per-call timer never fires. `analyze_job.result` is
+shape-identical to sync `analyze_codebase`'s body.
 
 ## Arguments
 
@@ -61,17 +47,12 @@ Wait for queued work to complete and retry, or poll `get_status()` for FIFO diag
 
 `[response].max_bytes` changes do **not** need `force=true` — just re-run `analyze_codebase`.
 
-For any byte-budgeted page (including an async community terminal result), empty `results` with
-`truncated: true` and `next_offset` equal to the requested `offset` is a start-fresh marker, not a
-continuation. Do **not** retry unchanged: raise `[response].max_bytes`, re-run
-`analyze_codebase` to refresh cached config, then retry. `detect_cycles` is count-paginated only.
-
 ## Notes
 
 - Read `AnalyzeResult.warnings`. A "no config found" warning means engine-style declarations
   (`class CORE_API Foo`) will not extract until `[cpp].macro_strip` is configured; an "orphan
   cache" warning means a stale cache sits at an invocation subdir and is being ignored.
-- Cache lives at `<project_root>/.code-graph-cache.db` (rkyv, v10), co-located with the discovered
+- Cache lives at `<project_root>/.code-graph-cache.db` (rkyv, v8), co-located with the discovered
   `.code-graph.toml`. A version mismatch silently re-indexes — no `force` needed.
 - To keep the graph live while you edit, call `watch_start` (auto-reindex on change) and
   `watch_stop` when done.

@@ -251,7 +251,7 @@ fn mcp_round_trip<W: Write, R: Read>(mut writer: W, reader: R) {
         .expect("read tools/list response");
     let response: Value = serde_json::from_str(&line).expect("tools/list JSON");
     assert_eq!(response["id"], 2);
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
 }
 
 fn uds_connect(endpoint: &str) -> UnixStream {

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 
-use crate::analyze_job::{Job, JobKind, JobPhase, JobRequest, JobResult, JobStatus};
+use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
 use crate::handlers::analyze::AnalyzeResult;
 use crate::server::ServerInner;
 
@@ -44,11 +44,12 @@ pub struct StatusResult {
     /// (i.e. release profile). Bisects the obvious "is this a debug
     /// build?" question without a separate flag.
     pub release_build: bool,
-    /// Absolute path to the `.code-graph.toml` that produced the active
-    /// index, or `null` when that successful analyze used built-in defaults.
-    /// This is applied provenance, not a current filesystem probe: it remains
-    /// present if the file is later removed and remains null if one is created
-    /// after indexing, until a successful later analyze applies it.
+    /// Absolute path to the discovered `.code-graph.toml`, or `null`
+    /// when no toml was found at any ancestor (project-root fallback
+    /// to the invocation path). Surfaces the load-bearing answer to
+    /// "which config actually applied" — the bug the upward-walk
+    /// work in commit `c06fc73` fixed and that
+    /// `get_status` makes self-evident going forward.
     pub config_path: Option<String>,
     /// Count of entries in `[cpp].macro_strip` after load-time
     /// filtering (drained empties + duplicates). `0` means no
@@ -86,15 +87,6 @@ pub struct StatusResult {
     /// full rebuild result" — the difference matters when the user
     /// is verifying a fix that requires a force-reindex to surface.
     pub index_force_built: Option<bool>,
-    /// Snapshot of the global long-running-job slot. Unlike the analyze
-    /// compatibility projection below, this can be any supported job kind.
-    pub job: Option<JobView>,
-    /// Prior terminal in the global slot's one-rotation grace window.
-    pub job_previous_terminal: Option<JobView>,
-    /// Number of all job kinds waiting in FIFO promotion order.
-    pub job_pending_count: u32,
-    /// Pending IDs for all job kinds in FIFO promotion order.
-    pub job_pending_ids: Vec<String>,
     /// Snapshot of the current `analyze_slot.current` job, when any
     /// analyze has ever run (sync or async). `null` before the first
     /// analyze. Serializes as explicit `null` (no
@@ -102,14 +94,11 @@ pub struct StatusResult {
     /// ever" from "missing field on an old server" — matches the
     /// `index_force_built` precedent above.
     pub analyze_job: Option<AnalyzeJobView>,
-    /// Latest retained terminal analyze job across the bounded generic job
-    /// history. Same explicit-`null` serialization rule as `analyze_job`.
+    /// Snapshot of the previous terminal job preserved across a single
+    /// grace-window kickoff (Design Decision 4). Becomes `null` again
+    /// once a second analyze terminates and rotates the slot. Same
+    /// explicit-`null` serialization rule as `analyze_job`.
     pub analyze_job_previous_terminal: Option<AnalyzeJobView>,
-    /// Number of FIFO-admitted jobs waiting behind `analyze_job`. Pending
-    /// jobs are represented by IDs only in this phase.
-    pub analyze_job_pending_count: u32,
-    /// Pending job IDs in FIFO promotion order.
-    pub analyze_job_pending_ids: Vec<String>,
 }
 
 /// Wire shape for one `AnalyzeJob` in a `get_status` response.
@@ -118,16 +107,16 @@ pub struct StatusResult {
 /// its associated payload (`error` for Failed, `result` for Completed)
 /// are mutually consistent — see [`AnalyzeJobView::from_job`].
 ///
-/// `status` serializes as the lowercase string `"running"`, `"queued"`,
+/// `status` serializes as the lowercase string `"running"`,
 /// `"completed"`, or `"failed"` — NOT the enum tag. `error` is
 /// populated ONLY when `status == "failed"`; `result` is populated
 /// ONLY when `status == "completed"`. The two never co-occur.
 #[derive(Debug, Serialize)]
 pub struct AnalyzeJobView {
-    /// 20-char zero-padded decimal identifier, issued uniquely even when
-    /// several jobs are admitted within the same clock tick.
+    /// 20-char zero-padded decimal nanosecond timestamp from
+    /// kickoff. Unique-by-construction under single-flight.
     pub job_id: String,
-    /// `"running"` | `"queued"` | `"completed"` | `"failed"`.
+    /// `"running"` | `"completed"` | `"failed"`.
     pub status: String,
     /// User-supplied path that was indexed (as passed to the
     /// originating `analyze_codebase` / `analyze_codebase_async`).
@@ -137,7 +126,7 @@ pub struct AnalyzeJobView {
     /// RFC3339 UTC timestamp of kickoff.
     pub started_at: String,
     /// RFC3339 UTC timestamp of terminal transition; `null` while
-    /// `status` is `"running"` or `"queued"`.
+    /// `status == "running"`.
     pub finished_at: Option<String>,
     /// Files processed in the current phase. Monotonic non-decreasing
     /// **within a phase**; resets when the worker crosses a phase
@@ -168,133 +157,7 @@ pub struct AnalyzeJobView {
     /// `finish_completed` / `finish_failed`, treated as historical.
     /// Serializes as an explicit `null` when `None` so clients can
     /// distinguish "no phase yet" from "missing field on an old server".
-    pub current_phase: Option<JobPhase>,
-}
-
-/// Generic wire shape for one long-running job. `result` is intentionally
-/// untagged: its JSON is exactly the synchronous response for the job kind.
-#[derive(Debug, Serialize)]
-pub struct JobView {
-    pub job_id: String,
-    pub status: String,
-    /// Analyze compatibility fields remain top-level for every job view.
-    /// Community jobs use their empty/false sentinel values; their actual
-    /// optional arguments are exposed by the additive fields below.
-    pub path: String,
-    pub force: bool,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub progress: u32,
-    pub progress_total: u32,
-    pub progress_message: String,
-    pub error: Option<String>,
-    pub result: Option<JobResult>,
-    pub current_phase: Option<JobPhase>,
-    /// Additive discriminator for generic polling consumers.
-    pub kind: JobKind,
-    /// Community-only request arguments. They remain absent for analyze jobs
-    /// so legacy analyze payloads differ only by the additive `kind` field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub granularity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_iterations: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub members_per_community: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u32>,
-}
-
-impl JobView {
-    pub(crate) fn from_job(job: &Job) -> Self {
-        let state = job.state.read();
-        let (status, error, result) = match &state.status {
-            JobStatus::Running => ("running".to_string(), None, None),
-            JobStatus::Queued => ("queued".to_string(), None, None),
-            JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
-            JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
-        };
-        let (granularity, max_iterations, members_per_community, limit, offset) = match &job.request
-        {
-            JobRequest::Analyze { .. } => (None, None, None, None, None),
-            JobRequest::DetectCommunities {
-                granularity,
-                max_iterations,
-                members_per_community,
-                limit,
-                offset,
-            } => (
-                granularity.clone(),
-                *max_iterations,
-                *members_per_community,
-                *limit,
-                *offset,
-            ),
-        };
-        Self {
-            job_id: job.job_id.clone(),
-            status,
-            path: job.path.clone(),
-            force: job.force,
-            started_at: format_unix_nanos_rfc3339(job.started_at),
-            finished_at: state.finished_at.map(format_unix_nanos_rfc3339),
-            progress: state.progress,
-            progress_total: state.progress_total,
-            progress_message: state.progress_message.clone(),
-            error,
-            result,
-            current_phase: state.current_phase,
-            kind: job.kind,
-            granularity,
-            max_iterations,
-            members_per_community,
-            limit,
-            offset,
-        }
-    }
-
-    /// Build the terminal community-job shape before its nested response has
-    /// been finalized. This lets the worker measure the real wrapper (job ID,
-    /// timestamps, escaped request strings, and optional request fields) and
-    /// reserve it from the captured response budget without changing the wire
-    /// shape returned by `get_job_status`.
-    pub(crate) fn completed_community(
-        job: &Job,
-        result: crate::handlers::DetectCommunitiesResponse,
-        finished_at: u64,
-    ) -> Self {
-        let JobRequest::DetectCommunities {
-            granularity,
-            max_iterations,
-            members_per_community,
-            limit,
-            offset,
-        } = &job.request
-        else {
-            unreachable!("community budget view requires a community job");
-        };
-        Self {
-            job_id: job.job_id.clone(),
-            status: "completed".to_string(),
-            path: job.path.clone(),
-            force: job.force,
-            started_at: format_unix_nanos_rfc3339(job.started_at),
-            finished_at: Some(format_unix_nanos_rfc3339(finished_at)),
-            progress: 1,
-            progress_total: 1,
-            progress_message: "Community detection complete".to_string(),
-            error: None,
-            result: Some(JobResult::DetectCommunities(result)),
-            current_phase: Some(JobPhase::DetectingCommunities),
-            kind: JobKind::DetectCommunities,
-            granularity: granularity.clone(),
-            max_iterations: *max_iterations,
-            members_per_community: *members_per_community,
-            limit: *limit,
-            offset: *offset,
-        }
-    }
+    pub current_phase: Option<AnalyzePhase>,
 }
 
 impl AnalyzeJobView {
@@ -304,17 +167,11 @@ impl AnalyzeJobView {
     /// are mutually consistent with `progress` / `finished_at`. The
     /// guard is dropped at the end of this scope; the returned view
     /// owns its data and outlives the lock.
-    pub(crate) fn from_job(job: &Job) -> Self {
+    pub(crate) fn from_job(job: &AnalyzeJob) -> Self {
         let state = job.state.read();
         let (status, error, result) = match &state.status {
             JobStatus::Running => ("running".to_string(), None, None),
-            JobStatus::Queued => ("queued".to_string(), None, None),
-            JobStatus::Completed(JobResult::Analyze(r)) => {
-                ("completed".to_string(), None, Some(r.clone()))
-            }
-            JobStatus::Completed(JobResult::DetectCommunities(_)) => {
-                unreachable!("AnalyzeJobView only projects analyze jobs")
-            }
+            JobStatus::Completed(r) => ("completed".to_string(), None, Some(r.clone())),
             JobStatus::Failed(msg) => ("failed".to_string(), Some(msg.clone()), None),
         };
         Self {
@@ -338,11 +195,6 @@ impl AnalyzeJobView {
 /// wrapper only converts the typed result to the rmcp wire type.
 pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::status::get_status(inner))
-}
-
-/// `get_job_status` adapter. The typed core owns lookup and error wording.
-pub fn get_job_status(inner: Arc<ServerInner>, job_id: String) -> CallToolResult {
-    crate::core::to_call_tool_result(crate::core::status::get_job_status(inner, job_id))
 }
 
 /// Format `nanos` since UNIX_EPOCH as an RFC3339 UTC string of the
@@ -437,9 +289,9 @@ mod tests {
     /// snapshot during phase transitions.
     #[test]
     fn analyze_job_view_propagates_current_phase() {
-        use crate::analyze_job::{Job, JobPhase};
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
 
-        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
         let view = AnalyzeJobView::from_job(&job);
         // No phase set yet → `None` (serializes as explicit `null`).
         assert!(
@@ -463,9 +315,9 @@ mod tests {
             st.progress_total = 100;
             st.progress_message = "Parsing: foo.cpp".to_string();
         }
-        job.set_phase(JobPhase::Resolving);
+        job.set_phase(AnalyzePhase::Resolving);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(JobPhase::Resolving));
+        assert_eq!(view.current_phase, Some(AnalyzePhase::Resolving));
         assert_eq!(view.progress, 0, "set_phase resets progress to 0");
         assert_eq!(
             view.progress_total, 100,
@@ -486,9 +338,9 @@ mod tests {
     /// `ProgressSink::report` during cache serialization).
     #[test]
     fn set_phase_persisting_overrides_message_and_total() {
-        use crate::analyze_job::{Job, JobPhase};
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
 
-        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
         // Simulate the tail state of the Resolving phase.
         {
             let mut st = job.state.write();
@@ -496,9 +348,9 @@ mod tests {
             st.progress_total = 63784;
             st.progress_message = "Resolving edges: foo.cpp".to_string();
         }
-        job.set_phase(JobPhase::Persisting);
+        job.set_phase(AnalyzePhase::Persisting);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(JobPhase::Persisting));
+        assert_eq!(view.current_phase, Some(AnalyzePhase::Persisting));
         assert_eq!(view.progress, 0, "persisting starts at 0");
         assert_eq!(
             view.progress_total, 1,
@@ -520,21 +372,21 @@ mod tests {
     /// per phase.
     #[test]
     fn set_phase_sets_default_message_per_phase() {
-        use crate::analyze_job::{Job, JobPhase};
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
 
-        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
         {
             let mut st = job.state.write();
             st.progress_message = "stale".to_string();
         }
 
         for (phase, expected) in [
-            (JobPhase::LoadingCache, "Loading cache from disk"),
-            (JobPhase::Discovering, "Discovering source files"),
-            (JobPhase::Parsing, "Parsing source files"),
-            (JobPhase::Resolving, "Resolving cross-file edges"),
-            (JobPhase::Persisting, "Persisting cache to disk"),
-            (JobPhase::Completed, "Analyze complete"),
+            (AnalyzePhase::LoadingCache, "Loading cache from disk"),
+            (AnalyzePhase::Discovering, "Discovering source files"),
+            (AnalyzePhase::Parsing, "Parsing source files"),
+            (AnalyzePhase::Resolving, "Resolving cross-file edges"),
+            (AnalyzePhase::Persisting, "Persisting cache to disk"),
+            (AnalyzePhase::Completed, "Analyze complete"),
         ] {
             job.set_phase(phase);
             let view = AnalyzeJobView::from_job(&job);
@@ -553,17 +405,17 @@ mod tests {
     /// rendering a progress bar.
     #[test]
     fn set_phase_loading_cache_overrides_total_to_one() {
-        use crate::analyze_job::{Job, JobPhase};
-        let job = Job::new_running("0".into(), "/x".into(), false, 0);
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase};
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
         {
             let mut s = job.state.write();
             s.progress = 100;
             s.progress_total = 100;
             s.progress_message = "stale".to_string();
         }
-        job.set_phase(JobPhase::LoadingCache);
+        job.set_phase(AnalyzePhase::LoadingCache);
         let view = AnalyzeJobView::from_job(&job);
-        assert_eq!(view.current_phase, Some(JobPhase::LoadingCache));
+        assert_eq!(view.current_phase, Some(AnalyzePhase::LoadingCache));
         assert_eq!(view.progress, 0);
         assert_eq!(view.progress_total, 1);
         assert_eq!(view.progress_message, "Loading cache from disk");
@@ -574,14 +426,14 @@ mod tests {
     /// rule without re-deriving the test from the JSON each time.
     #[test]
     fn analyze_phase_serializes_as_snake_case() {
-        use crate::analyze_job::JobPhase;
+        use crate::analyze_job::AnalyzePhase;
         let cases = [
-            (JobPhase::LoadingCache, "loading_cache"),
-            (JobPhase::Discovering, "discovering"),
-            (JobPhase::Parsing, "parsing"),
-            (JobPhase::Resolving, "resolving"),
-            (JobPhase::Persisting, "persisting"),
-            (JobPhase::Completed, "completed"),
+            (AnalyzePhase::LoadingCache, "loading_cache"),
+            (AnalyzePhase::Discovering, "discovering"),
+            (AnalyzePhase::Parsing, "parsing"),
+            (AnalyzePhase::Resolving, "resolving"),
+            (AnalyzePhase::Persisting, "persisting"),
+            (AnalyzePhase::Completed, "completed"),
         ];
         for (variant, expected) in cases {
             let s = serde_json::to_value(variant).unwrap();
@@ -599,10 +451,10 @@ mod tests {
     /// (not via the worker) so the test stays unit-level.
     #[test]
     fn analyze_job_view_retains_phase_on_failed_terminal() {
-        use crate::analyze_job::{Job, JobPhase, JobStatus};
+        use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
 
-        let job = Job::new_running("0".into(), "/x".into(), false, 0);
-        job.set_phase(JobPhase::Parsing);
+        let job = AnalyzeJob::new_running("0".into(), "/x".into(), false, 0);
+        job.set_phase(AnalyzePhase::Parsing);
         {
             let mut s = job.state.write();
             s.status = JobStatus::Failed("simulated failure".to_string());
@@ -612,7 +464,7 @@ mod tests {
         assert_eq!(view.status, "failed");
         assert_eq!(
             view.current_phase,
-            Some(JobPhase::Parsing),
+            Some(AnalyzePhase::Parsing),
             "failed terminal must retain the last in-flight phase as historical"
         );
         assert_eq!(view.error.as_deref(), Some("simulated failure"));

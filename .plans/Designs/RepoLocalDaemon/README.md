@@ -3,7 +3,7 @@ title: "Repository-Local Daemon and CLI (Track B)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-11
+updated: 2026-08-13
 tags: [daemon, cli, ipc, named-pipe, unix-socket, idle-timeout, analyze-queue]
 related:
   - Specs/GraphPlatformExpansion
@@ -19,7 +19,7 @@ Implementation-gate validation for this design follows the initiative scope reco
 
 Today every agent session spawns its own `code-graph-mcp`, builds or loads its own graph, and holds its own copy in memory. Two sessions on one repository pay the indexing cost twice and cannot see each other's index. This design makes the graph a per-repository service: one daemon per project root, N clients attached, with the existing stdio binary demoted to a thin proxy so no client configuration changes (FR-06 – FR-16, D-0001).
 
-It also adds a command-line front-end over the same core (FR-17 – FR-20), and replaces the current analyze-contention error with a coalescing queue (FR-41 – FR-43).
+It also adds a command-line front-end over the same core (FR-17 – FR-20), and replaces the current analyze-contention error with an analyze-only path-compacting FIFO (FR-41 – FR-43).
 
 The scoping decision that makes this tractable is **repository-local** (D-0001). A multi-tenant daemon needs a keyed registry of graphs, per-root locking, and a workspace-selection protocol. One daemon per root needs none of that: `ServerInner` already *is* exactly one graph, one index lock, one watch handle, one analyze slot. The daemon reuses it unchanged.
 
@@ -58,7 +58,7 @@ graph TD
       RMCP["rmcp service per connection"]
       INNER["Arc&lt;ServerInner&gt;<br/>graph, index/watch/analyze state,<br/>cache root + lifecycle coordinator"]
       IDLE["idle timer<br/>(task 3.5 planned)"]
-      QUEUE["analyze queue + coalescer<br/>(phase 4 planned)"]
+       QUEUE["analyze-only path-compacting FIFO<br/>(phase 4 planned)"]
     end
 
     C1 --> SOCK
@@ -73,7 +73,7 @@ graph TD
     IDLE -.future analyze guard.-> QUEUE
 ```
 
-The graph/query state in `ServerInner` keeps its existing semantics and one `Arc<ServerInner>` is shared by several rmcp services instead of one. Task 3.4 adds lifecycle-only state beside it: the active cache project root and an analyze/persist/watch-cleanup coordinator used to drain mutation before replacement exit. Phase 4 later adds the planned queue/coalescer.
+The graph/query state in `ServerInner` keeps its existing semantics and one `Arc<ServerInner>` is shared by several rmcp services instead of one. Task 3.4 adds lifecycle-only state beside it: the active cache project root and an analyze/persist/watch-cleanup coordinator used to drain mutation before replacement exit. Phase 4 later adds the planned analyze-only compacting FIFO.
 
 ### Data Flow
 
@@ -219,31 +219,25 @@ Two details that follow: after acknowledgement, the daemon closes new analyze/wa
 
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 
-### Decision 7: Analyze requests queue and coalesce by admitted identity, then path containment (FR-41, FR-42, FR-43, D-0010)
+### Decision 7: Analyze-only pending paths compact by containment (FR-41, FR-42, FR-43)
 
 **Context:** FR-41 – FR-43. Today `analyze_codebase` inspects the slot and returns `"indexing already in progress"` on contention. With N attached sessions, that error goes from rare to routine.
 
-**Decision:** Replace the error with a queue. A request is admitted, and before running is tested against the queue: **X covers Y only when they have the same discovered project root and the same admitted effective configuration identity and provenance; then Y's path is equal to or nested under X's path, and X forces or Y does not force.** A covered request does not run; its caller receives the covering request's outcome, flagged as coalesced. Configuration creation, removal, or replacement between admissions makes the later request distinct even if the path and force conditions would otherwise cover it. Per D-0010, the shared queue has at most 32 pending entries (not counting current or terminal history): coverage is evaluated before the cap so only genuinely covered analyzes still coalesce, while an additional distinct analyze or community job is rejected with a retryable queue-full tool error and does not retain an admission guard. A config-distinct request at capacity therefore receives queue-full rather than a wrong-result coalescing.
+**Decision:** Replace the error with an analyze-only pending FIFO capped at 32 entries after compaction. The running scan is immutable. Compaction considers only pending canonical paths: an equal or ancestor pending path absorbs the incoming request as a follower; an incoming ancestor replaces all pending descendants at the earliest displaced FIFO position, and those requests become followers; disjoint paths retain FIFO order. The compacted entry uses `force = OR` across all attached/replaced requests. Followers receive its terminal result or error.
 
-**Rationale:** The admitted identity gate prevents a TOCTOU wrong result: a later caller must not receive work admitted under a prior configuration snapshot or provenance, even if it names a contained path. The force asymmetry is the other subtlety. A non-forcing run skips unchanged mtimes, so it does *not* perform the invalidation a forcing request asked for — a forced `/a/b/c` absorbed into a plain `/a/b` would silently no-op the very thing the caller wanted. Identity plus containment plus force are all required; the force cases and configuration creation/removal/replacement cases are enumerated in AC-51.
+**Rationale:** This removes redundant queued scans without converting the daemon into a generic scheduler. The running scan stays immutable, avoiding changes to already-started work. OR-ing force never loses requested invalidation; the only cost is extra reindexing. Configuration identity/provenance and `coalesced_by` are intentionally excluded because they make a simple path queue depend on unrelated state and wire behavior.
 
-**The queue is a new structure, not a reinterpretation of the existing slot.** `AnalyzeSlot` today holds exactly `current: Option<Arc<AnalyzeJob>>` and `previous_terminal: Option<Arc<AnalyzeJob>>` — there is nowhere to put "admitted but not yet started". This design adds a third field, `pending: Vec<Arc<AnalyzeJob>>`, ordered by admission and capped at 32 by D-0010. Admission runs the admitted-identity, containment, and force coverage rule against the running job **and** every pending entry before enforcing that cap; a covered request is not appended and is instead attached to its coverer. When the running job terminates, the head of `pending` is promoted to `current` under the same rotation that exists today, freeing exactly one admission slot.
+**The queue is a small analyze-only structure.** It holds one current scan plus pending compacted scan entries and their followers. The cap is checked after compaction, so absorbed followers consume no pending slot; a distinct 33rd pending analyze is rejected. Community detection and other whole-graph queries do not enter this queue.
 
-Three consequences the coverage rule alone does not settle:
+Follower completion needs only an internal association from each absorbed/replaced request to the compacted pending scan. The server retains every absorbed or displaced asynchronous ID as an internal alias of that scan, so async callers retain their original handle while polling the existing shared analyze-job status; synchronous callers wait and return the ordinary terminal result or error. This does not require generic job kinds, generic polling/status projections, a widened `analyze_job` shape, or a new response field.
 
-- **`AnalyzeJobView` needs a queued state.** `status` is currently `"running" | "completed" | "failed"`, which cannot express "admitted, not started". A fourth value `"queued"` is added, with `progress`/`progress_message` absent until it starts. This is an additive change to a documented enum, so clients matching on the three known values must be assumed to exist — the tool description and CLAUDE.md must call it out.
-- **`analyze_job` reports the running job only.** Pending entries are exposed as a count plus their ids rather than by widening `analyze_job` into a list, which would break the single-job wire shape every current client reads. The one-rotation `previous_terminal` grace window is untouched.
-- **Sync `analyze_codebase` must not wait behind an unbounded queue.** Today it installs itself as `current` and runs immediately. Under a queue it could block behind N ahead of it, and CLAUDE.md already documents `MCP_TOOL_TIMEOUT` killing long sync analyses — a queue turns that from a large-corpus problem into an any-corpus problem. **Rule: a sync request that would be admitted behind one or more already-pending jobs returns immediately with its `job_id` and `status: "queued"`, directing the caller to poll `get_status`.** A sync request that is coalesced still returns its coverer's result, and one that starts immediately still behaves exactly as today. Blocking is preserved only where it cannot bite.
-
-This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent sessions produce far fewer jobs, so the slot's existing one-rotation `previous_terminal` window stops being contended and its documented semantics need no change.
-
-### Decision 10: The job slot generalizes beyond analyze (FR-49, AC-58)
+### Decision 10: Generic long-running jobs are deferred (FR-49, AC-58)
 
 **Context:** `analyze_codebase_async` exists because a UE4-scale analyze exceeds the client's wall-clock tool timeout and `spawn_blocking` cannot help — the timer is client-side. Phase 1's review found `detect_communities` has the same shape: whole-graph label propagation, measured only at 841 files, with no async escape.
 
-**Decision:** When Decision 7 reshapes `AnalyzeSlot` into a queue, generalize it to hold long-running *query* jobs as well, and give `detect_communities` an async form on that machinery. Do not build a second, parallel job mechanism.
+**Decision:** Do not generalize the analyze queue and do not add `detect_communities_async` in Phase 4. Future asynchronous whole-graph work requires a dedicated design and plan.
 
-**Rationale:** The slot is already being reshaped for the analyze queue — adding a `pending` vector, a `Queued` status, and coalescing. Generalizing the job concept in the same pass costs far less than touching `AnalyzeSlot` and `AnalyzeJobView` again later, and it means one polling vocabulary rather than two. Building `detect_communities_async` standalone would duplicate the job-id, progress, and terminal-result plumbing that already exists for analyze.
+**Rationale:** Analysis admission is a path-compaction problem; community detection is not. Sharing a scheduler couples unrelated locking, retention, status, budgeting, and cancellation concerns.
 
 ### Decision 8: The CLI is a separate binary and depends on Track A
 
@@ -280,13 +274,13 @@ This also resolves the spec's OQ-06 at the cause: with coalescing, concurrent se
 | Cache write fails on idle exit | Log via `eprintln!` and exit anyway — the cache is a warm-start optimisation, and refusing to exit would leak a process. |
 | Orphaned socket inode blocking bind (POSIX) | Unlink only while holding the lock and only after a connection attempt is refused (Decision 4). Never on file existence alone. |
 | Daemon ignores shutdown signal | Escalate to a hard kill after a bounded grace period, accept a possibly stale cache, fall back in-process (Decision 5). |
-| Sync analyze admitted behind pending jobs | Return immediately with `job_id` and `status: "queued"`; do not block (Decision 7). |
+| Pending analyze is absorbed or replaced | Retain the caller as a follower and complete it with the compacted scan's terminal result or error (Decision 7). |
 
 All user-visible failures remain `CallToolResult` with the error flag. Diagnostics use `eprintln!`; no `tracing` (NFR-05).
 
 ## Testing Strategy
 
-**Unit** — the coalescing coverage rule as a pure function over admitted project root, effective-config identity/provenance, `(path, force)`, exhaustively over the four AC-51 force/containment cases plus disjoint paths and configuration creation/removal/replacement; the idle-timer state machine driven by a mock clock, including the analyze-in-flight hold and the restart-from-zero rule; stale-lock detection with a fabricated dead pid.
+**Unit** — canonical pending-path compaction: immutable running scan, follower absorption under an equal/ancestor pending path, ancestor replacement at the earliest displaced FIFO position, disjoint FIFO order, terminal success/error propagation, force OR, and the post-compaction 32-entry cap; plus the idle-timer state machine and stale-lock detection.
 
 **Integration** — these need real processes and are the tests that actually prove the feature:
 
@@ -323,16 +317,14 @@ Additive and reversible at every step. The configured command spelling is unchan
 3. **Proxy mode**, default off behind `[daemon].enabled = false`. Opt-in testing.
 4. **Flip the default to on with binary identity replacement**, graceful drain, and in-process fallback proven by AC-10. The first user-visible change.
 5. **Idle timeout.**
-6. **Analyze queue and coalescing** — replaces the contention error. The largest behaviour change in the track: it retires a documented error, adds a `"queued"` status to `AnalyzeJobView`, adds the optional coalescing field (OQ-B3), and changes when sync `analyze_codebase` blocks. All four need CLAUDE.md and the tool descriptions updated in the same commit.
+6. **Analyze-only path-compacting FIFO** — replaces the contention error without generic jobs or a new coalescing wire field. The running scan remains unchanged; only pending paths compact and followers receive the satisfying scan result.
 7. **CLI** — after Track A, with its own interface design (Decision 8).
 
 Documentation lands with the code: the `[daemon]` section in `.code-graph.toml.example` and CLAUDE.md, the `.code-graph/` directory added to `.gitignore`, the analyze-contention behaviour change, and the note that watch is now shared.
 
 ## Resolved Questions
 
-**OQ-B3 — RESOLVED.** *Does the coalesced-caller response fit the existing `AnalyzeResult`?* Evolve the wire format with an **additive optional field** rather than introducing a second shape. The field carries the coalescing fact and the identity of the request that satisfied it, is annotated `skip_serializing_if` so it is **absent** — not `null` — whenever coalescing did not occur, and is added to the *shared* shape so `analyze_codebase`'s body and `analyze_job.result` stay structurally identical and one client deserializer still covers both (the property CLAUDE.md documents). Byte-identity of the non-coalesced path is therefore preserved, satisfying NFR-01 without special-casing.
-
-  Note the deliberate asymmetry with `analyze_job` / `analyze_job_previous_terminal`, which serialize explicit `null` so a client can distinguish "no analyze ever" from "old server". That reasoning does not apply here: absence and "not coalesced" are the same fact, so an explicit `null` would add a field to every response to convey nothing.
+**OQ-B3 — RESOLVED.** *Does follower completion require a new `AnalyzeResult` shape?* No. Followers receive the satisfying scan's existing terminal result or error; Phase 4 adds no `coalesced_by` field.
 
 ## Open Questions
 

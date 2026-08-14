@@ -1,163 +1,38 @@
-//! Shared FIFO slot + job types for long-running server work.
+//! Slot + job types for the single-flight analyze model.
 //!
-//! - `JobSlot` lives in a `PlRwLock` on `ServerInner` and holds one
-//!   current job, a FIFO of admitted queued jobs, and at most one terminal
-//!   job from the previous run (`previous_terminal`).
-//! - `Job` is immutable in shape after construction; only its
+//! - `AnalyzeSlot` lives in a `PlRwLock` on `ServerInner` and holds at
+//!   most one `Running` job (`current`) plus at most one terminal job
+//!   from the previous run (`previous_terminal`).
+//! - `AnalyzeJob` is immutable in shape after construction; only its
 //!   inner `state` (a single `PlRwLock<JobMutableState>`) mutates. All
 //!   mutable state lives behind that one lock — no atomics. Held only
-//!   via `Arc<Job>`; `pub(crate)` fields + no `Clone` derive
+//!   via `Arc<AnalyzeJob>`; `pub(crate)` fields + no `Clone` derive
 //!   keep the Arc-only invariant compiler-enforced.
-//! - `JobStatus` tags the state machine: Queued → Running → Completed(result)
+//! - `JobStatus` tags the state machine: Running → Completed(result)
 //!   or Failed(msg).
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
 
-use code_graph_core::RootConfig;
-
 use crate::handlers::analyze::AnalyzeResult;
-use crate::handlers::DetectCommunitiesResponse;
-use crate::indexer::ProgressSink;
-use crate::server::JobGuard;
-
-/// The operation a retained job executes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobKind {
-    Analyze,
-    DetectCommunities,
-}
-
-/// Typed, public-safe request retained with a job. Runtime-only settings such
-/// as the configured response byte budget deliberately do not appear here.
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(tag = "request_kind", rename_all = "snake_case")]
-pub enum JobRequest {
-    Analyze {
-        path: String,
-        force: bool,
-    },
-    DetectCommunities {
-        granularity: Option<String>,
-        max_iterations: Option<u32>,
-        members_per_community: Option<u32>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    },
-}
-
-/// Terminal payload retained for generic polling. Untagged serialization keeps
-/// each `result` value byte-for-byte the synchronous tool response shape.
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(untagged)]
-pub enum JobResult {
-    Analyze(AnalyzeResult),
-    DetectCommunities(DetectCommunitiesResponse),
-}
-
-/// Number of displaced terminal jobs retained for job-addressable polling.
-pub(crate) const TERMINAL_HISTORY_LIMIT: usize = 32;
-
-/// Maximum number of admitted jobs waiting behind the current shared job.
-///
-/// This bounds only `JobSlot::pending`; the current job and retained terminal
-/// history do not consume pending capacity. Covered analyze requests do not
-/// enter this queue and therefore continue to coalesce when it is full.
-pub(crate) const JOB_PENDING_LIMIT: usize = 32;
 
 // `is_terminal` is the rotation helper retained for callers who want
 // the predicate without pattern-matching on `JobStatus` directly —
 // kept for future use even though both handlers currently inline the
 // `matches!` check at their call sites.
 #[derive(Default)]
-pub(crate) struct JobSlot {
-    pub(crate) current: Option<Arc<Job>>,
-    pub(crate) previous_terminal: Option<Arc<Job>>,
-    /// Terminal jobs displaced from `current`, oldest first. This retention is
-    /// independent of `previous_terminal`'s one-rotation compatibility view.
-    pub(crate) terminal_history: VecDeque<Arc<Job>>,
-    /// Admitted jobs that have not started, in FIFO admission order. Each
-    /// retains its shutdown-drain guard and original progress sink until a
-    /// terminal current job promotes it.
-    pub(crate) pending: VecDeque<PendingJob>,
-    /// Monotonic issuance floor for job IDs. Wall-clock nanoseconds alone can
-    /// collide when several requests arrive in one clock tick.
-    pub(crate) next_job_id: u64,
-    /// True from installing/promoting `current` until its supervisor has
-    /// performed the terminal slot transition. It prevents admissions from
-    /// racing a terminal-visible worker before that authoritative transition.
-    pub(crate) current_completion_pending: bool,
-    /// Deterministic test-only pause after a worker has written terminal state
-    /// but before its supervisor acquires the slot to rotate/promote.
-    #[cfg(test)]
-    pub(crate) completion_hook: Option<CompletionHook>,
-    /// Deterministic worker-panic injection for the generic community-job
-    /// supervisor regression test. Consumed once by the worker.
-    #[cfg(test)]
-    pub(crate) panic_next_community_job: bool,
+pub(crate) struct AnalyzeSlot {
+    pub(crate) current: Option<Arc<AnalyzeJob>>,
+    pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
 }
 
-#[cfg(test)]
-pub(crate) struct CompletionHook {
-    pub(crate) reached: tokio::sync::oneshot::Sender<()>,
-    pub(crate) proceed: tokio::sync::oneshot::Receiver<()>,
-}
-
-pub(crate) struct PendingJob {
-    pub(crate) job: Arc<Job>,
-    pub(crate) job_guard: JobGuard,
-    pub(crate) sink: Arc<dyn ProgressSink>,
-}
-
-pub(crate) struct Job {
+pub(crate) struct AnalyzeJob {
     pub(crate) job_id: String,
-    pub(crate) kind: JobKind,
-    pub(crate) request: JobRequest,
-    /// The caller-supplied path, retained for status and diagnostics.
     pub(crate) path: String,
-    /// Coverage identity captured at admission. Besides coalescing coverage,
-    /// its invocation path is the stable execution path: a queued symlink
-    /// request must index the target it named when admitted even if the
-    /// symlink is retargeted before promotion. `None` means the request did
-    /// not name a valid existing project and the worker must validate the raw
-    /// path/config to preserve its established error behavior.
-    pub(crate) coverage: Option<CoverageIdentity>,
     pub(crate) force: bool,
-    /// Response budget captured at community-job admission so queued work has
-    /// the same inputs it had at kickoff, even if a later analyze reloads TOML.
-    pub(crate) max_bytes: usize,
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
-    /// Wakes sync callers waiting for this job's terminal state. Callers arm
-    /// this before checking state, so a terminal transition cannot be lost.
-    pub(crate) terminal_changed: tokio::sync::Notify,
-}
-
-/// Stable identity used to decide whether one admitted analyze can reuse
-/// another. Both paths are canonical: invocation containment is meaningful
-/// only within one discovered project root.
-#[derive(Clone, Debug)]
-pub(crate) struct CoverageIdentity {
-    pub(crate) invocation_path: PathBuf,
-    pub(crate) project_root: PathBuf,
-    /// Validated configuration captured with the project boundary at
-    /// admission. Analyze workers must use this rather than rediscovering
-    /// TOML after queueing, because a nested config can appear, disappear, or
-    /// change while a job waits for promotion.
-    pub(crate) config: RootConfig,
-    /// Canonical serialization of the admitted validated config. This is
-    /// runtime-only admission data: two requests at the same project root can
-    /// coalesce only when their effective configs match, preventing a caller
-    /// admitted after a config replacement from receiving older job results.
-    pub(crate) config_identity: String,
-    /// Whether the admitted configuration came from an on-disk TOML file.
-    /// This keeps no-config warnings tied to the same admission snapshot as
-    /// the configuration and cache root, without rereading TOML at execution.
-    pub(crate) config_present: bool,
 }
 
 #[derive(Default)]
@@ -184,15 +59,14 @@ pub(crate) struct JobMutableState {
     /// `ProgressSink::report`. Terminal jobs leave the field at whatever
     /// the last set value was — clients reading `status == "completed"`
     /// (or "failed") should treat `current_phase` as historical.
-    pub(crate) current_phase: Option<JobPhase>,
+    pub(crate) current_phase: Option<AnalyzePhase>,
 }
 
 #[derive(Default)]
 pub(crate) enum JobStatus {
     #[default]
     Running,
-    Queued,
-    Completed(JobResult),
+    Completed(AnalyzeResult),
     Failed(String),
 }
 
@@ -205,7 +79,7 @@ pub(crate) enum JobStatus {
 /// duplicated here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JobPhase {
+pub enum AnalyzePhase {
     /// rkyv cache file is being deserialized from disk before the
     /// real work begins. On UE-scale projects the cache is multi-GB
     /// and this can take minutes; without a distinct phase polling
@@ -238,111 +112,22 @@ pub enum JobPhase {
     /// failure happened; `Completed` is reserved for successful
     /// terminals.
     Completed,
-    /// Whole-graph label propagation for `detect_communities_async`.
-    DetectingCommunities,
 }
 
-impl Job {
-    #[cfg(test)]
+impl AnalyzeJob {
     pub(crate) fn new_running(
         job_id: String,
         path: String,
         force: bool,
         started_at: u64,
     ) -> Arc<Self> {
-        Self::new_running_with_coverage(job_id, path, force, started_at, None)
-    }
-
-    pub(crate) fn new_running_with_coverage(
-        job_id: String,
-        path: String,
-        force: bool,
-        started_at: u64,
-        coverage: Option<CoverageIdentity>,
-    ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
-            kind: JobKind::Analyze,
-            request: JobRequest::Analyze {
-                path: path.clone(),
-                force,
-            },
             path,
-            coverage,
             force,
-            max_bytes: 0,
             started_at,
             state: PlRwLock::new(JobMutableState::default()),
-            terminal_changed: tokio::sync::Notify::new(),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_queued(
-        job_id: String,
-        path: String,
-        force: bool,
-        started_at: u64,
-    ) -> Arc<Self> {
-        Self::new_queued_with_coverage(job_id, path, force, started_at, None)
-    }
-
-    pub(crate) fn new_queued_with_coverage(
-        job_id: String,
-        path: String,
-        force: bool,
-        started_at: u64,
-        coverage: Option<CoverageIdentity>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            job_id,
-            kind: JobKind::Analyze,
-            request: JobRequest::Analyze {
-                path: path.clone(),
-                force,
-            },
-            path,
-            coverage,
-            force,
-            max_bytes: 0,
-            started_at,
-            state: PlRwLock::new(JobMutableState {
-                status: JobStatus::Queued,
-                ..JobMutableState::default()
-            }),
-            terminal_changed: tokio::sync::Notify::new(),
-        })
-    }
-
-    pub(crate) fn new_running_communities(
-        job_id: String,
-        request: JobRequest,
-        started_at: u64,
-        max_bytes: usize,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            job_id,
-            kind: JobKind::DetectCommunities,
-            request,
-            path: String::new(),
-            coverage: None,
-            force: false,
-            max_bytes,
-            started_at,
-            state: PlRwLock::new(JobMutableState::default()),
-            terminal_changed: tokio::sync::Notify::new(),
-        })
-    }
-
-    pub(crate) fn new_queued_communities(
-        job_id: String,
-        request: JobRequest,
-        started_at: u64,
-        max_bytes: usize,
-    ) -> Arc<Self> {
-        let job = Self::new_running_communities(job_id, request, started_at, max_bytes);
-        job.state.write().status = JobStatus::Queued;
-        job
     }
 
     /// Transition the job into a new indexing phase atomically with
@@ -367,12 +152,12 @@ impl Job {
     /// Without this special-case, the client would see the stale
     /// `"Resolving edges: <last file>"` message and the resolving
     /// counter for the entire persist window.
-    pub(crate) fn set_phase(&self, phase: JobPhase) {
+    pub(crate) fn set_phase(&self, phase: AnalyzePhase) {
         let mut s = self.state.write();
         s.current_phase = Some(phase);
         s.progress = 0;
         s.progress_message = match phase {
-            JobPhase::LoadingCache => {
+            AnalyzePhase::LoadingCache => {
                 // No per-step report fires during rkyv deserialization,
                 // so this is the only message the client sees for the
                 // duration of the load. Synthetic `(0, 1)` totals
@@ -382,14 +167,14 @@ impl Job {
                 s.progress_total = 1;
                 "Loading cache from disk".to_string()
             }
-            JobPhase::Discovering => "Discovering source files".to_string(),
-            JobPhase::Parsing => "Parsing source files".to_string(),
-            JobPhase::Resolving => "Resolving cross-file edges".to_string(),
-            JobPhase::Persisting => {
+            AnalyzePhase::Discovering => "Discovering source files".to_string(),
+            AnalyzePhase::Parsing => "Parsing source files".to_string(),
+            AnalyzePhase::Resolving => "Resolving cross-file edges".to_string(),
+            AnalyzePhase::Persisting => {
                 s.progress_total = 1;
                 "Persisting cache to disk".to_string()
             }
-            JobPhase::Completed => {
+            AnalyzePhase::Completed => {
                 // Terminal stamp. Set both numerator and denominator
                 // to 1 so a progress-bar UI renders 100%; the message
                 // names the terminal explicitly so clients reading
@@ -399,89 +184,13 @@ impl Job {
                 s.progress_total = 1;
                 "Analyze complete".to_string()
             }
-            JobPhase::DetectingCommunities => {
-                s.progress_total = 1;
-                "Detecting file communities".to_string()
-            }
         };
     }
-
-    pub(crate) fn mark_running(&self) {
-        let mut s = self.state.write();
-        debug_assert!(matches!(s.status, JobStatus::Queued));
-        s.status = JobStatus::Running;
-    }
-}
-
-/// Whether an already-admitted request covers a later request.
-///
-/// Project roots must match before invocation containment is considered.
-/// `Path::starts_with` compares components rather than bytes, so `/repo/a`
-/// covers `/repo/a/file` but not `/repo/ab`. A forced request can cover either
-/// kind of request; a non-forcing request must never absorb a forced request.
-pub(crate) fn covers(
-    coverer: (&CoverageIdentity, bool),
-    covered: (&CoverageIdentity, bool),
-) -> bool {
-    coverer.0.project_root == covered.0.project_root
-        && coverer.0.config_identity == covered.0.config_identity
-        && coverer.0.config_present == covered.0.config_present
-        && covered
-            .0
-            .invocation_path
-            .starts_with(&coverer.0.invocation_path)
-        && (coverer.1 || !covered.1)
 }
 
 impl JobMutableState {
     #[allow(dead_code)]
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self.status, JobStatus::Completed(_) | JobStatus::Failed(_))
-    }
-}
-
-#[cfg(test)]
-mod coalesce {
-    use super::{covers, CoverageIdentity};
-    use code_graph_core::RootConfig;
-    use std::path::PathBuf;
-
-    fn identity(path: &str, project_root: &str) -> CoverageIdentity {
-        CoverageIdentity {
-            invocation_path: PathBuf::from(path),
-            project_root: PathBuf::from(project_root),
-            config: RootConfig::default(),
-            config_identity: String::new(),
-            config_present: false,
-        }
-    }
-
-    #[test]
-    fn pure_component_aware_coverage_force_matrix() {
-        let root = identity("/repo/a", "/repo");
-        let child = identity("/repo/a/child", "/repo");
-        let sibling_prefix = identity("/repo/ab", "/repo");
-        let shadowing_child = identity("/repo/a/child", "/repo/a/child");
-
-        // Same-scope force matrix.
-        assert!(covers((&root, false), (&root, false)));
-        assert!(!covers((&root, false), (&root, true)));
-        assert!(covers((&root, true), (&root, false)));
-        assert!(covers((&root, true), (&root, true)));
-
-        // Nested requests retain the same force asymmetry.
-        assert!(covers((&root, false), (&child, false)));
-        assert!(covers((&root, true), (&child, false)));
-        assert!(covers((&root, true), (&child, true)));
-        assert!(
-            !covers((&root, false), (&child, true)),
-            "a non-force parent must not absorb a force child"
-        );
-        assert!(!covers((&child, false), (&root, false)));
-        assert!(!covers((&root, false), (&sibling_prefix, false)));
-        assert!(
-            !covers((&root, true), (&shadowing_child, false)),
-            "a nested config creates a distinct project boundary"
-        );
     }
 }

@@ -14,16 +14,6 @@ the gotchas on large or specially-configured codebases.
 `mcp__code-graph__analyze_codebase(path="<abs dir>")` parses the tree and builds
 the graph. It uses an on-disk rkyv cache at `<project_root>/.code-graph-cache.db`
 plus mtime-based incremental re-index, so repeat calls are cheap.
-- If another analyze first matches the admitted project root and effective-config
-  identity/provenance, then covers the same scope with compatible force, sync waits for that outcome and adds
-  `coalesced_by` with the covering job ID (or its error ends with
-  `(coalesced_by: <job_id>)`). The first distinct request behind a running job blocks to its own
-  terminal result. If distinct work is already queued, sync returns
-   `{ job_id, status: "queued", started_at, existing: false, note }` immediately; poll
-   `get_job_status(job_id)` rather than waiting on the call.
-  The shared FIFO admits at most 32 pending jobs. Covered analyzes still coalesce at capacity, but
-  additional distinct analyze or community jobs receive a retryable queue-full tool error; poll
-  `get_status()` and retry after queued work completes.
 - `force=true` bypasses the cache and fully rebuilds — use it after changing
   `.code-graph.toml` (macro config, extensions) or when the graph looks wrong.
 - **Scoping:** `analyze_codebase("<subtree>")` indexes only that subtree and
@@ -36,18 +26,15 @@ On big trees (tens of thousands of files), sync `analyze_codebase` can exceed th
 MCP client's per-call timeout and surface as a tool error *even though the server
 finishes*. Avoid this:
 
-1. `mcp__code-graph__analyze_codebase_async(path=…)` → returns before indexing and
-   normally quickly with a `job_id` and `status` (`"running"` or `"queued"`).
-   Admission canonicalization and config discovery may wait on a slow filesystem.
-   Reuse first requires matching admitted project root and effective-config
-   identity/provenance, then containment and compatible force. A reused covering job has
-   `existing: true` and a coalescing note.
-2. Poll `mcp__code-graph__get_job_status(job_id=…)` — read `progress` /
-   `progress_message` for live progress, and `result` (or `.error`) once `status`
-   becomes `"completed"` / `"failed"`.
+1. `mcp__code-graph__analyze_codebase_async(path=…)` → returns sub-second with a
+   `job_id` and `status: "running"`.
+2. Poll `mcp__code-graph__get_status` — read `analyze_job.progress` /
+   `progress_message` for live progress, and `analyze_job.result` (or `.error`)
+   once `status` becomes `"completed"` / `"failed"`.
 
-Async still avoids the per-call timeout during indexing. (If you must use sync
-analyze on a large tree, raising `MCP_TOOL_TIMEOUT` to ~900000 is the alternative.)
+Because each call is sub-second, the per-call timeout never fires. (If you must use
+sync analyze on a large tree, raising `MCP_TOOL_TIMEOUT` to ~900000 is the
+alternative.)
 
 ## Keep it fresh
 
@@ -56,18 +43,7 @@ analyze on a large tree, raising `MCP_TOOL_TIMEOUT` to ~900000 is the alternativ
 - Without watch, just call `analyze_codebase` again — mtime incremental keeps it fast.
 - If results look stale right after edits and no watch is running, re-run
   `analyze_codebase` (add `force=true` only if a *config* change is involved;
-   ordinary edits don't need it).
-
-## Large whole-graph queries
-
-`detect_communities_async` accepts the same arguments as `detect_communities` but returns a
-sub-second job kickoff. Prefer it for large graphs; poll `get_job_status(job_id)`. Its terminal
-`result` has the same `DetectCommunitiesResponse` shape and semantics as sync, but the JobView
-wrapper reserves bytes from captured `max_bytes`, so it can have fewer rows and a different
-`next_offset`; resume with `offset = next_offset`. For any byte-budgeted page, empty `results`
-with `truncated: true` and `next_offset` equal to the requested `offset` is a start-fresh marker:
-do **not** retry unchanged. Raise `[response].max_bytes`, rerun `analyze_codebase` to refresh the
-cached config, then retry. `detect_cycles` is count-paginated only.
+  ordinary edits don't need it).
 
 ## Check state
 
@@ -96,6 +72,6 @@ The cases worth flagging to the user:
 
 - Small/medium repo, interactive → `analyze_codebase`.
 - Large repo, or you've hit a tool timeout → `analyze_codebase_async` + poll
-  `get_job_status(job_id)`.
+  `get_status`.
 - Actively editing and querying → `watch_start` once, then just query.
 - Changed `.code-graph.toml` → `analyze_codebase(force=true)`.

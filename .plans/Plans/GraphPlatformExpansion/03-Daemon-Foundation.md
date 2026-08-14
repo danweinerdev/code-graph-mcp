@@ -7,6 +7,13 @@ status: complete
 created: 2026-08-08
 updated: 2026-08-11
 deliverable: "A repository-local daemon holding one graph per project root, with the stdio binary attaching to it transparently, an idle timeout, and in-process fallback."
+waivers:
+  - code: SDD173
+    reason: "Phase 3's frozen review predates unrelated dirty Phase 4 rollback work; its reviewed implementation and evidence remain unchanged."
+    accepted: "2026-08-13"
+  - code: SDD174
+    reason: "The normalized plan README changed only to record the separately approved Phase 4 replacement; Phase 3's frozen review remains the authoritative review of its immutable range."
+    accepted: "2026-08-13"
 tasks:
   - id: "3.1"
     title: "[daemon] config section, parsed and inert"

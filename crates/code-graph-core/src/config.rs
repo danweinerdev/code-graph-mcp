@@ -50,21 +50,25 @@ fn default_macro_define_type_keyword() -> String {
     "struct".to_string()
 }
 
-/// Custom deserializer for `[response].max_bytes`. The budget must be
-/// positive so byte-budgeted pagination always has a nonzero configured
-/// budget. Negative integers and non-integer values are rejected by
-/// `toml`/`serde` at the type-coercion layer (the field is `usize`).
+/// Custom deserializer for `[response].max_bytes`. Rejects zero with a
+/// clear error message — a budget of zero would make every paginated
+/// handler return an empty page with `truncated=true`, which is
+/// silently-broken behavior nobody would intend.
+///
+/// Negative integers and non-integer values are rejected by `toml`/`serde`
+/// at the type-coercion layer (the field is `usize`), so this validator
+/// only has to guard against the one in-range value that's still nonsense.
 fn deserialize_response_max_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let max_bytes = usize::deserialize(deserializer)?;
-    if max_bytes == 0 {
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
         return Err(serde::de::Error::custom(
             "`[response].max_bytes` must be > 0",
         ));
     }
-    Ok(max_bytes)
+    Ok(value)
 }
 
 /// Top-level project configuration loaded from `<root>/.code-graph.toml`.
@@ -430,10 +434,10 @@ impl ExtensionsConfig {
 /// can absorb without forcing summarization.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResponseConfig {
-    /// Per-response byte budget consulted by paginated handlers. Must be
-    /// greater than zero; default `102_400` (100 KB). Tiny positive values
-    /// may return an empty resumable page when the response envelope itself
-    /// leaves no room for a row.
+    /// Per-response byte budget consulted by paginated handlers. Default
+    /// `102_400` (100 KB). Must be `> 0`; zero is rejected at load time
+    /// with a clear error (a zero budget would silently return an empty
+    /// page on every call).
     #[serde(
         default = "default_response_max_bytes",
         deserialize_with = "deserialize_response_max_bytes"
@@ -539,27 +543,13 @@ impl RootConfig {
     /// rustfmt, git, editorconfig, and npm: project-root config files
     /// are discovered by upward walk, never by exact-dir match.
     pub fn load(start: &Path) -> Result<(Self, PathBuf), ConfigError> {
-        let (config, project_root, _) = Self::load_with_presence(start)?;
-        Ok((config, project_root))
-    }
-
-    /// Discover and load configuration with provenance from the same
-    /// successful upward-walk read. The boolean is `true` only when this call
-    /// read and validated a `.code-graph.toml`; it is `false` when the walk
-    /// reached the filesystem root without finding one.
-    ///
-    /// This avoids a second filesystem probe that could observe a different
-    /// create/remove state than the configuration and project root returned by
-    /// the walk. [`RootConfig::load`] remains the compatibility API for
-    /// callers that do not need that provenance.
-    pub fn load_with_presence(start: &Path) -> Result<(Self, PathBuf, bool), ConfigError> {
         let mut search = Some(start);
         while let Some(dir) = search {
             let path = dir.join(".code-graph.toml");
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let cfg = Self::parse_and_validate(&content)?;
-                    return Ok((cfg, dir.to_path_buf(), true));
+                    return Ok((cfg, dir.to_path_buf()));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     search = dir.parent();
@@ -567,7 +557,7 @@ impl RootConfig {
                 Err(e) => return Err(ConfigError::Io(e)),
             }
         }
-        Ok((Self::default(), start.to_path_buf(), false))
+        Ok((Self::default(), start.to_path_buf()))
     }
 
     /// Parse and validate `.code-graph.toml` content. Shared between
@@ -779,43 +769,6 @@ mod tests {
         assert_eq!(
             canonical_root, canonical_dir,
             "project root must equal the start dir when toml is found there"
-        );
-    }
-
-    #[test]
-    fn load_with_presence_reports_the_successful_read() {
-        let dir = TempDir::new().unwrap();
-        let child = dir.path().join("child");
-        fs::create_dir(&child).unwrap();
-        fs::write(
-            dir.path().join(".code-graph.toml"),
-            "[cpp]\nmacro_strip = [\"PRESENT_API\"]\n",
-        )
-        .unwrap();
-
-        let (with_presence, root, present) = RootConfig::load_with_presence(&child).unwrap();
-        let (legacy, legacy_root) = RootConfig::load(&child).unwrap();
-
-        assert!(present, "the successful read must report config provenance");
-        assert_eq!(root, dir.path());
-        assert_eq!(legacy_root, root);
-        assert_eq!(
-            serde_json::to_value(&legacy).unwrap(),
-            serde_json::to_value(&with_presence).unwrap(),
-            "load must preserve its compatibility result by delegating"
-        );
-    }
-
-    #[test]
-    fn load_with_presence_reports_absence_without_a_second_probe() {
-        let dir = TempDir::new().unwrap();
-        let (config, root, present) = RootConfig::load_with_presence(dir.path()).unwrap();
-
-        assert!(!present, "default config must retain no-file provenance");
-        assert_eq!(root, dir.path());
-        assert_eq!(
-            serde_json::to_value(&config).unwrap(),
-            serde_json::to_value(RootConfig::default()).unwrap()
         );
     }
 
@@ -1659,19 +1612,27 @@ disabled = [""]
 
     #[test]
     fn response_max_bytes_zero_is_rejected() {
+        // A zero budget would make every paginated handler return an empty
+        // page with `truncated=true` — silently-broken. The custom
+        // deserializer rejects it at load time with a clear error message.
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".code-graph.toml"),
             "[response]\nmax_bytes = 0\n",
         )
         .unwrap();
-        let err = RootConfig::load(dir.path()).expect_err("zero max_bytes must be rejected");
-        assert!(matches!(err, ConfigError::Toml(_)));
-        assert!(
-            err.to_string()
-                .contains("`[response].max_bytes` must be > 0"),
-            "zero rejection must identify the invalid setting: {err}"
-        );
+        let err = RootConfig::load(dir.path())
+            .expect_err("max_bytes = 0 must be rejected, not silently accepted");
+        match err {
+            ConfigError::Toml(ref e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("max_bytes") && msg.contains("> 0"),
+                    "error must clearly name the field and the constraint, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Toml, got: {other:?}"),
+        }
     }
 
     #[test]

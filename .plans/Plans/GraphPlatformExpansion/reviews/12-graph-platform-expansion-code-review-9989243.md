@@ -50,11 +50,12 @@ findings:
   - id: F-09
     severity: minor
     title: "Fixed-sleep negative assertions in daemon_serve.rs carry 300-500ms margins (informational; act only on observed CI flake)"
-    status: no-action
+    status: rejected
   - id: F-10
     severity: minor
     title: "Scope creep: .claude/router-config.json committed mid-range with no plan task (harmless tooling config)"
-    status: no-action
+    status: rejected
+followups: []
 ---
 
 # Code Review: GraphPlatformExpansion Phases 1–3 — adversarial full-range review
@@ -123,16 +124,35 @@ F-01, F-02, F-03 — all three of its findings were unique. The three intent-awa
 
 All dispositions applied 2026-08-12 on `feature/shared-process` (working tree atop 9989243). Verified: `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean, `make snapshot-clean` clean, `cargo test -p code-graph-tools` 665/0, `cargo test -p code-graph-graph` 177/0, `cargo test -p code-graph-mcp` all green except one environment-only failure (see New observations).
 
-- **F-01 fixed** — `main.rs` pre-daemon cwd resolution now routes through `code_graph_core::paths::canonicalize` (same function as `daemon::run`), with a comment pinning the must-match constraint.
-- **F-02 fixed** — `finish_proxy` now `eprintln!`s the swallowed `pump_connection` error ("daemon connection ended mid-session") before returning `Ok(())`; exit code stays 0 by design.
-- **F-03 fixed** — macOS deep-path UDS→TCP caveat documented in the new CLAUDE.md daemon section (routed to Phase 10 for a code-level mitigation if wanted).
-- **F-04 fixed (amended approach)** — the review's recommended `rustix::fs::flock` was **wrong**: rustix has no `fs` module on Windows and the lock paths are cross-platform. Replaced `fs2` with **std file locking** (`File::{lock, try_lock, unlock}`, flock on Unix / LockFileEx on Windows — same syscalls as fs2), dropping the dependency with no cfg split. Required bumping workspace `rust-version` 1.84 → 1.89 (std file locking stabilized in 1.89); the MSRV bump also enabled clippy `manual_is_multiple_of`, fixed at its one site (`code-graph-lang-cpp/src/preprocess.rs:260`). USER MAY VETO the MSRV bump — reverting means keeping `fs2`.
-- **F-05 fixed** — CLAUDE.md gained a "Repository-local daemon (runtime model)" section: runtime-file inventory, transport fallback order, binary-compatibility gate, failure surface, path discipline.
-- **F-06 fixed** — git-SHA build logic single-sourced in `build-support/git-identity.rs`, `include!`d by both build scripts (with a rerun-if-changed hint on the fragment itself).
-- **F-07 fixed** — dead `cap == 0` branch replaced with `debug_assert_ne!` + invariant comment.
-- **F-08 fixed** — dead `node_count > 1` conjunct removed.
-- **F-09 no-action** — per the finding itself: widen margins only on observed CI flake.
-- **F-10 no-action** — `.claude/router-config.json` is the user's own tooling config; noted, left in place.
+### F-01 — fixed (2026-08-12)
+`main.rs` pre-daemon cwd resolution now routes through `code_graph_core::paths::canonicalize` (same function as `daemon::run`), with a comment pinning the must-match constraint.
+
+### F-02 — fixed (2026-08-12)
+`finish_proxy` now `eprintln!`s the swallowed `pump_connection` error ("daemon connection ended mid-session") before returning `Ok(())`; exit code stays 0 by design.
+
+### F-03 — fixed (2026-08-12)
+The macOS deep-path UDS→TCP caveat is documented in the new CLAUDE.md daemon section and routed to Phase 10 for any code-level mitigation.
+
+### F-04 — fixed (2026-08-12)
+The recommended `rustix::fs::flock` was unavailable cross-platform. The fix uses std file locking instead, dropping `fs2` without a cfg split and documenting the required MSRV change.
+
+### F-05 — fixed (2026-08-12)
+CLAUDE.md gained the repository-local daemon runtime model section: runtime files, transport fallback, binary compatibility, failure surface, and path discipline.
+
+### F-06 — fixed (2026-08-12)
+Git-SHA build logic is single-sourced in `build-support/git-identity.rs` and included from both build scripts.
+
+### F-07 — fixed (2026-08-12)
+The unreachable `cap == 0` branch became an invariant `debug_assert_ne!`.
+
+### F-08 — fixed (2026-08-12)
+The dead `node_count > 1` conjunct was removed.
+
+### F-09 — rejected (2026-08-12)
+The finding itself directs action only on an observed CI flake; no flake was observed, so widening timing margins is intentionally not planned.
+
+### F-10 — rejected (2026-08-12)
+`.claude/router-config.json` is user-owned tooling configuration; its harmless historical scope deviation remains documented and does not require code work.
 
 ### New observations from the fix pass (environment, not code defects)
 

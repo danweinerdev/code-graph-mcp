@@ -90,8 +90,8 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
-| 3 Daemon Foundation | implementation complete, phase `in-progress` | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and fully gated by two consecutive `make verify` runs. The remaining gate is a fresh frozen four-lane phase review. Native platform completion remains deferred to phases 10/11. |
-| 4 Analyze Queue | tasks 4.1–4.10 complete; phase `in-progress` | FIFO analyze queue/coalescing, the generic long-job engine, `detect_communities_async`, admitted-config identity, async-community budgeting, blocking admission probes, D-0010's shared pending-FIFO bound, positive response-budget validation, and the reconciled coalescing contract are committed through `b6716a0`. The frozen phase review is pending. |
+| 3 Daemon Foundation | complete / frozen reviewed | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and frozen reviewed. Native platform completion remains deferred to phases 10/11. |
+| 4 Analyze Queue | replacement plan active | The committed generic-job/config-provenance/async-community implementation is being rolled back. The active target is an analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion. |
 | 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
 | 6 Symbol History | planned | Gated on 5. |
 | 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
@@ -211,6 +211,9 @@ flowchart LR
 ```
 
 ## Key Decisions
+
+- **Historical Phase 4 ledger references.** D-0009 and D-0010 describe the superseded generic-job/shared-FIFO implementation. They remain cited for historical traceability only; the active Phase 4 replacement is governed by FR-41 through FR-43 and does not extend that scheduler model.
+- **Deferred async whole-graph scope.** FR-49 and AC-58 are explicitly deferred; Phase 4 does not provide `detect_communities_async` or generic long-running jobs. The absence is intentional and is the required plan coverage for FR-49 / AC-58.
 
 - **Repository-local daemon, not multi-tenant** (D-0001). `ServerInner` is reused verbatim because one-daemon-per-root means a keyed workspace registry cannot arise.
 - **Opaque revision identity** (D-0002). `RevId` is a newtype over `String`; nothing assumes a hash, a length, or hex, so Perforce changelists fit without reshaping anything.

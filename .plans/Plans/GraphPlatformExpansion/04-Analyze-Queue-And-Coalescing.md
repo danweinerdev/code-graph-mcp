@@ -6,7 +6,14 @@ phase: 4
 status: in-progress
 created: 2026-08-08
 updated: 2026-08-13
-deliverable: "Analyze requests queue and coalesce by path containment instead of failing on contention, the wire format evolves additively, and the job slot generalizes to cover long-running whole-graph queries."
+deliverable: "An analyze-only, path-compacting FIFO: a running scan remains unchanged; pending paths compact and followers receive the satisfying scan result."
+waivers:
+  - code: SDD075
+    reason: "Tasks 4.5 through 4.12 preserve historical completion evidence from the superseded implementation; their original records lack the later timestamp format and must not be rewritten as fresh verification."
+    accepted: "2026-08-13"
+  - code: SDD169
+    reason: "Tasks 4.5 through 4.12 preserve historical completion evidence from the superseded implementation; their original reviewed-candidate form predates the current exact-identity rule and must remain historical."
+    accepted: "2026-08-13"
 tasks:
   - id: "4.1"
     title: "Pending queue in AnalyzeSlot and the queued job status"
@@ -79,14 +86,24 @@ tasks:
     justifies: "Frozen phase-review follow-up. get_status currently probes config-path existence at query time, so config creation/removal after admission can misreport which configuration produced the active index."
     verification: "Prospective: cargo test -p code-graph-tools config_path; cargo test -p code-graph-tools; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make snapshot-clean; make plugin-sync-check; git diff --check — status config_path derives from the admitted/applied config provenance and remains stable across post-admission config creation/removal."
     depends_on: ["4.5"]
+  - id: "4.15"
+    title: "Rollback superseded Phase 4 implementation"
+    status: in-progress
+    justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. The generic scheduler, async-community route, configuration-provenance coalescing, and coalesced_by surface contradict the replacement scope and must be removed first."
+    verification: "cargo test -p code-graph-tools; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make plugin-sync-check; make snapshot-clean; git diff --check — Phase 3 remains intact, pre-Phase-4 contention behavior is restored, and generic jobs, detect_communities_async, config-provenance coalescing, and coalesced_by are absent."
+  - id: "4.16"
+    title: "Implement analyze-only path-compacting FIFO"
+    status: in-progress
+    justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. Concurrent daemon clients need serialized analysis without redundant queued descendants or loss of requested force."
+    verification: "cargo test -p code-graph-tools analyze_job::; cargo test -p code-graph-tools analyze::; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make verify — tests prove immutable running work, follower absorption, earliest-position ancestor replacement, disjoint FIFO order, result/error propagation, force OR, post-compaction cap, and distinct-33rd rejection."
 
 ---
 
-# Phase 4: Analyze Queue and Coalescing
+# Phase 4: Analyze Queue and Path Compaction
 
 ## Overview
 
-The largest behaviour change in the plan. Today `analyze_codebase` returns `"indexing already in progress"` on contention — rare with one session, routine with a shared daemon. This phase replaces that with a queue that coalesces requests with matching admitted project/config identity by path containment and force, and evolves the wire format additively to report it.
+The prior Phase 4 implementation is historical work that will be cleanly rolled back; its completion evidence below is not evidence for this replacement. The active deliverable is an **analyze-only** FIFO. A running scan never changes. Only pending canonical paths compact: an equal or ancestor pending path absorbs an incoming follower; an incoming ancestor replaces pending descendants at the earliest displaced FIFO position; disjoint entries retain FIFO order. Followers receive the satisfying scan result or error, and each compacted scan uses `force = OR`. Generic jobs, `detect_communities_async`, community admission, configuration identity/provenance coalescing, and `coalesced_by` are outside this phase.
 
 Depends on phase 3. Separated from it so a bisect through daemon bring-up does not also cross this change.
 
@@ -262,6 +279,10 @@ Reaching for `spawn_blocking` and considering it solved. It moves the work off t
 - [x] Prevent execution from silently crossing a changed nested-config boundary
 - [x] Cover nested config creation, removal, and replacement while queued
 
+### Notes
+
+Historical evidence for the superseded identity-gated implementation; task 4.15 removes this behavior rather than reopening or backfilling this completed task.
+
 ### Completion Evidence
 
 - Verified: 2026-08-13
@@ -320,6 +341,10 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 - [x] Preserve sync and async validation/coalescing semantics
 - [x] Add scheduler-responsiveness regression coverage
 
+### Notes
+
+Historical evidence for the superseded admission path. The replacement queue uses canonical paths but does not retain the configuration-identity admission contract.
+
 ### Completion Evidence
 
 - Verified: 2026-08-13
@@ -348,6 +373,10 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 - [x] Evaluate analyze coverage before rejecting a distinct overflow, so covered analyzes still coalesce at capacity
 - [x] Reject distinct analyze and community overflow without issuing an ID, retaining a guard, or mutating the queue
 - [x] Verify promotion frees exactly one pending slot and rejected work does not extend shutdown drain
+
+### Notes
+
+Historical evidence for the former shared generic queue. Task 4.16 retains only the numeric 32-entry bound after analyze-only path compaction.
 
 ### Completion Evidence
 
@@ -378,6 +407,10 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 - [x] Preserve rejection of negative and non-integer values and acceptance of positive values
 - [x] Retain the positive tiny-budget async-community start-fresh behavior
 - [x] Run the prospective focused, full, and repository hygiene verification
+
+### Notes
+
+Historical independent configuration validation; its async-community references are superseded, while the completed validation evidence remains intact.
 
 ### Completion Evidence
 
@@ -448,6 +481,10 @@ This review follow-up corrects governing-document wording; it does not remove `c
 - [x] Correct agent-facing config-aware coalescing wording found by the same frozen review
 - [x] Document the generic empty non-advancing start-fresh marker for byte-starved pages
 
+### Notes
+
+Historical independent pagination fix. Its evidence is preserved but it is not part of the replacement queue's behavior.
+
 ### Completion Evidence
 
 - Verified: 2026-08-13
@@ -478,6 +515,10 @@ This review follow-up corrects governing-document wording; it does not remove `c
 - [x] Make `get_status.config_path` report applied state rather than current filesystem existence
 - [x] Cover config creation and removal after admission/indexing
 
+### Notes
+
+Historical status-reporting fix. It does not reintroduce configuration provenance as a Phase 4 queue-compaction condition.
+
 ### Completion Evidence
 
 - Verified: 2026-08-13
@@ -500,18 +541,58 @@ This review follow-up corrects governing-document wording; it does not remove `c
 |---|---|---|---|
 | Focused quality review | Complete task 4.12 diff | PASS/Aligned | Applied-config publication locking and ordering were reviewed for correctness, scope, tests, maintainability, and task boundary. |
 
+## Historical Implementation Note
+
+Tasks 4.1–4.12 and their evidence record the superseded implementation through `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`. They do not satisfy the replacement acceptance criteria below; task 4.15 removes their queue-related behavior before task 4.16 builds the smaller design.
+
+## 4.15: Rollback superseded Phase 4 implementation
+
+### Subtasks
+
+- [ ] Remove the uncommitted Phase 4.13/4.14 work and the committed generic scheduler, async-community route, generic polling/projections, config-provenance coalescing, and `coalesced_by` behavior through a clean implementation revision; do not rewrite published history.
+- [ ] Restore the pre-Phase-4 analyze contention behavior while retaining all Phase 3 daemon functionality.
+- [ ] Remove documentation and snapshots that advertise the superseded Phase 4 surface.
+- [ ] Verify Phase 3 daemon/proxy behavior remains intact and record only commands actually run.
+
+### Notes
+
+Revision boundary: a clean, buildable Phase-3-plus-pre-Phase-4 baseline. This task deliberately does not introduce replacement queue behavior; isolating rollback keeps the simplification reviewable and reversible.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 4.16: Implement analyze-only path-compacting FIFO
+
+### Subtasks
+
+- [ ] Add an analyze-only pending FIFO with at most 32 entries **after** compaction; never alter, attach to, upgrade, or replace the running scan.
+- [ ] Canonicalize invocation paths. Make an equal or ancestor pending path absorb the new request as a follower; make an incoming ancestor replace all queued descendants at the earliest displaced FIFO position; leave disjoint entries in FIFO order.
+- [ ] Preserve followers for every absorbed or replaced request. Retain absorbed/displaced asynchronous IDs as internal aliases of the compacted scan; synchronous callers wait and return its ordinary terminal success or error, while asynchronous callers keep their original handle and poll the existing shared analyze-job status.
+- [ ] Compute effective force as logical OR across the compacted entry and every attached or replaced request.
+- [ ] Add deterministic tests for running-scan immutability, follower absorption, ancestor replacement/order, success/error propagation, force OR, post-compaction cap, and retryable rejection of a distinct 33rd pending analyze.
+
+### Notes
+
+Revision boundary: an analyze-only queue satisfying FR-41–FR-43 and AC-50–AC-52. It must be a complete green revision after task 4.15. Do not reintroduce generic job kinds, `detect_communities_async`, community work in this queue, configuration identity/provenance gating, generic status projections, or a `coalesced_by` wire field.
+
+### Trap
+
+Do not compact against the running scan. It has already chosen its path and force; mutating it makes active work and terminal attribution nondeterministic. Compact only pending entries before applying the cap.
+
+### Completion Evidence
+
+Pending — not complete.
+
 ## Acceptance Criteria
 
-- [x] **AC-50**: An analyze issued during another is queued and runs, rather than returning the contention error (FR-41).
-- [x] **AC-51**: The coverage rule first requires matching admitted project/config identity, then holds across all four force/containment cases and never coalesces disjoint paths; config transitions remain distinct. (FR-42.)
-- [x] **AC-52**: A coalesced caller receives the covering request's outcome, and the response identifies the coalescing (FR-43).
-- [x] Non-coalesced analyze bodies remain byte-identical; one deserializer still covers both shapes (NFR-01).
-- [x] CLAUDE.md and tool descriptions updated for the retired error, the `"queued"` status, the new optional field, and the sync blocking change (NFR-11).
-- [x] **AC-27**: `make verify` passes (NFR-04).
-- [x] **AC-58**: A whole-graph query runs asynchronously with sub-second calls throughout, so a wall-clock client timeout cannot fire (FR-49).
-- [x] **D-0010**: The shared FIFO has at most 32 pending jobs; covered analyzes still coalesce at capacity, while distinct analyze or community overflow receives the retryable queue-full error without extending shutdown drain. (Depends on 4.8.)
-- [x] FR-41, FR-42, FR-43, FR-49, D-0010 realized.
+- [ ] **AC-50**: Analyze requests queue without concurrent execution, with at most 32 pending analyze entries after compaction. The running scan is unchanged and a distinct 33rd pending analyze gets a retryable queue-full error. (FR-41)
+- [ ] **AC-51**: Canonical-path compaction absorbs a request under an equal/ancestor pending path, replaces queued descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order; configuration identity/provenance does not participate. (FR-42)
+- [ ] **AC-52**: Every follower receives the satisfying compacted scan terminal result or error, and no merged force request is lost because effective force is logical OR. No generic projection or `coalesced_by` field is required. (FR-43)
+- [ ] **AC-58**: **Deferred.** Generic asynchronous whole-graph jobs, including `detect_communities_async`, are excluded from this phase; a later initiative must specify and plan them. (FR-49)
+
+- [ ] **AC-27**: `make verify` passes. (NFR-04)
 
 ## Phase Completion Evidence
 
-All acceptance criteria are met by committed tasks through `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`. The phase remains `in-progress`; the frozen phase review is pending.
+Pending — not complete.
