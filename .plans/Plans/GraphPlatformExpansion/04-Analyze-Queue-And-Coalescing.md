@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 4
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-13
+updated: 2026-08-14
 deliverable: "An analyze-only, path-compacting FIFO: a running scan remains unchanged; pending paths compact and followers receive the satisfying scan result."
 waivers:
   - code: SDD075
@@ -96,19 +96,21 @@ tasks:
     status: in-progress
     justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. Concurrent daemon clients need serialized analysis without redundant queued descendants or loss of requested force."
     verification: "cargo test -p code-graph-tools analyze_job::; cargo test -p code-graph-tools analyze::; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make verify — tests prove immutable running work, follower absorption, earliest-position ancestor replacement, disjoint FIFO order, result/error propagation, force OR, post-compaction cap, and distinct-33rd rejection."
-
+  - id: "4.17"
+    title: "Exercise queue semantics through live daemon clients"
+    status: complete
+    justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. The replacement queue is currently covered only through in-process handlers and unit state; real proxy clients must prove they share the daemon slot and observe compaction, terminal attribution, capacity, and shutdown behavior across the transport boundary."
+    verification: "cargo test -p code-graph-mcp --test daemon_proxy queue; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make verify — isolated live clients prove pending absorption, ancestor replacement at earliest FIFO position, force OR, success/error follower completion, post-compaction 32-entry rejection, and daemon shutdown drain without leaked processes."
 ---
 
-# Phase 4: Analyze Queue and Path Compaction
+# Analyze Queue and Coalescing
 
 ## Overview
-
 The prior Phase 4 implementation is historical work that will be cleanly rolled back; its completion evidence below is not evidence for this replacement. The active deliverable is an **analyze-only** FIFO. A running scan never changes. Only pending canonical paths compact: an equal or ancestor pending path absorbs an incoming follower; an incoming ancestor replaces pending descendants at the earliest displaced FIFO position; disjoint entries retain FIFO order. Followers receive the satisfying scan result or error, and each compacted scan uses `force = OR`. Generic jobs, `detect_communities_async`, community admission, configuration identity/provenance coalescing, and `coalesced_by` are outside this phase.
 
 Depends on phase 3. Separated from it so a bisect through daemon bring-up does not also cross this change.
 
 ## 4.1: Pending queue in AnalyzeSlot and the queued job status
-
 ### Subtasks
 - [x] Add `pending: Vec<Arc<AnalyzeJob>>` to `AnalyzeSlot`, ordered by admission
 - [x] Add a `Queued` variant to the job status and map it to the wire string `"queued"`
@@ -149,7 +151,6 @@ Job-addressable lookup is the retrieval counterpart: pending IDs would otherwise
 | Focused intent-blind quality review | Complete task 4.1 diff excluding lifecycle-only plan files | PASS | Queue, promotion, cancellation/panic supervision, bounded terminal retention, polling route, tests, and documentation were judged correct, scoped, maintainable, and bisectable after stale-comment fixes. |
 
 ## 4.2: Admitted-identity, path-containment coverage rule with force asymmetry
-
 ### Subtasks
 - [x] Implement `covers(x, y)` as a pure function over admitted project/config identity plus `(path, force)`
 - [x] Run admission against the running job and every pending entry
@@ -187,7 +188,6 @@ The rule: **X covers Y only when both requests have the same discovered project 
 Implementing coverage as path containment alone. It reads as obviously correct and passes any test that does not vary the force flag or configuration snapshot. The failures it produces are a forced re-index silently absorbed into a plain one, so stale entries survive, or a caller admitted after a config change receiving an older job's result; both appear much later and look like cache bugs, not queue bugs.
 
 ## 4.3: Coalesced-caller reporting and sync non-blocking rule
-
 ### Subtasks
 - [x] Add the optional coalescing field to the shared analyze result shape with `skip_serializing_if`
 - [x] Return the coverer's outcome to the coalesced caller
@@ -229,7 +229,6 @@ Adding it to the *shared* shape keeps `analyze_codebase`'s body and `analyze_job
 Letting sync `analyze_codebase` block behind the queue because "that's what a queue means". CLAUDE.md already documents `MCP_TOOL_TIMEOUT` killing long sync analyses on large trees; queueing makes wall-clock depend on other sessions' work, so a small repo can now time out because someone else started an index. Return queued instead.
 
 ## 4.4: Generalize the job slot to long-running queries and add detect_communities_async
-
 ### Subtasks
 - [x] Widen the job slot from analyze-specific to a job kind that covers long-running queries
 - [x] Keep `analyze_job` in `get_status` reporting analyze jobs, so no existing client breaks
@@ -273,7 +272,6 @@ Generalize rather than special-case. A second job mechanism beside the analyze o
 Reaching for `spawn_blocking` and considering it solved. It moves the work off the async worker and does nothing about the client's wall-clock timeout, which is the actual failure. Only a return-immediately-and-poll shape fixes that.
 
 ## 4.5: Freeze admitted analyze config identity through execution
-
 ### Subtasks
 - [x] Carry the admitted project/config identity into queued and running jobs
 - [x] Prevent execution from silently crossing a changed nested-config boundary
@@ -304,7 +302,6 @@ Historical evidence for the superseded identity-gated implementation; task 4.15 
 | Four-lane focused review | Complete task 4.5 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
 
 ## 4.6: Budget async community job envelopes
-
 ### Subtasks
 - [x] Reserve generic JobView wrapper overhead before community result budgeting
 - [x] Verify terminal polling stays within `[response].max_bytes`
@@ -335,7 +332,6 @@ The async terminal result has the same `DetectCommunitiesResponse` shape and sem
 | Four-lane focused review | Complete task 4.6 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
 
 ## 4.7: Move analyze admission filesystem probes off Tokio workers
-
 ### Subtasks
 - [x] Dispatch canonicalization and config discovery through blocking execution
 - [x] Preserve sync and async validation/coalescing semantics
@@ -367,7 +363,6 @@ Historical evidence for the superseded admission path. The replacement queue use
 | Four-lane focused review | Complete task 4.7 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
 
 ## 4.8: Bound shared pending FIFO
-
 ### Subtasks
 - [x] Cap the shared pending FIFO at 32 entries, excluding the current job and retained terminal history
 - [x] Evaluate analyze coverage before rejecting a distinct overflow, so covered analyzes still coalesce at capacity
@@ -400,7 +395,6 @@ Historical evidence for the former shared generic queue. Task 4.16 retains only 
 | Four-lane focused review | Complete task 4.8 diff | PASS/Aligned | Inspection evidence recorded for correctness, scope, tests, maintainability, and task boundary; this is not a frozen phase gate. |
 
 ## 4.9: Reject zero response byte budgets
-
 ### Subtasks
 
 - [x] Restore `[response].max_bytes > 0` validation in the core configuration deserializer
@@ -435,7 +429,6 @@ Historical independent configuration validation; its async-community references 
 | Focused quality review | Complete task 4.9 diff | PASS/Aligned | Complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary; zero budgets are rejected and positive tiny budgets remain unchanged. |
 
 ## 4.10: Reconcile coalescing contract with admitted config identity
-
 ### Subtasks
 
 - [x] Reconcile FR-42, AC-51, and Decision 7 with the admitted effective-config identity/provenance gate
@@ -472,7 +465,6 @@ This review follow-up corrects governing-document wording; it does not remove `c
 | Focused spec-compliance review | Complete task 4.10 diff | PASS/Aligned | The admitted effective-config identity/provenance gate precedes containment and force; config transitions remain distinct, capacity rejects distinct work, and positive tiny-budget start-fresh recovery remains documented. |
 
 ## 4.11: Preserve continuation at the count limit
-
 ### Subtasks
 
 - [x] Distinguish exact-limit natural completion from limit-plus-one continuation
@@ -508,7 +500,6 @@ Historical independent pagination fix. Its evidence is preserved but it is not p
 | Focused quality review | Complete task 4.11 diff | PASS/Aligned | Count-limit continuation, search pagination, and byte-starved start-fresh recovery were reviewed for correctness, scope, tests, maintainability, and task boundary. |
 
 ## 4.12: Report the applied config provenance in status
-
 ### Subtasks
 
 - [x] Store the applied config path/provenance with indexed server state
@@ -542,11 +533,9 @@ Historical status-reporting fix. It does not reintroduce configuration provenanc
 | Focused quality review | Complete task 4.12 diff | PASS/Aligned | Applied-config publication locking and ordering were reviewed for correctness, scope, tests, maintainability, and task boundary. |
 
 ## Historical Implementation Note
-
 Tasks 4.1–4.12 and their evidence record the superseded implementation through `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`. They do not satisfy the replacement acceptance criteria below; task 4.15 removes their queue-related behavior before task 4.16 builds the smaller design.
 
 ## 4.15: Rollback superseded Phase 4 implementation
-
 ### Subtasks
 
 - [ ] Remove the uncommitted Phase 4.13/4.14 work and the committed generic scheduler, async-community route, generic polling/projections, config-provenance coalescing, and `coalesced_by` behavior through a clean implementation revision; do not rewrite published history.
@@ -563,7 +552,6 @@ Revision boundary: a clean, buildable Phase-3-plus-pre-Phase-4 baseline. This ta
 Pending — not complete.
 
 ## 4.16: Implement analyze-only path-compacting FIFO
-
 ### Subtasks
 
 - [ ] Add an analyze-only pending FIFO with at most 32 entries **after** compaction; never alter, attach to, upgrade, or replace the running scan.
@@ -584,8 +572,74 @@ Do not compact against the running scan. It has already chosen its path and forc
 
 Pending — not complete.
 
-## Acceptance Criteria
+## 4.17: Exercise queue semantics through live daemon clients
+### Subtasks
 
+- [x] Extend the daemon-proxy test harness with deterministic slow-analysis coordination and independent live client requests, preserving process cleanup on every assertion path.
+- [x] Drive pending follower absorption and incoming-ancestor replacement from separate clients; assert the earliest-displaced FIFO position, force OR, and the satisfying terminal result or error for every synchronous follower.
+- [x] Fill the pending queue through live clients, prove post-compaction followers do not consume a slot, and assert the distinct 33rd pending analyze receives the retryable queue-full error without starting a worker.
+- [x] Start shutdown with queued work and prove the daemon drains the canonical pending scans before runtime cleanup, without orphaned daemon processes.
+- [x] Run focused daemon-proxy, full MCP, workspace structural, and hygiene verification.
+
+### Notes
+
+Revision boundary: transport-level acceptance coverage for the committed analyze-only queue, without changing its queue algorithm, MCP response shapes, or daemon lifecycle implementation. The tests must use distinct live proxy clients against one repository-local daemon; direct `ServerInner` tests do not prove the proxy/daemon boundary shares the slot.
+
+### Trap
+
+Do not make these tests pass by issuing requests serially from one client or by inspecting internal queue state. The regression risk is cross-client admission through the daemon transport, so assertions must be driven by observable MCP results, status snapshots, runtime cleanup, and process ownership.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Focused review: `git show 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp --test daemon_proxy && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: 18 daemon-proxy tests (including all three live queue tests) and the full code-graph-mcp suite passed; formatting and warning-deny clippy passed; verify confirmed clean snapshots and synchronized plugin mirrors; git diff --check reported no whitespace errors. The known query-perf and server doctests remained ignored.` |
+
+### Subtasks
+
+- [ ] Extend the daemon-proxy test harness with deterministic slow-analysis coordination and independent live client requests, preserving process cleanup on every assertion path.
+- [ ] Drive pending follower absorption and incoming-ancestor replacement from separate clients; assert the earliest-displaced FIFO position, force OR, and the satisfying terminal result or error for every synchronous follower.
+- [ ] Fill the pending queue through live clients, prove post-compaction followers do not consume a slot, and assert the distinct 33rd pending analyze receives the retryable queue-full error without starting a worker.
+- [ ] Start shutdown with queued work and prove the daemon drains the canonical pending scans before runtime cleanup, without orphaned daemon processes.
+- [ ] Run focused daemon-proxy, full MCP, workspace structural, and hygiene verification.
+
+### Notes
+
+Revision boundary: transport-level acceptance coverage for the committed analyze-only queue, without changing its queue algorithm, MCP response shapes, or daemon lifecycle implementation. The tests must use distinct live proxy clients against one repository-local daemon; direct `ServerInner` tests do not prove the proxy/daemon boundary shares the slot.
+
+### Trap
+
+Do not make these tests pass by issuing requests serially from one client or by inspecting internal queue state. The regression risk is cross-client admission through the daemon transport, so assertions must be driven by observable MCP results, status snapshots, runtime cleanup, and process ownership.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Focused review: `git show 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `git show --check 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2` | `.` | PASS (`exit 0`) | `PASS: committed task diff is limited to daemon-proxy live queue coverage and debug-only test coordination, with no whitespace errors; reviewed candidate/final is 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git status --short` | `Source-identity recheck after implementation commit` | PASS | `Only the task lifecycle artifact remains modified; implementation commit is 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2.` |
+
+## Acceptance Criteria
 - [ ] **AC-50**: Analyze requests queue without concurrent execution, with at most 32 pending analyze entries after compaction. The running scan is unchanged and a distinct 33rd pending analyze gets a retryable queue-full error. (FR-41)
 - [ ] **AC-51**: Canonical-path compaction absorbs a request under an equal/ancestor pending path, replaces queued descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order; configuration identity/provenance does not participate. (FR-42)
 - [ ] **AC-52**: Every follower receives the satisfying compacted scan terminal result or error, and no merged force request is lost because effective force is logical OR. No generic projection or `coalesced_by` field is required. (FR-43)
@@ -594,5 +648,4 @@ Pending — not complete.
 - [ ] **AC-27**: `make verify` passes. (NFR-04)
 
 ## Phase Completion Evidence
-
 Pending — not complete.
