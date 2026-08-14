@@ -118,10 +118,10 @@ pub struct AnalyzeJobView {
     pub job_id: String,
     /// `"running"` | `"completed"` | `"failed"`.
     pub status: String,
-    /// User-supplied path that was indexed (as passed to the
-    /// originating `analyze_codebase` / `analyze_codebase_async`).
+    /// Canonical invocation path selected for this scan.
     pub path: String,
-    /// `force` flag the originating call used.
+    /// Effective force for this scan, including any force request merged
+    /// from pending followers before it started.
     pub force: bool,
     /// RFC3339 UTC timestamp of kickoff.
     pub started_at: String,
@@ -178,7 +178,7 @@ impl AnalyzeJobView {
             job_id: job.job_id.clone(),
             status,
             path: job.path.clone(),
-            force: job.force,
+            force: job.force || state.forced_by_follower,
             started_at: format_unix_nanos_rfc3339(job.started_at),
             finished_at: state.finished_at.map(format_unix_nanos_rfc3339),
             progress: state.progress,

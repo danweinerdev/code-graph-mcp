@@ -387,8 +387,8 @@ impl Drop for WatchCleanupGuard {
 ///   for the duration of the query and serialize the response.
 /// - [`Self::index_lock`] uses `tokio::sync::Mutex` because
 ///   `analyze_codebase` is async and the lock guard must cross await
-///   points. `try_lock` returns "indexing already in progress" matching
-///   Go behavior.
+///   points. The analyze-only slot serializes analyze work; this lock only
+///   serializes the active worker against watch reindexing.
 /// - [`Self::indexed`] is an `AtomicBool` so [`CodeGraphServer::require_indexed`]
 ///   can check the flag with no lock acquisition.
 pub struct ServerInner {
@@ -399,10 +399,9 @@ pub struct ServerInner {
     /// `true` after at least one successful `analyze_codebase`. Read by
     /// [`CodeGraphServer::require_indexed`] without taking a lock.
     pub indexed: AtomicBool,
-    /// Single-flight guard for `analyze_codebase`. `try_lock` returns
-    /// "indexing already in progress" identical to the Go behavior; the
-    /// watch loop's `reindex_file` also acquires this lock to
-    /// close the analyze-vs-watch merge race the Go implementation has.
+    /// Serializes the active analyze worker against the watch loop's
+    /// `reindex_file` to close their merge race. The analyze slot, not this
+    /// lock, serializes one running worker plus pending analyzes.
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
@@ -1177,7 +1176,7 @@ impl CodeGraphServer {
     // -- P0 -----------------------------------------------------------------
 
     #[tool(
-        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools."
+        description = "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools. `path` is required; `force` is optional (default false) and bypasses the cache. Concurrent analyzes are serialized: the running scan is unchanged, while pending canonical paths compact by containment and OR `force`; this synchronous call waits for its satisfying terminal `{ files, symbols, edges, root_path, warnings }` result or error."
     )]
     async fn analyze_codebase(
         &self,
@@ -1210,10 +1209,11 @@ impl CodeGraphServer {
                        (optional, default false — full re-index ignoring the cache). \
                        Response shape: \
                        `{ job_id, status, started_at, existing, note }`. `job_id` is \
-                       a 20-char zero-padded nanosecond timestamp unique-by-construction \
-                       under single-flight; `status` is always the literal \
-                       `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
-                       `existing` is the duplicate-call discriminator (see below); \
+                        the 20-char zero-padded decimal ID of the canonical pending scan \
+                        (distinct canonical scans are unique; absorbed callers share the \
+                        coverer's ID); `status` is always the literal \
+                        `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
+                        `existing` is false for every accepted request; \
                        `note` is a short human-readable hint. **Polling pattern:** \
                        call `get_status` and read the `analyze_job` field. Poll \
                        while `analyze_job.status == \"running\"`; once it flips to \
@@ -1229,17 +1229,17 @@ impl CodeGraphServer {
                        `analyze_job_previous_terminal` for exactly ONE additional \
                        kickoff — if you start a new analyze before reading the \
                        prior terminal, the prior result is still recoverable for \
-                       that one rotation, after which it is gone. **Duplicate \
-                       kickoff (`existing: true`):** if a job is already in \
-                       flight when this is called, the response returns that \
-                       job's `job_id` and `started_at` with `existing: true` \
-                       (NOT a new job_id; NOT an error). Args of the duplicate \
-                       call — including `path` and `force` — are IGNORED; if \
-                       `force` is required, wait for the in-flight job to \
-                       terminate (poll `get_status`) and call again. Sync \
-                       `analyze_codebase` called against a `Running` slot \
-                       continues to error with `\"indexing already in progress\"` \
-                       — only async kickoff returns the duplicate-as-success."
+                        that one rotation, after which it is gone. **Concurrent \
+                        kickoff:** every arrival while a scan is running enters \
+                        the pending analyze-only FIFO; only pending canonical \
+                        paths compact, never the running scan. An equal or \
+                        descendant request follows its pending coverer; an \
+                        incoming ancestor replaces pending descendants at the \
+                        earliest displaced FIFO position; disjoint paths keep \
+                        FIFO order. The response still returns immediately and \
+                        callers poll the shared `analyze_job`; `force` is ORed \
+                        across compacted pending work. There is no contention \
+                        error or argument-ignored duplicate path."
     )]
     async fn analyze_codebase_async(
         &self,

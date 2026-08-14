@@ -4,7 +4,7 @@ expression: "tool_entry(\"analyze_codebase\")"
 ---
 {
   "name": "analyze_codebase",
-  "description": "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools.",
+  "description": "Index a codebase (C/C++, Rust, Go, Python, C#, Java) and build the code graph. Must be called before any query tools. `path` is required; `force` is optional (default false) and bypasses the cache. Concurrent analyzes are serialized: the running scan is unchanged, while pending canonical paths compact by containment and OR `force`; this synchronous call waits for its satisfying terminal `{ files, symbols, edges, root_path, warnings }` result or error.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {

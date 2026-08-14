@@ -33,7 +33,7 @@ use std::sync::Arc;
 use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::Graph;
 
-use crate::analyze_job::{AnalyzeJob, AnalyzePhase, JobStatus};
+use crate::analyze_job::{allocate_job_timestamp, AnalyzeJob, AnalyzePhase, JobStatus};
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
 use crate::handlers::status::format_unix_nanos_rfc3339;
@@ -118,7 +118,7 @@ pub(crate) async fn run_analyze_job(
     sink: Arc<dyn ProgressSink>,
 ) {
     let path_raw = job.path.clone();
-    let force = job.force;
+    let force = job.force();
 
     // A bound Linux daemon keeps logical paths for all index work, but must
     // reject the operation before its first filesystem lookup if that logical
@@ -661,6 +661,8 @@ pub(crate) fn finish_completed(job: &AnalyzeJob, result: AnalyzeResult) {
     s.progress_message = "Analyze complete".to_string();
     s.status = JobStatus::Completed(result);
     s.finished_at = Some(now_nanos_u64());
+    drop(s);
+    job.notify_terminal();
 }
 
 pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
@@ -672,6 +674,8 @@ pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
     let mut s = job.state.write();
     s.status = JobStatus::Failed(msg);
     s.finished_at = Some(now_nanos_u64());
+    drop(s);
+    job.notify_terminal();
 }
 
 /// `analyze_codebase` body.
@@ -692,30 +696,16 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
-    let _analyze_guard = inner
-        .persist
-        .begin_analyze()
-        .map_err(|message| ToolError(message.to_string()))?;
+    let path = canonicalize_admission_path(&inner, &path_raw)?;
+    let admission = admit_sync(&inner, path, force)?;
 
-    let job = {
-        let mut slot = inner.analyze_slot.write();
-        if let Some(cur) = &slot.current {
-            if matches!(cur.state.read().status, JobStatus::Running) {
-                drop(slot);
-                return Err(ToolError("indexing already in progress".to_string()));
-            }
+    let job = match admission {
+        SyncAdmission::RunNow { job, guard } => {
+            spawn_analyze_worker(Arc::clone(&inner), Arc::clone(&job), sink, guard);
+            AnalyzeJob::wait_for_terminal(job).await
         }
-        let started_at = now_nanos_u64();
-        let job_id = format!("{started_at:020}");
-        let job = AnalyzeJob::new_running(job_id, path_raw.clone(), force, started_at);
-        if let Some(prev) = slot.current.take() {
-            slot.previous_terminal = Some(prev);
-        }
-        slot.current = Some(Arc::clone(&job));
-        job
+        SyncAdmission::Follower(job) => AnalyzeJob::wait_for_terminal(job).await,
     };
-
-    run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink).await;
 
     let state = job.state.read();
     match &state.status {
@@ -732,9 +722,8 @@ pub async fn analyze_codebase(
 ///
 /// Identical slot protocol to [`analyze_codebase`] (Design Decision 1)
 /// except the worker is `tokio::spawn`ed and detached instead of
-/// `await`ed inline, and a duplicate kickoff against a `Running` slot is
-/// a SUCCESS (not an error — Design Decision 3) carrying the in-flight
-/// job's `job_id` with `existing: true`.
+/// `await`ed inline. Arrivals while work is active compact only against
+/// pending requests and return immediately.
 ///
 /// No progress sink parameter — async kickoff has no client-side
 /// progress channel; agents observe progress by polling `get_status`.
@@ -750,46 +739,16 @@ pub async fn analyze_codebase_async(
         return Err(ToolError("'path' is required".to_string()));
     }
 
-    enum Kickoff {
-        Existing { job_id: String, started_at: u64 },
-        New(Arc<AnalyzeJob>, crate::server::AnalyzeGuard),
-    }
-
-    let kickoff = {
-        let mut slot = inner.analyze_slot.write();
-        if let Some(cur) = &slot.current {
-            if matches!(cur.state.read().status, JobStatus::Running) {
-                let existing = Kickoff::Existing {
-                    job_id: cur.job_id.clone(),
-                    started_at: cur.started_at,
-                };
-                drop(slot);
-                existing
-            } else {
-                let guard = inner
-                    .persist
-                    .begin_analyze()
-                    .map_err(|message| ToolError(message.to_string()))?;
-                let job = install_new_running(&mut slot, path_raw.clone(), force);
-                Kickoff::New(job, guard)
-            }
-        } else {
-            let guard = inner
-                .persist
-                .begin_analyze()
-                .map_err(|message| ToolError(message.to_string()))?;
-            let job = install_new_running(&mut slot, path_raw.clone(), force);
-            Kickoff::New(job, guard)
-        }
-    };
+    let path = canonicalize_admission_path(&inner, &path_raw)?;
+    let kickoff = admit_async(&inner, path, force)?;
 
     match kickoff {
-        Kickoff::Existing { job_id, started_at } => Ok(ToolOk::Value(AsyncKickoffResponse {
+        Kickoff::Pending { job_id, started_at } => Ok(ToolOk::Value(AsyncKickoffResponse {
             job_id,
             status: "running",
             started_at: format_unix_nanos_rfc3339(started_at),
-            existing: true,
-            note: "analyze already in progress — args ignored; poll get_status for progress",
+            existing: false,
+            note: "analyze queued behind active work — poll get_status for progress and the terminal result",
         })),
         Kickoff::New(job, analyze_guard) => {
             let response = AsyncKickoffResponse {
@@ -802,17 +761,476 @@ pub async fn analyze_codebase_async(
             // Detach: the JoinHandle is dropped intentionally so the
             // worker outlives this call. Terminal state flows back
             // through `job.state`, observable via get_status.
-            tokio::spawn(async move {
-                let _analyze_guard = analyze_guard;
-                run_analyze_job(
-                    Arc::clone(&inner),
-                    Arc::clone(&job),
-                    Arc::new(NoopProgressSink),
-                )
-                .await;
-            });
+            spawn_analyze_worker(inner, job, Arc::new(NoopProgressSink), analyze_guard);
             Ok(ToolOk::Value(response))
         }
+    }
+}
+
+const MAX_PENDING_ANALYZES: usize = 32;
+
+enum SyncAdmission {
+    RunNow {
+        job: Arc<AnalyzeJob>,
+        guard: crate::server::AnalyzeGuard,
+    },
+    Follower(Arc<AnalyzeJob>),
+}
+
+enum Kickoff {
+    New(Arc<AnalyzeJob>, crate::server::AnalyzeGuard),
+    Pending { job_id: String, started_at: u64 },
+}
+
+enum PendingAdmission {
+    Canonical(Arc<AnalyzeJob>),
+    Attached(Arc<AnalyzeJob>),
+}
+
+fn canonicalize_admission_path(inner: &ServerInner, path_raw: &str) -> Result<String, ToolError> {
+    inner.ensure_daemon_root_current().map_err(ToolError)?;
+    paths::canonicalize(std::path::Path::new(path_raw))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| ToolError(format!("directory does not exist: {path_raw}")))
+}
+
+fn is_ancestor_or_equal(ancestor: &str, descendant: &str) -> bool {
+    std::path::Path::new(descendant).starts_with(std::path::Path::new(ancestor))
+}
+
+fn next_job(path: String, force: bool) -> Arc<AnalyzeJob> {
+    let started_at = allocate_job_timestamp();
+    AnalyzeJob::new_running(format!("{started_at:020}"), path, force, started_at)
+}
+
+/// Add a request to pending work. `current` is deliberately absent from this
+/// function: compaction never observes or mutates active work.
+fn compact_pending(
+    slot: &mut crate::analyze_job::AnalyzeSlot,
+    path: String,
+    force: bool,
+    guard: crate::server::AnalyzeGuard,
+) -> Result<PendingAdmission, ToolError> {
+    if let Some(entry) = slot
+        .pending
+        .iter()
+        .find(|entry| is_ancestor_or_equal(&entry.job.path, &path))
+    {
+        entry.job.or_force(force);
+        return Ok(PendingAdmission::Attached(Arc::clone(&entry.job)));
+    }
+
+    let descendants: Vec<usize> = slot
+        .pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| is_ancestor_or_equal(&path, &entry.job.path).then_some(index))
+        .collect();
+    if descendants.is_empty() && slot.pending.len() == MAX_PENDING_ANALYZES {
+        return Err(ToolError(
+            "analyze queue is full; retry after a pending analyze completes".to_string(),
+        ));
+    }
+
+    let job = next_job(path, force);
+    if descendants.is_empty() {
+        slot.pending.push_back(crate::analyze_job::PendingAnalyze {
+            job: Arc::clone(&job),
+            guard,
+        });
+        return Ok(PendingAdmission::Canonical(job));
+    }
+
+    let first = descendants[0];
+    let mut removed = Vec::with_capacity(descendants.len());
+    for index in descendants.into_iter().rev() {
+        removed.push(
+            slot.pending
+                .remove(index)
+                .expect("pending index came from queue"),
+        );
+    }
+    for displaced in removed {
+        job.or_force(displaced.job.force());
+        displaced.job.replace_with(Arc::clone(&job));
+        slot.aliases
+            .insert(displaced.job.job_id.clone(), job.job_id.clone());
+        for alias in slot.aliases.values_mut() {
+            if alias == &displaced.job.job_id {
+                *alias = job.job_id.clone();
+            }
+        }
+        // Dropping the displaced guard is correct: the replacement's guard
+        // now accounts for this compacted canonical work.
+    }
+    slot.pending.insert(
+        first,
+        crate::analyze_job::PendingAnalyze {
+            job: Arc::clone(&job),
+            guard,
+        },
+    );
+    Ok(PendingAdmission::Canonical(job))
+}
+
+fn admit_sync(
+    inner: &Arc<ServerInner>,
+    path: String,
+    force: bool,
+) -> Result<SyncAdmission, ToolError> {
+    let mut slot = inner.analyze_slot.write();
+    if slot
+        .current
+        .as_ref()
+        .is_some_and(|job| matches!(job.state.read().status, JobStatus::Running))
+        || !slot.pending.is_empty()
+    {
+        let guard = inner
+            .persist
+            .begin_analyze()
+            .map_err(|message| ToolError(message.to_string()))?;
+        let job = match compact_pending(&mut slot, path, force, guard)? {
+            PendingAdmission::Canonical(job) | PendingAdmission::Attached(job) => job,
+        };
+        return Ok(SyncAdmission::Follower(job));
+    }
+    let guard = inner
+        .persist
+        .begin_analyze()
+        .map_err(|message| ToolError(message.to_string()))?;
+    let job = install_new_running(&mut slot, path, force);
+    Ok(SyncAdmission::RunNow { job, guard })
+}
+
+fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Kickoff, ToolError> {
+    let mut slot = inner.analyze_slot.write();
+    if slot
+        .current
+        .as_ref()
+        .is_some_and(|job| matches!(job.state.read().status, JobStatus::Running))
+        || !slot.pending.is_empty()
+    {
+        let guard = inner
+            .persist
+            .begin_analyze()
+            .map_err(|message| ToolError(message.to_string()))?;
+        return match compact_pending(&mut slot, path, force, guard)? {
+            PendingAdmission::Canonical(job) => Ok(Kickoff::Pending {
+                job_id: job.job_id.clone(),
+                started_at: job.started_at,
+            }),
+            PendingAdmission::Attached(target) => Ok(Kickoff::Pending {
+                job_id: target.job_id.clone(),
+                started_at: target.started_at,
+            }),
+        };
+    }
+    let guard = inner
+        .persist
+        .begin_analyze()
+        .map_err(|message| ToolError(message.to_string()))?;
+    let job = install_new_running(&mut slot, path, force);
+    Ok(Kickoff::New(job, guard))
+}
+
+fn spawn_analyze_worker(
+    inner: Arc<ServerInner>,
+    job: Arc<AnalyzeJob>,
+    sink: Arc<dyn ProgressSink>,
+    guard: crate::server::AnalyzeGuard,
+) {
+    tokio::spawn(async move {
+        run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink).await;
+        drop(guard);
+        if let Some(next) = promote_next(&inner, &job) {
+            spawn_pending_worker(inner, next);
+        }
+    });
+}
+
+fn promote_next(
+    inner: &ServerInner,
+    completed: &Arc<AnalyzeJob>,
+) -> Option<crate::analyze_job::PendingAnalyze> {
+    let mut slot = inner.analyze_slot.write();
+    if !slot
+        .current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, completed))
+    {
+        return None;
+    }
+    slot.aliases.retain(|_, target| target != &completed.job_id);
+    let next = slot.pending.pop_front()?;
+    slot.previous_terminal = slot.current.replace(Arc::clone(&next.job));
+    Some(next)
+}
+
+fn spawn_pending_worker(inner: Arc<ServerInner>, pending: crate::analyze_job::PendingAnalyze) {
+    spawn_analyze_worker(
+        inner,
+        pending.job,
+        Arc::new(NoopProgressSink),
+        pending.guard,
+    );
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use crate::analyze_job::AnalyzeSlot;
+    use code_graph_lang::LanguageRegistry;
+
+    fn server() -> crate::server::CodeGraphServer {
+        crate::server::CodeGraphServer::new(LanguageRegistry::new())
+    }
+
+    fn pending_paths(slot: &AnalyzeSlot) -> Vec<String> {
+        slot.pending
+            .iter()
+            .map(|pending| pending.job.path.clone())
+            .collect()
+    }
+
+    fn queue(server: &crate::server::CodeGraphServer, path: &str, force: bool) -> Arc<AnalyzeJob> {
+        let guard = server.inner.persist.begin_analyze().unwrap();
+        compact_pending(
+            &mut server.inner.analyze_slot.write(),
+            path.to_string(),
+            force,
+            guard,
+        )
+        .map(|admission| match admission {
+            PendingAdmission::Canonical(job) | PendingAdmission::Attached(job) => job,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_compaction_absorbs_followers_or_force_and_preserves_disjoint_fifo() {
+        let server = server();
+        let a = queue(&server, "/queue/a", false);
+        let _b = queue(&server, "/queue/b", false);
+        let follower = queue(&server, "/queue/a/child", true);
+
+        assert!(Arc::ptr_eq(&a, &follower));
+        assert!(
+            a.force(),
+            "follower force must OR into pending canonical job"
+        );
+        assert_eq!(
+            pending_paths(&server.inner.analyze_slot.read()),
+            ["/queue/a", "/queue/b"]
+        );
+    }
+
+    #[test]
+    fn incoming_ancestor_replaces_descendants_at_earliest_fifo_position() {
+        let server = server();
+        let before = queue(&server, "/queue/before", false);
+        let child = queue(&server, "/queue/root/child", false);
+        let grandchild = queue(&server, "/queue/root/other", true);
+        let after = queue(&server, "/queue/after", false);
+        let replacement = queue(&server, "/queue/root", false);
+
+        assert_eq!(
+            pending_paths(&server.inner.analyze_slot.read()),
+            ["/queue/before", "/queue/root", "/queue/after"]
+        );
+        assert!(
+            replacement.force(),
+            "displaced force must OR into replacement"
+        );
+        assert!(Arc::ptr_eq(
+            child
+                .state
+                .read()
+                .replacement
+                .as_ref()
+                .expect("displaced child must point at replacement"),
+            &replacement
+        ));
+        assert!(grandchild.state.read().replacement.is_some());
+        assert!(Arc::ptr_eq(&before, &queue_job(&server, 0)));
+        assert!(Arc::ptr_eq(&after, &queue_job(&server, 2)));
+    }
+
+    fn queue_job(server: &crate::server::CodeGraphServer, index: usize) -> Arc<AnalyzeJob> {
+        Arc::clone(&server.inner.analyze_slot.read().pending[index].job)
+    }
+
+    #[tokio::test]
+    async fn followers_receive_terminal_success_and_failure() {
+        let success = AnalyzeJob::new_running("success".into(), "/queue/success".into(), false, 0);
+        let success_follower = Arc::clone(&success);
+        finish_completed(
+            &success,
+            AnalyzeResult {
+                files: 1,
+                symbols: 2,
+                edges: 3,
+                root_path: "/queue/success".into(),
+                warnings: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            AnalyzeJob::wait_for_terminal(success_follower)
+                .await
+                .state
+                .read()
+                .status,
+            JobStatus::Completed(_)
+        ));
+
+        let failed = AnalyzeJob::new_running("failed".into(), "/queue/failed".into(), false, 0);
+        let failed_follower = Arc::clone(&failed);
+        finish_failed(&failed, "expected failure".into());
+        let failed_terminal = AnalyzeJob::wait_for_terminal(failed_follower).await;
+        assert!(matches!(
+            &failed_terminal.state.read().status,
+            JobStatus::Failed(message) if message == "expected failure"
+        ));
+    }
+
+    #[test]
+    fn post_compaction_cap_rejects_distinct_thirty_third_pending_request() {
+        let server = server();
+        for index in 0..MAX_PENDING_ANALYZES {
+            queue(&server, &format!("/queue/{index}"), false);
+        }
+        let guard = server.inner.persist.begin_analyze().unwrap();
+        let error = match compact_pending(
+            &mut server.inner.analyze_slot.write(),
+            "/queue/distinct".into(),
+            false,
+            guard,
+        ) {
+            Ok(_) => panic!("33rd distinct pending request must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.0.contains("queue is full"));
+        assert_eq!(
+            server.inner.analyze_slot.read().pending.len(),
+            MAX_PENDING_ANALYZES
+        );
+
+        let covered = queue(&server, "/queue/0/nested", true);
+        assert_eq!(
+            server.inner.analyze_slot.read().pending.len(),
+            MAX_PENDING_ANALYZES
+        );
+        assert!(covered.force());
+    }
+
+    #[test]
+    fn running_job_is_not_considered_by_pending_compaction() {
+        let server = server();
+        let running = AnalyzeJob::new_running("running".into(), "/queue/root".into(), false, 0);
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&running));
+
+        let queued = queue(&server, "/queue/root/child", true);
+        assert_eq!(running.path, "/queue/root");
+        assert!(!running.force());
+        assert_eq!(queued.path, "/queue/root/child");
+        assert!(queued.force());
+    }
+
+    #[test]
+    fn terminal_current_does_not_allow_new_work_to_overtake_pending_fifo() {
+        let server = server();
+        let terminal =
+            AnalyzeJob::new_running("terminal".into(), "/queue/current".into(), false, 0);
+        finish_completed(
+            &terminal,
+            AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/queue/current".into(),
+                warnings: Vec::new(),
+            },
+        );
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&terminal));
+        let first = queue(&server, "/queue/first", false);
+        let second = queue(&server, "/queue/second", false);
+
+        let third = match admit_sync(&server.inner, "/queue/third".into(), false).unwrap() {
+            SyncAdmission::Follower(job) => job,
+            SyncAdmission::RunNow { .. } => {
+                panic!("terminal current must not overtake pending FIFO")
+            }
+        };
+        assert_eq!(
+            pending_paths(&server.inner.analyze_slot.read()),
+            ["/queue/first", "/queue/second", "/queue/third"]
+        );
+        let promoted = promote_next(&server.inner, &terminal).expect("promote FIFO head");
+        assert!(Arc::ptr_eq(&promoted.job, &first));
+        assert!(Arc::ptr_eq(
+            server
+                .inner
+                .analyze_slot
+                .read()
+                .current
+                .as_ref()
+                .expect("promoted job is current"),
+            &first
+        ));
+        assert!(Arc::ptr_eq(&queue_job(&server, 0), &second));
+        assert!(Arc::ptr_eq(&queue_job(&server, 1), &third));
+    }
+
+    #[test]
+    fn aliases_repoint_on_replacement_and_clear_when_satisfied() {
+        let server = server();
+        let running = AnalyzeJob::new_running("running".into(), "/queue/current".into(), false, 0);
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&running));
+
+        let child = match admit_async(&server.inner, "/queue/root/child".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("running work must queue incoming work"),
+        };
+        let follower = match admit_async(&server.inner, "/queue/root/child/grandchild".into(), true)
+            .unwrap()
+        {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("covered work must remain pending"),
+        };
+        let replacement = match admit_async(&server.inner, "/queue/root".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("ancestor must replace pending descendants"),
+        };
+        {
+            let slot = server.inner.analyze_slot.read();
+            assert_eq!(follower, child, "absorbed async work shares canonical ID");
+            assert_eq!(slot.aliases.get(&child), Some(&replacement));
+            assert_eq!(slot.aliases.len(), 1, "only displaced canonical jobs alias");
+        }
+
+        finish_completed(
+            &running,
+            AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/queue/current".into(),
+                warnings: Vec::new(),
+            },
+        );
+        let pending = promote_next(&server.inner, &running).expect("replacement promotes");
+        assert_eq!(pending.job.job_id, replacement);
+        finish_completed(
+            &pending.job,
+            AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/queue/root".into(),
+                warnings: Vec::new(),
+            },
+        );
+        assert!(promote_next(&server.inner, &pending.job).is_none());
+        assert!(server.inner.analyze_slot.read().aliases.is_empty());
     }
 }
 
@@ -825,9 +1243,7 @@ fn install_new_running(
     path: String,
     force: bool,
 ) -> Arc<AnalyzeJob> {
-    let started_at = now_nanos_u64();
-    let job_id = format!("{started_at:020}");
-    let job = AnalyzeJob::new_running(job_id, path, force, started_at);
+    let job = next_job(path, force);
     if let Some(prev) = slot.current.take() {
         slot.previous_terminal = Some(prev);
     }
@@ -1058,6 +1474,44 @@ mod tests {
             !code_graph_graph::cache_path(&relocated).exists(),
             "replacement symbols must not be persisted into the retained root"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_admission_rejects_replaced_daemon_root_before_canonicalization() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "code-graph-async-analyze-replaced-root-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let server = crate::server::CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        server.bind_daemon_project_root(root.clone()).unwrap();
+        let retained_root = std::fs::File::open(&root).unwrap();
+        server
+            .bind_daemon_retained_root(&retained_root.metadata().unwrap())
+            .unwrap();
+
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let result = analyze_codebase_async(
+            Arc::clone(&server.inner),
+            root.to_string_lossy().into_owned(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ToolError(message)) if message.contains("project root was replaced")),
+            "async admission must reject before canonicalizing the replacement root"
+        );
+        assert!(server.inner.analyze_slot.read().current.is_none());
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(relocated).unwrap();

@@ -131,7 +131,7 @@ async fn analyze_then_query_pipeline() {
 // -------- concurrent analyze single-flight ------------------------------
 
 #[tokio::test]
-async fn concurrent_analyze_returns_indexing_in_progress() {
+async fn concurrent_analyze_requests_are_serialized() {
     // Build two servers sharing the same `Arc<ServerInner>` so the
     // index_lock is the actual shared lock under test. (Two distinct
     // servers would each hold their own lock and the test would race
@@ -150,34 +150,22 @@ async fn concurrent_analyze_returns_indexing_in_progress() {
     let inner_b = inner.clone();
     let path_b = path.clone();
 
-    // Drive both calls concurrently. The handler holds index_lock across
-    // its full async path, so whichever call grabs the lock first
-    // succeeds; the other immediately errors.
+    // Drive both calls concurrently. The second waits behind the active
+    // scan and receives its own ordinary terminal result.
     let (a, b) = tokio::join!(
         async move { analyze_codebase(inner_a, path_a, true, None, None).await },
         async move { analyze_codebase(inner_b, path_b, true, None, None).await }
     );
 
-    let a_err = a.is_error == Some(true);
-    let b_err = b.is_error == Some(true);
-    let errored = if a_err { &a } else { &b };
-    let succeeded = if a_err { &b } else { &a };
-
-    // Exactly one error and one success. A reverse outcome (both Ok or
-    // both errors) means the single-flight gate failed.
-    assert!(
-        a_err ^ b_err,
-        "exactly one call must error; got a_err={a_err} b_err={b_err}",
-    );
-
-    // The error must carry the single-flight wording byte-for-byte.
-    let body = first_text(errored);
-    assert_eq!(body, "indexing already in progress", "got: {body}");
-
-    // The successful call returns a populated AnalyzeResult.
-    let body = first_text(succeeded);
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(parsed["files"].as_u64().unwrap() > 0);
+    for result in [&a, &b] {
+        assert!(
+            result.is_error.is_none() || result.is_error == Some(false),
+            "queued analyze must return a terminal result: {}",
+            first_text(result)
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&first_text(result)).unwrap();
+        assert!(parsed["files"].as_u64().unwrap() > 0);
+    }
 }
 
 // -------- bad-path errors ------------------------------------------------

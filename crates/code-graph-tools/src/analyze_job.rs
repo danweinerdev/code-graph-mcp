@@ -11,6 +11,8 @@
 //! - `JobStatus` tags the state machine: Running → Completed(result)
 //!   or Failed(msg).
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
@@ -25,14 +27,54 @@ use crate::handlers::analyze::AnalyzeResult;
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
+    /// Canonical analyze requests waiting behind `current`. This is
+    /// deliberately analyze-specific: it is not a general job scheduler.
+    pub(crate) pending: VecDeque<PendingAnalyze>,
+    /// Async IDs absorbed by pending compaction. They are intentionally
+    /// internal: status continues to expose only `current`.
+    pub(crate) aliases: HashMap<String, String>,
+}
+
+/// One process-wide, collision-safe source for the 20-digit decimal IDs
+/// exposed by analyze kickoff. It advances from wall-clock nanoseconds so
+/// ordinary IDs retain their timestamp ordering while rapid queued admissions
+/// cannot reuse one value.
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn allocate_job_timestamp() -> u64 {
+    loop {
+        let now = crate::handlers::analyze::now_nanos_u64();
+        let previous = NEXT_JOB_ID.load(Ordering::Relaxed);
+        let next = now.max(
+            previous
+                .checked_add(1)
+                .expect("analyze job ID space exhausted"),
+        );
+        if NEXT_JOB_ID
+            .compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+/// One canonical pending scan. Its guard is acquired at admission, not when
+/// promoted, so daemon shutdown accounts for queued work and cannot let it
+/// escape the drain.
+pub(crate) struct PendingAnalyze {
+    pub(crate) job: Arc<AnalyzeJob>,
+    pub(crate) guard: crate::server::AnalyzeGuard,
 }
 
 pub(crate) struct AnalyzeJob {
     pub(crate) job_id: String,
     pub(crate) path: String,
+    /// Original request force, retained for the existing status view.
     pub(crate) force: bool,
     pub(crate) started_at: u64,
     pub(crate) state: PlRwLock<JobMutableState>,
+    terminal: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -42,6 +84,9 @@ pub(crate) struct JobMutableState {
     pub(crate) progress: u32,
     pub(crate) progress_total: u32,
     pub(crate) progress_message: String,
+    /// Force requested by a follower while this job remained pending. A
+    /// running job is never compacted or upgraded.
+    pub(crate) forced_by_follower: bool,
     /// Active indexing phase. `None` until the worker enters its first
     /// phase (post-config-load). Independent of [`JobStatus`] — that
     /// field carries Running/Completed/Failed; this field names which
@@ -60,6 +105,10 @@ pub(crate) struct JobMutableState {
     /// the last set value was — clients reading `status == "completed"`
     /// (or "failed") should treat `current_phase` as historical.
     pub(crate) current_phase: Option<AnalyzePhase>,
+    /// Set only when a pending canonical request is replaced by a broader
+    /// pending request. The old job is never executed; callers follow this
+    /// internal link to the scan that satisfies them.
+    pub(crate) replacement: Option<Arc<AnalyzeJob>>,
 }
 
 #[derive(Default)]
@@ -127,7 +176,56 @@ impl AnalyzeJob {
             force,
             started_at,
             state: PlRwLock::new(JobMutableState::default()),
+            terminal: tokio::sync::Notify::new(),
         })
+    }
+
+    pub(crate) fn force(&self) -> bool {
+        self.force || self.state.read().forced_by_follower
+    }
+
+    /// A compacted scan must retain every request's invalidation intent.
+    pub(crate) fn or_force(&self, force: bool) {
+        if force {
+            self.state.write().forced_by_follower = true;
+        }
+    }
+
+    pub(crate) fn notify_terminal(&self) {
+        self.terminal.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_terminal(mut job: Arc<Self>) -> Arc<Self> {
+        loop {
+            // Arm before inspecting mutable state. `Notify` does not retain
+            // notifications for a future waiter, so checking first could lose
+            // a terminal transition in the check-to-await window.
+            let next = {
+                let observed = Arc::clone(&job);
+                let notified = observed.terminal.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let next = {
+                    let state = observed.state.read();
+                    if state.is_terminal() {
+                        return Arc::clone(&job);
+                    }
+                    state.replacement.clone()
+                };
+                if next.is_none() {
+                    notified.await;
+                }
+                next
+            };
+            if let Some(next) = next {
+                job = next;
+            }
+        }
+    }
+
+    pub(crate) fn replace_with(&self, replacement: Arc<AnalyzeJob>) {
+        self.state.write().replacement = Some(replacement);
+        self.notify_terminal();
     }
 
     /// Transition the job into a new indexing phase atomically with
