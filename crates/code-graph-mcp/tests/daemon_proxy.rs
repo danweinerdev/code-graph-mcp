@@ -19,6 +19,8 @@ use code_graph_graph::Graph;
 use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PROCESS_TEST_SERIALIZATION: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -74,13 +76,37 @@ impl Drop for TestRoot {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|metadata| metadata["pid"].as_u64().map(|pid| pid as u32));
-        if let Some(pid) = tracked.or(published) {
-            let _ = Command::new("kill")
-                .args(["-INT", &pid.to_string()])
-                .status();
-            thread::sleep(Duration::from_millis(50));
+        let mut pids: Vec<_> = [tracked, published].into_iter().flatten().collect();
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
+            reap_process_bounded(pid);
         }
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Releases a debug-only held persist even when a test assertion panics.
+/// Instances must be declared after their [`TestRoot`] so this drop runs
+/// before `TestRoot` asks the daemon to drain during cleanup.
+#[cfg(debug_assertions)]
+struct ReleaseMarker(PathBuf);
+
+#[cfg(debug_assertions)]
+impl ReleaseMarker {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn release(&self) {
+        let _ = fs::write(&self.0, b"release held persist\n");
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ReleaseMarker {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -343,6 +369,75 @@ fn wait_runtime_cleanup(root: &Path) {
     assert!(!lock.exists(), "daemon lock was cleaned up");
 }
 
+fn wait_for_path(path: &Path, description: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{description}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_marker_count(path: &Path, expected: usize, description: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let count = fs::read_to_string(path)
+            .map(|marker| marker.lines().count())
+            .unwrap_or(0);
+        if count >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{description}; observed {count} of {expected} pending admissions"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_async_admitted(response: &Value, description: &str) {
+    assert!(response["result"].is_object(), "{description}: {response}");
+    assert!(
+        response["result"].get("isError").is_none() || response["result"]["isError"] == false,
+        "{description} must not return a tool error: {response}"
+    );
+}
+
+fn async_job_id(response: &Value) -> String {
+    Client::text(response)["job_id"]
+        .as_str()
+        .expect("async kickoff job ID")
+        .to_owned()
+}
+
+fn wait_for_running_path(client: &mut Client, path: &Path) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = Client::text(&client.tool("get_status", json!({})));
+        let job = &status["analyze_job"];
+        if job["status"] == "running" && job["path"] == path.to_string_lossy().as_ref() {
+            return job.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not promote expected running path {}: {status}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + TIMEOUT;
+    while process_is_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon process {pid} did not exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn admitted_uds_connection(endpoint: &str) -> UnixStream {
     let mut stream = UnixStream::connect(endpoint).expect("connect UDS saturation holder");
@@ -426,7 +521,6 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
     }
 }
 
-#[cfg(debug_assertions)]
 fn process_is_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -434,6 +528,37 @@ fn process_is_alive(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Best-effort test-root cleanup. Do not propagate failures from `Drop`: a
+/// held queued persist can take longer than a graceful signal, so boundedly
+/// escalate to SIGKILL before removing the runtime directory.
+fn reap_process_bounded(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if wait_for_process_exit_bounded(pid, DROP_REAP_TIMEOUT) {
+        return;
+    }
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = wait_for_process_exit_bounded(pid, DROP_REAP_TIMEOUT);
+}
+
+fn wait_for_process_exit_bounded(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while process_is_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    true
 }
 
 #[test]
@@ -608,6 +733,444 @@ fn root_and_nested_clients_share_index_watch_and_async_slot() {
     b.close();
     stop_daemon(&metadata);
     wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let release_marker = root.0.join("persist-release.marker");
+    let release = ReleaseMarker::new(release_marker.clone());
+    let running = root.0.join("running");
+    let alpha_child = root.0.join("alpha/child");
+    let alpha_descendant = alpha_child.join("grandchild");
+    let alpha = root.0.join("alpha");
+    let alpha_sync = alpha.join("sync");
+    let beta = root.0.join("beta");
+    let malformed = root.0.join("malformed");
+    let malformed_follower = malformed.join("follower");
+    for directory in [
+        &running,
+        &alpha_descendant,
+        &alpha_sync,
+        &beta,
+        &malformed_follower,
+    ] {
+        fs::create_dir_all(directory).expect("create queue fixture directory");
+        fs::write(directory.join("fixture.rs"), "fn fixture() {}\n")
+            .expect("write queue fixture source");
+    }
+    let root_string = root.0.to_string_lossy().into_owned();
+    let admitted_marker = root.0.join("persist-admitted.marker");
+    let admitted_marker_string = admitted_marker.to_string_lossy().into_owned();
+    let release_marker_string = release_marker.to_string_lossy().into_owned();
+    let pending_marker = root.0.join("pending-admissions.marker");
+    let pending_marker_string = pending_marker.to_string_lossy().into_owned();
+    let mut status_client = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "3000"),
+            (
+                "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
+                &admitted_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PERSIST_RELEASE_MARKER",
+                &release_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PENDING_ADMISSION_MARKER",
+                &pending_marker_string,
+            ),
+        ],
+    )
+    .initialize();
+    let metadata = wait_metadata(&root);
+    let initial = status_client.tool(
+        "analyze_codebase_async",
+        json!({"path":running, "force":true}),
+    );
+    assert!(
+        initial["result"].is_object(),
+        "initial analyze starts: {initial}"
+    );
+    wait_for_path(
+        &admitted_marker,
+        "initial analyze did not reach the deterministic persist hold",
+    );
+    wait_for_running_path(&mut status_client, &running);
+
+    let mut child_client = Client::spawn(&root.0, &[]);
+    let child = child_client.tool(
+        "analyze_codebase_async",
+        json!({"path":alpha_child, "force":false}),
+    );
+    let child_id = async_job_id(&child);
+    child_client.close();
+
+    let mut beta_client = Client::spawn(&root.0, &[]);
+    let beta_kickoff = beta_client.tool(
+        "analyze_codebase_async",
+        json!({"path":beta, "force":false}),
+    );
+    let beta_id = async_job_id(&beta_kickoff);
+    beta_client.close();
+
+    let mut descendant_client = Client::spawn(&root.0, &[]);
+    let descendant = descendant_client.tool(
+        "analyze_codebase_async",
+        json!({"path":alpha_descendant, "force":true}),
+    );
+    assert_eq!(
+        async_job_id(&descendant),
+        child_id,
+        "a pending descendant is absorbed by its pending ancestor across clients"
+    );
+    descendant_client.close();
+
+    let mut ancestor_client = Client::spawn(&root.0, &[]);
+    let ancestor = ancestor_client.tool(
+        "analyze_codebase_async",
+        json!({"path":alpha, "force":false}),
+    );
+    let alpha_id = async_job_id(&ancestor);
+    assert_ne!(
+        alpha_id, child_id,
+        "incoming ancestor replaces pending child"
+    );
+    ancestor_client.close();
+
+    let success_root = root.0.clone();
+    let success_path = alpha_sync.clone();
+    let sync_success = thread::spawn(move || {
+        let mut client = Client::spawn(&success_root, &[]);
+        let response = client.tool(
+            "analyze_codebase",
+            json!({"path":success_path, "force":false}),
+        );
+        let stderr = client.close();
+        (response, stderr)
+    });
+
+    let mut malformed_client = Client::spawn(&root.0, &[]);
+    let malformed_kickoff = malformed_client.tool(
+        "analyze_codebase_async",
+        json!({"path":malformed, "force":false}),
+    );
+    assert!(
+        malformed_kickoff["result"].is_object(),
+        "malformed request is admitted behind held work: {malformed_kickoff}"
+    );
+    malformed_client.close();
+
+    let error_root = root.0.clone();
+    let error_path = malformed_follower.clone();
+    let sync_error = thread::spawn(move || {
+        let mut client = Client::spawn(&error_root, &[]);
+        let response = client.tool(
+            "analyze_codebase",
+            json!({"path":error_path, "force":false}),
+        );
+        let stderr = client.close();
+        (response, stderr)
+    });
+
+    wait_for_marker_count(
+        &pending_marker,
+        7,
+        "all cross-client pending requests did not reach serialized admission",
+    );
+    fs::write(malformed.join(".code-graph.toml"), "[daemon\n")
+        .expect("make canonical parent config malformed after follower admission");
+    fs::write(
+        malformed_follower.join(".code-graph.toml"),
+        "[daemon]\nenabled = true\n",
+    )
+    .expect("make child config valid after follower admission");
+    release.release();
+    let alpha_view = wait_for_running_path(&mut status_client, &alpha);
+    assert_eq!(alpha_view["job_id"], alpha_id);
+    assert_eq!(
+        alpha_view["force"], true,
+        "replacement retains the force from an absorbed pending descendant"
+    );
+    let (success, success_stderr) = sync_success.join().expect("sync success client joins");
+    assert!(
+        success_stderr.is_empty(),
+        "sync success proxy stderr: {success_stderr}"
+    );
+    let beta_view = wait_for_running_path(&mut status_client, &beta);
+    assert_eq!(beta_view["job_id"], beta_id);
+    assert_eq!(beta_view["force"], false);
+    let post_success_status = Client::text(&status_client.tool("get_status", json!({})));
+    assert_eq!(
+        post_success_status["analyze_job_previous_terminal"]["path"],
+        alpha.to_string_lossy().as_ref(),
+        "the synchronous follower completed on alpha before the next FIFO scan"
+    );
+    assert_eq!(
+        post_success_status["analyze_job_previous_terminal"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        Client::text(&success)["root_path"],
+        root.0.to_string_lossy().as_ref(),
+        "a synchronous pending follower receives the daemon's normal terminal success"
+    );
+    let (error, error_stderr) = sync_error.join().expect("sync error client joins");
+    assert!(
+        error_stderr.is_empty(),
+        "sync error proxy stderr: {error_stderr}"
+    );
+    assert_eq!(
+        error["result"]["isError"], true,
+        "follower receives tool error"
+    );
+    assert!(
+        error["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| {
+                text.contains("failed to parse .code-graph.toml")
+                    && !text.contains("daemon is bound to project root")
+            }),
+        "follower receives the canonical parent's parse failure, not the valid child's daemon-root error: {error}"
+    );
+
+    status_client.close();
+    stop_daemon(&metadata);
+    wait_runtime_cleanup(&root.0);
+    wait_for_process_exit(metadata["pid"].as_u64().expect("daemon pid") as u32);
+    root.disarm_daemon();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn live_proxy_queue_cap_keeps_covered_analyze_slot_free() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let release_marker = root.0.join("persist-release.marker");
+    let _release = ReleaseMarker::new(release_marker.clone());
+    let running = root.0.join("running");
+    fs::create_dir_all(&running).unwrap();
+    fs::write(running.join("fixture.rs"), "fn running() {}\n").unwrap();
+    let pending = root.0.join("pending");
+    for index in 0..33 {
+        let directory = pending.join(index.to_string());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("fixture.rs"),
+            format!("fn pending_{index}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let covered = pending.join("0/covered");
+    fs::create_dir_all(&covered).unwrap();
+    fs::write(covered.join("fixture.rs"), "fn covered() {}\n").unwrap();
+    let overflow = root.0.join("overflow");
+    fs::create_dir_all(&overflow).unwrap();
+    fs::write(overflow.join("fixture.rs"), "fn overflow() {}\n").unwrap();
+
+    let root_string = root.0.to_string_lossy().into_owned();
+    let admitted_marker = root.0.join("persist-admitted.marker");
+    let admitted_marker_string = admitted_marker.to_string_lossy().into_owned();
+    let release_marker_string = release_marker.to_string_lossy().into_owned();
+    let pending_marker = root.0.join("pending-admissions.marker");
+    let pending_marker_string = pending_marker.to_string_lossy().into_owned();
+    let mut holder = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "5000"),
+            (
+                "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
+                &admitted_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PERSIST_RELEASE_MARKER",
+                &release_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PENDING_ADMISSION_MARKER",
+                &pending_marker_string,
+            ),
+        ],
+    )
+    .initialize();
+    let metadata = wait_metadata(&root);
+    holder.tool(
+        "analyze_codebase_async",
+        json!({"path":running, "force":true}),
+    );
+    wait_for_path(
+        &admitted_marker,
+        "capacity holder did not reach the deterministic persist hold",
+    );
+    wait_for_running_path(&mut holder, &running);
+
+    let mut client = Client::spawn(&root.0, &[]);
+    let first = client.tool(
+        "analyze_codebase_async",
+        json!({"path":pending.join("0"), "force":false}),
+    );
+    assert_async_admitted(&first, "first of 32 distinct pending analyzes");
+    let first_id = async_job_id(&first);
+    for index in 1..32 {
+        let admitted = client.tool(
+            "analyze_codebase_async",
+            json!({"path":pending.join(index.to_string()), "force":false}),
+        );
+        assert_async_admitted(&admitted, &format!("pending analyze {index}"));
+    }
+    let covered_response = client.tool(
+        "analyze_codebase_async",
+        json!({"path":covered, "force":true}),
+    );
+    assert_async_admitted(&covered_response, "covered pending analyze at capacity");
+    assert_eq!(
+        async_job_id(&covered_response),
+        first_id,
+        "covered request shares the canonical pending scan rather than taking a slot"
+    );
+    wait_for_marker_count(
+        &pending_marker,
+        33,
+        "32 distinct and one covered pending analyze did not reach serialized admission",
+    );
+    let rejected = client.tool(
+        "analyze_codebase_async",
+        json!({"path":overflow, "force":false}),
+    );
+    assert_eq!(
+        rejected["result"]["isError"], true,
+        "33rd distinct request rejects"
+    );
+    assert!(
+        rejected["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("queue is full") && text.contains("retry")),
+        "overflow is retryable: {rejected}"
+    );
+    let running_view = wait_for_running_path(&mut holder, &running);
+    assert_eq!(
+        running_view["status"], "running",
+        "overflow did not start another worker while held work remains active"
+    );
+
+    client.close();
+    holder.close();
+    let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .expect("kill capacity daemon");
+    assert!(status.success(), "SIGKILL capacity daemon");
+    wait_for_process_exit(pid);
+    root.disarm_daemon();
+    let _ = fs::remove_file(root.0.join(".code-graph/daemon.json"));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn live_proxy_shutdown_drains_queued_analyzes_before_cleaning_runtime() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let release_marker = root.0.join("persist-release.marker");
+    let release = ReleaseMarker::new(release_marker.clone());
+    let running = root.0.join("running");
+    let alpha = root.0.join("alpha");
+    let beta = root.0.join("beta");
+    for (directory, function) in [
+        (&running, "running_before_shutdown"),
+        (&alpha, "alpha_before_shutdown"),
+        (&beta, "beta_before_shutdown"),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(
+            directory.join("fixture.rs"),
+            format!("fn {function}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let root_string = root.0.to_string_lossy().into_owned();
+    let admitted_marker = root.0.join("persist-admitted.marker");
+    let admitted_marker_string = admitted_marker.to_string_lossy().into_owned();
+    let release_marker_string = release_marker.to_string_lossy().into_owned();
+    let pending_marker = root.0.join("pending-admissions.marker");
+    let pending_marker_string = pending_marker.to_string_lossy().into_owned();
+    let mut holder = Client::launch_with_env(
+        &root.0,
+        &[],
+        &[
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "500"),
+            (
+                "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
+                &admitted_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PERSIST_RELEASE_MARKER",
+                &release_marker_string,
+            ),
+            (
+                "CODE_GRAPH_TEST_PENDING_ADMISSION_MARKER",
+                &pending_marker_string,
+            ),
+        ],
+    )
+    .initialize();
+    let metadata = wait_metadata(&root);
+    holder.tool(
+        "analyze_codebase_async",
+        json!({"path":running, "force":true}),
+    );
+    wait_for_path(
+        &admitted_marker,
+        "shutdown holder did not reach the deterministic persist hold",
+    );
+    wait_for_running_path(&mut holder, &running);
+
+    let mut alpha_client = Client::spawn(&root.0, &[]);
+    let alpha_kickoff = alpha_client.tool(
+        "analyze_codebase_async",
+        json!({"path":alpha, "force":false}),
+    );
+    assert_async_admitted(&alpha_kickoff, "first shutdown-drain pending analyze");
+    alpha_client.close();
+    let mut beta_client = Client::spawn(&root.0, &[]);
+    let beta_kickoff = beta_client.tool(
+        "analyze_codebase_async",
+        json!({"path":beta, "force":false}),
+    );
+    assert_async_admitted(&beta_kickoff, "second shutdown-drain pending analyze");
+    beta_client.close();
+    wait_for_marker_count(
+        &pending_marker,
+        2,
+        "queued shutdown-drain analyzes did not reach serialized admission",
+    );
+    holder.close();
+
+    release.release();
+    let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
+    stop_daemon(&metadata);
+    wait_runtime_cleanup(&root.0);
+    wait_for_process_exit(pid);
+    let mut graph = Graph::new();
+    assert!(
+        graph.load(&root.0).unwrap(),
+        "shutdown leaves a loadable cache"
+    );
+    assert_eq!(
+        graph.stats().files,
+        3,
+        "shutdown drained every queued canonical scope before its final cache save"
+    );
     root.disarm_daemon();
 }
 

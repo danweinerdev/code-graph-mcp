@@ -889,7 +889,10 @@ fn admit_sync(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let job = match compact_pending(&mut slot, path, force, guard)? {
+        let pending = compact_pending(&mut slot, path, force, guard)?;
+        #[cfg(debug_assertions)]
+        debug_record_pending_admission();
+        let job = match pending {
             PendingAdmission::Canonical(job) | PendingAdmission::Attached(job) => job,
         };
         return Ok(SyncAdmission::Follower(job));
@@ -914,7 +917,10 @@ fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Ki
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        return match compact_pending(&mut slot, path, force, guard)? {
+        let pending = compact_pending(&mut slot, path, force, guard)?;
+        #[cfg(debug_assertions)]
+        debug_record_pending_admission();
+        return match pending {
             PendingAdmission::Canonical(job) => Ok(Kickoff::Pending {
                 job_id: job.job_id.clone(),
                 started_at: job.started_at,
@@ -1291,10 +1297,43 @@ fn debug_delay_persist(dir: &std::path::Path) {
         return;
     };
     if std::path::Path::new(&root) == dir {
+        debug_wait_for_persist_release_marker();
         if let Ok(delay_millis) = delay_millis.parse::<u64>() {
             std::thread::sleep(std::time::Duration::from_millis(delay_millis));
         }
     }
+}
+
+/// Optional test-only gate for process-level daemon tests. The persistent
+/// marker makes the first held save observable without imposing a gate on
+/// production or ordinary debug executions; later saves pass once the test
+/// releases that same marker.
+#[cfg(debug_assertions)]
+fn debug_wait_for_persist_release_marker() {
+    let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PERSIST_RELEASE_MARKER") else {
+        return;
+    };
+    let marker = std::path::Path::new(&marker);
+    while !marker.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Append one line for every successful pending admission while the slot lock
+/// is still held. This is test-only transport coordination; no production
+/// behavior or MCP response depends on the marker.
+#[cfg(debug_assertions)]
+fn debug_record_pending_admission() {
+    use std::io::Write;
+
+    let Ok(marker) = std::env::var("CODE_GRAPH_TEST_PENDING_ADMISSION_MARKER") else {
+        return;
+    };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+        .and_then(|mut file| file.write_all(b"pending admission\n"));
 }
 
 #[cfg(debug_assertions)]
