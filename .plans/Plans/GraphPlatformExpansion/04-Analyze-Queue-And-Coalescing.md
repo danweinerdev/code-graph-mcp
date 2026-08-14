@@ -604,41 +604,6 @@ Do not make these tests pass by issuing requests serially from one client or by 
 |---|---|---|---|
 | `cargo test -p code-graph-mcp --test daemon_proxy && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: 18 daemon-proxy tests (including all three live queue tests) and the full code-graph-mcp suite passed; formatting and warning-deny clippy passed; verify confirmed clean snapshots and synchronized plugin mirrors; git diff --check reported no whitespace errors. The known query-perf and server doctests remained ignored.` |
 
-### Subtasks
-
-- [ ] Extend the daemon-proxy test harness with deterministic slow-analysis coordination and independent live client requests, preserving process cleanup on every assertion path.
-- [ ] Drive pending follower absorption and incoming-ancestor replacement from separate clients; assert the earliest-displaced FIFO position, force OR, and the satisfying terminal result or error for every synchronous follower.
-- [ ] Fill the pending queue through live clients, prove post-compaction followers do not consume a slot, and assert the distinct 33rd pending analyze receives the retryable queue-full error without starting a worker.
-- [ ] Start shutdown with queued work and prove the daemon drains the canonical pending scans before runtime cleanup, without orphaned daemon processes.
-- [ ] Run focused daemon-proxy, full MCP, workspace structural, and hygiene verification.
-
-### Notes
-
-Revision boundary: transport-level acceptance coverage for the committed analyze-only queue, without changing its queue algorithm, MCP response shapes, or daemon lifecycle implementation. The tests must use distinct live proxy clients against one repository-local daemon; direct `ServerInner` tests do not prove the proxy/daemon boundary shares the slot.
-
-### Trap
-
-Do not make these tests pass by issuing requests serially from one client or by inspecting internal queue state. The regression risk is cross-client admission through the daemon transport, so assertions must be driven by observable MCP results, status snapshots, runtime cleanup, and process ownership.
-
-### Completion Evidence
-
-- Verified: 2026-08-14
-- Repository: `.`
-- VCS: `git`
-- Revision / checkpoint: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
-- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
-- Focused review: `git show 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
-- Reviewed candidate / final: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
-- Review result: PASS/Aligned
-
-| Command | Working directory | Result | Observable evidence |
-|---|---|---|---|
-| `git show --check 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2` | `.` | PASS (`exit 0`) | `PASS: committed task diff is limited to daemon-proxy live queue coverage and debug-only test coordination, with no whitespace errors; reviewed candidate/final is 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2.` |
-
-| Tool / inspection | Context | Result | Observable evidence |
-|---|---|---|---|
-| `git status --short` | `Source-identity recheck after implementation commit` | PASS | `Only the task lifecycle artifact remains modified; implementation commit is 69850ab1a6af0531cbf2d1a0a876ef7a407b72a2.` |
-
 ## Acceptance Criteria
 - [ ] **AC-50**: Analyze requests queue without concurrent execution, with at most 32 pending analyze entries after compaction. The running scan is unchanged and a distinct 33rd pending analyze gets a retryable queue-full error. (FR-41)
 - [ ] **AC-51**: Canonical-path compaction absorbs a request under an equal/ancestor pending path, replaces queued descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order; configuration identity/provenance does not participate. (FR-42)
