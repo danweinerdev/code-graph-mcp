@@ -3,12 +3,9 @@ title: "Repository-Local Daemon and CLI (Track B)"
 type: design
 status: approved
 created: 2026-08-08
-updated: 2026-08-13
+updated: 2026-08-14
 tags: [daemon, cli, ipc, named-pipe, unix-socket, idle-timeout, analyze-queue]
 related:
-  - Specs/GraphPlatformExpansion
-  - Designs/TypedCoreLayering
-  - Designs/SharedDaemon
 ---
 
 # Repository-Local Daemon and CLI (Track B)
@@ -16,7 +13,6 @@ related:
 Implementation-gate validation for this design follows the initiative scope recorded in D-0008.
 
 ## Overview
-
 Today every agent session spawns its own `code-graph-mcp`, builds or loads its own graph, and holds its own copy in memory. Two sessions on one repository pay the indexing cost twice and cannot see each other's index. This design makes the graph a per-repository service: one daemon per project root, N clients attached, with the existing stdio binary demoted to a thin proxy so no client configuration changes (FR-06 – FR-16, D-0001).
 
 It also adds a command-line front-end over the same core (FR-17 – FR-20), and replaces the current analyze-contention error with an analyze-only path-compacting FIFO (FR-41 – FR-43).
@@ -24,7 +20,6 @@ It also adds a command-line front-end over the same core (FR-17 – FR-20), and 
 The scoping decision that makes this tractable is **repository-local** (D-0001). A multi-tenant daemon needs a keyed registry of graphs, per-root locking, and a workspace-selection protocol. One daemon per root needs none of that: `ServerInner` already *is* exactly one graph, one index lock, one watch handle, one analyze slot. The daemon reuses it unchanged.
 
 ## Non-Goals
-
 - **No multi-tenancy, no cross-workspace queries, no state outside the repository** (D-0001, superseding `Designs/SharedDaemon`). No discovery file under `~`, no port registry, no `list_workspaces`.
 - **No new wire protocol.** Decision 3 proxies MCP JSON-RPC verbatim. Designing an RPC schema, versioning it, and keeping it in sync with the tool surface is work this design declines to do.
 - **No remote access.** Loopback and local-user only, always (NFR-06).
@@ -36,7 +31,6 @@ The scoping decision that makes this tractable is **repository-local** (D-0001).
 ## Architecture
 
 ### Components
-
 ```mermaid
 graph TD
     subgraph clients["Clients (N per root)"]
@@ -76,7 +70,6 @@ graph TD
 The graph/query state in `ServerInner` keeps its existing semantics and one `Arc<ServerInner>` is shared by several rmcp services instead of one. Task 3.4 adds lifecycle-only state beside it: the active cache project root and an analyze/persist/watch-cleanup coordinator used to drain mutation before replacement exit. Phase 4 later adds the planned analyze-only compacting FIFO.
 
 ### Data Flow
-
 Attach is the only genuinely new control flow:
 
 ```mermaid
@@ -115,7 +108,6 @@ sequenceDiagram
 ```
 
 ### Interfaces
-
 **Binary modes.** One binary, three modes, selected by argument. The no-argument command spelling is unchanged, but task 3.4 makes its default behavior the transparent proxy path:
 
 | Invocation | Mode |
@@ -148,7 +140,6 @@ idle_timeout_secs = 1800 # automatic idle exit after 1800 seconds; 0 = never exi
 ## Design Decisions
 
 ### Decision 1: The daemon reuses `ServerInner` verbatim
-
 **Context:** A daemon needs to hold graph state for many connections. `ServerInner` holds exactly that for one.
 
 **Options considered:** (1) Reuse `Arc<ServerInner>` as-is, one per daemon process. (2) Introduce a `Workspace` type keyed by root, as `Designs/SharedDaemon` sketched.
@@ -158,7 +149,6 @@ idle_timeout_secs = 1800 # automatic idle exit after 1800 seconds; 0 = never exi
 **Rationale:** D-0001 makes the daemon repository-local, so "many workspaces" cannot arise by construction. Every field already has the right lifetime and the right sharing semantics: `graph` behind `PlRwLock`, `index_lock` serialising worker against watch, `analyze_slot` single-flight, `watch` a single handle. `CodeGraphServer` is already `Clone` with all state behind `Arc<ServerInner>` precisely so rmcp's dispatch can hold it by value — which means N concurrent services over one `Arc` is the shape the type was already built for. Option 2 is the multi-tenant design this supersedes, and would add a keyed map and per-root locking for a case that cannot occur.
 
 ### Decision 2: The client is a byte proxy; the daemon speaks MCP over the socket
-
 **Context:** Something must cross the process boundary. The tool surface is ~22 tools with rich response shapes.
 
 **Options considered:** (1) Define an RPC protocol for graph queries. (2) Proxy MCP JSON-RPC verbatim: the daemon runs the same rmcp service over the socket, the client pumps bytes between stdio and the socket.
@@ -172,7 +162,6 @@ idle_timeout_secs = 1800 # automatic idle exit after 1800 seconds; 0 = never exi
 A consequence worth stating: because the proxy is byte-level, protocol version skew is impossible — but *binary* skew is not, which is what Decision 5 handles.
 
 ### Decision 3: Linux UDS first, loopback TCP with a credential as fallback (FR-38, FR-39, FR-40)
-
 **Context:** FR-38 – FR-40 and NFR-06/07. Native platform completion is governed separately by NFR-12/13. (Resolves the spec's OQ-02.)
 
 **Decision:** The Linux MVP uses a Unix domain socket at `<project_root>/.code-graph/daemon.sock`. If UDS establishment fails, it falls back to a TCP listener bound to `127.0.0.1:0` and requires a per-instance credential stored at `<project_root>/.code-graph/secret` with owner-only permissions. The client sends `CG-AUTH <64 lowercase hex>\n`, capped at 73 bytes with a two-second read timeout and constant-time comparison; after successful validation, the daemon acknowledges with `CG-OK\n` before either side passes the stream to rmcp's MCP codec. Both lines are transport authentication, not a graph-query protocol. The transport enum and accept-loop boundary retain macOS/Windows seams; native macOS support is deferred to Phase 10 (NFR-12) and Windows named-pipe/ACL support to Phase 11 (NFR-13). Those branches may remain ignored or best-effort during the Linux MVP. The active transport is recorded in `daemon.json`, and fallback is reported rather than silent.
@@ -182,7 +171,6 @@ A consequence worth stating: because the proxy is byte-level, protocol version s
 `tokio` is already present with `features = ["full"]`, which covers the Linux UDS/TCP implementation and the deferred transport seams. Task 3.2 adds direct `getrandom`, safe `sysinfo`, and `fs2` dependencies for CSPRNG-backed credentials, process identity, and an OS lock that releases on crash; all stay in the binary crate, outside the protected core crates. No MVP acceptance claim depends on unexercised Windows ACL code (NFR-02).
 
 ### Decision 4: Exclusive-create lockfile with crash-released OS ownership
-
 **Context:** FR-13 — several sessions may start at once against a root with no daemon. Nothing in the workspace does single-instance today; there is no precedent to follow.
 
 **Decision:** A client that finds no live daemon may spawn a daemon contender. Each daemon contender atomically attempts to create `<project_root>/.code-graph/daemon.lock`, then holds an exclusive `fs2` OS lock on that file for its lifetime. The file records pid, process start time, and a random nonce. The winner binds and publishes metadata; losers exit and their clients retry with bounded backoff. After a crash the OS releases ownership even though the file remains, so exactly one contender locks that same inode and replaces a dead/malformed identity in place. The winning daemon removes its own lock and metadata on clean exit. Lock ownership is never transferred from a proxy parent to a daemon child.
@@ -200,7 +188,6 @@ Named pipes and TCP do not have this problem — a pipe vanishes with its owning
 **Clients re-probe rather than probing once.** If the winning daemon dies after taking the lock but before writing metadata, a client that checked liveness once at first failure would ride out its whole backoff and fall back in-process even though the daemon slot is now free. The client backoff loop therefore re-checks lock staleness and may spawn another contender on each attempt, not only at entry. Self-healing on the *next* session is not good enough when the whole point is to avoid redundant in-process fallbacks.
 
 ### Decision 5: Binary identity, not protocol version, gates attachment
-
 **Context:** FR-12. A developer rebuilds the binary while a daemon from the previous build is running.
 
 **Decision:** `daemon.json` records the same build SHA `get_status` already reports (`CODE_GRAPH_GIT_SHA`, stamped by `code-graph-tools/build.rs`, with a `-dirty` suffix) plus a deterministic fingerprint of the executable bytes. Attachment requires both fields to match. A client whose identity differs asks the daemon to shut down and replaces it. Metadata written by an older binary without a fingerprint is incompatible by construction.
@@ -212,7 +199,6 @@ Named pipes and TCP do not have this problem — a pipe vanishes with its owning
 Two details that follow: after acknowledgement, the daemon closes new analyze/watch admission, drains admitted analyses and cache writes, joins watcher cleanup, and performs one final save to the active cache project root before removing runtime state. The client allows a longer bounded acknowledged-drain window than the initial request-ack window. If the exact OS-lock owner still does not exit, the client revalidates ownership, escalates to a hard kill, accepts that the cache may be stale, and falls back in-process. A refusal to die must not wedge the session, and one proxy invocation replaces at most one incompatible owner so competing builds cannot oscillate forever.
 
 ### Decision 6: Idle timer counts only when there is nothing to lose
-
 **Context:** FR-10, FR-11.
 
 **Decision (implemented in task 3.5):** `[daemon].idle_timeout_secs`, default 1800, `0` meaning never. The timer runs only when attached connections are zero **and** no analyze job is in flight. A new attachment or analyze transition restarts the full interval. When an analyze reaches a terminal state with no connections attached, the timer starts again **from zero**, not from where it paused. On expiry it atomically closes new connection/analyze admission before closing the listener; graceful shutdown then persists the cache and removes `daemon.json` and the lock.
@@ -220,19 +206,17 @@ Two details that follow: after acknowledgement, the daemon closes new analyze/wa
 **Rationale:** The zero-restart rule is the one that is easy to get wrong: resuming a partial count means a long analyze that finishes at T-1s gets one second of grace, and the next client attaches to a corpse. Persisting before exit is what makes idle exit invisible — the next session loads the cache instead of re-indexing (AC-07).
 
 ### Decision 7: Analyze-only pending paths compact by containment (FR-41, FR-42, FR-43)
-
 **Context:** FR-41 – FR-43. Today `analyze_codebase` inspects the slot and returns `"indexing already in progress"` on contention. With N attached sessions, that error goes from rare to routine.
 
-**Decision:** Replace the error with an analyze-only pending FIFO capped at 32 entries after compaction. The running scan is immutable. Compaction considers only pending canonical paths: an equal or ancestor pending path absorbs the incoming request as a follower; an incoming ancestor replaces all pending descendants at the earliest displaced FIFO position, and those requests become followers; disjoint paths retain FIFO order. The compacted entry uses `force = OR` across all attached/replaced requests. Followers receive its terminal result or error.
+**Decision:** Replace the error with an analyze-only pending FIFO capped at 32 pending requests after compaction, counting canonical entries and every follower. The running scan is immutable. Compaction considers only pending canonical paths: an equal or ancestor pending path absorbs the incoming request as a follower; an incoming ancestor replaces all pending descendants at the earliest displaced FIFO position, and those requests become followers; disjoint paths retain FIFO order. The compacted entry uses `force = OR` across all attached/replaced requests. Followers receive its terminal result or error.
 
 **Rationale:** This removes redundant queued scans without converting the daemon into a generic scheduler. The running scan stays immutable, avoiding changes to already-started work. OR-ing force never loses requested invalidation; the only cost is extra reindexing. Configuration identity/provenance and `coalesced_by` are intentionally excluded because they make a simple path queue depend on unrelated state and wire behavior.
 
-**The queue is a small analyze-only structure.** It holds one current scan plus pending compacted scan entries and their followers. The cap is checked after compaction, so absorbed followers consume no pending slot; a distinct 33rd pending analyze is rejected. Community detection and other whole-graph queries do not enter this queue.
+**The queue is a small analyze-only structure.** It holds one current scan plus pending compacted scan entries and their followers. The cap counts every pending request after compaction, so absorbed followers consume capacity even though they create no canonical entry; a 33rd pending request, including an otherwise covered follower, is rejected. Community detection and other whole-graph queries do not enter this queue.
 
-Follower completion needs only an internal association from each absorbed/replaced request to the compacted pending scan. The server retains every absorbed or displaced asynchronous ID as an internal alias of that scan, so async callers retain their original handle while polling the existing shared analyze-job status; synchronous callers wait and return the ordinary terminal result or error. This does not require generic job kinds, generic polling/status projections, a widened `analyze_job` shape, or a new response field.
+Follower completion needs only an internal association from each absorbed/replaced request to the compacted pending scan. The server retains every absorbed or displaced asynchronous ID as an internal alias of that scan, so async callers retain their original handle while polling the analyze-only `get_analyze_status(job_id)` tool; synchronous callers wait and return the ordinary terminal result or error. This does not require generic job kinds or generic polling/status projections; `get_status.analyze_job` remains the shared projection.
 
 ### Decision 10: Generic long-running jobs are deferred (FR-49, AC-58)
-
 **Context:** `analyze_codebase_async` exists because a UE4-scale analyze exceeds the client's wall-clock tool timeout and `spawn_blocking` cannot help — the timer is client-side. Phase 1's review found `detect_communities` has the same shape: whole-graph label propagation, measured only at 841 files, with no async escape.
 
 **Decision:** Do not generalize the analyze queue and do not add `detect_communities_async` in Phase 4. Future asynchronous whole-graph work requires a dedicated design and plan.
@@ -240,7 +224,6 @@ Follower completion needs only an internal association from each absorbed/replac
 **Rationale:** Analysis admission is a path-compaction problem; community detection is not. Sharing a scheduler couples unrelated locking, retention, status, budgeting, and cancellation concerns.
 
 ### Decision 8: The CLI is a separate binary and depends on Track A
-
 **Context:** FR-17 – FR-20 require a CLI whose output matches the MCP payload and which does not duplicate query logic.
 
 **Decision:** A new `code-graph` binary using `clap`, calling the same core functions the MCP adapter calls. **This part of Track B is blocked on Track A** and must be sequenced after it.
@@ -252,7 +235,6 @@ Follower completion needs only an internal association from each absorbed/replac
 **The CLI's own interface design is deliberately deferred, not omitted.** This design fixes only what constrains the daemon: that the CLI is a separate binary, that it calls the typed core, and that it is sequenced after Track A. The command surface, the human-vs-machine output convention (FR-19), and the exit-status mapping (FR-20) are settled in a follow-on design once the typed core exists and its function signatures are known — designing a command surface against a core that has not been written yet would be guesswork, and the shapes it must render are exactly what Track A produces. The sketch to start from: a `--json` flag selecting machine output, subcommands mirroring tool names, and exit `0` / `1` / `2` for success / tool error / operational failure. AC-11, AC-12, and AC-40 are that follow-on's acceptance gate.
 
 ### Decision 9: Watch becomes daemon-owned (FR-14, FR-15)
-
 **Context:** FR-14. `watch_start` stores a single `WatchHandle` in `ServerInner`; with N clients, N calls would contend.
 
 **Decision:** The handle stays exactly where it is. Because all clients share one `ServerInner`, the first `watch_start` wins and subsequent calls hit the existing `"watch mode is already active"` path; `watch_stop` from any client stops the shared watcher. The daemon tears the watcher down on idle exit.
@@ -260,7 +242,6 @@ Follower completion needs only an internal association from each absorbed/replac
 **Rationale:** This is what the current code already does when given a shared `ServerInner` — the design work is recognising that the existing semantics are correct under sharing, not changing them. The user-visible improvement (one OS watcher instead of N) falls out. The wording of the already-active message is worth revisiting, since under a daemon it now means "another session started it", but that is a description change, not a behaviour change.
 
 ## Error Handling
-
 | Condition | Behaviour |
 |---|---|
 | No daemon and spawn fails | Serve in-process and report the fallback (FR-16). Never fail the session. |
@@ -279,7 +260,6 @@ Follower completion needs only an internal association from each absorbed/replac
 All user-visible failures remain `CallToolResult` with the error flag. Diagnostics use `eprintln!`; no `tracing` (NFR-05).
 
 ## Testing Strategy
-
 **Unit** — canonical pending-path compaction: immutable running scan, follower absorption under an equal/ancestor pending path, ancestor replacement at the earliest displaced FIFO position, disjoint FIFO order, terminal success/error propagation, force OR, and the post-compaction 32-entry cap; plus the idle-timer state machine and stale-lock detection.
 
 **Integration** — these need real processes and are the tests that actually prove the feature:
@@ -303,13 +283,11 @@ All user-visible failures remain `CallToolResult` with the error flag. Diagnosti
 **CLI (AC-11, AC-12, AC-40)** — deferred with the CLI itself to after Track A, per Decision 8. Named here rather than omitted: output-shape parity across the five distinct response shapes (AC-11), the three exit-status classes (AC-12), and daemon-vs-standalone output identity (AC-40) are all untestable until the binary exists, and they are the acceptance gate for that step rather than for the daemon.
 
 ### Structural Verification
-
 - `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all --check`; `make verify` as the gate.
 - No `unsafe` is introduced, so `miri` is not required.
 - Process-spawning tests must be leak-free: every integration test kills its daemon on both the pass and fail path, or CI accumulates orphans that make later runs flaky. A test harness guard type with a `Drop` impl is the mechanism.
 
 ## Migration / Rollout
-
 Additive and reversible at every step. The configured command spelling is unchanged; from step 4 the no-argument process proxies by default, and `--no-daemon` restores direct in-process behavior exactly.
 
 1. **`[daemon]` config section**, parsed and ignored. Zero behaviour change.
@@ -323,10 +301,8 @@ Additive and reversible at every step. The configured command spelling is unchan
 Documentation lands with the code: the `[daemon]` section in `.code-graph.toml.example` and CLAUDE.md, the `.code-graph/` directory added to `.gitignore`, the analyze-contention behaviour change, and the note that watch is now shared.
 
 ## Resolved Questions
-
 **OQ-B3 — RESOLVED.** *Does follower completion require a new `AnalyzeResult` shape?* No. Followers receive the satisfying scan's existing terminal result or error; Phase 4 adds no `coalesced_by` field.
 
 ## Open Questions
-
 - The idle-timeout default of 1800 seconds (OQ-B1) — **non-blocking** — the mechanism, the config key, and the `0` sentinel are fixed; only the number is a guess and it is tunable without touching an interface.
 - Whether the CLI auto-spawns a daemon or only attaches to a running one (OQ-B2) — **non-blocking** — FR-18 requires identical output in both modes either way, so this is a latency question for one-shot commands, not a correctness one.

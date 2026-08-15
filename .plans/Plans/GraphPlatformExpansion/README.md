@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-13
+updated: 2026-08-14
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -69,7 +69,6 @@ phases:
 # Graph Platform Expansion
 
 ## Overview
-
 Five tracks that lift three constraints on the code graph: it is reachable only from an MCP client, only one session at a time can hold it, and it knows nothing about history. Delivered as eleven phases that interleave the implementation tracks, complete a fully supported Linux MVP first, and defer native macOS/Windows completion behind explicit platform seams.
 
 - **Track A** (phase 2) — a typed core beneath the MCP handlers, so a CLI or socket front-end can reach structured results.
@@ -83,7 +82,6 @@ Phases 1, 3, and 5 have no dependencies on each other and may run concurrently i
 Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deliberately deferred until the Linux implementation phases they certify are complete. The phase numbering is a suggested order; `depends_on` is the real constraint.
 
 ## Current State
-
 *Written for a cold start. Last updated 2026-08-13.*
 
 | Phase | Status | Where it stands |
@@ -129,7 +127,6 @@ Each is a reconciliation event, not drift — the code was right and the documen
 - **Deterministic output matters more than it looks.** `Graph.nodes`/`adj`/`radj` are `HashMap` with a random seed; `files`/`includes` are a `PathTrie` that iterates sorted. Anything whose output is snapshotted must drive iteration from the trie and use keyed lookups only.
 
 ## Non-Goals
-
 Carried forward from `Specs/GraphPlatformExpansion`:
 
 - **No system-wide or multi-tenant daemon.** One daemon per project root, all state inside the repository (D-0001).
@@ -149,7 +146,6 @@ Decided during planning:
 - **No native macOS or Windows support claim in phases 1–9.** Those phases deliver the Linux MVP while preserving explicit platform seams; phases 10/11 own native enablement and acceptance.
 
 ## Architecture
-
 ```mermaid
 graph TD
     P1["Phase 1<br/>Graph Queries<br/>(Track C)"]
@@ -211,8 +207,7 @@ flowchart LR
 ```
 
 ## Key Decisions
-
-- **Historical Phase 4 ledger references.** D-0009 and D-0010 describe the superseded generic-job/shared-FIFO implementation. They remain cited for historical traceability only; the active Phase 4 replacement is governed by FR-41 through FR-43 and does not extend that scheduler model.
+- **Phase 4 queue policy** (D-0011). `get_analyze_status(job_id)` polls canonical or follower aliases; every non-terminal pending request, including followers, counts against the 32-request bound. The queue remains analyze-only and path-compacting. **Pagination continuation** (D-0013): `truncated=true` means more matching results remain after either a count or byte cap, and `next_offset` resumes the page.
 - **Deferred async whole-graph scope.** FR-49 and AC-58 are explicitly deferred; Phase 4 does not provide `detect_communities_async` or generic long-running jobs. The absence is intentional and is the required plan coverage for FR-49 / AC-58.
 
 - **Repository-local daemon, not multi-tenant** (D-0001). `ServerInner` is reused verbatim because one-daemon-per-root means a keyed workspace registry cannot arise.
@@ -227,7 +222,6 @@ flowchart LR
 - **Validation is initiative-scoped for implementation gating** (D-0008). Diagnostics in this plan and its directly governing GraphPlatformExpansion spec/designs block progression; unrelated legacy-artifact diagnostics reached through transitive links are reported but do not.
 
 ## Dependencies
-
 - **New third-party crates**, all outside the four protected core crates: `clap` (phase 7), a pure-Rust git library (phase 5), `async_trait` (phase 5). The `code-graph-lang` default fingerprint hook uses `std` hashing only — a non-std hash there would violate NFR-02.
 - **No new dependency for the daemon transport.** `tokio` is already present with `features = ["full"]`.
 - **Dogfood submodules initialised** for the phase 1 and phase 3 performance measurements (`external/ripgrep`, `external/abseil-cpp`).
@@ -235,11 +229,9 @@ flowchart LR
 - **Git fixture harness** (phase 5) — no test in the workspace currently creates a temporary git repository.
 
 ## Plan Completion Evidence
-
 Pending — not complete.
 
 ## Open Questions
-
 - Default idle timeout of 1800s for the daemon — **non-blocking** — the config key, the `0` sentinel, and the timer semantics are fixed; only the number is a guess and it is tunable without touching an interface.
 - Whether the CLI auto-spawns a daemon or only attaches to a running one — **non-blocking** — FR-18 requires identical output in both modes either way, so this is latency, not correctness.
 - Default revision-window size for `symbol_history` — **non-blocking** — the bound and the partial-result flag are fixed; only the default is unsettled.

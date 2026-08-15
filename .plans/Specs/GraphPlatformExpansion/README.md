@@ -3,12 +3,9 @@ title: "Graph Platform Expansion"
 type: spec
 status: approved
 created: 2026-08-08
-updated: 2026-08-13
+updated: 2026-08-14
 tags: [daemon, cli, vcs, graph-queries, architecture, perforce]
 related:
-  - Designs/SharedDaemon
-  - Designs/RustRewrite
-  - Designs/AnalyzeCodebaseAsync
 ---
 
 # Graph Platform Expansion
@@ -16,7 +13,6 @@ related:
 Implementation-gate validation for this initiative is scoped by D-0008; unrelated legacy-artifact diagnostics do not override this spec's own requirements.
 
 ## Overview
-
 code-graph-mcp today is a single-purpose stdio MCP server: one process per agent session, one graph per process, reachable only by an MCP client, and aware only of the working tree as it exists right now. This specification defines four related pieces of work that lift those three constraints while leaving the existing tool surface behaviourally unchanged.
 
 The four tracks are specified together because they share constraints, a sequencing dependency, and one enabling refactor. **They do not ship as a unit.** Each yields its own design and implementation plan, and each is independently releasable. Track A is a prerequisite for reaching B's CLI and C's and D's queries from any non-MCP front-end; once it lands, B, C, and D may proceed in parallel and in any order. Track C depends on nothing here and could land first.
@@ -29,7 +25,6 @@ The four tracks are specified together because they share constraints, a sequenc
 Scope was informed by a survey of a comparable open-source code-intelligence server (referred to below as *the example material*), which independently arrived at several of these capabilities. Two of its capabilities were evaluated and deliberately rejected — see Non-Goals.
 
 ## Goals
-
 - Let multiple concurrent agent sessions on one repository share a single indexed graph instead of each building and holding its own.
 - Make every graph query reachable from a terminal, not only from an MCP client.
 - Answer "what symbol is at this file and line?", "how does A reach B?", and "what are the de-facto modules here?" — three questions the current tool surface cannot answer at all.
@@ -37,7 +32,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - Preserve the existing 19-tool MCP wire contract exactly, so no client configuration or agent-facing behaviour changes as a side effect of this work.
 
 ## Non-Goals
-
 - **System-wide or multi-tenant daemon.** One daemon serves exactly one project root. Cross-workspace queries, a shared discovery file outside the repository, and a daemon hosting several unrelated roots are explicitly out of scope. This narrows `Designs/SharedDaemon`, which specified the multi-tenant shape; see Constraints.
 - **Full-text / regex search over file contents.** The example material offers indexed regex search, which is cheap for it because its store is content-addressed and holds file bodies. This graph stores symbols, edges, and paths — not contents — so the same capability would mean a new content store, a much larger cache, and a new invalidation axis. Free-text search remains a legitimate job for `Grep`.
 - **Precise (scope-proof) name resolution.** The example material vendors a scope-graph resolution engine; in that implementation it is feature-gated off by default and covers two of its languages, with everything else falling back to the same name-matching this project already does. The cost is not justified by the delta. Call-resolution remains the documented heuristic, and ambiguity continues to be surfaced through `Confidence` and `find_class_candidates` rather than hidden.
@@ -47,11 +41,9 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - **Perforce support itself.** This spec constrains the abstraction so Perforce can be added later; it does not deliver a Perforce provider.
 
 ## Requirements
-
 <!-- No third-party API, protocol, or wire format is pinned by this spec. The one external contract touched — the Model Context Protocol tool surface — is consumed via the existing `rmcp` 1.5.0 dependency and is required to stay unchanged (NFR-01), so no new version pin is introduced. -->
 
 ### Functional Requirements
-
 **Track A — Typed core layering**
 
 - **FR-01**: Every tool-facing handler shall expose a function whose return type is a domain value (for example `Page<CallChain>`, `AnalyzeResult`, `HierarchyNode`), not an MCP wire type. A caller shall be able to obtain structured results without constructing, inspecting, or deserialising an `rmcp` type.
@@ -120,12 +112,11 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 
 **Track B — Analyze request compaction**
 
-- **FR-41**: Analyze requests arriving while another scan is in flight shall queue rather than reject or run concurrently. The queue is analyze-only and has at most 32 **pending** entries after compaction. The running scan is never modified, coalesced into, upgraded, or replaced. A distinct request requiring a 33rd pending entry shall receive a retryable queue-full tool error.
-- **FR-42**: Pending compaction shall use canonical invocation paths only. An equal or ancestor pending path absorbs an incoming request as a follower without creating an entry. An incoming ancestor replaces all covered pending descendants at the earliest displaced FIFO position; those displaced requests become followers. Disjoint pending paths preserve FIFO order. Configuration identity, provenance, and configuration transitions do not participate in compaction.
-- **FR-43**: Every follower shall receive the satisfying compacted scan's terminal result or error. The server retains every absorbed or displaced asynchronous job ID as an internal alias of the satisfying scan; synchronous callers wait for and return its ordinary `AnalyzeResult`, while asynchronous callers continue polling the existing shared analyze-job status without a new tool or response field. The compacted scan's effective `force` shall be the logical OR of all attached and replaced requests: extra forced work is acceptable, but a force request must not be lost. This phase requires neither a generic job projection nor a `coalesced_by` wire field.
+- **FR-41**: Analyze requests arriving while another scan is in flight shall queue rather than reject or run concurrently. The queue is analyze-only and has at most 32 **pending requests** after compaction, counting canonical entries and every follower. The running scan is never modified, coalesced into, upgraded, or replaced. A distinct request requiring a 33rd pending entry shall receive a retryable queue-full tool error.
+- **FR-42**: Pending compaction shall use canonical invocation paths only. An equal or ancestor pending path absorbs an incoming request as a follower without creating a canonical entry, provided the pending-request capacity remains available. An incoming ancestor replaces all covered pending descendants at the earliest displaced FIFO position; those displaced requests become followers. Disjoint pending paths preserve FIFO order. Configuration identity, provenance, and configuration transitions do not participate in compaction.
+- **FR-43**: Every follower shall receive the satisfying compacted scan's terminal result or error. The server retains every absorbed or displaced asynchronous job ID as an internal alias of the satisfying scan; synchronous callers wait for and return its ordinary `AnalyzeResult`, while asynchronous callers poll their canonical or alias ID through the analyze-only `get_analyze_status` tool. This tool is not generic job infrastructure. Every non-terminal pending request, including synchronous and asynchronous followers, consumes the same 32-request capacity. The compacted scan's effective `force` shall be the logical OR of all attached and replaced requests: extra forced work is acceptable, but a force request must not be lost. This phase requires neither a generic job projection nor a `coalesced_by` wire field.
 
 ### Non-Functional Requirements
-
 - **NFR-01**: The existing 19 MCP tools shall be wire-compatible after this work. Response field names, ordering guarantees, envelope shapes, null-serialisation behaviour, and the documented paging-resume contract shall be unchanged. Existing snapshot tests shall pass without rebaselining.
 - **NFR-02**: `code-graph-core`, `code-graph-graph`, `code-graph-lang`, and `code-graph-path-trie` shall gain no new third-party dependency from this work, and shall remain free of MCP, async, and I/O concerns where they are today.
 - **NFR-03**: New algorithmic output shall be deterministic and therefore snapshot-testable, consistent with the repository's `insta` conventions.
@@ -141,7 +132,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - **NFR-13**: The deferred Windows phase shall make the complete GraphPlatformExpansion surface natively supported and acceptance-tested on Windows, including named-pipe, ACL, and Windows-path behavior, without weakening NFR-06.
 
 ## User Stories
-
 - As an engineer running two agent sessions on one repository, I want the second session to query the graph immediately, so that I do not pay the indexing cost twice or hold two copies of the graph in memory.
 - As an engineer with an agent that hit an indexing timeout, I want the index to already exist when the session starts, so that a long analyze is a one-time cost rather than a per-session one.
 - As an engineer in a terminal, I want to ask the graph who calls a function without starting an agent session, so that I can use it in scripts and while debugging.
@@ -152,7 +142,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - As a team on Perforce, I want history features to work against our depot eventually, so that adopting this tool does not require being on git.
 
 ## Acceptance Criteria
-
 - [ ] **AC-01**: For every existing tool, a caller can obtain a structured result by calling a typed function, without referencing any `rmcp` type. (FR-01)
 - [ ] **AC-02**: The full existing snapshot suite passes unmodified after the Track A refactor. (FR-02, NFR-01)
 - [ ] **AC-03**: Calling the typed core for `get_callers` on a non-callable kind yields a result distinguishable from both a structured page and an error, and the MCP adapter renders it as the plain-text advisory success it produces today. (FR-03)
@@ -202,9 +191,9 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-47**: On Linux, the daemon establishes a UDS transport by default. With UDS establishment forced to fail, it falls back to loopback TCP, reports the fallback, and remains fully functional. (FR-38)
 - [ ] **AC-48**: On the TCP fallback, a client that does not present the daemon's secret is refused; the secret file is owner-only; and a new daemon instance does not accept the previous instance's secret. (FR-39)
 - [ ] **AC-49**: A client determines the active transport from repository-local metadata and connects on the first attempt, with no fallback probing of a transport the daemon is not serving. (FR-40)
-- [ ] **AC-50**: Analyze requests are serialized with at most 32 pending analyze entries after compaction. The running scan remains unchanged, and a distinct request requiring a 33rd entry receives a retryable queue-full error. (FR-41)
+- [ ] **AC-50**: Analyze requests are serialized with at most 32 pending analyze requests after compaction, including followers. The running scan remains unchanged, and a distinct request requiring a 33rd entry receives a retryable queue-full error. (FR-41)
 - [ ] **AC-51**: Canonical-path compaction absorbs requests under equal or ancestor pending paths, replaces pending descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order without a configuration identity/provenance gate. (FR-42)
-- [ ] **AC-52**: Followers receive the satisfying compacted scan's terminal success or error, and effective force is ORed across every attached or replaced request. (FR-43)
+- [ ] **AC-52**: Followers poll their alias or canonical ID for the satisfying compacted scan terminal success or error, and effective force is ORed across every attached or replaced request. (FR-43)
 - [ ] **AC-53**: Community detection reports file granularity by default, and the granularity used is present in the response. (FR-44)
 - [ ] **AC-54**: Community detection reports which termination condition ended it — convergence or iteration ceiling — and requires no caller-supplied tuning parameter to return a partition. (FR-45)
 - [ ] **AC-55**: On a synthetic graph engineered to collapse into one community, and on one with no edges at all, the response flags the partition as degenerate rather than returning it as an ordinary result. (FR-46)
@@ -215,7 +204,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - [ ] **AC-60**: On a native Windows runner, the Phase 11 acceptance matrix accounts for every completed task and acceptance criterion in phases 1–9; all applicable workspace and acceptance suites pass, the daemon exercises named-pipe and loopback-TCP fallback paths, deterministic pipe-security-descriptor inspection and another-local-account denial establish ACL enforcement, and Windows path behavior is covered rather than inferred from Linux. (NFR-13)
 
 ## Constraints
-
 - **This spec supersedes `Designs/SharedDaemon` (D-0001).** That design specified a multi-tenant daemon: one process hosting many workspaces keyed by absolute root path, an HTTP transport with a bearer token, a discovery file under the user's XDG data directory, and `list_workspaces` / `select_workspace` tools. Its Decision 1 explicitly rejected Unix domain sockets. The direction here is deliberately narrower — one daemon per project root, all state inside the repository, no cross-workspace capability — on the grounds that system-wide state is not yet wanted. The two cannot both stand as written, and the earlier design is marked `superseded`. Because the repository-local shape is a strict subset of the multi-tenant one, a later expansion to multi-tenancy remains open and would not be blocked by anything specified here.
 - The MCP tool surface is a published contract. Tool descriptions are production behaviour that agents pattern-match on, not documentation.
 - The single `unsafe` opt-in in the workspace is scoped to one memory-map site in `code-graph-graph`. Nothing in this work may widen it.
@@ -225,7 +213,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - Windows path handling retains its documented seams and known boundaries, but native Windows correctness is deferred to Phase 11 / AC-60 rather than inferred from the Linux MVP.
 
 ## Dependencies
-
 - Track B and Track C's CLI exposure depend on Track A. Track C's query implementations do not.
 - Track D depends on Track A only for front-end exposure; the provider trait and git implementation are independent.
 - Track D depends on the existing language-plugin parse interface accepting a byte buffer rather than a path — confirmed present.
@@ -233,7 +220,6 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 - The decision ledger lives at `Decisions/decisions.md`; D-0001 records the repository-local daemon supersession described in Constraints.
 
 ## Resolved Questions
-
 **OQ-01 — RESOLVED (D-0001).** *Is narrowing `Designs/SharedDaemon` to a repository-local daemon confirmed?* Yes. The repository-local model stands and `Designs/SharedDaemon` is marked `superseded`. Recorded as D-0001; see Constraints.
 
 **OQ-02 — RESOLVED for MVP scope.** *What is the transport?* Linux uses UDS first and authenticated loopback TCP as fallback (FR-38 through FR-40). The transport seam retains the named-pipe shape, but native Windows implementation and validation are deferred to Phase 11 / AC-60; macOS completion is deferred to Phase 10 / AC-59.
@@ -244,8 +230,7 @@ Scope was informed by a survey of a comparable open-source code-intelligence ser
 
 **OQ-05 — RESOLVED.** *Should symbol-history fingerprints be cached?* Yes, under `<project_root>/.code-graph/`, keyed so a stale entry cannot be served and degrading to recomputation on absence or corruption (FR-37).
 
-**OQ-06 — RESOLVED, and reframed.** *Does the shared analyze slot need a larger retention window?* No. The replacement queue retains only followers necessary to complete absorbed or replaced pending requests. It compacts pending canonical paths, never touches the running scan, and ORs force; it has no configuration identity/provenance gate or generic-job retention requirement (FR-41 through FR-43).
+**OQ-06 — RESOLVED, and reframed.** *Does the shared analyze slot need a larger retention window?* No. The replacement queue retains only followers necessary to complete absorbed or replaced pending requests; D-0011 bounds all such pending requests at 32 and makes async aliases individually pollable. It compacts pending canonical paths, never touches the running scan, and ORs force; it has no configuration identity/provenance gate or generic-job retention requirement (FR-41 through FR-43).
 
 ## Open Questions
-
 - No specification-level question remains — **non-blocking** — all six raised during specification were answered before approval and are recorded under Resolved Questions above; the tuning-level questions that remain are design and plan concerns, not requirements gaps.

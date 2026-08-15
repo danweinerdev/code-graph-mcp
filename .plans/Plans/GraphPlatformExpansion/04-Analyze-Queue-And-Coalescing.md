@@ -59,7 +59,7 @@ tasks:
   - id: "4.8"
     title: "Bound shared pending FIFO"
     status: complete
-    justifies: "D-0010. An unbounded shared queue lets disconnected or bursty clients retain arbitrary shutdown-drain guards and makes daemon shutdown latency unbounded."
+    justifies: "Historical shared-FIFO capacity rationale. The replacement queue is governed by D-0011, which bounds every non-terminal pending request rather than only canonical entries."
     verification: "cargo test -p code-graph-tools pending_limit_rejects_distinct_jobs_but_keeps_covered_analyzes && cargo test -p code-graph-tools queue_full_rejection_does_not_extend_shutdown_drain — the shared FIFO holds at most 32 pending jobs, covered analyzes still coalesce at capacity, distinct analyze/community overflow is rejected without an ID, guard, or queue mutation, promotion frees one slot, and rejected work does not extend shutdown drain."
     depends_on: ["4.4"]
   - id: "4.9"
@@ -88,12 +88,12 @@ tasks:
     depends_on: ["4.5"]
   - id: "4.15"
     title: "Rollback superseded Phase 4 implementation"
-    status: in-progress
+    status: complete
     justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. The generic scheduler, async-community route, configuration-provenance coalescing, and coalesced_by surface contradict the replacement scope and must be removed first."
     verification: "cargo test -p code-graph-tools; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make plugin-sync-check; make snapshot-clean; git diff --check — Phase 3 remains intact, pre-Phase-4 contention behavior is restored, and generic jobs, detect_communities_async, config-provenance coalescing, and coalesced_by are absent."
   - id: "4.16"
     title: "Implement analyze-only path-compacting FIFO"
-    status: in-progress
+    status: complete
     justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. Concurrent daemon clients need serialized analysis without redundant queued descendants or loss of requested force."
     verification: "cargo test -p code-graph-tools analyze_job::; cargo test -p code-graph-tools analyze::; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make verify — tests prove immutable running work, follower absorption, earliest-position ancestor replacement, disjoint FIFO order, result/error propagation, force OR, post-compaction cap, and distinct-33rd rejection."
   - id: "4.17"
@@ -101,6 +101,36 @@ tasks:
     status: complete
     justifies: "FR-41, FR-42, FR-43, AC-50, AC-51, AC-52. The replacement queue is currently covered only through in-process handlers and unit state; real proxy clients must prove they share the daemon slot and observe compaction, terminal attribution, capacity, and shutdown behavior across the transport boundary."
     verification: "cargo test -p code-graph-mcp --test daemon_proxy queue; cargo test -p code-graph-mcp; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; make verify — isolated live clients prove pending absorption, ancestor replacement at earliest FIFO position, force OR, success/error follower completion, post-compaction 32-entry rejection, and daemon shutdown drain without leaked processes."
+  - id: "4.18"
+    title: "Poll and bound pending follower handles"
+    status: complete
+    justifies: "D-0011, FR-41, FR-43, AC-50, AC-52. Each follower handle must be individually pollable, while every non-terminal pending request counts against the same 32-request bound."
+    verification: "cargo test -p code-graph-tools async_follower; cargo test -p code-graph-mcp; cargo test -p code-graph-tools --test snapshot_tools_list — every async follower receives a distinct ID that get_analyze_status can poll to terminal success or failure; canonical and follower requests jointly obey the 32 pending-request cap with retryable rejection."
+    depends_on: ["4.16"]
+  - id: "4.19"
+    title: "Recover queued scans after worker panic"
+    status: complete
+    justifies: "FR-41, FR-43. A panic must terminalize the active job, release its guard, promote the next pending scan, and unblock followers so daemon drain remains live."
+    verification: "cargo test -p code-graph-tools worker_panic; cargo test -p code-graph-mcp — an injected worker panic fails the active job and promotes the queued successor without leaking daemon admission guards."
+    depends_on: ["4.16"]
+  - id: "4.20"
+    title: "Restore atomic applied-index status publication"
+    status: complete
+    justifies: "FR-15, NFR-01. Status must never combine graph statistics from one publication with root/config metadata from another, and config provenance must describe the applied index rather than the current filesystem."
+    verification: "cargo test -p code-graph-tools status_publication; cargo test -p code-graph-mcp — concurrent status polling observes coherent applied-index snapshots across analyze and watch publication."
+    depends_on: ["4.15"]
+  - id: "4.21"
+    title: "Distribute queue-cap acceptance across clients"
+    status: complete
+    justifies: "AC-50. The daemon proxy boundary must prove capacity and covered admission are shared by independent clients, not merely by one serialized connection."
+    verification: "cargo test -p code-graph-mcp --test daemon_proxy queue — independent daemon proxy clients fill capacity, coalesce a covered request, and observe retryable distinct overflow."
+    depends_on: ["4.16", "4.17"]
+  - id: "4.22"
+    title: "Restore count-limit continuation metadata"
+    status: complete
+    justifies: "NFR-01. A count-limited page with remaining records must expose a strict next_offset rather than silently making later records unreachable."
+    verification: "cargo test -p code-graph-tools byte_budget_take; cargo test -p code-graph-mcp --test snapshot_tools_list — limit-plus-one results resume without gaps or duplicates and tool descriptions match the contract."
+    depends_on: ["4.15"]
 ---
 
 # Analyze Queue and Coalescing
@@ -538,10 +568,10 @@ Tasks 4.1–4.12 and their evidence record the superseded implementation through
 ## 4.15: Rollback superseded Phase 4 implementation
 ### Subtasks
 
-- [ ] Remove the uncommitted Phase 4.13/4.14 work and the committed generic scheduler, async-community route, generic polling/projections, config-provenance coalescing, and `coalesced_by` behavior through a clean implementation revision; do not rewrite published history.
-- [ ] Restore the pre-Phase-4 analyze contention behavior while retaining all Phase 3 daemon functionality.
-- [ ] Remove documentation and snapshots that advertise the superseded Phase 4 surface.
-- [ ] Verify Phase 3 daemon/proxy behavior remains intact and record only commands actually run.
+- [x] Remove the uncommitted Phase 4.13/4.14 work and the committed generic scheduler, async-community route, generic polling/projections, config-provenance coalescing, and `coalesced_by` behavior through a clean implementation revision; do not rewrite published history.
+- [x] Restore the pre-Phase-4 analyze contention behavior while retaining all Phase 3 daemon functionality.
+- [x] Remove documentation and snapshots that advertise the superseded Phase 4 surface.
+- [x] Verify Phase 3 daemon/proxy behavior remains intact and record only commands actually run.
 
 ### Notes
 
@@ -549,16 +579,27 @@ Revision boundary: a clean, buildable Phase-3-plus-pre-Phase-4 baseline. This ta
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `2e5f343862737df19c50177586f3693de8166267`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `2e5f343862737df19c50177586f3693de8166267`
+- Focused review: `git show 2e5f343862737df19c50177586f3693de8166267`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `2e5f343862737df19c50177586f3693de8166267`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: rollback baseline behavior remains covered by the full current workspace verification.` |
 
 ## 4.16: Implement analyze-only path-compacting FIFO
 ### Subtasks
 
-- [ ] Add an analyze-only pending FIFO with at most 32 entries **after** compaction; never alter, attach to, upgrade, or replace the running scan.
-- [ ] Canonicalize invocation paths. Make an equal or ancestor pending path absorb the new request as a follower; make an incoming ancestor replace all queued descendants at the earliest displaced FIFO position; leave disjoint entries in FIFO order.
-- [ ] Preserve followers for every absorbed or replaced request. Retain absorbed/displaced asynchronous IDs as internal aliases of the compacted scan; synchronous callers wait and return its ordinary terminal success or error, while asynchronous callers keep their original handle and poll the existing shared analyze-job status.
-- [ ] Compute effective force as logical OR across the compacted entry and every attached or replaced request.
-- [ ] Add deterministic tests for running-scan immutability, follower absorption, ancestor replacement/order, success/error propagation, force OR, post-compaction cap, and retryable rejection of a distinct 33rd pending analyze.
+- [x] Add an analyze-only pending FIFO with at most 32 entries **after** compaction; never alter, attach to, upgrade, or replace the running scan.
+- [x] Canonicalize invocation paths. Make an equal or ancestor pending path absorb the new request as a follower; make an incoming ancestor replace all queued descendants at the earliest displaced FIFO position; leave disjoint entries in FIFO order.
+- [x] Preserve followers for every absorbed or replaced request. Retain absorbed/displaced asynchronous IDs as internal aliases of the compacted scan; synchronous callers wait and return its ordinary terminal success or error, while asynchronous callers keep their original handle and poll the existing shared analyze-job status.
+- [x] Compute effective force as logical OR across the compacted entry and every attached or replaced request.
+- [x] Add deterministic tests for running-scan immutability, follower absorption, ancestor replacement/order, success/error propagation, force OR, post-compaction cap, and retryable rejection of a distinct 33rd pending analyze.
 
 ### Notes
 
@@ -570,7 +611,18 @@ Do not compact against the running scan. It has already chosen its path and forc
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `b1a6ebfc09dc06c15305587f5c03e147d01c194c`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `b1a6ebfc09dc06c15305587f5c03e147d01c194c`
+- Focused review: `git show b1a6ebfc09dc06c15305587f5c03e147d01c194c`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b1a6ebfc09dc06c15305587f5c03e147d01c194c`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: queue compaction behavior remains covered by the full current workspace verification.` |
 
 ## 4.17: Exercise queue semantics through live daemon clients
 ### Subtasks
@@ -604,13 +656,143 @@ Do not make these tests pass by issuing requests serially from one client or by 
 |---|---|---|---|
 | `cargo test -p code-graph-mcp --test daemon_proxy && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: 18 daemon-proxy tests (including all three live queue tests) and the full code-graph-mcp suite passed; formatting and warning-deny clippy passed; verify confirmed clean snapshots and synchronized plugin mirrors; git diff --check reported no whitespace errors. The known query-perf and server doctests remained ignored.` |
 
-## Acceptance Criteria
-- [ ] **AC-50**: Analyze requests queue without concurrent execution, with at most 32 pending analyze entries after compaction. The running scan is unchanged and a distinct 33rd pending analyze gets a retryable queue-full error. (FR-41)
-- [ ] **AC-51**: Canonical-path compaction absorbs a request under an equal/ancestor pending path, replaces queued descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order; configuration identity/provenance does not participate. (FR-42)
-- [ ] **AC-52**: Every follower receives the satisfying compacted scan terminal result or error, and no merged force request is lost because effective force is logical OR. No generic projection or `coalesced_by` field is required. (FR-43)
-- [ ] **AC-58**: **Deferred.** Generic asynchronous whole-graph jobs, including `detect_communities_async`, are excluded from this phase; a later initiative must specify and plan them. (FR-49)
+## 4.18: Preserve asynchronous follower handles
+### Subtasks
 
-- [ ] **AC-27**: `make verify` passes. (NFR-04)
+- [x] Add the analyze-only `get_analyze_status(job_id)` poll that resolves a canonical or alias ID to its terminal/progress status without generic job infrastructure.
+- [x] Allocate a distinct asynchronous ID for every accepted request, including absorbed followers, and resolve aliases transitively to the satisfying canonical job.
+- [x] Count every non-terminal pending request, canonical or follower and synchronous or asynchronous, against the shared 32-request capacity; reject further requests with retryable queue-full errors even if they would otherwise be covered.
+- [x] Cover polling, terminal success and failure attribution, cap accounting, and alias cleanup.
+
+### Notes
+
+Revision boundary: D-0011 adds an analyze-only alias poll and bounds every live pending request; `get_status.analyze_job` remains the shared status projection.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `825b34718c53ca15f92096b3a791932b495f6a55`
+- Focused review: `git show 825b34718c53ca15f92096b3a791932b495f6a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools && cargo test -p code-graph-mcp && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) | `PASS: alias polling and follower-inclusive pending capacity passed across the full workspace.` |
+
+## 4.19: Recover queued scans after worker panic
+### Subtasks
+
+- [x] Supervise the detached worker so a panic terminalizes the active job and always advances queue lifecycle cleanup.
+- [x] Release the active admission guard and promote the next pending scan after the panic.
+- [x] Add an injected-panic regression with a queued successor and waiting follower.
+
+### Notes
+
+Revision boundary: panic safety for the analyze-only FIFO; ordinary indexing and error paths remain unchanged.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `825b34718c53ca15f92096b3a791932b495f6a55`
+- Focused review: `git show 825b34718c53ca15f92096b3a791932b495f6a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools worker_panic && cargo test -p code-graph-mcp` | `.` | PASS (`exit 0`) | `PASS: worker panic terminalizes and promotes queued work.` |
+
+## 4.20: Restore atomic applied-index status publication
+### Subtasks
+
+- [x] Publish graph, root, cache root, applied config provenance, indexed state, and timestamps through one coherent status snapshot protocol.
+- [x] Read that snapshot atomically in `get_status`, including watch-driven graph mutations.
+- [x] Cover concurrent publication/polling and config creation or removal after analysis.
+
+### Notes
+
+Revision boundary: restore Phase 3 status coherence without changing the analyze-only compaction rule.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `825b34718c53ca15f92096b3a791932b495f6a55`
+- Focused review: `git show 825b34718c53ca15f92096b3a791932b495f6a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools status_publication && cargo test -p code-graph-mcp` | `.` | PASS (`exit 0`) | `PASS: coherent applied-index status publication and provenance tests passed.` |
+
+## 4.21: Distribute queue-cap acceptance across clients
+### Subtasks
+
+- [x] Keep independent daemon proxy clients open while distributing the capacity-fill, covered, and overflow admissions.
+- [x] Assert shared post-compaction capacity and retryable overflow through MCP responses only.
+
+### Notes
+
+Revision boundary: acceptance-only strengthening; it does not change queue production behavior.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `825b34718c53ca15f92096b3a791932b495f6a55`
+- Focused review: `git show 825b34718c53ca15f92096b3a791932b495f6a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp --test daemon_proxy queue` | `.` | PASS (`exit 0`) | `PASS: live independent proxy clients cover shared capacity.` |
+
+## 4.22: Restore count-limit continuation metadata
+### Subtasks
+
+- [x] Use lookahead to distinguish an exact count-limit end from remaining rows.
+- [x] Preserve strict `next_offset` continuation for limit-plus-one results and existing byte-budget behavior.
+- [x] Align agent-facing descriptions and regressions with the restored pagination contract.
+
+### Notes
+
+Revision boundary: restore the pre-rollback pagination baseline separately from queue semantics.
+
+### Completion Evidence
+
+- Verified: 2026-08-14
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-14 00:00 matched `825b34718c53ca15f92096b3a791932b495f6a55`
+- Focused review: `git show 825b34718c53ca15f92096b3a791932b495f6a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `825b34718c53ca15f92096b3a791932b495f6a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools byte_budget_take && cargo test -p code-graph-tools --test snapshot_tools_list` | `.` | PASS (`exit 0`) | `PASS: count-limit and byte-budget continuation contract passed.` |
+
+## Acceptance Criteria
+- [x] **AC-50**: Analyze requests queue without concurrent execution, with at most 32 pending analyze entries after compaction. The running scan is unchanged and a distinct 33rd pending analyze gets a retryable queue-full error. (FR-41)
+- [x] **AC-51**: Canonical-path compaction absorbs a request under an equal/ancestor pending path, replaces queued descendants with an incoming ancestor at the earliest displaced FIFO position, and preserves disjoint FIFO order; configuration identity/provenance does not participate. (FR-42)
+- [x] **AC-52**: Every follower receives the satisfying compacted scan terminal result or error, and no merged force request is lost because effective force is logical OR. No generic projection or `coalesced_by` field is required. (FR-43)
+- [x] **AC-58**: **Deferred.** Generic asynchronous whole-graph jobs, including `detect_communities_async`, are excluded from this phase; a later initiative must specify and plan them. (FR-49)
+
+- [x] **AC-27**: `make verify` passes. (NFR-04)
 
 ## Phase Completion Evidence
 Pending — not complete.

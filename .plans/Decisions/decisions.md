@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-12
+updated: 2026-08-14
 tags: [decisions]
 related: []
 decisions:
@@ -156,7 +156,7 @@ decisions:
     reversibility: two-way
   - id: D-0010
     kind: answered-question
-    status: accepted
+    status: superseded
     date: 2026-08-12
     decided_by: user
     statement: "The shared long-running-job FIFO admits at most 32 pending jobs; covered analyze requests still coalesce at capacity, while additional distinct analyze or community jobs are rejected with a retryable queue-full tool error."
@@ -171,7 +171,47 @@ decisions:
       - Plans/GraphPlatformExpansion
     tags: [jobs, queue, backpressure, daemon, availability]
     reversibility: two-way
+    superseded_by: D-0011
+  - id: D-0011
+    kind: decision
+    status: accepted
+    supersedes: D-0010
+    date: 2026-08-14
+    decided_by: user-approved
+    statement: "Analyze aliases are individually pollable through an alias-ID status query. The 32-entry pending bound counts every admitted, non-terminal pending analyze request, including absorbed followers; once full, even an otherwise covered request receives a retryable queue-full error."
+    rejected: [Returning the canonical job ID for absorbed async requests, Allowing unbounded absorbed aliases outside the pending cap, Coalescing covered requests after the pending-request limit is reached]
+    rationale: "Distinct async handles need a usable polling path, and every retained handle consumes memory. Counting followers against the same live pending bound prevents unbounded alias growth."
+    scope: [Specs/GraphPlatformExpansion, Designs/RepoLocalDaemon, Plans/GraphPlatformExpansion]
+    tags: [analyze, queue, aliases, polling, backpressure]
+    reversibility: two-way
+  - id: D-0012
+    kind: decision
+    status: superseded
+    date: 2026-08-14
+    decided_by: user-approved
+    statement: "For paginated responses,  means more matching results remain, whether the page was cut by the response byte budget or the requested record limit.  resumes after the final emitted record in either case."
+    rejected: [Restricting truncated to byte-budget clipping and silently treating count-limited pages as complete, Adding a separate continuation field]
+    rationale: "A record limit is an upper bound, not proof of natural completion. One continuation signal prevents later records from becoming unreachable without expanding every Page response."
+    scope: [Specs/GraphPlatformExpansion, Plans/GraphPlatformExpansion, CLAUDE.md]
+    tags: [pagination, response-contract, backward-compatibility]
+    reversibility: two-way
+    superseded_by: D-0013
+  - id: D-0013
+    kind: decision
+    status: accepted
+    supersedes: D-0012
+    date: 2026-08-14
+    decided_by: user-approved
+    statement: "For paginated responses, `truncated: true` means more matching results remain, whether the page was cut by the response byte budget or the requested record limit. `next_offset` resumes after the final emitted record in either case."
+    rejected: [Restricting truncated to byte-budget clipping and silently treating count-limited pages as complete, Adding a separate continuation field]
+    rationale: "A record limit is an upper bound, not proof of natural completion. One continuation signal prevents later records from becoming unreachable without expanding every Page response."
+    scope: [Specs/GraphPlatformExpansion, Plans/GraphPlatformExpansion, CLAUDE.md]
+    tags: [pagination, response-contract, backward-compatibility]
+    reversibility: two-way
 ---
+
+
+
 
 # Decision Ledger
 
