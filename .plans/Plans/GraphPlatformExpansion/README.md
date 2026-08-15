@@ -207,6 +207,7 @@ flowchart LR
 ```
 
 ## Key Decisions
+- **Historical generic-job projection** (D-0009). It describes the superseded generic scheduler and remains historical only.
 - **Phase 4 queue policy** (D-0011). `get_analyze_status(job_id)` polls canonical or follower aliases; every non-terminal pending request, including followers, counts against the 32-request bound. The queue remains analyze-only and path-compacting. **Pagination continuation** (D-0013): `truncated=true` means more matching results remain after either a count or byte cap, and `next_offset` resumes the page.
 - **Deferred async whole-graph scope.** FR-49 and AC-58 are explicitly deferred; Phase 4 does not provide `detect_communities_async` or generic long-running jobs. The absence is intentional and is the required plan coverage for FR-49 / AC-58.
 
