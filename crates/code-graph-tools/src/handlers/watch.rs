@@ -222,6 +222,9 @@ pub async fn try_reindex_file(
         if let Err(error) = inner.ensure_daemon_root_current() {
             return ReindexOutcome::Error(error);
         }
+        // Lock order: status_publication is outermost of graph mutations so
+        // get_status cannot pair a partially-mutated graph with its metadata.
+        let _publication = inner.status_publication.write();
         let mut g = inner.graph.write();
         // Capture the file's pre-existing symbol IDs *before* dropping the
         // file from the graph — they're the truly-removed set for the
@@ -445,6 +448,9 @@ pub async fn try_reindex_file(
     if let Err(error) = inner.ensure_daemon_root_current() {
         return ReindexOutcome::Error(error);
     }
+    // Lock order: status_publication is outermost of graph mutations so
+    // get_status cannot pair a partially-mutated graph with its metadata.
+    let _publication = inner.status_publication.write();
     let mut g = inner.graph.write();
     g.merge_file_graph(new_fg);
     g.prune_dangling_edges(&removed_ids);
@@ -613,6 +619,9 @@ async fn try_reindex_subtree_removal(inner: &Arc<ServerInner>, path: &Path) {
     if inner.ensure_daemon_root_current().is_err() {
         return;
     }
+    // Lock order: status_publication is outermost of graph mutations so
+    // get_status cannot pair a partially-mutated graph with its metadata.
+    let _publication = inner.status_publication.write();
     let mut g = inner.graph.write();
     let removed_ids = g.remove_files_under(path);
     if removed_ids.is_empty() {

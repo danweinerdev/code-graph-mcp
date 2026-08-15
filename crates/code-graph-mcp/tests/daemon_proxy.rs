@@ -482,7 +482,7 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
                 .to_owned()
         })
         .collect();
-    assert_eq!(names.len(), 22, "expected every advertised tool");
+    assert_eq!(names.len(), 23, "expected every advertised tool");
     let symbol = format!("{}:fallback_query", source.display());
 
     for name in names {
@@ -504,6 +504,7 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
             "watch_start" => json!({}),
             "watch_stop" => json!({}),
             "get_status" => json!({}),
+            "get_analyze_status" => json!({"job_id": "unknown"}),
             "find_overrides" => json!({"symbol": symbol}),
             "find_class_candidates" => json!({"name": "Missing"}),
             "get_symbol_at" => json!({"file": source, "line": 1}),
@@ -571,7 +572,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     client.close();
     let metadata = wait_metadata(&default_root);
@@ -591,7 +592,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     client.close();
     assert!(!disabled.0.join(".code-graph").exists());
@@ -604,7 +605,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let stderr = client.close();
     assert!(!stderr.contains("daemon unavailable"));
@@ -617,7 +618,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     client.close();
     assert!(!forced.0.join(".code-graph").exists());
@@ -825,10 +826,10 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         "analyze_codebase_async",
         json!({"path":alpha_descendant, "force":true}),
     );
-    assert_eq!(
-        async_job_id(&descendant),
-        child_id,
-        "a pending descendant is absorbed by its pending ancestor across clients"
+    let descendant_id = async_job_id(&descendant);
+    assert_ne!(
+        descendant_id, child_id,
+        "an absorbed pending descendant retains a distinct asynchronous handle across clients"
     );
     descendant_client.close();
 
@@ -842,6 +843,15 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         alpha_id, child_id,
         "incoming ancestor replaces pending child"
     );
+    for alias in [&child_id, &descendant_id] {
+        let polled =
+            Client::text(&ancestor_client.tool("get_analyze_status", json!({"job_id": alias})));
+        assert_eq!(
+            polled["job_id"], alpha_id,
+            "an alias polls the satisfying canonical pending scan across clients"
+        );
+        assert_eq!(polled["status"], "running");
+    }
     ancestor_client.close();
 
     let success_root = root.0.clone();
@@ -916,6 +926,19 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         post_success_status["analyze_job_previous_terminal"]["status"],
         "completed"
     );
+    for handle in [&alpha_id, &child_id, &descendant_id] {
+        let polled =
+            Client::text(&status_client.tool("get_analyze_status", json!({"job_id": handle})));
+        assert_eq!(
+            polled["job_id"], alpha_id,
+            "canonical and alias polling return the satisfying canonical ID"
+        );
+        assert_eq!(polled["status"], "completed");
+        assert!(
+            polled["result"].is_object(),
+            "terminal poll includes result"
+        );
+    }
     assert_eq!(
         Client::text(&success)["root_path"],
         root.0.to_string_lossy().as_ref(),
@@ -949,7 +972,7 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
 
 #[cfg(debug_assertions)]
 #[test]
-fn live_proxy_queue_cap_keeps_covered_analyze_slot_free() {
+fn live_proxy_queue_cap_rejects_covered_followers_across_clients() {
     let _guard = process_test_guard();
     let root = TestRoot::new(true);
     let release_marker = root.0.join("persist-release.marker");
@@ -1012,36 +1035,47 @@ fn live_proxy_queue_cap_keeps_covered_analyze_slot_free() {
     );
     wait_for_running_path(&mut holder, &running);
 
-    let mut client = Client::spawn(&root.0, &[]);
-    let first = client.tool(
+    // Keep both proxy connections open while alternating admissions. Capacity
+    // belongs to the daemon's shared queue, not to either client connection.
+    let mut first_client = Client::spawn(&root.0, &[]);
+    let mut second_client = Client::spawn(&root.0, &[]);
+    let first = first_client.tool(
         "analyze_codebase_async",
         json!({"path":pending.join("0"), "force":false}),
     );
     assert_async_admitted(&first, "first of 32 distinct pending analyzes");
-    let first_id = async_job_id(&first);
     for index in 1..32 {
+        let client = if index % 2 == 0 {
+            &mut first_client
+        } else {
+            &mut second_client
+        };
         let admitted = client.tool(
             "analyze_codebase_async",
             json!({"path":pending.join(index.to_string()), "force":false}),
         );
         assert_async_admitted(&admitted, &format!("pending analyze {index}"));
     }
-    let covered_response = client.tool(
+    let covered_response = second_client.tool(
         "analyze_codebase_async",
         json!({"path":covered, "force":true}),
     );
-    assert_async_admitted(&covered_response, "covered pending analyze at capacity");
-    assert_eq!(
-        async_job_id(&covered_response),
-        first_id,
-        "covered request shares the canonical pending scan rather than taking a slot"
-    );
     wait_for_marker_count(
         &pending_marker,
-        33,
-        "32 distinct and one covered pending analyze did not reach serialized admission",
+        32,
+        "32 distinct pending analyzes did not reach serialized admission",
     );
-    let rejected = client.tool(
+    assert_eq!(
+        covered_response["result"]["isError"], true,
+        "a covered follower is the 33rd pending request and must reject"
+    );
+    assert!(
+        covered_response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("queue is full") && text.contains("retry")),
+        "covered overflow is retryable across daemon clients: {covered_response}"
+    );
+    let rejected = first_client.tool(
         "analyze_codebase_async",
         json!({"path":overflow, "force":false}),
     );
@@ -1061,7 +1095,8 @@ fn live_proxy_queue_cap_keeps_covered_analyze_slot_free() {
         "overflow did not start another worker while held work remains active"
     );
 
-    client.close();
+    first_client.close();
+    second_client.close();
     holder.close();
     let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
     let status = Command::new("kill")
@@ -1186,7 +1221,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let metadata = wait_metadata(&tcp);
     assert_eq!(
@@ -1215,7 +1250,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     assert!(
         client.tool("analyze_codebase", json!({"path":failed.0, "force":true}))["result"]
@@ -1332,7 +1367,7 @@ fn forced_fallback_terminates_a_slow_contender_before_it_can_publish() {
             .as_array()
             .unwrap()
             .len(),
-        22,
+        23,
         "forced fallback serves in process"
     );
     thread::sleep(Duration::from_secs(1));
@@ -1403,7 +1438,7 @@ fn saturated_uds_attachment_falls_back_instead_of_reporting_a_dead_connection() 
             .as_array()
             .unwrap()
             .len(),
-        22,
+        23,
         "the saturated proxy still has MCP service through fallback"
     );
     let stderr = client.close();
@@ -1432,7 +1467,7 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
                 .as_array()
                 .unwrap()
                 .len(),
-            22
+            23
         );
     }
     let owner_pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
@@ -1472,7 +1507,7 @@ fn clean_binary_mismatch_recovers_a_truncated_request_and_replaces_the_old_owner
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let new = wait_replacement_metadata(&root, &old["owner"]);
     assert_ne!(
@@ -1524,7 +1559,7 @@ fn different_executable_content_replaces_even_when_build_sha_matches() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let new = wait_metadata(&root);
     assert_ne!(new["owner"], old["owner"], "different executable replaced");
@@ -1547,7 +1582,7 @@ fn sequential_clients_keep_the_same_matching_executable_owner() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let current = wait_metadata(&root);
     assert_eq!(current["owner"], old["owner"]);
@@ -1573,7 +1608,7 @@ fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     let new = wait_metadata(&root);
     assert_ne!(new["owner"], old["owner"], "dirty owner was replaced once");
@@ -1606,7 +1641,7 @@ fn ignored_replacement_request_is_hard_killed_and_client_falls_back() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     fallback.close();
     assert!(
@@ -1675,7 +1710,7 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
     assert!(
         started.elapsed() >= Duration::from_secs(2),
@@ -1764,7 +1799,7 @@ fn root_replacement_during_admitted_persist_uses_the_retained_cache_inode() {
             .as_array()
             .unwrap()
             .len(),
-        22,
+        23,
         "a new proxy client converges on the replacement-root daemon"
     );
     let new = wait_metadata(&root);

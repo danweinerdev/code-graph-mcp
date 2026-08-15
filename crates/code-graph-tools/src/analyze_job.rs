@@ -11,7 +11,7 @@
 //! - `JobStatus` tags the state machine: Running → Completed(result)
 //!   or Failed(msg).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -27,12 +27,72 @@ use crate::handlers::analyze::AnalyzeResult;
 pub(crate) struct AnalyzeSlot {
     pub(crate) current: Option<Arc<AnalyzeJob>>,
     pub(crate) previous_terminal: Option<Arc<AnalyzeJob>>,
-    /// Canonical analyze requests waiting behind `current`. This is
-    /// deliberately analyze-specific: it is not a general job scheduler.
+    /// Canonical analyze requests waiting behind `current`. Each entry carries
+    /// the number of requests compacted into it, so the 32-request capacity
+    /// includes synchronous followers and async aliases, not merely scans.
+    /// This is deliberately analyze-specific: it is not a general job
+    /// scheduler.
     pub(crate) pending: VecDeque<PendingAnalyze>,
     /// Async IDs absorbed by pending compaction. They are intentionally
-    /// internal: status continues to expose only `current`.
+    /// internal: status continues to expose only `current`. Entries remain
+    /// while their target has the same current/previous-terminal retention
+    /// as its canonical job.
     pub(crate) aliases: HashMap<String, String>,
+}
+
+impl AnalyzeSlot {
+    fn resolve_alias_id(&self, job_id: &str) -> Option<String> {
+        let mut canonical_id = job_id.to_string();
+        let mut remaining = self.aliases.len().saturating_add(1);
+        while let Some(next) = self.aliases.get(&canonical_id) {
+            if remaining == 0 {
+                return None;
+            }
+            canonical_id = next.clone();
+            remaining -= 1;
+        }
+        Some(canonical_id)
+    }
+
+    /// Resolve a canonical or absorbed async handle to its satisfying job.
+    ///
+    /// Following the map rather than assuming a single hop keeps displaced
+    /// followers correct even if compaction has formed an alias chain.
+    pub(crate) fn resolve_async_job(&self, job_id: &str) -> Option<Arc<AnalyzeJob>> {
+        let canonical_id = self.resolve_alias_id(job_id)?;
+
+        self.current
+            .iter()
+            .chain(self.previous_terminal.iter())
+            .map(Arc::clone)
+            .chain(self.pending.iter().map(|pending| Arc::clone(&pending.job)))
+            .find(|job| job.job_id == canonical_id)
+    }
+
+    /// Number of live requests still waiting behind the running scan. Terminal
+    /// alias retention deliberately lives outside `pending`, so the grace
+    /// window never occupies a request-capacity slot.
+    pub(crate) fn pending_request_count(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|pending| pending.request_count)
+            .sum()
+    }
+
+    /// Drop aliases only when the canonical terminal falls out of the same
+    /// one-job grace window used by `previous_terminal`.
+    pub(crate) fn discard_aliases_for(&mut self, job_id: &str) {
+        let stale: HashSet<_> = self
+            .aliases
+            .keys()
+            .filter(|alias| {
+                self.resolve_alias_id(alias)
+                    .is_some_and(|target| target == job_id)
+            })
+            .cloned()
+            .collect();
+        self.aliases.retain(|alias, _| !stale.contains(alias));
+    }
 }
 
 /// One process-wide, collision-safe source for the 20-digit decimal IDs
@@ -65,6 +125,9 @@ pub(crate) fn allocate_job_timestamp() -> u64 {
 pub(crate) struct PendingAnalyze {
     pub(crate) job: Arc<AnalyzeJob>,
     pub(crate) guard: crate::server::AnalyzeGuard,
+    /// Canonical request plus every synchronous or asynchronous follower
+    /// compacted into this pending scan.
+    pub(crate) request_count: usize,
 }
 
 pub(crate) struct AnalyzeJob {

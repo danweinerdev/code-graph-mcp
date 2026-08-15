@@ -197,6 +197,13 @@ pub fn get_status(inner: Arc<ServerInner>) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::status::get_status(inner))
 }
 
+/// Analyze-only ID-addressed poll. Unlike the shared `get_status` projection,
+/// this resolves an async request's original handle through pending-compaction
+/// aliases and returns the satisfying canonical job view.
+pub fn get_analyze_status(inner: Arc<ServerInner>, job_id: String) -> CallToolResult {
+    crate::core::to_call_tool_result(crate::core::status::get_analyze_status(inner, job_id))
+}
+
 /// Format `nanos` since UNIX_EPOCH as an RFC3339 UTC string of the
 /// form `"YYYY-MM-DDTHH:MM:SSZ"` (second precision). Standalone
 /// implementation rather than pulling in `chrono` / `time` for a

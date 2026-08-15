@@ -295,10 +295,11 @@ pub struct CouplingBoth {
 /// is the source of truth, not the snapshots. Integer fields stay `u32`
 /// (not `usize`) so JSON output is byte-identical across platforms.
 ///
-/// `truncated` is `true` when the handler stopped emitting results before
-/// reaching `limit` due to a byte-budget cap. `next_offset` is `Some(n)` when a
-/// client should re-request with `offset = n` to continue paging — `None`
-/// when there is no further page. The fields always serialize (no
+/// `truncated` is `true` when the handler stopped emitting results before the
+/// source was exhausted because either `limit` or the byte-budget cap cut the
+/// page. `next_offset` is `Some(n)` when a client should re-request with
+/// `offset = n` to continue paging — `None` when there is no further page.
+/// The fields always serialize (no
 /// `skip_serializing_if`) so MCP clients can rely on a stable envelope
 /// shape: `truncated: false` and `next_offset: null` are emitted explicitly
 /// when no truncation occurred.
@@ -555,8 +556,10 @@ pub const NO_BYTE_BUDGET: usize = usize::MAX;
 /// - If a candidate would push the total over budget, it is NOT included,
 ///   the function returns early with `truncated = true` and
 ///   `next_offset = Some(offset + kept_count)`.
-/// - If `limit` is reached, or `iter` is exhausted, before the budget
-///   bites, the function returns `truncated = false` and `next_offset = None`.
+/// - A one-item lookahead distinguishes an iterator exhausted exactly at
+///   `limit` from one with another item available: exact end returns
+///   `truncated = false` and `next_offset = None`; a count-capped page returns
+///   `truncated = true` and `next_offset = Some(offset + kept_count)`.
 /// - Pathological case: if the very first candidate alone exceeds the
 ///   budget, the helper returns 0 records, `truncated = true`, and
 ///   `next_offset = Some(offset)` — never panics, never makes forward
@@ -629,11 +632,11 @@ pub(super) fn byte_budget_take<T: Serialize, I: IntoIterator<Item = T>>(
 
     for item in iter.into_iter().skip(offset as usize) {
         if (kept.len() as u32) >= limit {
-            // Hit the count cap before the byte budget — clean page, no
-            // continuation token. Anything beyond `limit` is the next call's
-            // responsibility, signalled by the caller-supplied `offset+limit`,
-            // not by the helper.
-            return (kept, limit, false, None);
+            // Reaching this branch means `item` is a one-item lookahead beyond
+            // the count cap. The source has more records, so expose an honest
+            // continuation instead of making clients infer `offset + limit`.
+            let kept_len = kept.len() as u32;
+            return (kept, kept_len, true, Some(offset.saturating_add(kept_len)));
         }
         // Production `T` types (SymbolResult, CallChain) are infallible
         // serializers — they hold only plain owned data with no cycles or
@@ -997,16 +1000,64 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_take_limit_cap_before_budget() {
-        // limit caps before budget bites. 5 records, limit=2, generous
-        // budget → exactly 2 kept, truncated=false (caller decides whether
-        // to re-page via offset+limit).
+    fn byte_budget_take_limit_plus_one_returns_continuation() {
+        // The third record is the one-item lookahead proving this page was
+        // cut by limit, not naturally exhausted. Its continuation is strictly
+        // past the two emitted records.
         let items: Vec<Rec> = (0..5).map(|id| Rec { id }).collect();
+        let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 2, 10_000);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(total_kept, 2);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(2));
+    }
+
+    #[test]
+    fn byte_budget_take_exact_limit_is_complete() {
+        // No lookahead item exists when the source ends exactly at the count
+        // cap, so this is a complete page rather than a truncated one.
+        let items: Vec<Rec> = (0..2).map(|id| Rec { id }).collect();
         let (kept, total_kept, truncated, next_offset) = byte_budget_take(items, 0, 2, 10_000);
         assert_eq!(kept.len(), 2);
         assert_eq!(total_kept, 2);
         assert!(!truncated);
         assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn byte_budget_take_limit_continuations_resume_without_gaps_or_duplicates() {
+        // Follow the helper's continuation tokens over five records with
+        // limit=2: [0, 1], [2, 3], [4]. The concatenated IDs prove every
+        // record is returned exactly once and the exact-limit final page has
+        // no spurious continuation.
+        let page = |offset| {
+            byte_budget_take(
+                (0..5).map(|id| Rec { id }).collect::<Vec<_>>(),
+                offset,
+                2,
+                10_000,
+            )
+        };
+
+        let (first, _, first_truncated, first_next) = page(0);
+        assert!(first_truncated);
+        assert_eq!(first_next, Some(2));
+
+        let (second, _, second_truncated, second_next) = page(first_next.unwrap());
+        assert!(second_truncated);
+        assert_eq!(second_next, Some(4));
+
+        let (third, _, third_truncated, third_next) = page(second_next.unwrap());
+        assert!(!third_truncated);
+        assert_eq!(third_next, None);
+
+        let ids: Vec<u32> = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

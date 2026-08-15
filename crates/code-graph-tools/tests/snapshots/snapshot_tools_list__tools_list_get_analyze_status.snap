@@ -1,0 +1,23 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+assertion_line: 148
+expression: "tool_entry(\"get_analyze_status\")"
+---
+{
+  "name": "get_analyze_status",
+  "description": "Poll one `analyze_codebase_async` request. `job_id` is required and may be either the original canonical async job ID or an absorbed/displaced follower alias. Returns the satisfying canonical `AnalyzeJobView`: `{ job_id, status, path, force, started_at, finished_at, progress, progress_total, progress_message, error, result, current_phase }`. The returned `job_id` identifies the satisfying canonical scan, so it may differ from an alias input. Poll while `status == \"running\"` (250-1000ms is a reasonable cadence); read `result` on `\"completed\"` or `error` on `\"failed\"`. Unknown IDs, and aliases whose canonical terminal has left the one-job grace window, return a user-visible tool error. `get_status` remains the shared current/previous diagnostic projection.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "job_id": {
+        "description": "Async analyze request job ID returned by analyze_codebase_async",
+        "type": "string"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "title": "GetAnalyzeStatusArgs",
+    "type": "object"
+  }
+}

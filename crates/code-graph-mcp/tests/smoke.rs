@@ -2,13 +2,13 @@
 //!
 //! Spawns the freshly-built `code-graph-mcp` debug binary, completes the
 //! `initialize` handshake, sends a `tools/list` request, and asserts that
-//! the response advertises 22 tools. The full wire-format snapshot
+//! the response advertises 23 tools. The full wire-format snapshot
 //! suite lives in `code-graph-tools`'s snapshot tests; this assertion
 //! is a coarse compile-and-handshake gate.
 //!
-//! This complements the unit-level `tool_router_registers_twenty_two_tools`
+//! This complements the unit-level `tool_router_registers_twenty_three_tools`
 //! test in `code-graph-tools::server` — that test never starts the IO loop,
-//! so it can't catch a regression where the macro generates 22 routes but
+//! so it can't catch a regression where the macro generates 23 routes but
 //! `ServerHandler::list_tools` filters them. Running both gives us
 //! belt-and-braces coverage without depending on an external MCP client.
 
@@ -108,7 +108,7 @@ impl LineReader {
 }
 
 #[test]
-fn binary_advertises_twenty_two_tools() {
+fn binary_advertises_twenty_three_tools() {
     // Prefer the cargo-built path. `CARGO_BIN_EXE_<name>` is set by cargo
     // for integration tests targeting binary crates; if it's unset (e.g.
     // running this file via `rust-analyzer` directly) we fail fast with a
@@ -181,8 +181,8 @@ fn binary_advertises_twenty_two_tools() {
 
     assert_eq!(
         tools.len(),
-        22,
-        "tools/list must advertise 22 tools, got {}: {tools:?}",
+        23,
+        "tools/list must advertise 23 tools, got {}: {tools:?}",
         tools.len(),
     );
 
@@ -209,6 +209,7 @@ fn binary_advertises_twenty_two_tools() {
         "watch_start",
         "watch_stop",
         "get_status",
+        "get_analyze_status",
         "find_overrides",
         "find_class_candidates",
         "get_symbol_at",

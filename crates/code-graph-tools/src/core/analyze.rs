@@ -117,6 +117,11 @@ pub(crate) async fn run_analyze_job(
     job: Arc<AnalyzeJob>,
     sink: Arc<dyn ProgressSink>,
 ) {
+    #[cfg(test)]
+    if take_injected_worker_panic(&job.path) {
+        panic!("injected analyze worker panic");
+    }
+
     let path_raw = job.path.clone();
     let force = job.force();
 
@@ -157,25 +162,28 @@ pub(crate) async fn run_analyze_job(
         }
     }
 
-    let (mut cfg, project_root) = match RootConfig::load(&abs_path) {
-        Ok((c, root)) => (c, root),
-        Err(ConfigError::Toml(e)) => {
-            finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
-            return;
-        }
-        Err(ConfigError::Io(e)) => {
-            finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
-            return;
-        }
-        Err(e @ ConfigError::ExtensionMissingDot { .. })
-        | Err(e @ ConfigError::ExtensionConflict { .. })
-        | Err(e @ ConfigError::MacroStripConflict { .. })
-        | Err(e @ ConfigError::MacroDefineTypeEmptyName)
-        | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
-            finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
-            return;
-        }
-    };
+    let (mut cfg, project_root, applied_config_path) =
+        match RootConfig::load_with_provenance(&abs_path) {
+            Ok((c, root, config_path)) => (c, root, config_path),
+            Err(ConfigError::Toml(e)) => {
+                finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
+                return;
+            }
+            Err(ConfigError::Io(e)) => {
+                finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
+                return;
+            }
+            Err(e @ ConfigError::ExtensionMissingDot { .. })
+            | Err(e @ ConfigError::ExtensionConflict { .. })
+            | Err(e @ ConfigError::MacroStripConflict { .. })
+            | Err(e @ ConfigError::MacroDefineTypeEmptyName)
+            | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
+                finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
+                return;
+            }
+        };
+    #[cfg(test)]
+    wait_for_config_discovery_hook(&inner);
     if let Some(daemon_root) = inner.daemon_project_root.get() {
         if daemon_root != &project_root {
             finish_failed(
@@ -314,17 +322,32 @@ pub(crate) async fn run_analyze_job(
                     return;
                 }
                 {
-                    let mut g = inner.graph.write();
-                    *g = probe;
+                    // `get_status` takes the matching read guard. Keep every
+                    // status-facing part of a successful analyze publication
+                    // inside this write section so it cannot combine this
+                    // graph with metadata from a prior index.
+                    let _publication = inner.status_publication.write();
+                    {
+                        let mut g = inner.graph.write();
+                        *g = probe;
+                    }
+                    #[cfg(test)]
+                    wait_for_publication_hook(&inner);
+                    *inner.root_path.write() = Some(project_root.clone());
+                    *inner.cache_root.write() = Some(project_root.clone());
+                    *inner.config.write() = cfg.clone();
+                    {
+                        let mut applied = inner.applied_index.write();
+                        applied.root_path = Some(project_root.clone());
+                        applied.config_path = applied_config_path.clone();
+                        applied.config = cfg;
+                    }
+                    inner.indexed.store(true, Ordering::Release);
+                    inner
+                        .index_built_at
+                        .store(now_nanos_u64(), Ordering::Release);
+                    inner.index_force_built.store(force, Ordering::Release);
                 }
-                *inner.root_path.write() = Some(project_root.clone());
-                *inner.cache_root.write() = Some(project_root.clone());
-                *inner.config.write() = cfg;
-                inner.indexed.store(true, Ordering::Release);
-                inner
-                    .index_built_at
-                    .store(now_nanos_u64(), Ordering::Release);
-                inner.index_force_built.store(force, Ordering::Release);
                 if sweep_ran {
                     // The sweep introduces a cache write — bump the
                     // phase so a polling client doesn't see the
@@ -558,19 +581,34 @@ pub(crate) async fn run_analyze_job(
                 Err(error)
             } else {
                 let stats = {
-                    let mut g = inner.graph.write();
-                    *g = merged_graph;
-                    g.stats()
+                    // `get_status` takes the matching read guard. Keep every
+                    // status-facing part of a successful analyze publication
+                    // inside this write section so it cannot combine this
+                    // graph with metadata from a prior index.
+                    let _publication = inner.status_publication.write();
+                    let stats = {
+                        let mut g = inner.graph.write();
+                        *g = merged_graph;
+                        g.stats()
+                    };
+                    #[cfg(test)]
+                    wait_for_publication_hook(&inner);
+                    *inner.root_path.write() = Some(project_root.clone());
+                    *inner.cache_root.write() = Some(project_root.clone());
+                    *inner.config.write() = cfg.clone();
+                    {
+                        let mut applied = inner.applied_index.write();
+                        applied.root_path = Some(project_root.clone());
+                        applied.config_path = applied_config_path.clone();
+                        applied.config = cfg;
+                    }
+                    inner.indexed.store(true, Ordering::Release);
+                    inner
+                        .index_built_at
+                        .store(now_nanos_u64(), Ordering::Release);
+                    inner.index_force_built.store(force, Ordering::Release);
+                    stats
                 };
-
-                *inner.root_path.write() = Some(project_root.clone());
-                *inner.cache_root.write() = Some(project_root.clone());
-                *inner.config.write() = cfg;
-                inner.indexed.store(true, Ordering::Release);
-                inner
-                    .index_built_at
-                    .store(now_nanos_u64(), Ordering::Release);
-                inner.index_force_built.store(force, Ordering::Release);
 
                 if abs_path != project_root {
                     let in_scope_count = {
@@ -678,6 +716,28 @@ pub(crate) fn finish_failed(job: &AnalyzeJob, msg: String) {
     job.notify_terminal();
 }
 
+/// Pause a test worker after graph replacement while it still owns the
+/// publication lock. This makes the no-tear status invariant deterministic
+/// without adding a production synchronization point.
+#[cfg(test)]
+fn wait_for_publication_hook(inner: &ServerInner) {
+    if let Some(hook) = inner.publication_hook.lock().take() {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
+/// Pause after discovery has selected config provenance. This makes it
+/// possible to prove a subsequent config create/remove cannot alter what is
+/// eventually published to `get_status`.
+#[cfg(test)]
+fn wait_for_config_discovery_hook(inner: &ServerInner) {
+    if let Some(hook) = inner.config_discovery_hook.lock().take() {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
 /// `analyze_codebase` body.
 ///
 /// Slot-protocol coordination only — the heavy lifting (cache fast-path,
@@ -726,7 +786,7 @@ pub async fn analyze_codebase(
 /// pending requests and return immediately.
 ///
 /// No progress sink parameter — async kickoff has no client-side
-/// progress channel; agents observe progress by polling `get_status`.
+/// progress channel; agents observe progress by polling `get_analyze_status`.
 /// The detached worker runs with `Arc::new(NoopProgressSink)`.
 ///
 /// Ungated by design, same as [`analyze_codebase`].
@@ -748,7 +808,7 @@ pub async fn analyze_codebase_async(
             status: "running",
             started_at: format_unix_nanos_rfc3339(started_at),
             existing: false,
-            note: "analyze queued behind active work — poll get_status for progress and the terminal result",
+            note: "analyze queued behind active work — poll get_analyze_status for progress and the terminal result",
         })),
         Kickoff::New(job, analyze_guard) => {
             let response = AsyncKickoffResponse {
@@ -756,7 +816,7 @@ pub async fn analyze_codebase_async(
                 status: "running",
                 started_at: format_unix_nanos_rfc3339(job.started_at),
                 existing: false,
-                note: "analyze kicked off — poll get_status for progress and the terminal result",
+                note: "analyze kicked off — poll get_analyze_status for progress and the terminal result",
             };
             // Detach: the JoinHandle is dropped intentionally so the
             // worker outlives this call. Terminal state flows back
@@ -803,6 +863,14 @@ fn next_job(path: String, force: bool) -> Arc<AnalyzeJob> {
     AnalyzeJob::new_running(format!("{started_at:020}"), path, force, started_at)
 }
 
+/// Allocate the opaque handle for an async follower without creating another
+/// queued scan. The handle is retained in `AnalyzeSlot::aliases` and resolves
+/// to the pending canonical job that will satisfy this request.
+fn next_async_alias_id() -> (String, u64) {
+    let started_at = allocate_job_timestamp();
+    (format!("{started_at:020}"), started_at)
+}
+
 /// Add a request to pending work. `current` is deliberately absent from this
 /// function: compaction never observes or mutates active work.
 fn compact_pending(
@@ -811,12 +879,23 @@ fn compact_pending(
     force: bool,
     guard: crate::server::AnalyzeGuard,
 ) -> Result<PendingAdmission, ToolError> {
-    if let Some(entry) = slot
+    // Capacity is by every live request, before compaction. A covered
+    // follower is still a pending request and cannot bypass the 32-request
+    // bound merely because it needs no new scan.
+    if slot.pending_request_count() == MAX_PENDING_ANALYZES {
+        return Err(ToolError(
+            "analyze queue is full; retry after a pending analyze completes".to_string(),
+        ));
+    }
+
+    if let Some(index) = slot
         .pending
         .iter()
-        .find(|entry| is_ancestor_or_equal(&entry.job.path, &path))
+        .position(|entry| is_ancestor_or_equal(&entry.job.path, &path))
     {
+        let entry = &mut slot.pending[index];
         entry.job.or_force(force);
+        entry.request_count += 1;
         return Ok(PendingAdmission::Attached(Arc::clone(&entry.job)));
     }
 
@@ -826,17 +905,12 @@ fn compact_pending(
         .enumerate()
         .filter_map(|(index, entry)| is_ancestor_or_equal(&path, &entry.job.path).then_some(index))
         .collect();
-    if descendants.is_empty() && slot.pending.len() == MAX_PENDING_ANALYZES {
-        return Err(ToolError(
-            "analyze queue is full; retry after a pending analyze completes".to_string(),
-        ));
-    }
-
     let job = next_job(path, force);
     if descendants.is_empty() {
         slot.pending.push_back(crate::analyze_job::PendingAnalyze {
             job: Arc::clone(&job),
             guard,
+            request_count: 1,
         });
         return Ok(PendingAdmission::Canonical(job));
     }
@@ -850,7 +924,9 @@ fn compact_pending(
                 .expect("pending index came from queue"),
         );
     }
+    let mut request_count = 1;
     for displaced in removed {
+        request_count += displaced.request_count;
         job.or_force(displaced.job.force());
         displaced.job.replace_with(Arc::clone(&job));
         slot.aliases
@@ -868,6 +944,7 @@ fn compact_pending(
         crate::analyze_job::PendingAnalyze {
             job: Arc::clone(&job),
             guard,
+            request_count,
         },
     );
     Ok(PendingAdmission::Canonical(job))
@@ -925,10 +1002,11 @@ fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Ki
                 job_id: job.job_id.clone(),
                 started_at: job.started_at,
             }),
-            PendingAdmission::Attached(target) => Ok(Kickoff::Pending {
-                job_id: target.job_id.clone(),
-                started_at: target.started_at,
-            }),
+            PendingAdmission::Attached(target) => {
+                let (job_id, started_at) = next_async_alias_id();
+                slot.aliases.insert(job_id.clone(), target.job_id.clone());
+                Ok(Kickoff::Pending { job_id, started_at })
+            }
         };
     }
     let guard = inner
@@ -946,12 +1024,49 @@ fn spawn_analyze_worker(
     guard: crate::server::AnalyzeGuard,
 ) {
     tokio::spawn(async move {
-        run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink).await;
+        // Keep the pipeline in a child task so this detached supervisor gets
+        // a JoinError instead of unwinding before it can terminalize the job,
+        // release its daemon admission, and promote queued work.
+        let worker = tokio::spawn(run_analyze_job(Arc::clone(&inner), Arc::clone(&job), sink));
+        if let Err(join_error) = worker.await {
+            finish_failed(&job, format!("analyze worker panicked: {join_error}"));
+        }
         drop(guard);
         if let Some(next) = promote_next(&inner, &job) {
             spawn_pending_worker(inner, next);
         }
     });
+}
+
+/// Arm a one-shot, path-targeted panic at the start of an analyze pipeline.
+/// Keeping the hook test-only makes the worker-supervision path deterministic
+/// without adding a production failure mode.
+#[cfg(test)]
+fn inject_worker_panic(path: String) {
+    let mut target = injected_worker_panic_target()
+        .lock()
+        .expect("injected worker-panic mutex must not be poisoned");
+    *target = Some(path);
+}
+
+#[cfg(test)]
+fn take_injected_worker_panic(path: &str) -> bool {
+    let mut target = injected_worker_panic_target()
+        .lock()
+        .expect("injected worker-panic mutex must not be poisoned");
+    if target.as_deref() == Some(path) {
+        target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn injected_worker_panic_target() -> &'static std::sync::Mutex<Option<String>> {
+    static TARGET: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    TARGET.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 fn promote_next(
@@ -966,8 +1081,10 @@ fn promote_next(
     {
         return None;
     }
-    slot.aliases.retain(|_, target| target != &completed.job_id);
     let next = slot.pending.pop_front()?;
+    if let Some(expired) = slot.previous_terminal.take() {
+        slot.discard_aliases_for(&expired.job_id);
+    }
     slot.previous_terminal = slot.current.replace(Arc::clone(&next.job));
     Some(next)
 }
@@ -1027,6 +1144,11 @@ mod queue_tests {
         assert_eq!(
             pending_paths(&server.inner.analyze_slot.read()),
             ["/queue/a", "/queue/b"]
+        );
+        assert_eq!(
+            server.inner.analyze_slot.read().pending_request_count(),
+            3,
+            "canonical scans and covered followers each occupy a pending request slot"
         );
     }
 
@@ -1098,34 +1220,174 @@ mod queue_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn worker_panic_fails_active_promotes_successor_and_releases_drain() {
+        use code_graph_lang_cpp::CppParser;
+
+        let root = tempfile::tempdir().expect("create worker-panic fixture root");
+        let active_dir = root.path().join("active");
+        let successor_dir = root.path().join("successor");
+        std::fs::create_dir_all(&active_dir).expect("create active fixture directory");
+        std::fs::create_dir_all(successor_dir.join("async-follower"))
+            .expect("create async follower fixture directory");
+        std::fs::create_dir_all(successor_dir.join("sync-follower"))
+            .expect("create sync follower fixture directory");
+        std::fs::write(successor_dir.join("main.cpp"), b"void recovered() {}\n")
+            .expect("write successor source");
+
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().expect("create C++ parser")))
+            .expect("register C++ parser");
+        let server = crate::server::CodeGraphServer::new(registry);
+        let active_path = paths::canonicalize(&active_dir)
+            .expect("canonicalize active fixture directory")
+            .to_string_lossy()
+            .into_owned();
+        let successor_path = paths::canonicalize(&successor_dir)
+            .expect("canonicalize successor fixture directory")
+            .to_string_lossy()
+            .into_owned();
+        let async_follower_path = paths::canonicalize(&successor_dir.join("async-follower"))
+            .expect("canonicalize async follower fixture directory")
+            .to_string_lossy()
+            .into_owned();
+        let sync_follower_path = paths::canonicalize(&successor_dir.join("sync-follower"))
+            .expect("canonicalize sync follower fixture directory")
+            .to_string_lossy()
+            .into_owned();
+
+        inject_worker_panic(active_path.clone());
+        let active_job_id =
+            match analyze_codebase_async(Arc::clone(&server.inner), active_path, true)
+                .await
+                .expect("admit active async analyze")
+            {
+                ToolOk::Value(response) => response.job_id,
+                ToolOk::Text(_) => panic!("async kickoff must return its structured response"),
+            };
+        let successor_job_id =
+            match analyze_codebase_async(Arc::clone(&server.inner), successor_path, true)
+                .await
+                .expect("queue successor async analyze")
+            {
+                ToolOk::Value(response) => response.job_id,
+                ToolOk::Text(_) => panic!("async kickoff must return its structured response"),
+            };
+        let async_follower_id =
+            match analyze_codebase_async(Arc::clone(&server.inner), async_follower_path, false)
+                .await
+                .expect("attach async follower to queued successor")
+            {
+                ToolOk::Value(response) => response.job_id,
+                ToolOk::Text(_) => panic!("async kickoff must return its structured response"),
+            };
+        assert_ne!(async_follower_id, successor_job_id);
+
+        let sync_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            analyze_codebase(
+                Arc::clone(&server.inner),
+                sync_follower_path,
+                false,
+                Arc::new(NoopProgressSink),
+            ),
+        )
+        .await
+        .expect("synchronous follower must not remain blocked after active worker panic");
+        assert!(matches!(sync_result, Ok(ToolOk::Value(_))));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.inner.persist.close_analyze_and_wait(),
+        )
+        .await
+        .expect("daemon analyze drain must release every worker admission");
+
+        let slot = server.inner.analyze_slot.read();
+        let current = Arc::clone(slot.current.as_ref().expect("successor remains current"));
+        assert_eq!(current.job_id, successor_job_id);
+        assert!(matches!(
+            current.state.read().status,
+            JobStatus::Completed(_)
+        ));
+        let failed_active = slot
+            .previous_terminal
+            .as_ref()
+            .expect("panicked active job is retained as the previous terminal");
+        assert_eq!(failed_active.job_id, active_job_id);
+        assert!(matches!(
+            &failed_active.state.read().status,
+            JobStatus::Failed(message) if message.contains("injected analyze worker panic")
+        ));
+        let async_follower = slot
+            .resolve_async_job(&async_follower_id)
+            .expect("async alias must resolve after the active worker panic");
+        assert!(Arc::ptr_eq(&async_follower, &current));
+        assert!(matches!(
+            async_follower.state.read().status,
+            JobStatus::Completed(_)
+        ));
+    }
+
     #[test]
-    fn post_compaction_cap_rejects_distinct_thirty_third_pending_request() {
+    fn pending_request_cap_rejects_covered_and_sync_followers_at_thirty_third_request() {
         let server = server();
         for index in 0..MAX_PENDING_ANALYZES {
             queue(&server, &format!("/queue/{index}"), false);
         }
+        for path in ["/queue/0/nested", "/queue/1/nested"] {
+            let guard = server.inner.persist.begin_analyze().unwrap();
+            let error = match compact_pending(
+                &mut server.inner.analyze_slot.write(),
+                path.into(),
+                true,
+                guard,
+            ) {
+                Ok(_) => panic!("a covered 33rd request must be rejected before compaction"),
+                Err(error) => error,
+            };
+            assert!(error.0.contains("queue is full"));
+        }
+        assert_eq!(
+            server.inner.analyze_slot.read().pending_request_count(),
+            MAX_PENDING_ANALYZES
+        );
+        assert_eq!(
+            server.inner.analyze_slot.read().pending.len(),
+            MAX_PENDING_ANALYZES
+        );
+        assert!(
+            !queue_job(&server, 0).force(),
+            "rejected covered followers must not OR force into their target"
+        );
+    }
+
+    #[test]
+    fn terminal_alias_grace_window_does_not_consume_pending_request_capacity() {
+        let server = server();
+        let terminal =
+            AnalyzeJob::new_running("terminal".into(), "/queue/terminal".into(), false, 0);
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            slot.previous_terminal = Some(Arc::clone(&terminal));
+            for index in 0..64 {
+                slot.aliases
+                    .insert(format!("retained-{index}"), terminal.job_id.clone());
+            }
+        }
+        for index in 0..MAX_PENDING_ANALYZES {
+            queue(&server, &format!("/queue/{index}"), false);
+        }
+        assert_eq!(server.inner.analyze_slot.read().pending_request_count(), 32);
         let guard = server.inner.persist.begin_analyze().unwrap();
-        let error = match compact_pending(
+        assert!(compact_pending(
             &mut server.inner.analyze_slot.write(),
-            "/queue/distinct".into(),
+            "/queue/0/covered".into(),
             false,
             guard,
-        ) {
-            Ok(_) => panic!("33rd distinct pending request must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.0.contains("queue is full"));
-        assert_eq!(
-            server.inner.analyze_slot.read().pending.len(),
-            MAX_PENDING_ANALYZES
-        );
-
-        let covered = queue(&server, "/queue/0/nested", true);
-        assert_eq!(
-            server.inner.analyze_slot.read().pending.len(),
-            MAX_PENDING_ANALYZES
-        );
-        assert!(covered.force());
+        )
+        .is_err());
     }
 
     #[test]
@@ -1187,7 +1449,7 @@ mod queue_tests {
     }
 
     #[test]
-    fn aliases_repoint_on_replacement_and_clear_when_satisfied() {
+    fn async_follower_aliases_resolve_replaced_terminal_success() {
         let server = server();
         let running = AnalyzeJob::new_running("running".into(), "/queue/current".into(), false, 0);
         server.inner.analyze_slot.write().current = Some(Arc::clone(&running));
@@ -1208,9 +1470,25 @@ mod queue_tests {
         };
         {
             let slot = server.inner.analyze_slot.read();
-            assert_eq!(follower, child, "absorbed async work shares canonical ID");
+            assert_ne!(follower, child, "absorbed async work needs its own handle");
+            assert_ne!(child, replacement, "replacement needs its own handle");
+            assert_ne!(
+                follower, replacement,
+                "follower must retain its original handle"
+            );
             assert_eq!(slot.aliases.get(&child), Some(&replacement));
-            assert_eq!(slot.aliases.len(), 1, "only displaced canonical jobs alias");
+            assert_eq!(slot.aliases.get(&follower), Some(&replacement));
+            assert_eq!(
+                slot.aliases.len(),
+                2,
+                "both async identities must be retained"
+            );
+            assert_eq!(
+                slot.resolve_async_job(&follower)
+                    .expect("follower alias must resolve while pending")
+                    .job_id,
+                replacement
+            );
         }
 
         finish_completed(
@@ -1236,7 +1514,348 @@ mod queue_tests {
             },
         );
         assert!(promote_next(&server.inner, &pending.job).is_none());
-        assert!(server.inner.analyze_slot.read().aliases.is_empty());
+        let slot = server.inner.analyze_slot.read();
+        let terminal = slot
+            .resolve_async_job(&follower)
+            .expect("follower alias must retain the canonical terminal");
+        assert!(matches!(
+            terminal.state.read().status,
+            JobStatus::Completed(AnalyzeResult { files: 1, .. })
+        ));
+        assert!(slot.aliases.contains_key(&child));
+        assert!(slot.aliases.contains_key(&follower));
+        drop(slot);
+
+        // The canonical terminal stays addressable through the same one-job
+        // grace window as `previous_terminal`, then its aliases expire with
+        // it on the following rotation.
+        let next = {
+            let mut slot = server.inner.analyze_slot.write();
+            install_new_running(&mut slot, "/queue/next".into(), false)
+        };
+        finish_completed(
+            &next,
+            AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/queue/next".into(),
+                warnings: Vec::new(),
+            },
+        );
+        {
+            let mut slot = server.inner.analyze_slot.write();
+            let _ = install_new_running(&mut slot, "/queue/newer".into(), false);
+        }
+        let slot = server.inner.analyze_slot.read();
+        assert!(slot.aliases.is_empty());
+        assert!(slot.resolve_async_job(&follower).is_none());
+    }
+
+    #[test]
+    fn async_follower_aliases_resolve_replaced_terminal_error() {
+        let server = server();
+        let running = AnalyzeJob::new_running("running".into(), "/queue/current".into(), false, 0);
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&running));
+
+        let child = match admit_async(&server.inner, "/queue/root/child".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("running work must queue incoming work"),
+        };
+        let follower =
+            match admit_async(&server.inner, "/queue/root/child/grandchild".into(), false).unwrap()
+            {
+                Kickoff::Pending { job_id, .. } => job_id,
+                Kickoff::New(_, _) => panic!("covered work must remain pending"),
+            };
+        let replacement = match admit_async(&server.inner, "/queue/root".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("ancestor must replace pending descendants"),
+        };
+        assert_ne!(child, follower, "absorbed async work needs its own handle");
+
+        finish_completed(
+            &running,
+            AnalyzeResult {
+                files: 1,
+                symbols: 1,
+                edges: 0,
+                root_path: "/queue/current".into(),
+                warnings: Vec::new(),
+            },
+        );
+        let pending = promote_next(&server.inner, &running).expect("replacement promotes");
+        assert_eq!(pending.job.job_id, replacement);
+        finish_failed(&pending.job, "expected replacement failure".into());
+        assert!(promote_next(&server.inner, &pending.job).is_none());
+
+        let slot = server.inner.analyze_slot.read();
+        let terminal = slot
+            .resolve_async_job(&follower)
+            .expect("follower alias must retain the canonical terminal");
+        assert!(matches!(
+            &terminal.state.read().status,
+            JobStatus::Failed(message) if message == "expected replacement failure"
+        ));
+        assert!(Arc::ptr_eq(
+            &terminal,
+            &slot
+                .resolve_async_job(&child)
+                .expect("displaced async handle must resolve to the same terminal")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod status_publication_tests {
+    use super::*;
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    use code_graph_lang_cpp::CppParser;
+
+    fn server() -> crate::server::CodeGraphServer {
+        let mut registry = code_graph_lang::LanguageRegistry::new();
+        registry
+            .register(Box::new(CppParser::new().expect("create C++ parser")))
+            .expect("register C++ parser");
+        crate::server::CodeGraphServer::new(registry)
+    }
+
+    async fn apply_analyze(server: &crate::server::CodeGraphServer, root: &std::path::Path) {
+        let job = AnalyzeJob::new_running(
+            "status-publication".into(),
+            root.to_string_lossy().into_owned(),
+            false,
+            0,
+        );
+        run_analyze_job(
+            Arc::clone(&server.inner),
+            Arc::clone(&job),
+            Arc::new(NoopProgressSink),
+        )
+        .await;
+        assert!(
+            matches!(job.state.read().status, JobStatus::Completed(_)),
+            "fixture analyze must succeed"
+        );
+    }
+
+    fn status(server: &crate::server::CodeGraphServer) -> crate::handlers::status::StatusResult {
+        let ToolOk::Value(status) = crate::core::status::get_status(Arc::clone(&server.inner))
+            .expect("status must succeed")
+        else {
+            panic!("status must return a value")
+        };
+        status
+    }
+
+    #[tokio::test]
+    async fn status_publication_preserves_config_provenance_after_create_and_remove() {
+        let created = tempfile::TempDir::new().expect("create config-created fixture");
+        let created_root =
+            paths::canonicalize(created.path()).expect("canonicalize created fixture");
+        std::fs::write(created_root.join("subject.cpp"), "void subject() {}\n")
+            .expect("write created fixture source");
+        let created_server = server();
+
+        apply_analyze(&created_server, &created_root).await;
+        assert!(status(&created_server).config_path.is_none());
+        std::fs::write(
+            created_root.join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = []\n",
+        )
+        .expect("create config after analyze");
+        assert!(
+            status(&created_server).config_path.is_none(),
+            "a config created after indexing must not claim to have governed the active graph"
+        );
+
+        let removed = tempfile::TempDir::new().expect("create config-removed fixture");
+        let removed_root =
+            paths::canonicalize(removed.path()).expect("canonicalize removed fixture");
+        let config_path = removed_root.join(".code-graph.toml");
+        std::fs::write(removed_root.join("subject.cpp"), "void subject() {}\n")
+            .expect("write removed fixture source");
+        std::fs::write(&config_path, "[cpp]\nmacro_strip = []\n").expect("write applied config");
+        let removed_server = server();
+
+        apply_analyze(&removed_server, &removed_root).await;
+        let expected = config_path.to_string_lossy().into_owned();
+        assert_eq!(status(&removed_server).config_path, Some(expected.clone()));
+        std::fs::remove_file(&config_path).expect("remove applied config");
+        assert_eq!(
+            status(&removed_server).config_path,
+            Some(expected),
+            "removing the applied config must not erase active-index provenance"
+        );
+    }
+
+    /// Discovery returns the path whose bytes it read. A config create/remove
+    /// after that point must not turn a default-config analyze into a
+    /// configured one, or erase the provenance of a configuration that was
+    /// already parsed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_publication_uses_discovery_provenance_without_second_probe() {
+        let created = tempfile::TempDir::new().expect("create config-created fixture");
+        let created_root =
+            paths::canonicalize(created.path()).expect("canonicalize created fixture");
+        std::fs::write(created_root.join("subject.cpp"), "void subject() {}\n")
+            .expect("write created fixture source");
+        let created_server = server();
+        let (created_reached_tx, created_reached_rx) = tokio::sync::oneshot::channel();
+        let created_proceed = Arc::new(Barrier::new(2));
+        *created_server.inner.config_discovery_hook.lock() =
+            Some(crate::server::ConfigDiscoveryHook {
+                reached: created_reached_tx,
+                proceed: Arc::clone(&created_proceed),
+            });
+        let created_job = AnalyzeJob::new_running(
+            "config-created-during-analyze".into(),
+            created_root.to_string_lossy().into_owned(),
+            false,
+            0,
+        );
+        let created_worker = tokio::spawn(run_analyze_job(
+            Arc::clone(&created_server.inner),
+            Arc::clone(&created_job),
+            Arc::new(NoopProgressSink),
+        ));
+        created_reached_rx
+            .await
+            .expect("discovery must select default provenance first");
+        std::fs::write(
+            created_root.join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = []\n",
+        )
+        .expect("create config after discovery");
+        created_proceed.wait();
+        created_worker
+            .await
+            .expect("created-config worker must not panic");
+        assert!(matches!(
+            created_job.state.read().status,
+            JobStatus::Completed(_)
+        ));
+        assert!(
+            status(&created_server).config_path.is_none(),
+            "a config created after discovery must not become applied provenance"
+        );
+
+        let removed = tempfile::TempDir::new().expect("create config-removed fixture");
+        let removed_root =
+            paths::canonicalize(removed.path()).expect("canonicalize removed fixture");
+        let removed_config = removed_root.join(".code-graph.toml");
+        std::fs::write(removed_root.join("subject.cpp"), "void subject() {}\n")
+            .expect("write removed fixture source");
+        std::fs::write(&removed_config, "[cpp]\nmacro_strip = []\n")
+            .expect("write config before discovery");
+        let removed_server = server();
+        let (removed_reached_tx, removed_reached_rx) = tokio::sync::oneshot::channel();
+        let removed_proceed = Arc::new(Barrier::new(2));
+        *removed_server.inner.config_discovery_hook.lock() =
+            Some(crate::server::ConfigDiscoveryHook {
+                reached: removed_reached_tx,
+                proceed: Arc::clone(&removed_proceed),
+            });
+        let removed_job = AnalyzeJob::new_running(
+            "config-removed-during-analyze".into(),
+            removed_root.to_string_lossy().into_owned(),
+            false,
+            0,
+        );
+        let removed_worker = tokio::spawn(run_analyze_job(
+            Arc::clone(&removed_server.inner),
+            Arc::clone(&removed_job),
+            Arc::new(NoopProgressSink),
+        ));
+        removed_reached_rx
+            .await
+            .expect("discovery must select config provenance first");
+        std::fs::remove_file(&removed_config).expect("remove config after discovery");
+        removed_proceed.wait();
+        removed_worker
+            .await
+            .expect("removed-config worker must not panic");
+        assert!(matches!(
+            removed_job.state.read().status,
+            JobStatus::Completed(_)
+        ));
+        assert_eq!(
+            status(&removed_server).config_path,
+            Some(removed_config.to_string_lossy().into_owned()),
+            "a config removed after discovery must remain applied provenance"
+        );
+    }
+
+    /// The cache fast-path's publication guard covers the gap between
+    /// replacing the graph and writing matching status metadata. A concurrent
+    /// status read remains blocked until release, then observes the complete
+    /// new snapshot rather than new graph statistics plus old provenance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_publication_blocks_polling_until_complete_snapshot() {
+        let temp = tempfile::TempDir::new().expect("create publication fixture");
+        let root = paths::canonicalize(temp.path()).expect("canonicalize publication fixture");
+        std::fs::write(root.join("subject.cpp"), "void old_symbol() {}\n")
+            .expect("write publication fixture source");
+        let server = server();
+        apply_analyze(&server, &root).await;
+
+        let config_path = root.join(".code-graph.toml");
+        std::fs::write(&config_path, "[cpp]\nmacro_strip = []\n")
+            .expect("write replacement config");
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let proceed = Arc::new(Barrier::new(2));
+        *server.inner.publication_hook.lock() = Some(crate::server::PublicationHook {
+            reached: reached_tx,
+            proceed: Arc::clone(&proceed),
+        });
+
+        let job = AnalyzeJob::new_running(
+            "publication-consistency".into(),
+            root.to_string_lossy().into_owned(),
+            false,
+            0,
+        );
+        let worker = tokio::spawn(run_analyze_job(
+            Arc::clone(&server.inner),
+            Arc::clone(&job),
+            Arc::new(NoopProgressSink),
+        ));
+        reached_rx
+            .await
+            .expect("analyze must pause after graph replacement");
+
+        let (status_tx, status_rx) = mpsc::channel();
+        let status_inner = Arc::clone(&server.inner);
+        let reader = std::thread::spawn(move || {
+            status_tx
+                .send(crate::core::status::get_status(status_inner))
+                .expect("status receiver remains live");
+        });
+        assert!(
+            status_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "get_status must wait for the in-progress publication"
+        );
+
+        proceed.wait();
+        worker.await.expect("analyze worker must not panic");
+        let ToolOk::Value(status) = status_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("get_status must complete after publication")
+            .expect("get_status must succeed")
+        else {
+            panic!("status must return a value")
+        };
+        reader.join().expect("status reader must not panic");
+        assert!(status.indexed);
+        assert_eq!(status.index_symbols, 1);
+        assert_eq!(
+            status.config_path,
+            Some(config_path.to_string_lossy().into_owned()),
+            "status must pair the new graph with its applied config provenance"
+        );
+        assert!(matches!(job.state.read().status, JobStatus::Completed(_)));
     }
 }
 
@@ -1251,6 +1870,9 @@ fn install_new_running(
 ) -> Arc<AnalyzeJob> {
     let job = next_job(path, force);
     if let Some(prev) = slot.current.take() {
+        if let Some(expired) = slot.previous_terminal.take() {
+            slot.discard_aliases_for(&expired.job_id);
+        }
         slot.previous_terminal = Some(prev);
     }
     slot.current = Some(Arc::clone(&job));

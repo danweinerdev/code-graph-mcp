@@ -543,13 +543,25 @@ impl RootConfig {
     /// rustfmt, git, editorconfig, and npm: project-root config files
     /// are discovered by upward walk, never by exact-dir match.
     pub fn load(start: &Path) -> Result<(Self, PathBuf), ConfigError> {
+        let (config, project_root, _) = Self::load_with_provenance(start)?;
+        Ok((config, project_root))
+    }
+
+    /// Discover and load the nearest configuration, also returning the exact
+    /// path read during discovery. The provenance is `None` only when no
+    /// configuration existed anywhere in the upward walk; unlike probing the
+    /// returned project root later, it cannot be changed by a create/remove
+    /// race after the configuration bytes have been selected.
+    pub fn load_with_provenance(
+        start: &Path,
+    ) -> Result<(Self, PathBuf, Option<PathBuf>), ConfigError> {
         let mut search = Some(start);
         while let Some(dir) = search {
             let path = dir.join(".code-graph.toml");
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let cfg = Self::parse_and_validate(&content)?;
-                    return Ok((cfg, dir.to_path_buf()));
+                    return Ok((cfg, dir.to_path_buf(), Some(path)));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     search = dir.parent();
@@ -557,7 +569,7 @@ impl RootConfig {
                 Err(e) => return Err(ConfigError::Io(e)),
             }
         }
-        Ok((Self::default(), start.to_path_buf()))
+        Ok((Self::default(), start.to_path_buf(), None))
     }
 
     /// Parse and validate `.code-graph.toml` content. Shared between

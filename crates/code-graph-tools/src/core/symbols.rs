@@ -329,23 +329,27 @@ pub fn search_symbols(
     let budget = max_bytes.saturating_sub(ENVELOPE_OVERHEAD_BYTES);
     let mut results: Vec<SymbolResult> = Vec::with_capacity(page.len());
     let mut running_bytes: usize = 0;
-    let mut truncated = false;
-    let mut next_offset: Option<u32> = None;
-
     for record in page {
         let serialized_len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
         let projected = running_bytes
             .saturating_add(serialized_len)
             .saturating_add(1);
         if projected > budget {
-            let k = results.len() as u32;
-            truncated = true;
-            next_offset = Some(resolved_offset.saturating_add(k));
             break;
         }
         running_bytes = projected;
         results.push(record);
     }
+
+    // `Graph::search` returns at most `resolved_limit` records, so unlike
+    // `byte_budget_take` this handler cannot use iterator lookahead. Its
+    // pre-pagination `total` supplies the equivalent evidence: if more
+    // records exist after the emitted prefix, the page is truncated whether
+    // that prefix stopped at the count limit or the byte budget.
+    let emitted = results.len() as u32;
+    let next = resolved_offset.saturating_add(emitted);
+    let truncated = sr.total > next;
+    let next_offset = truncated.then_some(next);
 
     let page = Page::<SymbolResult> {
         results,

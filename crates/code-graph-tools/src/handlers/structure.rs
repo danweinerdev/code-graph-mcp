@@ -2136,11 +2136,10 @@ mod tests {
     }
 
     #[test]
-    fn orphans_byte_budget_no_truncation_with_no_budget() {
-        // Mirror anti-regression: with NO_BYTE_BUDGET (= usize::MAX), the
-        // handler's existing behavior is preserved exactly — no truncation,
-        // no next_offset. Locks the contract that the byte-budget wiring
-        // does not affect callers that opt out.
+    fn orphans_count_cap_returns_continuation_with_no_budget() {
+        // NO_BYTE_BUDGET removes only the byte cap. With 30 matches and
+        // limit=20, lookahead still proves another orphan exists, so the
+        // count-capped page must publish a strict continuation.
         let g = locked(graph_with_n_orphan_functions(30));
         let r = get_orphans(
             &g,
@@ -2153,12 +2152,13 @@ mod tests {
             None,
             NO_BYTE_BUDGET,
         );
-        let (arr, total, _, _) = page_parts(&r);
+        let (arr, total, offset, _) = page_parts(&r);
         let (truncated, next_offset) = super::super::test_helpers::page_extras(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 30);
-        assert!(!truncated);
-        assert_eq!(next_offset, None);
+        assert!(truncated);
+        assert_eq!(next_offset, Some(20));
+        assert!(next_offset.unwrap() > offset);
     }
 
     // --- count_only invariants --------------------------------------------

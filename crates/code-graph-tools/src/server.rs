@@ -1,4 +1,4 @@
-//! MCP server that exposes the code graph as 22 rmcp tools over stdio.
+//! MCP server that exposes the code graph as 23 rmcp tools over stdio.
 //!
 //! Phase 3.1 shipped the scaffold: [`CodeGraphServer`] with all tools
 //! wired through `#[tool_router]` plus the `ServerInner` state struct.
@@ -33,6 +33,8 @@ use code_graph_graph::Graph;
 use code_graph_lang::LanguageRegistry;
 use notify_debouncer_full::notify::RecommendedWatcher;
 use notify_debouncer_full::{Debouncer, RecommendedCache};
+#[cfg(test)]
+use parking_lot::Mutex as PlMutex;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -391,6 +393,11 @@ impl Drop for WatchCleanupGuard {
 ///   serializes the active worker against watch reindexing.
 /// - [`Self::indexed`] is an `AtomicBool` so [`CodeGraphServer::require_indexed`]
 ///   can check the flag with no lock acquisition.
+/// - [`Self::status_publication`] makes the graph and its status-facing
+///   provenance one publication unit. It is always the outermost lock when
+///   combined with graph, applied-index, or operational-config locks; never
+///   hold it across an `.await`. `get_status` takes it for read, successful
+///   analyze publication and watch graph mutations take it for write.
 pub struct ServerInner {
     /// In-memory code graph populated by `analyze_codebase`.
     pub graph: PlRwLock<Graph>,
@@ -399,12 +406,20 @@ pub struct ServerInner {
     /// `true` after at least one successful `analyze_codebase`. Read by
     /// [`CodeGraphServer::require_indexed`] without taking a lock.
     pub indexed: AtomicBool,
+    /// Serializes publication of graph contents and the metadata reported with
+    /// them by `get_status`. See the lock-order rule on [`ServerInner`].
+    pub(crate) status_publication: PlRwLock<()>,
     /// Serializes the active analyze worker against the watch loop's
     /// `reindex_file` to close their merge race. The analyze slot, not this
     /// lock, serializes one running worker plus pending analyzes.
     pub index_lock: TokioMutex<()>,
     /// Last indexed root directory; needed by `watch_start`.
     pub root_path: PlRwLock<Option<PathBuf>>,
+    /// Status-facing snapshot of the root and configuration that produced the
+    /// active indexed state. Analyze replaces this only after it has
+    /// successfully applied its admitted configuration; watch reindexing keeps
+    /// the snapshot intact because it uses that cached configuration.
+    pub(crate) applied_index: PlRwLock<AppliedIndexState>,
     /// Project root owning the active cache. Unlike `root_path`, this is not
     /// the invocation/watch scope and may be an ancestor with nested config.
     pub cache_root: PlRwLock<Option<PathBuf>>,
@@ -449,9 +464,34 @@ pub struct ServerInner {
     /// grace-window read pattern. Read by 1.2's worker (next commit).
     #[allow(dead_code)]
     pub(crate) analyze_slot: PlRwLock<AnalyzeSlot>,
+    /// Test-only synchronous handoff performed inside analyze publication
+    /// after graph replacement and before matching provenance is written.
+    /// It proves `get_status` cannot observe an incomplete publication.
+    #[cfg(test)]
+    pub(crate) publication_hook: PlMutex<Option<PublicationHook>>,
+    /// Test-only handoff after config discovery has selected its provenance
+    /// and before analysis publishes the resulting graph.
+    #[cfg(test)]
+    pub(crate) config_discovery_hook: PlMutex<Option<ConfigDiscoveryHook>>,
 }
 
-/// MCP server exposing the code graph through 22 tools.
+/// Test-only barrier proving that `get_status` cannot observe a newly
+/// replaced graph before its applied-index metadata is published.
+#[cfg(test)]
+pub(crate) struct PublicationHook {
+    pub(crate) reached: oneshot::Sender<()>,
+    pub(crate) proceed: Arc<std::sync::Barrier>,
+}
+
+/// Test-only barrier proving config provenance comes from discovery rather
+/// than a second filesystem probe after discovery returns.
+#[cfg(test)]
+pub(crate) struct ConfigDiscoveryHook {
+    pub(crate) reached: oneshot::Sender<()>,
+    pub(crate) proceed: Arc<std::sync::Barrier>,
+}
+
+/// MCP server exposing the code graph through 23 tools.
 ///
 /// Cloneable because rmcp's macro-generated dispatch table holds the server
 /// by value (the `tool_router` field is a `ToolRouter<Self>` and dispatch
@@ -478,8 +518,10 @@ impl CodeGraphServer {
                 graph: PlRwLock::new(Graph::new()),
                 registry,
                 indexed: AtomicBool::new(false),
+                status_publication: PlRwLock::new(()),
                 index_lock: TokioMutex::new(()),
                 root_path: PlRwLock::new(None),
+                applied_index: PlRwLock::new(AppliedIndexState::default()),
                 cache_root: PlRwLock::new(None),
                 cache_io_root: PlRwLock::new(None),
                 daemon_project_root: OnceLock::new(),
@@ -491,6 +533,10 @@ impl CodeGraphServer {
                 index_force_built: AtomicBool::new(false),
                 persist: Arc::new(PersistCoordinator::new()),
                 analyze_slot: PlRwLock::new(AnalyzeSlot::default()),
+                #[cfg(test)]
+                publication_hook: PlMutex::new(None),
+                #[cfg(test)]
+                config_discovery_hook: PlMutex::new(None),
             }),
             tool_router: Self::tool_router(),
         }
@@ -651,6 +697,19 @@ impl CodeGraphServer {
     }
 }
 
+/// Root and configuration provenance atomically published to `get_status`.
+///
+/// This is deliberately separate from the operational `root_path` and
+/// `config` locks: those fields are consumed by watch and query paths, while
+/// status must report one self-consistent successful-analyze snapshot without
+/// probing the filesystem again.
+#[derive(Default)]
+pub(crate) struct AppliedIndexState {
+    pub(crate) root_path: Option<PathBuf>,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) config: RootConfig,
+}
+
 /// Portable Linux directory identity retained by a daemon for its lifetime.
 /// It deliberately stores no file descriptor, so code-graph-tools remains
 /// free of platform I/O dependencies and all normal paths stay logical.
@@ -729,6 +788,12 @@ pub struct AnalyzeCodebaseAsyncArgs {
     #[schemars(description = "Force full re-index, ignoring any cache (default false)")]
     #[serde(default)]
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAnalyzeStatusArgs {
+    #[schemars(description = "Async analyze request job ID returned by analyze_codebase_async")]
+    pub job_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1199,7 +1264,7 @@ impl CodeGraphServer {
         description = "Kick off `analyze_codebase` on a background task and return \
                        immediately (< 1KB, sub-second) with a job handle. The indexing \
                        pipeline runs detached on the tokio runtime; agents observe \
-                       progress and the terminal result by polling `get_status`. \
+                        progress and the terminal result by polling `get_analyze_status`. \
                        Prefer this over the sync `analyze_codebase` for large \
                        codebases (UE / LLVM-scale, ~130-200s wall time) or any case \
                        where the client's `MCP_TOOL_TIMEOUT` could fire on a long \
@@ -1209,18 +1274,18 @@ impl CodeGraphServer {
                        (optional, default false — full re-index ignoring the cache). \
                        Response shape: \
                        `{ job_id, status, started_at, existing, note }`. `job_id` is \
-                        the 20-char zero-padded decimal ID of the canonical pending scan \
-                        (distinct canonical scans are unique; absorbed callers share the \
-                        coverer's ID); `status` is always the literal \
+                         a distinct 20-char zero-padded decimal async-request handle, including \
+                         when pending work is absorbed; `status` is always the literal \
                         `\"running\"` at kickoff; `started_at` is RFC3339 UTC; \
                         `existing` is false for every accepted request; \
                        `note` is a short human-readable hint. **Polling pattern:** \
-                       call `get_status` and read the `analyze_job` field. Poll \
-                       while `analyze_job.status == \"running\"`; once it flips to \
-                       `\"completed\"` read `analyze_job.result` (byte-identical \
+                        call `get_analyze_status(job_id)` with this response's handle. It \
+                        resolves an alias to the satisfying canonical `AnalyzeJobView`; poll \
+                        while `status == \"running\"`; once it flips to \
+                        `\"completed\"` read `result` (byte-identical \
                        shape to `analyze_codebase`'s success body — `{ files, \
                        symbols, edges, root_path, warnings }`); on `\"failed\"` \
-                       read `analyze_job.error`. A poll cadence of 250-1000ms is \
+                        read `error`. A poll cadence of 250-1000ms is \
                        a reasonable starting point — the slot and inner state \
                        locks are held only for `Arc::clone` and a small struct \
                        read on each poll, so polling does not contend with the \
@@ -1237,9 +1302,10 @@ impl CodeGraphServer {
                         incoming ancestor replaces pending descendants at the \
                         earliest displaced FIFO position; disjoint paths keep \
                         FIFO order. The response still returns immediately and \
-                        callers poll the shared `analyze_job`; `force` is ORed \
-                        across compacted pending work. There is no contention \
-                        error or argument-ignored duplicate path."
+                         callers poll their own handle; `force` is ORed across compacted \
+                         pending work. The queue permits 32 non-terminal pending requests, \
+                         including synchronous and asynchronous followers; a further request \
+                         returns a retryable queue-full tool error even if it is covered."
     )]
     async fn analyze_codebase_async(
         &self,
@@ -1266,9 +1332,10 @@ impl CodeGraphServer {
                        specific symbol. `count_only=true` returns the match total with \
                        an empty `results` array in a < 1KB bounded response — use it for \
                        sizing queries before paging. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget bites, \
-                       `truncated` is true and `next_offset` points at the first \
-                       un-emitted record — re-call with `offset = next_offset` to resume. \
+                        `[response].max_bytes` (default 100KB); when either `limit` or the \
+                        byte budget leaves records un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted record — re-call with \
+                        `offset = next_offset` to resume. \
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
@@ -1358,9 +1425,10 @@ impl CodeGraphServer {
                        block), so clients counting matches must use plain \
                        `query` (no anchors) or call again without `count_only` to \
                        receive suggestions. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget \
-                       bites, `truncated` is true and `next_offset` points at the first \
-                       un-emitted record — re-call with `offset = next_offset` to \
+                        `[response].max_bytes` (default 100KB); when either `limit` or the \
+                        byte budget leaves records un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted record — re-call with \
+                        `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
@@ -1440,9 +1508,10 @@ impl CodeGraphServer {
                        count (NOT the sum of individual symbols) and an empty `results` \
                        array in a < 1KB bounded response — use it to size the row set \
                        before paging. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget \
-                       bites, `truncated` is true and `next_offset` points at the first \
-                       un-emitted row — re-call with `offset = next_offset` to resume. \
+                        `[response].max_bytes` (default 100KB); when either `limit` or the \
+                        byte budget leaves rows un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted row — re-call with \
+                        `offset = next_offset` to resume. \
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
@@ -1491,9 +1560,10 @@ impl CodeGraphServer {
                        nearest-symbol guess. `limit` defaults to 100 (max 1000, clamped \
                        silently — the echoed `limit` reflects the resolved value); raise \
                        `limit` for deeply-nested spans, or use `offset` to page through. \
-                       Responses are also capped by `[response].max_bytes` (default 100KB); \
-                       when the byte budget bites, `truncated` is true and `next_offset` \
-                       points at the first un-emitted record — re-call with `offset = \
+                        Responses are also capped by `[response].max_bytes` (default 100KB); \
+                        when either `limit` or the byte budget leaves records un-emitted, \
+                        `truncated` is true and `next_offset` points at the first un-emitted \
+                        record — re-call with `offset = \
                        next_offset` to resume. `truncated=false` plus `next_offset=null` \
                        means the page is complete."
     )]
@@ -1571,9 +1641,10 @@ impl CodeGraphServer {
                        the remainder, or narrow by lowering `depth`. `offset` defaults \
                        to 0; raise `offset` to skip past previous results, or set \
                        `offset = next_offset` to resume. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget \
-                       bites, `truncated` is true and `next_offset` points at the first \
-                       un-emitted record — re-call with `offset = next_offset` to \
+                        `[response].max_bytes` (default 100KB); when either `limit` or the \
+                        byte budget leaves records un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted record — re-call with \
+                        `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
@@ -1650,9 +1721,10 @@ impl CodeGraphServer {
                        or narrow by lowering `depth` to scope a specific subtree. \
                        `offset` defaults to 0; raise `offset` to skip past previous \
                        results, or set `offset = next_offset` to resume. Responses are \
-                       also capped by `[response].max_bytes` (default 100KB); when the \
-                       byte budget bites, `truncated` is true and `next_offset` points \
-                       at the first un-emitted record — re-call with `offset = \
+                        also capped by `[response].max_bytes` (default 100KB); when either \
+                        `limit` or the byte budget leaves records un-emitted, `truncated` is \
+                        true and `next_offset` points at the first un-emitted record — re-call \
+                        with `offset = \
                        next_offset` to resume. `truncated=false` plus `next_offset=null` \
                        means the page is complete. `results.length` may be less than \
                        `limit` when the byte cap fires, so consult `truncated`, not \
@@ -1796,10 +1868,11 @@ impl CodeGraphServer {
                        not an error — it returns an empty page (results: [], total: 0). \
                        `limit` defaults to 100 (max 1000, clamped silently — the echoed \
                        `limit` reflects the resolved value); raise `limit` for files with \
-                       many includes, or use `offset` to page through. Responses are also \
-                       capped by `[response].max_bytes` (default 100KB); when the byte \
-                       budget bites, `truncated` is true and `next_offset` points at the \
-                       first un-emitted record — re-call with `offset = next_offset` to \
+                        many includes, or use `offset` to page through. Responses are also \
+                        capped by `[response].max_bytes` (default 100KB); when either `limit` \
+                        or the byte budget leaves records un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted record — re-call with \
+                        `offset = next_offset` to \
                        resume. `truncated=false` plus `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
@@ -1871,9 +1944,10 @@ impl CodeGraphServer {
                        `count_only=true` returns the orphan total with an empty \
                        `results` array in a < 1KB bounded response — use it to size \
                        the orphan set before paging. Responses are also capped by \
-                       `[response].max_bytes` (default 100KB); when the byte budget \
-                       bites, `truncated` is true and `next_offset` points at the \
-                       first un-emitted record — re-call with `offset = next_offset` \
+                        `[response].max_bytes` (default 100KB); when either `limit` or the \
+                        byte budget leaves records un-emitted, `truncated` is true and \
+                        `next_offset` points at the first un-emitted record — re-call with \
+                        `offset = next_offset` \
                        to resume. `truncated=false` plus `next_offset=null` means the \
                        page is complete. `results.length` may be less than `limit` \
                        when the byte cap fires, so consult `truncated`, not length, \
@@ -2006,8 +2080,8 @@ impl CodeGraphServer {
                        the incoming page plus a fixed wrapper reserve; if incoming \
                        consumes the whole budget the outgoing page comes back empty \
                        with `truncated:true` and `next_offset:0` (a start-fresh \
-                       marker). When `truncated` is true on either side, that side was \
-                       cut by the byte budget — re-call with that single \
+                        marker). When `truncated` is true on either side, that side has \
+                        un-emitted rows because `limit` or the byte budget cut it — re-call with that single \
                        `direction=\"incoming\"` (or `\"outgoing\"`) and `offset = \
                        next_offset` from the truncated page to resume; `truncated=false` \
                        plus `next_offset=null` means that page is complete. \
@@ -2277,6 +2351,29 @@ impl CodeGraphServer {
     ) -> Result<CallToolResult, McpError> {
         Ok(handlers::status::get_status(self.inner.clone()))
     }
+
+    #[tool(
+        description = "Poll one `analyze_codebase_async` request. `job_id` is required and may \
+                       be either the original canonical async job ID or an absorbed/displaced \
+                       follower alias. Returns the satisfying canonical `AnalyzeJobView`: \
+                       `{ job_id, status, path, force, started_at, finished_at, progress, \
+                       progress_total, progress_message, error, result, current_phase }`. The \
+                       returned `job_id` identifies the satisfying canonical scan, so it may differ \
+                       from an alias input. Poll while `status == \"running\"` (250-1000ms is a \
+                       reasonable cadence); read `result` on `\"completed\"` or `error` on \
+                       `\"failed\"`. Unknown IDs, and aliases whose canonical terminal has left \
+                       the one-job grace window, return a user-visible tool error. `get_status` \
+                       remains the shared current/previous diagnostic projection."
+    )]
+    async fn get_analyze_status(
+        &self,
+        Parameters(args): Parameters<GetAnalyzeStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(handlers::status::get_analyze_status(
+            self.inner.clone(),
+            args.job_id,
+        ))
+    }
 }
 
 #[tool_handler]
@@ -2484,16 +2581,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 22 tools. If a future change adds
+    /// `tools/list` must surface exactly 23 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_two_tools() {
+    fn tool_router_registers_twenty_three_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            22,
-            "expected 22 registered tools, got {}",
+            23,
+            "expected 23 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2528,6 +2625,7 @@ mod tests {
             "watch_start",
             "watch_stop",
             "get_status",
+            "get_analyze_status",
             "find_overrides",
             "find_class_candidates",
             "get_symbol_at",
