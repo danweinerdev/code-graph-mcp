@@ -473,6 +473,14 @@ pub struct ServerInner {
     /// and before analysis publishes the resulting graph.
     #[cfg(test)]
     pub(crate) config_discovery_hook: PlMutex<Option<ConfigDiscoveryHook>>,
+    /// Test-only pause after the blocking async-admission probe. It makes the
+    /// single-worker Tokio responsiveness regression deterministic.
+    #[cfg(test)]
+    pub(crate) admission_probe_hook: PlMutex<Option<AdmissionProbeHook>>,
+    /// Test-only pause at analyze-worker entry for deterministic queue/panic
+    /// supervision coverage.
+    #[cfg(test)]
+    pub(crate) worker_start_hook: PlMutex<Option<WorkerStartHook>>,
 }
 
 /// Test-only barrier proving that `get_status` cannot observe a newly
@@ -488,6 +496,21 @@ pub(crate) struct PublicationHook {
 #[cfg(test)]
 pub(crate) struct ConfigDiscoveryHook {
     pub(crate) reached: oneshot::Sender<()>,
+    pub(crate) proceed: Arc<std::sync::Barrier>,
+}
+
+/// Test-only handoff proving async admission probes run on Tokio's blocking
+/// pool rather than occupying a runtime worker.
+#[cfg(test)]
+pub(crate) struct AdmissionProbeHook {
+    pub(crate) reached: std::sync::mpsc::Sender<()>,
+    pub(crate) proceed: Arc<std::sync::Barrier>,
+}
+
+/// Test-only handoff before an analyze worker performs its first action.
+#[cfg(test)]
+pub(crate) struct WorkerStartHook {
+    pub(crate) reached: std::sync::mpsc::Sender<()>,
     pub(crate) proceed: Arc<std::sync::Barrier>,
 }
 
@@ -537,6 +560,10 @@ impl CodeGraphServer {
                 publication_hook: PlMutex::new(None),
                 #[cfg(test)]
                 config_discovery_hook: PlMutex::new(None),
+                #[cfg(test)]
+                admission_probe_hook: PlMutex::new(None),
+                #[cfg(test)]
+                worker_start_hook: PlMutex::new(None),
             }),
             tool_router: Self::tool_router(),
         }
@@ -1335,7 +1362,10 @@ impl CodeGraphServer {
                         `[response].max_bytes` (default 100KB); when either `limit` or the \
                         byte budget leaves records un-emitted, `truncated` is true and \
                         `next_offset` points at the first un-emitted record — re-call with \
-                        `offset = next_offset` to resume. \
+                        `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. \
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
@@ -1427,9 +1457,12 @@ impl CodeGraphServer {
                        receive suggestions. Responses are also capped by \
                         `[response].max_bytes` (default 100KB); when either `limit` or the \
                         byte budget leaves records un-emitted, `truncated` is true and \
-                        `next_offset` points at the first un-emitted record — re-call with \
-                        `offset = next_offset` to \
-                       resume. `truncated=false` plus `next_offset=null` means the page \
+                         `next_offset` points at the first un-emitted record — re-call with \
+                         `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. `truncated=false` plus \
+                        `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
@@ -1510,8 +1543,11 @@ impl CodeGraphServer {
                        before paging. Responses are also capped by \
                         `[response].max_bytes` (default 100KB); when either `limit` or the \
                         byte budget leaves rows un-emitted, `truncated` is true and \
-                        `next_offset` points at the first un-emitted row — re-call with \
-                        `offset = next_offset` to resume. \
+                         `next_offset` points at the first un-emitted row — re-call with \
+                         `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. \
                        `truncated=false` plus `next_offset=null` means the page is \
                        complete. `results.length` may be less than `limit` when the byte \
                        cap fires, so consult `truncated`, not length, to detect partial \
@@ -1563,8 +1599,11 @@ impl CodeGraphServer {
                         Responses are also capped by `[response].max_bytes` (default 100KB); \
                         when either `limit` or the byte budget leaves records un-emitted, \
                         `truncated` is true and `next_offset` points at the first un-emitted \
-                        record — re-call with `offset = \
-                       next_offset` to resume. `truncated=false` plus `next_offset=null` \
+                         record — re-call with `offset = next_offset` to resume. If a byte-starved \
+                        page is empty and `next_offset` equals the requested `offset`, that is a \
+                        start-fresh marker, not a continuation: do not retry unchanged; raise \
+                        `[response].max_bytes`, re-run `analyze_codebase`, then retry. \
+                        `truncated=false` plus `next_offset=null` \
                        means the page is complete."
     )]
     async fn get_symbol_at(
@@ -1643,9 +1682,12 @@ impl CodeGraphServer {
                        `offset = next_offset` to resume. Responses are also capped by \
                         `[response].max_bytes` (default 100KB); when either `limit` or the \
                         byte budget leaves records un-emitted, `truncated` is true and \
-                        `next_offset` points at the first un-emitted record — re-call with \
-                        `offset = next_offset` to \
-                       resume. `truncated=false` plus `next_offset=null` means the page \
+                         `next_offset` points at the first un-emitted record — re-call with \
+                         `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. `truncated=false` plus \
+                        `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
@@ -1723,9 +1765,12 @@ impl CodeGraphServer {
                        results, or set `offset = next_offset` to resume. Responses are \
                         also capped by `[response].max_bytes` (default 100KB); when either \
                         `limit` or the byte budget leaves records un-emitted, `truncated` is \
-                        true and `next_offset` points at the first un-emitted record — re-call \
-                        with `offset = \
-                       next_offset` to resume. `truncated=false` plus `next_offset=null` \
+                         true and `next_offset` points at the first un-emitted record — re-call \
+                         with `offset = next_offset` to resume. If a byte-starved page is empty \
+                        and `next_offset` equals the requested `offset`, that is a start-fresh \
+                        marker, not a continuation: do not retry unchanged; raise \
+                        `[response].max_bytes`, re-run `analyze_codebase`, then retry. \
+                        `truncated=false` plus `next_offset=null` \
                        means the page is complete. `results.length` may be less than \
                        `limit` when the byte cap fires, so consult `truncated`, not \
                        length, to detect partial pages."
@@ -1830,8 +1875,11 @@ impl CodeGraphServer {
                        Inherits edges); other languages always return empty until their \
                        extractors are extended. `limit` defaults to 100 (max 1000, clamped \
                        silently); `offset` defaults to 0. Response capped at \
-                       `[response].max_bytes` (default 100KB); `truncated`/`next_offset` \
-                       resume contract identical to the other paginated tools."
+                        `[response].max_bytes` (default 100KB). Re-call with `offset = \
+                        next_offset` to resume a truncated page, except when a byte-starved page \
+                        is empty and `next_offset` equals the requested `offset`: that is a \
+                        start-fresh marker, not a continuation. Do not retry unchanged; raise \
+                        `[response].max_bytes`, re-run `analyze_codebase`, then retry."
     )]
     async fn find_overrides(
         &self,
@@ -1871,9 +1919,12 @@ impl CodeGraphServer {
                         many includes, or use `offset` to page through. Responses are also \
                         capped by `[response].max_bytes` (default 100KB); when either `limit` \
                         or the byte budget leaves records un-emitted, `truncated` is true and \
-                        `next_offset` points at the first un-emitted record — re-call with \
-                        `offset = next_offset` to \
-                       resume. `truncated=false` plus `next_offset=null` means the page \
+                         `next_offset` points at the first un-emitted record — re-call with \
+                         `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. `truncated=false` plus \
+                        `next_offset=null` means the page \
                        is complete. `results.length` may be less than `limit` when the \
                        byte cap fires, so consult `truncated`, not length, to detect \
                        partial pages."
@@ -1946,9 +1997,12 @@ impl CodeGraphServer {
                        the orphan set before paging. Responses are also capped by \
                         `[response].max_bytes` (default 100KB); when either `limit` or the \
                         byte budget leaves records un-emitted, `truncated` is true and \
-                        `next_offset` points at the first un-emitted record — re-call with \
-                        `offset = next_offset` \
-                       to resume. `truncated=false` plus `next_offset=null` means the \
+                         `next_offset` points at the first un-emitted record — re-call with \
+                         `offset = next_offset` to resume. If a byte-starved page is empty and \
+                        `next_offset` equals the requested `offset`, that is a start-fresh marker, \
+                        not a continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. `truncated=false` plus \
+                        `next_offset=null` means the \
                        page is complete. `results.length` may be less than `limit` \
                        when the byte cap fires, so consult `truncated`, not length, \
                        to detect partial pages.")]
@@ -2074,16 +2128,22 @@ impl CodeGraphServer {
                        files, or use `offset` (default 0) to page through. An unknown \
                        file is not an error — it returns empty page(s) (results: [], \
                        total: 0). Responses are capped by `[response].max_bytes` \
-                       (default 100KB). In `both` mode the budget is allocated \
+                        (default 100KB). For any byte-starved empty page whose `next_offset` \
+                        equals the requested `offset`, treat it as a start-fresh marker, not a \
+                        continuation: do not retry unchanged; raise `[response].max_bytes`, \
+                        re-run `analyze_codebase`, then retry. In `both` mode the budget is allocated \
                        SEQUENTIALLY: the incoming page is sized first against the full \
                        budget, then the outgoing page receives only what remains after \
                        the incoming page plus a fixed wrapper reserve; if incoming \
-                       consumes the whole budget the outgoing page comes back empty \
-                       with `truncated:true` and `next_offset:0` (a start-fresh \
-                        marker). When `truncated` is true on either side, that side has \
-                        un-emitted rows because `limit` or the byte budget cut it — re-call with that single \
-                       `direction=\"incoming\"` (or `\"outgoing\"`) and `offset = \
-                       next_offset` from the truncated page to resume; `truncated=false` \
+                        consumes the whole budget the outgoing page comes back empty \
+                        with `truncated:true` and `next_offset:0` (a start-fresh \
+                        marker, not a continuation): do not retry it unchanged; raise \
+                        `[response].max_bytes`, re-run `analyze_codebase`, then retry. When \
+                        `truncated` is true on either side and `next_offset` differs from the \
+                        requested `offset`, that side has un-emitted rows because `limit` or the \
+                        byte budget cut it — re-call with that single `direction=\"incoming\"` \
+                        (or `\"outgoing\"`) and `offset = next_offset` from the truncated \
+                        page to resume; `truncated=false` \
                        plus `next_offset=null` means that page is complete. \
                        `results.length` may be less than `limit` when the byte cap \
                        fires, so consult `truncated`, not length, to detect partial \
@@ -2164,8 +2224,11 @@ impl CodeGraphServer {
                        `limit`. `limit` defaults to 100 (max 1000, clamped silently); raise \
                        `limit` for more communities per page, use `offset` to page through \
                        the rest. Responses are capped by `[response].max_bytes` (default \
-                       100KB); `truncated`/`next_offset` resume contract identical to the \
-                       other paginated tools."
+                        100KB). Re-call with `offset = next_offset` to resume a truncated page, \
+                        except when a byte-starved page is empty and `next_offset` equals the \
+                        requested `offset`: that is a start-fresh marker, not a continuation. Do \
+                        not retry unchanged; raise `[response].max_bytes`, re-run \
+                        `analyze_codebase`, then retry."
     )]
     async fn detect_communities(
         &self,

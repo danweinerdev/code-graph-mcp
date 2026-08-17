@@ -275,8 +275,8 @@ pub struct DegenerateInfo {
 /// against the full budget, and outgoing receives whatever remains after
 /// the incoming page plus a fixed outer-wrapper overhead is subtracted.
 /// If incoming exhausts the budget, outgoing is an empty page flagged
-/// `truncated: true` with `next_offset: Some(0)` so a client knows to
-/// re-request the outgoing side fresh.
+/// `truncated: true` with `next_offset` equal to the resolved request offset
+/// so a client knows to re-request the outgoing side with a larger budget.
 #[derive(Debug, Serialize)]
 pub struct CouplingBoth {
     pub incoming: Page<CouplingEntry>,
@@ -967,11 +967,13 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_take_first_record_exceeds_budget() {
+    fn byte_budget_take_first_record_exceeds_budget_returns_start_fresh_marker() {
         // Single record whose serialized form alone blows past the
         // envelope-overhead-adjusted budget. With budget = 5 bytes (after
         // subtracting overhead), an 8-byte record cannot fit. Expected:
-        // 0 records kept, truncated=true, next_offset=Some(offset).
+        // 0 records kept, truncated=true, next_offset=Some(offset): this is
+        // the byte-starved start-fresh marker, so callers must raise the
+        // configured budget before retrying rather than loop at this offset.
         //
         // Uses offset=3 with enough records that skip(3) lands on a real
         // candidate — proves the "first post-skip candidate too big" path,

@@ -525,7 +525,7 @@ pub fn get_coupling(
                 offset: resolved_offset,
                 limit: resolved_limit,
                 truncated: true,
-                next_offset: Some(0),
+                next_offset: Some(resolved_offset),
             }
         } else {
             let (out_results, _out_kept, out_truncated, out_next) =

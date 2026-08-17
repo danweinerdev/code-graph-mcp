@@ -38,7 +38,9 @@ server's include/import edges.
   `Cycle` it means that one cycle's file list was capped. Neither implies the other.
 - `get_coupling(direction: "both")` returns `{ incoming, outgoing }` with **no top-level
   `results`**, and the two pages share one byte budget sequentially — if `incoming` exhausts it,
-  `outgoing` comes back empty with `truncated: true` and `next_offset: 0`.
+  `outgoing` comes back empty with `truncated: true` and `next_offset: 0`. That is a start-fresh
+  marker, not a continuation: raise `[response].max_bytes`, re-run `analyze_codebase`, then retry
+  instead of re-calling offset 0.
 - `subtree` on `detect_cycles` is a **post-detection filter**: cycles that cross the prefix
   boundary are silently dropped, not clipped.
 

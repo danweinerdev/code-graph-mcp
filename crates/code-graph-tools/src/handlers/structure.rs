@@ -309,8 +309,8 @@ pub(crate) fn is_unreliable_orphan(sym: &Symbol, mode: ReliabilityMode, graph: &
 /// (incoming first against the full `max_bytes`, outgoing against the
 /// remainder after the incoming page plus a fixed wrapper overhead).
 /// When incoming exhausts the budget, outgoing is an empty page flagged
-/// `truncated: true` with `next_offset: Some(0)` so a client can
-/// re-request the outgoing side fresh via `direction=outgoing offset=0`.
+/// `truncated: true` with `next_offset` equal to the resolved request offset
+/// so a client can re-request the outgoing side with a larger budget.
 ///
 /// Defaults: `limit = 50` per side (zero-or-missing resolves to the
 /// default; mirrors `get_orphans` / `search_symbols`), clamped at 1000;

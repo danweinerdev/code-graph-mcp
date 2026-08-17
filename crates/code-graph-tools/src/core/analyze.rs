@@ -33,7 +33,10 @@ use std::sync::Arc;
 use code_graph_core::{paths, ConfigError, RootConfig};
 use code_graph_graph::Graph;
 
-use crate::analyze_job::{allocate_job_timestamp, AnalyzeJob, AnalyzePhase, JobStatus};
+use crate::analyze_job::{
+    allocate_job_timestamp, AnalyzeAdmission, AnalyzeJob, AnalyzePhase, AnalyzePreparation,
+    JobStatus,
+};
 use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
 use crate::handlers::status::format_unix_nanos_rfc3339;
@@ -118,6 +121,8 @@ pub(crate) async fn run_analyze_job(
     sink: Arc<dyn ProgressSink>,
 ) {
     #[cfg(test)]
+    wait_for_worker_start_hook(&inner);
+    #[cfg(test)]
     if take_injected_worker_panic(&job.path) {
         panic!("injected analyze worker panic");
     }
@@ -133,70 +138,44 @@ pub(crate) async fn run_analyze_job(
         return;
     }
 
-    let abs_path = match paths::canonicalize(std::path::Path::new(&path_raw)) {
-        Ok(p) => p,
-        Err(_) => {
-            finish_failed(&job, format!("directory does not exist: {path_raw}"));
-            return;
-        }
-    };
-    if !abs_path.is_dir() {
-        finish_failed(
-            &job,
-            format!("path is not a directory: {}", abs_path.display()),
-        );
-        return;
-    }
-
-    if let Some(daemon_root) = inner.daemon_project_root.get() {
-        if !abs_path.starts_with(daemon_root) {
-            finish_failed(
-                &job,
-                format!(
-                    "daemon is bound to project root {}; cannot analyze path {} outside that root",
-                    daemon_root.display(),
-                    abs_path.display()
+    let (abs_path, mut cfg, project_root, applied_config_path) =
+        if let Some(admission) = job.admission.clone() {
+            match admission.preparation {
+                Ok(preparation) => (
+                    admission.path,
+                    preparation.config,
+                    preparation.project_root,
+                    preparation.applied_config_path,
                 ),
-            );
-            return;
-        }
-    }
-
-    let (mut cfg, project_root, applied_config_path) =
-        match RootConfig::load_with_provenance(&abs_path) {
-            Ok((c, root, config_path)) => (c, root, config_path),
-            Err(ConfigError::Toml(e)) => {
-                finish_failed(&job, format!("failed to parse .code-graph.toml: {e}"));
-                return;
+                Err(error) => {
+                    finish_failed(&job, error);
+                    return;
+                }
             }
-            Err(ConfigError::Io(e)) => {
-                finish_failed(&job, format!("failed to read .code-graph.toml: {e}"));
-                return;
-            }
-            Err(e @ ConfigError::ExtensionMissingDot { .. })
-            | Err(e @ ConfigError::ExtensionConflict { .. })
-            | Err(e @ ConfigError::MacroStripConflict { .. })
-            | Err(e @ ConfigError::MacroDefineTypeEmptyName)
-            | Err(e @ ConfigError::MacroDefineTypeKeyword { .. }) => {
-                finish_failed(&job, format!("invalid .code-graph.toml: {e}"));
-                return;
+        } else {
+            match probe_analyze_admission(&inner, &path_raw) {
+                Ok(admission) => {
+                    #[cfg(test)]
+                    wait_for_config_discovery_hook(&inner);
+                    match admission.preparation {
+                        Ok(preparation) => (
+                            admission.path,
+                            preparation.config,
+                            preparation.project_root,
+                            preparation.applied_config_path,
+                        ),
+                        Err(error) => {
+                            finish_failed(&job, error);
+                            return;
+                        }
+                    }
+                }
+                Err(ToolError(error)) => {
+                    finish_failed(&job, error);
+                    return;
+                }
             }
         };
-    #[cfg(test)]
-    wait_for_config_discovery_hook(&inner);
-    if let Some(daemon_root) = inner.daemon_project_root.get() {
-        if daemon_root != &project_root {
-            finish_failed(
-                &job,
-                format!(
-                    "daemon is bound to project root {}; cannot analyze project root {}",
-                    daemon_root.display(),
-                    project_root.display()
-                ),
-            );
-            return;
-        }
-    }
     let mut warnings = cfg.resolve_concurrency();
 
     // Serialize against the watch reindex path; the slot already gates
@@ -738,6 +717,27 @@ fn wait_for_config_discovery_hook(inner: &ServerInner) {
     }
 }
 
+/// Pause after an async admission probe has completed its filesystem work.
+/// The caller reaches this only from `spawn_blocking`, so tests can prove an
+/// unrelated task still runs on a single-worker Tokio runtime.
+#[cfg(test)]
+fn wait_for_admission_probe_hook(inner: &ServerInner) {
+    if let Some(hook) = inner.admission_probe_hook.lock().take() {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
+/// Pause at worker entry so panic-supervision tests can enqueue followers
+/// before the deliberately panicking worker reaches its test-only trigger.
+#[cfg(test)]
+fn wait_for_worker_start_hook(inner: &ServerInner) {
+    if let Some(hook) = inner.worker_start_hook.lock().take() {
+        let _ = hook.reached.send(());
+        hook.proceed.wait();
+    }
+}
+
 /// `analyze_codebase` body.
 ///
 /// Slot-protocol coordination only — the heavy lifting (cache fast-path,
@@ -799,8 +799,18 @@ pub async fn analyze_codebase_async(
         return Err(ToolError("'path' is required".to_string()));
     }
 
-    let path = canonicalize_admission_path(&inner, &path_raw)?;
-    let kickoff = admit_async(&inner, path, force)?;
+    // Canonicalization, directory validation, daemon-root validation, and
+    // config/project discovery all stat or read from the filesystem. Awaiting
+    // the probe keeps the admission result synchronous to the caller without
+    // parking a Tokio runtime worker on a slow network mount.
+    let probe_inner = Arc::clone(&inner);
+    let admission =
+        tokio::task::spawn_blocking(move || probe_analyze_admission(&probe_inner, &path_raw))
+            .await
+            .map_err(|error| {
+                ToolError(format!("async analyze admission probe panicked: {error}"))
+            })??;
+    let kickoff = admit_async_with_admission(&inner, admission, force)?;
 
     match kickoff {
         Kickoff::Pending { job_id, started_at } => Ok(ToolOk::Value(AsyncKickoffResponse {
@@ -854,13 +864,83 @@ fn canonicalize_admission_path(inner: &ServerInner, path_raw: &str) -> Result<St
         .map_err(|_| ToolError(format!("directory does not exist: {path_raw}")))
 }
 
+/// Perform all filesystem-bound checks needed before an async request enters
+/// the slot. This deliberately captures configuration only for the eventual
+/// canonical scan; [`compact_pending`] still decides coverage solely by path.
+fn probe_analyze_admission(
+    inner: &ServerInner,
+    path_raw: &str,
+) -> Result<AnalyzeAdmission, ToolError> {
+    inner.ensure_daemon_root_current().map_err(ToolError)?;
+    let path = paths::canonicalize(std::path::Path::new(path_raw))
+        .map_err(|_| ToolError(format!("directory does not exist: {path_raw}")))?;
+    let preparation = (|| {
+        if !path.is_dir() {
+            return Err(ToolError(format!(
+                "path is not a directory: {}",
+                path.display()
+            )));
+        }
+        if let Some(daemon_root) = inner.daemon_project_root.get() {
+            if !path.starts_with(daemon_root) {
+                return Err(ToolError(format!(
+                    "daemon is bound to project root {}; cannot analyze path {} outside that root",
+                    daemon_root.display(),
+                    path.display()
+                )));
+            }
+        }
+
+        let (config, project_root, applied_config_path) =
+            RootConfig::load_with_provenance(&path).map_err(config_error_to_tool_error)?;
+        if let Some(daemon_root) = inner.daemon_project_root.get() {
+            if daemon_root != &project_root {
+                return Err(ToolError(format!(
+                    "daemon is bound to project root {}; cannot analyze project root {}",
+                    daemon_root.display(),
+                    project_root.display()
+                )));
+            }
+        }
+        Ok(AnalyzePreparation {
+            config,
+            project_root,
+            applied_config_path,
+        })
+    })()
+    .map_err(|error: ToolError| error.0);
+    #[cfg(test)]
+    wait_for_admission_probe_hook(inner);
+    Ok(AnalyzeAdmission { path, preparation })
+}
+
+fn config_error_to_tool_error(error: ConfigError) -> ToolError {
+    match error {
+        ConfigError::Toml(error) => ToolError(format!("failed to parse .code-graph.toml: {error}")),
+        ConfigError::Io(error) => ToolError(format!("failed to read .code-graph.toml: {error}")),
+        error @ ConfigError::ExtensionMissingDot { .. }
+        | error @ ConfigError::ExtensionConflict { .. }
+        | error @ ConfigError::MacroStripConflict { .. }
+        | error @ ConfigError::MacroDefineTypeEmptyName
+        | error @ ConfigError::MacroDefineTypeKeyword { .. } => {
+            ToolError(format!("invalid .code-graph.toml: {error}"))
+        }
+    }
+}
+
 fn is_ancestor_or_equal(ancestor: &str, descendant: &str) -> bool {
     std::path::Path::new(descendant).starts_with(std::path::Path::new(ancestor))
 }
 
-fn next_job(path: String, force: bool) -> Arc<AnalyzeJob> {
+fn next_job(path: String, force: bool, admission: Option<AnalyzeAdmission>) -> Arc<AnalyzeJob> {
     let started_at = allocate_job_timestamp();
-    AnalyzeJob::new_running(format!("{started_at:020}"), path, force, started_at)
+    AnalyzeJob::new_running_with_admission(
+        format!("{started_at:020}"),
+        path,
+        force,
+        started_at,
+        admission,
+    )
 }
 
 /// Allocate the opaque handle for an async follower without creating another
@@ -877,6 +957,7 @@ fn compact_pending(
     slot: &mut crate::analyze_job::AnalyzeSlot,
     path: String,
     force: bool,
+    admission: Option<AnalyzeAdmission>,
     guard: crate::server::AnalyzeGuard,
 ) -> Result<PendingAdmission, ToolError> {
     // Capacity is by every live request, before compaction. A covered
@@ -905,7 +986,7 @@ fn compact_pending(
         .enumerate()
         .filter_map(|(index, entry)| is_ancestor_or_equal(&path, &entry.job.path).then_some(index))
         .collect();
-    let job = next_job(path, force);
+    let job = next_job(path, force, admission);
     if descendants.is_empty() {
         slot.pending.push_back(crate::analyze_job::PendingAnalyze {
             job: Arc::clone(&job),
@@ -966,7 +1047,7 @@ fn admit_sync(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, guard)?;
+        let pending = compact_pending(&mut slot, path, force, None, guard)?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         let job = match pending {
@@ -978,11 +1059,16 @@ fn admit_sync(
         .persist
         .begin_analyze()
         .map_err(|message| ToolError(message.to_string()))?;
-    let job = install_new_running(&mut slot, path, force);
+    let job = install_new_running(&mut slot, path, force, None);
     Ok(SyncAdmission::RunNow { job, guard })
 }
 
-fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Kickoff, ToolError> {
+fn admit_async_with_admission(
+    inner: &Arc<ServerInner>,
+    admission: AnalyzeAdmission,
+    force: bool,
+) -> Result<Kickoff, ToolError> {
+    let path = admission.path.to_string_lossy().into_owned();
     let mut slot = inner.analyze_slot.write();
     if slot
         .current
@@ -994,7 +1080,7 @@ fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Ki
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, guard)?;
+        let pending = compact_pending(&mut slot, path, force, Some(admission), guard)?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         return match pending {
@@ -1013,8 +1099,28 @@ fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Ki
         .persist
         .begin_analyze()
         .map_err(|message| ToolError(message.to_string()))?;
-    let job = install_new_running(&mut slot, path, force);
+    let job = install_new_running(&mut slot, path, force, Some(admission));
     Ok(Kickoff::New(job, guard))
+}
+
+/// In-memory queue tests exercise admission directly, without creating a
+/// filesystem fixture. Production async requests always use
+/// [`admit_async_with_admission`] after the blocking probe.
+#[cfg(test)]
+fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Kickoff, ToolError> {
+    let path = std::path::PathBuf::from(path);
+    admit_async_with_admission(
+        inner,
+        AnalyzeAdmission {
+            path: path.clone(),
+            preparation: Ok(AnalyzePreparation {
+                config: RootConfig::default(),
+                project_root: path,
+                applied_config_path: None,
+            }),
+        },
+        force,
+    )
 }
 
 fn spawn_analyze_worker(
@@ -1121,6 +1227,7 @@ mod queue_tests {
             &mut server.inner.analyze_slot.write(),
             path.to_string(),
             force,
+            None,
             guard,
         )
         .map(|admission| match admission {
@@ -1220,7 +1327,7 @@ mod queue_tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_panic_fails_active_promotes_successor_and_releases_drain() {
         use code_graph_lang_cpp::CppParser;
 
@@ -1240,6 +1347,12 @@ mod queue_tests {
             .register(Box::new(CppParser::new().expect("create C++ parser")))
             .expect("register C++ parser");
         let server = crate::server::CodeGraphServer::new(registry);
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::channel();
+        let worker_proceed = Arc::new(std::sync::Barrier::new(2));
+        *server.inner.worker_start_hook.lock() = Some(crate::server::WorkerStartHook {
+            reached: worker_started_tx,
+            proceed: Arc::clone(&worker_proceed),
+        });
         let active_path = paths::canonicalize(&active_dir)
             .expect("canonicalize active fixture directory")
             .to_string_lossy()
@@ -1266,6 +1379,9 @@ mod queue_tests {
                 ToolOk::Value(response) => response.job_id,
                 ToolOk::Text(_) => panic!("async kickoff must return its structured response"),
             };
+        worker_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("active worker must reach the panic-test handoff");
         let successor_job_id =
             match analyze_codebase_async(Arc::clone(&server.inner), successor_path, true)
                 .await
@@ -1284,17 +1400,25 @@ mod queue_tests {
             };
         assert_ne!(async_follower_id, successor_job_id);
 
-        let sync_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            analyze_codebase(
-                Arc::clone(&server.inner),
-                sync_follower_path,
-                false,
-                Arc::new(NoopProgressSink),
-            ),
-        )
+        let sync_follower = tokio::spawn(analyze_codebase(
+            Arc::clone(&server.inner),
+            sync_follower_path,
+            false,
+            Arc::new(NoopProgressSink),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.inner.analyze_slot.read().pending_request_count() != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("synchronous follower must not remain blocked after active worker panic");
+        .expect("both followers must queue before the active panic");
+        worker_proceed.wait();
+
+        let sync_result = tokio::time::timeout(std::time::Duration::from_secs(10), sync_follower)
+            .await
+            .expect("synchronous follower must not remain blocked after active worker panic")
+            .expect("synchronous follower task must not panic");
         assert!(matches!(sync_result, Ok(ToolOk::Value(_))));
 
         tokio::time::timeout(
@@ -1342,6 +1466,7 @@ mod queue_tests {
                 &mut server.inner.analyze_slot.write(),
                 path.into(),
                 true,
+                None,
                 guard,
             ) {
                 Ok(_) => panic!("a covered 33rd request must be rejected before compaction"),
@@ -1385,6 +1510,7 @@ mod queue_tests {
             &mut server.inner.analyze_slot.write(),
             "/queue/0/covered".into(),
             false,
+            None,
             guard,
         )
         .is_err());
@@ -1531,7 +1657,7 @@ mod queue_tests {
         // it on the following rotation.
         let next = {
             let mut slot = server.inner.analyze_slot.write();
-            install_new_running(&mut slot, "/queue/next".into(), false)
+            install_new_running(&mut slot, "/queue/next".into(), false, None)
         };
         finish_completed(
             &next,
@@ -1545,7 +1671,7 @@ mod queue_tests {
         );
         {
             let mut slot = server.inner.analyze_slot.write();
-            let _ = install_new_running(&mut slot, "/queue/newer".into(), false);
+            let _ = install_new_running(&mut slot, "/queue/newer".into(), false, None);
         }
         let slot = server.inner.analyze_slot.read();
         assert!(slot.aliases.is_empty());
@@ -1603,6 +1729,61 @@ mod queue_tests {
                 .resolve_async_job(&child)
                 .expect("displaced async handle must resolve to the same terminal")
         ));
+    }
+}
+
+#[cfg(test)]
+mod admission_probe {
+    use super::*;
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    /// A held admission probe models slow canonicalization/config discovery.
+    /// With one runtime worker, an unrelated task must still run before the
+    /// probe is released; otherwise filesystem I/O has leaked onto Tokio.
+    #[test]
+    fn blocking_probe_keeps_single_worker_runtime_responsive() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker Tokio runtime");
+        let root = tempfile::tempdir().expect("create admission fixture");
+        let server = crate::server::CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let proceed = Arc::new(Barrier::new(2));
+        *server.inner.admission_probe_hook.lock() = Some(crate::server::AdmissionProbeHook {
+            reached: reached_tx,
+            proceed: Arc::clone(&proceed),
+        });
+
+        let inner = Arc::clone(&server.inner);
+        let path = root.path().to_string_lossy().into_owned();
+        let kickoff =
+            runtime.spawn(async move { analyze_codebase_async(inner, path, false).await });
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking admission probe must reach its test handoff");
+
+        let (unrelated_tx, unrelated_rx) = mpsc::channel();
+        runtime.spawn(async move {
+            let _ = unrelated_tx.send(());
+        });
+        let responsive = unrelated_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+
+        // Always release the blocking-pool task before asserting so a broken
+        // implementation cannot strand the runtime during test cleanup.
+        proceed.wait();
+        let result = runtime
+            .block_on(kickoff)
+            .expect("async kickoff task must not panic");
+        assert!(result.is_ok(), "admission probe fixture must be accepted");
+        assert!(
+            responsive,
+            "a held admission probe blocked the sole Tokio runtime worker"
+        );
     }
 }
 
@@ -1867,8 +2048,9 @@ fn install_new_running(
     slot: &mut crate::analyze_job::AnalyzeSlot,
     path: String,
     force: bool,
+    admission: Option<AnalyzeAdmission>,
 ) -> Arc<AnalyzeJob> {
-    let job = next_job(path, force);
+    let job = next_job(path, force, admission);
     if let Some(prev) = slot.current.take() {
         if let Some(expired) = slot.previous_terminal.take() {
             slot.discard_aliases_for(&expired.job_id);

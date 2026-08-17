@@ -48,10 +48,12 @@ rsplit on the rightmost `:` that is not part of `::`.
 ## Pagination & response shape
 
 Paginated tools return `{results, total, offset, limit, truncated, next_offset}`.
-To get more, **raise `limit`** (default 100, max 1000) or resume with
-`offset = next_offset` when `truncated=true`. Do not assume `results.length == limit`
-means "done" — check `truncated`. Use `count_only=true` / `brief=true` to keep
-responses small when you only need totals or names.
+To get more, **raise `limit`** (default 100, max 1000) or, when `truncated=true` and
+`next_offset` differs from the requested `offset`, resume with `offset = next_offset`.
+An empty `truncated: true` page with `next_offset == offset` is a byte-starved start-fresh
+marker, not a continuation: raise `[response].max_bytes`, re-run `analyze_codebase`, then
+retry. Do not assume `results.length == limit` means "done" — check `truncated`. Use
+`count_only=true` / `brief=true` to keep responses small when you only need totals or names.
 
 ## When to fall back to grep
 

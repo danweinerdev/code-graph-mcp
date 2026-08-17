@@ -50,6 +50,10 @@ Pagination here is **by-count only** (`limit`/`offset`), not byte-budgeted, so a
 page with huge cycles can still be large. `subtree` filters to cycles fully under a
 prefix. Default `limit` is 20 because cycles are rare in healthy codebases.
 
+For byte-budgeted `get_coupling` pages, an empty `truncated: true` page with
+`next_offset` equal to the requested `offset` is a start-fresh marker, not a
+continuation. Raise `[response].max_bytes`, re-run `analyze_codebase`, then retry.
+
 ## generate_diagram
 
 `generate_diagram` has three modes:

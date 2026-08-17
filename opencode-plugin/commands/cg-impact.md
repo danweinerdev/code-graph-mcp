@@ -16,7 +16,9 @@ skips the comment/string/test-name noise a grep drowns in.
    `file:name` or `file:Parent::name`, and passing an ambiguous bare name gets you the wrong one.
    For a bare class name, `find_class_candidates`.
 2. **Inbound.** `get_callers(symbol_id)` — everything that would need to change. Start with
-   `depth` shallow and widen; page with `next_offset` until `truncated` is false.
+   `depth` shallow and widen; page with `next_offset` while it differs from the requested offset.
+   An empty `truncated: true` page with unchanged `next_offset` is a byte-starved start-fresh
+   marker: raise `[response].max_bytes`, re-run `analyze_codebase`, then retry.
 3. **Outbound.** `get_callees(symbol_id)` — what this symbol relies on, i.e. what could break
    *it*.
 4. **Polymorphic reach.** If it's a virtual/overridable method, `find_overrides` — the call graph

@@ -177,6 +177,9 @@ fn tools_list_find_class_candidates() {
 //   soft-hint behavior (kind names + the alternative-tool routing).
 // - `search_symbols`: `suggestions` field semantics (anchored `^…$` AND
 //   `total == 0` trigger condition, `count_only` exclusion).
+// - Byte-budgeted pages: an empty page with unchanged `next_offset` is a
+//   start-fresh marker that requires a larger configured budget, not a
+//   same-offset continuation.
 
 fn description_of(name: &str) -> String {
     let tool = tool_entry(name);
@@ -261,4 +264,26 @@ fn search_symbols_description_documents_suggestions_field() {
     );
     // `count_only` exclusion.
     assert_contains(&d, "Never emitted on `count_only=true`", "search_symbols");
+}
+
+#[test]
+fn byte_budgeted_tool_descriptions_document_start_fresh_recovery() {
+    for tool in [
+        "get_file_symbols",
+        "search_symbols",
+        "get_symbol_summary",
+        "get_symbol_at",
+        "get_callers",
+        "get_callees",
+        "find_overrides",
+        "get_dependencies",
+        "get_orphans",
+        "get_coupling",
+        "detect_communities",
+    ] {
+        let description = description_of(tool);
+        assert_contains(&description, "start-fresh marker", tool);
+        assert_contains(&description, "not a continuation", tool);
+        assert_contains(&description, "re-run `analyze_codebase`", tool);
+    }
 }

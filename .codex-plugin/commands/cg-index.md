@@ -46,6 +46,9 @@ shape-identical to sync `analyze_codebase`'s body.
   invalidates inside the invoked subtree.
 
 `[response].max_bytes` changes do **not** need `force=true` — just re-run `analyze_codebase`.
+If a positive byte budget yields an empty `truncated: true` page with `next_offset` equal to the
+requested `offset`, it is a start-fresh marker, not a continuation: raise the budget, re-run the
+analysis, then retry instead of re-calling the same offset.
 
 ## Notes
 

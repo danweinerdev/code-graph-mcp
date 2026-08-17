@@ -774,7 +774,7 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         &[],
         &[
             ("CODE_GRAPH_TEST_PERSIST_DELAY_ROOT", &root_string),
-            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "3000"),
+            ("CODE_GRAPH_TEST_PERSIST_DELAY_MILLIS", "2000"),
             (
                 "CODE_GRAPH_TEST_PERSIST_ADMITTED_MARKER",
                 &admitted_marker_string,
@@ -866,6 +866,11 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         (response, stderr)
     });
 
+    // Async admission captures config discovery before it joins the queue.
+    // Make the canonical request invalid before that probe, then attach the
+    // synchronous descendant while path-only compaction is still in effect.
+    fs::write(malformed.join(".code-graph.toml"), "[daemon\n")
+        .expect("make canonical parent config malformed before async admission");
     let mut malformed_client = Client::spawn(&root.0, &[]);
     let malformed_kickoff = malformed_client.tool(
         "analyze_codebase_async",
@@ -894,8 +899,6 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
         7,
         "all cross-client pending requests did not reach serialized admission",
     );
-    fs::write(malformed.join(".code-graph.toml"), "[daemon\n")
-        .expect("make canonical parent config malformed after follower admission");
     fs::write(
         malformed_follower.join(".code-graph.toml"),
         "[daemon]\nenabled = true\n",

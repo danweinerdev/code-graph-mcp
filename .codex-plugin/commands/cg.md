@@ -48,8 +48,10 @@ instead of hand-picking a tool when you just want the answer.
 - Answer with **paths, line numbers, and signatures**. Read source only after a tool has pinned
   the exact span, and read that span, not the file.
 - Paginated tools return `{results, total, offset, limit, truncated, next_offset}`. When
-  `truncated` is true, re-call with `offset = next_offset` — raising `limit` alone will not get
-  you the rest.
+  `truncated` is true and `next_offset` differs from the requested `offset`, re-call with
+  `offset = next_offset` — raising `limit` alone will not get you the rest. An empty
+  `truncated: true` page with `next_offset == offset` is a byte-starved start-fresh marker,
+  not a continuation: raise `[response].max_bytes`, re-run `analyze_codebase`, then retry.
 - Call resolution is **syntactic, not semantic**, in all six languages. Overloads can misresolve;
   pass `min_confidence: "resolved"` on `get_callers`/`get_callees` when a clean edge set matters
   more than coverage.

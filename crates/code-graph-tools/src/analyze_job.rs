@@ -17,7 +17,26 @@ use std::sync::Arc;
 
 use parking_lot::RwLock as PlRwLock;
 
+use code_graph_core::RootConfig;
+
 use crate::handlers::analyze::AnalyzeResult;
+
+/// Filesystem-derived facts captured before an asynchronous analyze request is
+/// admitted. They belong to the canonical request only: path containment, not
+/// configuration identity, controls pending-work compaction.
+#[derive(Clone)]
+pub(crate) struct AnalyzeAdmission {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) preparation: Result<AnalyzePreparation, String>,
+}
+
+/// Successful config/project discovery captured by an async admission probe.
+#[derive(Clone)]
+pub(crate) struct AnalyzePreparation {
+    pub(crate) config: RootConfig,
+    pub(crate) project_root: std::path::PathBuf,
+    pub(crate) applied_config_path: Option<std::path::PathBuf>,
+}
 
 // `is_terminal` is the rotation helper retained for callers who want
 // the predicate without pattern-matching on `JobStatus` directly —
@@ -136,6 +155,10 @@ pub(crate) struct AnalyzeJob {
     /// Original request force, retained for the existing status view.
     pub(crate) force: bool,
     pub(crate) started_at: u64,
+    /// Present only for async work after its blocking admission probe has
+    /// canonicalized the invocation path and discovered its project config.
+    /// Sync analyzes retain their established execution-time discovery path.
+    pub(crate) admission: Option<AnalyzeAdmission>,
     pub(crate) state: PlRwLock<JobMutableState>,
     terminal: tokio::sync::Notify,
 }
@@ -227,17 +250,29 @@ pub enum AnalyzePhase {
 }
 
 impl AnalyzeJob {
+    #[cfg(test)]
     pub(crate) fn new_running(
         job_id: String,
         path: String,
         force: bool,
         started_at: u64,
     ) -> Arc<Self> {
+        Self::new_running_with_admission(job_id, path, force, started_at, None)
+    }
+
+    pub(crate) fn new_running_with_admission(
+        job_id: String,
+        path: String,
+        force: bool,
+        started_at: u64,
+        admission: Option<AnalyzeAdmission>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             job_id,
             path,
             force,
             started_at,
+            admission,
             state: PlRwLock::new(JobMutableState::default()),
             terminal: tokio::sync::Notify::new(),
         })

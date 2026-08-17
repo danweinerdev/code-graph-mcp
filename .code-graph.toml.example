@@ -61,7 +61,11 @@ idle_timeout_secs = 1800
 # Byte cap on paginated MCP responses. When a page would exceed this
 # size, the server truncates mid-page and surfaces `truncated: true`
 # plus a `next_offset` to resume paging. Default chosen to fit Claude
-# Code's harness; raise for clients with larger token budgets.
+# Code's harness; raise for clients with larger token budgets. A positive value
+# too small for one row yields an empty `truncated: true` start-fresh page whose
+# `next_offset` equals the requested `offset`, not a continuation: do not retry
+# it unchanged. Raise `max_bytes`, re-run `analyze_codebase` to refresh cached
+# config, then retry.
 # max_bytes = 102400
 
 # C++-specific knobs. The `macro_strip` list contains identifier tokens to

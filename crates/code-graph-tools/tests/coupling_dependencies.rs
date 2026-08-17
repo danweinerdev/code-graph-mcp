@@ -204,9 +204,9 @@ async fn get_coupling_both_split_shape() {
 /// sides, the budget is allocated sequentially: incoming is sized against
 /// the full budget first, and when it consumes (essentially) all of it
 /// the outgoing side is emitted as an *empty* page flagged
-/// `truncated: true` with `next_offset: 0` — the start-fresh marker
-/// telling a client to re-request the outgoing side via
-/// `direction=outgoing offset=0`.
+/// `truncated: true` with `next_offset` equal to the resolved request offset
+/// — the start-fresh marker telling a client to raise the response budget
+/// before re-requesting the outgoing side.
 ///
 /// Byte math (why the magic number works):
 /// `byte_budget_take` reserves `ENVELOPE_OVERHEAD_BYTES` (512) off the
@@ -221,7 +221,8 @@ async fn get_coupling_both_split_shape() {
 /// `592 - 48` (`COUPLING_BOTH_WRAPPER_OVERHEAD = 48`). So
 /// `remaining = max_bytes - incoming_bytes - 48` saturates to 0 and the
 /// handler takes the "incoming ate the whole budget" branch, emitting the
-/// empty/truncated/`next_offset:0` outgoing page. The fixture supplies
+/// empty/truncated outgoing page whose `next_offset` equals the request
+/// offset. The fixture supplies
 /// many incoming files and a couple of outgoing ones so the starvation is
 /// caused by the budget, not by an empty graph.
 #[tokio::test]
@@ -312,6 +313,33 @@ async fn get_coupling_byte_budget_sequential() {
         Some(2),
         "starved outgoing page must still report the true total (2); \
          got: {outgoing}",
+    );
+
+    // The start-fresh marker must retain a nonzero resolved offset. Returning
+    // zero here would incorrectly tell a caller that requested page 1 to
+    // restart from page 0 after raising the budget.
+    let nonzero_offset = 1;
+    let r = get_coupling(
+        &server.inner.graph,
+        &hub_h,
+        Some("both"),
+        Some(nonzero_offset),
+        None,
+        max_bytes,
+    );
+    let body = ok_json(&r);
+    let outgoing = &body["outgoing"];
+    assert_eq!(
+        outgoing["results"].as_array().map(|rows| rows.len()),
+        Some(0),
+        "incoming must still starve the nonzero-offset outgoing page; got: {outgoing}",
+    );
+    assert_eq!(outgoing["truncated"].as_bool(), Some(true));
+    assert_eq!(outgoing["offset"].as_u64(), Some(nonzero_offset as u64));
+    assert_eq!(
+        outgoing["next_offset"].as_u64(),
+        Some(nonzero_offset as u64),
+        "starved outgoing marker must retain the resolved request offset; got: {outgoing}",
     );
 
     drop(dir);
