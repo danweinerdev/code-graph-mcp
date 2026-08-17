@@ -14,7 +14,7 @@ related:
 phases:
   - id: 1
     title: "Graph Queries"
-    status: in-progress
+    status: complete
     doc: "01-Graph-Queries.md"
   - id: 2
     title: "Typed Core Layering"
