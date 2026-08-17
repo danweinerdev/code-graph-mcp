@@ -10,5 +10,11 @@ description = "Git VCS provider and hermetic test fixtures"
 [lints]
 workspace = true
 
+[dependencies]
+async-trait = { workspace = true }
+code-graph-vcs = { path = "../code-graph-vcs" }
+gix = "0.86.0"
+tokio = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

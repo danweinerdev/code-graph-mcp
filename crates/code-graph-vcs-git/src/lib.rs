@@ -1,10 +1,434 @@
 #![forbid(unsafe_code)]
 
-//! Git VCS provider implementation.
+//! Pure-Rust Git VCS provider implementation.
 //!
-//! The provider is introduced separately from its test fixture harness. The
-//! harness below is compiled only for this crate's tests so Git CLI use cannot
-//! enter production code.
+//! Production operations use `gix` only. The Git CLI is confined to the test
+//! fixture harness, where it creates and independently verifies repositories.
+
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use code_graph_vcs::{BlameHunk, Commit, RevId, VcsError, VcsProvider};
+
+/// A Git provider bound to one discovered working tree.
+///
+/// Bind the provider with [`GitProvider::open`] before registering it. The
+/// provider reopens that repository inside each blocking task instead of
+/// keeping a non-thread-safe repository handle across async calls.
+#[derive(Clone, Debug)]
+pub struct GitProvider {
+    project_root: PathBuf,
+}
+
+impl GitProvider {
+    /// Discover and bind a Git working tree containing `project_root`.
+    pub fn open(project_root: impl AsRef<Path>) -> Result<Self, VcsError> {
+        let project_root = project_root.as_ref();
+        let repository = gix::discover(project_root).map_err(|error| {
+            VcsError::Unavailable(format!("{}: {error}", project_root.display()))
+        })?;
+        let work_dir = repository.workdir().ok_or_else(|| {
+            VcsError::Unavailable(format!(
+                "{} is a bare Git repository",
+                project_root.display()
+            ))
+        })?;
+
+        Ok(Self {
+            project_root: work_dir.to_path_buf(),
+        })
+    }
+
+    fn is_working_tree(project_root: &Path) -> bool {
+        Self::open(project_root).is_ok()
+    }
+
+    async fn blocking<T, F>(&self, operation: F) -> Result<T, VcsError>
+    where
+        T: Send + 'static,
+        F: FnOnce(PathBuf) -> Result<T, VcsError> + Send + 'static,
+    {
+        let project_root = self.project_root.clone();
+        tokio::task::spawn_blocking(move || operation(project_root))
+            .await
+            .map_err(|error| VcsError::Operation(format!("Git blocking task failed: {error}")))?
+    }
+}
+
+#[async_trait]
+impl VcsProvider for GitProvider {
+    fn id(&self) -> &'static str {
+        "git"
+    }
+
+    fn detect(&self, working_tree: &Path) -> bool {
+        Self::is_working_tree(working_tree)
+    }
+
+    async fn blame(
+        &self,
+        path: &Path,
+        lines: Option<(u32, u32)>,
+        at: Option<&RevId>,
+    ) -> Result<Vec<BlameHunk>, VcsError> {
+        let path = path.to_path_buf();
+        let revision = at.map(|revision| revision.as_str().to_owned());
+        self.blocking(move |project_root| blame(&project_root, &path, lines, revision.as_deref()))
+            .await
+    }
+
+    async fn revisions_touching(&self, path: &Path, limit: u32) -> Result<Vec<Commit>, VcsError> {
+        let path = path.to_path_buf();
+        self.blocking(move |project_root| revisions_touching(&project_root, &path, limit))
+            .await
+    }
+
+    async fn read_at(&self, rev: &RevId, path: &Path) -> Result<Vec<u8>, VcsError> {
+        let revision = rev.as_str().to_owned();
+        let path = path.to_path_buf();
+        self.blocking(move |project_root| read_at(&project_root, &revision, &path))
+            .await
+    }
+
+    async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
+        let spec = spec.to_owned();
+        self.blocking(move |project_root| resolve_rev(&project_root, &spec))
+            .await
+    }
+}
+
+fn open_repository(project_root: &Path) -> Result<gix::Repository, VcsError> {
+    gix::discover(project_root)
+        .map_err(|error| VcsError::Unavailable(format!("{}: {error}", project_root.display())))
+}
+
+fn resolve_rev(project_root: &Path, spec: &str) -> Result<RevId, VcsError> {
+    let repository = open_repository(project_root)?;
+    let object = repository
+        .rev_parse_single(spec)
+        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
+    let commit = object
+        .object()
+        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?
+        .peel_to_commit()
+        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
+    Ok(RevId::new(commit.id.to_string()))
+}
+
+fn read_at(project_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>, VcsError> {
+    let repository = open_repository(project_root)?;
+    let object = repository
+        .rev_parse_single(revision)
+        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?;
+    let commit = object
+        .object()
+        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?
+        .peel_to_commit()
+        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?;
+    let tree = commit
+        .tree()
+        .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
+    let relative_path = repository_relative_path(project_root, path)?;
+    let entry = tree
+        .lookup_entry_by_path(relative_path)
+        .map_err(|error| VcsError::Operation(format!("read tree entry for {revision}: {error}")))?
+        .ok_or_else(|| VcsError::NotFound(format!("{} at {revision}", path.display())))?;
+    let blob = repository.find_blob(entry.oid()).map_err(|error| {
+        VcsError::NotFound(format!("{} at {revision}: {error}", path.display()))
+    })?;
+    Ok(blob.data.to_vec())
+}
+
+fn blame(
+    project_root: &Path,
+    path: &Path,
+    lines: Option<(u32, u32)>,
+    revision: Option<&str>,
+) -> Result<Vec<BlameHunk>, VcsError> {
+    let repository = open_repository(project_root)?;
+    let relative_path = repository_relative_path(project_root, path)?;
+    let revision = revision
+        .map(|spec| {
+            repository
+                .rev_parse_single(spec)
+                .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))
+        })
+        .transpose()?
+        .map(gix::Id::detach);
+    let revision = match revision {
+        Some(revision) => revision,
+        None => repository
+            .head_id()
+            .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
+            .detach(),
+    };
+    let outcome = repository
+        .blame_file(
+            gix::bstr::BStr::new(relative_path.to_string_lossy().as_bytes()),
+            revision,
+            Default::default(),
+        )
+        .map_err(|error| VcsError::Operation(format!("blame {}: {error}", path.display())))?;
+
+    let requested = lines.unwrap_or((1, u32::MAX));
+    outcome
+        .entries
+        .iter()
+        .map(|entry| {
+            let start_line = entry.start_in_blamed_file.saturating_add(1);
+            let line_count = entry.len.get();
+            let end_line = start_line.saturating_add(line_count.saturating_sub(1));
+            let overlap_start = start_line.max(requested.0);
+            let overlap_end = end_line.min(requested.1);
+            let commit = repository.find_commit(entry.commit_id).map_err(|error| {
+                VcsError::Operation(format!("read blame commit {}: {error}", entry.commit_id))
+            })?;
+            let (author, timestamp_utc) = commit_identity(&commit)?;
+            Ok((overlap_start <= overlap_end).then(|| BlameHunk {
+                rev: RevId::new(entry.commit_id.to_string()),
+                author,
+                timestamp_utc,
+                start_line: overlap_start,
+                line_count: overlap_end.saturating_sub(overlap_start).saturating_add(1),
+            }))
+        })
+        .filter_map(|hunk| hunk.transpose())
+        .collect()
+}
+
+fn revisions_touching(
+    project_root: &Path,
+    path: &Path,
+    limit: u32,
+) -> Result<Vec<Commit>, VcsError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let repository = open_repository(project_root)?;
+    let relative_path = repository_relative_path(project_root, path)?;
+    let head = repository
+        .head_id()
+        .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
+        .detach();
+    let mut revisions = Vec::new();
+    let mut pending = BinaryHeap::new();
+    let mut sequence = 0;
+    enqueue_commit(&repository, &mut pending, head, &mut sequence)?;
+    let mut seen = HashSet::new();
+    while let Some(pending_commit) = pending.pop() {
+        if !seen.insert(pending_commit.id) {
+            continue;
+        }
+        let commit = repository.find_commit(pending_commit.id).map_err(|error| {
+            VcsError::Operation(format!("read commit {}: {error}", pending_commit.id))
+        })?;
+        let parent_ids = commit.parent_ids().collect::<Vec<_>>();
+        for parent_id in parent_ids {
+            enqueue_commit(&repository, &mut pending, parent_id.detach(), &mut sequence)?;
+        }
+        if commit_changes_path(&repository, &commit, &relative_path)? {
+            revisions.push(commit_metadata(&commit)?);
+            if revisions.len() == limit as usize {
+                break;
+            }
+        }
+    }
+    Ok(revisions)
+}
+
+/// One commit queued for the manual newest-first revwalk.
+///
+/// The sequence makes equal commit timestamps deterministic without assigning
+/// any meaning to the opaque revision identifier.
+#[derive(Debug, Eq, PartialEq)]
+struct PendingCommit {
+    timestamp_utc: i64,
+    sequence: u64,
+    id: gix::ObjectId,
+}
+
+impl Ord for PendingCommit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp_utc
+            .cmp(&other.timestamp_utc)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+impl PartialOrd for PendingCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn enqueue_commit(
+    repository: &gix::Repository,
+    pending: &mut BinaryHeap<PendingCommit>,
+    id: gix::ObjectId,
+    sequence: &mut u64,
+) -> Result<(), VcsError> {
+    let commit = repository
+        .find_commit(id)
+        .map_err(|error| VcsError::Operation(format!("read commit {id}: {error}")))?;
+    pending.push(PendingCommit {
+        timestamp_utc: commit_timestamp(&commit)?,
+        sequence: *sequence,
+        id,
+    });
+    *sequence = sequence.saturating_add(1);
+    Ok(())
+}
+
+fn commit_changes_path(
+    repository: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    path: &Path,
+) -> Result<bool, VcsError> {
+    let tree = commit
+        .tree()
+        .map_err(|error| VcsError::Operation(format!("read commit tree: {error}")))?;
+    let current = tree
+        .lookup_entry_by_path(path)
+        .map_err(|error| VcsError::Operation(format!("read commit tree entry: {error}")))?
+        .map(|entry| (entry.oid().to_owned(), entry.mode()));
+    let mut parent_ids = commit.parent_ids();
+    let Some(first_parent_id) = parent_ids.next() else {
+        return Ok(current.is_some());
+    };
+    let first_parent = repository.find_commit(first_parent_id).map_err(|error| {
+        VcsError::Operation(format!("read commit parent for {}: {error}", commit.id))
+    })?;
+
+    if first_parent
+        .tree()
+        .map_err(|error| VcsError::Operation(format!("read parent tree: {error}")))?
+        .lookup_entry_by_path(path)
+        .map_err(|error| VcsError::Operation(format!("read parent tree entry: {error}")))?
+        .map(|entry| (entry.oid().to_owned(), entry.mode()))
+        != current
+    {
+        return Ok(true);
+    }
+
+    for parent_id in parent_ids {
+        let parent = repository.find_commit(parent_id).map_err(|error| {
+            VcsError::Operation(format!("read commit parent for {}: {error}", commit.id))
+        })?;
+        if parent
+            .tree()
+            .map_err(|error| VcsError::Operation(format!("read parent tree: {error}")))?
+            .lookup_entry_by_path(path)
+            .map_err(|error| VcsError::Operation(format!("read parent tree entry: {error}")))?
+            .map(|entry| (entry.oid().to_owned(), entry.mode()))
+            != current
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn commit_metadata(commit: &gix::Commit<'_>) -> Result<Commit, VcsError> {
+    let (author, timestamp_utc) = commit_identity(commit)?;
+    let message = commit
+        .message_raw()
+        .map_err(|error| VcsError::Operation(format!("read commit message: {error}")))?;
+    Ok(Commit {
+        rev: RevId::new(commit.id.to_string()),
+        author,
+        timestamp_utc,
+        summary: message
+            .to_string()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn commit_identity(commit: &gix::Commit<'_>) -> Result<(String, i64), VcsError> {
+    let decoded = commit
+        .decode()
+        .map_err(|error| VcsError::Operation(format!("decode commit {}: {error}", commit.id)))?;
+    let author = gix::actor::SignatureRef::from_bytes(decoded.author).map_err(|error| {
+        VcsError::Operation(format!("read commit author for {}: {error}", commit.id))
+    })?;
+    let timestamp_utc = signature_timestamp(author.time, "author", commit.id)?;
+    Ok((author.name.to_string(), timestamp_utc))
+}
+
+fn commit_timestamp(commit: &gix::Commit<'_>) -> Result<i64, VcsError> {
+    let decoded = commit
+        .decode()
+        .map_err(|error| VcsError::Operation(format!("decode commit {}: {error}", commit.id)))?;
+    let committer = gix::actor::SignatureRef::from_bytes(decoded.committer).map_err(|error| {
+        VcsError::Operation(format!("read commit committer for {}: {error}", commit.id))
+    })?;
+    signature_timestamp(committer.time, "committer", commit.id)
+}
+
+fn signature_timestamp(timestamp: &str, role: &str, id: gix::ObjectId) -> Result<i64, VcsError> {
+    timestamp
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| VcsError::Operation(format!("missing {role} timestamp for {id}")))?
+        .parse()
+        .map_err(|error| VcsError::Operation(format!("invalid {role} timestamp for {id}: {error}")))
+}
+
+fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf, VcsError> {
+    let relative_path = if path.is_absolute() {
+        let normalized_root = normalize_lexical_path(project_root);
+        let normalized_path = normalize_lexical_path(path);
+        normalized_path
+            .strip_prefix(normalized_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                VcsError::NotFound(format!(
+                    "{} is outside {}",
+                    path.display(),
+                    project_root.display()
+                ))
+            })?
+    } else {
+        normalize_lexical_path(path)
+    };
+
+    if relative_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(VcsError::NotFound(format!(
+            "{} escapes bound repository root {}",
+            path.display(),
+            project_root.display()
+        )));
+    }
+    Ok(relative_path)
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(segment) => normalized.push(segment),
+            std::path::Component::ParentDir => match normalized.file_name() {
+                Some(name) if name != ".." => {
+                    normalized.pop();
+                }
+                _ if !path.is_absolute() => normalized.push(".."),
+                _ => {}
+            },
+        }
+    }
+    normalized
+}
 
 #[cfg(test)]
 mod harness {
@@ -113,11 +537,15 @@ mod harness {
             }
 
             self.git(&["add", "--all"])?;
-            self.git_with_commit_identity(
-                &["commit", "--no-gpg-sign", "--message", commit.message],
-                commit.timestamp,
-            )?;
+            self.commit_staged(commit.message, commit.timestamp)?;
             Ok(())
+        }
+
+        fn commit_staged(&self, message: &str, timestamp: &str) -> Result<(), HarnessError> {
+            self.git_with_commit_identity(
+                &["commit", "--no-gpg-sign", "--message", message],
+                timestamp,
+            )
         }
 
         fn commit_graph(&self) -> Result<String, HarnessError> {
@@ -151,6 +579,79 @@ mod harness {
                 "--format=%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI",
                 "HEAD",
             ])
+        }
+
+        fn path_history(
+            &self,
+            path: &str,
+        ) -> Result<Vec<(String, String, i64, String)>, HarnessError> {
+            self.git_stdout(&["log", "--format=%H%x1f%an%x1f%at%x1f%s", "--", path])
+                .map(|history| {
+                    history
+                        .lines()
+                        .map(|line| {
+                            let mut fields = line.split('\x1f');
+                            let revision =
+                                fields.next().expect("Git log revision field").to_string();
+                            let author = fields.next().expect("Git log author field").to_string();
+                            let timestamp_utc = fields
+                                .next()
+                                .expect("Git log timestamp field")
+                                .parse()
+                                .expect("Git log timestamp is an integer");
+                            let summary = fields.next().expect("Git log summary field").to_string();
+                            (revision, author, timestamp_utc, summary)
+                        })
+                        .collect()
+                })
+        }
+
+        fn blame_revision(&self, path: &str, line: u32) -> Result<String, HarnessError> {
+            self.git_stdout(&[
+                "blame",
+                "--porcelain",
+                "-L",
+                &format!("{line},{line}"),
+                "--",
+                path,
+            ])
+            .and_then(|output| {
+                output
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+                    .ok_or_else(|| HarnessError("git blame produced no revision".to_string()))
+            })
+        }
+
+        fn blame_revision_at(
+            &self,
+            revision: &str,
+            path: &str,
+            line: u32,
+        ) -> Result<String, HarnessError> {
+            self.git_stdout(&[
+                "blame",
+                "--porcelain",
+                "-L",
+                &format!("{line},{line}"),
+                revision,
+                "--",
+                path,
+            ])
+            .and_then(|output| {
+                output
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+                    .ok_or_else(|| HarnessError("git blame produced no revision".to_string()))
+            })
+        }
+
+        fn blob_id(&self, revision: &str, path: &str) -> Result<String, HarnessError> {
+            let object = format!("{revision}:{path}");
+            self.git_stdout(&["rev-parse", &object])
+                .map(|id| id.trim().to_string())
         }
 
         fn git(&self, args: &[&str]) -> Result<(), HarnessError> {
@@ -285,6 +786,54 @@ mod harness {
                 LITERAL_ONLY,
             ],
         }
+    }
+
+    const UNRELATED_CHANGE: ScriptedCommit = ScriptedCommit {
+        message: "add unrelated documentation",
+        timestamp: "2001-01-06T00:00:00+0000",
+        changes: &[FileChange {
+            path: "README.md",
+            contents: "This commit intentionally does not touch the calculator.\n",
+        }],
+    };
+
+    fn provider_script() -> FixtureScript {
+        FixtureScript {
+            commits: &[
+                INITIAL,
+                REFORMAT_ONLY,
+                LOGIC_CHANGE,
+                MOVE_WITHIN_FILE,
+                LITERAL_ONLY,
+                UNRELATED_CHANGE,
+            ],
+        }
+    }
+
+    fn initial_only_script() -> FixtureScript {
+        FixtureScript {
+            commits: &[INITIAL],
+        }
+    }
+
+    const FEATURE_UNRELATED_CHANGE: ScriptedCommit = ScriptedCommit {
+        message: "add feature notes",
+        timestamp: "2001-01-02T00:00:00+0000",
+        changes: &[FileChange {
+            path: "feature-notes.md",
+            contents: "Feature branch does not change the calculator.\n",
+        }],
+    };
+
+    fn merge_parent_fixture() -> Result<Fixture, HarnessError> {
+        let fixture = Fixture::build(initial_only_script())?;
+        fixture.git(&["checkout", "-b", "feature"])?;
+        fixture.apply_commit(FEATURE_UNRELATED_CHANGE)?;
+        fixture.git(&["checkout", INITIAL_BRANCH])?;
+        fixture.apply_commit(LOGIC_CHANGE)?;
+        fixture.git(&["merge", "--no-ff", "--no-commit", "feature"])?;
+        fixture.commit_staged("merge feature notes", "2001-01-04T00:00:00+0000")?;
+        Ok(fixture)
     }
 
     fn without_whitespace(source: &str) -> String {
@@ -426,5 +975,183 @@ mod harness {
             !redirect.path().join("redirected-git").exists(),
             "fixture must not create Git state outside its TempDir"
         );
+    }
+
+    #[tokio::test]
+    async fn git_provider_matches_git_cli_for_fixture_operations_and_path_history() {
+        use super::GitProvider;
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        const PATH: &str = "src/calculator.rs";
+        let fixture = Fixture::build(provider_script()).expect("fixture must build");
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+        let source_path = fixture.path().join(PATH);
+
+        assert!(provider.detect(fixture.path()));
+        let plain_directory = tempfile::tempdir().expect("plain temporary directory");
+        assert!(!provider.detect(plain_directory.path()));
+        assert!(GitProvider::open(plain_directory.path()).is_err());
+
+        let revision = provider
+            .resolve_rev("HEAD~2")
+            .await
+            .expect("Git revision resolves");
+        assert_eq!(
+            provider
+                .read_at(&revision, Path::new(PATH))
+                .await
+                .expect("read historical relative path"),
+            fixture
+                .file_at_commit(revision.as_str(), PATH)
+                .expect("Git CLI reads the same historical file")
+                .into_bytes()
+        );
+        assert_eq!(
+            provider
+                .read_at(&revision, Path::new("src/../src/calculator.rs"))
+                .await
+                .expect("component-normalized in-root path reads"),
+            fixture
+                .file_at_commit(revision.as_str(), PATH)
+                .expect("Git CLI reads the normalized historical file")
+                .into_bytes()
+        );
+        assert!(matches!(
+            provider
+                .read_at(&revision, Path::new("src/../../outside.rs"))
+                .await,
+            Err(VcsError::NotFound(_))
+        ));
+
+        let expected_history = fixture.path_history(PATH).expect("Git CLI path history");
+        let actual_history = provider
+            .revisions_touching(&source_path, 3)
+            .await
+            .expect("manual path revwalk succeeds");
+        let actual_history = actual_history
+            .iter()
+            .map(|commit| {
+                (
+                    commit.rev.as_str().to_string(),
+                    commit.author.clone(),
+                    commit.timestamp_utc,
+                    commit.summary.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_history, expected_history[..3]);
+        let full_history = provider
+            .revisions_touching(&source_path, 50)
+            .await
+            .expect("uncapped fixture history succeeds");
+        assert_eq!(
+            full_history.last().map(|commit| commit.summary.as_str()),
+            Some("initial calculator"),
+            "the root commit introducing a path must be included"
+        );
+        assert!(
+            actual_history
+                .iter()
+                .all(|(_, _, _, summary)| summary != "add unrelated documentation"),
+            "per-parent tree comparison must exclude commits that did not change the requested path"
+        );
+        assert!(provider
+            .revisions_touching(&source_path, 0)
+            .await
+            .expect("zero-limit history succeeds")
+            .is_empty());
+
+        let hunks = provider
+            .blame(&source_path, Some((1, 1)), None)
+            .await
+            .expect("blame succeeds");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].start_line, 1);
+        assert_eq!(hunks[0].line_count, 1);
+        assert_eq!(
+            hunks[0].rev.as_str(),
+            fixture
+                .blame_revision(PATH, 1)
+                .expect("Git CLI blame revision")
+        );
+        assert_eq!(hunks[0].author, AUTHOR_NAME);
+        assert_eq!(hunks[0].timestamp_utc, 978_652_800);
+
+        let historical_hunks = provider
+            .blame(&source_path, Some((1, 1)), Some(&revision))
+            .await
+            .expect("revision-bound blame succeeds");
+        assert_eq!(historical_hunks.len(), 1);
+        assert_eq!(
+            historical_hunks[0].rev.as_str(),
+            fixture
+                .blame_revision_at(revision.as_str(), PATH, 1)
+                .expect("Git CLI revision-bound blame")
+        );
+    }
+
+    #[tokio::test]
+    async fn revisions_touching_compares_every_merge_parent() {
+        use super::GitProvider;
+        use code_graph_vcs::VcsProvider;
+
+        const PATH: &str = "src/calculator.rs";
+        let fixture = merge_parent_fixture().expect("merge fixture builds");
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+        let merge_revision = provider.resolve_rev("HEAD").await.expect("resolve merge");
+        let history = provider
+            .revisions_touching(&fixture.path().join(PATH), 10)
+            .await
+            .expect("walk merge history");
+
+        assert!(
+            history.iter().any(|commit| commit.rev == merge_revision),
+            "the merge changes the path against its second parent even though it matches its first"
+        );
+    }
+
+    #[tokio::test]
+    async fn revisions_touching_detects_mode_only_changes_and_keeps_the_root_commit() {
+        use super::GitProvider;
+        use code_graph_vcs::VcsProvider;
+
+        const PATH: &str = "src/calculator.rs";
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        fixture
+            .git(&["update-index", "--chmod=+x", PATH])
+            .expect("stage executable-bit-only change");
+        fixture
+            .commit_staged("mark calculator executable", "2001-01-02T00:00:00+0000")
+            .expect("commit executable-bit-only change");
+        assert_eq!(
+            fixture.blob_id("HEAD", PATH).expect("current blob id"),
+            fixture.blob_id("HEAD~1", PATH).expect("parent blob id"),
+            "the mode-only regression fixture must retain the same blob"
+        );
+
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+        let history = provider
+            .revisions_touching(&fixture.path().join(PATH), 10)
+            .await
+            .expect("walk mode-only history");
+        assert_eq!(
+            history
+                .iter()
+                .map(|commit| commit.summary.as_str())
+                .collect::<Vec<_>>(),
+            ["mark calculator executable", "initial calculator"]
+        );
+    }
+
+    #[test]
+    fn git_backend_dependency_is_confined_to_this_provider_crate() {
+        let crate_manifest = include_str!("../Cargo.toml");
+        let workspace_manifest = include_str!("../../../Cargo.toml");
+
+        assert!(crate_manifest.contains("gix = \"0.86.0\""));
+        assert!(!crate_manifest.contains("git2"));
+        assert!(!crate_manifest.contains("libgit2"));
+        assert!(!workspace_manifest.contains("gix ="));
+        assert!(!workspace_manifest.contains("git2 ="));
     }
 }
