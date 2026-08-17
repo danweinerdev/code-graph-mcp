@@ -2136,7 +2136,8 @@ impl CodeGraphServer {
                        budget, then the outgoing page receives only what remains after \
                        the incoming page plus a fixed wrapper reserve; if incoming \
                         consumes the whole budget the outgoing page comes back empty \
-                        with `truncated:true` and `next_offset:0` (a start-fresh \
+                        with `truncated:true` and `next_offset` equal to the request's \
+                        resolved `offset` (a start-fresh \
                         marker, not a continuation): do not retry it unchanged; raise \
                         `[response].max_bytes`, re-run `analyze_codebase`, then retry. When \
                         `truncated` is true on either side and `next_offset` differs from the \
