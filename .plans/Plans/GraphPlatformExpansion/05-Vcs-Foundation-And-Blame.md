@@ -21,7 +21,7 @@ tasks:
     depends_on: ["5.1"]
   - id: "5.3"
     title: "Git fixture harness for temporary repositories"
-    status: planned
+    status: complete
     justifies: "Prevents unreproducible history tests. No test in the workspace creates a git repository today, so without a hermetic harness every history test would depend on contributor git config — signing, user identity, default branch name — and fail on machines that differ from the author's."
     verification: "cargo test -p code-graph-vcs-git harness:: — the harness builds a repo with scripted commits, fixed author identity, fixed timestamps, and commit.gpgsign disabled; two runs on the same script produce identical commit graphs; the harness cleans up on both the pass and fail path."
     depends_on: ["5.1"]
@@ -103,11 +103,11 @@ Pending — not complete.
 ## 5.3: Git fixture harness for temporary repositories
 
 ### Subtasks
-- [ ] Build a helper that creates a temp repo and applies a scripted sequence of commits
-- [ ] Pin author name, email, and timestamps; disable commit signing; pin the initial branch name
-- [ ] Provide the scripts phase 6 needs: reformat-only commit, logic-change commit, move-within-file commit, literal-only change
-- [ ] Ensure cleanup on both the pass and fail path
-- [ ] Determinism test: the same script twice produces identical commit graphs
+- [x] Build a helper that creates a temp repo and applies a scripted sequence of commits
+- [x] Pin author name, email, and timestamps; disable commit signing; pin the initial branch name
+- [x] Provide the scripts phase 6 needs: reformat-only commit, logic-change commit, move-within-file commit, literal-only change
+- [x] Ensure cleanup on both the pass and fail path
+- [x] Determinism test: the same script twice produces identical commit graphs
 
 ### Notes
 Revision boundary: history tests become writable and hermetic.
@@ -118,7 +118,22 @@ Pin the commit fixtures here rather than in phase 6 — the reformat-vs-logic pa
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-16
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `92c019cfd4e2cc0b1c1c51aefc0f6a362f2f6b44`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-16 00:00 matched `92c019cfd4e2cc0b1c1c51aefc0f6a362f2f6b44`
+- Focused review: `git show 92c019cfd4e2cc0b1c1c51aefc0f6a362f2f6b44`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `92c019cfd4e2cc0b1c1c51aefc0f6a362f2f6b44`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-vcs-git harness:: && cargo clippy -p code-graph-vcs-git --all-targets -- -D warnings && cargo fmt --all --check && git diff --check` | `.` | PASS (`exit 0`) | `Five deterministic fixture-harness tests passed; Clippy, formatting, and diff checks passed.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `intent-blind quality review` | `working tree task diff before commit` | PASS | `PASS: environment isolation and child-test execution checks added; final review finding was fixed.` |
 
 ## 5.4: blame_symbol tool with staleness detection
 
