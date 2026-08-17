@@ -15,7 +15,7 @@ tasks:
     verification: "cargo test -p code-graph-vcs — the required operation set is exactly four, reviewer-checkable (AC-34); a test-double provider whose revision identifiers are integers implements the trait with no change to the trait or its types (AC-24); a deliberately slow double satisfies the async contract without blocking the runtime (AC-35); a second provider registers without editing the first and detection selects correctly (AC-36)."
   - id: "5.2"
     title: "code-graph-vcs-git: pure-Rust provider including a path revwalk"
-    status: planned
+    status: complete
     justifies: "FR-31, FR-47, D-0004, AC-23, AC-56. revisions_touching has no first-class equivalent in the chosen library — it needs a manual revwalk with per-commit tree diffing — and both history features depend on it, so under-sizing this task under-sizes the phase."
     verification: "cargo test -p code-graph-vcs-git against a scripted fixture repository — blame, read_at, and resolve_rev return correct results; revisions_touching returns only commits that changed the path, newest first, capped at limit, verified against git log --oneline -- <path>; cargo tree shows no VCS crate under code-graph-core, -graph, -lang, or -path-trie (AC-23) and no new native-library dependency beyond the tree-sitter grammars (AC-56, D-0004)."
     depends_on: ["5.1"]
@@ -84,12 +84,12 @@ Typing `RevId` as anything that encodes git's shape — a `[u8; 20]`, a validate
 ## 5.2: code-graph-vcs-git: pure-Rust provider including a path revwalk
 
 ### Subtasks
-- [ ] Create `crates/code-graph-vcs-git` with the pure-Rust git dependency confined to it
-- [ ] Implement `blame`, `read_at`, and `resolve_rev` over the library's APIs
-- [ ] Implement `revisions_touching` as a revwalk with per-commit tree diffing against each parent, filtered and capped
-- [ ] Wrap all blocking work in `spawn_blocking`
-- [ ] Implement working-tree detection for registry selection
-- [ ] Add the `cargo tree` confinement assertions to CI
+- [x] Create `crates/code-graph-vcs-git` with the pure-Rust git dependency confined to it
+- [x] Implement `blame`, `read_at`, and `resolve_rev` over the library's APIs
+- [x] Implement `revisions_touching` as a revwalk with per-commit tree diffing against each parent, filtered and capped
+- [x] Wrap all blocking work in `spawn_blocking`
+- [x] Implement working-tree detection for registry selection
+- [x] Add the `cargo tree` confinement assertions to CI
 
 ### Notes
 Revision boundary: git history is reachable through the trait; no tool exposes it yet.
@@ -98,7 +98,22 @@ Effort is not evenly distributed across the four operations. `blame` is genuinel
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-16
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `0f7560ee71af947e86a20398582b8f0e0447d733`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-16 00:00 matched `0f7560ee71af947e86a20398582b8f0e0447d733`
+- Focused review: `git show 0f7560ee71af947e86a20398582b8f0e0447d733`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `0f7560ee71af947e86a20398582b8f0e0447d733`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-vcs-git && cargo clippy -p code-graph-vcs-git --all-targets -- -D warnings && cargo fmt --all --check && git diff --check` | `.` | PASS (`exit 0`) | `Nine provider and fixture tests passed; Clippy, formatting, and diff checks passed; gix is confined to code-graph-vcs-git.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `intent-blind quality review` | `working tree task diff before commit` | PASS | `PASS: root path safety, per-parent mode/OID comparison, merge/root behavior, and blocking isolation reviewed.` |
 
 ## 5.3: Git fixture harness for temporary repositories
 
