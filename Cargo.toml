@@ -15,6 +15,7 @@ members = [
     "crates/code-graph-parse-test",
     "crates/code-graph-path-trie",
     "crates/code-graph-vcs",
+    "crates/code-graph-vcs-git",
 ]
 
 [workspace.package]
