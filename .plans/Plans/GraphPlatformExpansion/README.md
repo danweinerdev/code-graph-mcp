@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-14
+updated: 2026-08-16
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -14,7 +14,7 @@ related:
 phases:
   - id: 1
     title: "Graph Queries"
-    status: complete
+    status: in-progress
     doc: "01-Graph-Queries.md"
   - id: 2
     title: "Typed Core Layering"
@@ -27,7 +27,7 @@ phases:
     doc: "03-Daemon-Foundation.md"
   - id: 4
     title: "Analyze Queue and Coalescing"
-    status: in-progress
+    status: complete
     doc: "04-Analyze-Queue-And-Coalescing.md"
     depends_on: [3]
   - id: 5

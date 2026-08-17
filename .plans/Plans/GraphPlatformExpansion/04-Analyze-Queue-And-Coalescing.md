@@ -14,6 +14,9 @@ waivers:
   - code: SDD169
     reason: "Tasks 4.5 through 4.12 preserve historical completion evidence from the superseded implementation; their original reviewed-candidate form predates the current exact-identity rule and must remain historical."
     accepted: "2026-08-13"
+  - code: SDD173
+    reason: "Tasks 4.1 through 4.12 document the superseded Phase 4 implementation. The final aligned review intentionally freezes the replacement implementation beginning at task 4.15; historical task evidence remains for provenance but is not within that review range."
+    accepted: "2026-08-17"
 tasks:
   - id: "4.1"
     title: "Pending queue in AnalyzeSlot and the queued job status"
@@ -795,22 +798,43 @@ Revision boundary: restore the pre-rollback pagination baseline separately from 
 - [x] **AC-27**: `make verify` passes. (NFR-04)
 
 ## Phase Completion Evidence
-- Verified: 2026-08-16
-- Repository: `.`
+- Verified: 2026-08-17
+- Repository: `~/Development/Code/code-graph-mcp`
 - VCS: `git`
 - Revision / checkpoint: `72768ef8e81a7e698ec9e78c193df5230f971444`
-- Final aligned review: `.plans/Plans/GraphPlatformExpansion/reviews/13-analyze-queue-and-coalescing-final-review-4eaccaa-72768ef.md`; frozen: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444`
+- Identity recheck: `git show --no-patch --format=%H 72768ef8e81a7e698ec9e78c193df5230f971444` at 2026-08-17T02:54:42Z matched `72768ef8e81a7e698ec9e78c193df5230f971444`
+- Focused review: `git diff 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444`; complete phase diff reviewed for correctness, scope, tests, maintainability, and phase boundary
+- Reviewed candidate / final: `diff: 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444`
+- Final aligned review: `Plans/GraphPlatformExpansion/reviews/13-analyze-queue-and-coalescing-final-review-4eaccaa-72768ef.md`; frozen: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444`
 - Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify && git diff --check && git diff --quiet 72768ef8e81a7e698ec9e78c193df5230f971444..HEAD -- Cargo.lock crates Makefile plugin .codex-plugin opencode-plugin && git show --no-patch --format=%H 72768ef8e81a7e698ec9e78c193df5230f971444` | `.` | PASS (`exit 0`) | Workspace tests, formatting, Clippy, snapshots, and plugin-mirror checks passed; no source, dependency, build, or plugin change exists after the frozen endpoint; the final command printed the frozen endpoint. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `git diff 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444 && git diff --check 4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc..72768ef8e81a7e698ec9e78c193df5230f971444` | `.` | PASS | Complete replacement-queue range was reviewed; whitespace validation emitted no errors. |
 
 ### Completed task identities
 
-| Task | Revision / checkpoint |
-|---|---|
-| 4.15 | `2e5f343862737df19c50177586f3693de8166267` |
-| 4.16 | `b1a6ebfc09dc06c15305587f5c03e147d01c194c` |
-| 4.17 | `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2` |
-| 4.18–4.22 | `825b34718c53ca15f92096b3a791932b495f6a55` |
-
-| Command | Working directory | Result |
-|---|---|---|
-| `cargo test --workspace && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && make verify && make snapshot-clean && git diff --check` | `.` | PASS (`exit 0`) |
+- `4.1`: `6b5302ee40a700bdb0372b1475833d8bc1676806`
+- `4.2`: `6144a9fc640adb9786e32862f675cc753fd174e5`
+- `4.3`: `0a72bab32a230bb2a60e5f3e17dd1f992079fe7d`
+- `4.4`: `8aaac0a02dd9e95eb21ea3b91d1abf231cd9c7bc`
+- `4.5`: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- `4.6`: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- `4.7`: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- `4.8`: `b2f48f6f972a3c4488571668f1e8448992791cdf`
+- `4.9`: `5886dc732e85207e4b21df9ecfeb0f08b3241733`
+- `4.10`: `b6716a04f430fa9a7cdea4a4d5402d645f9b1007`
+- `4.11`: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- `4.12`: `4eaccaad0a46e6e3ebf9c41f9ebdea3875bc96dc`
+- `4.15`: `2e5f343862737df19c50177586f3693de8166267`
+- `4.16`: `b1a6ebfc09dc06c15305587f5c03e147d01c194c`
+- `4.17`: `69850ab1a6af0531cbf2d1a0a876ef7a407b72a2`
+- `4.18`: `825b34718c53ca15f92096b3a791932b495f6a55`
+- `4.19`: `825b34718c53ca15f92096b3a791932b495f6a55`
+- `4.20`: `825b34718c53ca15f92096b3a791932b495f6a55`
+- `4.21`: `825b34718c53ca15f92096b3a791932b495f6a55`
+- `4.22`: `825b34718c53ca15f92096b3a791932b495f6a55`

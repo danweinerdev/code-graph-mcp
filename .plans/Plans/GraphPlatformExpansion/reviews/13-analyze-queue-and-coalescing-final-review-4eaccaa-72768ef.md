@@ -1,7 +1,7 @@
 ---
 title: "Phase review: Analyze Queue and Coalescing"
 type: review
-status: open
+status: resolved
 created: 2026-08-16
 updated: 2026-08-16
 tags: [review]
