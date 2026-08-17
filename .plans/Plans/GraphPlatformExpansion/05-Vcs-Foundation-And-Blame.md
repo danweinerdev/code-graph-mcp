@@ -5,12 +5,12 @@ plan: GraphPlatformExpansion
 phase: 5
 status: planned
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-16
 deliverable: "A provider-abstracted version-control layer with a pure-Rust git implementation, and a blame_symbol tool answering who last changed a symbol."
 tasks:
   - id: "5.1"
     title: "code-graph-vcs crate: trait, opaque RevId, registry, test double"
-    status: planned
+    status: complete
     justifies: "FR-27, FR-28, FR-29, FR-30, D-0002, AC-24, AC-34, AC-35, AC-36. D-0002 is reversibility one-way — once a hash-shaped identifier reaches a persisted field or the wire, relaxing it is a breaking change, so the newtype has to exist before any provider does."
     verification: "cargo test -p code-graph-vcs — the required operation set is exactly four, reviewer-checkable (AC-34); a test-double provider whose revision identifiers are integers implements the trait with no change to the trait or its types (AC-24); a deliberately slow double satisfies the async contract without blocking the runtime (AC-35); a second provider registers without editing the first and detection selects correctly (AC-36)."
   - id: "5.2"
@@ -44,13 +44,13 @@ Independent of phases 1, 2, and 3. Gates phase 6.
 ## 5.1: code-graph-vcs crate: trait, opaque RevId, registry, test double
 
 ### Subtasks
-- [ ] Create `crates/code-graph-vcs` following the `code-graph-lang` crate conventions
-- [ ] Define `RevId(String)` — constructed only by providers, never parsed by callers
-- [ ] Define `Commit`, `BlameHunk`, and a `thiserror`-based `VcsError`
-- [ ] Define the async `VcsProvider` trait with exactly four required operations
-- [ ] Implement `VcsRegistry` with detection, mirroring `LanguageRegistry`'s shape
-- [ ] Add an integer-revision test double and a deliberately slow double
-- [ ] Add the crate to the workspace members list
+- [x] Create `crates/code-graph-vcs` following the `code-graph-lang` crate conventions
+- [x] Define `RevId(String)` — constructed only by providers, never parsed by callers
+- [x] Define `Commit`, `BlameHunk`, and a `thiserror`-based `VcsError`
+- [x] Define the async `VcsProvider` trait with exactly four required operations
+- [x] Implement `VcsRegistry` with detection, mirroring `LanguageRegistry`'s shape
+- [x] Add an integer-revision test double and a deliberately slow double
+- [x] Add the crate to the workspace members list
 
 ### Notes
 Revision boundary: the abstraction exists, is registrable, and is proven against a non-git provider — with no git dependency anywhere yet.
@@ -61,7 +61,22 @@ Keep the required set at four. Churn, recent-commits, and diff rendering are all
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-16
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `273484ed1a35923107d9907b4eab89beb208a317`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-16 00:00 matched `273484ed1a35923107d9907b4eab89beb208a317`
+- Focused review: `git show 273484ed1a35923107d9907b4eab89beb208a317`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `273484ed1a35923107d9907b4eab89beb208a317`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-vcs && cargo clippy -p code-graph-vcs --all-targets -- -D warnings && cargo fmt --all --check && git diff --check` | `.` | PASS (`exit 0`) | `Five unit tests and doc tests passed; Clippy emitted no denied warnings; formatting and diff checks passed.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `intent-blind quality review` | `working tree task diff before commit` | PASS | `PASS: duplicate-registration regression gap fixed; follow-up review found no defects.` |
 
 ### Trap
 Typing `RevId` as anything that encodes git's shape — a `[u8; 20]`, a validated-hex `String`, or a `Sha` alias. It will look tidy and it forecloses Perforce, whose revisions are changelist numbers and `#rev` specifiers. D-0002 is marked one-way for exactly this reason.
