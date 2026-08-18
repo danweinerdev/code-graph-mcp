@@ -522,7 +522,7 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
                 .to_owned()
         })
         .collect();
-    assert_eq!(names.len(), 23, "expected every advertised tool");
+    assert_eq!(names.len(), 24, "expected every advertised tool");
     let symbol = format!("{}:fallback_query", source.display());
 
     for name in names {
@@ -550,6 +550,7 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
             "get_symbol_at" => json!({"file": source, "line": 1}),
             "find_path" => json!({"from": symbol, "to": symbol}),
             "detect_communities" => json!({}),
+            "blame_symbol" => json!({"symbol": symbol}),
             unexpected => panic!("new advertised tool {unexpected} needs fallback test arguments"),
         };
         let response = client.tool(&name, arguments);
@@ -654,7 +655,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     client.close();
     let metadata = wait_metadata(&default_root);
@@ -674,7 +675,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     client.close();
     assert!(!disabled.0.join(".code-graph").exists());
@@ -687,7 +688,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let stderr = client.close();
     assert!(!stderr.contains("daemon unavailable"));
@@ -700,7 +701,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     client.close();
     assert!(!forced.0.join(".code-graph").exists());
@@ -1302,7 +1303,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let metadata = wait_metadata(&tcp);
     // A planted daemon.sock file occupies the UDS pathname and forces the
@@ -1350,7 +1351,7 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     assert!(
         client.tool("analyze_codebase", json!({"path":failed.0, "force":true}))["result"]
@@ -1467,7 +1468,7 @@ fn forced_fallback_terminates_a_slow_contender_before_it_can_publish() {
             .as_array()
             .unwrap()
             .len(),
-        23,
+        24,
         "forced fallback serves in process"
     );
     thread::sleep(Duration::from_secs(1));
@@ -1534,7 +1535,7 @@ fn saturated_uds_attachment_falls_back_instead_of_reporting_a_dead_connection() 
             .as_array()
             .unwrap()
             .len(),
-        23,
+        24,
         "the saturated proxy still has MCP service through fallback"
     );
     let stderr = client.close();
@@ -1563,7 +1564,7 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
                 .as_array()
                 .unwrap()
                 .len(),
-            23
+            24
         );
     }
     let owner_pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
@@ -1603,7 +1604,7 @@ fn clean_binary_mismatch_recovers_a_truncated_request_and_replaces_the_old_owner
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let new = wait_replacement_metadata(&root, &old["owner"]);
     assert_ne!(
@@ -1664,7 +1665,7 @@ fn different_executable_content_replaces_even_when_build_sha_matches() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let new = wait_metadata(&root);
     assert_ne!(new["owner"], old["owner"], "different executable replaced");
@@ -1687,7 +1688,7 @@ fn sequential_clients_keep_the_same_matching_executable_owner() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let current = wait_metadata(&root);
     assert_eq!(current["owner"], old["owner"]);
@@ -1713,7 +1714,7 @@ fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     let new = wait_metadata(&root);
     assert_ne!(new["owner"], old["owner"], "dirty owner was replaced once");
@@ -1746,7 +1747,7 @@ fn ignored_replacement_request_is_hard_killed_and_client_falls_back() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     fallback.close();
     assert!(
@@ -1815,7 +1816,7 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
             .as_array()
             .unwrap()
             .len(),
-        23
+        24
     );
     assert!(
         started.elapsed() >= Duration::from_secs(2),
@@ -1904,7 +1905,7 @@ fn root_replacement_during_admitted_persist_uses_the_retained_cache_inode() {
             .as_array()
             .unwrap()
             .len(),
-        23,
+        24,
         "a new proxy client converges on the replacement-root daemon"
     );
     let new = wait_metadata(&root);

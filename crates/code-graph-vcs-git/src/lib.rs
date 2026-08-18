@@ -36,8 +36,14 @@ impl GitProvider {
             ))
         })?;
 
+        // Bind the canonical long form: callers pass graph-stored paths that
+        // are dunce-canonicalized, and `repository_relative_path` strips the
+        // bound root lexically — an 8.3 short-form or verbatim-prefixed
+        // binding would spuriously report every file as outside the tree.
+        let work_dir = dunce::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
+
         Ok(Self {
-            project_root: work_dir.to_path_buf(),
+            project_root: work_dir,
         })
     }
 
@@ -164,6 +170,26 @@ fn blame(
             .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
             .detach(),
     };
+    // Absence at the blamed revision is `NotFound` (an untracked file, or a
+    // path introduced later), not an opaque `Operation` failure — callers
+    // route `NotFound` to the success-shaped "no history for this path"
+    // outcome (FR-36). Same membership check `read_at` performs.
+    let tree = repository
+        .find_commit(revision)
+        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?
+        .tree()
+        .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
+    if tree
+        .lookup_entry_by_path(&relative_path)
+        .map_err(|error| VcsError::Operation(format!("read tree entry for {revision}: {error}")))?
+        .is_none()
+    {
+        return Err(VcsError::NotFound(format!(
+            "{} at {revision}",
+            path.display()
+        )));
+    }
+
     let tree_path = gix_tree_path(&relative_path, path)?;
     let outcome = repository
         .blame_file(
@@ -424,8 +450,14 @@ fn gix_tree_path(relative_path: &Path, original: &Path) -> Result<String, VcsErr
 
 fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf, VcsError> {
     let relative_path = if path.is_absolute() {
+        // The bound root is canonical (see `GitProvider::open`); bring the
+        // incoming absolute path to the same form so the lexical strip is
+        // not defeated by 8.3 short names or symlinked prefixes. A path
+        // that does not exist on disk (e.g. deleted, queried at an old
+        // revision) falls back to its lexical form unchanged.
+        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let normalized_root = normalize_lexical_path(project_root);
-        let normalized_path = normalize_lexical_path(path);
+        let normalized_path = normalize_lexical_path(&canonical);
         normalized_path
             .strip_prefix(normalized_root)
             .map(Path::to_path_buf)

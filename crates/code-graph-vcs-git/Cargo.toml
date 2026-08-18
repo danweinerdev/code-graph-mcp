@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 code-graph-vcs = { path = "../code-graph-vcs" }
+# Canonical long-form binding for the discovered working tree: graph paths
+# are dunce-canonicalized, and repository-relative containment is lexical.
+dunce = { workspace = true }
 gix = "0.86.0"
 tokio = { workspace = true }
 

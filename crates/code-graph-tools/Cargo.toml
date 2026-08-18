@@ -14,6 +14,9 @@ workspace = true
 code-graph-core = { path = "../code-graph-core" }
 code-graph-lang = { path = "../code-graph-lang" }
 code-graph-graph = { path = "../code-graph-graph" }
+# Trait + registry only (AC-23): no VCS backend dependency enters this
+# crate. The git implementation is injected by the binary crate.
+code-graph-vcs = { path = "../code-graph-vcs" }
 rmcp = { workspace = true }
 notify-debouncer-full = { workspace = true }
 tokio = { workspace = true }
@@ -28,6 +31,13 @@ crossbeam-channel = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+# Test-only: integration tests exercise blame_symbol against a real git
+# fixture through the production provider, and implement provider test
+# doubles (async-trait mirrors the trait crate's own usage). Runtime
+# confinement (AC-23) is unaffected — dev-dependencies do not enter the
+# shipped graph.
+code-graph-vcs-git = { path = "../code-graph-vcs-git" }
+async-trait = { workspace = true }
 code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
 code-graph-lang-csharp = { path = "../code-graph-lang-csharp" }
 code-graph-lang-go = { path = "../code-graph-lang-go" }

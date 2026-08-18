@@ -1,0 +1,29 @@
+---
+source: crates/code-graph-tools/tests/snapshot_tools_list.rs
+expression: "tool_entry(\"blame_symbol\")"
+---
+{
+  "name": "blame_symbol",
+  "description": "Who last changed a symbol: per-line authorship for the symbol's line span, from version control. `symbol` (required) is the symbol ID as returned by get_file_symbols/search_symbols. `at` (optional) is a revision specifier (commit hash, tag, HEAD~2); default is the provider's default revision (git: HEAD) — attribution always reflects committed state at that revision, never uncommitted edits. Returns a single JSON object (NOT a Page envelope): {available, reason?, symbol_id, file, start_line, end_line, rev, stale, stale_reason?, hunks}, where each hunk is {rev, author, timestamp_utc, start_line, line_count} clipped to the span. `available: false` with `reason` is a SUCCESS, not an error — it means no supported VCS covers the indexed root or this path has no history at the blamed revision; every other tool works normally either way. `stale: true` means the on-disk file (which the span's line numbers come from) differs from the blamed revision, so attributed line numbers may misalign — commit the edits or pass `at` naming a revision matching the indexed state, then re-call. Attribution is line-granular: a symbol sharing its first or last line with another symbol has that shared line attributed to both. Unknown `symbol` is a tool error with did-you-mean suggestions; an unresolvable `at` is a tool error naming the bad specifier.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "at": {
+        "description": "Optional revision specifier to blame at (e.g. a commit hash, tag, or HEAD~2 for git). Default: the provider's default revision (git: HEAD). Attribution always reflects committed state at this revision, never uncommitted working-tree edits.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "symbol": {
+        "description": "Symbol ID in format file:name as returned by get_file_symbols or search_symbols",
+        "type": "string"
+      }
+    },
+    "required": [
+      "symbol"
+    ],
+    "title": "BlameSymbolArgs",
+    "type": "object"
+  }
+}

@@ -15,6 +15,7 @@ use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 
 pub mod analyze;
+pub mod history;
 pub mod query;
 pub mod status;
 pub mod structure;

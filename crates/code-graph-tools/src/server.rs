@@ -403,6 +403,12 @@ pub struct ServerInner {
     pub graph: PlRwLock<Graph>,
     /// Plugin registry (one entry per registered language).
     pub registry: LanguageRegistry,
+    /// Version-control providers for the history tools. Empty by default —
+    /// history tools then report unavailability as a success (FR-36). The
+    /// binary injects the git provider via
+    /// [`CodeGraphServer::with_vcs_registry`]; this crate depends on the
+    /// trait crate only (AC-23).
+    pub vcs: Arc<code_graph_vcs::VcsRegistry>,
     /// `true` after at least one successful `analyze_codebase`. Read by
     /// [`CodeGraphServer::require_indexed`] without taking a lock.
     pub indexed: AtomicBool,
@@ -534,12 +540,22 @@ pub struct CodeGraphServer {
 impl CodeGraphServer {
     /// Construct a fresh server. The graph starts empty; the registry is
     /// taken by value (the registry is `!Clone` and is moved in here once
-    /// at startup).
+    /// at startup). The VCS registry starts empty, so history tools report
+    /// unavailability; the binary uses [`Self::with_vcs_registry`].
     pub fn new(registry: LanguageRegistry) -> Self {
+        Self::with_vcs_registry(registry, code_graph_vcs::VcsRegistry::new())
+    }
+
+    /// Construct a server with version-control providers for the history
+    /// tools. Kept separate from [`Self::new`] so the ~40 existing test
+    /// construction sites stay untouched and provider injection remains a
+    /// binary-crate decision (AC-23).
+    pub fn with_vcs_registry(registry: LanguageRegistry, vcs: code_graph_vcs::VcsRegistry) -> Self {
         Self {
             inner: Arc::new(ServerInner {
                 graph: PlRwLock::new(Graph::new()),
                 registry,
+                vcs: Arc::new(vcs),
                 indexed: AtomicBool::new(false),
                 status_publication: PlRwLock::new(()),
                 index_lock: TokioMutex::new(()),
@@ -912,6 +928,21 @@ pub struct GetSymbolDetailArgs {
         description = "Symbol ID in format file:name as returned by get_file_symbols or search_symbols"
     )]
     pub symbol: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BlameSymbolArgs {
+    #[schemars(
+        description = "Symbol ID in format file:name as returned by get_file_symbols or search_symbols"
+    )]
+    pub symbol: String,
+    #[schemars(
+        description = "Optional revision specifier to blame at (e.g. a commit hash, tag, or \
+                       HEAD~2 for git). Default: the provider's default revision (git: HEAD). \
+                       Attribution always reflects committed state at this revision, never \
+                       uncommitted working-tree edits."
+    )]
+    pub at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1515,6 +1546,46 @@ impl CodeGraphServer {
             &self.inner.graph,
             &args.symbol,
         ))
+    }
+
+    #[tool(
+        description = "Who last changed a symbol: per-line authorship for the symbol's line \
+                       span, from version control. `symbol` (required) is the symbol ID as \
+                       returned by get_file_symbols/search_symbols. `at` (optional) is a \
+                       revision specifier (commit hash, tag, HEAD~2); default is the \
+                       provider's default revision (git: HEAD) — attribution always reflects \
+                       committed state at that revision, never uncommitted edits. Returns a \
+                       single JSON object (NOT a Page envelope): {available, reason?, \
+                       symbol_id, file, start_line, end_line, rev, stale, stale_reason?, \
+                       hunks}, where each hunk is {rev, author, timestamp_utc, start_line, \
+                       line_count} clipped to the span. `available: false` with `reason` is a \
+                       SUCCESS, not an error — it means no supported VCS covers the indexed \
+                       root or this path has no history at the blamed revision; every other \
+                       tool works normally either way. `stale: true` means the on-disk file \
+                       (which the span's line numbers come from) differs from the blamed \
+                       revision, so attributed line numbers may misalign — commit the edits \
+                       or pass `at` naming a revision matching the indexed state, then \
+                       re-call. Attribution is line-granular: a symbol sharing its first or \
+                       last line with another symbol has that shared line attributed to \
+                       both. Unknown `symbol` is a tool error with did-you-mean suggestions; \
+                       an unresolvable `at` is a tool error naming the bad specifier."
+    )]
+    async fn blame_symbol(
+        &self,
+        Parameters(args): Parameters<BlameSymbolArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        let root = self.inner.root_path.read().clone();
+        Ok(handlers::history::blame_symbol(
+            &self.inner.graph,
+            &self.inner.vcs,
+            root,
+            &args.symbol,
+            args.at.as_deref(),
+        )
+        .await)
     }
 
     #[tool(
@@ -2645,16 +2716,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 23 tools. If a future change adds
+    /// `tools/list` must surface exactly 24 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_three_tools() {
+    fn tool_router_registers_twenty_four_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            23,
-            "expected 23 registered tools, got {}",
+            24,
+            "expected 24 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2695,6 +2766,7 @@ mod tests {
             "get_symbol_at",
             "find_path",
             "detect_communities",
+            "blame_symbol",
         ] {
             assert!(
                 names.contains(expected),

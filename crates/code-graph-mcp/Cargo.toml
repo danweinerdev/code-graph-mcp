@@ -21,6 +21,8 @@ code-graph-lang-python = { path = "../code-graph-lang-python" }
 code-graph-lang-rust = { path = "../code-graph-lang-rust" }
 code-graph-graph = { path = "../code-graph-graph" }
 code-graph-tools = { path = "../code-graph-tools" }
+code-graph-vcs = { path = "../code-graph-vcs" }
+code-graph-vcs-git = { path = "../code-graph-vcs-git" }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

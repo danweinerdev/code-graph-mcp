@@ -107,5 +107,29 @@ fn make_server() -> anyhow::Result<CodeGraphServer> {
         ))
         .context("register Java language plugin")?;
 
-    Ok(CodeGraphServer::new(registry))
+    Ok(CodeGraphServer::with_vcs_registry(registry, vcs_registry()))
+}
+
+/// Version-control providers for the history tools. Binding happens here in
+/// the binary so `code-graph-tools` depends on the trait crate only (AC-23).
+///
+/// The git provider binds to the working tree discovered from the process
+/// working directory — the daemon runs with its project root as cwd, and
+/// direct stdio servers are launched at the workspace root by MCP hosts. A
+/// cwd outside any git repository simply registers no provider, and the
+/// history tools report unavailability as a success (FR-36).
+fn vcs_registry() -> code_graph_vcs::VcsRegistry {
+    let mut vcs = code_graph_vcs::VcsRegistry::new();
+    let Ok(cwd) = std::env::current_dir() else {
+        return vcs;
+    };
+    let Ok(root) = code_graph_core::paths::canonicalize(&cwd) else {
+        return vcs;
+    };
+    if let Ok(provider) = code_graph_vcs_git::GitProvider::open(&root) {
+        if let Err(error) = vcs.register(Box::new(provider)) {
+            eprintln!("code-graph-mcp: register git provider: {error}");
+        }
+    }
+    vcs
 }
