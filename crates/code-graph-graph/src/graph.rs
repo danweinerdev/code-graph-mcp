@@ -1059,10 +1059,12 @@ mod tests {
             );
             assert_eq!(fg.language, Language::Cpp);
         }
-        // Find /a.cpp's snapshot — order is HashMap-defined.
+        // Find /a.cpp's snapshot — order is HashMap-defined. Snapshot paths
+        // are trie-reconstructed with the native separator, so normalize the
+        // Unix-style fixture before comparing.
         let a = snapshot
             .iter()
-            .find(|fg| fg.path == "/a.cpp")
+            .find(|fg| fg.path.replace('\\', "/") == "/a.cpp")
             .expect("/a.cpp present");
         assert_eq!(a.symbols.len(), 2);
         assert_eq!(a.symbols[0].name, "foo");

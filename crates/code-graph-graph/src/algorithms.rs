@@ -719,10 +719,14 @@ mod tests {
         g
     }
 
+    /// Cycle members come back partly trie-reconstructed, which joins
+    /// segments with the native separator. The Unix-style fixtures in these
+    /// topology tests therefore reappear as `\a` on Windows; normalize to
+    /// `/` so the assertions test cycle membership, not separator flavor.
     fn scc_contents(scc: &[PathBuf]) -> Vec<String> {
         let mut v: Vec<String> = scc
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
         v.sort();
         v

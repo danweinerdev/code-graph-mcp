@@ -798,13 +798,20 @@ mod tests {
         assert!(matches!(result.termination, Termination::Converged { .. }));
     }
 
+    /// `community_label` rebuilds the shared prefix from components, which
+    /// joins with the native separator; normalize so these Unix-style
+    /// fixtures assert prefix logic rather than separator flavor.
+    fn normalized_label(members: &[PathBuf]) -> String {
+        community_label(members).replace('\\', "/")
+    }
+
     #[test]
     fn community_label_uses_longest_common_directory_prefix() {
         let members = vec![
             PathBuf::from("/proj/mod/a.cpp"),
             PathBuf::from("/proj/mod/sub/b.cpp"),
         ];
-        assert_eq!(community_label(&members), "/proj/mod");
+        assert_eq!(normalized_label(&members), "/proj/mod");
     }
 
     #[test]
@@ -816,6 +823,6 @@ mod tests {
     #[test]
     fn community_label_singleton_is_its_own_path() {
         let members = vec![PathBuf::from("/only/one.cpp")];
-        assert_eq!(community_label(&members), "/only/one.cpp");
+        assert_eq!(normalized_label(&members), "/only/one.cpp");
     }
 }
