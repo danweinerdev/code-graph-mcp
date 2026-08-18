@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-14
+updated: 2026-08-18
 tags: [decisions]
 related: []
 decisions:
@@ -208,6 +208,23 @@ decisions:
     scope: [Specs/GraphPlatformExpansion, Plans/GraphPlatformExpansion, CLAUDE.md]
     tags: [pagination, response-contract, backward-compatibility]
     reversibility: two-way
+  - id: D-0014
+    kind: decision
+    status: accepted
+    date: 2026-08-18
+    decided_by: user
+    statement: "The daemon's security scope is one local user working in a local project with multiple sessions. Owner-only ACLs and permissions remain as hygiene, but cross-account isolation is not a claimed or tested guarantee: no second-local-account denial testing, no multi-user hardening, and no expansion of this scope without explicit user approval."
+    rejected:
+      - "Second-local-account denial testing as a phase 11 acceptance gate"
+      - "Multi-user or service-account daemon hardening"
+    rationale: "The daemon exists so multiple sessions of the same user share one graph instance in one local project. Multi-account isolation adds account provisioning and audit surface for a threat model the tool does not serve; the owner-only DACL/permission hygiene already landed is sufficient for the intended scope."
+    confirmation: "Phase 11 acceptance references single-user checks only (owner-only DACL inspection, no inherited ACEs); no test or task requires provisioning a second account."
+    scope:
+      - Plans/GraphPlatformExpansion
+      - Specs/GraphPlatformExpansion
+      - Designs/RepoLocalDaemon
+    tags: [daemon, security, scope, windows]
+    reversibility: two-way
 ---
 
 
@@ -240,3 +257,7 @@ The conclusion is unchanged. D-0004 restates it on the argument that actually ho
 ## D-0008 — Validation scope for GraphPlatformExpansion
 
 Repository-wide validation still reports legacy structural debt through transitive `related` links. During this plan, diagnostics outside the active plan and its directly governing spec/design set are reported but do not stop task progression; diagnostics inside that set remain blocking.
+
+## D-0014 — Single-local-user daemon security scope
+
+Decided during the phase 11 pull-forward, when the remaining 11.2 security items were being enumerated. The daemon's reason to exist is multiple sessions of the *same* user sharing one graph instance in one local project (D-0001's repository-local shape), so the second-local-account denial check and any multi-user hardening are out of scope, not deferred work. What stays: the owner-only hygiene that already shipped — `0o600`/`0o700` on Unix, the SID-resolved owner-only DACL with inheritance stripped on Windows, and the per-instance TCP secret — plus the native regression test pinning that DACL shape. Any future scope expansion (shared machines, service accounts, CI runners with mixed users) requires explicit user approval first.

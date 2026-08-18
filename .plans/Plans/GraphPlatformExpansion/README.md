@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-16
+updated: 2026-08-18
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -96,7 +96,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 | 8 Per-Language Fingerprints | planned | Gated on 6. Six sub-tasks, one per language. |
 | 9 Resolver Candidate Count | planned | Added mid-flight from phase 1's review. Gated on 1. |
 | 10 macOS Platform Completion | deferred | Activates and certifies macOS seams after the Linux MVP; not part of current support acceptance. |
-| 11 Windows Platform Completion | in-progress (pulled forward 2026-08-18) | User decision: Windows daemon mode is required so large workspaces share a graph instance. 11.1 substantially done, 11.2 partially done in the working tree — full workspace gates green natively, `daemon_serve`/`daemon_proxy` un-gated and green, pipe admission ack + mandatory-lock semantics + handle-inheritance seal landed. Remaining: pipe DACL/second-account denial, Windows TCP-forcing seam, 11.3 certification matrix (waits on phases 5–9). See the phase doc's pull-forward note. |
+| 11 Windows Platform Completion | in-progress (pulled forward 2026-08-18) | User decision: Windows daemon mode is required so large workspaces share a graph instance. 11.1 substantially done, 11.2 mostly done — full workspace gates green natively, `daemon_serve`/`daemon_proxy` un-gated and green, pipe admission ack + mandatory-lock semantics + handle-inheritance seal + SID-based owner-only DACL (natively regression-tested) landed. Security scope is one local user, one local project, multiple sessions (D-0014) — no cross-account work. Remaining: process-level Windows TCP-forcing seam; 11.3 certification matrix (waits on phases 5–9). See the phase doc's pull-forward note. |
 
 ### Why phases 1 and 2 are `in-progress` with every task complete
 

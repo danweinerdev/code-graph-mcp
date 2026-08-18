@@ -18,7 +18,7 @@ tasks:
     status: in-progress
     depends_on: ["11.1"]
     justifies: "NFR-13, NFR-06, AC-60. Named-pipe ACLs, `icacls`, TCP fallback, replacement, and idle behavior cannot be inferred from Linux UDS tests."
-    verification: "Native Windows process tests exercise named-pipe attachment, forced loopback-TCP fallback and credential rotation, simultaneous startup, binary replacement, idle exit/cache reuse, and repository-local cleanup. Deterministic security-descriptor inspection must prove the pipe DACL is restricted to the invoking user/system as intended, and a separately provisioned local account must be denied."
+    verification: "Native Windows process tests exercise named-pipe attachment, forced loopback-TCP fallback and credential rotation, simultaneous startup, binary replacement, idle exit/cache reuse, and repository-local cleanup. Deterministic security-descriptor inspection must prove the runtime state is restricted to the invoking user (owner-only DACL, no inherited ACEs). Cross-account checks — including second-local-account denial — are out of scope per D-0014: the daemon serves one local user's sessions in one local project."
   - id: "11.3"
     title: "Certify Windows paths, feature, and CLI parity"
     status: deferred
@@ -73,12 +73,13 @@ durable revision exists):
   directory DACL (no inherited ACEs, no broad built-in principals, exactly
   one grant naming the invoking user); liveness probes refresh only the
   target PID instead of full-system scans inside the 50ms poll loops.
-- **Remaining for 11.2:** the second-local-account denial check (needs a
-  provisioned account this harness cannot create); forced loopback-TCP
-  fallback + credential rotation at process level on Windows (per-PID pipe
-  names cannot be occupied externally — covered today by the unit-level
-  pipe-occupation TCP-fallback test). **11.3 untouched** (certification
-  matrix waits on phases 5–9).
+- **Remaining for 11.2:** forced loopback-TCP fallback + credential rotation
+  at process level on Windows (per-PID pipe names cannot be occupied
+  externally — covered today by the unit-level pipe-occupation TCP-fallback
+  test). The second-local-account denial check was removed from scope by
+  D-0014 (single local user, local project, multiple sessions; no scope
+  expansion without explicit user approval). **11.3 untouched**
+  (certification matrix waits on phases 5–9).
 
 ## 11.1: Activate and repair Windows platform seams
 
@@ -103,12 +104,12 @@ Do not claim success from `cargo check --target ...` on Linux. The grammar build
 ## 11.2: Validate Windows daemon transport, ACL, and lifecycle
 
 ### Subtasks
-- [ ] Exercise named-pipe publication, attachment, multiple clients, and cleanup.
-- [ ] Inspect the live pipe security descriptor and assert its owner/DACL excludes unrelated local users.
-- [ ] Provision a second local account and prove it cannot attach to the first account's pipe or use its TCP fallback credential.
-- [ ] Force named-pipe failure and exercise loopback TCP authentication and credential rotation.
-- [ ] Exercise replacement, idle shutdown, final cache save, and warm restart.
-- [ ] Pin contender, stale-lock, and runtime-file cleanup behavior on Windows.
+- [x] Exercise named-pipe publication, attachment, multiple clients, and cleanup.
+- [x] Inspect the daemon's runtime-state DACL and assert it is owner-only: no inherited ACEs, no broad built-in principals, exactly one grant naming the invoking user (`runtime_directory_dacl_is_restricted_to_the_invoking_user`).
+- ~~Provision a second local account and prove it cannot attach to the first account's pipe or use its TCP fallback credential.~~ Out of scope per D-0014: the daemon serves one local user's sessions in one local project; cross-account isolation is not a claimed guarantee and must not be expanded without explicit user approval.
+- [ ] Force named-pipe failure and exercise loopback TCP authentication and credential rotation at process level (unit-level pipe-occupation coverage exists).
+- [x] Exercise replacement, idle shutdown, final cache save, and warm restart.
+- [x] Pin contender, stale-lock, and runtime-file cleanup behavior on Windows.
 
 ### Notes
 
