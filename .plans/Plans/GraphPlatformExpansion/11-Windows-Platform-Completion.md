@@ -66,12 +66,19 @@ durable revision exists):
   suites un-gated and green natively, including queue-through-proxy,
   replacement, idle lifecycle, stale-lock recovery, and contender
   convergence; Windows graceful stop rides the `shutdown.request` protocol.
-- **Remaining for 11.2:** security-descriptor inspection with a second local
-  account denial; forced loopback-TCP fallback + credential rotation on
-  Windows (per-PID pipe names cannot be occupied externally — needs an
-  in-process forcing seam or the unit-level occupation test that now covers
-  TCP fallback metadata); ACL hardening for domain/AzureAD `USERNAME`
-  ambiguity. **11.3 untouched** (certification matrix waits on phases 5–9).
+- **Also landed (follow-up hardening):** `icacls` grants prefer the current
+  user's SID (`whoami /user`, captured; `USERNAME` fallback) — closes the
+  domain/AzureAD bare-name ambiguity, verified natively against a
+  domain-joined account; a native `daemon_serve` test inspects the runtime
+  directory DACL (no inherited ACEs, no broad built-in principals, exactly
+  one grant naming the invoking user); liveness probes refresh only the
+  target PID instead of full-system scans inside the 50ms poll loops.
+- **Remaining for 11.2:** the second-local-account denial check (needs a
+  provisioned account this harness cannot create); forced loopback-TCP
+  fallback + credential rotation at process level on Windows (per-PID pipe
+  names cannot be occupied externally — covered today by the unit-level
+  pipe-occupation TCP-fallback test). **11.3 untouched** (certification
+  matrix waits on phases 5–9).
 
 ## 11.1: Activate and repair Windows platform seams
 

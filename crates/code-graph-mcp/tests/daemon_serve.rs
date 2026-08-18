@@ -507,6 +507,59 @@ fn simultaneous_contenders_recover_one_stale_lock() {
     assert!(!runtime.join("daemon.lock").exists(), "lock cleanup");
 }
 
+/// Phase 11.2 security subset that runs without a second local account: the
+/// daemon's runtime directory DACL must be restricted to the invoking user.
+/// `restrict_windows_runtime_dir` strips inheritance and grants exactly one
+/// principal, so the `icacls` listing must show no inherited `(I)` ACEs, no
+/// broad built-in principals, and exactly one grant naming the current user.
+/// (The second-account denial check remains a manual phase-11.2 item — it
+/// needs a provisioned local account this harness cannot create.)
+#[cfg(windows)]
+#[test]
+fn runtime_directory_dacl_is_restricted_to_the_invoking_user() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(8);
+    let mut daemon = DaemonChild::spawn(&root.0, false);
+    let metadata = wait_for_metadata(&root.0);
+
+    let output = std::process::Command::new("icacls")
+        .arg(root.0.join(".code-graph"))
+        .output()
+        .expect("run icacls against the daemon runtime directory");
+    assert!(output.status.success(), "icacls listing succeeds");
+    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(
+        !listing.contains("(I)"),
+        "runtime dir must carry no inherited ACEs (inheritance:r): {listing}"
+    );
+    for broad in [
+        "Everyone",
+        "BUILTIN\\Users",
+        "Authenticated Users",
+        "NT AUTHORITY\\INTERACTIVE",
+    ] {
+        assert!(
+            !listing.contains(broad),
+            "broad principal {broad} must not appear in the runtime dir DACL: {listing}"
+        );
+    }
+    assert_eq!(
+        listing.matches(":(").count(),
+        1,
+        "exactly one explicit grant on the runtime dir: {listing}"
+    );
+    let username = std::env::var("USERNAME").expect("USERNAME set on Windows");
+    assert!(
+        listing.to_lowercase().contains(&username.to_lowercase()),
+        "the single grant must name the invoking user {username}: {listing}"
+    );
+
+    stop_owned_daemon(&root.0, &metadata);
+    daemon.wait();
+    wait_for_cleanup(&root.0);
+}
+
 /// TCP fallback is forced by occupying the UDS pathname, which only exists on
 /// Unix. Windows pipe names are per-PID (`code-graph-mcp-{pid}`), so a bind
 /// collision cannot be staged externally; the TCP auth matrix has in-process
