@@ -894,7 +894,7 @@ mod tests {
             before_files, after_files,
             "lock contention must leave file count unchanged"
         );
-        let abs_a_cpp = std::fs::canonicalize(&a_cpp).unwrap();
+        let abs_a_cpp = code_graph_core::paths::canonicalize(&a_cpp).unwrap();
         let r = get_file_symbols(
             &inner.graph,
             &abs_a_cpp.to_string_lossy(),
@@ -979,7 +979,7 @@ mod tests {
         .unwrap();
 
         // Trigger a reindex of an existing file.
-        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+        let a_cpp = code_graph_core::paths::canonicalize(&dir.path().join("a.cpp")).unwrap();
         std::fs::write(&a_cpp, b"void post_change() {}\n").unwrap();
         let outcome = try_reindex_file(&inner, &a_cpp, false).await;
         match outcome {
@@ -1005,7 +1005,7 @@ mod tests {
     async fn try_reindex_file_modify_updates_graph() {
         let (server, dir) = indexed_server().await;
         let inner = Arc::clone(&server.inner);
-        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+        let a_cpp = code_graph_core::paths::canonicalize(&dir.path().join("a.cpp")).unwrap();
 
         // Replace the function body with a new function name.
         std::fs::write(&a_cpp, b"void brand_new_function() {}\n").unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
     async fn try_reindex_file_remove_drops_file_from_graph() {
         let (server, dir) = indexed_server().await;
         let inner = Arc::clone(&server.inner);
-        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+        let a_cpp = code_graph_core::paths::canonicalize(&dir.path().join("a.cpp")).unwrap();
 
         // Sanity: the file exists in the graph before removal.
         assert!(!inner.graph.read().file_symbols(&a_cpp).is_empty());
@@ -1109,7 +1109,7 @@ mod tests {
 
         let (server, dir) = indexed_server().await;
         let inner = Arc::clone(&server.inner);
-        let a_cpp = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
+        let a_cpp = code_graph_core::paths::canonicalize(&dir.path().join("a.cpp")).unwrap();
 
         // Sentinel: the file is in the graph before the event.
         assert!(
@@ -1206,7 +1206,7 @@ mod tests {
         // Modify one file on disk and drive try_reindex_file directly
         // (no debouncer wait — same determinism rationale as the other
         // watch-path tests in this module).
-        let a_rec = std::fs::canonicalize(dir.path().join("a.rec")).unwrap();
+        let a_rec = code_graph_core::paths::canonicalize(&dir.path().join("a.rec")).unwrap();
         std::fs::write(&a_rec, b"// a edited\n").unwrap();
 
         let outcome = try_reindex_file(&server.inner, &a_rec, false).await;
@@ -1232,7 +1232,7 @@ mod tests {
              not just the changed file: {watch_call:?}"
         );
         let want_a = a_rec.to_string_lossy().into_owned();
-        let want_b = std::fs::canonicalize(dir.path().join("b.rec"))
+        let want_b = code_graph_core::paths::canonicalize(&dir.path().join("b.rec"))
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -1324,7 +1324,7 @@ mod tests {
         // first symbol. The copy-back at line 394 lifts that state into
         // `new_fg`, which `merge_file_graph` then inserts into the
         // Graph's node table.
-        let a_rec = std::fs::canonicalize(dir.path().join("a.rec")).unwrap();
+        let a_rec = code_graph_core::paths::canonicalize(&dir.path().join("a.rec")).unwrap();
         std::fs::write(&a_rec, b"// a edited\n").unwrap();
         let outcome = try_reindex_file(&server.inner, &a_rec, false).await;
         match outcome {
@@ -1361,7 +1361,7 @@ mod tests {
 
         let txt = dir.path().join("README.txt");
         std::fs::write(&txt, b"hello\n").unwrap();
-        let txt = std::fs::canonicalize(&txt).unwrap();
+        let txt = code_graph_core::paths::canonicalize(&txt).unwrap();
         let stats_before = inner.graph.read().stats();
 
         let outcome = try_reindex_file(&inner, &txt, false).await;

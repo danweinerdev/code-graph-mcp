@@ -333,8 +333,11 @@ mod tests {
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
         assert!(paths.iter().any(|p| p.ends_with("keep.cpp")));
+        // Normalize separators: discovery returns native paths on Windows.
         assert!(
-            paths.iter().any(|p| p.contains("target/foo.cpp")),
+            paths
+                .iter()
+                .any(|p| p.replace('\\', "/").contains("target/foo.cpp")),
             "target/foo.cpp must be included when respect_gitignore=false: {paths:?}"
         );
     }

@@ -50,7 +50,7 @@ fn seed_dir(n: usize) -> (TempDir, std::path::PathBuf) {
         )
         .expect("seed write");
     }
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
     (dir, root)
 }
 

@@ -64,7 +64,7 @@ fn fixture_src() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("ue_synthetic");
-    std::fs::canonicalize(&raw)
+    code_graph_core::paths::canonicalize(&raw)
         .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; fixture must exist"))
 }
 
@@ -85,7 +85,7 @@ struct Indexed {
 async fn build_indexed() -> Indexed {
     let dir = TempDir::new().expect("TempDir for UE synthetic fixture");
     copy_fixture_files(dir.path());
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize tempdir");
     let server = fresh_server();
     let r = analyze_codebase(
         server.inner.clone(),

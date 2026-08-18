@@ -28,14 +28,14 @@ fn server_with_root(root: std::path::PathBuf) -> CodeGraphServer {
 #[test]
 fn relative_subtree_resolves_against_indexed_root() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
     let server = server_with_root(root.clone());
 
     let got = server
         .validate_subtree(Some("src"))
         .expect("relative in-root subtree must be accepted");
-    let expected = std::fs::canonicalize(root.join("src"))
+    let expected = code_graph_core::paths::canonicalize(&root.join("src"))
         .unwrap()
         .to_string_lossy()
         .into_owned();
@@ -49,7 +49,7 @@ fn relative_subtree_resolves_against_indexed_root() {
 #[test]
 fn absolute_in_root_subtree_still_accepted() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
     let server = server_with_root(root.clone());
 
@@ -67,7 +67,7 @@ fn absolute_in_root_subtree_still_accepted() {
 #[test]
 fn relative_parent_traversal_rejected() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let server = server_with_root(root);
 
     // `../outside` does not exist on disk; the guard must still reject it
@@ -82,9 +82,9 @@ fn relative_parent_traversal_rejected() {
 #[test]
 fn absolute_outside_root_rejected() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let other = TempDir::new().unwrap();
-    let outside = std::fs::canonicalize(other.path()).unwrap();
+    let outside = code_graph_core::paths::canonicalize(other.path()).unwrap();
     let server = server_with_root(root);
 
     let r = server.validate_subtree(Some(&outside.to_string_lossy()));
@@ -97,7 +97,7 @@ fn absolute_outside_root_rejected() {
 #[test]
 fn absent_and_empty_subtree_resolve_to_none() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let server = server_with_root(root);
 
     assert_eq!(

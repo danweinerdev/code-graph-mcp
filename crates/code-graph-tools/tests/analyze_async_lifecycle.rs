@@ -79,7 +79,7 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
     // a mix of free functions, classes, methods, enums, typedefs.
     let dir = TempDir::new().expect("tempdir");
     copy_testdata(dir.path());
-    let path = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    let path = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize tempdir");
     let path_str: String = path.to_string_lossy().into_owned();
 
     // Count the source files we wrote so we can pin `result.files`
@@ -201,7 +201,8 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
     // writes from racing or sharing data.
     let dir_sync = TempDir::new().expect("sync tempdir");
     copy_testdata(dir_sync.path());
-    let path_sync = std::fs::canonicalize(dir_sync.path()).expect("canonicalize sync tempdir");
+    let path_sync =
+        code_graph_core::paths::canonicalize(dir_sync.path()).expect("canonicalize sync tempdir");
     let server_sync = production_server();
     let sync_r = analyze_codebase(
         server_sync.inner.clone(),

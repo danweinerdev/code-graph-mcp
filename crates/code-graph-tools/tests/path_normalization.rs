@@ -131,8 +131,8 @@ async fn build_indexed() -> Indexed {
     // (the tempdir path can include `/tmp/.tmpXXXXXX` symlinks on some
     // platforms; canonicalize resolves them so per-file paths in the
     // graph share the same prefix the analyze response reports).
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize tempdir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize tempdir for indexed_root");
 
     let server = cpp_server();
     let r = analyze_codebase(

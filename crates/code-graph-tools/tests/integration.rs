@@ -47,7 +47,7 @@ async fn analyze_then_query_pipeline() {
     // other tests in this file (they all hit `analyze_codebase`).
     let dir = TempDir::new().unwrap();
     copy_testdata(dir.path());
-    let path = std::fs::canonicalize(dir.path()).unwrap();
+    let path = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let server = fresh_server();
     let r = analyze_codebase(
@@ -140,7 +140,7 @@ async fn concurrent_analyze_requests_are_serialized() {
     copy_testdata(dir.path());
     let server = fresh_server();
     let inner: Arc<ServerInner> = server.inner.clone();
-    let path = std::fs::canonicalize(dir.path())
+    let path = code_graph_core::paths::canonicalize(dir.path())
         .unwrap()
         .to_string_lossy()
         .into_owned();

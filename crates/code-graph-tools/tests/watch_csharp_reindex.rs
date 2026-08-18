@@ -81,7 +81,7 @@ fn seed_csharp_project_with_alpha_beta_delta() -> (TempDir, PathBuf) {
 }\n",
     )
     .unwrap();
-    let models = std::fs::canonicalize(dir.path().join("Models.cs")).unwrap();
+    let models = code_graph_core::paths::canonicalize(&dir.path().join("Models.cs")).unwrap();
     (dir, models)
 }
 
@@ -117,9 +117,9 @@ fn seed_csharp_project_with_partials() -> (TempDir, PathBuf, PathBuf, PathBuf) {
 }\n",
     )
     .unwrap();
-    let sentinel = std::fs::canonicalize(dir.path().join("Sentinel.cs")).unwrap();
-    let foo_a = std::fs::canonicalize(dir.path().join("Foo_a.cs")).unwrap();
-    let foo_b = std::fs::canonicalize(dir.path().join("Foo_b.cs")).unwrap();
+    let sentinel = code_graph_core::paths::canonicalize(&dir.path().join("Sentinel.cs")).unwrap();
+    let foo_a = code_graph_core::paths::canonicalize(&dir.path().join("Foo_a.cs")).unwrap();
+    let foo_b = code_graph_core::paths::canonicalize(&dir.path().join("Foo_b.cs")).unwrap();
     (dir, sentinel, foo_a, foo_b)
 }
 
@@ -558,7 +558,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
 }\n",
     )
     .unwrap();
-    let foo_c_path = std::fs::canonicalize(&foo_c_path).unwrap();
+    let foo_c_path = code_graph_core::paths::canonicalize(&foo_c_path).unwrap();
     let outcome = try_reindex_file(&server.inner, &foo_c_path, false).await;
     match outcome {
         ReindexOutcome::Reindexed => {}

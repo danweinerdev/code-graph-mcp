@@ -68,7 +68,7 @@ fn seed_rust_project_with_alpha_beta_caller() -> (TempDir, PathBuf) {
         b"pub fn alpha() {}\npub fn beta() {}\npub fn caller() { beta(); }\n",
     )
     .unwrap();
-    let lib = std::fs::canonicalize(dir.path().join("src").join("lib.rs")).unwrap();
+    let lib = code_graph_core::paths::canonicalize(&dir.path().join("src").join("lib.rs")).unwrap();
     (dir, lib)
 }
 

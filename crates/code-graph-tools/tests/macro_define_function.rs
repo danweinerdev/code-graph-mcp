@@ -29,7 +29,7 @@ fn fresh_server() -> CodeGraphServer {
 #[tokio::test]
 async fn macro_define_function_synthesizes_top_level_symbol() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"
@@ -95,7 +95,7 @@ IMPLEMENT_RELEASE_FN(Bar)
 #[tokio::test]
 async fn macro_define_function_handles_multiple_invocations() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"
@@ -142,7 +142,7 @@ macro_define_function = [
 #[tokio::test]
 async fn macro_define_function_inactive_when_unconfigured() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join(".code-graph.toml"), "[cpp]\n").unwrap();
     std::fs::write(root.join("subject.cpp"), "IMPLEMENT_RELEASE_FN(Bar)\n").unwrap();
 
@@ -171,7 +171,7 @@ async fn macro_define_function_inactive_when_unconfigured() {
 #[tokio::test]
 async fn macro_define_function_picks_correct_arg_index() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"

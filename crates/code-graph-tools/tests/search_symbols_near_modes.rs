@@ -35,7 +35,7 @@ async fn fixture_two_subtrees() -> (Arc<ServerInner>, std::path::PathBuf, TempDi
     std::fs::create_dir(dir.path().join("b")).unwrap();
     std::fs::write(dir.path().join("a/afile.cpp"), "void widget() {}\n").unwrap();
     std::fs::write(dir.path().join("b/bfile.cpp"), "void widget() {}\n").unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let mut registry = LanguageRegistry::new();
     registry

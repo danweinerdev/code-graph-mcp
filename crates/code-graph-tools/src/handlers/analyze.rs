@@ -982,24 +982,33 @@ mod tests {
 
     #[tokio::test]
     async fn async_same_path_against_running_job_is_pending_and_does_not_mutate_running() {
+        // Admission canonicalizes the requested path against the real
+        // filesystem, so the fixture must exist on the host — a literal
+        // `/tmp` does not on Windows. Canonicalize once and use the same
+        // string for the synthetic running job and the new request.
+        let dir = TempDir::new().unwrap();
+        let running_path = code_graph_core::paths::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let server = server_with_cpp_parser();
         let inner = server.inner.clone();
         let synthetic = AnalyzeJob::new_running(
             "00000000000000000001".to_string(),
-            "/tmp".to_string(),
+            running_path.clone(),
             false,
             1,
         );
         inner.analyze_slot.write().current = Some(Arc::clone(&synthetic));
 
-        let r = analyze_codebase_async(inner.clone(), "/tmp".to_string(), true).await;
+        let r = analyze_codebase_async(inner.clone(), running_path.clone(), true).await;
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_ne!(parsed["job_id"], serde_json::json!("00000000000000000001"));
         assert_eq!(parsed["existing"], serde_json::json!(false));
         assert!(!synthetic.force(), "running work must remain immutable");
         let slot = inner.analyze_slot.read();
         let pending = slot.pending.front().expect("same-path request is pending");
-        assert_eq!(pending.job.path, "/tmp");
+        assert_eq!(pending.job.path, running_path);
         assert!(pending.job.force());
     }
 

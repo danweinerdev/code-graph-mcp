@@ -109,7 +109,7 @@ async fn run_analyze(server: &CodeGraphServer, path: &Path, force: bool) -> Anal
 #[tokio::test]
 async fn discovery_finds_parent_config_and_caches_at_project_root() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subdir = root.join("subdir");
     std::fs::create_dir(&subdir).unwrap();
 
@@ -175,7 +175,7 @@ async fn discovery_finds_parent_config_and_caches_at_project_root() {
 #[tokio::test]
 async fn discovery_walks_three_levels_to_find_config() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let deep = root.join("a").join("b").join("c");
     std::fs::create_dir_all(&deep).unwrap();
 
@@ -215,7 +215,7 @@ async fn discovery_walks_three_levels_to_find_config() {
 #[tokio::test]
 async fn discovery_no_config_anywhere_falls_back_with_warning() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     // Deliberately do NOT write a .code-graph.toml.
     std::fs::write(root.join("NoMacro.h"), "class Plain {};\n").unwrap();
 
@@ -258,7 +258,7 @@ async fn discovery_no_config_anywhere_falls_back_with_warning() {
 #[tokio::test]
 async fn nested_toml_first_match_wins_no_merging() {
     let dir = TempDir::new().unwrap();
-    let outer = std::fs::canonicalize(dir.path()).unwrap();
+    let outer = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let inner = outer.join("inner");
     std::fs::create_dir(&inner).unwrap();
 
@@ -328,7 +328,7 @@ async fn nested_toml_first_match_wins_no_merging() {
 #[tokio::test]
 async fn orphan_cache_at_invocation_dir_is_detected_and_warned() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subdir = root.join("subdir");
     std::fs::create_dir(&subdir).unwrap();
 
@@ -379,7 +379,7 @@ async fn orphan_cache_at_invocation_dir_is_detected_and_warned() {
 #[tokio::test]
 async fn merge_accumulates_across_scoped_invocations() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subtree_a = root.join("a");
     let subtree_b = root.join("b");
     std::fs::create_dir_all(&subtree_a).unwrap();
@@ -449,7 +449,7 @@ async fn merge_accumulates_across_scoped_invocations() {
 #[tokio::test]
 async fn scoped_force_invalidates_only_in_scope_entries() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subtree_a = root.join("a");
     let subtree_b = root.join("b");
     std::fs::create_dir_all(&subtree_a).unwrap();
@@ -515,7 +515,7 @@ async fn scoped_force_invalidates_only_in_scope_entries() {
 #[tokio::test]
 async fn mtime_driven_incremental_replaces_stale_symbols_in_scope() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n").unwrap();
 
     let header = root.join("Subject.h");
@@ -594,7 +594,7 @@ async fn mtime_driven_incremental_replaces_stale_symbols_in_scope() {
 #[tokio::test]
 async fn sweep_cadence_skips_when_recent_runs_when_elapsed() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subtree_a = root.join("a");
     let subtree_b = root.join("b");
     std::fs::create_dir_all(&subtree_a).unwrap();
@@ -712,7 +712,7 @@ async fn sweep_cadence_skips_when_recent_runs_when_elapsed() {
 #[tokio::test]
 async fn cross_scope_edge_resolution_is_asymmetric() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     let subtree_a = root.join("a");
     let subtree_b = root.join("b");
     std::fs::create_dir_all(&subtree_a).unwrap();

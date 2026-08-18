@@ -32,7 +32,7 @@ fn fresh_server() -> CodeGraphServer {
 
 async fn seed_and_analyze(server: &CodeGraphServer, src: &str) -> std::path::PathBuf {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join(".code-graph.toml"), "[cpp]\n").unwrap();
     std::fs::write(root.join("subject.cpp"), src).unwrap();
     let r = analyze_codebase(
@@ -59,7 +59,7 @@ async fn seed_and_analyze_multi(
     files: &[(&str, &str)],
 ) -> std::path::PathBuf {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join(".code-graph.toml"), "[cpp]\n").unwrap();
     for (name, contents) in files {
         std::fs::write(root.join(name), contents).unwrap();

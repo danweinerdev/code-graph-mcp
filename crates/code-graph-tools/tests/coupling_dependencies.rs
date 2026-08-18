@@ -125,7 +125,7 @@ async fn get_coupling_both_split_shape() {
     std::fs::write(root.join("in2.cpp"), b"#include \"hub.h\"\nvoid in2() {}\n").unwrap();
     std::fs::write(root.join("in3.cpp"), b"#include \"hub.h\"\nvoid in3() {}\n").unwrap();
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -246,7 +246,7 @@ async fn get_coupling_byte_budget_sequential() {
         .unwrap();
     }
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -371,7 +371,7 @@ async fn get_coupling_directional_pagination_resume() {
         .unwrap();
     }
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
     let hub_h = canonical.join("hub.h").to_string_lossy().into_owned();
@@ -484,7 +484,7 @@ async fn get_dependencies_line_numbers_preserved() {
     src.push_str("void m() {}\n");
     std::fs::write(root.join("main.cpp"), src.as_bytes()).unwrap();
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -570,7 +570,7 @@ async fn indexer_ini_filter_drops_non_source_edges() {
     )
     .unwrap();
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -623,7 +623,7 @@ async fn get_dependencies_ini_excluded_from_response() {
     )
     .unwrap();
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -692,7 +692,7 @@ async fn watch_reindex_applies_ini_filter() {
     )
     .unwrap();
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 

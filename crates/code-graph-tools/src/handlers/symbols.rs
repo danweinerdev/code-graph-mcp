@@ -1142,21 +1142,29 @@ mod tests {
         }
     }
 
+    /// `Graph::search`'s subtree filter compares trie-reconstructed paths
+    /// (joined with the native separator) against stored `Symbol.file`
+    /// strings byte-for-byte, so subtree fixtures must use the native
+    /// separator end-to-end or Windows never matches.
+    fn native(p: &str) -> String {
+        p.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
     /// Two-file graph for subtree-filter tests: one symbol under /a,
     /// one under /b. Both match `query="foo"`. Subtree filter should
     /// narrow to whichever subtree the test selects.
     fn graph_with_foos_in_two_subtrees() -> Graph {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: "/a/x.cpp".to_string(),
+            path: native("/a/x.cpp"),
             language: Language::Cpp,
-            symbols: vec![sym_in("foo", SymbolKind::Function, "/a/x.cpp")],
+            symbols: vec![sym_in("foo", SymbolKind::Function, &native("/a/x.cpp"))],
             edges: vec![],
         });
         g.merge_file_graph(FileGraph {
-            path: "/b/y.cpp".to_string(),
+            path: native("/b/y.cpp"),
             language: Language::Cpp,
-            symbols: vec![sym_in("foo", SymbolKind::Function, "/b/y.cpp")],
+            symbols: vec![sym_in("foo", SymbolKind::Function, &native("/b/y.cpp"))],
             edges: vec![],
         });
         g
@@ -1186,9 +1194,10 @@ mod tests {
         // ONLY the /a symbol, not the /b one — even though both match
         // the regex.
         let g = locked(graph_with_foos_in_two_subtrees());
+        let subtree = native("/a");
         let input = SearchSymbolsInput {
             query: Some("foo"),
-            subtree: Some("/a"),
+            subtree: Some(&subtree),
             ..search_input()
         };
         let r = search_symbols(&g, input, NO_BYTE_BUDGET);
@@ -1204,7 +1213,7 @@ mod tests {
         // brief/full fields the wire shape happens to expose.
         let sid = results[0]["id"].as_str().unwrap();
         assert!(
-            sid.starts_with("/a/x.cpp"),
+            sid.starts_with(&native("/a/x.cpp")),
             "expected symbol from /a/x.cpp; got id={sid}"
         );
         assert_eq!(body["total"].as_u64().unwrap(), 1);
@@ -1226,9 +1235,10 @@ mod tests {
         // count_only would report graph-wide totals where the
         // materializing path reports subtree-scoped results.
         let g = locked(graph_with_foos_in_two_subtrees());
+        let subtree = native("/a");
         let input = SearchSymbolsInput {
             query: Some("foo"),
-            subtree: Some("/a"),
+            subtree: Some(&subtree),
             count_only: true,
             ..search_input()
         };

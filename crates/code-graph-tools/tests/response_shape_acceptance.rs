@@ -105,8 +105,8 @@ async fn build_indexed_fixture(files: &[(&str, String)]) -> IndexedFixture {
         std::fs::write(dir.path().join(name), src)
             .unwrap_or_else(|e| panic!("write fixture file {name}: {e}"));
     }
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize fixture dir for analyze");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize fixture dir for analyze");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -410,7 +410,8 @@ async fn generate_diagram_both_directions_and_no_file_node_leak() {
     // Reconstruct the `file:name` symbol id the same way the indexer did:
     // the canonicalized fixture-dir path joined with the file name, then
     // `:target_fn`.
-    let root = std::fs::canonicalize(fx._dir.path()).expect("canonicalize fixture dir");
+    let root =
+        code_graph_core::paths::canonicalize(fx._dir.path()).expect("canonicalize fixture dir");
     let file_path = root.join("fanout.rs");
     let symbol_id = format!("{}:target_fn", file_path.to_string_lossy());
 

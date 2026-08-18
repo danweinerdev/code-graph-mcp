@@ -93,8 +93,8 @@ async fn build_indexed(src: &std::path::Path) -> IndexedFixture {
 /// in-TempDir source files (e.g. the cross-language `init` collision and
 /// the Go interface tests) instead of seeding from a `testdata/` corpus.
 async fn build_indexed_from_dir(dir: TempDir) -> IndexedFixture {
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let server = server_with_all_parsers();
     let r = analyze_codebase(

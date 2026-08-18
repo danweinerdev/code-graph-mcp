@@ -511,6 +511,14 @@ mod tests {
         RwLock::new(g)
     }
 
+    /// Cycle/coupling results mix stored path strings with trie-reconstructed
+    /// ones (joined with the native separator), so fixtures asserting on
+    /// concrete paths must use the native separator end-to-end or Windows
+    /// diverges from the Unix-style literals.
+    fn native(p: &str) -> String {
+        p.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
     // --- detect_cycles ---
 
     /// Build a graph with `n` independent 2-node cycles: each pair
@@ -576,16 +584,16 @@ mod tests {
     fn detect_cycles_two_node_cycle_returns_envelope_with_one_cycle() {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: "/a.h".to_string(),
+            path: native("/a.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/a.h", "/b.h")],
+            edges: vec![include_edge(&native("/a.h"), &native("/b.h"))],
         });
         g.merge_file_graph(FileGraph {
-            path: "/b.h".to_string(),
+            path: native("/b.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/b.h", "/a.h")],
+            edges: vec![include_edge(&native("/b.h"), &native("/a.h"))],
         });
         let g = locked(g);
         let r = detect_cycles(&g, None, None, None, None);
@@ -596,7 +604,7 @@ mod tests {
         assert_eq!(cycle.len(), 2);
         // Inner cycle paths sorted in canonical order, no need to sort here.
         let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(names, vec!["/a.h", "/b.h"]);
+        assert_eq!(names, vec![native("/a.h"), native("/b.h")]);
         // Each cycle is now a {files, truncated} object; an untruncated
         // cycle emits truncated:false and omits original_len.
         assert_eq!(arr[0]["truncated"], serde_json::json!(false));
@@ -612,38 +620,39 @@ mod tests {
         // subtree="/a" should report only the /a cycle.
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: "/a/x.h".to_string(),
+            path: native("/a/x.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/a/x.h", "/a/y.h")],
+            edges: vec![include_edge(&native("/a/x.h"), &native("/a/y.h"))],
         });
         g.merge_file_graph(FileGraph {
-            path: "/a/y.h".to_string(),
+            path: native("/a/y.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/a/y.h", "/a/x.h")],
+            edges: vec![include_edge(&native("/a/y.h"), &native("/a/x.h"))],
         });
         g.merge_file_graph(FileGraph {
-            path: "/b/p.h".to_string(),
+            path: native("/b/p.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/b/p.h", "/b/q.h")],
+            edges: vec![include_edge(&native("/b/p.h"), &native("/b/q.h"))],
         });
         g.merge_file_graph(FileGraph {
-            path: "/b/q.h".to_string(),
+            path: native("/b/q.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/b/q.h", "/b/p.h")],
+            edges: vec![include_edge(&native("/b/q.h"), &native("/b/p.h"))],
         });
         let g = locked(g);
 
-        let r = detect_cycles(&g, Some("/a"), None, None, None);
+        let subtree = native("/a");
+        let r = detect_cycles(&g, Some(&subtree), None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(total, 1);
         let cycle = arr[0]["files"].as_array().unwrap();
         let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(names, vec!["/a/x.h", "/a/y.h"]);
+        assert_eq!(names, vec![native("/a/x.h"), native("/a/y.h")]);
 
         let r_all = detect_cycles(&g, None, None, None, None);
         let (arr_all, total_all, _, _) = page_parts(&r_all);
@@ -2830,8 +2839,13 @@ mod tests {
         // Outgoing: the call /a -> /b -> /b.cpp count 1.
         assert_eq!(outgoing[0]["file"], serde_json::json!("/b.cpp"));
         assert_eq!(outgoing[0]["count"], serde_json::json!(1));
-        // Incoming: /c.cpp includes /a.cpp -> /c.cpp count 1.
-        assert_eq!(incoming[0]["file"], serde_json::json!("/c.cpp"));
+        // Incoming: /c.cpp includes /a.cpp -> /c.cpp count 1. Incoming rows
+        // are trie-reconstructed (native separator on Windows); normalize
+        // before comparing to the Unix-style fixture literal.
+        assert_eq!(
+            incoming[0]["file"].as_str().unwrap().replace('\\', "/"),
+            "/c.cpp"
+        );
         assert_eq!(incoming[0]["count"], serde_json::json!(1));
         assert_eq!(parsed["outgoing"]["total"], serde_json::json!(1));
         assert_eq!(parsed["incoming"]["total"], serde_json::json!(1));

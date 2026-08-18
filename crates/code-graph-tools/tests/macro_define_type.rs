@@ -30,7 +30,7 @@ fn fresh_server() -> CodeGraphServer {
 #[tokio::test]
 async fn macro_define_type_recovers_struct_and_members() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"
@@ -111,7 +111,7 @@ EXPORT_STRUCT(Foo, (
 #[tokio::test]
 async fn macro_define_type_recovers_class_inheritance() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"
@@ -179,7 +179,7 @@ EXPORT_CLASS(Derived : public Base, (
 #[tokio::test]
 async fn macro_define_type_inactive_when_unconfigured() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join(".code-graph.toml"), "[cpp]\n").unwrap();
     std::fs::write(
         root.join("subject.cpp"),
@@ -214,7 +214,7 @@ async fn macro_define_type_inactive_when_unconfigured() {
 #[tokio::test]
 async fn macro_define_type_chains_with_macro_strip() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"
@@ -286,7 +286,7 @@ macro_define_type = [
 #[tokio::test]
 async fn macro_define_type_chains_with_macro_strip_with_args() {
     let dir = TempDir::new().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join(".code-graph.toml"),
         r#"

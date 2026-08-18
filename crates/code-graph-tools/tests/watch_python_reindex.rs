@@ -68,7 +68,7 @@ fn seed_python_project_with_alpha_beta_delta() -> (TempDir, PathBuf) {
         "class Alpha:\n    def m(self): pass\n\nclass Beta(Alpha):\n    def m(self): pass\n\nclass Delta:\n    def use_beta(self):\n        Beta()\n",
     )
     .unwrap();
-    let models = std::fs::canonicalize(dir.path().join("models.py")).unwrap();
+    let models = code_graph_core::paths::canonicalize(&dir.path().join("models.py")).unwrap();
     (dir, models)
 }
 

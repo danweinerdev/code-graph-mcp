@@ -48,8 +48,8 @@ async fn cpp_macro_define_type_survives_watch_reindex() {
         "void real_fn() {}\nEXPORT_STRUCT(Alpha, (int a; void am();));\n",
     )
     .unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    let subject = std::fs::canonicalize(&subject).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
+    let subject = code_graph_core::paths::canonicalize(&subject).unwrap();
 
     let server = fresh_server();
 

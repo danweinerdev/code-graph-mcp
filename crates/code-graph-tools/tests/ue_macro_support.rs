@@ -56,7 +56,7 @@ fn fixture_src() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("ue_minimal");
-    std::fs::canonicalize(&raw)
+    code_graph_core::paths::canonicalize(&raw)
         .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; fixture must exist"))
 }
 
@@ -106,7 +106,7 @@ async fn build_indexed(override_toml: Option<&str>) -> Indexed {
     // tempdir paths on some platforms contain `/tmp/.tmpXXXXXX` symlinks;
     // resolving them here keeps per-file paths in the graph aligned with
     // the path strings we hand to the query handlers.
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize tempdir");
 
     let server = fresh_server();
 
@@ -440,7 +440,7 @@ macro_strip_with_args = [\"UCLASS\", \"GENERATED_BODY\"]
 ";
     std::fs::write(dir.path().join(".code-graph.toml"), cfg).expect("write .code-graph.toml");
 
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize tempdir");
     let server = fresh_server();
     let r = analyze_codebase(
         server.inner.clone(),

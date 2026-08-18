@@ -60,8 +60,8 @@ fn seed_two_file_call_graph() -> (TempDir, std::path::PathBuf, std::path::PathBu
         b"void old_fn();\nvoid caller() { old_fn(); }\n",
     )
     .unwrap();
-    let a = std::fs::canonicalize(dir.path().join("a.cpp")).unwrap();
-    let b = std::fs::canonicalize(dir.path().join("b.cpp")).unwrap();
+    let a = code_graph_core::paths::canonicalize(&dir.path().join("a.cpp")).unwrap();
+    let b = code_graph_core::paths::canonicalize(&dir.path().join("b.cpp")).unwrap();
     (dir, a, b)
 }
 

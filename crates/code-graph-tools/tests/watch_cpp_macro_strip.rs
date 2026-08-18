@@ -62,7 +62,7 @@ async fn cpp_macro_strip_watch_mode_picks_up_cached_config() {
     // Empty seed file ensures `analyze_codebase` finds at least one
     // `.h` file and doesn't short-circuit on an empty root.
     std::fs::write(dir.path().join("seed.h"), "// seed\n").unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let server = fresh_server();
 

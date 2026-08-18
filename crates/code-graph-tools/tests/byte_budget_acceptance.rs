@@ -104,8 +104,8 @@ struct IndexedFixture {
 async fn build_indexed_fixture() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for large_orphan_set fixture");
     large_orphan_set::write_fixture_to(dir.path());
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize fixture dir for analyze");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize fixture dir for analyze");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -535,7 +535,7 @@ async fn count_only_under_1kb_file_symbols() {
     // TempDir. `get_file_symbols` keys off the absolute path that was
     // recorded at index time, so reconstruct it the same way
     // `build_indexed_fixture` did.
-    let file_path = std::fs::canonicalize(fx._dir.path())
+    let file_path = code_graph_core::paths::canonicalize(fx._dir.path())
         .expect("canonicalize fixture dir")
         .join(large_orphan_set::FIXTURE_FILENAME)
         .to_string_lossy()

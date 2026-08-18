@@ -78,8 +78,8 @@ struct IndexedFixture {
 async fn build_indexed_fixture() -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for testdata copy");
     copy_testdata(dir.path());
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -138,7 +138,10 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 /// portable across machines and across runs (TempDir paths vary).
 fn settings_with_path_redaction(indexed_root: &Path) -> insta::Settings {
     let mut settings = insta::Settings::clone_current();
-    let testdata_str = indexed_root.to_string_lossy().into_owned();
+    // `parsed_sorted` normalizes every `\` to `/` before snapshotting, so
+    // the redaction pattern must be built from the same normalized form —
+    // on Windows the raw root carries backslashes that would never match.
+    let testdata_str = indexed_root.to_string_lossy().replace('\\', "/");
     // Add a trailing slash so `[testdata]/foo` is the result, not
     // `[testdata]foo`. Both forms (with and without trailing /) are
     // listed separately so symbol IDs (`<dir>/foo.cpp:Bar`) and the
@@ -148,13 +151,35 @@ fn settings_with_path_redaction(indexed_root: &Path) -> insta::Settings {
     settings
 }
 
+/// Recursively normalize path separators in every string value: `\` → `/`.
+/// The snapshots are recorded with Unix separators; on Windows the same
+/// responses carry native backslashes in ids/files/labels. A no-op on Unix
+/// (recorded strings contain no backslashes), so snapshots stay
+/// byte-identical there.
+fn normalize_separators(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(s.replace('\\', "/")),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, normalize_separators(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(normalize_separators).collect()),
+        other => other,
+    }
+}
+
 /// Parse a tool response's first text block as JSON, then `sort_json`
-/// for deterministic key ordering.
+/// for deterministic key ordering and `normalize_separators` for
+/// cross-platform path portability. NOTE: `raw_results` deliberately does
+/// NOT normalize — byte-budget math must measure the handler's real
+/// serialized bytes (JSON-escaped `\\` is two bytes, `/` is one).
 fn parsed_sorted(r: &CallToolResult) -> serde_json::Value {
     let body = first_text(r);
     let parsed: serde_json::Value =
         serde_json::from_str(&body).expect("response body must be valid JSON");
-    sort_json(parsed)
+    normalize_separators(sort_json(parsed))
 }
 
 /// The `results` array of a paginated response, in EMISSION order (NOT
@@ -218,7 +243,7 @@ async fn response_analyze_codebase_testdata_cpp() {
     // response itself rather than discarding it inside `build_indexed_fixture`.
     let dir = TempDir::new().unwrap();
     copy_testdata(dir.path());
-    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -788,8 +813,8 @@ async fn build_cpp_only_fixture(files: &[(&str, &str)]) -> IndexedFixture {
         std::fs::write(dir.path().join(name), content)
             .unwrap_or_else(|e| panic!("write {name}: {e}"));
     }
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -1615,8 +1640,8 @@ async fn response_detect_communities_member_capped() {
 async fn build_indexed_fixture_for_dir_with_all_parsers(src: &Path) -> IndexedFixture {
     let dir = TempDir::new().expect("TempDir for testdata copy");
     copy_testdata_from(src, dir.path());
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -1660,7 +1685,7 @@ async fn response_analyze_codebase_testdata_mixed() {
     // binary's runtime shape (foo.cpp + foo.rs + foo.go).
     let dir = TempDir::new().unwrap();
     copy_testdata_from(&testdata_mixed_path(), dir.path());
-    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -1792,8 +1817,8 @@ async fn build_indexed_fixture_with_go_interface() -> IndexedFixture {
     // Fixture body lives in `common::GO_INTERFACE_FIXTURE` so this and
     // the matching mixed-language test stay byte-identical.
     std::fs::write(dir.path().join("reader.go"), GO_INTERFACE_FIXTURE).expect("write reader.go");
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -1906,8 +1931,8 @@ async fn build_indexed_fixture_with_python_models() -> IndexedFixture {
                   class Dog(Animal):\n    \
                   def speak(self):\n        return \"woof\"\n";
     std::fs::write(dir.path().join("models.py"), source).expect("write models.py");
-    let indexed_root =
-        std::fs::canonicalize(dir.path()).expect("canonicalize TempDir for indexed_root");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize TempDir for indexed_root");
 
     let mut registry = LanguageRegistry::new();
     registry
@@ -1957,7 +1982,7 @@ async fn response_analyze_codebase_python_models() {
                   class Dog(Animal):\n    \
                   def speak(self):\n        return \"woof\"\n";
     std::fs::write(dir.path().join("models.py"), source).unwrap();
-    let indexed_root = std::fs::canonicalize(dir.path()).unwrap();
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
 
     let mut registry = LanguageRegistry::new();
     registry

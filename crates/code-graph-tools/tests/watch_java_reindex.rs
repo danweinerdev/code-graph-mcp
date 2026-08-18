@@ -93,7 +93,7 @@ class Delta {\n\
 }\n",
     )
     .unwrap();
-    let models = std::fs::canonicalize(dir.path().join("Models.java")).unwrap();
+    let models = code_graph_core::paths::canonicalize(&dir.path().join("Models.java")).unwrap();
     (dir, models)
 }
 
@@ -137,8 +137,9 @@ public class AnonHost {\n\
 }\n",
     )
     .unwrap();
-    let sentinel = std::fs::canonicalize(dir.path().join("Sentinel.java")).unwrap();
-    let anon_host = std::fs::canonicalize(dir.path().join("AnonHost.java")).unwrap();
+    let sentinel = code_graph_core::paths::canonicalize(&dir.path().join("Sentinel.java")).unwrap();
+    let anon_host =
+        code_graph_core::paths::canonicalize(&dir.path().join("AnonHost.java")).unwrap();
     (dir, sentinel, anon_host)
 }
 

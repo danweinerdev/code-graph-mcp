@@ -49,8 +49,8 @@ async fn cpp_macro_define_function_survives_watch_reindex() {
     // Seed the subject file with a real symbol + one macro invocation.
     let subject = dir.path().join("subject.cpp");
     std::fs::write(&subject, "void real_fn() {}\nMAKE_FN(Alpha)\n").unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    let subject = std::fs::canonicalize(&subject).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
+    let subject = code_graph_core::paths::canonicalize(&subject).unwrap();
 
     let server = fresh_server();
 

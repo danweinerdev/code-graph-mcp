@@ -46,7 +46,7 @@ fn seed_root(cfg: Option<&str>) -> (TempDir, std::path::PathBuf) {
     if let Some(toml) = cfg {
         std::fs::write(dir.path().join(".code-graph.toml"), toml).unwrap();
     }
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = code_graph_core::paths::canonicalize(dir.path()).unwrap();
     (dir, root)
 }
 

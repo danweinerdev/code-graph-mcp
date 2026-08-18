@@ -178,7 +178,7 @@ async fn envelope_honesty_mid_page() {
     let root = dir.path();
     write_n_disjoint_2cycles(root, 100);
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -299,7 +299,7 @@ async fn per_cycle_cap_truncates_large_scc() {
     let root = dir.path();
     write_one_ring_of_n(root, 200);
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 
@@ -371,7 +371,7 @@ async fn per_cycle_cap_default_50() {
     let root = dir.path();
     write_one_ring_of_n(root, 200);
 
-    let canonical = std::fs::canonicalize(root).unwrap();
+    let canonical = code_graph_core::paths::canonicalize(root).unwrap();
     let server = fresh_server();
     analyze(&server, &canonical).await;
 

@@ -69,7 +69,7 @@ fn seed_go_project_with_alpha_beta_caller() -> (TempDir, PathBuf) {
           func (s *Server) Caller() { s.Beta() }\n",
     )
     .unwrap();
-    let srv = std::fs::canonicalize(dir.path().join("srv.go")).unwrap();
+    let srv = code_graph_core::paths::canonicalize(&dir.path().join("srv.go")).unwrap();
     (dir, srv)
 }
 

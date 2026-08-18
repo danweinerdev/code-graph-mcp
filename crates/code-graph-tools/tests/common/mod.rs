@@ -52,7 +52,7 @@ fn testdata_subdir(name: &str) -> PathBuf {
         .join("..")
         .join("testdata")
         .join(name);
-    std::fs::canonicalize(&raw)
+    code_graph_core::paths::canonicalize(&raw)
         .unwrap_or_else(|e| panic!("canonicalize {raw:?} failed: {e}; testdata must exist"))
 }
 

@@ -71,7 +71,7 @@ fn write_cargo_toml(dir: &std::path::Path, crate_name: &str) -> std::path::PathB
     let body =
         format!("[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     std::fs::write(&manifest, body).expect("write Cargo.toml");
-    std::fs::canonicalize(&manifest).expect("canonicalize Cargo.toml")
+    code_graph_core::paths::canonicalize(&manifest).expect("canonicalize Cargo.toml")
 }
 
 /// Materialize a `.rs` file at `dir/rel_path`, creating parent dirs as
@@ -82,7 +82,7 @@ fn write_rs(dir: &std::path::Path, rel_path: &str, contents: &str) -> std::path:
         std::fs::create_dir_all(parent).expect("create_dir_all parent");
     }
     std::fs::write(&abs, contents).expect("write .rs file");
-    std::fs::canonicalize(&abs).expect("canonicalize written file")
+    code_graph_core::paths::canonicalize(&abs).expect("canonicalize written file")
 }
 
 // ---------------------------------------------------------------------
@@ -109,7 +109,7 @@ async fn get_dependencies_and_diagram_non_empty_for_rust() {
     let a = write_rs(dir.path(), "src/a.rs", "fn af() {}\n");
     let b = write_rs(dir.path(), "src/b.rs", "fn bf() {}\n");
 
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
     let server = rust_only_server();
     analyze(&server, &root).await;
 
@@ -221,7 +221,7 @@ async fn detect_cycles_finds_mod_a_mod_b_mod_a_cycle() {
     let a = write_rs(dir.path(), "src/a.rs", "mod b;\nfn af() {}\n");
     let b = write_rs(dir.path(), "src/b.rs", "mod a;\nfn bf() {}\n");
 
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
     let server = rust_only_server();
     analyze(&server, &root).await;
 
@@ -275,7 +275,7 @@ async fn use_and_extern_crate_still_drop_after_2_2() {
         "use std::io;\nextern crate alloc;\n\nfn f() {}\n",
     );
 
-    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
     let server = rust_only_server();
     analyze(&server, &root).await;
 
