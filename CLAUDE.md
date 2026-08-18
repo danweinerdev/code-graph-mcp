@@ -26,7 +26,7 @@ Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs 
 | `code-graph-mcp` | `crates/code-graph-mcp` | Binary; rmcp stdio server entry |
 | `code-graph-core` | `crates/code-graph-core` | `Symbol`, `Edge`, `SymbolKind`, `EdgeKind`, `Confidence`, `RootConfig` (TOML) |
 | `code-graph-lang` | `crates/code-graph-lang` | `LanguagePlugin` trait, `LanguageRegistry`, `SymbolIndex` |
-| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v10) at `<project_root>/.code-graph-cache.db`. The single `#![allow(unsafe_code)]` opt-in in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs`. |
+| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v10) at `<project_root>/.code-graph-cache.db`. One of two `#![allow(unsafe_code)]` opt-ins in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs` (the other is the function-scoped Windows handle-inheritance seal in `code-graph-mcp`'s `daemon.rs`). |
 | `code-graph-path-trie` | `crates/code-graph-path-trie` | Segment-keyed Patricia trie (`PathTrie<V>`), `PathSet`, `PathInterner`. Backs `Graph.files`/`Graph.includes` and the cache encoder's path interning. `#![forbid(unsafe_code)]`. |
 | `code-graph-tools` | `crates/code-graph-tools` | Tool handlers; parallel discovery+indexer; watcher (notify-debouncer-full) |
 | `code-graph-parse-test` | `crates/code-graph-parse-test` | Dev binaries: `code-graph-parse-test` (parser-corpus harness) and `code-graph-bench` (repo-agnostic index/cache/verify). Not built into the server. |
@@ -262,13 +262,40 @@ itself; `--no-daemon` wins over `--serve` if both are passed.
   `daemon.sock` (UDS), `shutdown.request`/`shutdown.ack` (replacement
   protocol), plus Linux-only `shutdown.control.lock`.
 - **Transport fallback:** Unix binds UDS first (0600, inode-swap guard);
-  Windows uses a named pipe; both fall back to loopback TCP (`127.0.0.1:0`)
+  Windows binds a per-PID named pipe (`\\.\pipe\code-graph-mcp-{pid}`,
+  runtime dir ACL-restricted via `icacls` with **captured** output — an
+  inherited-stdio `icacls` would inject its "processed file" chatter into
+  the MCP stdout stream); both fall back to loopback TCP (`127.0.0.1:0`)
   with a `CG-AUTH <token>` / `CG-OK` line handshake, constant-time token
-  compare. Every fallback prints an `eprintln!` breadcrumb. Linux uses a
-  `/proc/<pid>/fd/…` short alias to dodge the 108-byte `sun_path` limit;
+  compare. **Every transport delivers a `CG-OK` admission prelude** — a
+  connected-but-unadmitted peer (saturation, idle-claim race) sees
+  close-without-ack and retries or falls back instead of byte-pumping a
+  dead stream. Every fallback prints an `eprintln!` breadcrumb. Linux uses
+  a `/proc/<pid>/fd/…` short alias to dodge the 108-byte `sun_path` limit;
   **macOS has no equivalent**, so deeply nested checkouts (> ~104-byte
   socket path) routinely degrade to loopback TCP there — logged, not
   silent, and functionally equivalent (revisit in Phase 10).
+- **Windows semantics differ in three load-bearing ways.** (1) `std`'s
+  file locks are **mandatory** there: while the daemon holds `daemon.lock`,
+  any other handle's data read fails with `ERROR_LOCK_VIOLATION` (os error
+  33) — so that read failure IS the actively-held liveness proof
+  (`is_lock_violation`), a readable lock file means no live owner, and the
+  live owner's identity is read from `daemon.json` instead of the lock
+  contents (`still_owned`/`metadata_owner_is_active`/`active_lock_identity`
+  all fork on this). (2) Named pipes cannot half-close: `poll_shutdown` on
+  the client write half is a no-op, so stdin EOF ends a pipe proxy session
+  by flush + bounded drain (`PIPE_EOF_DRAIN`, 500ms) + handle drop rather
+  than the UDS/TCP shutdown-then-drain-to-EOF pattern. (3) Inheritable
+  stdio pipe handles leak into every spawned child (`bInheritHandles`,
+  stable std has no handle-list control), so the proxy clears
+  `HANDLE_FLAG_INHERIT` on its standard handles before spawning the
+  contender (`seal_standard_handles_from_inheritance`, the workspace's one
+  function-scoped unsafe outside `code-graph-graph`) — without it the
+  daemon retains the host↔proxy pipe ends and the host never sees EOF
+  after proxy exit. Windows tests stop daemons via the `shutdown.request`
+  owner file (no SIGINT for detached console processes); `daemon_serve`
+  and `daemon_proxy` suites run natively on Windows (TCP-forcing tests
+  stay Unix-gated — per-PID pipe names cannot be occupied externally).
 - **Binary-compatibility gate:** a client attaches only when the daemon's
   published identity matches (`metadata_compatible`: build SHA via
   `CODE_GRAPH_GIT_SHA` + `executable_fingerprint`, a 64-bit non-cryptographic
