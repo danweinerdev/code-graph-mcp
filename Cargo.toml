@@ -25,10 +25,13 @@ repository = "https://github.com/danweinerdev/code-graph-mcp"
 rust-version = "1.89"
 
 [workspace.lints.rust]
-# Workspace default: `deny` (not `forbid`) so a single audited crate
-# (`code-graph-graph`) can opt into `#![allow(unsafe_code)]` for the
-# v7 cache's mmap boundary. Every OTHER crate restores `forbid` via an
-# explicit `#![forbid(unsafe_code)]` at its `lib.rs` top, so the
+# Workspace default: `deny` (not `forbid`) so two audited opt-ins can
+# exist: `code-graph-graph`'s crate-level `#![allow(unsafe_code)]` for
+# the cache's mmap boundary, and one function-scoped allow in
+# `code-graph-mcp`'s daemon (`seal_standard_handles_from_inheritance`,
+# a single Win32 `SetHandleInformation` call — stable std exposes no
+# handle-inheritance control). Every OTHER crate restores `forbid` via
+# an explicit `#![forbid(unsafe_code)]` at its `lib.rs` top, so the
 # safety wall stays load-bearing where it should. See lib.rs of each
 # crate + .plans/Designs/PackedCache/README.md Decision 5.
 unsafe_code = "deny"

@@ -31,5 +31,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.33"
 
+[target.'cfg(windows)'.dependencies]
+# Win32 bindings only (no native library, D-0004): the daemon proxy must
+# clear HANDLE_FLAG_INHERIT on its standard handles before spawning the
+# daemon contender, and stable std exposes no handle-inheritance control.
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 tokio = { workspace = true }

@@ -68,6 +68,11 @@ const REPLACEMENT_KILL_WAIT: Duration = Duration::from_millis(500);
 /// window for admitted indexing and cache persistence before escalation.
 const REPLACEMENT_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const SHUTDOWN_REQUEST_POLL: Duration = Duration::from_millis(50);
+/// Post-stdin-EOF drain window for the named-pipe proxy. Pipes cannot
+/// half-close, so this bounds how long already-submitted requests may keep
+/// flushing replies to stdout before the session handle drops.
+#[cfg(windows)]
+const PIPE_EOF_DRAIN: Duration = Duration::from_millis(500);
 /// Ownership paths are only advisory while the root-inode lock is held, but a
 /// short poll bounds the time an old daemon can keep serving after its visible
 /// namespace has been replaced.
@@ -356,11 +361,6 @@ impl DaemonPaths {
             name,
             AtFlags::empty(),
         )?)
-    }
-
-    #[cfg(not(unix))]
-    fn remove_child(&self, name: &str) -> std::io::Result<()> {
-        fs::remove_file(self.ordinary_path(name))
     }
 
     #[cfg(unix)]
@@ -843,10 +843,10 @@ fn read_metadata(paths: &DaemonPaths) -> anyhow::Result<DaemonMetadata> {
     serde_json::from_slice(&encoded).context("parse daemon metadata")
 }
 
-/// Path-based fallback used outside Unix and by the static-entry regression.
-/// Runtime callers on Unix instead open relative to the retained directory
-/// descriptor through [`DaemonPaths::read_bounded_record`].
-#[cfg_attr(unix, allow(dead_code))]
+/// Static-entry regression helper. Runtime callers on every platform go
+/// through [`DaemonPaths::read_bounded_record`]; on Unix that opens relative
+/// to the retained directory descriptor, elsewhere it takes the path route.
+#[cfg(test)]
 fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
     read_bounded_record_path(path, MAX_METADATA_BYTES, false)
 }
@@ -922,6 +922,10 @@ fn validate_bounded_record_metadata(
             path.display()
         );
     }
+    // Stable std exposes no link count on Windows metadata; the runtime
+    // directory ACL is the hard-link defense there instead.
+    #[cfg(not(unix))]
+    let _ = require_single_link;
     if metadata.len() > max_bytes as u64 {
         bail!(
             "daemon runtime record {} exceeds {max_bytes}-byte limit",
@@ -937,7 +941,7 @@ fn report_tcp_fallback(metadata: &DaemonMetadata) {
     }
 }
 
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg(all(test, unix))]
 fn read_lock_identity(path: &Path) -> anyhow::Result<LockIdentity> {
     serde_json::from_slice(&read_bounded_record_path(
         path,
@@ -952,47 +956,68 @@ fn read_lock_identity_child(paths: &DaemonPaths) -> anyhow::Result<LockIdentity>
     serde_json::from_slice(&encoded).context("parse daemon lock")
 }
 
+/// `ERROR_LOCK_VIOLATION` (os error 33): the read hit a byte range another
+/// handle holds a mandatory lock on. On Windows this is the only way a data
+/// read of an actively held `daemon.lock` can end, so callers treat it as the
+/// liveness signal rather than corruption. Harmless to probe on other
+/// platforms — advisory locks never fail reads with this code.
+#[cfg(not(unix))]
+fn is_lock_violation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| io_error.raw_os_error() == Some(33))
+}
+
 fn metadata_owner_is_active(paths: &DaemonPaths, metadata: &DaemonMetadata) -> bool {
     // The before/after exact-identity checks around the actively-held lock
     // probe are the authorization: the metadata owner must still name the
     // lock owner after proving that lock is actively held.
-    let Ok(lock) = read_lock_identity_child(paths) else {
-        return false;
-    };
-    metadata.pid == metadata.owner.pid
-        && lock == metadata.owner
-        && identity_is_alive(&metadata.owner)
-        && lock_is_actively_held(paths)
-        && read_lock_identity_child(paths).is_ok_and(|owner| owner == metadata.owner)
+    #[cfg(unix)]
+    {
+        let Ok(lock) = read_lock_identity_child(paths) else {
+            return false;
+        };
+        metadata.pid == metadata.owner.pid
+            && lock == metadata.owner
+            && identity_is_alive(&metadata.owner)
+            && lock_is_actively_held(paths)
+            && read_lock_identity_child(paths).is_ok_and(|owner| owner == metadata.owner)
+    }
+    // Windows mandatory locking inverts the probe: an actively held lock is
+    // unreadable (ERROR_LOCK_VIOLATION), so the failed read IS the held
+    // proof and the metadata owner cannot be cross-checked against the lock
+    // contents while the owner lives. A readable lock file means no live
+    // owner holds it.
+    #[cfg(not(unix))]
+    {
+        match read_lock_identity_child(paths) {
+            Ok(_) => false,
+            Err(error) if is_lock_violation(&error) => {
+                metadata.pid == metadata.owner.pid && identity_is_alive(&metadata.owner)
+            }
+            Err(_) => false,
+        }
+    }
 }
 
+/// Unix-only advisory-lock probe. Windows callers never probe by re-locking:
+/// mandatory locking already surfaces an actively held lock as a
+/// lock-violation read failure (see [`is_lock_violation`]), and a probe
+/// `try_lock` from a second handle could spuriously steal a lock released
+/// between checks.
+#[cfg(unix)]
 fn lock_is_actively_held(paths: &DaemonPaths) -> bool {
-    #[cfg(unix)]
     let file = match paths.open_child(LOCK_FILE, OFlags::RDWR | OFlags::NONBLOCK, Mode::empty()) {
         Ok(file) => file,
         Err(_) => return false,
     };
-    #[cfg(unix)]
     if !file
         .metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
     {
         return false;
     }
-    #[cfg(not(unix))]
-    let file = {
-        let path = &paths.lock;
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return false;
-        }
-        let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
-            return false;
-        };
-        file
-    };
     match file.try_lock() {
         Err(TryLockError::WouldBlock) => true,
         Ok(()) => {
@@ -1092,12 +1117,28 @@ fn replace_stale_shutdown_request(
     Ok(())
 }
 
+#[cfg(unix)]
 fn active_lock_identity(paths: &DaemonPaths) -> Option<LockIdentity> {
     let owner = read_lock_identity_child(paths).ok()?;
     (identity_is_alive(&owner)
         && lock_is_actively_held(paths)
         && read_lock_identity_child(paths).is_ok_and(|current| current == owner))
     .then_some(owner)
+}
+
+/// Windows cannot read an actively held lock's contents (mandatory locking),
+/// so the live owner identity comes from the published metadata record once
+/// the lock-violation read failure proves someone holds the lock.
+#[cfg(not(unix))]
+fn active_lock_identity(paths: &DaemonPaths) -> Option<LockIdentity> {
+    match read_lock_identity_child(paths) {
+        Ok(_) => None,
+        Err(error) if is_lock_violation(&error) => read_metadata(paths)
+            .ok()
+            .map(|metadata| metadata.owner)
+            .filter(identity_is_alive),
+        Err(_) => None,
+    }
 }
 
 fn kill_identity(identity: &LockIdentity) -> bool {
@@ -1129,7 +1170,46 @@ async fn finish_proxy(stream: ClientStream) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The host hands this proxy its stdio pipe ends with `HANDLE_FLAG_INHERIT`
+/// set — that is how they crossed `CreateProcess` in the first place — and
+/// Windows copies every inheritable handle into every child spawned with
+/// handle inheritance enabled (stable std `Command` exposes no handle-list
+/// control). Without this seal the daemon contender would silently retain
+/// the host↔proxy stdio pipe ends for its entire lifetime, so the host would
+/// never observe EOF on the proxy's stdout/stderr after the proxy exits —
+/// observed as an MCP host (or test harness) hanging on session teardown
+/// until the daemon's idle timeout fires.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn seal_standard_handles_from_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    for handle in [
+        stdin.as_raw_handle(),
+        stdout.as_raw_handle(),
+        stderr.as_raw_handle(),
+    ] {
+        if handle.is_null() {
+            continue;
+        }
+        // SAFETY: each handle is one of this process's own standard handles,
+        // owned for the life of the process; clearing the inherit flag
+        // neither closes nor otherwise invalidates it. A failed call (e.g. a
+        // console pseudo-handle rejecting the request) fails open: the flag
+        // stays set and behavior is unchanged from before this call.
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+
 async fn spawn_contender(root: &Path) -> anyhow::Result<tokio::process::Child> {
+    #[cfg(windows)]
+    seal_standard_handles_from_inheritance();
     let executable = std::env::current_exe().context("locate code-graph-mcp executable")?;
     tokio::process::Command::new(executable)
         .arg("--serve")
@@ -1228,11 +1308,18 @@ async fn connect_to_metadata(
             ClientStream::Uds(stream)
         }
         #[cfg(windows)]
-        Transport::Pipe => ClientStream::Pipe(
-            tokio::net::windows::named_pipe::ClientOptions::new()
+        Transport::Pipe => {
+            let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
                 .open(&metadata.endpoint)
-                .with_context(|| format!("connect daemon pipe {}", metadata.endpoint))?,
-        ),
+                .with_context(|| format!("connect daemon pipe {}", metadata.endpoint))?;
+            // A successful pipe open is not admission: the daemon may be
+            // saturated or racing an idle-timeout shutdown. Only the CG-OK
+            // prelude proves an attached MCP service is behind the stream;
+            // its absence lets the proxy retry or fall back instead of
+            // byte-pumping a dead pipe and exiting 0.
+            read_acknowledgement(&mut stream, connect_timeout, "pipe admission").await?;
+            ClientStream::Pipe(stream)
+        }
         Transport::Tcp => {
             let mut stream = timeout(
                 connect_timeout,
@@ -1293,8 +1380,60 @@ async fn pump_connection(stream: ClientStream) -> anyhow::Result<()> {
         #[cfg(unix)]
         ClientStream::Uds(stream) => pump_bytes(stream).await,
         #[cfg(windows)]
-        ClientStream::Pipe(stream) => pump_bytes(stream).await,
+        ClientStream::Pipe(stream) => pump_bytes_without_half_close(stream).await,
         ClientStream::Tcp(stream) => pump_bytes(stream).await,
+    }
+}
+
+/// Named pipes cannot half-close: `poll_shutdown` on the client's write half
+/// is a no-op, so the UDS/TCP pattern — shutdown after stdin EOF, then drain
+/// until the daemon closes — would hang this proxy forever. Stdin EOF is the
+/// host's session teardown, so the pipe session instead ends by flushing
+/// pending writes and dropping the duplex handle; the daemon observes the
+/// close and releases the connection. A response still in flight at that
+/// point is dropped, which matches how a host treats a session it has
+/// already torn down.
+#[cfg(windows)]
+async fn pump_bytes_without_half_close<S>(stream: S) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut socket_read, mut socket_write) = tokio::io::split(stream);
+    let stdin_to_socket = async {
+        let mut stdin = tokio::io::stdin();
+        tokio::io::copy(&mut stdin, &mut socket_write)
+            .await
+            .context("proxy stdin to daemon")?;
+        socket_write
+            .flush()
+            .await
+            .context("flush daemon pipe after stdin EOF")
+    };
+    let socket_to_stdout = async {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut socket_read, &mut stdout)
+            .await
+            .context("proxy daemon to stdout")?;
+        stdout.flush().await.context("flush proxy stdout")
+    };
+
+    tokio::pin!(stdin_to_socket);
+    tokio::pin!(socket_to_stdout);
+    // A broken established stream still ends the session immediately. EOF on
+    // stdin ends it after the flush above plus a bounded drain: without
+    // half-close the daemon cannot signal end-of-responses, so replies to
+    // already-submitted requests get a short window to reach stdout before
+    // the handle drops.
+    tokio::select! {
+        biased;
+        output = &mut socket_to_stdout => output,
+        input = &mut stdin_to_socket => {
+            input?;
+            match timeout(PIPE_EOF_DRAIN, &mut socket_to_stdout).await {
+                Ok(output) => output,
+                Err(_elapsed) => Ok(()),
+            }
+        }
     }
 }
 
@@ -1485,12 +1624,34 @@ impl DaemonLock {
         self.root_file.is_some()
     }
 
+    #[cfg(unix)]
     fn still_owned(&self) -> bool {
         self.file.is_some()
             && self
                 .paths
                 .read_bounded_record(LOCK_FILE, MAX_LOCK_RECORD_BYTES, true)
                 .is_ok_and(|contents| contents == self.contents.as_bytes())
+    }
+
+    /// Windows file locks are mandatory: while this owner holds the
+    /// whole-file lock, a data read through any other handle fails with
+    /// `ERROR_LOCK_VIOLATION`, so the contents cannot be re-verified the way
+    /// the Unix advisory-lock path does. That read failure is itself the
+    /// ownership proof — the pathname still names an actively held lock. A
+    /// readable lock file means the lock is no longer held, and a missing
+    /// file means it was removed.
+    #[cfg(not(unix))]
+    fn still_owned(&self) -> bool {
+        if self.file.is_none() {
+            return false;
+        }
+        match self
+            .paths
+            .read_bounded_record(LOCK_FILE, MAX_LOCK_RECORD_BYTES, true)
+        {
+            Ok(contents) => contents == self.contents.as_bytes(),
+            Err(error) => is_lock_violation(&error),
+        }
     }
 
     fn write_identity(&mut self, identity: LockIdentity) -> std::io::Result<()> {
@@ -2116,7 +2277,14 @@ async fn acquire_or_detect_live_with_initial_file(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let file = match initial_file.take() {
                     Some(file) => file,
-                    None => open_existing_lock(paths).context("open existing daemon lock")?,
+                    None => match open_existing_lock(paths) {
+                        Ok(file) => file,
+                        // The prior owner can remove the lock between our
+                        // failed exclusive create and this open. The pathname
+                        // is free again; retry from creation.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error).context("open existing daemon lock"),
+                    },
                 };
                 match file.try_lock() {
                     Ok(()) => {}
@@ -2578,25 +2746,37 @@ fn restrict_windows_runtime_dir(path: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn restrict_windows_path(path: &Path, permissions: &str, label: &str) -> anyhow::Result<()> {
     let owner = std::env::var("USERNAME").context("read Windows account for daemon secret ACL")?;
+    // `.output()` (never `.status()`): icacls chatters "processed file: …" on
+    // success, and inherited stdio would inject that line into the middle of
+    // the MCP stdout stream when this runs inside the proxy, corrupting
+    // JSON-RPC framing for the attached host.
     let reset = std::process::Command::new("icacls")
         .arg(path)
         .arg("/reset")
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .with_context(|| format!("reset icacls DACL for {label}"))?;
-    if !reset.success() {
-        bail!("icacls failed to reset {label} DACL")
+    if !reset.status.success() {
+        bail!(
+            "icacls failed to reset {label} DACL: {}",
+            String::from_utf8_lossy(&reset.stderr).trim()
+        )
     }
-    let status = std::process::Command::new("icacls")
+    let restrict = std::process::Command::new("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(format!("{owner}:{permissions}"))
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .with_context(|| format!("run icacls for {label}"))?;
-    if status.success() {
+    if restrict.status.success() {
         Ok(())
     } else {
-        bail!("icacls failed to restrict {label}")
+        bail!(
+            "icacls failed to restrict {label}: {}",
+            String::from_utf8_lossy(&restrict.stderr).trim()
+        )
     }
 }
 
@@ -2842,14 +3022,20 @@ async fn serve_pipe<F>(
 #[cfg(windows)]
 fn spawn_service<S>(
     server: CodeGraphServer,
-    stream: S,
+    mut stream: S,
     permit: OwnedSemaphorePermit,
     connection: code_graph_tools::ConnectionGuard,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        serve_service(server, stream, permit, connection).await;
+        // A connected pipe peer is not attached until both guards are held
+        // and this prelude is delivered — the same admission contract as the
+        // UDS and TCP paths. A peer that never sees CG-OK observes pipe
+        // closure and retries or falls back.
+        if write_acknowledgement(&mut stream).await.is_ok() {
+            serve_service(server, stream, permit, connection).await;
+        }
     });
 }
 
@@ -3308,6 +3494,7 @@ mod tests {
         fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tcp_fallback_metadata_is_loopback_only() {
         let root = test_root();
@@ -3326,6 +3513,38 @@ mod tests {
         drop(secret);
         let _ = fs::remove_file(&paths.secret);
         let _ = fs::remove_file(&paths.socket);
+        lock.remove_if_owned();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Windows forces TCP by occupying the daemon's per-PID pipe name rather
+    /// than planting a socket file. Safe against parallel in-process tests:
+    /// every other unit test calling `bind_listener` is unix/linux-gated, so
+    /// nothing else binds this process's pipe name on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tcp_fallback_metadata_is_loopback_only() {
+        let endpoint = format!(r"\\.\pipe\code-graph-mcp-{}", std::process::id());
+        let _occupied = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .unwrap();
+
+        let root = test_root();
+        let paths = DaemonPaths::for_root(&root);
+        paths.ensure_runtime_dir().unwrap();
+        let lock = DaemonLock::acquire(&paths).unwrap();
+        let (listener, metadata, secret) = bind_listener(&paths, &lock).await.unwrap();
+        let address: std::net::SocketAddr = metadata.endpoint.parse().unwrap();
+        assert_eq!(metadata.transport, Transport::Tcp);
+        assert!(
+            address.ip().is_loopback(),
+            "TCP fallback never binds a LAN address"
+        );
+        assert!(secret.is_some(), "TCP fallback publishes a secret");
+        drop(listener);
+        drop(secret);
+        let _ = fs::remove_file(&paths.secret);
         lock.remove_if_owned();
         fs::remove_dir_all(root).unwrap();
     }
@@ -4284,8 +4503,27 @@ mod tests {
 
         let replacement = acquire_or_detect_live(&paths).await.unwrap().unwrap();
         assert!(replacement.still_owned());
-        assert_ne!(fs::read(&paths.lock).unwrap(), b"partial lock write");
-        replacement.remove_if_owned();
+        #[cfg(unix)]
+        {
+            assert_ne!(fs::read(&paths.lock).unwrap(), b"partial lock write");
+            replacement.remove_if_owned();
+        }
+        // Windows mandatory locking makes the held lock unreadable, which is
+        // itself the replaced-in-place proof (the malformed bytes were only
+        // readable because nothing held them). Release without removing to
+        // verify the rewritten identity, then clean up the pathname.
+        #[cfg(not(unix))]
+        {
+            let error = fs::read(&paths.lock).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(33),
+                "held replacement lock is unreadable through the pathname"
+            );
+            replacement.release();
+            assert_ne!(fs::read(&paths.lock).unwrap(), b"partial lock write");
+            fs::remove_file(&paths.lock).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
