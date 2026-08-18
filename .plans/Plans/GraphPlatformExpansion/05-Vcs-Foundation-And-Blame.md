@@ -33,7 +33,7 @@ tasks:
     depends_on: ["5.2", "5.3", "5.5"]
   - id: "5.5"
     title: "Absorb the adversarial-review findings on the git provider"
-    status: in-progress
+    status: complete
     justifies: "Review 2986df0-series adversarial findings M3/M4/M5 on the phase 5 provider: blame's `at: None` contract claimed working-tree attribution while gix blames committed state; revisions_touching walked unbounded history with no node cap (minutes of CPU on engine-scale repos for a stale path); a shallow-clone boundary hard-errored the whole call instead of terminating the walk the way git log does. blame_symbol builds directly on these operations, so the findings must land before the tool does."
     verification: "cargo test -p code-graph-vcs-git — a --depth-1 file:// shallow clone returns its boundary commit from revisions_touching instead of erroring; the revwalk visit cap is asserted structurally (bounded loop, cap constant documented); the trait doc for blame's at: None names the provider default revision (Git: HEAD) rather than promising working-tree attribution."
     depends_on: ["5.2", "5.3"]
@@ -212,7 +212,22 @@ results for healthy full-history repositories are unchanged.
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `6dcbf28022de7d60ec6bde846f736bec45ee0896`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-18 16:26 matched `6dcbf28022de7d60ec6bde846f736bec45ee0896`
+- Focused review: `git show 6dcbf28022de7d60ec6bde846f736bec45ee0896`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `6dcbf28022de7d60ec6bde846f736bec45ee0896`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-vcs-git && cargo clippy -p code-graph-vcs -p code-graph-vcs-git --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `10 harness tests passed natively on Windows, including the new --depth 1 file:// shallow-clone regression returning exactly the boundary commit; clippy denied no warnings; formatting clean.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 6dcbf28` | PASS | `Walk-termination changes only (cap + boundary); healthy-repo results unchanged, pinned by the 9 pre-existing harness tests staying green; blame contract now names the provider default revision.` |
 
 ## Acceptance Criteria
 
