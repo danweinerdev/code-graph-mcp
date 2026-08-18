@@ -1145,10 +1145,11 @@ fn kill_identity(identity: &LockIdentity) -> bool {
     // Safe Rust has no portable pidfd/process-handle primitive here. The
     // caller immediately revalidates metadata + actively-held lock, and this
     // final sysinfo start-time check narrows PID reuse without unsafe or
-    // platform-specific APIs.
-    let mut system = System::new_all();
-    system.refresh_all();
-    let Some(process) = system.process(sysinfo::Pid::from_u32(identity.pid)) else {
+    // platform-specific APIs. Targeted refresh — see `process_start_time`.
+    let target = sysinfo::Pid::from_u32(identity.pid);
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    let Some(process) = system.process(target) else {
         return false;
     };
     if process.start_time() != identity.start_time {
@@ -2455,11 +2456,13 @@ fn read_lock_identity_from(file: &std::fs::File) -> Option<LockIdentity> {
 }
 
 fn process_start_time(pid: u32) -> Option<u64> {
-    let mut system = System::new_all();
-    system.refresh_all();
-    system
-        .process(sysinfo::Pid::from_u32(pid))
-        .map(sysinfo::Process::start_time)
+    // Targeted refresh: this runs inside 50ms client attach/replacement
+    // poll loops, where a full-system process/disk/network scan
+    // (`System::new_all` + `refresh_all`) is a sustained busy loop.
+    let target = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    system.process(target).map(sysinfo::Process::start_time)
 }
 
 fn identity_is_alive(identity: &LockIdentity) -> bool {
@@ -2743,9 +2746,47 @@ fn restrict_windows_runtime_dir(path: &Path) -> anyhow::Result<()> {
     restrict_windows_path(path, "(OI)(CI)(F)", "daemon runtime directory")
 }
 
+/// Prefer the current user's SID for the `icacls` grant: a bare `USERNAME`
+/// principal is ambiguous on domain-joined machines (a local `alice` shadows
+/// `DOMAIN\alice`) and often fails outright for AzureAD accounts, while
+/// `icacls` accepts a `*S-1-…` SID directly and unambiguously. The
+/// environment-variable form stays as the fallback so an exotic `whoami`
+/// failure degrades to the previous behavior instead of disabling the daemon.
+#[cfg(windows)]
+fn windows_owner_grant_principal() -> anyhow::Result<String> {
+    if let Some(sid) = current_user_sid() {
+        return Ok(format!("*{sid}"));
+    }
+    std::env::var("USERNAME").context("read Windows account for daemon secret ACL")
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    // `.output()` (never `.status()`/inherited stdio): child chatter must
+    // not reach the MCP stdout stream when this runs inside the proxy.
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // /fo csv /nh emits one line: "domain\user","S-1-5-21-…"
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .trim()
+        .rsplit(',')
+        .next()?
+        .trim()
+        .trim_matches('"')
+        .to_owned();
+    sid.starts_with("S-1-").then_some(sid)
+}
+
 #[cfg(windows)]
 fn restrict_windows_path(path: &Path, permissions: &str, label: &str) -> anyhow::Result<()> {
-    let owner = std::env::var("USERNAME").context("read Windows account for daemon secret ACL")?;
+    let owner = windows_owner_grant_principal()?;
     // `.output()` (never `.status()`): icacls chatters "processed file: …" on
     // success, and inherited stdio would inject that line into the middle of
     // the MCP stdout stream when this runs inside the proxy, corrupting
