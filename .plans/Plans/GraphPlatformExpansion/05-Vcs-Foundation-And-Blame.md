@@ -27,7 +27,7 @@ tasks:
     depends_on: ["5.1"]
   - id: "5.4"
     title: "blame_symbol tool with staleness detection"
-    status: in-progress
+    status: complete
     justifies: "FR-32, FR-36, NFR-10, NFR-11, AC-21, AC-22, AC-44, AC-45. Blame against a moved working tree silently attributes the wrong lines, which is worse than refusing — the graph's span refers to a file state that no longer exists."
     verification: "cargo test -p code-graph-tools blame_symbol — per-line attribution matches git blame --porcelain -L <line>,<end_line> for the same revision, using the git output as oracle rather than hand-asserted values (AC-21); in a directory under no supported VCS the tool reports unavailability as a success and every other tool behaves normally (AC-22); with a deliberately slow provider a concurrent non-history query returns in its normal time (AC-44, NFR-10); a file modified after indexing without a matching commit returns results flagged stale; the tool description meets the agent-facing lens (AC-45)."
     depends_on: ["5.2", "5.3", "5.5"]
@@ -159,12 +159,12 @@ Pin the commit fixtures here rather than in phase 6 — the reformat-vs-logic pa
 ## 5.4: blame_symbol tool with staleness detection
 
 ### Subtasks
-- [ ] Resolve `(file, name, kind)` against the graph to a line span
-- [ ] Call `blame(path, Some((line, end_line)), at)` and shape the hunks
-- [ ] Flag stale results (on-disk content diverged from the blamed revision) rather than suppressing or silently returning them
-- [ ] Handle the no-VCS and untracked-file cases as success-shaped results
-- [ ] Register the tool with a description meeting the agent-facing lens
-- [ ] Oracle-based blame test plus the no-VCS, staleness, and slow-provider tests
+- [x] Resolve `(file, name, kind)` against the graph to a line span
+- [x] Call `blame(path, Some((line, end_line)), at)` and shape the hunks
+- [x] Flag stale results (on-disk content diverged from the blamed revision) rather than suppressing or silently returning them
+- [x] Handle the no-VCS and untracked-file cases as success-shaped results
+- [x] Register the tool with a description meeting the agent-facing lens
+- [x] Oracle-based blame test plus the no-VCS, staleness, and slow-provider tests
 
 ### Notes
 Revision boundary: the first history feature is live end to end.
@@ -187,9 +187,22 @@ Line-granular attribution is a real limitation — `Symbol` has no end column �
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `0dd91151c42820ae2143721621cd7a29e92639f6`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-18 17:05 matched `0dd91151c42820ae2143721621cd7a29e92639f6`
+- Focused review: `git show 0dd91151c42820ae2143721621cd7a29e92639f6`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `0dd91151c42820ae2143721621cd7a29e92639f6`
+- Review result: PASS/Aligned
 
-### Trap
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `79 test binaries, 1,852 tests, 0 failures natively on Windows — including the 8-test blame_symbol suite (porcelain oracle AC-21, no-VCS success AC-22, gated-provider isolation AC-44, staleness, untracked, did-you-mean, bad-at) and the 24-tool count/route fixtures; clippy denied no warnings; formatting clean.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `agent-facing description lens (AC-45)` | `tools_list_blame_symbol snapshot` | PASS | `Description names the response envelope field-by-field, documents both arguments with defaults, states the committed-state/staleness contract, the line-granularity limitation, and the success-shaped unavailability trichotomy.` |
 Hand-asserting expected authors and SHAs in the blame test. The fixture's commit ids change whenever the harness script changes, so hand-asserted values rot into either constant maintenance or a disabled test. Diff against `git blame --porcelain` output and let git be the oracle.
 
 ## 5.5: Absorb the adversarial-review findings on the git provider
