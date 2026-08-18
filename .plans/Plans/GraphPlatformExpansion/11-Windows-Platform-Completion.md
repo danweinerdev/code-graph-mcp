@@ -73,13 +73,14 @@ durable revision exists):
   directory DACL (no inherited ACEs, no broad built-in principals, exactly
   one grant naming the invoking user); liveness probes refresh only the
   target PID instead of full-system scans inside the 50ms poll loops.
-- **Remaining for 11.2:** forced loopback-TCP fallback + credential rotation
-  at process level on Windows (per-PID pipe names cannot be occupied
-  externally — covered today by the unit-level pipe-occupation TCP-fallback
-  test). The second-local-account denial check was removed from scope by
-  D-0014 (single local user, local project, multiple sessions; no scope
-  expansion without explicit user approval). **11.3 untouched**
-  (certification matrix waits on phases 5–9).
+- **11.2 in-scope items are now covered:** the loopback-TCP fallback,
+  authentication matrix, and credential rotation run at process level on
+  both platforms (Unix by occupying the UDS pathname, Windows via the
+  debug-only `CODE_GRAPH_TEST_FORCE_TCP_ROOT` seam — per-PID pipe names
+  cannot be occupied externally). The second-local-account denial check was
+  removed from scope by D-0014 (single local user, local project, multiple
+  sessions; no scope expansion without explicit user approval).
+  **11.3 untouched** (certification matrix waits on phases 5–9).
 
 ## 11.1: Activate and repair Windows platform seams
 
@@ -107,7 +108,7 @@ Do not claim success from `cargo check --target ...` on Linux. The grammar build
 - [x] Exercise named-pipe publication, attachment, multiple clients, and cleanup.
 - [x] Inspect the daemon's runtime-state DACL and assert it is owner-only: no inherited ACEs, no broad built-in principals, exactly one grant naming the invoking user (`runtime_directory_dacl_is_restricted_to_the_invoking_user`).
 - ~~Provision a second local account and prove it cannot attach to the first account's pipe or use its TCP fallback credential.~~ Out of scope per D-0014: the daemon serves one local user's sessions in one local project; cross-account isolation is not a claimed guarantee and must not be expanded without explicit user approval.
-- [ ] Force named-pipe failure and exercise loopback TCP authentication and credential rotation at process level (unit-level pipe-occupation coverage exists).
+- [x] Force the loopback-TCP fallback and exercise TCP authentication and credential rotation at process level (Unix occupies the UDS pathname; Windows uses the debug-only `CODE_GRAPH_TEST_FORCE_TCP_ROOT` seam — per-PID pipe names cannot be occupied externally; unit-level pipe-occupation coverage also exists).
 - [x] Exercise replacement, idle shutdown, final cache save, and warm restart.
 - [x] Pin contender, stale-lock, and runtime-file cleanup behavior on Windows.
 
