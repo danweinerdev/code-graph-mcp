@@ -3,9 +3,9 @@ title: "VCS Foundation and Blame"
 type: phase
 plan: GraphPlatformExpansion
 phase: 5
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-16
+updated: 2026-08-18
 deliverable: "A provider-abstracted version-control layer with a pure-Rust git implementation, and a blame_symbol tool answering who last changed a symbol."
 tasks:
   - id: "5.1"
@@ -27,9 +27,15 @@ tasks:
     depends_on: ["5.1"]
   - id: "5.4"
     title: "blame_symbol tool with staleness detection"
-    status: planned
+    status: in-progress
     justifies: "FR-32, FR-36, NFR-10, NFR-11, AC-21, AC-22, AC-44, AC-45. Blame against a moved working tree silently attributes the wrong lines, which is worse than refusing — the graph's span refers to a file state that no longer exists."
-    verification: "cargo test -p code-graph-tools blame_symbol:: — per-line attribution matches git blame --porcelain -L <line>,<end_line> for the same revision, using the git output as oracle rather than hand-asserted values (AC-21); in a directory under no supported VCS the tool reports unavailability as a success and every other tool behaves normally (AC-22); with a deliberately slow provider a concurrent non-history query returns in its normal time (AC-44, NFR-10); a file modified since indexing returns results flagged stale; the tool description meets the agent-facing lens (AC-45)."
+    verification: "cargo test -p code-graph-tools blame_symbol — per-line attribution matches git blame --porcelain -L <line>,<end_line> for the same revision, using the git output as oracle rather than hand-asserted values (AC-21); in a directory under no supported VCS the tool reports unavailability as a success and every other tool behaves normally (AC-22); with a deliberately slow provider a concurrent non-history query returns in its normal time (AC-44, NFR-10); a file modified after indexing without a matching commit returns results flagged stale; the tool description meets the agent-facing lens (AC-45)."
+    depends_on: ["5.2", "5.3", "5.5"]
+  - id: "5.5"
+    title: "Absorb the adversarial-review findings on the git provider"
+    status: in-progress
+    justifies: "Review 2986df0-series adversarial findings M3/M4/M5 on the phase 5 provider: blame's `at: None` contract claimed working-tree attribution while gix blames committed state; revisions_touching walked unbounded history with no node cap (minutes of CPU on engine-scale repos for a stale path); a shallow-clone boundary hard-errored the whole call instead of terminating the walk the way git log does. blame_symbol builds directly on these operations, so the findings must land before the tool does."
+    verification: "cargo test -p code-graph-vcs-git — a --depth-1 file:// shallow clone returns its boundary commit from revisions_touching instead of erroring; the revwalk visit cap is asserted structurally (bounded loop, cap constant documented); the trait doc for blame's at: None names the provider default revision (Git: HEAD) rather than promising working-tree attribution."
     depends_on: ["5.2", "5.3"]
 ---
 
@@ -155,18 +161,27 @@ Pin the commit fixtures here rather than in phase 6 — the reformat-vs-logic pa
 ### Subtasks
 - [ ] Resolve `(file, name, kind)` against the graph to a line span
 - [ ] Call `blame(path, Some((line, end_line)), at)` and shape the hunks
-- [ ] Add a read-only accessor exposing the indexed mtime, and compare against the on-disk mtime
-- [ ] Flag stale results rather than suppressing or silently returning them
+- [ ] Flag stale results (on-disk content diverged from the blamed revision) rather than suppressing or silently returning them
 - [ ] Handle the no-VCS and untracked-file cases as success-shaped results
 - [ ] Register the tool with a description meeting the agent-facing lens
-- [ ] Oracle-based blame test plus the no-VCS and slow-provider tests
+- [ ] Oracle-based blame test plus the no-VCS, staleness, and slow-provider tests
 
 ### Notes
 Revision boundary: the first history feature is live end to end.
 
-Blame is requested for the **working-tree state**; staleness is detected by comparing the file's on-disk mtime against the mtime recorded at index time, which the incremental indexer already tracks for cache staleness. This needs a small accessor — the value exists, so it is plumbing rather than new state, and it is the one place Track D touches an existing crate beyond the trait hook.
-
-If that accessor turns out not to be cheaply reachable, drop the staleness flag and document that blame reflects the working tree. Do **not** keep the flag while being unable to compute it.
+**Staleness mechanism, reconciled to the codebase.** The design's preferred
+mtime accessor is not cheaply reachable: the in-memory `Graph` carries no
+per-file mtimes (they exist only as a column in the rkyv cache archive,
+stat'd fresh at save/load — `persist/mod.rs::mtime_nanos`/`stale_paths`),
+so exposing them at query time would mean new in-memory state, which the
+design's own fallback forbids trading for. The fallback applies, upgraded:
+gix attributes the **committed state** (`at: None` = HEAD, per task 5.5's
+contract fix), the graph's spans come from the **on-disk** file, and the
+handler compares on-disk bytes against `read_at(blamed rev)` — divergence
+sets `stale: true` with a reason. That detects the actual misattribution
+hazard (span/attribution referring to different file states) more directly
+than an index-time mtime would, and it never silently returns possibly-wrong
+attribution while claiming otherwise.
 
 Line-granular attribution is a real limitation — `Symbol` has no end column — so a symbol sharing a line with another gets that line attributed to both. State it in the description.
 
@@ -176,6 +191,28 @@ Pending — not complete.
 
 ### Trap
 Hand-asserting expected authors and SHAs in the blame test. The fixture's commit ids change whenever the harness script changes, so hand-asserted values rot into either constant maintenance or a disabled test. Diff against `git blame --porcelain` output and let git be the oracle.
+
+## 5.5: Absorb the adversarial-review findings on the git provider
+
+### Subtasks
+- [ ] Correct the `VcsProvider::blame` doc contract: `at: None` selects the provider's default revision (Git: HEAD, committed state), not working-tree attribution
+- [ ] Bound `revisions_touching`'s manual revwalk with a visited-commit cap, mirroring `find_path`'s node-cap discipline
+- [ ] Treat an unreadable parent commit as a history boundary (shallow clone), terminating the walk the way `git log` does instead of erroring the call
+- [ ] Shallow-clone regression test via `git clone --depth 1 file://…` in the fixture harness
+
+### Notes
+Revision boundary: the provider operations `blame_symbol` builds on are
+contract-honest and bounded before the tool consumes them.
+
+These are review findings M3/M4/M5 from the adversarial full-range review of
+this branch, filed against the already-committed tasks 5.1–5.2. M3 is a
+documentation-contract fix (gix has no working-tree blame; the tool layer
+compensates with the 5.4 staleness flag). M4/M5 change walk termination only:
+results for healthy full-history repositories are unchanged.
+
+### Completion Evidence
+
+Pending — not complete.
 
 ## Acceptance Criteria
 
