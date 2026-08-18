@@ -3,19 +3,19 @@ title: "Windows Platform Completion"
 type: phase
 plan: GraphPlatformExpansion
 phase: 11
-status: deferred
+status: in-progress
 created: 2026-08-11
-updated: 2026-08-11
+updated: 2026-08-18
 deliverable: "Native Windows support across the completed Linux-MVP seams, including named pipes, ACLs, Windows paths, daemon lifecycle, and CLI parity."
 tasks:
   - id: "11.1"
     title: "Activate and repair Windows platform seams"
-    status: deferred
+    status: in-progress
     justifies: "NFR-13, AC-60. The Linux MVP retains cfg-gated Windows seams, but cross-compilation cannot establish native tree-sitter toolchain, filesystem, process, or transport correctness."
     verification: "On a native Windows runner with the required MSVC C toolchain, `cargo test --workspace`, workspace clippy with warnings denied, and rustfmt pass; named-pipe/path/process/ACL branches compile and Linux gates remain unchanged."
   - id: "11.2"
     title: "Validate Windows daemon transport, ACL, and lifecycle"
-    status: deferred
+    status: in-progress
     depends_on: ["11.1"]
     justifies: "NFR-13, NFR-06, AC-60. Named-pipe ACLs, `icacls`, TCP fallback, replacement, and idle behavior cannot be inferred from Linux UDS tests."
     verification: "Native Windows process tests exercise named-pipe attachment, forced loopback-TCP fallback and credential rotation, simultaneous startup, binary replacement, idle exit/cache reuse, and repository-local cleanup. Deterministic security-descriptor inspection must prove the pipe DACL is restricted to the invoking user/system as intended, and a separately provisioned local account must be denied."
@@ -31,7 +31,47 @@ tasks:
 
 ## Overview
 
-Deferred until after the Linux MVP. This phase activates the existing named-pipe, path, process, and ACL seams and makes Windows a supported platform through native evidence. Linux and cross-target results do not substitute for Windows execution.
+Originally deferred until after the Linux MVP; pulled forward by an explicit
+user decision on 2026-08-18 ("daemon mode on Windows needs to be a thing so
+that large workspaces can share a graph instance"). This phase activates the
+existing named-pipe, path, process, and ACL seams and makes Windows a
+supported platform through native evidence. Linux and cross-target results do
+not substitute for Windows execution.
+
+### Pull-forward state (2026-08-18, working tree — not yet committed)
+
+Landed natively on Windows (uncommitted; task evidence stays pending until a
+durable revision exists):
+
+- **11.1 substantially done.** `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo fmt --all --check`, and the full `cargo test --workspace`
+  (78 test binaries) pass natively. Repairs: five cfg-orphaned clippy errors
+  in `daemon.rs`; Windows lock-recovery `NotFound` retry; mandatory-lock
+  semantics (`is_lock_violation`, `still_owned`/`metadata_owner_is_active`/
+  `active_lock_identity` forks — a held `daemon.lock` is unreadable on
+  Windows, so the lock-violation read failure is the liveness proof and owner
+  identity rides `daemon.json`); `gix_tree_path` separator fix in
+  `code-graph-vcs-git::blame`; ~30 test files ported off unix-only fixtures
+  (verbatim-path canonicalize, 8.3 short-form TEMP, `/`-separator literals,
+  drive-colon symbol-ID assumptions, snapshot separator normalization).
+- **11.2 partially done.** Named-pipe transport gained the `CG-OK` admission
+  prelude (client + server; saturation/idle-race peers now fail attach
+  instead of byte-pumping a dead pipe); pipe sessions end on stdin EOF via
+  flush + bounded 500ms drain (pipes cannot half-close); the proxy seals
+  `HANDLE_FLAG_INHERIT` on its stdio handles before spawning the contender
+  (scoped-unsafe `SetHandleInformation`, new windows-only `windows-sys` dep)
+  so the daemon no longer retains host↔proxy pipe ends; `icacls` runs with
+  captured output (inherited stdio was injecting "processed file" chatter
+  into the MCP stdout stream). `daemon_serve` (6) and `daemon_proxy` (15)
+  suites un-gated and green natively, including queue-through-proxy,
+  replacement, idle lifecycle, stale-lock recovery, and contender
+  convergence; Windows graceful stop rides the `shutdown.request` protocol.
+- **Remaining for 11.2:** security-descriptor inspection with a second local
+  account denial; forced loopback-TCP fallback + credential rotation on
+  Windows (per-PID pipe names cannot be occupied externally — needs an
+  in-process forcing seam or the unit-level occupation test that now covers
+  TCP fallback metadata); ACL hardening for domain/AzureAD `USERNAME`
+  ambiguity. **11.3 untouched** (certification matrix waits on phases 5–9).
 
 ## 11.1: Activate and repair Windows platform seams
 
