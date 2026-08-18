@@ -2511,39 +2511,62 @@ enum Listener {
     Tcp(tokio::net::TcpListener),
 }
 
+/// Test-only transport forcing for process-level TCP coverage. Unix tests
+/// force the fallback by occupying the UDS pathname (a production-shaped
+/// cause), but Windows pipe names are per-PID and cannot be occupied
+/// externally, so the TCP authentication/rotation path needs an explicit
+/// seam. The root match keeps concurrent test roots isolated; release
+/// builds omit the seam entirely.
+#[cfg(debug_assertions)]
+fn debug_force_tcp(paths: &DaemonPaths) -> bool {
+    let Ok(root) = std::env::var("CODE_GRAPH_TEST_FORCE_TCP_ROOT") else {
+        return false;
+    };
+    Path::new(&root) == paths.root
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_force_tcp(_paths: &DaemonPaths) -> bool {
+    false
+}
+
 async fn bind_listener(
     paths: &DaemonPaths,
     lock: &DaemonLock,
 ) -> anyhow::Result<(Listener, DaemonMetadata, Option<String>)> {
-    #[cfg(unix)]
-    match bind_uds(paths, lock).await {
-        UdsBind::Listener(listener) => {
-            let endpoint = paths.socket.to_string_lossy().into_owned();
-            return Ok((
-                Listener::Uds(listener),
-                DaemonMetadata::new(Transport::Uds, endpoint, lock.identity.clone())?,
-                None,
-            ));
+    if debug_force_tcp(paths) {
+        eprintln!("code-graph-mcp: test seam forced daemon transport; using loopback TCP");
+    } else {
+        #[cfg(unix)]
+        match bind_uds(paths, lock).await {
+            UdsBind::Listener(listener) => {
+                let endpoint = paths.socket.to_string_lossy().into_owned();
+                return Ok((
+                    Listener::Uds(listener),
+                    DaemonMetadata::new(Transport::Uds, endpoint, lock.identity.clone())?,
+                    None,
+                ));
+            }
+            UdsBind::LiveListener => {
+                eprintln!("code-graph-mcp: live UDS listener retained; using loopback TCP")
+            }
+            UdsBind::Unavailable(error) => {
+                eprintln!("code-graph-mcp: UDS unavailable ({error}); using loopback TCP")
+            }
         }
-        UdsBind::LiveListener => {
-            eprintln!("code-graph-mcp: live UDS listener retained; using loopback TCP")
-        }
-        UdsBind::Unavailable(error) => {
-            eprintln!("code-graph-mcp: UDS unavailable ({error}); using loopback TCP")
-        }
-    }
 
-    #[cfg(windows)]
-    match bind_pipe() {
-        Ok((listener, endpoint)) => {
-            return Ok((
-                Listener::Pipe(listener, endpoint.clone()),
-                DaemonMetadata::new(Transport::Pipe, endpoint, lock.identity.clone())?,
-                None,
-            ));
-        }
-        Err(error) => {
-            eprintln!("code-graph-mcp: named pipe unavailable ({error}); using loopback TCP")
+        #[cfg(windows)]
+        match bind_pipe() {
+            Ok((listener, endpoint)) => {
+                return Ok((
+                    Listener::Pipe(listener, endpoint.clone()),
+                    DaemonMetadata::new(Transport::Pipe, endpoint, lock.identity.clone())?,
+                    None,
+                ));
+            }
+            Err(error) => {
+                eprintln!("code-graph-mcp: named pipe unavailable ({error}); using loopback TCP")
+            }
         }
     }
 

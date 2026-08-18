@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(unix)]
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -164,8 +163,6 @@ fn wait_for_metadata(root: &std::path::Path) -> Value {
     }
 }
 
-/// Only the Unix-gated TCP-fallback test replaces a crashed daemon in place.
-#[cfg(unix)]
 fn wait_for_metadata_for_pid(root: &std::path::Path, pid: u32) -> Value {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -206,8 +203,6 @@ fn stop_owned_daemon(root: &std::path::Path, metadata: &Value) {
     .expect("write daemon shutdown request");
 }
 
-/// Only the Unix-gated TCP-fallback test needs an unclean kill.
-#[cfg(unix)]
 fn kill_unclean(child: &mut DaemonChild) {
     child.child.kill().expect("SIGKILL daemon");
     child.wait();
@@ -375,7 +370,28 @@ fn wait_for_path(path: &std::path::Path) {
     }
 }
 
-#[cfg(unix)]
+/// Forces the daemon's loopback-TCP fallback. Unix occupies the UDS
+/// pathname with a regular file — the production-shaped cause. Windows pipe
+/// names are per-PID and cannot be occupied externally, so the debug-only
+/// `CODE_GRAPH_TEST_FORCE_TCP_ROOT` seam substitutes; the TCP
+/// authentication, secret, and rotation code under test is identical.
+fn force_tcp(root: &std::path::Path) -> Vec<(String, String)> {
+    #[cfg(unix)]
+    {
+        let runtime = root.join(".code-graph");
+        fs::create_dir_all(&runtime).expect("create runtime dir for TCP forcing");
+        fs::write(runtime.join("daemon.sock"), b"force TCP fallback").expect("occupy UDS pathname");
+        Vec::new()
+    }
+    #[cfg(windows)]
+    {
+        vec![(
+            "CODE_GRAPH_TEST_FORCE_TCP_ROOT".to_owned(),
+            root.to_string_lossy().into_owned(),
+        )]
+    }
+}
+
 fn tcp_mcp(endpoint: &str, token: &str) {
     let mut stream = TcpStream::connect(endpoint).expect("connect TCP from metadata");
     stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
@@ -389,7 +405,6 @@ fn tcp_mcp(endpoint: &str, token: &str) {
     mcp_round_trip(stream.try_clone().unwrap(), stream);
 }
 
-#[cfg(unix)]
 fn tcp_rejected(endpoint: &str, prelude: &[u8]) {
     let mut stream = TcpStream::connect(endpoint).expect("connect rejected TCP client");
     stream
@@ -560,24 +575,18 @@ fn runtime_directory_dacl_is_restricted_to_the_invoking_user() {
     wait_for_cleanup(&root.0);
 }
 
-/// TCP fallback is forced by occupying the UDS pathname, which only exists on
-/// Unix. Windows pipe names are per-PID (`code-graph-mcp-{pid}`), so a bind
-/// collision cannot be staged externally; the TCP auth matrix has in-process
-/// coverage in `daemon.rs` unit tests on every platform.
-#[cfg(unix)]
 #[test]
 fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
     let _guard = process_test_guard();
     let root = TestRoot::new(1);
     let runtime = root.0.join(".code-graph");
-    fs::create_dir_all(&runtime).unwrap();
-    let socket_path = runtime.join("daemon.sock");
-    fs::write(&socket_path, b"force TCP fallback").unwrap();
+    let environment = force_tcp(&root.0);
 
-    let mut first = DaemonChild::spawn(&root.0, true);
+    let mut first = DaemonChild::spawn_with_env(&root.0, true, &environment);
     let first_metadata = wait_for_metadata_for_pid(&root.0, first.pid());
     assert_eq!(first_metadata["transport"], "tcp");
-    assert!(fs::symlink_metadata(&socket_path)
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(runtime.join("daemon.sock"))
         .unwrap()
         .file_type()
         .is_file());
@@ -586,6 +595,7 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
         .trim()
         .to_owned();
     assert_eq!(first_token.len(), 64);
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(runtime.join("secret"))
             .unwrap()
@@ -602,7 +612,7 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
     tcp_mcp(first_metadata["endpoint"].as_str().unwrap(), &first_token);
 
     kill_unclean(&mut first);
-    let mut second = DaemonChild::spawn(&root.0, true);
+    let mut second = DaemonChild::spawn_with_env(&root.0, true, &environment);
     let second_metadata = wait_for_metadata_for_pid(&root.0, second.pid());
     let second_token = fs::read_to_string(runtime.join("secret"))
         .unwrap()
@@ -622,14 +632,15 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
     stop_owned_daemon(&root.0, &second_metadata);
     second.wait();
     wait_for_cleanup(&root.0);
-    assert!(fs::symlink_metadata(&socket_path)
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(runtime.join("daemon.sock"))
         .unwrap()
         .file_type()
         .is_file());
     let first_stderr = first.stderr_text();
     let second_stderr = second.stderr_text();
     assert!(
-        first_stderr.contains("UDS unavailable") && second_stderr.contains("UDS unavailable"),
+        first_stderr.contains("using loopback TCP") && second_stderr.contains("using loopback TCP"),
         "TCP fallback is reported"
     );
 }
@@ -735,17 +746,12 @@ fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
     );
 }
 
-/// See `tcp_fallback_authenticates_and_rotates_after_crash_recovery` for why
-/// TCP forcing is Unix-only.
-#[cfg(unix)]
 #[test]
 fn unauthenticated_tcp_socket_does_not_hold_idle_daemon_alive() {
     let _guard = process_test_guard();
     let root = TestRoot::with_idle_timeout(7, 1);
-    let runtime = root.0.join(".code-graph");
-    fs::create_dir_all(&runtime).unwrap();
-    fs::write(runtime.join("daemon.sock"), b"force TCP fallback").unwrap();
-    let mut daemon = DaemonChild::spawn(&root.0, false);
+    let environment = force_tcp(&root.0);
+    let mut daemon = DaemonChild::spawn_with_env(&root.0, false, &environment);
     let metadata = wait_for_metadata(&root.0);
     assert_eq!(metadata["transport"], "tcp");
     let _unauthenticated = TcpStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
