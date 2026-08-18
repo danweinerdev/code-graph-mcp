@@ -199,6 +199,14 @@ fn blame(
         .collect()
 }
 
+/// Upper bound on commits examined by one `revisions_touching` walk. The
+/// manual revwalk visits every reachable commit when a path has fewer than
+/// `limit` touches — including a path that no longer exists — so without a
+/// cap a single call on an engine-scale repository (10⁵–10⁶ commits) is
+/// minutes of CPU inside one blocking task. Mirrors `find_path`'s node-cap
+/// discipline: hitting the cap returns what was found rather than erroring.
+const MAX_REVWALK_COMMITS: usize = 100_000;
+
 fn revisions_touching(
     project_root: &Path,
     path: &Path,
@@ -220,6 +228,9 @@ fn revisions_touching(
     enqueue_commit(&repository, &mut pending, head, &mut sequence)?;
     let mut seen = HashSet::new();
     while let Some(pending_commit) = pending.pop() {
+        if seen.len() >= MAX_REVWALK_COMMITS {
+            break;
+        }
         if !seen.insert(pending_commit.id) {
             continue;
         }
@@ -265,15 +276,21 @@ impl PartialOrd for PendingCommit {
     }
 }
 
+/// Queue `id` for the walk. A commit whose object cannot be read is a
+/// history **boundary**, not an error: the ubiquitous cause is a shallow
+/// clone, where parents beyond the fetch depth are referenced but absent,
+/// and `git log` terminates there rather than failing. Consequence worth
+/// naming: an unreadable HEAD object yields an empty history instead of an
+/// error, trading a corrupt-repository diagnostic for shallow tolerance.
 fn enqueue_commit(
     repository: &gix::Repository,
     pending: &mut BinaryHeap<PendingCommit>,
     id: gix::ObjectId,
     sequence: &mut u64,
 ) -> Result<(), VcsError> {
-    let commit = repository
-        .find_commit(id)
-        .map_err(|error| VcsError::Operation(format!("read commit {id}: {error}")))?;
+    let Ok(commit) = repository.find_commit(id) else {
+        return Ok(());
+    };
     pending.push(PendingCommit {
         timestamp_utc: commit_timestamp(&commit)?,
         sequence: *sequence,
@@ -299,9 +316,12 @@ fn commit_changes_path(
     let Some(first_parent_id) = parent_ids.next() else {
         return Ok(current.is_some());
     };
-    let first_parent = repository.find_commit(first_parent_id).map_err(|error| {
-        VcsError::Operation(format!("read commit parent for {}: {error}", commit.id))
-    })?;
+    // An unreadable first parent is a shallow-clone boundary: treat the
+    // commit like a root, the same way `git log` reports a boundary commit
+    // as introducing the paths it carries.
+    let Ok(first_parent) = repository.find_commit(first_parent_id) else {
+        return Ok(current.is_some());
+    };
 
     if first_parent
         .tree()
@@ -315,9 +335,10 @@ fn commit_changes_path(
     }
 
     for parent_id in parent_ids {
-        let parent = repository.find_commit(parent_id).map_err(|error| {
-            VcsError::Operation(format!("read commit parent for {}: {error}", commit.id))
-        })?;
+        // Same boundary rule for the remaining parents of a merge.
+        let Ok(parent) = repository.find_commit(parent_id) else {
+            continue;
+        };
         if parent
             .tree()
             .map_err(|error| VcsError::Operation(format!("read parent tree: {error}")))?
@@ -1162,6 +1183,63 @@ mod harness {
                 .map(|commit| commit.summary.as_str())
                 .collect::<Vec<_>>(),
             ["mark calculator executable", "initial calculator"]
+        );
+    }
+
+    /// M5 regression: a `--depth 1` clone advertises parents beyond the
+    /// fetch depth without carrying their objects. The revwalk must treat
+    /// the unreadable parent as a history boundary — returning the boundary
+    /// commit the way `git log` does — instead of failing the whole call.
+    #[tokio::test]
+    async fn revisions_touching_terminates_at_a_shallow_clone_boundary() {
+        use super::GitProvider;
+        use code_graph_vcs::VcsProvider;
+
+        const PATH: &str = "src/calculator.rs";
+        let fixture = Fixture::build(phase_six_script()).expect("fixture must build");
+        let full_history_len = fixture
+            .path_history(PATH)
+            .expect("full-history oracle")
+            .len();
+        assert!(
+            full_history_len > 1,
+            "the fixture must have history beyond the shallow boundary"
+        );
+
+        // `git clone --depth 1` requires a transport; `file://` provides one
+        // without any network. Forward slashes keep the URL valid on Windows.
+        let source = fixture.path().to_string_lossy().replace('\\', "/");
+        let url = if source.starts_with('/') {
+            format!("file://{source}")
+        } else {
+            format!("file:///{source}")
+        };
+        fixture
+            .git(&["clone", "--depth", "1", &url, "shallow-clone"])
+            .expect("create shallow clone");
+        let clone_root = fixture.path().join("shallow-clone");
+        assert!(
+            clone_root.join(".git/shallow").exists(),
+            "the clone must be genuinely shallow"
+        );
+        let boundary_revision = fixture
+            .git_stdout(&["-C", "shallow-clone", "rev-parse", "HEAD"])
+            .expect("read shallow HEAD")
+            .trim()
+            .to_owned();
+
+        let provider = GitProvider::open(&clone_root).expect("shallow clone is a working tree");
+        let history = provider
+            .revisions_touching(&clone_root.join(PATH), 10)
+            .await
+            .expect("a shallow boundary terminates the walk instead of erroring");
+        assert_eq!(
+            history
+                .iter()
+                .map(|commit| commit.rev.as_str())
+                .collect::<Vec<_>>(),
+            [boundary_revision.as_str()],
+            "exactly the boundary commit is reported, as git log does"
         );
     }
 

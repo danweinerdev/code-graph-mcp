@@ -106,7 +106,15 @@ pub trait VcsProvider: Send + Sync {
     fn detect(&self, working_tree: &Path) -> bool;
 
     /// Attribute an optional inclusive one-based line range at an optional
-    /// revision. `None` values select the provider's working-tree defaults.
+    /// revision.
+    ///
+    /// `lines: None` selects the whole file. `at: None` selects the
+    /// provider's **default revision** — for Git that is `HEAD`, so
+    /// attribution reflects the committed state, never uncommitted
+    /// working-tree edits. A caller whose line numbers come from the
+    /// on-disk file must detect divergence itself (for example by
+    /// comparing the on-disk contents against [`Self::read_at`] for the
+    /// blamed revision) rather than assume the two line spaces agree.
     async fn blame(
         &self,
         path: &Path,
