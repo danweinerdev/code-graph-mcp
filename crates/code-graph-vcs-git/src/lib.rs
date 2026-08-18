@@ -164,9 +164,10 @@ fn blame(
             .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
             .detach(),
     };
+    let tree_path = gix_tree_path(&relative_path, path)?;
     let outcome = repository
         .blame_file(
-            gix::bstr::BStr::new(relative_path.to_string_lossy().as_bytes()),
+            gix::bstr::BStr::new(tree_path.as_bytes()),
             revision,
             Default::default(),
         )
@@ -377,6 +378,27 @@ fn signature_timestamp(timestamp: &str, role: &str, id: gix::ObjectId) -> Result
         .ok_or_else(|| VcsError::Operation(format!("missing {role} timestamp for {id}")))?
         .parse()
         .map_err(|error| VcsError::Operation(format!("invalid {role} timestamp for {id}: {error}")))
+}
+
+/// gix tree paths are `/`-separated regardless of host. Joining the relative
+/// path's components explicitly keeps `blame` correct where the OS separator
+/// differs (Windows), and surfaces a non-UTF-8 name as an error instead of
+/// silently corrupting it through a lossy conversion.
+fn gix_tree_path(relative_path: &Path, original: &Path) -> Result<String, VcsError> {
+    let mut tree_path = String::new();
+    for component in relative_path.components() {
+        let part = component.as_os_str().to_str().ok_or_else(|| {
+            VcsError::Operation(format!(
+                "{} contains a non-UTF-8 path component",
+                original.display()
+            ))
+        })?;
+        if !tree_path.is_empty() {
+            tree_path.push('/');
+        }
+        tree_path.push_str(part);
+    }
+    Ok(tree_path)
 }
 
 fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf, VcsError> {
