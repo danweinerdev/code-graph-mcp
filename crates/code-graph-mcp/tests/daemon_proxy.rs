@@ -1,6 +1,6 @@
 //! Process coverage for default-on daemon proxy attachment.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -47,7 +47,14 @@ impl TestRoot {
                     std::process::id()
                 ));
                 match fs::create_dir(&root) {
-                    Ok(()) => Some(root),
+                    // Canonicalize so every derived string — analyze paths,
+                    // debug-hook roots, job-view comparisons — matches the
+                    // daemon's own canonical form. Windows bash exports a
+                    // short-form (8.3) TEMP; the daemon compares long forms.
+                    Ok(()) => Some(
+                        code_graph_core::paths::canonicalize(&root)
+                            .expect("canonicalize daemon proxy test root"),
+                    ),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
                     Err(error) => panic!("create fresh test root: {error}"),
                 }
@@ -316,6 +323,9 @@ fn wait_metadata(root: &TestRoot) -> Value {
     }
 }
 
+/// Only the Linux-gated truncated-request replacement test waits for a new
+/// owner to publish over an old one.
+#[cfg(target_os = "linux")]
 fn wait_replacement_metadata(root: &TestRoot, previous_owner: &Value) -> Value {
     let path = root.0.join(".code-graph/daemon.json");
     let deadline = Instant::now() + TIMEOUT;
@@ -335,7 +345,9 @@ fn wait_replacement_metadata(root: &TestRoot, previous_owner: &Value) -> Value {
     }
 }
 
-fn stop_daemon(metadata: &Value) {
+#[cfg(unix)]
+fn stop_daemon(root: &Path, metadata: &Value) {
+    let _ = root;
     let status = Command::new("kill")
         .args([
             "-INT",
@@ -348,6 +360,20 @@ fn stop_daemon(metadata: &Value) {
         .status()
         .expect("signal daemon");
     assert!(status.success(), "SIGINT daemon");
+}
+
+/// Windows has no SIGINT equivalent for a detached console process. The
+/// daemon's replacement protocol is the graceful-stop channel there: naming
+/// the current owner in `shutdown.request` makes it drain, save the cache,
+/// clean its runtime records, and exit — the same path a replacing client
+/// takes in production.
+#[cfg(windows)]
+fn stop_daemon(root: &Path, metadata: &Value) {
+    fs::write(
+        root.join(".code-graph/shutdown.request"),
+        serde_json::to_vec(&metadata["owner"]).expect("encode daemon owner identity"),
+    )
+    .expect("write daemon shutdown request");
 }
 
 fn replace_metadata_sha(root: &TestRoot, metadata: &Value, binary_sha: String) {
@@ -455,6 +481,7 @@ fn admitted_uds_connection(endpoint: &str) -> UnixStream {
     stream
 }
 
+#[cfg(unix)]
 fn child_pids(parent: u32) -> Vec<u32> {
     let output = Command::new("pgrep")
         .args(["-P", &parent.to_string()])
@@ -463,6 +490,19 @@ fn child_pids(parent: u32) -> Vec<u32> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|pid| pid.parse().expect("child pid"))
+        .collect()
+}
+
+#[cfg(windows)]
+fn child_pids(parent: u32) -> Vec<u32> {
+    let parent = sysinfo::Pid::from_u32(parent);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .filter(|process| process.parent() == Some(parent))
+        .map(|process| process.pid().as_u32())
         .collect()
 }
 
@@ -522,6 +562,7 @@ fn assert_all_advertised_tools_route(client: &mut Client, root: &Path, source: &
     }
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -531,9 +572,36 @@ fn process_is_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    let target = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    system.process(target).is_some()
+}
+
+/// Unclean termination for crash-recovery tests: SIGKILL on Unix, a forced
+/// `taskkill` on Windows. Both leave runtime records behind by design.
+fn kill_hard(pid: u32) {
+    #[cfg(unix)]
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .expect("SIGKILL daemon");
+    #[cfg(windows)]
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("taskkill daemon");
+    assert!(status.success(), "hard-kill daemon {pid}");
+}
+
 /// Best-effort test-root cleanup. Do not propagate failures from `Drop`: a
 /// held queued persist can take longer than a graceful signal, so boundedly
 /// escalate to SIGKILL before removing the runtime directory.
+#[cfg(unix)]
 fn reap_process_bounded(pid: u32) {
     let _ = Command::new("kill")
         .args(["-INT", &pid.to_string()])
@@ -545,6 +613,20 @@ fn reap_process_bounded(pid: u32) {
     }
     let _ = Command::new("kill")
         .args(["-KILL", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = wait_for_process_exit_bounded(pid, DROP_REAP_TIMEOUT);
+}
+
+/// Best-effort test-root cleanup. Windows offers no graceful console signal
+/// for a detached process, and successful tests already stopped their daemon
+/// through the shutdown-request protocol, so `Drop` escalates straight to a
+/// forced termination of anything left.
+#[cfg(windows)]
+fn reap_process_bounded(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -576,7 +658,7 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
     );
     client.close();
     let metadata = wait_metadata(&default_root);
-    stop_daemon(&metadata);
+    stop_daemon(&default_root.0, &metadata);
     wait_runtime_cleanup(&default_root.0);
     default_root.disarm_daemon();
 
@@ -732,7 +814,7 @@ fn root_and_nested_clients_share_index_watch_and_async_slot() {
 
     a.close();
     b.close();
-    stop_daemon(&metadata);
+    stop_daemon(&root.0, &metadata);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -967,7 +1049,7 @@ fn live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes(
     );
 
     status_client.close();
-    stop_daemon(&metadata);
+    stop_daemon(&root.0, &metadata);
     wait_runtime_cleanup(&root.0);
     wait_for_process_exit(metadata["pid"].as_u64().expect("daemon pid") as u32);
     root.disarm_daemon();
@@ -1102,11 +1184,7 @@ fn live_proxy_queue_cap_rejects_covered_followers_across_clients() {
     second_client.close();
     holder.close();
     let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
-    let status = Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status()
-        .expect("kill capacity daemon");
-    assert!(status.success(), "SIGKILL capacity daemon");
+    kill_hard(pid);
     wait_for_process_exit(pid);
     root.disarm_daemon();
     let _ = fs::remove_file(root.0.join(".code-graph/daemon.json"));
@@ -1196,7 +1274,7 @@ fn live_proxy_shutdown_drains_queued_analyzes_before_cleaning_runtime() {
 
     release.release();
     let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
-    stop_daemon(&metadata);
+    stop_daemon(&root.0, &metadata);
     wait_runtime_cleanup(&root.0);
     wait_for_process_exit(pid);
     let mut graph = Graph::new();
@@ -1227,19 +1305,38 @@ fn tcp_metadata_attachment_and_start_failure_fallback_are_safe() {
         23
     );
     let metadata = wait_metadata(&tcp);
-    assert_eq!(
-        metadata["transport"], "tcp",
-        "proxy read metadata and authenticated TCP"
-    );
-    let stderr = client.close();
-    assert_eq!(
-        stderr
-            .matches("local IPC was unavailable; loopback TCP fallback is active")
-            .count(),
-        1,
-        "the attaching proxy reports its metadata-selected TCP fallback"
-    );
-    stop_daemon(&metadata);
+    // A planted daemon.sock file occupies the UDS pathname and forces the
+    // loopback-TCP fallback on Unix. Windows pipe names are per-PID and never
+    // touch daemon.sock, so the same setup must instead prove a stray socket
+    // file cannot disturb pipe attachment.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            metadata["transport"], "tcp",
+            "proxy read metadata and authenticated TCP"
+        );
+        let stderr = client.close();
+        assert_eq!(
+            stderr
+                .matches("local IPC was unavailable; loopback TCP fallback is active")
+                .count(),
+            1,
+            "the attaching proxy reports its metadata-selected TCP fallback"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            metadata["transport"], "pipe",
+            "a stray daemon.sock file does not disturb pipe transport"
+        );
+        let stderr = client.close();
+        assert!(
+            !stderr.contains("local IPC was unavailable"),
+            "no fallback diagnostic on the pipe transport: {stderr}"
+        );
+    }
+    stop_daemon(&tcp.0, &metadata);
     wait_runtime_cleanup(&tcp.0);
     tcp.disarm_daemon();
 
@@ -1333,8 +1430,8 @@ fn daemon_project_roots_are_isolated_for_sync_and_async_analyze() {
 
     a.close();
     b.close();
-    stop_daemon(&a_metadata);
-    stop_daemon(&b_metadata);
+    stop_daemon(&a_root.0, &a_metadata);
+    stop_daemon(&b_root.0, &b_metadata);
     wait_runtime_cleanup(&a_root.0);
     wait_runtime_cleanup(&b_root.0);
     a_root.disarm_daemon();
@@ -1398,12 +1495,8 @@ fn established_daemon_death_ends_proxy_while_stdin_remains_open() {
     let metadata = wait_metadata(&root);
 
     let started = Instant::now();
-    let pid = metadata["pid"].as_u64().expect("daemon pid").to_string();
-    let status = Command::new("kill")
-        .args(["-KILL", &pid])
-        .status()
-        .expect("kill established daemon");
-    assert!(status.success(), "SIGKILL daemon");
+    let pid = metadata["pid"].as_u64().expect("daemon pid") as u32;
+    kill_hard(pid);
     wait_or_kill(&mut client.child);
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -1452,7 +1545,7 @@ fn saturated_uds_attachment_falls_back_instead_of_reporting_a_dead_connection() 
     );
 
     drop(holders);
-    stop_daemon(&metadata);
+    stop_daemon(&root.0, &metadata);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1486,7 +1579,7 @@ fn simultaneous_real_proxy_clients_converge_without_contender_leaks() {
     for client in clients {
         client.close();
     }
-    stop_daemon(&metadata);
+    stop_daemon(&root.0, &metadata);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1522,7 +1615,7 @@ fn clean_binary_mismatch_recovers_a_truncated_request_and_replaces_the_old_owner
         "replacement stays within client bound"
     );
     replacement.close();
-    stop_daemon(&new);
+    stop_daemon(&root.0, &new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1530,10 +1623,16 @@ fn clean_binary_mismatch_recovers_a_truncated_request_and_replaces_the_old_owner
 #[test]
 fn different_executable_content_replaces_even_when_build_sha_matches() {
     let _guard = process_test_guard();
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let root = TestRoot::new(false);
+    // Windows resolves executables by extension; Unix by mode bits. The copy
+    // must remain spawnable on both.
+    #[cfg(unix)]
     let copied = root.0.join("altered-code-graph-mcp");
+    #[cfg(windows)]
+    let copied = root.0.join("altered-code-graph-mcp.exe");
     fs::copy(env!("CARGO_BIN_EXE_code-graph-mcp"), &copied).unwrap();
     OpenOptions::new()
         .append(true)
@@ -1541,11 +1640,14 @@ fn different_executable_content_replaces_even_when_build_sha_matches() {
         .unwrap()
         .write_all(b"code-graph-test-trailing-bytes")
         .unwrap();
-    let mode = fs::metadata(env!("CARGO_BIN_EXE_code-graph-mcp"))
-        .unwrap()
-        .permissions()
-        .mode();
-    fs::set_permissions(&copied, fs::Permissions::from_mode(mode)).unwrap();
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(env!("CARGO_BIN_EXE_code-graph-mcp"))
+            .unwrap()
+            .permissions()
+            .mode();
+        fs::set_permissions(&copied, fs::Permissions::from_mode(mode)).unwrap();
+    }
     let mut altered = Command::new(&copied)
         .arg("--serve")
         .current_dir(&root.0)
@@ -1568,7 +1670,7 @@ fn different_executable_content_replaces_even_when_build_sha_matches() {
     assert_ne!(new["owner"], old["owner"], "different executable replaced");
     client.close();
     let _ = altered.wait();
-    stop_daemon(&new);
+    stop_daemon(&root.0, &new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1591,7 +1693,7 @@ fn sequential_clients_keep_the_same_matching_executable_owner() {
     assert_eq!(current["owner"], old["owner"]);
     first.close();
     second.close();
-    stop_daemon(&current);
+    stop_daemon(&root.0, &current);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1616,7 +1718,7 @@ fn equal_dirty_metadata_is_replaced_once_then_converges_on_new_owner() {
     let new = wait_metadata(&root);
     assert_ne!(new["owner"], old["owner"], "dirty owner was replaced once");
     replacement.close();
-    stop_daemon(&new);
+    stop_daemon(&root.0, &new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1729,7 +1831,7 @@ fn replacement_waits_for_delayed_persist_before_runtime_cleanup() {
     let new = wait_metadata(&root);
     client.close();
     replacement.close();
-    stop_daemon(&new);
+    stop_daemon(&root.0, &new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
 }
@@ -1807,7 +1909,7 @@ fn root_replacement_during_admitted_persist_uses_the_retained_cache_inode() {
     );
     let new = wait_metadata(&root);
     successor.close();
-    stop_daemon(&new);
+    stop_daemon(&root.0, &new);
     wait_runtime_cleanup(&root.0);
     root.disarm_daemon();
     fs::remove_dir_all(relocated).unwrap();

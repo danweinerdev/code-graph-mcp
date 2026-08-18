@@ -1,11 +1,14 @@
 //! Process coverage for the explicit `--serve` daemon mode.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, Command, Stdio};
@@ -115,7 +118,16 @@ impl TestRoot {
                 std::process::id(),
             ));
             match fs::create_dir(&root) {
-                Ok(()) => return Self(root),
+                // Canonicalize so derived debug-hook roots and path
+                // assertions match the daemon's canonical form (Windows bash
+                // exports a short-form 8.3 TEMP; the daemon compares long
+                // forms).
+                Ok(()) => {
+                    return Self(
+                        code_graph_core::paths::canonicalize(&root)
+                            .expect("canonicalize daemon serve test root"),
+                    )
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("create fresh test project root: {error}"),
             }
@@ -152,6 +164,8 @@ fn wait_for_metadata(root: &std::path::Path) -> Value {
     }
 }
 
+/// Only the Unix-gated TCP-fallback test replaces a crashed daemon in place.
+#[cfg(unix)]
 fn wait_for_metadata_for_pid(root: &std::path::Path, pid: u32) -> Value {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -167,7 +181,9 @@ fn wait_for_metadata_for_pid(root: &std::path::Path, pid: u32) -> Value {
     }
 }
 
-fn stop_owned_daemon(metadata: &Value) {
+#[cfg(unix)]
+fn stop_owned_daemon(root: &std::path::Path, metadata: &Value) {
+    let _ = root;
     let pid = metadata["pid"].as_u64().expect("metadata pid").to_string();
     let status = Command::new("kill")
         .args(["-INT", &pid])
@@ -176,6 +192,22 @@ fn stop_owned_daemon(metadata: &Value) {
     assert!(status.success(), "SIGINT daemon");
 }
 
+/// Windows has no SIGINT equivalent for a detached console process. The
+/// daemon's replacement protocol is the graceful-stop channel there: naming
+/// the current owner in `shutdown.request` makes it drain, save the cache,
+/// clean its runtime records, and exit — the same path a replacing client
+/// takes in production.
+#[cfg(windows)]
+fn stop_owned_daemon(root: &std::path::Path, metadata: &Value) {
+    fs::write(
+        root.join(".code-graph/shutdown.request"),
+        serde_json::to_vec(&metadata["owner"]).expect("encode daemon owner identity"),
+    )
+    .expect("write daemon shutdown request");
+}
+
+/// Only the Unix-gated TCP-fallback test needs an unclean kill.
+#[cfg(unix)]
 fn kill_unclean(child: &mut DaemonChild) {
     child.child.kill().expect("SIGKILL daemon");
     child.wait();
@@ -254,24 +286,43 @@ fn mcp_round_trip<W: Write, R: Read>(mut writer: W, reader: R) {
     assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 23);
 }
 
-fn uds_connect(endpoint: &str) -> UnixStream {
-    let mut stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
-    stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = fs::File;
+
+/// Connects to the daemon's published IPC endpoint (UDS on Unix, a named
+/// pipe on Windows) and consumes the CG-OK admission prelude, so a returned
+/// stream is a genuinely attached MCP connection on both platforms.
+fn ipc_connect(metadata: &Value) -> IpcStream {
+    let endpoint = metadata["endpoint"].as_str().expect("IPC endpoint");
+    #[cfg(unix)]
+    let mut stream = {
+        let stream = UnixStream::connect(endpoint).expect("connect UDS from metadata");
+        stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+        stream
+    };
+    #[cfg(windows)]
+    let mut stream = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(endpoint)
+        .expect("open daemon named pipe from metadata");
     let mut acknowledgement = [0_u8; 6];
     stream
         .read_exact(&mut acknowledgement)
-        .expect("read UDS admission acknowledgement");
+        .expect("read IPC admission acknowledgement");
     assert_eq!(&acknowledgement, b"CG-OK\n");
     stream
 }
 
-fn uds_mcp(endpoint: &str) {
-    let stream = uds_connect(endpoint);
+fn ipc_mcp(metadata: &Value) {
+    let stream = ipc_connect(metadata);
     mcp_round_trip(stream.try_clone().unwrap(), stream);
 }
 
-fn uds_analyze(endpoint: &str, root: &std::path::Path, asynchronous: bool, force: bool) -> Value {
-    let stream = uds_connect(endpoint);
+fn ipc_analyze(metadata: &Value, root: &std::path::Path, asynchronous: bool, force: bool) -> Value {
+    let stream = ipc_connect(metadata);
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     writeln!(
@@ -324,6 +375,7 @@ fn wait_for_path(path: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
 fn tcp_mcp(endpoint: &str, token: &str) {
     let mut stream = TcpStream::connect(endpoint).expect("connect TCP from metadata");
     stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
@@ -337,6 +389,7 @@ fn tcp_mcp(endpoint: &str, token: &str) {
     mcp_round_trip(stream.try_clone().unwrap(), stream);
 }
 
+#[cfg(unix)]
 fn tcp_rejected(endpoint: &str, prelude: &[u8]) {
     let mut stream = TcpStream::connect(endpoint).expect("connect rejected TCP client");
     stream
@@ -352,7 +405,7 @@ fn tcp_rejected(endpoint: &str, prelude: &[u8]) {
 }
 
 #[test]
-fn serve_publishes_owner_only_uds_and_serves_mcp() {
+fn serve_publishes_owner_only_ipc_and_serves_mcp() {
     let _guard = process_test_guard();
     let root = TestRoot::new(0);
     let mut daemon = DaemonChild::spawn(&root.0, false);
@@ -360,23 +413,35 @@ fn serve_publishes_owner_only_uds_and_serves_mcp() {
     let runtime = root.0.join(".code-graph");
 
     assert_eq!(metadata["pid"].as_u64(), Some(u64::from(daemon.pid())));
-    assert_eq!(metadata["transport"], "uds");
-    assert_eq!(
-        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    let endpoint = metadata["endpoint"].as_str().expect("UDS endpoint");
-    assert!(fs::symlink_metadata(endpoint)
-        .unwrap()
-        .file_type()
-        .is_socket());
-    assert_eq!(
-        fs::metadata(endpoint).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    uds_mcp(endpoint);
+    #[cfg(unix)]
+    {
+        assert_eq!(metadata["transport"], "uds");
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let endpoint = metadata["endpoint"].as_str().expect("UDS endpoint");
+        assert!(fs::symlink_metadata(endpoint)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        assert_eq!(
+            fs::metadata(endpoint).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(metadata["transport"], "pipe");
+        let endpoint = metadata["endpoint"].as_str().expect("pipe endpoint");
+        assert!(
+            endpoint.starts_with(r"\\.\pipe\code-graph-mcp-"),
+            "pipe endpoint is namespaced per daemon instance: {endpoint}"
+        );
+    }
+    ipc_mcp(&metadata);
 
-    stop_owned_daemon(&metadata);
+    stop_owned_daemon(&root.0, &metadata);
     daemon.wait();
     wait_for_cleanup(&root.0);
     assert!(!runtime.join("daemon.sock").exists(), "UDS cleanup");
@@ -400,8 +465,8 @@ fn simultaneous_serve_contenders_converge_twenty_times_without_leaks() {
                 child.wait();
             }
         }
-        uds_mcp(metadata["endpoint"].as_str().unwrap());
-        stop_owned_daemon(&metadata);
+        ipc_mcp(&metadata);
+        stop_owned_daemon(&root.0, &metadata);
         children[winner_index].wait();
         wait_for_cleanup(&root.0);
         assert!(
@@ -435,13 +500,18 @@ fn simultaneous_contenders_recover_one_stale_lock() {
             child.wait();
         }
     }
-    uds_mcp(metadata["endpoint"].as_str().unwrap());
-    stop_owned_daemon(&metadata);
+    ipc_mcp(&metadata);
+    stop_owned_daemon(&root.0, &metadata);
     children[winner_index].wait();
     wait_for_cleanup(&root.0);
     assert!(!runtime.join("daemon.lock").exists(), "lock cleanup");
 }
 
+/// TCP fallback is forced by occupying the UDS pathname, which only exists on
+/// Unix. Windows pipe names are per-PID (`code-graph-mcp-{pid}`), so a bind
+/// collision cannot be staged externally; the TCP auth matrix has in-process
+/// coverage in `daemon.rs` unit tests on every platform.
+#[cfg(unix)]
 #[test]
 fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
     let _guard = process_test_guard();
@@ -496,7 +566,7 @@ fn tcp_fallback_authenticates_and_rotates_after_crash_recovery() {
     );
     tcp_mcp(second_metadata["endpoint"].as_str().unwrap(), &second_token);
 
-    stop_owned_daemon(&second_metadata);
+    stop_owned_daemon(&root.0, &second_metadata);
     second.wait();
     wait_for_cleanup(&root.0);
     assert!(fs::symlink_metadata(&socket_path)
@@ -528,7 +598,7 @@ fn idle_daemon_exits_at_zero_clients_and_zero_never_exits() {
         &mut daemon,
         "zero idle timeout must not exit during observation",
     );
-    stop_owned_daemon(&metadata);
+    stop_owned_daemon(&never.0, &metadata);
     daemon.wait();
     wait_for_cleanup(&never.0);
 }
@@ -541,7 +611,7 @@ fn attached_client_and_disconnect_restart_the_full_idle_timeout() {
     let metadata = wait_for_metadata(&root.0);
     // Attach promptly, hold beyond the timeout, then verify disconnect starts
     // a fresh interval rather than resuming an elapsed zero-client countdown.
-    let stream = uds_connect(metadata["endpoint"].as_str().unwrap());
+    let stream = ipc_connect(&metadata);
     thread::sleep(Duration::from_millis(2_300));
     assert_alive(&mut daemon, "attached client must prevent idle exit");
     drop(stream);
@@ -573,7 +643,7 @@ fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
     ];
     let mut daemon = DaemonChild::spawn_with_env(&root.0, true, &environment);
     let metadata = wait_for_metadata(&root.0);
-    let response = uds_analyze(metadata["endpoint"].as_str().unwrap(), &root.0, true, true);
+    let response = ipc_analyze(&metadata, &root.0, true, true);
     assert_eq!(
         response["result"]["content"][0]["text"]
             .as_str()
@@ -596,12 +666,7 @@ fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
 
     let mut warm = DaemonChild::spawn(&root.0, true);
     let warm_metadata = wait_for_metadata(&root.0);
-    let response = uds_analyze(
-        warm_metadata["endpoint"].as_str().unwrap(),
-        &root.0,
-        false,
-        false,
-    );
+    let response = ipc_analyze(&warm_metadata, &root.0, false, false);
     assert!(response["result"].is_object(), "warm analyze succeeds");
     warm.wait();
     wait_for_cleanup(&root.0);
@@ -617,6 +682,9 @@ fn idle_waits_for_delayed_async_analyze_then_persists_a_warm_cache() {
     );
 }
 
+/// See `tcp_fallback_authenticates_and_rotates_after_crash_recovery` for why
+/// TCP forcing is Unix-only.
+#[cfg(unix)]
 #[test]
 fn unauthenticated_tcp_socket_does_not_hold_idle_daemon_alive() {
     let _guard = process_test_guard();
