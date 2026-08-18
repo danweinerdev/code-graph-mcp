@@ -450,11 +450,13 @@ fn package_level_closure_call_attributes_to_file_path_in_handler_go() {
     let handler = corpus.get("handler.go").expect("handler.go in corpus");
     // The Println edges in handler.go are: file-path -> Println (Logger),
     // handle -> Println, withLog -> Println. We're looking for the one
-    // whose `from` is the bare path (no `:`).
+    // whose `from` is the bare path — i.e. no `:symbol` suffix after the
+    // file path. (`!contains(':')` would be wrong on Windows, where the
+    // absolute path itself carries a drive colon.)
     let logger_edge = handler
         .edges
         .iter()
-        .find(|e| e.kind == EdgeKind::Calls && e.to == "Println" && !e.from.contains(':'))
+        .find(|e| e.kind == EdgeKind::Calls && e.to == "Println" && e.from.ends_with("handler.go"))
         .unwrap_or_else(|| {
             panic!(
                 "expected one Calls edge with To=Println and bare-path \

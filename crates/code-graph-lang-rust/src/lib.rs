@@ -3326,18 +3326,26 @@ mod tests {
     /// absolute path → `Some(path)`.
     #[test]
     fn resolve_include_indexed_absolute_path_returns_some() {
+        // `resolve_include` gates on `Path::is_absolute()`, and `/proj/...`
+        // is not absolute on Windows (no drive prefix) — use a fixture that
+        // is absolute on the host platform.
+        #[cfg(unix)]
+        const ABSOLUTE_FOO: &str = "/proj/src/foo.rs";
+        #[cfg(windows)]
+        const ABSOLUTE_FOO: &str = r"C:\proj\src\foo.rs";
+
         let parser = RustParser::new().expect("RustParser::new");
         let mut file_index = FileIndex::new();
         file_index
             .by_basename
             .entry("foo.rs".to_string())
             .or_default()
-            .push(PathBuf::from("/proj/src/foo.rs"));
+            .push(PathBuf::from(ABSOLUTE_FOO));
 
-        let resolved = parser.resolve_include("/proj/src/foo.rs", &file_index);
+        let resolved = parser.resolve_include(ABSOLUTE_FOO, &file_index);
         assert_eq!(
             resolved,
-            Some((PathBuf::from("/proj/src/foo.rs"), Confidence::Resolved)),
+            Some((PathBuf::from(ABSOLUTE_FOO), Confidence::Resolved)),
             "indexed absolute path must resolve to itself with Resolved confidence — \
              the Rust override never produces Heuristic (mod-decl + #[path] are \
              definitive, not basename guesses)"
