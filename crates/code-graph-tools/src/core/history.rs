@@ -373,7 +373,8 @@ pub struct SymbolHistoryResponse {
     /// Revisions the walk considered, including skipped ones.
     pub revisions_examined: u32,
     /// The window filled to `window` revisions — older revisions touching
-    /// this file exist beyond the window.
+    /// this file MAY exist beyond the window (a history exactly `window`
+    /// revisions long also sets this; the flag is conservative).
     pub window_filled: bool,
     /// The provider stopped examining history at its internal bound before
     /// exhausting reachable history (distinct from `window_filled`).

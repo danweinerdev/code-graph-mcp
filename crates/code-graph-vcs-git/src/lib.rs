@@ -150,8 +150,19 @@ fn read_at(project_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>, 
         .lookup_entry_by_path(relative_path)
         .map_err(|error| VcsError::Operation(format!("read tree entry for {revision}: {error}")))?
         .ok_or_else(|| VcsError::NotFound(format!("{} at {revision}", path.display())))?;
+    // The tree entry EXISTS past this point: a blob lookup failure is an
+    // unreadable object (partial clone without the blob, corrupt object
+    // store, non-blob entry such as a gitlink), NOT path absence. It must
+    // surface as `Operation` — consumers treat `NotFound` as a
+    // deterministic, cacheable "path absent at this revision" (a
+    // `symbol_history` deletion transition and a permanent tombstone), and
+    // a read failure mapped there would manufacture false `removed`
+    // entries that never heal.
     let blob = repository.find_blob(entry.oid()).map_err(|error| {
-        VcsError::NotFound(format!("{} at {revision}: {error}", path.display()))
+        VcsError::Operation(format!(
+            "read blob for {} at {revision}: {error}",
+            path.display()
+        ))
     })?;
     Ok(blob.data.to_vec())
 }
@@ -1390,6 +1401,55 @@ mod harness {
                 .collect::<Vec<_>>(),
             [boundary_revision.as_str()],
             "exactly the boundary commit is reported, as git log does"
+        );
+    }
+
+    /// Gate artifact 18 (cycle 2, M1): a tree entry that EXISTS but whose
+    /// object cannot be read as a blob (gitlink/submodule commit oid whose
+    /// object is absent — same shape as a `--filter=blob:none` partial
+    /// clone or a corrupt object store) must surface as `Operation`, never
+    /// `NotFound`. Consumers treat `NotFound` as deterministic "path absent
+    /// at this revision" and cache it permanently; a read failure mapped
+    /// there would manufacture false `removed` transitions that never heal.
+    #[tokio::test]
+    async fn read_at_reports_unreadable_blob_as_operation_not_absence() {
+        use super::GitProvider;
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        // A gitlink entry (mode 160000) whose commit object does not exist
+        // in this repository — exactly how a submodule rides in a tree.
+        fixture
+            .git(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,0123456789abcdef0123456789abcdef01234567,vendored/module",
+            ])
+            .expect("stage gitlink entry");
+        fixture
+            .commit_staged("add gitlink entry", "2001-01-02T00:00:00+0000")
+            .expect("commit gitlink entry");
+
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+        let head = provider.resolve_rev("HEAD").await.expect("resolve HEAD");
+
+        let unreadable = provider
+            .read_at(&head, Path::new("vendored/module"))
+            .await
+            .expect_err("a gitlink entry is not a readable blob");
+        assert!(
+            matches!(unreadable, VcsError::Operation(_)),
+            "an existing-but-unreadable entry is an Operation failure, got: {unreadable:?}"
+        );
+
+        let absent = provider
+            .read_at(&head, Path::new("src/never_existed.rs"))
+            .await
+            .expect_err("an absent path has no bytes");
+        assert!(
+            matches!(absent, VcsError::NotFound(_)),
+            "genuine path absence keeps the NotFound contract, got: {absent:?}"
         );
     }
 

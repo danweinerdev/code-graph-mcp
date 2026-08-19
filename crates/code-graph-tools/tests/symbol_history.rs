@@ -677,6 +677,82 @@ async fn symbol_history_skipped_oldest_marks_boundary() {
     );
 }
 
+/// `history_truncated` is plumbed from `RevisionWindow.truncated` to the
+/// wire, and it alone (window unfilled, nothing skipped) makes an oldest
+/// `introduced` boundary-ambiguous (gate artifact 18 cycle-2 test gap).
+#[tokio::test]
+async fn symbol_history_provider_truncation_reaches_the_wire() {
+    use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+
+    struct TruncatedProvider;
+
+    #[async_trait::async_trait]
+    impl VcsProvider for TruncatedProvider {
+        fn id(&self) -> &'static str {
+            "truncated-history"
+        }
+        fn detect(&self, _working_tree: &Path) -> bool {
+            true
+        }
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: vec![Commit {
+                    rev: RevId::new("rev-visible"),
+                    author: "fixture".to_string(),
+                    timestamp_utc: 0,
+                    summary: "the provider stopped examining here".to_string(),
+                }],
+                truncated: true,
+            })
+        }
+        async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            Ok(b"pub fn target_function() -> u32 {\n    1\n}\n".to_vec())
+        }
+        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec))
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(TruncatedProvider)).unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 {\n    1\n}\n",
+    )
+    .unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let symbol = symbol_id(dir.path(), "lib.rs", "target_function");
+
+    let body = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert_eq!(
+        body["history_truncated"],
+        serde_json::json!(true),
+        "the provider's internal examination bound reaches the wire: {body}"
+    );
+    assert_eq!(body["window_filled"], serde_json::json!(false));
+    assert!(body["skipped"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["entries"][0]["at_window_boundary"],
+        serde_json::json!(true),
+        "provider truncation alone makes the oldest introduction boundary-ambiguous: {body}"
+    );
+}
+
 /// NFR-10: a hung provider delays only the history tool; an unrelated query
 /// completes while the walk is gated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
