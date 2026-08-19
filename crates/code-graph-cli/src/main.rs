@@ -14,6 +14,7 @@
 mod args;
 mod daemon_client;
 mod exec;
+mod render;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -123,9 +124,10 @@ fn daemon_metadata_path(project_root: &std::path::Path) -> PathBuf {
     project_root.join(".code-graph").join("daemon.json")
 }
 
-/// Machine mode prints the payload verbatim; human mode is an interim
-/// pretty-print of the same payload until task 7.3 lands the per-shape
-/// renderer (both modes read the SAME payload text — Decision 4).
+/// Machine mode prints the payload verbatim; human mode renders FROM the
+/// same payload JSON through the per-shape renderer (Decision 4 — one
+/// payload, one renderer; `ToolOk::Text` bodies pass through verbatim in
+/// both modes).
 fn render(outcome: Outcome, json_mode: bool) {
     match outcome {
         Outcome::Json(payload) => {
@@ -133,10 +135,7 @@ fn render(outcome: Outcome, json_mode: bool) {
                 println!("{payload}");
             } else {
                 match serde_json::from_str::<serde_json::Value>(&payload) {
-                    Ok(value) => println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or(payload)
-                    ),
+                    Ok(value) => print!("{}", render::human(&value)),
                     Err(_) => println!("{payload}"),
                 }
             }

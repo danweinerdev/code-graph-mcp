@@ -49,6 +49,27 @@ If the server is registered under a name other than `code-graph`, the
 `mcp__code-graph__*` tool names in the skills/nudge won't resolve — keep the
 server name `code-graph`.
 
+## Command-line usage (outside a session)
+
+The same queries are available from a terminal via the `code-graph` binary
+(built alongside `code-graph-mcp`; crate `code-graph-cli`). Subcommands
+mirror the MCP tool names kebab-cased, and `--json` prints the exact MCP
+payload, so anything a skill teaches about a tool's response shape applies
+verbatim to the CLI:
+
+```bash
+code-graph analyze-codebase              # index the current directory
+code-graph search-symbols MyClass --json
+code-graph get-callers 'src/lib.rs:handle' --limit 20
+code-graph blame-symbol 'src/lib.rs:handle'
+```
+
+Exit statuses: `0` success (including success-shaped negatives like
+`found: false`), `1` tool error (unknown symbol, unindexed repo), `2`
+operational failure. When a repository daemon is running the CLI attaches
+to it (never spawns or replaces one); otherwise it answers from the
+on-disk cache.
+
 ## Enable it
 
 Load the plugin directory directly — this activates its hooks and skills for the
