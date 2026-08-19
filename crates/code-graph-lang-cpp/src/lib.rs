@@ -1255,3 +1255,73 @@ mod fingerprint {
         );
     }
 }
+
+/// Gate artifact 20 pin: the extractor records the INNER definition node's
+/// position (the `template_declaration` wrapper starts at the `template`
+/// keyword — a different position that can never exact-match), so the
+/// fingerprint covers exactly the inner node's span. Consequence, pinned
+/// deliberately: a template-parameter-list-only edit is INVISIBLE under
+/// both modes, while a body edit inside the templated definition stays
+/// visible. If a future extractor change records the wrapper instead,
+/// this test fails and the docs (locate_symbol_node's comment + the
+/// CLAUDE.md fingerprint matrix) must flip with it.
+#[cfg(test)]
+mod fingerprint_template_boundary {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::CppParser;
+
+    fn symbol_in(parser: &CppParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.cpp"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &CppParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for C++")
+    }
+
+    #[test]
+    fn template_parameter_list_is_outside_the_fingerprinted_span() {
+        let parser = CppParser::new().unwrap();
+        let one: &[u8] = b"template <typename T>\nT identity(T value) {\n    return value;\n}\n";
+        let two: &[u8] =
+            b"template <typename T, int N>\nT identity(T value) {\n    return value;\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "identity", mode),
+                fp(&parser, two, "identity", mode),
+                "the template clause is the wrapper's span, not the recorded \
+                 inner node's — invisible by the extractor's span convention ({mode:?})"
+            );
+        }
+
+        // The boundary cuts one way only: a body edit inside the templated
+        // definition stays visible.
+        let three: &[u8] =
+            b"template <typename T>\nT identity(T value) {\n    return value + value;\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_ne!(
+                fp(&parser, one, "identity", mode),
+                fp(&parser, three, "identity", mode),
+                "body edits inside the templated definition stay visible ({mode:?})"
+            );
+        }
+    }
+}

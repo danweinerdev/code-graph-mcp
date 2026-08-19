@@ -255,7 +255,7 @@ pub enum Command {
     /// When did this symbol's CONTENT change (transitions only)
     SymbolHistory {
         symbol: String,
-        /// normalized (default); literal_insensitive arrives in a later phase
+        /// normalized (default) or literal_insensitive (ignores literal VALUES); both modes work for all six languages
         #[arg(long)]
         mode: Option<String>,
         /// Revisions to examine (default 50, max 500)

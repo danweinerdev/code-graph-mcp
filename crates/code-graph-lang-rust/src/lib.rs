@@ -1156,13 +1156,21 @@ impl LanguagePlugin for RustParser {
     /// Rust has no `preprocess` pass, so `content` is the raw revision
     /// bytes — the same bytes `parse_file` saw.
     ///
-    /// Mode participation decisions (task 8.2): doc comments (`///`,
-    /// `//!`, `/** */`) parse as comment nodes and are invisible under
-    /// BOTH modes — they are comments. Attributes (`#[derive(...)]`,
-    /// `#[cfg(...)]`) are code and contribute under both modes — a derive
-    /// change is a logic change. A string literal INSIDE an attribute
-    /// (`#[doc = "..."]`, `#[path = "..."]`) is still a literal node and
-    /// follows the mode like any other literal value.
+    /// Mode participation decisions (task 8.2, boundary corrected by gate
+    /// artifact 20): doc comments (`///`, `//!`, `/** */`) parse as
+    /// comment nodes and are invisible under BOTH modes — they are
+    /// comments. Attributes participate as code ONLY when they sit inside
+    /// the located subtree (e.g. `#![...]` inner attributes, or
+    /// `#[allow(...)]` on a statement inside the body). OUTER attributes
+    /// on the symbol itself — `#[derive(...)]`, `#[cfg(...)]` above a
+    /// struct/fn — are `attribute_item` SIBLINGS of the item node in
+    /// tree-sitter-rust, outside the extractor-recorded span and therefore
+    /// outside the fingerprinted subtree: a derive-only edit produces NO
+    /// fingerprint change and no `symbol_history` transition. This is the
+    /// same span convention Python decorators live under (a documented
+    /// extraction boundary, not a fingerprint defect). A string literal
+    /// INSIDE a participating attribute (`#[doc = "..."]`,
+    /// `#[path = "..."]`) is still a literal node and follows the mode.
     fn fingerprint_symbol(
         &self,
         content: &[u8],
@@ -1202,6 +1210,12 @@ impl LanguagePlugin for RustParser {
 /// kind still contributes, so adding or removing a literal stays visible
 /// under both modes.
 fn rust_literal_kind(kind: &str) -> bool {
+    // tree-sitter-rust v0.24.2 folds byte/C-string forms into the kinds
+    // below: `b"…"`/`c"…"` lex as `string_literal`, `br`/`cr` forms as
+    // `raw_string_literal`, `b'x'` as `char_literal` — there are no
+    // separate byte/c-string kinds in this grammar (verified against the
+    // vendored node-types.json; gate artifact 20 removed four phantom
+    // spellings that implied otherwise).
     matches!(
         kind,
         "string_literal"
@@ -1210,10 +1224,6 @@ fn rust_literal_kind(kind: &str) -> bool {
             | "integer_literal"
             | "float_literal"
             | "boolean_literal"
-            | "byte_literal"
-            | "byte_string_literal"
-            | "raw_byte_string_literal"
-            | "c_string_literal"
     )
 }
 
@@ -3684,10 +3694,7 @@ mod fingerprint {
             );
         }
 
-        // Attributes participate: structs carry derives in the fixture
-        // because the extractor's span for a fn does not include a
-        // preceding attribute line unless the node does — use an inline
-        // cfg attribute inside the body instead, which is unambiguous.
+        // Attributes INSIDE the located subtree are code.
         let plain: &[u8] = b"pub fn gated() -> u32 {\n    { 1 }\n}\n";
         let gated: &[u8] = b"pub fn gated() -> u32 {\n    #[allow(unused)] { 1 }\n}\n";
         for mode in [
@@ -3697,7 +3704,35 @@ mod fingerprint {
             assert_ne!(
                 fp(&parser, plain, "gated", mode),
                 fp(&parser, gated, "gated", mode),
-                "attributes are code ({mode:?})"
+                "attributes inside the located subtree are code ({mode:?})"
+            );
+        }
+    }
+
+    /// The OTHER side of the attribute boundary, pinned deliberately
+    /// (gate artifact 20): OUTER attributes on the symbol itself are
+    /// `attribute_item` SIBLINGS of the item node in tree-sitter-rust —
+    /// outside the extractor-recorded span, outside the fingerprinted
+    /// subtree. A derive-only edit is NOT a `symbol_history` transition.
+    /// This test exists so the limitation is a documented contract, not a
+    /// silent surprise: if a future extractor change widens the span to
+    /// include outer attributes, this test fails and the docs (override
+    /// doc comment + CLAUDE.md fingerprint matrix) must flip with it.
+    #[test]
+    fn outer_attributes_are_outside_the_fingerprinted_span() {
+        let parser = RustParser::new().unwrap();
+        let bare: &[u8] = b"pub struct Config {\n    pub value: u32,\n}\n";
+        let derived: &[u8] =
+            b"#[derive(Clone, Debug)]\npub struct Config {\n    pub value: u32,\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, bare, "Config", mode),
+                fp(&parser, derived, "Config", mode),
+                "outer attributes are siblings of the item node — outside the \
+                 fingerprinted span, same convention as Python decorators ({mode:?})"
             );
         }
     }

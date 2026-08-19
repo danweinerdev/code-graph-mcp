@@ -305,10 +305,22 @@ fn char_literal_end(span: &[u8], start: usize) -> Option<usize> {
 
 /// Locates the AST node for `symbol`'s span in a freshly parsed tree of the
 /// same content the span was extracted from: exact start `(row, column)`
-/// and end-row match, outermost (first in pre-order) named node winning so
-/// wrapper nodes (e.g. `template_declaration`) fingerprint their whole
-/// declaration. Returns `None` when no node matches — synthesized symbols
-/// (`[cpp].macro_define_function`) and heavily error-recovered spans.
+/// and end-row match, outermost (first in pre-order) named node winning
+/// when several named nodes share the exact same span. Returns `None` when
+/// no node matches — synthesized symbols (`[cpp].macro_define_function`)
+/// and heavily error-recovered spans.
+///
+/// **The located node is the one the EXTRACTOR recorded, wrappers
+/// excluded.** Every extractor records `def_node.start_position()` of the
+/// inner definition node — a C++ `template_declaration` wrapper starts at
+/// the `template` keyword, a different position, so it can never
+/// exact-match: the walk fingerprints the inner `function_definition` /
+/// `class_specifier`, and a template-parameter-list-only edit
+/// (`template<typename T>` → `template<typename T, int N>`) is INVISIBLE
+/// under both modes. Same boundary as Rust outer attributes and Python
+/// decorators: the span convention is the extractor's, and the
+/// fingerprint honestly covers exactly that span (pinned per language by
+/// the `mod fingerprint` suites).
 pub fn locate_symbol_node<'t>(
     root: tree_sitter::Node<'t>,
     symbol: &Symbol,
