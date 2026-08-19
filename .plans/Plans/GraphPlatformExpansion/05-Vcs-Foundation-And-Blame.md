@@ -33,14 +33,14 @@ tasks:
     depends_on: ["5.2", "5.3", "5.5"]
   - id: "5.6"
     title: "Resolve the phase-gate review findings"
-    status: in-progress
+    status: complete
     justifies: "Material findings from the phase 5 four-lane gate review (artifact 15): F1 detect-vs-bound-root split (misleading unavailability, wrong-repo attribution in nested checkouts); F2 byte-exact staleness compare permanently stale on autocrlf checkouts; F3 whole-file blame cost despite gix range support; plus silent staleness degradations, empty-hunk shape signal, inline blocking reads, comment overclaims, and a missing injection breadcrumb."
     verification: "cargo test -p code-graph-vcs-git && cargo test -p code-graph-tools --test blame_symbol — detection selects the provider only for its bound tree and a file owned by a different repository reports as such (not as 'untracked'); a CRLF-normalized checkout is not stale; blame requests only the symbol's range from gix and clamps a span beyond the revision's EOF instead of erroring; unverifiable staleness carries an explicit reason; the AC-36-letter registry test selects git alongside a second double."
     depends_on: ["5.4", "5.5"]
   - id: "5.5"
     title: "Absorb the adversarial-review findings on the git provider"
     status: complete
-    justifies: "Review 2986df0-series adversarial findings M3/M4/M5 on the phase 5 provider: blame's `at: None` contract claimed working-tree attribution while gix blames committed state; revisions_touching walked unbounded history with no node cap (minutes of CPU on engine-scale repos for a stale path); a shallow-clone boundary hard-errored the whole call instead of terminating the walk the way git log does. blame_symbol builds directly on these operations, so the findings must land before the tool does."
+    justifies: "Adversarial full-branch review findings M3/M4/M5 (reviews/14-adversarial-branch-review-1db21d6-1c96bbf.md) on the phase 5 provider: blame's `at: None` contract claimed working-tree attribution while gix blames committed state; revisions_touching walked unbounded history with no node cap (minutes of CPU on engine-scale repos for a stale path); a shallow-clone boundary hard-errored the whole call instead of terminating the walk the way git log does. blame_symbol builds directly on these operations, so the findings must land before the tool does."
     verification: "cargo test -p code-graph-vcs-git — a --depth-1 file:// shallow clone returns its boundary commit from revisions_touching instead of erroring; the revwalk visit cap is asserted structurally (bounded loop, cap constant documented); the trait doc for blame's at: None names the provider default revision (Git: HEAD) rather than promising working-tree attribution."
     depends_on: ["5.2", "5.3"]
 ---
@@ -209,22 +209,24 @@ Line-granular attribution is a real limitation — `Symbol` has no end column �
 | Tool / inspection | Context | Result | Observable evidence |
 |---|---|---|---|
 | `agent-facing description lens (AC-45)` | `tools_list_blame_symbol snapshot` | PASS | `Description names the response envelope field-by-field, documents both arguments with defaults, states the committed-state/staleness contract, the line-granularity limitation, and the success-shaped unavailability trichotomy.` |
+### Trap
 Hand-asserting expected authors and SHAs in the blame test. The fixture's commit ids change whenever the harness script changes, so hand-asserted values rot into either constant maintenance or a disabled test. Diff against `git blame --porcelain` output and let git be the oracle.
 
 ## 5.5: Absorb the adversarial-review findings on the git provider
 
 ### Subtasks
-- [ ] Correct the `VcsProvider::blame` doc contract: `at: None` selects the provider's default revision (Git: HEAD, committed state), not working-tree attribution
-- [ ] Bound `revisions_touching`'s manual revwalk with a visited-commit cap, mirroring `find_path`'s node-cap discipline
-- [ ] Treat an unreadable parent commit as a history boundary (shallow clone), terminating the walk the way `git log` does instead of erroring the call
-- [ ] Shallow-clone regression test via `git clone --depth 1 file://…` in the fixture harness
+- [x] Correct the `VcsProvider::blame` doc contract: `at: None` selects the provider's default revision (Git: HEAD, committed state), not working-tree attribution
+- [x] Bound `revisions_touching`'s manual revwalk with a visited-commit cap, mirroring `find_path`'s node-cap discipline
+- [x] Treat an unreadable parent commit as a history boundary (shallow clone), terminating the walk the way `git log` does instead of erroring the call
+- [x] Shallow-clone regression test via `git clone --depth 1 file://…` in the fixture harness
 
 ### Notes
 Revision boundary: the provider operations `blame_symbol` builds on are
 contract-honest and bounded before the tool consumes them.
 
-These are review findings M3/M4/M5 from the adversarial full-range review of
-this branch, filed against the already-committed tasks 5.1–5.2. M3 is a
+These are review findings M3/M4/M5 from the adversarial full-branch review
+(persisted as `reviews/14-adversarial-branch-review-1db21d6-1c96bbf.md`),
+filed against the already-committed tasks 5.1–5.2. M3 is a
 documentation-contract fix (gix has no working-tree blame; the tool layer
 compensates with the 5.4 staleness flag). M4/M5 change walk termination only:
 results for healthy full-history repositories are unchanged.
@@ -247,6 +249,43 @@ results for healthy full-history repositories are unchanged.
 | Tool / inspection | Context | Result | Observable evidence |
 |---|---|---|---|
 | `focused diff review` | `git show 6dcbf28` | PASS | `Walk-termination changes only (cap + boundary); healthy-repo results unchanged, pinned by the 9 pre-existing harness tests staying green; blame contract now names the provider default revision.` |
+
+## 5.6: Resolve the phase-gate review findings
+
+### Subtasks
+- [x] F1: make `GitProvider::detect` an identity check on the bound tree, and verify per-operation that the queried file belongs to it (submodules/nested clones report "belongs to a different repository", success-shaped)
+- [x] F2: line-ending-insensitive staleness comparison (autocrlf checkouts verify clean)
+- [x] F3/F4: hand gix the symbol's range (`BlameRanges`), clamped to the blamed revision's EOF; clip entries before decoding their commits
+- [x] F6: explicit `stale_reason` when the comparison cannot run or the span has no attributable lines; on-disk reads via `tokio::fs`
+- [x] F8: stderr breadcrumb for unexpected provider-open failures at injection
+- [x] Comment repairs (revwalk-cap claim, gated-test claim) and the AC-36-letter registry test (git alongside a second double)
+
+### Notes
+Revision boundary: every material finding from gate-review artifact 15's
+first cycle is closed with a pinned regression test; the remaining review
+observations (inline `vcs.detect` discovery cost, the git-specific `"HEAD"`
+default-revision echo behind the provider-neutral trait) are accepted
+follow-ups recorded in the review artifact, not silent omissions.
+
+### Completion Evidence
+
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-18 17:55 matched `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Focused review: `git show 569722264dfb83cd781c72ee9c4444eb393aff57`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy (deny warnings), rustfmt check, full workspace tests (1,856 passed, 0 failed), pending-snapshot check, and plugin-mirror sync all green natively on Windows — AC-27.` |
+| `cargo test -p code-graph-vcs-git && cargo test -p code-graph-tools --test blame_symbol` | `.` | PASS (`exit 0`) | `13 provider tests (foreign-repo refusal, EOF clamp, registry-with-git selection, shallow boundary, oracle parity) and 9 tool tests (CRLF-clean staleness, unverified-staleness note, porcelain oracle) passed.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 5697222` | PASS | `Scope confined to the gate findings: provider identity/ownership checks, ranged+clamped blame, EOL-insensitive + tri-state staleness reporting, breadcrumb, comment repairs, and their tests.` |
 
 ## Acceptance Criteria
 

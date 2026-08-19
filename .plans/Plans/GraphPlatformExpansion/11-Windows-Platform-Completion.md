@@ -38,10 +38,10 @@ existing named-pipe, path, process, and ACL seams and makes Windows a
 supported platform through native evidence. Linux and cross-target results do
 not substitute for Windows execution.
 
-### Pull-forward state (2026-08-18, working tree — not yet committed)
+### Pull-forward state (2026-08-18; committed as `ccd9e11..89a2af2`)
 
-Landed natively on Windows (uncommitted; task evidence stays pending until a
-durable revision exists):
+Landed natively on Windows (task evidence stays pending until this phase's
+own gate; the commit series is the durable identity):
 
 - **11.1 substantially done.** `cargo clippy --workspace --all-targets -- -D
   warnings`, `cargo fmt --all --check`, and the full `cargo test --workspace`
