@@ -27,13 +27,13 @@ tasks:
     depends_on: ["8.1"]
   - id: "8.4"
     title: "AST fingerprint override for Python"
-    status: in-progress
+    status: complete
     justifies: "FR-34, AC-39. Python's significant indentation makes it the case where a naive whitespace-collapsing normalizer and an AST fingerprint diverge most, so it validates that the override genuinely supersedes the text default."
     verification: "cargo test -p code-graph-lang-python fingerprint:: — LiteralInsensitive returns Some; literal-only change invisible under LiteralInsensitive (AC-39); a change to indentation that alters block structure IS reported under both modes, distinguishing structural whitespace from cosmetic whitespace."
     depends_on: ["8.1"]
   - id: "8.5"
     title: "AST fingerprint override for C#"
-    status: planned
+    status: in-progress
     justifies: "FR-34, AC-39. Completes literal-insensitive coverage for C#."
     verification: "cargo test -p code-graph-lang-csharp fingerprint:: — LiteralInsensitive returns Some; literal-only change invisible under LiteralInsensitive, visible under Normalized (AC-39); reformatting invisible under both."
     depends_on: ["8.1"]
@@ -166,18 +166,35 @@ Go is also the language that makes the 8.2 shared-walk comma fix load-bearing ra
 ## 8.4: AST fingerprint override for Python
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `PythonParser` following the 8.1 shape
-- [ ] Verify that structural indentation changes are reported while cosmetic ones are not
-- [ ] Tests per the verification field
+- [x] Implement `fingerprint_symbol` on `PythonParser` following the 8.1 shape
+- [x] Verify that structural indentation changes are reported while cosmetic ones are not
+- [x] Tests per the verification field
 
 ### Notes
 Revision boundary: Python supports both modes.
 
 Python is where the text default is weakest and the AST override earns the most: collapsing whitespace runs is exactly wrong for a language where indentation determines block structure. A re-indent that moves a statement into or out of a block is a logic change, and the AST walk gets that right where the text default cannot.
 
+**F-string decision (made at implementation).** The literal predicate matches `string_content`/`escape_sequence`, NOT the whole `string` node: interpolated EXPRESSIONS inside f-strings are code and stay visible under both modes; only the literal text around them follows the mode. Docstrings are string nodes, not comments — their text follows the literal mode. The test fixture also documents a subtlety: a literal INSIDE an interpolation (`f"{x + 1}"` → `f"{x + 2}"`) is still a literal and correctly follows the mode — the structural-change discriminator must swap an operator, not a number.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `b39704f4e8f3d9089dafe18a61008f360fa30444`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:22 matched `b39704f4e8f3d9089dafe18a61008f360fa30444`
+- Focused review: `git show b39704f4e8f3d9089dafe18a61008f360fa30444`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `b39704f4e8f3d9089dafe18a61008f360fa30444`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-python fingerprint:: && cargo clippy -p code-graph-lang-python --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `4 tests passed: LiteralInsensitive returns Some for Python; string AND numeric literal-only changes track the mode (AC-39); block-membership indentation is content while a uniform indent-width change plus comments is cosmetic (the Python-specific discriminator the task verification names); f-string interpolation structural change visible under LiteralInsensitive while the surrounding literal text follows the mode. Clippy denied no warnings. Full make verify rides with task 8.6's workspace gate.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show b39704f` | PASS | `1 file: the override mirrors the 8.1 shape verbatim; the f-string token-level literal predicate is the task's one non-mechanical decision and is documented on the override and the predicate; no shared-walk changes needed.` |
 
 ## 8.5: AST fingerprint override for C#
 
