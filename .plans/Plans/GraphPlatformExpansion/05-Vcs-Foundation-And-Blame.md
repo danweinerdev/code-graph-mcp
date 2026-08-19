@@ -31,6 +31,12 @@ tasks:
     justifies: "FR-32, FR-36, NFR-10, NFR-11, AC-21, AC-22, AC-44, AC-45. Blame against a moved working tree silently attributes the wrong lines, which is worse than refusing — the graph's span refers to a file state that no longer exists."
     verification: "cargo test -p code-graph-tools blame_symbol — per-line attribution matches git blame --porcelain -L <line>,<end_line> for the same revision, using the git output as oracle rather than hand-asserted values (AC-21); in a directory under no supported VCS the tool reports unavailability as a success and every other tool behaves normally (AC-22); with a deliberately slow provider a concurrent non-history query returns in its normal time (AC-44, NFR-10); a file modified after indexing without a matching commit returns results flagged stale; the tool description meets the agent-facing lens (AC-45)."
     depends_on: ["5.2", "5.3", "5.5"]
+  - id: "5.6"
+    title: "Resolve the phase-gate review findings"
+    status: in-progress
+    justifies: "Material findings from the phase 5 four-lane gate review (artifact 15): F1 detect-vs-bound-root split (misleading unavailability, wrong-repo attribution in nested checkouts); F2 byte-exact staleness compare permanently stale on autocrlf checkouts; F3 whole-file blame cost despite gix range support; plus silent staleness degradations, empty-hunk shape signal, inline blocking reads, comment overclaims, and a missing injection breadcrumb."
+    verification: "cargo test -p code-graph-vcs-git && cargo test -p code-graph-tools --test blame_symbol — detection selects the provider only for its bound tree and a file owned by a different repository reports as such (not as 'untracked'); a CRLF-normalized checkout is not stale; blame requests only the symbol's range from gix and clamps a span beyond the revision's EOF instead of erroring; unverifiable staleness carries an explicit reason; the AC-36-letter registry test selects git alongside a second double."
+    depends_on: ["5.4", "5.5"]
   - id: "5.5"
     title: "Absorb the adversarial-review findings on the git provider"
     status: complete

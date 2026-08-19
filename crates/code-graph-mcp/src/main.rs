@@ -126,10 +126,20 @@ fn vcs_registry() -> code_graph_vcs::VcsRegistry {
     let Ok(root) = code_graph_core::paths::canonicalize(&cwd) else {
         return vcs;
     };
-    if let Ok(provider) = code_graph_vcs_git::GitProvider::open(&root) {
-        if let Err(error) = vcs.register(Box::new(provider)) {
-            eprintln!("code-graph-mcp: register git provider: {error}");
+    match code_graph_vcs_git::GitProvider::open(&root) {
+        Ok(provider) => {
+            if let Err(error) = vcs.register(Box::new(provider)) {
+                eprintln!("code-graph-mcp: register git provider: {error}");
+            }
         }
+        // A cwd outside any repository is the ordinary no-VCS case and
+        // stays silent (FR-36 reports it per call); anything else is a
+        // real failure worth a breadcrumb rather than a silent absence.
+        Err(code_graph_vcs::VcsError::Unavailable(_)) => {}
+        Err(error) => eprintln!(
+            "code-graph-mcp: git provider unavailable at {}: {error}",
+            root.display()
+        ),
     }
     vcs
 }

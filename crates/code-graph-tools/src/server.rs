@@ -1563,9 +1563,13 @@ impl CodeGraphServer {
                        root or this path has no history at the blamed revision; every other \
                        tool works normally either way. `stale: true` means the on-disk file \
                        (which the span's line numbers come from) differs from the blamed \
-                       revision, so attributed line numbers may misalign — commit the edits \
+                       revision (line-ending-insensitive compare, so autocrlf checkouts stay \
+                       clean), so attributed line numbers may misalign — commit the edits \
                        or pass `at` naming a revision matching the indexed state, then \
-                       re-call. Attribution is line-granular: a symbol sharing its first or \
+                       re-call. `stale_reason` may also accompany `stale: false` when the \
+                       comparison could not be performed or the span has no attributable \
+                       lines at the blamed revision; absent `stale_reason` means verified \
+                       clean. Attribution is line-granular: a symbol sharing its first or \
                        last line with another symbol has that shared line attributed to \
                        both. Unknown `symbol` is a tool error with did-you-mean suggestions; \
                        an unresolvable `at` is a tool error naming the bad specifier."

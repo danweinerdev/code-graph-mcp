@@ -47,10 +47,6 @@ impl GitProvider {
         })
     }
 
-    fn is_working_tree(project_root: &Path) -> bool {
-        Self::open(project_root).is_ok()
-    }
-
     async fn blocking<T, F>(&self, operation: F) -> Result<T, VcsError>
     where
         T: Send + 'static,
@@ -70,7 +66,15 @@ impl VcsProvider for GitProvider {
     }
 
     fn detect(&self, working_tree: &Path) -> bool {
-        Self::is_working_tree(working_tree)
+        // A provider is bound to ONE working tree; answering "yes" for any
+        // git tree would let the registry select this provider for a root
+        // whose operations then run against the wrong bound repository
+        // (phase-gate review F1). Detection is an identity check: the probe
+        // must discover the same canonical working tree this provider is
+        // bound to.
+        Self::open(working_tree)
+            .map(|discovered| discovered.project_root == self.project_root)
+            .unwrap_or(false)
     }
 
     async fn blame(
@@ -136,6 +140,7 @@ fn read_at(project_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>, 
     let tree = commit
         .tree()
         .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
+    require_owned_by_bound_repository(project_root, path)?;
     let relative_path = repository_relative_path(project_root, path)?;
     let entry = tree
         .lookup_entry_by_path(relative_path)
@@ -154,6 +159,7 @@ fn blame(
     revision: Option<&str>,
 ) -> Result<Vec<BlameHunk>, VcsError> {
     let repository = open_repository(project_root)?;
+    require_owned_by_bound_repository(project_root, path)?;
     let relative_path = repository_relative_path(project_root, path)?;
     let revision = revision
         .map(|spec| {
@@ -179,58 +185,102 @@ fn blame(
         .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?
         .tree()
         .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
-    if tree
+    let entry = tree
         .lookup_entry_by_path(&relative_path)
         .map_err(|error| VcsError::Operation(format!("read tree entry for {revision}: {error}")))?
-        .is_none()
-    {
-        return Err(VcsError::NotFound(format!(
-            "{} at {revision}",
-            path.display()
-        )));
+        .ok_or_else(|| VcsError::NotFound(format!("{} at {revision}", path.display())))?;
+
+    // Clamp the requested range to the file as it exists at the blamed
+    // revision: the caller's span comes from the (possibly newer) on-disk
+    // file, gix rejects out-of-range blame ranges, and a span lying wholly
+    // beyond this revision's EOF means "no attributable lines" — the tool
+    // layer reports the divergence through its staleness flag — not an
+    // error (phase-gate review F4).
+    let blob = repository.find_blob(entry.oid()).map_err(|error| {
+        VcsError::NotFound(format!("{} at {revision}: {error}", path.display()))
+    })?;
+    let revision_line_count = blob_line_count(&blob.data);
+    let requested = lines.unwrap_or((1, u32::MAX));
+    let range_start = requested.0.max(1);
+    let range_end = requested.1.max(range_start);
+    if range_start > revision_line_count {
+        return Ok(Vec::new());
     }
+    let range_end = range_end.min(revision_line_count);
 
     let tree_path = gix_tree_path(&relative_path, path)?;
+    // Blame only the requested range (phase-gate review F3): whole-file
+    // blame pays the full history-diff walk for every hunk in the file,
+    // which on engine-scale files re-opens the documented MCP-timeout
+    // failure class this codebase works to avoid.
+    let ranges = gix::blame::BlameRanges::from_one_based_inclusive_range(range_start..=range_end)
+        .map_err(|error| {
+        VcsError::Operation(format!(
+            "blame range {range_start}..={range_end} for {}: {error}",
+            path.display()
+        ))
+    })?;
+    let options = gix::repository::blame_file::Options {
+        ranges,
+        ..Default::default()
+    };
     let outcome = repository
         .blame_file(
             gix::bstr::BStr::new(tree_path.as_bytes()),
             revision,
-            Default::default(),
+            options,
         )
         .map_err(|error| VcsError::Operation(format!("blame {}: {error}", path.display())))?;
 
-    let requested = lines.unwrap_or((1, u32::MAX));
-    outcome
-        .entries
-        .iter()
-        .map(|entry| {
-            let start_line = entry.start_in_blamed_file.saturating_add(1);
-            let line_count = entry.len.get();
-            let end_line = start_line.saturating_add(line_count.saturating_sub(1));
-            let overlap_start = start_line.max(requested.0);
-            let overlap_end = end_line.min(requested.1);
-            let commit = repository.find_commit(entry.commit_id).map_err(|error| {
-                VcsError::Operation(format!("read blame commit {}: {error}", entry.commit_id))
+    let mut hunks = Vec::new();
+    for blame_entry in outcome.entries.iter() {
+        let start_line = blame_entry.start_in_blamed_file.saturating_add(1);
+        let line_count = blame_entry.len.get();
+        let end_line = start_line.saturating_add(line_count.saturating_sub(1));
+        let overlap_start = start_line.max(range_start);
+        let overlap_end = end_line.min(range_end);
+        // Clip before decoding: a non-overlapping entry must not cost a
+        // commit decode, nor fail the whole call if its commit is
+        // unreadable (phase-gate review F3).
+        if overlap_start > overlap_end {
+            continue;
+        }
+        let commit = repository
+            .find_commit(blame_entry.commit_id)
+            .map_err(|error| {
+                VcsError::Operation(format!(
+                    "read blame commit {}: {error}",
+                    blame_entry.commit_id
+                ))
             })?;
-            let (author, timestamp_utc) = commit_identity(&commit)?;
-            Ok((overlap_start <= overlap_end).then(|| BlameHunk {
-                rev: RevId::new(entry.commit_id.to_string()),
-                author,
-                timestamp_utc,
-                start_line: overlap_start,
-                line_count: overlap_end.saturating_sub(overlap_start).saturating_add(1),
-            }))
-        })
-        .filter_map(|hunk| hunk.transpose())
-        .collect()
+        let (author, timestamp_utc) = commit_identity(&commit)?;
+        hunks.push(BlameHunk {
+            rev: RevId::new(blame_entry.commit_id.to_string()),
+            author,
+            timestamp_utc,
+            start_line: overlap_start,
+            line_count: overlap_end.saturating_sub(overlap_start).saturating_add(1),
+        });
+    }
+    Ok(hunks)
+}
+
+/// One-based line count of a blob: newline count plus a final unterminated
+/// line when present. An empty blob has zero lines.
+fn blob_line_count(data: &[u8]) -> u32 {
+    let newlines = data.iter().filter(|&&byte| byte == b'\n').count();
+    let unterminated = usize::from(!data.is_empty() && data.last() != Some(&b'\n'));
+    u32::try_from(newlines + unterminated).unwrap_or(u32::MAX)
 }
 
 /// Upper bound on commits examined by one `revisions_touching` walk. The
 /// manual revwalk visits every reachable commit when a path has fewer than
 /// `limit` touches — including a path that no longer exists — so without a
 /// cap a single call on an engine-scale repository (10⁵–10⁶ commits) is
-/// minutes of CPU inside one blocking task. Mirrors `find_path`'s node-cap
-/// discipline: hitting the cap returns what was found rather than erroring.
+/// minutes of CPU inside one blocking task. Hitting the cap returns what was
+/// found rather than erroring. Unlike `find_path`'s `cap_reached`, nothing
+/// signals truncation on this trait yet — `symbol_history` (phase 6) must
+/// add a partial-result flag at its wire layer before consuming this.
 const MAX_REVWALK_COMMITS: usize = 100_000;
 
 fn revisions_touching(
@@ -243,6 +293,7 @@ fn revisions_touching(
     }
 
     let repository = open_repository(project_root)?;
+    require_owned_by_bound_repository(project_root, path)?;
     let relative_path = repository_relative_path(project_root, path)?;
     let head = repository
         .head_id()
@@ -446,6 +497,44 @@ fn gix_tree_path(relative_path: &Path, original: &Path) -> Result<String, VcsErr
         tree_path.push_str(part);
     }
     Ok(tree_path)
+}
+
+/// The queried file must belong to the bound working tree. Without this
+/// check, a nested full clone inside the bound tree (a vendored checkout)
+/// would satisfy the lexical containment strip and blame the OUTER
+/// repository's stale copy of the same relative path — success-shaped
+/// attribution from the wrong repository (phase-gate review F1). A
+/// submodule path likewise reports as belonging to its own repository
+/// instead of masquerading as an untracked outer-tree file. `NotFound`
+/// routes to the tool layer's success-shaped unavailability with the
+/// honest reason.
+fn require_owned_by_bound_repository(project_root: &Path, path: &Path) -> Result<(), VcsError> {
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // A parent that no longer exists (deleted directory) or lies outside
+    // any repository is settled downstream by the lexical strip and the
+    // tree-membership lookup.
+    let Ok(repository) = gix::discover(parent) else {
+        return Ok(());
+    };
+    let Some(work_dir) = repository.workdir() else {
+        return Ok(());
+    };
+    let work_dir = dunce::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
+    if work_dir == project_root {
+        Ok(())
+    } else {
+        Err(VcsError::NotFound(format!(
+            "{} belongs to a different repository ({}) than the bound working tree ({})",
+            path.display(),
+            work_dir.display(),
+            project_root.display()
+        )))
+    }
 }
 
 fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf, VcsError> {
@@ -1272,6 +1361,147 @@ mod harness {
                 .collect::<Vec<_>>(),
             [boundary_revision.as_str()],
             "exactly the boundary commit is reported, as git log does"
+        );
+    }
+
+    /// AC-36 letter: a second provider registers ALONGSIDE the git provider
+    /// without editing it, and detection selects each for its own tree.
+    #[test]
+    fn registry_selects_git_alongside_an_independent_second_provider() {
+        use code_graph_vcs::{BlameHunk, Commit, RevId, VcsError, VcsProvider, VcsRegistry};
+
+        struct MarkerProvider;
+
+        #[async_trait::async_trait]
+        impl VcsProvider for MarkerProvider {
+            fn id(&self) -> &'static str {
+                "marker-test"
+            }
+            fn detect(&self, working_tree: &Path) -> bool {
+                working_tree.join(".marker-vcs").is_dir()
+            }
+            async fn blame(
+                &self,
+                _path: &Path,
+                _lines: Option<(u32, u32)>,
+                _at: Option<&RevId>,
+            ) -> Result<Vec<BlameHunk>, VcsError> {
+                Ok(Vec::new())
+            }
+            async fn revisions_touching(
+                &self,
+                _path: &Path,
+                _limit: u32,
+            ) -> Result<Vec<Commit>, VcsError> {
+                Ok(Vec::new())
+            }
+            async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+                Ok(Vec::new())
+            }
+            async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
+                Ok(RevId::new(spec))
+            }
+        }
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        let marker_tree = tempfile::tempdir().expect("marker tree");
+        fs::create_dir(marker_tree.path().join(".marker-vcs")).expect("marker dir");
+
+        let mut registry = VcsRegistry::new();
+        registry
+            .register(Box::new(
+                super::GitProvider::open(fixture.path()).expect("open fixture"),
+            ))
+            .unwrap();
+        registry.register(Box::new(MarkerProvider)).unwrap();
+
+        assert_eq!(
+            registry
+                .detect(fixture.path())
+                .map(code_graph_vcs::VcsProvider::id),
+            Some("git"),
+            "the git tree selects the git provider"
+        );
+        assert_eq!(
+            registry
+                .detect(marker_tree.path())
+                .map(code_graph_vcs::VcsProvider::id),
+            Some("marker-test"),
+            "the marker tree selects the second provider without touching git"
+        );
+        assert_eq!(
+            registry
+                .detect(
+                    std::env::temp_dir()
+                        .join("code-graph-nonexistent-vcs-probe")
+                        .as_path()
+                )
+                .map(code_graph_vcs::VcsProvider::id),
+            None,
+            "an unrecognized tree selects nothing"
+        );
+    }
+
+    /// Gate-review F1: a provider bound to repository A must not answer for
+    /// files owned by repository B — neither by detection nor by operating
+    /// on them through the outer tree's lexical namespace.
+    #[tokio::test]
+    async fn provider_refuses_files_owned_by_a_different_repository() {
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        const PATH: &str = "src/calculator.rs";
+        let bound = Fixture::build(initial_only_script()).expect("bound fixture");
+        let other = Fixture::build(initial_only_script()).expect("other fixture");
+        let provider = super::GitProvider::open(bound.path()).expect("open bound fixture");
+
+        assert!(
+            !provider.detect(other.path()),
+            "detection is an identity check on the bound tree, not 'any git tree'"
+        );
+
+        let foreign = other.path().join(PATH);
+        let error = provider
+            .blame(&foreign, Some((1, 3)), None)
+            .await
+            .expect_err("a foreign file must not blame through the bound repository");
+        assert!(
+            matches!(&error, VcsError::NotFound(reason)
+                if reason.contains("belongs to a different repository")),
+            "the refusal names the real cause: {error}"
+        );
+    }
+
+    /// Gate-review F3/F4: blame requests only the span's range, and a span
+    /// beyond the blamed revision's EOF clamps instead of erroring.
+    #[tokio::test]
+    async fn blame_clamps_spans_to_the_revision_eof() {
+        use code_graph_vcs::VcsProvider;
+
+        const PATH: &str = "src/calculator.rs";
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        let provider = super::GitProvider::open(fixture.path()).expect("open fixture");
+        let file = fixture.path().join(PATH);
+        let line_count = super::blob_line_count(&fs::read(&file).expect("read fixture file"));
+        assert!(line_count > 1, "fixture file spans multiple lines");
+
+        let beyond = provider
+            .blame(&file, Some((line_count + 100, line_count + 200)), None)
+            .await
+            .expect("a span wholly beyond EOF is empty, not an error");
+        assert!(beyond.is_empty());
+
+        let clamped = provider
+            .blame(&file, Some((1, line_count + 500)), None)
+            .await
+            .expect("a span overhanging EOF clamps");
+        let last_attributed = clamped
+            .iter()
+            .map(|hunk| hunk.start_line + hunk.line_count - 1)
+            .max()
+            .expect("clamped blame attributes at least one line");
+        assert_eq!(
+            last_attributed, line_count,
+            "attribution stops at the revision's last line"
         );
     }
 

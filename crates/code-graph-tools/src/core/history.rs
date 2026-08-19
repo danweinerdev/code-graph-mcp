@@ -60,13 +60,18 @@ pub struct BlameSymbolResponse {
     /// unavailable or when the default could not be resolved (blame then
     /// still ran against the provider default).
     pub rev: Option<String>,
-    /// `true` when the on-disk file bytes differ from the file at the
-    /// blamed revision. The graph's span comes from the on-disk file while
-    /// attribution reflects the committed state, so a `true` here means
-    /// line numbers may misalign between the two. `false` means no
-    /// divergence was detected.
+    /// `true` when the on-disk file contents diverge from the file at the
+    /// blamed revision (compared line-ending-insensitively, so autocrlf
+    /// checkouts stay clean). The graph's span comes from the on-disk file
+    /// while attribution reflects the committed state, so `true` means line
+    /// numbers may misalign between the two. `false` means no divergence
+    /// was detected — which is only "verified clean" when `stale_reason`
+    /// is absent.
     pub stale: bool,
-    /// Human-readable explanation when `stale` is `true`. Absent otherwise.
+    /// Present when `stale` is `true` (explains the divergence), when the
+    /// comparison could not be performed (`stale` stays `false` but the
+    /// span is unverified), or when the span has no attributable lines at
+    /// the blamed revision. Absent means verified clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
     /// Attribution ranges clipped to `[start_line, end_line]`, in file
@@ -80,6 +85,19 @@ struct SymbolSpan {
     file: String,
     start_line: u32,
     end_line: u32,
+}
+
+/// Byte comparison with `\r` stripped from both sides. autocrlf/eol-filtered
+/// checkouts materialize LF blobs as CRLF on disk; that is not a divergence
+/// in the lines blame attributes, and treating it as one would make `stale`
+/// permanently true on Windows-normalized repositories (gate review F2).
+/// Other smudge filters (ident, LFS) can still report stale — rare for
+/// source files, and honest when they do.
+fn eol_insensitive_eq(on_disk: &[u8], committed: &[u8]) -> bool {
+    on_disk
+        .iter()
+        .filter(|&&byte| byte != b'\r')
+        .eq(committed.iter().filter(|&&byte| byte != b'\r'))
 }
 
 fn unavailable(
@@ -212,11 +230,13 @@ pub async fn blame_symbol(
     // Staleness: the span is derived from the on-disk file; attribution
     // reflects the blamed revision. Divergence between the two means line
     // numbers may misalign — report it, never silently return possibly
-    // misaligned attribution (Designs/VcsHistory Decision 4).
-    let (stale, stale_reason) = match &resolved {
+    // misaligned attribution (Designs/VcsHistory Decision 4). When the
+    // comparison itself is impossible, say so explicitly instead of
+    // letting `stale: false` read as "verified clean" (gate review F6).
+    let (stale, mut stale_reason) = match &resolved {
         Some(rev) => match provider.read_at(rev, path).await {
-            Ok(committed) => match std::fs::read(path) {
-                Ok(on_disk) if on_disk == committed => (false, None),
+            Ok(committed) => match tokio::fs::read(path).await {
+                Ok(on_disk) if eol_insensitive_eq(&on_disk, &committed) => (false, None),
                 Ok(_) => (
                     true,
                     Some(format!(
@@ -235,11 +255,36 @@ pub async fn blame_symbol(
                 ),
             },
             // Blame succeeded but the revision's bytes are unreadable —
-            // nothing to compare against, so no divergence is *detected*.
-            Err(_) => (false, None),
+            // no divergence was DETECTED, which is not the same as
+            // verified clean.
+            Err(error) => (
+                false,
+                Some(format!(
+                    "staleness not verified: the blamed revision's contents could \
+                     not be read for comparison ({error})"
+                )),
+            ),
         },
-        None => (false, None),
+        None => (
+            false,
+            Some(
+                "staleness not verified: the provider's default revision did not \
+                 resolve, so on-disk contents were not compared"
+                    .to_string(),
+            ),
+        ),
     };
+
+    // A span lying wholly beyond the blamed revision's EOF clamps to zero
+    // attributable lines (gate review F4). Make the empty page carry its
+    // own signal rather than looking like a quietly successful blame.
+    if hunks.is_empty() && stale_reason.is_none() {
+        stale_reason = Some(
+            "the symbol's span has no attributable lines at the blamed revision \
+             (the file is shorter there than the on-disk span)"
+                .to_string(),
+        );
+    }
 
     Ok(ToolOk::Value(BlameSymbolResponse {
         available: true,

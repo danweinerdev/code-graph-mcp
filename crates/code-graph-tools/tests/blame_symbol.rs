@@ -323,6 +323,36 @@ async fn blame_symbol_flags_uncommitted_edits_as_stale() {
     );
 }
 
+/// Gate-review F2: an autocrlf-style checkout (CRLF on disk, LF in the
+/// blob) is NOT stale — the staleness compare is line-ending-insensitive,
+/// so the flag cannot degenerate into permanent noise on Windows-normalized
+/// repositories.
+#[tokio::test]
+async fn blame_symbol_is_not_stale_on_a_crlf_normalized_checkout() {
+    let fixture = GitFixture::build();
+    let server = git_backed_server(fixture.path());
+    analyze(&server, fixture.path()).await;
+    let (_root, file, symbol) = fixture_symbol(fixture.path());
+
+    // Materialize the exact committed contents with CRLF line endings —
+    // what an autocrlf checkout produces for an LF blob.
+    let committed = std::fs::read_to_string(&file).expect("read fixture source");
+    assert!(!committed.contains('\r'), "fixture blob is LF");
+    std::fs::write(&file, committed.replace('\n', "\r\n")).expect("write CRLF working copy");
+
+    let body = ok_json(&call_blame(&server, &symbol, None).await);
+    assert_eq!(body["available"], serde_json::json!(true));
+    assert_eq!(
+        body["stale"],
+        serde_json::json!(false),
+        "CRLF-only divergence is not staleness: {body}"
+    );
+    assert!(
+        body.get("stale_reason").is_none(),
+        "verified clean carries no stale_reason: {body}"
+    );
+}
+
 #[tokio::test]
 async fn blame_symbol_reports_unavailability_without_vcs_and_degrades_nothing() {
     let dir = TempDir::new().unwrap();
@@ -420,7 +450,11 @@ async fn blame_symbol_unresolvable_at_is_a_tool_error() {
 }
 
 /// AC-44 / NFR-10: a hung provider delays only the history tool. The gate
-/// blocks `blame` while an unrelated query runs to completion.
+/// blocks `blame` while an unrelated query runs to completion. (The graph
+/// read-lock discipline itself is enforced at compile time — a guard held
+/// across the await would make the spawned future non-`Send` — so this
+/// test pins the observable half: an unrelated query completes while the
+/// provider hangs, and the blame future is still pending afterwards.)
 struct GatedProvider {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -521,4 +555,14 @@ async fn blame_symbol_slow_provider_delays_only_history_tools() {
     let body = ok_json(&blame.await.expect("blame task joins"));
     assert_eq!(body["available"], serde_json::json!(true));
     assert_eq!(body["hunks"][0]["rev"], serde_json::json!("gated-rev"));
+    // GatedProvider's read_at errors, so the staleness comparison cannot
+    // run — that must surface as an explicit unverified note, not read as
+    // "verified clean" (gate-review F6).
+    assert_eq!(body["stale"], serde_json::json!(false));
+    assert!(
+        body["stale_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("staleness not verified")),
+        "unverifiable staleness is explicit: {body}"
+    );
 }
