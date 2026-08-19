@@ -15,13 +15,13 @@ tasks:
     verification: "cargo test -p code-graph-lang fingerprint:: — the default implementation returns an unchanged fingerprint for a symbol whose only change is whitespace or comments (AC-38); LiteralInsensitive returns None from the default rather than silently falling back to Normalized; all six existing plugins compile with no change, proving the hook is additive; cargo tree confirms code-graph-lang gained no third-party dependency (NFR-02)."
   - id: "6.2"
     title: "Fingerprint cache under .code-graph/fingerprints"
-    status: in-progress
+    status: complete
     justifies: "FR-37, AC-46. A history walk re-reads and re-parses every revision in the window and the parse dominates; without the cache a repeated query pays the whole cost again, and the tombstone case makes pre-existence revisions free."
     verification: "cargo test -p code-graph-tools fingerprint_cache:: — a second identical query is served from cache; deleting the cache directory recomputes the same answer; a corrupted shard recomputes rather than erroring (AC-46); a revision predating the symbol is cached as a tombstone and not re-parsed on the second walk; the cache is separate from .code-graph-cache.db and CACHE_VERSION is unchanged."
     depends_on: ["6.1"]
   - id: "6.3"
     title: "symbol_history tool: transition walk and exact symbol matching"
-    status: planned
+    status: in-progress
     justifies: "FR-33, FR-35, NFR-10, NFR-11, AC-19, AC-20, AC-37, AC-45. Distinguishing a logic change from a reformat is the whole value of the feature; without transition comparison the tool degenerates into git log for a file, which the agent could already get."
     verification: "cargo test -p code-graph-tools symbol_history:: against the phase 5 fixture — a reformat-only commit is not reported while the logic commit is (AC-19); a commit moving the function without changing it is not reported (AC-20); historical bytes are parsed in memory with no temporary file written, asserted by watching the temp directory (AC-37); a case-only rename reports Removed then Introduced, matching the exact-match rule; a large-window call does not delay a concurrent non-history query (NFR-10); the tool description meets the agent-facing lens (AC-45)."
     depends_on: ["6.2"]
@@ -91,12 +91,12 @@ Making `LiteralInsensitive` fall back to `Normalized` when a plugin has no overr
 ## 6.2: Fingerprint cache under .code-graph/fingerprints
 
 ### Subtasks
-- [ ] Key on `(provider id, RevId, repo-relative path, symbol name, kind, mode, binary identity)`
-- [ ] Store the `u64` fingerprint or a tombstone recording absence at that revision
-- [ ] Shard on the key's leading bits, one file per shard
-- [ ] Treat every read, decode, or key-mismatch failure as a miss; delete and recompute a corrupt shard
-- [ ] Confirm no interaction with `.code-graph-cache.db` or `CACHE_VERSION`
-- [ ] Tests for hit, cold miss, deleted directory, corrupt shard, and tombstone reuse
+- [x] Key on `(provider id, RevId, repo-relative path, symbol name, kind, mode, binary identity)`
+- [x] Store the `u64` fingerprint or a tombstone recording absence at that revision
+- [x] Shard on the key's leading bits, one file per shard
+- [x] Treat every read, decode, or key-mismatch failure as a miss; delete and recompute a corrupt shard (the full key string is stored, so key aliasing is structurally impossible rather than detected)
+- [x] Confirm no interaction with `.code-graph-cache.db` or `CACHE_VERSION`
+- [x] Tests for hit, cold miss, deleted directory, corrupt shard, and tombstone reuse
 
 ### Notes
 Revision boundary: fingerprints are cached and the cache is provably safe to lose.
@@ -107,7 +107,22 @@ Tombstones matter more than they look. "Not present at this revision" is a real,
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `ea6df2df6f05b8788d570748d80392fd13a1f313`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-18 20:25 matched `ea6df2df6f05b8788d570748d80392fd13a1f313`
+- Focused review: `git show ea6df2df6f05b8788d570748d80392fd13a1f313`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `ea6df2df6f05b8788d570748d80392fd13a1f313`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools --lib fingerprint_cache && cargo clippy -p code-graph-tools --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `Six cache tests passed: hit, tombstone round-trip, key isolation (rev/symbol/mode), deleted-directory recompute, corrupt-shard delete-and-recompute, and graph-cache independence (AC-46); clippy denied no warnings.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show ea6df2d` | PASS | `One new module plus its core/mod.rs registration; no interaction with persist/, CACHE_VERSION, or any wire surface; writes are temp+rename and every failure path degrades to a miss.` |
 
 ## 6.3: symbol_history tool: transition walk and exact symbol matching
 
