@@ -3,7 +3,7 @@ title: "Command-Line Interface"
 type: phase
 plan: GraphPlatformExpansion
 phase: 7
-status: in-progress
+status: complete
 created: 2026-08-08
 updated: 2026-08-19
 deliverable: "A code-graph CLI over the typed core, producing payloads identical to the MCP surface and working with or without a daemon."
@@ -157,14 +157,36 @@ The five shapes are chosen to cover structurally different envelopes, not five a
 
 ## Acceptance Criteria
 
-- [ ] **AC-11**: CLI machine-readable output equals the MCP payload for each of the five distinct response shapes (FR-17, FR-19).
-- [ ] **AC-12**: Exit status distinguishes success, tool error, and operational failure (FR-20).
-- [ ] **AC-33**: Position lookup, shortest path, and community detection are invocable from both the MCP surface and the CLI, completing the criterion opened in phase 1 (FR-26).
-- [ ] **AC-40**: Identical output with and without a running daemon (FR-18).
-- [ ] No query logic duplicated between the CLI and the MCP adapter; every subcommand calls the typed core (FR-17).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
-- [ ] FR-17, FR-18, FR-19, FR-20 realized.
+- [x] **AC-11**: CLI machine-readable output equals the MCP payload for each of the five distinct response shapes (FR-17, FR-19). — six-test parity suite (`tests/parity.rs`): Page, tree, flattened envelope BOTH with and without `suggestions`, dual-page, non-JSON mermaid — each byte-compared against the real `to_call_tool_result` adapter path
+- [x] **AC-12**: Exit status distinguishes success, tool error, and operational failure (FR-20). — `exit_statuses_separate_the_three_outcome_classes`: 0 incl. `found:false`, 1 incl. the byte-exact unindexed domain error, 2 via the directory-shaped-cache genuine I/O fixture; corrupt/version-mismatch = honest-unindexed = 1 per the `Graph::load` contract
+- [x] **AC-33**: Position lookup, shortest path, and community detection are invocable from both the MCP surface and the CLI, completing the criterion opened in phase 1 (FR-26). — `phase_one_queries_are_invocable_from_the_cli`; `limit`/`offset`/`max_bytes` flow through the same core functions
+- [x] **AC-40**: Identical output with and without a running daemon (FR-18). — `daemon_and_standalone_output_are_byte_identical` covers the steady state AND the Decision 7 unindexed-daemon window; `get-status` carved out (reports daemon-side state) per the design
+- [x] No query logic duplicated between the CLI and the MCP adapter; every subcommand calls the typed core (FR-17). — all 21 arms in `exec.rs` call `core::`; no rmcp dependency, no handlers import (structurally pinned by `cli_depends_on_the_typed_core_only`); adapter-owned bool unwraps mirror `server.rs` verbatim
+- [x] **AC-27**: `make verify` passes (NFR-04). — green at the phase endpoint (tasks 7.2/7.3 evidence rows)
+- [x] FR-17, FR-18, FR-19, FR-20 realized. — spec lane cycle-1 disposition table: all SATISFIED with file:line evidence
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `35aa82f31c34aaad5c15c8e643f5141f4eebd6d4`
+- Identity recheck: `git rev-parse 35aa82f` at 2026-08-19 14:50 matched `35aa82f31c34aaad5c15c8e643f5141f4eebd6d4`
+- Focused review: four-lane frozen gate over `10a625377c5ee7fa0f7e972fc38c3808435ff0b4..35aa82f31c34aaad5c15c8e643f5141f4eebd6d4` (one cycle, all four lanes PASS/Aligned; two sub-material record inaccuracies repaired at the planning revision `415cc6d`); design task 7.1 separately reviewed in two rounds (Needs-changes → Approve-with-minors → approved)
+- Reviewed candidate / final: `35aa82f31c34aaad5c15c8e643f5141f4eebd6d4`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings (including the new crate), rustfmt check, full workspace tests (natively on Windows), pending-snapshot check, and plugin-mirror sync all green at the phase endpoint (AC-27); only docs-only commits follow the last verified code commit cca6705.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen 10a6253..35aa82f, planning 415cc6d` | PASS | `All four independent lanes returned PASS/Aligned on the first cycle; residual observations recorded as accepted follow-ups in the review artifact.` |
+
+### Completed task identities
+- `7.1`: `e3a4cfdbf1697aeab9652cf03d83439cba7f797b`
+- `7.2`: `43f1e0092ffdfb0f343278ba90bd7f59a3321eb6`
+- `7.3`: `cca67059873ecbebfb250d3e2473624356f7eec3`
+
+- Final aligned review: `reviews/19-command-line-interface-final-review-10a6253-35aa82f.md`; frozen: `10a625377c5ee7fa0f7e972fc38c3808435ff0b4..35aa82f31c34aaad5c15c8e643f5141f4eebd6d4`

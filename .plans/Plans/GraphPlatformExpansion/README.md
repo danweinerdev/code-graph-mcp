@@ -41,7 +41,7 @@ phases:
     depends_on: [5]
   - id: 7
     title: "Command-Line Interface"
-    status: planned
+    status: complete
     doc: "07-Command-Line-Interface.md"
     depends_on: [1, 2, 3]
   - id: 8
@@ -92,7 +92,7 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 | 4 Analyze Queue | complete / frozen reviewed | The superseded generic-job scheduler was rolled back (`2e5f343`) and replaced by the analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion; final aligned review at `reviews/13-…` (frozen `4eaccaa..72768ef`). One open follow-up from artifact 14: queued sync analyzes lose their progress sink (m5). |
 | 5 VCS Foundation and Blame | complete / frozen reviewed | Six tasks: `code-graph-vcs` trait/registry, gix provider + hermetic harness, provider hardening (revwalk cap, shallow boundaries, honest blame contract — artifact 14 M3/M4/M5), and the `blame_symbol` tool (tool 24, oracle-tested, success-shaped unavailability, tri-state staleness). Two gate cycles; final aligned review at `reviews/15-…` (frozen `b75812e..5697222`), accepted follow-ups recorded there. Gates phase 6. |
 | 6 Symbol History | complete / frozen reviewed | Five tasks: `LanguagePlugin::fingerprint_symbol` hook (std-only token-aware default, AC-38), content-addressed fingerprint sidecar under `.code-graph/fingerprints/` (RevId+config+binary-identity keyed, tombstones), and the `symbol_history` tool (tool 25 — transition-only walk, D-0005 exact matching, success-shaped unavailability), plus two gate-driven fix tasks: 6.4 (historical parses run the indexer's config pipeline; deletion commits report `removed`; boundary flag covers skipped-oldest; config identity joins the cache key) and 6.5 (unreadable blob is `Operation`, never a cacheable `NotFound` absence). Three gate cycles; final aligned review at `reviews/18-…` (frozen `2627a51..3ee9810`), accepted follow-ups recorded there. Gates phase 8. |
-| 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
+| 7 CLI | complete / frozen reviewed | Three tasks: the deferred interface design (Designs/CommandLineInterface, two review rounds — the Critical caught the unmodified proxy auto-spawning a contender, resolved by the new `code-graph-mcp --attach-only` mode), the `code-graph` binary over the typed core (crate `code-graph-cli`: 21 subcommands, honest `indexed` flag, daemon backend via a spawned attach-only child speaking byte-level JSON-RPC, Decision 7 unindexed-daemon fallback), and output parity (payload-defined `--json`, per-shape human renderer, exit 0/1/2, six-test AC-11 parity suite through the real adapter path). One gate cycle, all four lanes PASS/Aligned; final review at `reviews/19-…` (frozen `10a6253..35aa82f`), accepted follow-ups recorded there. Closes AC-33. |
 | 8 Per-Language Fingerprints | planned | Gated on 6. Six sub-tasks, one per language. |
 | 9 Resolver Candidate Count | planned | Added mid-flight from phase 1's review. Gated on 1. |
 | 10 macOS Platform Completion | deferred | Activates and certifies macOS seams after the Linux MVP; not part of current support acceptance. |
