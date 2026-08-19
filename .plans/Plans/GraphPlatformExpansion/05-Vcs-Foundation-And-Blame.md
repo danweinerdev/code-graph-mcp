@@ -3,7 +3,7 @@ title: "VCS Foundation and Blame"
 type: phase
 plan: GraphPlatformExpansion
 phase: 5
-status: in-progress
+status: complete
 created: 2026-08-08
 updated: 2026-08-18
 deliverable: "A provider-abstracted version-control layer with a pure-Rust git implementation, and a blame_symbol tool answering who last changed a symbol."
@@ -289,19 +289,44 @@ follow-ups recorded in the review artifact, not silent omissions.
 
 ## Acceptance Criteria
 
-- [ ] **AC-21**: Blame-a-symbol matches `git blame --porcelain` for the same span and revision (FR-32).
-- [ ] **AC-22**: With no supported VCS, history tools report unavailability as a success and nothing else degrades (FR-36).
-- [ ] **AC-23**: No VCS crate under `code-graph-core`, `-graph`, `-lang`, or `-path-trie` (FR-31, NFR-02).
-- [ ] **AC-24**: The trait supports an integer-revision provider with no change to the trait or any wire type (FR-28, D-0002).
-- [ ] **AC-34**: The required operation set is exactly four (FR-27).
-- [ ] **AC-35**: A slow provider satisfies the trait without blocking the runtime (FR-29).
-- [ ] **AC-36**: A second provider registers without editing the first; detection selects correctly (FR-30).
-- [ ] **AC-44**: A slow provider delays only history tools (NFR-10).
-- [ ] **AC-45**: The `blame_symbol` description meets the agent-facing-description lens (NFR-11).
-- [ ] **AC-56**: Native-library dependencies unchanged after the git provider lands (FR-47, D-0004).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
-- [ ] FR-27 through FR-32, FR-36, and FR-47 realized; NFR-02 and NFR-10 satisfied.
+- [x] **AC-21**: Blame-a-symbol matches `git blame --porcelain` for the same span and revision (FR-32).
+- [x] **AC-22**: With no supported VCS, history tools report unavailability as a success and nothing else degrades (FR-36).
+- [x] **AC-23**: No VCS crate under `code-graph-core`, `-graph`, `-lang`, or `-path-trie` (FR-31, NFR-02).
+- [x] **AC-24**: The trait supports an integer-revision provider with no change to the trait or any wire type (FR-28, D-0002).
+- [x] **AC-34**: The required operation set is exactly four (FR-27).
+- [x] **AC-35**: A slow provider satisfies the trait without blocking the runtime (FR-29).
+- [x] **AC-36**: A second provider registers without editing the first; detection selects correctly (FR-30).
+- [x] **AC-44**: A slow provider delays only history tools (NFR-10).
+- [x] **AC-45**: The `blame_symbol` description meets the agent-facing-description lens (NFR-11).
+- [x] **AC-56**: Native-library dependencies unchanged after the git provider lands (FR-47, D-0004).
+- [x] **AC-27**: `make verify` passes (NFR-04).
+- [x] FR-27 through FR-32, FR-36, and FR-47 realized; NFR-02 and NFR-10 satisfied.
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Identity recheck: `git rev-parse 5697222` at 2026-08-18 18:35 matched `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Focused review: four-lane frozen gate over `b75812ea8819b2ec4382c456f24080b0817e9cd6..569722264dfb83cd781c72ee9c4444eb393aff57` (two cycles; cycle-1 material findings resolved as task 5.6)
+- Reviewed candidate / final: `569722264dfb83cd781c72ee9c4444eb393aff57`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, rustfmt check, full workspace tests (1,856 passed, 0 failed, natively on Windows), pending-snapshot check, and plugin-mirror sync all green at the phase endpoint (AC-27).` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen b75812e..5697222, planning 665f327` | PASS | `All four independent lanes returned PASS/Aligned on cycle 2; residual observations recorded as accepted follow-ups in the review artifact.` |
+
+### Completed task identities
+- `5.1`: `273484ed1a35923107d9907b4eab89beb208a317`
+- `5.2`: `0f7560ee71af947e86a20398582b8f0e0447d733`
+- `5.3`: `92c019cfd4e2cc0b1c1c51aefc0f6a362f2f6b44`
+- `5.4`: `0dd91151c42820ae2143721621cd7a29e92639f6`
+- `5.5`: `6dcbf28022de7d60ec6bde846f736bec45ee0896`
+- `5.6`: `569722264dfb83cd781c72ee9c4444eb393aff57`
+
+- Final aligned review: `reviews/15-vcs-foundation-and-blame-final-review-b75812e-5697222.md`; frozen: `b75812ea8819b2ec4382c456f24080b0817e9cd6..569722264dfb83cd781c72ee9c4444eb393aff57`

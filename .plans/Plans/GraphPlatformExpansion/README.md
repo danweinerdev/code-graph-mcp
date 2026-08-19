@@ -32,7 +32,7 @@ phases:
     depends_on: [3]
   - id: 5
     title: "VCS Foundation and Blame"
-    status: planned
+    status: complete
     doc: "05-Vcs-Foundation-And-Blame.md"
   - id: 6
     title: "Symbol History"
@@ -82,15 +82,15 @@ Phases 1, 3, and 5 have no dependencies on each other and may run concurrently i
 Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deliberately deferred until the Linux implementation phases they certify are complete. The phase numbering is a suggested order; `depends_on` is the real constraint.
 
 ## Current State
-*Written for a cold start. Last updated 2026-08-13.*
+*Written for a cold start. Last updated 2026-08-18.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
 | 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
 | 3 Daemon Foundation | complete / frozen reviewed | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and frozen reviewed. Native platform completion remains deferred to phases 10/11. |
-| 4 Analyze Queue | replacement plan active | The committed generic-job/config-provenance/async-community implementation is being rolled back. The active target is an analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion. |
-| 5 VCS Foundation and Blame | planned | Independent — can run in parallel with 3. |
+| 4 Analyze Queue | complete / frozen reviewed | The superseded generic-job scheduler was rolled back (`2e5f343`) and replaced by the analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion; final aligned review at `reviews/13-…` (frozen `4eaccaa..72768ef`). One open follow-up from artifact 14: queued sync analyzes lose their progress sink (m5). |
+| 5 VCS Foundation and Blame | complete / frozen reviewed | Six tasks: `code-graph-vcs` trait/registry, gix provider + hermetic harness, provider hardening (revwalk cap, shallow boundaries, honest blame contract — artifact 14 M3/M4/M5), and the `blame_symbol` tool (tool 24, oracle-tested, success-shaped unavailability, tri-state staleness). Two gate cycles; final aligned review at `reviews/15-…` (frozen `b75812e..5697222`), accepted follow-ups recorded there. Gates phase 6. |
 | 6 Symbol History | planned | Gated on 5. |
 | 7 CLI | planned | Gated on 1, 2, 3. Opens with a design task, not code. |
 | 8 Per-Language Fingerprints | planned | Gated on 6. Six sub-tasks, one per language. |
