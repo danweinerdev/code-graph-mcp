@@ -34,7 +34,7 @@ Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs 
 | `code-graph-cli` | `crates/code-graph-cli` | Binary `code-graph`: CLI front-end over the typed core (Designs/CommandLineInterface). 21 subcommands mirroring tool names; machine mode is the MCP payload byte-for-byte; exits 0/1/2. No `rmcp`, no `handlers` import. `#![forbid(unsafe_code)]`. |
 | `code-graph-parse-test` | `crates/code-graph-parse-test` | Dev binaries: `code-graph-parse-test` (parser-corpus harness) and `code-graph-bench` (repo-agnostic index/cache/verify). Not built into the server. |
 | `code-graph-lang-cpp` | `crates/code-graph-lang-cpp` | tree-sitter-cpp v0.23.4 |
-| `code-graph-lang-rust` | `crates/code-graph-lang-rust` | tree-sitter-rust v0.24.0 |
+| `code-graph-lang-rust` | `crates/code-graph-lang-rust` | tree-sitter-rust v0.24.2 |
 | `code-graph-lang-go` | `crates/code-graph-lang-go` | tree-sitter-go v0.25.0 |
 | `code-graph-lang-python` | `crates/code-graph-lang-python` | tree-sitter-python v0.25.0 |
 | `code-graph-lang-csharp` | `crates/code-graph-lang-csharp` | tree-sitter-c-sharp v0.23.5 |
@@ -373,7 +373,7 @@ Limitations:
 6. **`template_method` node not matched** in v0.23.4 — `obj.foo<T>()` falls through to `field_expression` when possible.
 7. **`macro_strip` raw-string-delimiter collision.** Raw string with tag identical to a stripped macro (e.g. `R"CORE_API(…)CORE_API"`) → both delimiters overwritten → tree-sitter fails to close → rest of file becomes ERROR, zero symbols. Silent file-level failure. Workaround: drop the colliding macro from `macro_strip` / `macro_strip_with_args` or rename the raw-string tag.
 
-### Rust — tree-sitter-rust v0.24.0
+### Rust — tree-sitter-rust v0.24.2
 
 Supported:
 - Free functions; methods in `impl` blocks (`Type::method`); default and abstract trait methods → `Method`/parent=trait.
@@ -485,7 +485,7 @@ Limitations:
 
 ### Fingerprint support matrix (`symbol_history` modes)
 
-Every language plugin carries an AST-backed `fingerprint_symbol` override (shared walk in `code-graph-lang::fingerprint`: `locate_symbol_node` + `ast_fingerprint` — deterministic cursor pre-order, comments and commas invisible, literal subtrees contribute kind always and source text under `normalized` only). Both modes work everywhere; the per-language column is the decisions each plugin had to make, not a support gap. Two cross-language boundaries: (1) the fingerprint covers exactly the EXTRACTOR-recorded span — wrappers outside it (C++ `template_declaration` clauses, Rust outer attributes, Python decorators) are invisible to both modes, pinned per language by the `mod fingerprint` suites; (2) literal source text hashes raw bytes under `normalized`, so a CRLF↔LF-only commit reports `modified` for symbols containing MULTI-LINE string literals (`symbol_history` makes no line-ending-insensitivity claim — only `blame_symbol` does).
+Every language plugin carries an AST-backed `fingerprint_symbol` override (shared walk in `code-graph-lang::fingerprint`: `locate_symbol_node` + `ast_fingerprint` — deterministic cursor pre-order, comments and commas invisible, literal subtrees contribute kind always and source text under `normalized` only). Both modes work everywhere; the per-language column is the decisions each plugin had to make, not a support gap. Two cross-language boundaries: (1) the fingerprint covers exactly the EXTRACTOR-recorded span — wrappers outside it (C++ `template_declaration` clauses, Rust outer attributes, Python decorators) are invisible to both modes (test-pinned for Rust and C++; Python's decorator transparency follows the same extractor convention but carries no dedicated pin yet); (2) literal source text hashes raw bytes under `normalized`, so a CRLF↔LF-only commit reports `modified` for symbols containing MULTI-LINE string literals (`symbol_history` makes no line-ending-insensitivity claim — only `blame_symbol` does).
 
 | | `normalized` | `literal_insensitive` | Language-specific decisions |
 |---|---|---|---|

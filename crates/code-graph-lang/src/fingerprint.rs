@@ -319,8 +319,9 @@ fn char_literal_end(span: &[u8], start: usize) -> Option<usize> {
 /// (`template<typename T>` → `template<typename T, int N>`) is INVISIBLE
 /// under both modes. Same boundary as Rust outer attributes and Python
 /// decorators: the span convention is the extractor's, and the
-/// fingerprint honestly covers exactly that span (pinned per language by
-/// the `mod fingerprint` suites).
+/// fingerprint honestly covers exactly that span (test-pinned for Rust
+/// and C++; Python's decorator transparency follows the same extractor
+/// convention but carries no dedicated pin yet).
 pub fn locate_symbol_node<'t>(
     root: tree_sitter::Node<'t>,
     symbol: &Symbol,
