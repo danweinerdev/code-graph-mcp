@@ -3,9 +3,9 @@ title: "Typed Core Layering"
 type: phase
 plan: GraphPlatformExpansion
 phase: 2
-status: in-progress
+status: complete
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-18
 deliverable: "A typed core beneath every MCP handler, returning domain values instead of rmcp wire types, with byte-identical output and server.rs untouched."
 tasks:
   - id: "2.1"
@@ -277,11 +277,36 @@ It is tempting to drop the `require_indexed` call from `server.rs` once the core
 - [x] **AC-03**: The non-callable advisory is representable as a third outcome and renders as a plain-text success (FR-03).
 - [x] **AC-28**: An unindexed query yields a discriminable domain error without serialization (FR-04).
 - [x] **AC-29**: Byte-budget truncation and paging resume are correct against typed fields (FR-05).
-- [x] **AC-41**: No `tracing` in the dependency graph; diagnostics use `eprintln!` (NFR-05).
+- [x] **AC-41**: No **direct** `tracing` dependency; diagnostics use `eprintln!` (NFR-05). *(Wording reconciled at certification: `tracing` appears transitively via rmcp, as recorded in the plan README's "Corrections made to approved artifacts" — the evidence and the tick hold under the corrected reading.)*
 - [x] **AC-27**: `make verify` passes at every commit in the phase, not only at the end (NFR-04).
 - [x] No new dependency in `code-graph-core`, `-graph`, `-lang`, `-path-trie` (NFR-02).
 - [x] FR-01, FR-02, FR-03, FR-04, FR-05 realized; NFR-01 preserved.
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `f2d65833120745044a6a35b83c2e5a45dae203fe`
+- Identity recheck: `git rev-parse f2d6583` at 2026-08-18 19:25 matched `f2d65833120745044a6a35b83c2e5a45dae203fe`
+- Focused review: four-lane certification gate over `a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4..f2d65833120745044a6a35b83c2e5a45dae203fe` — the phase's full contiguous range, containing the cross-crate visibility fix (`4690da5`) that had superseded the earlier review
+- Reviewed candidate / final: `f2d65833120745044a6a35b83c2e5a45dae203fe`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (recorded per task at each checkpoint; current-tree state green at `5697222` with docs-only commits through the reviewed planning revision) | `.` | PASS (`exit 0`) | `Each task's evidence block records its make verify run and snapshot-unchanged assertion; the typed core, as since evolved (it now also hosts phase 5's core/history.rs), passes clippy -D warnings, rustfmt, 1,856 workspace tests, snapshot and plugin-mirror checks.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane certification gate` | `frozen a08ffcf..f2d6583, planning e234a8c, endpoint worktree` | PASS | `All four independent lanes returned PASS/Aligned; six accepted follow-ups recorded in the gate artifact (cross-crate compile test for rmcp-free reachability, require_indexed doc reconciliation, the pub handlers guard surface for the phase 7 CLI, adapter/core doc duplication, AC-41 wording, 4690da5's missing task revision).` |
+
+### Completed task identities
+- `2.1`: `db9c739ea87150f16615e14bebc200b7a44f5fb9`
+- `2.2`: `a97d85d56436a65348fecb04559d27d3b60da523`
+- `2.3`: `c597304a674a8636eeef626b714b31fb0d660e5d`
+- `2.4`: `0cdece9198110d76d00f29458ef240e610b5aeff`
+- `2.5`: `519d8d2ca81572e82410794b0cce40e1015f8a1c`
+- `2.6`: `a03b241a4af42632e5e491da6da79366e56f0e8a`
+
+- Final aligned review: `reviews/17-typed-core-layering-final-review-a08ffcf-f2d6583.md`; frozen: `a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4..f2d65833120745044a6a35b83c2e5a45dae203fe`

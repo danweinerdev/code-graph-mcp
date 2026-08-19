@@ -3,9 +3,9 @@ title: "Graph Queries"
 type: phase
 plan: GraphPlatformExpansion
 phase: 1
-status: in-progress
+status: complete
 created: 2026-08-08
-updated: 2026-08-09
+updated: 2026-08-18
 deliverable: "Three new MCP tools — get_symbol_at, find_path, detect_communities — answering position, reachability, and module-structure questions the current surface cannot answer."
 tasks:
   - id: "1.1"
@@ -336,7 +336,7 @@ No bug is observed today — both values are bounded well below overflow by the 
 - [x] **AC-16**: Shortest path returns a source-to-target chain of real edges, or an explicit not-found distinguishable from cap exhaustion.
 - [x] **AC-17**: Among equal-hop paths, the all-resolved path wins.
 - [x] **AC-18**: Community detection is deterministic across runs and captured by an `insta` snapshot.
-- [x] **AC-32**: Clusters ranked by descending size, both caps enforced and echoed, truncated clusters carry their true total.
+- [x] **AC-32**: Clusters ranked by descending size, both caps enforced and echoed, truncated clusters carry their true total. *(Certification note: the cluster cap is echoed via `Page.limit` and a member-capped community carries `truncated`/`original_len`, but the resolved `members_per_community` value itself is not a response field — the code faithfully implements the approved GraphQueries response shape, which omits that echo. Spec-side reconciliation recorded as a follow-up in gate artifact 16.)*
 - [x] **AC-53**: Granularity used is present in the response and defaults to file.
 - [x] **AC-54**: Termination condition reported; no tuning parameter required.
 - [x] **AC-55**: Degenerate partitions flagged rather than returned as ordinary results.
@@ -347,4 +347,30 @@ No bug is observed today — both values are bounded well below overflow by the 
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4`
+- Identity recheck: `git rev-parse a08ffcf` at 2026-08-18 19:20 matched `a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4`
+- Focused review: four-lane certification gate over `1db21d6a2e676ddec7f74b265179f5fb95eb25db..a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4` — the phase's full range, containing every post-review fix that had superseded the earlier review cycles
+- Reviewed candidate / final: `a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (recorded per task at each checkpoint; current-tree state green at `5697222` with docs-only commits through the reviewed planning revision) | `.` | PASS (`exit 0`) | `Each task's evidence block records its make verify run; the phase's code, as since evolved, passes clippy -D warnings, rustfmt, 1,856 workspace tests, snapshot and plugin-mirror checks.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane certification gate` | `frozen 1db21d6..a08ffcf, planning e234a8c, endpoint worktree` | PASS | `All four independent lanes returned PASS/Aligned; six accepted follow-ups recorded in the gate artifact (find_path byte-budget exemption, cap_reached frontier edge, AC-32 spec reconciliation, tally saturation consistency, determinism-wording tightening, task 1.4 measurement-evidence pointer).` |
+
+### Completed task identities
+- `1.1`: `50450d5065bcf4254cbca4624d196fdb9389189f`
+- `1.2`: `35381a247b98367f34df2e085c2171c30d0f541f`
+- `1.3`: `84c65661384d8e6b75765d66b26c4ebb26cf9073`
+- `1.4`: `2986df0e192517e51fa4f9f59717c58f9a4dd9c6`
+- `1.5`: `8d3e7ca9478898f4293429ba6fdfe0bfd868d291`
+- `1.6`: `28ac556e26e0e3a2734c49bc5429db2577671c05`
+- `1.7`: `a407b4108a8ee5870f1f92759d631063081dbb64`
+
+- Final aligned review: `reviews/16-graph-queries-final-review-1db21d6-a08ffcf.md`; frozen: `1db21d6a2e676ddec7f74b265179f5fb95eb25db..a08ffcf0d2addc8f6f2a49ea05b1a9d8bde890a4`

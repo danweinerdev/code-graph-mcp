@@ -14,11 +14,11 @@ related:
 phases:
   - id: 1
     title: "Graph Queries"
-    status: in-progress
+    status: complete
     doc: "01-Graph-Queries.md"
   - id: 2
     title: "Typed Core Layering"
-    status: in-progress
+    status: complete
     doc: "02-Typed-Core-Layering.md"
     depends_on: [1]
   - id: 3
@@ -86,8 +86,8 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 
 | Phase | Status | Where it stands |
 |---|---|---|
-| 1 Graph Queries | tasks complete, phase `in-progress` | 3 tools shipped (19→22). Two review cycles, 9 findings, all resolved. |
-| 2 Typed Core Layering | tasks complete, phase `in-progress` | 6 modules migrated. One review cycle, 2 findings, both resolved. |
+| 1 Graph Queries | complete / frozen reviewed | 3 tools shipped (19→22). Two review cycles, 9 findings resolved; certified 2026-08-18 by a fresh four-lane gate over the full range (`reviews/16-…`, frozen `1db21d6..a08ffcf`) — accepted follow-ups recorded there (find_path byte-budget exemption, cap_reached frontier edge, AC-32 spec reconciliation). |
+| 2 Typed Core Layering | complete / frozen reviewed | 6 modules migrated behind byte-identical adapters; `server.rs` zero-line diff. Certified 2026-08-18 by a fresh four-lane gate over the full range (`reviews/17-…`, frozen `a08ffcf..f2d6583`) — accepted follow-ups recorded there (cross-crate compile test, guard-surface shape for the phase 7 CLI). |
 | 3 Daemon Foundation | complete / frozen reviewed | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and frozen reviewed. Native platform completion remains deferred to phases 10/11. |
 | 4 Analyze Queue | complete / frozen reviewed | The superseded generic-job scheduler was rolled back (`2e5f343`) and replaced by the analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion; final aligned review at `reviews/13-…` (frozen `4eaccaa..72768ef`). One open follow-up from artifact 14: queued sync analyzes lose their progress sink (m5). |
 | 5 VCS Foundation and Blame | complete / frozen reviewed | Six tasks: `code-graph-vcs` trait/registry, gix provider + hermetic harness, provider hardening (revwalk cap, shallow boundaries, honest blame contract — artifact 14 M3/M4/M5), and the `blame_symbol` tool (tool 24, oracle-tested, success-shaped unavailability, tri-state staleness). Two gate cycles; final aligned review at `reviews/15-…` (frozen `b75812e..5697222`), accepted follow-ups recorded there. Gates phase 6. |
@@ -98,11 +98,9 @@ Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deli
 | 10 macOS Platform Completion | deferred | Activates and certifies macOS seams after the Linux MVP; not part of current support acceptance. |
 | 11 Windows Platform Completion | in-progress (pulled forward 2026-08-18) | User decision: Windows daemon mode is required so large workspaces share a graph instance. 11.1 substantially done, 11.2 mostly done — full workspace gates green natively, `daemon_serve`/`daemon_proxy` un-gated and green, pipe admission ack + mandatory-lock semantics + handle-inheritance seal + SID-based owner-only DACL (natively regression-tested) landed. Security scope is one local user, one local project, multiple sessions (D-0014) — no cross-account work. TCP fallback/auth/rotation now run at process level on both platforms (debug-only forcing seam on Windows). Remaining: 11.3 certification matrix only (waits on phases 5–9). See the phase doc's pull-forward note. |
 
-### Why phases 1 and 2 are `in-progress` with every task complete
+### How phases 1 and 2 were certified after the fact
 
-Phase completion requires a four-lane review returning Aligned on all four lanes. Both phases had findings fixed *after* their last review, and a material change supersedes a review — so certifying either needs a fresh cycle. That was skipped by explicit decision: the returns were diminishing and seven phases remained. Both phases are code-complete, fully evidenced, and reviewed; neither is certified, and `Phase Completion Evidence` in each stays pending rather than claiming a gate that was not run.
-
-If certification matters later, run a fresh four-lane review of each phase's full range and write the Aligned artifact. Nothing else is outstanding.
+Both phases sat at "tasks complete, phase `in-progress`" for a week: findings had been fixed *after* their last review, a material change supersedes a review, and re-gating was deferred by explicit decision. Certification happened 2026-08-18 exactly as the deferral note prescribed — a fresh four-lane gate over each phase's **full frozen range** (`1db21d6..a08ffcf` and `a08ffcf..f2d6583`), which by construction contains every superseding fix (`5a5f9f6`, `4690da5`). All eight lanes returned PASS/Aligned; artifacts 16 and 17 record the gates and their accepted follow-ups. The endpoints predate the later Windows test-portability fixes, so gate verification rides the recorded per-task `make verify` evidence plus the current tree's green state rather than re-running historical endpoints on a newer platform.
 
 ### Work added after approval
 
