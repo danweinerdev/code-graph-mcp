@@ -6,14 +6,18 @@
 //! no VCS backend dependency enters this crate (AC-23).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use code_graph_graph::Graph;
+use code_graph_lang::FingerprintMode;
 use code_graph_vcs::{VcsError, VcsRegistry};
 use parking_lot::RwLock;
 use serde::Serialize;
 
-use crate::handlers::suggest_symbols;
+use crate::handlers::{kind_str, suggest_symbols};
+use crate::server::ServerInner;
 
+use super::fingerprint_cache::{Cached, FingerprintCache, FingerprintKey};
 use super::{require_indexed, ToolError, ToolOk, ToolResult};
 
 /// One contiguous attribution range within the symbol's span.
@@ -307,4 +311,461 @@ pub async fn blame_symbol(
         start_line: span.start_line,
         end_line: span.end_line,
     }))
+}
+
+/// Default revision window for `symbol_history` (OQ-D2: the bound and the
+/// partial-result flags are fixed; the default is tunable).
+pub const SYMBOL_HISTORY_DEFAULT_WINDOW: u32 = 50;
+/// Ceiling on the revision window; larger requests clamp silently and the
+/// resolved value is echoed.
+pub const SYMBOL_HISTORY_MAX_WINDOW: u32 = 500;
+
+/// One reported transition in a symbol's history, oldest first.
+#[derive(Debug, Serialize)]
+pub struct SymbolHistoryEntry {
+    /// Provider-native revision identity (display-only).
+    pub rev: String,
+    /// Provider-reported author display value.
+    pub author: String,
+    /// Provider-reported UTC Unix timestamp in seconds.
+    pub timestamp_utc: i64,
+    /// Provider-reported one-line revision summary.
+    pub summary: String,
+    /// `"introduced"`, `"modified"`, or `"removed"`.
+    pub change: &'static str,
+    /// `true` only on an `introduced` entry at the window's oldest
+    /// examined revision when older history may exist (the window filled
+    /// or the provider truncated) — the symbol was *present at the window
+    /// boundary*, which is indistinguishable from a genuine introduction.
+    pub at_window_boundary: bool,
+}
+
+/// A revision the walk could not evaluate; the transition state carries
+/// over it unchanged.
+#[derive(Debug, Serialize)]
+pub struct SkippedRevision {
+    pub rev: String,
+    pub reason: String,
+}
+
+/// `symbol_history` response body — a single JSON object, not a `Page`.
+///
+/// Unavailability is a SUCCESS shape (FR-36), exactly like `blame_symbol`:
+/// `available: false` + `reason` covers "no supported VCS", "no committed
+/// history for this path", and "no indexed root". The tool-error channel is
+/// reserved for bad input (unknown symbol, unknown mode, a mode the
+/// language cannot fingerprint yet) and genuine provider failures.
+#[derive(Debug, Serialize)]
+pub struct SymbolHistoryResponse {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The requested symbol ID, echoed.
+    pub symbol_id: String,
+    /// Absolute file path the history was walked for.
+    pub file: String,
+    /// Resolved fingerprint mode (`"normalized"` today).
+    pub mode: String,
+    /// Resolved window size (requests clamp to the ceiling; `0` means the
+    /// default).
+    pub window: u32,
+    /// Revisions the walk considered, including skipped ones.
+    pub revisions_examined: u32,
+    /// The window filled to `window` revisions — older revisions touching
+    /// this file exist beyond the window.
+    pub window_filled: bool,
+    /// The provider stopped examining history at its internal bound before
+    /// exhausting reachable history (distinct from `window_filled`).
+    pub history_truncated: bool,
+    /// Transitions only, oldest first. Revisions where the symbol did not
+    /// change are deliberately absent — that filtering is the tool's value.
+    pub entries: Vec<SymbolHistoryEntry>,
+    /// Revisions skipped as unreadable or unparseable, in walk order.
+    pub skipped: Vec<SkippedRevision>,
+}
+
+fn history_unavailable(
+    symbol_id: &str,
+    file: &str,
+    mode: FingerprintMode,
+    window: u32,
+    reason: String,
+) -> ToolResult<SymbolHistoryResponse> {
+    Ok(ToolOk::Value(SymbolHistoryResponse {
+        available: false,
+        reason: Some(reason),
+        symbol_id: symbol_id.to_string(),
+        file: file.to_string(),
+        mode: mode_wire(mode).to_string(),
+        window,
+        revisions_examined: 0,
+        window_filled: false,
+        history_truncated: false,
+        entries: Vec::new(),
+        skipped: Vec::new(),
+    }))
+}
+
+fn mode_wire(mode: FingerprintMode) -> &'static str {
+    match mode {
+        FingerprintMode::Normalized => "normalized",
+        FingerprintMode::LiteralInsensitive => "literal_insensitive",
+    }
+}
+
+/// Per-revision input for the blocking walk, resolved in the async phase.
+enum RevisionInput {
+    /// The fingerprint (or tombstone) came from the cache; no bytes needed.
+    Cached(Option<u64>),
+    /// Cache miss: the file's bytes at this revision, fetched via
+    /// `read_at` (in memory, FR-35 — no temporary file is ever written).
+    Bytes(Vec<u8>),
+    /// The revision's bytes could not be read; the walk skips it.
+    ReadFailed(String),
+}
+
+/// `symbol_history` body: when did this symbol's *content* actually change,
+/// as opposed to when was its file touched (FR-33).
+///
+/// The walk runs oldest to newest over a bounded window of revisions
+/// touching the symbol's file, computes the symbol's fingerprint at each
+/// (exact, case-sensitive `(name, kind)` match — D-0005: any rename,
+/// including case-only, reports as `removed` + `introduced`), and emits
+/// only transitions. The CPU-bound half — parse + fingerprint per revision
+/// — runs inside one `spawn_blocking` so a large window cannot starve the
+/// runtime (NFR-10); revision bytes are prefetched through the provider's
+/// own blocking-pool dispatch, and cache hits skip the fetch entirely.
+pub async fn symbol_history(
+    inner: &Arc<ServerInner>,
+    indexed: bool,
+    symbol: &str,
+    mode: Option<&str>,
+    window: Option<u32>,
+) -> ToolResult<SymbolHistoryResponse> {
+    require_indexed(indexed)?;
+
+    if symbol.is_empty() {
+        return Err(ToolError("'symbol' is required".to_string()));
+    }
+    let mode = match mode.unwrap_or("normalized") {
+        "" | "normalized" => FingerprintMode::Normalized,
+        "literal_insensitive" => FingerprintMode::LiteralInsensitive,
+        other => {
+            return Err(ToolError(format!(
+                "unknown fingerprint mode {other:?}: use \"normalized\" or \
+                 \"literal_insensitive\""
+            )))
+        }
+    };
+    let window = match window {
+        None | Some(0) => SYMBOL_HISTORY_DEFAULT_WINDOW,
+        Some(requested) => requested.min(SYMBOL_HISTORY_MAX_WINDOW),
+    };
+
+    // Symbol facts under the read guard, dropped before any await.
+    let (target_name, target_kind, file, language) = {
+        let g = inner.graph.read();
+        match g.symbol_detail(symbol) {
+            Some(s) => (s.name, s.kind, s.file, s.language),
+            None => {
+                let suggestions = suggest_symbols(&g, symbol, 5);
+                return Err(if suggestions.is_empty() {
+                    ToolError(format!("symbol not found: {symbol:?}"))
+                } else {
+                    ToolError(format!(
+                        "symbol not found: {symbol:?}. Did you mean: {suggestions}?"
+                    ))
+                });
+            }
+        }
+    };
+
+    let root = inner.root_path.read().clone();
+    let Some(root) = root else {
+        return history_unavailable(
+            symbol,
+            &file,
+            mode,
+            window,
+            "no indexed root recorded; re-run analyze_codebase".to_string(),
+        );
+    };
+    let Some(provider) = inner.vcs.detect(&root) else {
+        return history_unavailable(
+            symbol,
+            &file,
+            mode,
+            window,
+            format!(
+                "no supported version-control system detected at {}",
+                root.display()
+            ),
+        );
+    };
+
+    let revision_window = match provider.revisions_touching(Path::new(&file), window).await {
+        Ok(revision_window) => revision_window,
+        Err(VcsError::NotFound(error)) => {
+            return history_unavailable(
+                symbol,
+                &file,
+                mode,
+                window,
+                format!("no history for this path: {error}"),
+            )
+        }
+        Err(VcsError::Unavailable(error)) => {
+            return history_unavailable(
+                symbol,
+                &file,
+                mode,
+                window,
+                format!("history unavailable: {error}"),
+            )
+        }
+        Err(error) => return Err(ToolError(format!("list revisions failed: {error}"))),
+    };
+    if revision_window.commits.is_empty() {
+        return history_unavailable(
+            symbol,
+            &file,
+            mode,
+            window,
+            "no committed history for this path (untracked, or never committed)".to_string(),
+        );
+    }
+
+    let history_truncated = revision_window.truncated;
+    let mut commits = revision_window.commits;
+    commits.reverse(); // provider returns newest first; the walk needs oldest first
+    let window_filled = commits.len() as u32 == window;
+
+    // The cache lives at the project root that owns the graph cache.
+    let cache_root = inner
+        .cache_root
+        .read()
+        .clone()
+        .unwrap_or_else(|| root.clone());
+    let cache = FingerprintCache::open(&cache_root);
+    let relative_path = Path::new(&file)
+        .strip_prefix(&cache_root)
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file.clone());
+    let provider_id = provider.id().to_string();
+    let kind = kind_str(target_kind);
+
+    // Async phase: consult the cache, prefetch bytes only for misses. The
+    // provider dispatches each read on its own blocking pool.
+    let mut inputs: Vec<RevisionInput> = Vec::with_capacity(commits.len());
+    for commit in &commits {
+        let key = FingerprintKey {
+            provider: &provider_id,
+            rev: commit.rev.as_str(),
+            relative_path: &relative_path,
+            symbol_name: &target_name,
+            kind,
+            mode,
+        };
+        if let Some(cached) = cache.get(&key) {
+            inputs.push(RevisionInput::Cached(match cached {
+                Cached::Fingerprint(fingerprint) => Some(fingerprint),
+                Cached::Tombstone => None,
+            }));
+            continue;
+        }
+        match provider.read_at(&commit.rev, Path::new(&file)).await {
+            Ok(bytes) => inputs.push(RevisionInput::Bytes(bytes)),
+            Err(error) => inputs.push(RevisionInput::ReadFailed(error.to_string())),
+        }
+    }
+
+    run_transition_walk(WalkArgs {
+        inner: Arc::clone(inner),
+        symbol_id: symbol.to_string(),
+        commits,
+        inputs,
+        file,
+        target_name,
+        target_kind,
+        language,
+        mode,
+        window,
+        window_filled,
+        history_truncated,
+        cache,
+        relative_path,
+        provider_id,
+        kind,
+    })
+    .await
+}
+
+/// Everything the blocking walk needs, owned, so the closure is `'static`.
+struct WalkArgs {
+    inner: Arc<ServerInner>,
+    symbol_id: String,
+    commits: Vec<code_graph_vcs::Commit>,
+    inputs: Vec<RevisionInput>,
+    file: String,
+    target_name: String,
+    target_kind: code_graph_core::SymbolKind,
+    language: code_graph_core::Language,
+    mode: FingerprintMode,
+    window: u32,
+    window_filled: bool,
+    history_truncated: bool,
+    cache: FingerprintCache,
+    relative_path: String,
+    provider_id: String,
+    kind: &'static str,
+}
+
+/// The CPU-bound half of `symbol_history`: parse + fingerprint each cache
+/// miss and assemble the transition walk, inside one `spawn_blocking`.
+async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse> {
+    let revisions_examined = args.commits.len() as u32;
+    let walk = tokio::task::spawn_blocking(move || {
+        let WalkArgs {
+            inner,
+            symbol_id,
+            commits,
+            inputs,
+            file,
+            target_name,
+            target_kind,
+            language,
+            mode,
+            window,
+            window_filled,
+            history_truncated,
+            cache,
+            relative_path,
+            provider_id,
+            kind,
+        } = args;
+        let Some(plugin) = inner.registry.plugin_for(language) else {
+            return Err(ToolError(format!("no parser registered for {language:?}")));
+        };
+
+        let mut entries: Vec<SymbolHistoryEntry> = Vec::new();
+        let mut skipped: Vec<SkippedRevision> = Vec::new();
+        // None = nothing examined yet; Some(None) = absent at the previous
+        // examined revision; Some(Some(fp)) = present with that fingerprint.
+        let mut previous: Option<Option<u64>> = None;
+
+        for (commit, input) in commits.iter().zip(inputs) {
+            let current: Option<u64> = match input {
+                RevisionInput::Cached(cached) => cached,
+                RevisionInput::ReadFailed(reason) => {
+                    skipped.push(SkippedRevision {
+                        rev: commit.rev.to_string(),
+                        reason: format!("unreadable at revision: {reason}"),
+                    });
+                    continue;
+                }
+                RevisionInput::Bytes(bytes) => {
+                    // Historical code may not parse with today's grammar —
+                    // expected, not exceptional: skip and flag.
+                    let parsed = match plugin.parse_file(Path::new(&file), &bytes) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            skipped.push(SkippedRevision {
+                                rev: commit.rev.to_string(),
+                                reason: format!("parse failed: {error}"),
+                            });
+                            continue;
+                        }
+                    };
+                    // Exact, case-sensitive (name, kind) — D-0005. Several
+                    // matches (overloads) resolve deterministically to the
+                    // earliest occurrence.
+                    let found = parsed
+                        .symbols
+                        .iter()
+                        .filter(|s| s.name == target_name && s.kind == target_kind)
+                        .min_by_key(|s| (s.line, s.column));
+                    let key = FingerprintKey {
+                        provider: &provider_id,
+                        rev: commit.rev.as_str(),
+                        relative_path: &relative_path,
+                        symbol_name: &target_name,
+                        kind,
+                        mode,
+                    };
+                    match found {
+                        None => {
+                            cache.put(&key, Cached::Tombstone);
+                            None
+                        }
+                        Some(historical) => {
+                            match plugin.fingerprint_symbol(&bytes, historical, mode) {
+                                Some(fingerprint) => {
+                                    cache.put(&key, Cached::Fingerprint(fingerprint));
+                                    Some(fingerprint)
+                                }
+                                None if mode == FingerprintMode::LiteralInsensitive => {
+                                    // Never silently fall back to Normalized
+                                    // (Designs/VcsHistory Decision 5).
+                                    return Err(ToolError(format!(
+                                        "fingerprint mode \"literal_insensitive\" is not \
+                                         supported for {language:?} yet (per-language \
+                                         overrides arrive in phase 8); use \"normalized\""
+                                    )));
+                                }
+                                None => {
+                                    skipped.push(SkippedRevision {
+                                        rev: commit.rev.to_string(),
+                                        reason: "span not fingerprintable at this revision"
+                                            .to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            let first_examined = previous.is_none();
+            let before = previous.flatten();
+            previous = Some(current);
+            let change = match (before, current) {
+                (None, Some(_)) => "introduced",
+                (Some(_), None) if !first_examined => "removed",
+                (Some(a), Some(b)) if a != b && !first_examined => "modified",
+                _ => continue,
+            };
+            entries.push(SymbolHistoryEntry {
+                rev: commit.rev.to_string(),
+                author: commit.author.clone(),
+                timestamp_utc: commit.timestamp_utc,
+                summary: commit.summary.clone(),
+                change,
+                // Present at the window's oldest examined revision with
+                // older history possibly existing: indistinguishable from a
+                // genuine introduction — say so instead of mislabelling.
+                at_window_boundary: first_examined
+                    && change == "introduced"
+                    && (window_filled || history_truncated),
+            });
+        }
+
+        Ok(SymbolHistoryResponse {
+            available: true,
+            reason: None,
+            symbol_id,
+            file,
+            mode: mode_wire(mode).to_string(),
+            window,
+            revisions_examined,
+            window_filled,
+            history_truncated,
+            entries,
+            skipped,
+        })
+    })
+    .await
+    .map_err(|error| ToolError(format!("symbol_history worker failed: {error}")))??;
+
+    Ok(ToolOk::Value(walk))
 }

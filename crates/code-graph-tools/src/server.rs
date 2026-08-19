@@ -946,6 +946,29 @@ pub struct BlameSymbolArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolHistoryArgs {
+    #[schemars(
+        description = "Symbol ID in format file:name as returned by get_file_symbols or search_symbols"
+    )]
+    pub symbol: String,
+    #[schemars(
+        description = "Fingerprint sensitivity: \"normalized\" (default — formatting- and \
+                       comment-insensitive; literal values count as changes) or \
+                       \"literal_insensitive\" (additionally ignores literal values; not yet \
+                       supported for any language — requesting it is a tool error until the \
+                       per-language overrides land)."
+    )]
+    pub mode: Option<String>,
+    #[schemars(
+        description = "How many revisions touching the symbol's file to examine, newest \
+                       backwards. Default 50, max 500 (clamped silently; the resolved value \
+                       is echoed as `window`), 0 means the default. Raise it when the \
+                       response says window_filled=true and you need older transitions."
+    )]
+    pub window: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetSymbolSummaryArgs {
     #[schemars(description = "Optional absolute path: scope counts to a single file")]
     #[serde(default)]
@@ -1588,6 +1611,51 @@ impl CodeGraphServer {
             root,
             &args.symbol,
             args.at.as_deref(),
+        )
+        .await)
+    }
+
+    #[tool(
+        description = "When did this symbol's CONTENT actually change — as opposed to when was \
+                       its file touched (that is git log, which you already have). Walks up to \
+                       `window` revisions touching the symbol's file (default 50, max 500, \
+                       0=default; resolved value echoed), oldest to newest, fingerprints the \
+                       symbol at each, and reports ONLY transitions. Returns a single JSON \
+                       object (NOT a Page envelope): {available, reason?, symbol_id, file, \
+                       mode, window, revisions_examined, window_filled, history_truncated, \
+                       entries, skipped}, where each entry is {rev, author, timestamp_utc, \
+                       summary, change, at_window_boundary} with change one of \
+                       \"introduced\" | \"modified\" | \"removed\", oldest first. A \
+                       reformat-only or comment-only commit is NOT reported under the default \
+                       `mode=\"normalized\"`; changed literals and code are. Matching is \
+                       exact, case-sensitive (name, kind): ANY rename — including a case-only \
+                       rename — reports as \"removed\" followed by \"introduced\" of the new \
+                       name, never \"modified\". `at_window_boundary: true` on an \
+                       \"introduced\" entry means the symbol was already present at the \
+                       oldest examined revision and older history may exist — raise `window` \
+                       to see further back; `window_filled: true` means more touching \
+                       revisions exist beyond the window; `history_truncated: true` means the \
+                       provider hit its internal examination bound. `skipped` lists revisions \
+                       that could not be read or parsed (historical code may not parse with \
+                       today's grammar); the transition state carries over them. \
+                       `available: false` + `reason` is a SUCCESS (no VCS at the indexed \
+                       root, or no committed history for this path); unknown `symbol` is a \
+                       tool error with did-you-mean suggestions; an unknown or unsupported \
+                       `mode` is a tool error naming the supported spelling. Results are \
+                       cached under .code-graph/fingerprints/, so repeated walks are cheap."
+    )]
+    async fn symbol_history(
+        &self,
+        Parameters(args): Parameters<SymbolHistoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(r) = self.require_indexed() {
+            return Ok(r);
+        }
+        Ok(handlers::history::symbol_history(
+            &self.inner,
+            &args.symbol,
+            args.mode.as_deref(),
+            args.window,
         )
         .await)
     }
@@ -2720,16 +2788,16 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    /// `tools/list` must surface exactly 24 tools. If a future change adds
+    /// `tools/list` must surface exactly 25 tools. If a future change adds
     /// or removes a `#[tool]`, this assertion is the first place a
     /// wire-format change shows up.
     #[test]
-    fn tool_router_registers_twenty_four_tools() {
+    fn tool_router_registers_twenty_five_tools() {
         let server = empty_server();
         assert_eq!(
             server.tool_count(),
-            24,
-            "expected 24 registered tools, got {}",
+            25,
+            "expected 25 registered tools, got {}",
             server.tool_count(),
         );
     }
@@ -2771,6 +2839,7 @@ mod tests {
             "find_path",
             "detect_communities",
             "blame_symbol",
+            "symbol_history",
         ] {
             assert!(
                 names.contains(expected),

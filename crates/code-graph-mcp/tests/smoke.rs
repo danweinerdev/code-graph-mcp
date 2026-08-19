@@ -2,13 +2,13 @@
 //!
 //! Spawns the freshly-built `code-graph-mcp` debug binary, completes the
 //! `initialize` handshake, sends a `tools/list` request, and asserts that
-//! the response advertises 24 tools. The full wire-format snapshot
+//! the response advertises 25 tools. The full wire-format snapshot
 //! suite lives in `code-graph-tools`'s snapshot tests; this assertion
 //! is a coarse compile-and-handshake gate.
 //!
 //! This complements the unit-level `tool_router_registers_twenty_four_tools`
 //! test in `code-graph-tools::server` — that test never starts the IO loop,
-//! so it can't catch a regression where the macro generates 24 routes but
+//! so it can't catch a regression where the macro generates 25 routes but
 //! `ServerHandler::list_tools` filters them. Running both gives us
 //! belt-and-braces coverage without depending on an external MCP client.
 
@@ -181,8 +181,8 @@ fn binary_advertises_twenty_three_tools() {
 
     assert_eq!(
         tools.len(),
-        24,
-        "tools/list must advertise 24 tools, got {}: {tools:?}",
+        25,
+        "tools/list must advertise 25 tools, got {}: {tools:?}",
         tools.len(),
     );
 
@@ -216,6 +216,7 @@ fn binary_advertises_twenty_three_tools() {
         "find_path",
         "detect_communities",
         "blame_symbol",
+        "symbol_history",
     ] {
         assert!(
             names.contains(expected),

@@ -18,7 +18,7 @@ use code_graph_lang::LanguageRegistry;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::CodeGraphServer;
-use code_graph_vcs::{BlameHunk, Commit, RevId, VcsError, VcsProvider, VcsRegistry};
+use code_graph_vcs::{BlameHunk, RevId, VcsError, VcsProvider, VcsRegistry};
 use code_graph_vcs_git::GitProvider;
 use common::{first_text, ok_json};
 use tempfile::TempDir;
@@ -488,8 +488,15 @@ impl VcsProvider for GatedProvider {
         }])
     }
 
-    async fn revisions_touching(&self, _path: &Path, _limit: u32) -> Result<Vec<Commit>, VcsError> {
-        Ok(Vec::new())
+    async fn revisions_touching(
+        &self,
+        _path: &Path,
+        _limit: u32,
+    ) -> Result<code_graph_vcs::RevisionWindow, VcsError> {
+        Ok(code_graph_vcs::RevisionWindow {
+            commits: Vec::new(),
+            truncated: false,
+        })
     }
 
     async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {

@@ -57,6 +57,24 @@ pub struct Commit {
     pub summary: String,
 }
 
+/// A bounded window of revisions that changed one file, newest first.
+///
+/// `truncated` distinguishes "the provider stopped examining history at an
+/// internal bound with unexamined history remaining" (the git revwalk cap)
+/// from the window merely filling to the requested `limit` — a caller can
+/// detect the latter itself via `commits.len() == limit`, but only the
+/// provider knows about the former. Consumers building user-facing results
+/// must surface both states rather than presenting a truncated walk as
+/// complete history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RevisionWindow {
+    /// Up to `limit` revisions that changed the path, newest first.
+    pub commits: Vec<Commit>,
+    /// The walk stopped at a provider-internal examination bound before
+    /// exhausting reachable history.
+    pub truncated: bool,
+}
+
 /// Attribution for a contiguous source-line range.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlameHunk {
@@ -122,8 +140,11 @@ pub trait VcsProvider: Send + Sync {
         at: Option<&RevId>,
     ) -> Result<Vec<BlameHunk>, VcsError>;
 
-    /// List up to `limit` revisions that changed `path`.
-    async fn revisions_touching(&self, path: &Path, limit: u32) -> Result<Vec<Commit>, VcsError>;
+    /// List up to `limit` revisions that changed `path`, newest first,
+    /// with an explicit signal when the provider's own examination bound
+    /// (not the caller's `limit`) cut the walk short.
+    async fn revisions_touching(&self, path: &Path, limit: u32)
+        -> Result<RevisionWindow, VcsError>;
 
     /// Read `path` as it existed at `rev`.
     async fn read_at(&self, rev: &RevId, path: &Path) -> Result<Vec<u8>, VcsError>;
@@ -249,16 +270,19 @@ mod tests {
             &self,
             _path: &Path,
             limit: u32,
-        ) -> Result<Vec<Commit>, VcsError> {
-            Ok((limit > 0)
-                .then(|| Commit {
-                    rev: self.revision(),
-                    author: "integer-provider".to_string(),
-                    timestamp_utc: 0,
-                    summary: "integer changelist".to_string(),
-                })
-                .into_iter()
-                .collect())
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: (limit > 0)
+                    .then(|| Commit {
+                        rev: self.revision(),
+                        author: "integer-provider".to_string(),
+                        timestamp_utc: 0,
+                        summary: "integer changelist".to_string(),
+                    })
+                    .into_iter()
+                    .collect(),
+                truncated: false,
+            })
         }
 
         async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
@@ -299,8 +323,11 @@ mod tests {
             &self,
             _path: &Path,
             _limit: u32,
-        ) -> Result<Vec<Commit>, VcsError> {
-            Ok(Vec::new())
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: Vec::new(),
+                truncated: false,
+            })
         }
 
         async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
@@ -351,9 +378,12 @@ mod tests {
             &self,
             _path: &Path,
             _limit: u32,
-        ) -> Result<Vec<Commit>, VcsError> {
+        ) -> Result<RevisionWindow, VcsError> {
             self.wait().await;
-            Ok(Vec::new())
+            Ok(RevisionWindow {
+                commits: Vec::new(),
+                truncated: false,
+            })
         }
 
         async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
@@ -385,14 +415,15 @@ mod tests {
             .blame(path, Some((4, 6)), Some(&revision))
             .await
             .unwrap();
-        let commits = provider.revisions_touching(path, 1).await.unwrap();
+        let window = provider.revisions_touching(path, 1).await.unwrap();
         let contents = provider.read_at(&revision, path).await.unwrap();
 
         assert_eq!(revision.as_str(), "42424");
         assert_eq!(blame[0].rev, revision);
         assert_eq!(blame[0].start_line, 4);
         assert_eq!(blame[0].line_count, 3);
-        assert_eq!(commits[0].rev, revision);
+        assert!(!window.truncated);
+        assert_eq!(window.commits[0].rev, revision);
         assert_eq!(contents, b"integer provider contents");
     }
 

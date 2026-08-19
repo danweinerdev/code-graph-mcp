@@ -10,7 +10,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use code_graph_vcs::{BlameHunk, Commit, RevId, VcsError, VcsProvider};
+use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
 
 /// A Git provider bound to one discovered working tree.
 ///
@@ -89,7 +89,11 @@ impl VcsProvider for GitProvider {
             .await
     }
 
-    async fn revisions_touching(&self, path: &Path, limit: u32) -> Result<Vec<Commit>, VcsError> {
+    async fn revisions_touching(
+        &self,
+        path: &Path,
+        limit: u32,
+    ) -> Result<RevisionWindow, VcsError> {
         let path = path.to_path_buf();
         self.blocking(move |project_root| revisions_touching(&project_root, &path, limit))
             .await
@@ -287,9 +291,12 @@ fn revisions_touching(
     project_root: &Path,
     path: &Path,
     limit: u32,
-) -> Result<Vec<Commit>, VcsError> {
+) -> Result<RevisionWindow, VcsError> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(RevisionWindow {
+            commits: Vec::new(),
+            truncated: false,
+        });
     }
 
     let repository = open_repository(project_root)?;
@@ -304,8 +311,13 @@ fn revisions_touching(
     let mut sequence = 0;
     enqueue_commit(&repository, &mut pending, head, &mut sequence)?;
     let mut seen = HashSet::new();
+    let mut truncated = false;
     while let Some(pending_commit) = pending.pop() {
         if seen.len() >= MAX_REVWALK_COMMITS {
+            // A pending entry was popped but not examined: reachable
+            // history remains beyond the cap. Filling the caller's `limit`
+            // below is NOT truncation — the caller sees that itself.
+            truncated = true;
             break;
         }
         if !seen.insert(pending_commit.id) {
@@ -325,7 +337,10 @@ fn revisions_touching(
             }
         }
     }
-    Ok(revisions)
+    Ok(RevisionWindow {
+        commits: revisions,
+        truncated,
+    })
 }
 
 /// One commit queued for the manual newest-first revwalk.
@@ -1193,6 +1208,7 @@ mod harness {
             .await
             .expect("manual path revwalk succeeds");
         let actual_history = actual_history
+            .commits
             .iter()
             .map(|commit| {
                 (
@@ -1209,9 +1225,16 @@ mod harness {
             .await
             .expect("uncapped fixture history succeeds");
         assert_eq!(
-            full_history.last().map(|commit| commit.summary.as_str()),
+            full_history
+                .commits
+                .last()
+                .map(|commit| commit.summary.as_str()),
             Some("initial calculator"),
             "the root commit introducing a path must be included"
+        );
+        assert!(
+            !full_history.truncated,
+            "an exhausted fixture history is complete, not truncated"
         );
         assert!(
             actual_history
@@ -1223,6 +1246,7 @@ mod harness {
             .revisions_touching(&source_path, 0)
             .await
             .expect("zero-limit history succeeds")
+            .commits
             .is_empty());
 
         let hunks = provider
@@ -1269,7 +1293,10 @@ mod harness {
             .expect("walk merge history");
 
         assert!(
-            history.iter().any(|commit| commit.rev == merge_revision),
+            history
+                .commits
+                .iter()
+                .any(|commit| commit.rev == merge_revision),
             "the merge changes the path against its second parent even though it matches its first"
         );
     }
@@ -1300,6 +1327,7 @@ mod harness {
             .expect("walk mode-only history");
         assert_eq!(
             history
+                .commits
                 .iter()
                 .map(|commit| commit.summary.as_str())
                 .collect::<Vec<_>>(),
@@ -1356,6 +1384,7 @@ mod harness {
             .expect("a shallow boundary terminates the walk instead of erroring");
         assert_eq!(
             history
+                .commits
                 .iter()
                 .map(|commit| commit.rev.as_str())
                 .collect::<Vec<_>>(),
@@ -1368,7 +1397,7 @@ mod harness {
     /// without editing it, and detection selects each for its own tree.
     #[test]
     fn registry_selects_git_alongside_an_independent_second_provider() {
-        use code_graph_vcs::{BlameHunk, Commit, RevId, VcsError, VcsProvider, VcsRegistry};
+        use code_graph_vcs::{BlameHunk, RevId, VcsError, VcsProvider, VcsRegistry};
 
         struct MarkerProvider;
 
@@ -1392,8 +1421,11 @@ mod harness {
                 &self,
                 _path: &Path,
                 _limit: u32,
-            ) -> Result<Vec<Commit>, VcsError> {
-                Ok(Vec::new())
+            ) -> Result<code_graph_vcs::RevisionWindow, VcsError> {
+                Ok(code_graph_vcs::RevisionWindow {
+                    commits: Vec::new(),
+                    truncated: false,
+                })
             }
             async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
                 Ok(Vec::new())
