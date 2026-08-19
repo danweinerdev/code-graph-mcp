@@ -23,7 +23,7 @@ tasks:
     title: "Output parity and exit-status behaviour"
     status: complete
     justifies: "FR-19, FR-20, AC-11, AC-12. Payload parity is the property that makes the CLI trustworthy for scripting; without per-shape coverage a divergence in one envelope type would go unnoticed until someone depended on it."
-    verification: "cargo test -p code-graph-cli parity:: — machine-readable output equals the MCP payload for one query of each distinct shape: a Page envelope (get_callers), a non-Page tree (get_class_hierarchy), a flattened envelope with a conditional field (search_symbols, both with and without suggestions), a dual-page response (get_coupling direction=both), and a non-JSON body (generate_diagram format=mermaid) (AC-11); exit status distinguishes success, an unknown-symbol tool error, and an operational failure such as an unreadable cache (AC-12)."
+    verification: "cargo test -p code-graph-cli --test parity — machine-readable output equals the MCP payload for one query of each distinct shape: a Page envelope (get_callers), a non-Page tree (get_class_hierarchy), a flattened envelope with a conditional field (search_symbols, both with and without suggestions), a dual-page response (get_coupling direction=both), and a non-JSON body (generate_diagram format=mermaid) (AC-11); exit status distinguishes success, an unknown-symbol tool error, and an operational failure such as an unreadable cache (AC-12)."
     depends_on: ["7.2"]
 ---
 

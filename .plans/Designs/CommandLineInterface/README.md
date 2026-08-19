@@ -304,11 +304,17 @@ parity tests loudly, which is the desired failure mode.
 1, message on stderr. Everything that prevents the core function from
 running or the answer from arriving → 2: cache file present but
 unreadable (I/O error, as opposed to version-mismatch → "not present" →
-honest unindexed → 1), child proxy spawn/handshake failure after the
-standalone fallback also fails, transport death mid-call, clap usage
-errors. In daemon mode, `is_error: true` in the response maps to 1 with
-the payload text on stderr — the same text the standalone `ToolError`
-carries, byte-identical by Decision 4's argument.
+honest unindexed → 1), a daemon channel that fails AFTER the child
+spawned (missing/truncated/malformed JSON-RPC response — surfaced, not
+retried standalone, because the daemon may already have partially
+answered and a silent standalone retry could return a DIFFERENT answer
+than the daemon would have), transport death mid-call, clap usage
+errors. Only a child that cannot be SPAWNED falls back to the
+standalone backend (with a breadcrumb) — spawn failure proves no
+channel was ever established, so the retry cannot diverge. In daemon
+mode, `is_error: true` in the response maps to 1 with the payload text
+on stderr — the same text the standalone `ToolError` carries,
+byte-identical by Decision 4's argument.
 
 **Rationale:** The three classes are exactly `ToolResult`'s shape plus
 "the machinery failed"; anything cleverer (per-error-kind statuses)
