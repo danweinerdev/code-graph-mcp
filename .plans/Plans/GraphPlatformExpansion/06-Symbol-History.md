@@ -3,7 +3,7 @@ title: "Symbol History"
 type: phase
 plan: GraphPlatformExpansion
 phase: 6
-status: in-progress
+status: complete
 created: 2026-08-08
 updated: 2026-08-19
 deliverable: "A symbol_history tool reporting the revisions at which a symbol's content actually changed, with a fingerprint hook on LanguagePlugin and a content-addressed fingerprint cache."
@@ -257,17 +257,41 @@ Mapping ALL of `read_at`'s early failure arms (`rev_parse_single`, `object()`, `
 
 ## Acceptance Criteria
 
-- [ ] **AC-19**: A reformat-only commit is not reported; the logic commit is (FR-33, FR-34).
-- [ ] **AC-20**: A commit moving the symbol without changing it is not reported (FR-33).
-- [ ] **AC-37**: Historical bytes are parsed in memory with no temporary file written (FR-35).
-- [ ] **AC-38**: A reformatted symbol yields an unchanged fingerprint under the formatting-insensitive mode (FR-34).
-- [ ] **AC-46**: The cache serves the second query, and recomputes rather than errors when absent or corrupt (FR-37).
-- [ ] **AC-45**: The `symbol_history` description meets the agent-facing-description lens, including the rename behaviour (NFR-11).
-- [ ] A `symbol_history` call over a large window does not delay a concurrent non-history query (NFR-10).
-- [ ] `code-graph-lang` gains no third-party dependency (NFR-02).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
-- [ ] FR-33, FR-35, FR-37 realized; FR-34 realized for `Normalized` across all languages, with `LiteralInsensitive` completing in phase 8.
+- [x] **AC-19**: A reformat-only commit is not reported; the logic commit is (FR-33, FR-34). — `symbol_history_reports_only_content_transitions`
+- [x] **AC-20**: A commit moving the symbol without changing it is not reported (FR-33). — same test, `_c4` move commit invisible
+- [x] **AC-37**: Historical bytes are parsed in memory with no temporary file written (FR-35). — `symbol_history_writes_no_temporary_files`
+- [x] **AC-38**: A reformatted symbol yields an unchanged fingerprint under the formatting-insensitive mode (FR-34). — `reformat_only_change_keeps_the_fingerprint` (canonical line-break-after-paren shape)
+- [x] **AC-46**: The cache serves the second query, and recomputes rather than errors when absent or corrupt (FR-37). — `fingerprint_cache_*` unit tests + `symbol_history_cache_populates_and_second_walk_matches`
+- [x] **AC-45**: The `symbol_history` description meets the agent-facing-description lens, including the rename behaviour (NFR-11). — spec lane cycle-3 disposition; description names the envelope, both args with defaults + ceilings, rename/earliest-occurrence/deletion/truncation caveats, operationally correct window advice
+- [x] A `symbol_history` call over a large window does not delay a concurrent non-history query (NFR-10). — `symbol_history_slow_provider_delays_only_history_tools` (provider await) + one `spawn_blocking` for the CPU loop (structural; test-shape follow-up recorded in artifact 18)
+- [x] `code-graph-lang` gains no third-party dependency (NFR-02). — empty Cargo.toml/Cargo.lock diff over the frozen range; `DefaultHasher` only
+- [x] **AC-27**: `make verify` passes (NFR-04). — green at the phase endpoint (tasks 6.3/6.4/6.5 evidence rows)
+- [x] FR-33, FR-35, FR-37 realized; FR-34 realized for `Normalized` across all languages, with `LiteralInsensitive` completing in phase 8. — upfront data-independent rejection names phase 8; default hook returns `None`, never a silent fallback
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `3ee981012cbd8d4f61320293938e7b538eb54a76`
+- Identity recheck: `git rev-parse 3ee9810` at 2026-08-19 13:37 matched `3ee981012cbd8d4f61320293938e7b538eb54a76`
+- Focused review: four-lane frozen gate over `2627a51ab1a0529e8fff0f7365cef0d45b349c2d..3ee981012cbd8d4f61320293938e7b538eb54a76` (three cycles; cycle-1 material M1 resolved as task 6.4, cycle-2 material M2 resolved as task 6.5)
+- Reviewed candidate / final: `3ee981012cbd8d4f61320293938e7b538eb54a76`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, rustfmt check, full workspace tests (natively on Windows), pending-snapshot check, and plugin-mirror sync all green at the phase endpoint (AC-27); only docs-only commits follow the last verified code commit e747b14.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen 2627a51..3ee9810, planning 8fccc83` | PASS | `All four independent lanes returned PASS/Aligned on cycle 3; residual observations recorded as accepted follow-ups in the review artifact.` |
+
+### Completed task identities
+- `6.1`: `0baf6c65bf4e1dbe41c9ee16313f401bbcea95e3`
+- `6.2`: `ea6df2df6f05b8788d570748d80392fd13a1f313`
+- `6.3`: `07b10d3e238821dc78c249359cf2c80657040f56`
+- `6.4`: `d6b3d9c9813e67a41d4bf3b5208abfb9c10d3bbd`
+- `6.5`: `e747b14ead60c663d1aba69d26b20b857873e337`
+
+- Final aligned review: `reviews/18-symbol-history-final-review-2627a51-3ee9810.md`; frozen: `2627a51ab1a0529e8fff0f7365cef0d45b349c2d..3ee981012cbd8d4f61320293938e7b538eb54a76`
