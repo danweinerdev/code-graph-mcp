@@ -46,6 +46,11 @@ use crate::handlers::{
     ENVELOPE_OVERHEAD_BYTES,
 };
 
+/// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
+/// Decision 1) can construct the input without importing `handlers` — the
+/// layer that carries the unguarded hardcoded-`indexed` adapters.
+pub use crate::handlers::symbols::SearchSymbolsInput as SearchInput;
+
 /// `get_file_symbols` body. Body moved verbatim from
 /// `handlers::symbols::get_file_symbols`, plus the core `require_indexed`
 /// call at entry (Decision 8). See the handler doc-comment (unchanged, and

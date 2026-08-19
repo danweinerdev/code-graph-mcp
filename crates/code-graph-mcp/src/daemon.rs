@@ -774,6 +774,65 @@ pub async fn proxy(root: PathBuf) -> anyhow::Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not publish metadata")))
 }
 
+/// Attach-only proxy (Designs/CommandLineInterface Decision 3): attaches to
+/// a published, compatible, live daemon or reports failure so the caller
+/// serves in-process. Unlike [`proxy`], it NEVER spawns a contender and
+/// NEVER initiates the replacement protocol — a drive-by CLI invocation
+/// must not leave a resident daemon behind and must not kill another
+/// session's daemon.
+///
+/// Failure is immediate (no retry loop) for the outcomes retrying cannot
+/// change without spawning or replacing: no published metadata, a
+/// binary-incompatible owner, or metadata with no live lock owner.
+/// Connection failures against a LIVE compatible owner retry within the
+/// attach deadline — the daemon may be momentarily saturated.
+pub async fn proxy_attach_only(root: PathBuf) -> anyhow::Result<()> {
+    let mut paths = DaemonPaths::for_root(&root);
+    paths.open_runtime_dir_if_present()?;
+    let fingerprint = executable_fingerprint()?;
+    let deadline = std::time::Instant::now() + PROXY_ATTACH_DEADLINE;
+    let mut last_error = None;
+
+    while std::time::Instant::now() < deadline {
+        // Namespace changes (runtime dir recreated underneath us) refresh
+        // the descriptor exactly as the full proxy does; the next metadata
+        // read observes the successor namespace.
+        refresh_proxy_paths(&mut paths, &root)?;
+        let metadata = read_metadata(&paths)
+            .map_err(|error| anyhow::anyhow!("no attachable daemon published: {error}"))?;
+        if !metadata_compatible(&metadata, &fingerprint) {
+            return Err(anyhow::anyhow!(
+                "published daemon is binary-incompatible; attach-only leaves it untouched"
+            ));
+        }
+        if !metadata_owner_is_active(&paths, &metadata) {
+            return Err(anyhow::anyhow!(
+                "published daemon metadata has no live lock owner"
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match connect_to_metadata(&paths, &metadata, remaining.min(PROXY_CONNECT_TIMEOUT)).await {
+            Ok(connection) => {
+                // Same post-connect revalidation as the full proxy: never
+                // hand an established stream to a daemon that lost its lock
+                // ownership while the connection was being established.
+                if metadata_owner_is_active(&paths, &metadata) && proxy_namespace_is_current(&paths)
+                {
+                    report_tcp_fallback(&metadata);
+                    return finish_proxy(connection.stream).await;
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "daemon metadata owner changed while connecting"
+                ));
+                drop(connection);
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(PROXY_RETRY_INTERVAL).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("attach-only deadline elapsed")))
+}
+
 /// A proxy normally keeps its verified runtime descriptor to avoid path
 /// reopening races. If the visible root or runtime inode diverges, that
 /// capability is detached and cannot observe the successor namespace; replace

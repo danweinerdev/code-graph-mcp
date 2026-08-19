@@ -58,6 +58,10 @@ use serde::Serialize;
 
 use crate::core::{require_indexed, ToolError, ToolOk, ToolResult};
 use crate::handlers::structure::{is_unreliable_orphan, GenerateDiagramInput, ReliabilityMode};
+
+/// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
+/// Decision 1) can construct the input without importing `handlers`.
+pub use crate::handlers::structure::GenerateDiagramInput as DiagramInput;
 use crate::handlers::{
     byte_budget_take, kind_str, parse_kind, parse_min_confidence, suggest_symbols,
     symbol_to_result, Community, CouplingBoth, CouplingEntry, Cycle, DegenerateInfo,

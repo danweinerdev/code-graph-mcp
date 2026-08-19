@@ -1,0 +1,40 @@
+[package]
+name = "code-graph-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line front-end over the typed core; payload-identical to the MCP surface"
+
+[[bin]]
+name = "code-graph"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+code-graph-core = { path = "../code-graph-core" }
+code-graph-lang = { path = "../code-graph-lang" }
+code-graph-lang-cpp = { path = "../code-graph-lang-cpp" }
+code-graph-lang-csharp = { path = "../code-graph-lang-csharp" }
+code-graph-lang-go = { path = "../code-graph-lang-go" }
+code-graph-lang-java = { path = "../code-graph-lang-java" }
+code-graph-lang-python = { path = "../code-graph-lang-python" }
+code-graph-lang-rust = { path = "../code-graph-lang-rust" }
+code-graph-tools = { path = "../code-graph-tools" }
+# Trait crate for the registry type; the git backend is composed here in
+# the binary exactly as code-graph-mcp does (AC-23).
+code-graph-vcs = { path = "../code-graph-vcs" }
+code-graph-vcs-git = { path = "../code-graph-vcs-git" }
+# CLI binary only (Designs/CommandLineInterface Decision 6). NOT rmcp:
+# every subcommand calls core:: typed functions; the daemon backend is a
+# byte-level JSON-RPC client over the spawned proxy's stdio (FR-17).
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

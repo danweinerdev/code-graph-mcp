@@ -25,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let no_daemon = args.iter().any(|arg| arg == "--no-daemon");
     let serve_daemon = !no_daemon && args.iter().any(|arg| arg == "--serve");
+    // Attach-only proxy mode (Designs/CommandLineInterface Decision 3):
+    // attach to a published, compatible, live daemon or serve in-process —
+    // never spawn a contender, never initiate the replacement protocol.
+    // `--no-daemon` and `--serve` both take precedence.
+    let attach_only = !no_daemon && !serve_daemon && args.iter().any(|arg| arg == "--attach-only");
 
     if !serve_daemon && !no_daemon {
         // Proxy selection must happen before constructing the MCP transport:
@@ -36,18 +41,25 @@ async fn main() -> anyhow::Result<()> {
             // directory and defeat attach on Windows.
             if let Ok(cwd) = code_graph_core::paths::canonicalize(&cwd) {
                 match RootConfig::load(&cwd) {
-                    Ok((config, root)) if config.daemon.enabled => match daemon::proxy(root.clone()).await {
-                        // `tokio::io::stdin` uses a blocking reader. After the daemon
-                        // closes first, its cancelled read can keep runtime teardown
-                        // waiting even though the byte pump has ended. The proxy has
-                        // already drained stdout, so exit without waiting for that
-                        // irrelevant stdin worker.
-                        Ok(()) => std::process::exit(0),
-                        Err(error) => eprintln!(
-                            "code-graph-mcp: daemon unavailable for {}; falling back to in-process stdio ({error})",
-                            root.display()
-                        ),
-                    },
+                    Ok((config, root)) if config.daemon.enabled => {
+                        let attempt = if attach_only {
+                            daemon::proxy_attach_only(root.clone()).await
+                        } else {
+                            daemon::proxy(root.clone()).await
+                        };
+                        match attempt {
+                            // `tokio::io::stdin` uses a blocking reader. After the daemon
+                            // closes first, its cancelled read can keep runtime teardown
+                            // waiting even though the byte pump has ended. The proxy has
+                            // already drained stdout, so exit without waiting for that
+                            // irrelevant stdin worker.
+                            Ok(()) => std::process::exit(0),
+                            Err(error) => eprintln!(
+                                "code-graph-mcp: daemon unavailable for {}; falling back to in-process stdio ({error})",
+                                root.display()
+                            ),
+                        }
+                    }
                     Ok(_) => {}
                     // A malformed configuration did not affect binary startup before
                     // daemon opt-in. Preserve that direct-stdio behavior; the normal

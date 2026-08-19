@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/code-graph-cli",
     "crates/code-graph-mcp",
     "crates/code-graph-core",
     "crates/code-graph-lang",
@@ -67,6 +68,9 @@ rmcp = { version = "=1.5.0", features = ["server", "macros", "transport-io", "sc
 notify-debouncer-full = "0.7"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+# CLI binary only (Designs/CommandLineInterface Decision 6): never enters
+# the four NFR-02-protected crates.
+clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 schemars = "1"
 insta = { version = "1", features = ["json", "redactions", "filters"] }

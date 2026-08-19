@@ -37,6 +37,10 @@ use crate::handlers::{
     CallChainResponse, DependencyEntry, FindPathResponse, Page,
 };
 
+/// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
+/// Decision 1) can select the walk arm without importing `handlers`.
+pub use crate::handlers::query::Direction as CallDirection;
+
 /// `callers_or_callees` body. Body moved verbatim from
 /// `handlers::query::callers_or_callees`, plus the core `require_indexed`
 /// call at entry (Decision 8).
