@@ -3,14 +3,14 @@ title: "Resolver Candidate Count"
 type: phase
 plan: GraphPlatformExpansion
 phase: 9
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-19
 deliverable: "Edges record how many same-named candidates competed for their target, and the tools that report edges surface it — replacing a one-bit heuristic tag with the number a caller can act on."
 tasks:
   - id: "9.1"
     title: "Record candidate count on the edge and bump the cache format"
-    status: planned
+    status: in-progress
     justifies: "FR-48, AC-57, D-0007. Confidence::Heuristic is a one-bit projection of 'N candidates competed'. The resolver knows N at the moment it picks, and then throws it away — so the information a caller needs to disambiguate is destroyed at index time and cannot be recovered by any downstream change."
     verification: "cargo test -p code-graph-graph persist:: and cargo test -p code-graph-lang resolve:: — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
   - id: "9.2"
