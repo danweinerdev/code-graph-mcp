@@ -16,9 +16,12 @@
 //! [`SymbolIndex`], [`FileIndex`] carry real fields populated by the
 //! indexer.
 
+mod fingerprint;
 pub mod helpers;
 
-use code_graph_core::{Confidence, ExtensionsConfig, FileGraph, Language, RootConfig, SymbolId};
+use code_graph_core::{
+    Confidence, ExtensionsConfig, FileGraph, Language, RootConfig, Symbol, SymbolId,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -322,6 +325,29 @@ pub(crate) fn default_basename_resolve(
 /// The trait is **object-safe**: `Box<dyn LanguagePlugin>` is the canonical
 /// storage form in [`LanguageRegistry`]. The unit tests in this crate prove
 /// object safety at compile time.
+/// The two symbol-fingerprint sensitivities (FR-34, Designs/VcsHistory
+/// Decision 5). Terminology note, load-bearing: neither mode touches
+/// identifiers or case. `Normalized` hashes the symbol's source span with
+/// comments stripped and inter-token whitespace normalized (kept only where
+/// two word tokens would otherwise merge, so a line break after `(` — the
+/// canonical reformat — is invisible) — identifiers, keywords, and literal
+/// VALUES contribute verbatim. `LiteralInsensitive` additionally
+/// excludes the values of string and numeric literals, so a changed message
+/// or constant does not read as a logic change; "insensitive" qualifies
+/// *literals*, not case. Fingerprints are computed within one
+/// already-identified symbol's span and never match symbols to each other.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FingerprintMode {
+    /// Formatting-insensitive: comments stripped, whitespace collapsed,
+    /// everything else verbatim. Supported by the default implementation
+    /// for every language.
+    Normalized,
+    /// Additionally excludes literal values. Requires a per-language AST
+    /// override (phase 8); the text default returns `None` rather than
+    /// silently degrading to [`Self::Normalized`].
+    LiteralInsensitive,
+}
+
 pub trait LanguagePlugin: Send + Sync {
     /// The language this plugin handles.
     fn id(&self) -> Language;
@@ -342,6 +368,39 @@ pub trait LanguagePlugin: Send + Sync {
     /// Parse a single file. `path` is the absolute file path used for symbol
     /// IDs; `content` is the raw file bytes.
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError>;
+
+    /// Fingerprint one symbol's content for change detection (FR-34,
+    /// Designs/VcsHistory Decision 5). `content` is the raw bytes of the
+    /// file **at the revision being examined** (not necessarily on disk);
+    /// `symbol` carries the span located in that same content by a
+    /// preceding [`Self::parse_file`] call.
+    ///
+    /// Returns `None` when the mode is not supported for this language —
+    /// the default supports [`FingerprintMode::Normalized`] only, via a
+    /// std-only text normalization (comments stripped, whitespace runs
+    /// collapsed, strings verbatim, hashed with `DefaultHasher`).
+    /// [`FingerprintMode::LiteralInsensitive`] arrives with the phase 8
+    /// per-language AST overrides; the default returns `None` for it and
+    /// MUST NOT fall back to `Normalized` — a silent fallback would make
+    /// "the logic didn't change" mean different things per language.
+    ///
+    /// Like `preprocess`/`synthesize_symbols`/`resolve_call`/`post_index`,
+    /// this is a default-provided hook: no existing plugin changes.
+    /// std-only is a requirement, not a style choice — this crate is
+    /// NFR-02-protected, so no third-party hash may land here.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &Symbol,
+        mode: FingerprintMode,
+    ) -> Option<u64> {
+        match mode {
+            FingerprintMode::Normalized => {
+                fingerprint::normalized_fingerprint(content, symbol, self.id())
+            }
+            FingerprintMode::LiteralInsensitive => None,
+        }
+    }
 
     /// Optional per-file post-parse symbol synthesis. Called by the
     /// indexer immediately after [`Self::parse_file`] returns Ok, with
