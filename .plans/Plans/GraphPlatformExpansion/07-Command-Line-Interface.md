@@ -21,7 +21,7 @@ tasks:
     depends_on: ["7.1"]
   - id: "7.3"
     title: "Output parity and exit-status behaviour"
-    status: in-progress
+    status: complete
     justifies: "FR-19, FR-20, AC-11, AC-12. Payload parity is the property that makes the CLI trustworthy for scripting; without per-shape coverage a divergence in one envelope type would go unnoticed until someone depended on it."
     verification: "cargo test -p code-graph-cli parity:: — machine-readable output equals the MCP payload for one query of each distinct shape: a Page envelope (get_callers), a non-Page tree (get_class_hierarchy), a flattened envelope with a conditional field (search_symbols, both with and without suggestions), a dual-page response (get_coupling direction=both), and a non-JSON body (generate_diagram format=mermaid) (AC-11); exit status distinguishes success, an unknown-symbol tool error, and an operational failure such as an unreadable cache (AC-12)."
     depends_on: ["7.2"]
@@ -121,12 +121,12 @@ Reaching for the MCP handlers because they are already wired and their signature
 ## 7.3: Output parity and exit-status behaviour
 
 ### Subtasks
-- [ ] Implement the machine-readable output mode per the 7.1 design
-- [ ] Implement the human-readable default rendering
-- [ ] Implement the exit-status mapping
-- [ ] Add parity tests across the five distinct response shapes
-- [ ] Add exit-status tests for the three outcome classes
-- [ ] Update CLAUDE.md and the plugin README with CLI usage
+- [x] Implement the machine-readable output mode per the 7.1 design (landed with 7.2 — payload-defined, required there for the AC-40 tests)
+- [x] Implement the human-readable default rendering
+- [x] Implement the exit-status mapping (landed with 7.2 — required there for the unindexed-error test)
+- [x] Add parity tests across the five distinct response shapes
+- [x] Add exit-status tests for the three outcome classes (landed with 7.2's `exit_statuses_separate_the_three_outcome_classes`)
+- [x] Update CLAUDE.md and the plugin README with CLI usage
 
 ### Notes
 Revision boundary: the CLI is complete and its output contract is verified.
@@ -137,7 +137,23 @@ The five shapes are chosen to cover structurally different envelopes, not five a
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `cca67059873ecbebfb250d3e2473624356f7eec3`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 14:37 matched `cca67059873ecbebfb250d3e2473624356f7eec3`
+- Focused review: `git show cca67059873ecbebfb250d3e2473624356f7eec3`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `cca67059873ecbebfb250d3e2473624356f7eec3`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-cli` | `.` | PASS (`exit 0`) | `11 tests passed: the six-test parity suite pins AC-11 across the five distinct response shapes — Page (get_callers), tree (get_class_hierarchy), flattened envelope BOTH with and without suggestions (search_symbols, absent-vs-present), dual-page (get_coupling both), non-JSON mermaid body — each comparing CLI --json bytes against the REAL adapter path (core:: through to_call_tool_result, payload extracted from the serialized envelope without naming an rmcp type); the human-mode pin shows the did-you-mean footer tracks field presence; the five task-7.2 tests (AC-33, exit statuses incl. the byte-exact unindexed error, no-rmcp guard, AC-40 daemon/standalone byte-identity incl. the Decision 7 window, attach-only stale-metadata) stay green.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings clean; fmt clean; full workspace tests green; no pending snapshots; plugin mirrors in sync (plugin/README.md is hand-maintained canonical content, not a fanned-out mirror).` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show cca6705` | PASS | `5 files: render.rs keys on structural family (results+total → Page; incoming+outgoing → dual-page; hierarchy → tree; array → table; else labelled lines) so no per-subcommand renderer can drift; the suggestions footer reads field PRESENCE, matching the skip_serializing_if contract; main.rs human mode now renders from the parsed payload and ToolOk::Text stays verbatim in both modes; CLAUDE.md gains the CLI section + workspace-map row and the tool table now enumerates all 25 tools (the design review's 23-vs-25 reconciliation); plugin/README.md CLI usage names the payload-identity property the skills rely on.` |
 
 ## Acceptance Criteria
 
