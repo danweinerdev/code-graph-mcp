@@ -672,7 +672,67 @@ impl LanguagePlugin for PythonParser {
     // no-op for Python's dotted module-path imports, which is the
     // intended behavior).
 
+    /// AST-backed fingerprint (phase 8.4, following the 8.1 shape).
+    /// Python has no `preprocess` pass, so `content` is the raw revision
+    /// bytes. This is the language where the AST walk earns the most:
+    /// indentation that ALTERS block structure changes the tree (visible
+    /// under both modes), while cosmetic indentation does not — a
+    /// distinction no text normalizer can make.
+    ///
+    /// F-strings are handled at the token level: the literal predicate
+    /// matches `string_content`/`escape_sequence`, NOT the whole `string`
+    /// node, so interpolated EXPRESSIONS (`f"{x + 1}"`) are code and stay
+    /// visible under both modes; only the literal text around them
+    /// follows the mode.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                python_literal_kind,
+                python_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+
     fn close(&self) {}
+}
+
+/// Literal node kinds for the fingerprint walk (tree-sitter-python
+/// v0.25): values whose CHANGE is invisible under `LiteralInsensitive`.
+/// `string_content`/`escape_sequence` rather than `string`, so f-string
+/// interpolations stay code; `true`/`false`/`none` are value literals.
+fn python_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_content" | "escape_sequence" | "integer" | "float" | "true" | "false" | "none"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38). Docstrings are
+/// STRING nodes, not comments — their text follows the literal mode.
+fn python_comment_kind(kind: &str) -> bool {
+    kind == "comment"
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the Python grammar.
@@ -1812,6 +1872,170 @@ import a, b
             edges[0].from, "D",
             "Inherits.from is the bare class name (NOT the full symbol_id), \
              matching C++/Rust and required by Graph::class_hierarchy"
+        );
+    }
+}
+
+/// Phase 8.4 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-python
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::PythonParser;
+
+    fn symbol_in(parser: &PythonParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.py"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &PythonParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for Python")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = PythonParser::new().unwrap();
+        let content = b"def answer():\n    return 42\n";
+        let symbol = symbol_in(&parser, content, "answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "Python supports LiteralInsensitive after phase 8.4"
+        );
+    }
+
+    /// AC-39: literal-only changes (string and numeric) are visible under
+    /// Normalized and invisible under LiteralInsensitive.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = PythonParser::new().unwrap();
+        let one: &[u8] = b"def greet():\n    return \"hello\"\n";
+        let two: &[u8] = b"def greet():\n    return \"goodbye\"\n";
+        assert_ne!(
+            fp(&parser, one, "greet", FingerprintMode::Normalized),
+            fp(&parser, two, "greet", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(&parser, one, "greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "greet", FingerprintMode::LiteralInsensitive),
+        );
+
+        let three: &[u8] = b"def answer():\n    return 42\n";
+        let four: &[u8] = b"def answer():\n    return 43\n";
+        assert_ne!(
+            fp(&parser, three, "answer", FingerprintMode::Normalized),
+            fp(&parser, four, "answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "answer", FingerprintMode::LiteralInsensitive),
+        );
+    }
+
+    /// The phase's Python-specific discriminator: indentation that ALTERS
+    /// block structure is a logic change (visible under both modes);
+    /// cosmetic indentation (uniform width change) and comments are not.
+    #[test]
+    fn structural_indentation_is_content_and_cosmetic_is_not() {
+        let parser = PythonParser::new().unwrap();
+        // b() outside the if-block vs. inside it: same tokens, different
+        // tree — a change no whitespace-collapsing normalizer can see.
+        let outside: &[u8] = b"def act(flag):\n    if flag:\n        first()\n    second()\n";
+        let inside: &[u8] = b"def act(flag):\n    if flag:\n        first()\n        second()\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_ne!(
+                fp(&parser, outside, "act", mode),
+                fp(&parser, inside, "act", mode),
+                "block membership is structure ({mode:?})"
+            );
+        }
+
+        // Uniform indent-width change (4 -> 2 spaces) plus a comment:
+        // identical tree, identical fingerprint.
+        let four_wide: &[u8] = b"def act(flag):\n    if flag:\n        first()\n    second()\n";
+        let two_wide: &[u8] =
+            b"def act(flag):\n  # narrower indent\n  if flag:\n    first()\n  second()\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, four_wide, "act", mode),
+                fp(&parser, two_wide, "act", mode),
+                "indent width and comments are cosmetic ({mode:?})"
+            );
+        }
+    }
+
+    /// F-string interpolations are code: changing the EXPRESSION inside
+    /// an f-string is visible under both modes, while changing the
+    /// literal text around it follows the mode.
+    #[test]
+    fn fstring_interpolation_is_code_and_text_is_literal() {
+        let parser = PythonParser::new().unwrap();
+        // The expression change must be STRUCTURAL (operator swap), not a
+        // literal swap — an integer inside the interpolation is still an
+        // integer literal and correctly follows the mode.
+        let expr_one: &[u8] = b"def show(x, y):\n    return f\"value {x + y}\"\n";
+        let expr_two: &[u8] = b"def show(x, y):\n    return f\"value {x * y}\"\n";
+        assert_ne!(
+            fp(
+                &parser,
+                expr_one,
+                "show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(
+                &parser,
+                expr_two,
+                "show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            "the interpolated expression is code even under LiteralInsensitive"
+        );
+
+        let text_one: &[u8] = b"def show(x):\n    return f\"value {x}\"\n";
+        let text_two: &[u8] = b"def show(x):\n    return f\"result {x}\"\n";
+        assert_eq!(
+            fp(
+                &parser,
+                text_one,
+                "show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(
+                &parser,
+                text_two,
+                "show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            "the literal text around the interpolation follows the mode"
+        );
+        assert_ne!(
+            fp(&parser, text_one, "show", FingerprintMode::Normalized),
+            fp(&parser, text_two, "show", FingerprintMode::Normalized),
         );
     }
 }
