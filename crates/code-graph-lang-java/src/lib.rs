@@ -587,6 +587,7 @@ impl JavaParser {
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -642,6 +643,7 @@ impl JavaParser {
                     file: path.to_owned(),
                     line: cap_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -761,6 +763,7 @@ impl JavaParser {
                 file: path.to_owned(),
                 line: def.start_position().row as u32 + 1,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             });
         }
     }

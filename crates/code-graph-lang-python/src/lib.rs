@@ -384,6 +384,7 @@ impl PythonParser {
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -496,6 +497,7 @@ impl PythonParser {
                             file: path.to_owned(),
                             line,
                             confidence: Confidence::Resolved,
+                            candidates: 1,
                         });
                     }
                     "import.module" => {
@@ -510,6 +512,7 @@ impl PythonParser {
                             file: path.to_owned(),
                             line,
                             confidence: Confidence::Resolved,
+                            candidates: 1,
                         });
                     }
                     "import.from_module" => {
@@ -524,6 +527,7 @@ impl PythonParser {
                             file: path.to_owned(),
                             line,
                             confidence: Confidence::Resolved,
+                            candidates: 1,
                         });
                     }
                     "import.from_module_relative" => {
@@ -547,6 +551,7 @@ impl PythonParser {
                                     file: path.to_owned(),
                                     line,
                                     confidence: Confidence::Resolved,
+                                    candidates: 1,
                                 });
                             }
                         } else {
@@ -560,6 +565,7 @@ impl PythonParser {
                                 file: path.to_owned(),
                                 line,
                                 confidence: Confidence::Resolved,
+                                candidates: 1,
                             });
                         }
                     }
@@ -641,6 +647,7 @@ impl PythonParser {
                 file: path.to_owned(),
                 line,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             });
         }
     }

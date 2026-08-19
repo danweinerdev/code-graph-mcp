@@ -805,6 +805,7 @@ mod tests {
             file: from.to_string(),
             line: 1,
             confidence: Confidence::Resolved,
+            candidates: 1,
         }
     }
 
@@ -928,6 +929,7 @@ mod tests {
                 file: "/x.cpp".to_string(),
                 line: 1,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             }],
         });
         g

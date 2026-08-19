@@ -1053,6 +1053,7 @@ mod tests {
             file: "/a.cpp".to_string(),
             line,
             confidence: Confidence::Resolved,
+            candidates: 1,
         };
         g.merge_file_graph(make_fg(
             "/a.cpp",
@@ -1097,6 +1098,7 @@ mod tests {
             file: file.to_string(),
             line,
             confidence: Confidence::Heuristic,
+            candidates: 1,
         }
     }
 

@@ -173,6 +173,25 @@ pub struct Edge {
     /// default is rarely exercised in production).
     #[serde(default)]
     pub confidence: Confidence,
+    /// How many same-named candidates competed for `to` when the resolver
+    /// picked it (FR-48, D-0007). `1` = unambiguous (sole candidate, or a
+    /// declarative edge — Inherits, Overrides, `mod`-resolved Includes —
+    /// which has exactly one target by construction); `N ≥ 2` = the scope
+    /// rule picked one of N. A count of 1 alongside `Resolved` is
+    /// meaningful and uniform, which is why this is a sibling field
+    /// rather than payload on the `Heuristic` variant. Parse-time edges
+    /// carry the provisional `1`; the resolve pass overwrites call edges
+    /// with the real count. The serde default exists for hand-written
+    /// fixtures only — cache-format safety comes from the CACHE_VERSION
+    /// bump that landed with this field (a pre-bump cache re-indexes; it
+    /// is never read with a guessed count).
+    #[serde(default = "default_candidate_count")]
+    pub candidates: u32,
+}
+
+/// Serde default for [`Edge::candidates`]: the unambiguous count.
+fn default_candidate_count() -> u32 {
+    1
 }
 
 /// Result of parsing a single source file. Mirrors the Go `parser.FileGraph`
@@ -434,6 +453,7 @@ mod tests {
                 file: "src/a.cpp".to_string(),
                 line: 42,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             };
             let v = serde_json::to_value(&e).unwrap();
             let back: Edge = serde_json::from_value(v).unwrap();
@@ -451,6 +471,9 @@ mod tests {
                 file: "src/a.cpp".to_string(),
                 line: 42,
                 confidence,
+                // Non-default value so the round-trip proves the field
+                // actually serializes rather than riding the default.
+                candidates: 3,
             };
             let v = serde_json::to_value(&e).unwrap();
             let back: Edge = serde_json::from_value(v).unwrap();
@@ -524,6 +547,7 @@ mod tests {
             file: "src/main.cpp".to_string(),
             line: 7,
             confidence: Confidence::Resolved,
+            candidates: 1,
         };
         let fg = FileGraph {
             path: "src/main.cpp".to_string(),

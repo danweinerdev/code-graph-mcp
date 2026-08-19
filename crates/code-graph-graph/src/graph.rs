@@ -92,6 +92,20 @@ pub struct EdgeEntry {
     /// is rarely exercised in production.
     #[serde(default)]
     pub confidence: Confidence,
+    /// How many same-named candidates competed for `target` (FR-48,
+    /// D-0007). Copied verbatim from
+    /// [`code_graph_core::Edge::candidates`] at merge time: `1` =
+    /// unambiguous or declarative, `N ≥ 2` = scope-rule pick among N. The
+    /// serde default (1) exists for hand-written fixtures; cache-format
+    /// safety comes from the v11 CACHE_VERSION bump — a pre-bump cache
+    /// re-indexes rather than being read with a guessed count.
+    #[serde(default = "default_candidate_count")]
+    pub candidates: u32,
+}
+
+/// Serde default for [`EdgeEntry::candidates`]: the unambiguous count.
+fn default_candidate_count() -> u32 {
+    1
 }
 
 /// Per-file metadata recorded at merge time. The Go reference stores only
@@ -212,6 +226,7 @@ impl Graph {
                             file: edge_file.clone(),
                             line: edge.line,
                             confidence: edge.confidence,
+                            candidates: edge.candidates,
                         });
                     self.radj.entry(edge.to).or_default().push(EdgeEntry {
                         target: edge.from,
@@ -219,6 +234,7 @@ impl Graph {
                         file: edge_file,
                         line: edge.line,
                         confidence: edge.confidence,
+                        candidates: edge.candidates,
                     });
                 }
                 EdgeKind::Includes => {
@@ -651,6 +667,7 @@ mod tests {
                     file: "/a.cpp".to_string(),
                     line: 12,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 },
             ],
         );

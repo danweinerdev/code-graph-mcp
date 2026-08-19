@@ -437,6 +437,7 @@ impl RustParser {
                                 file: path.to_owned(),
                                 line,
                                 confidence: Confidence::Resolved,
+                                candidates: 1,
                             });
                         }
                     }
@@ -456,6 +457,7 @@ impl RustParser {
                             file: path.to_owned(),
                             line,
                             confidence: Confidence::Resolved,
+                            candidates: 1,
                         });
                     }
 
@@ -567,6 +569,7 @@ impl RustParser {
                 file: path.to_owned(),
                 line,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             });
         }
     }
@@ -633,6 +636,7 @@ impl RustParser {
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -745,6 +749,7 @@ impl RustParser {
                 file: path.to_owned(),
                 line,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             });
         }
 
@@ -793,6 +798,7 @@ impl RustParser {
                 file: path.to_owned(),
                 line: bound.start_position().row as u32 + 1,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             });
         }
     }
@@ -916,7 +922,11 @@ impl LanguagePlugin for RustParser {
     /// direction that produces no false positives: an absolute path
     /// *in* the index points at a real source file, so any Rust edge
     /// whose `to` is that path is by definition resolved.
-    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<(PathBuf, Confidence)> {
+    fn resolve_include(
+        &self,
+        raw: &str,
+        file_index: &FileIndex,
+    ) -> Option<(PathBuf, Confidence, u32)> {
         let candidate = Path::new(raw);
         if !candidate.is_absolute() {
             // `use`/`extern crate` tokens (`"std::io"`, `"alloc"`) are
@@ -930,8 +940,9 @@ impl LanguagePlugin for RustParser {
             // absolute paths against a known file set, so a hit here
             // is always definitive — never the multi-candidate
             // basename-collision shape that produces Heuristic in
-            // the default resolver.
-            Some((candidate.to_path_buf(), Confidence::Resolved))
+            // the default resolver. Declarative edge: exactly one
+            // candidate by construction (FR-48), hence count 1.
+            Some((candidate.to_path_buf(), Confidence::Resolved, 1))
         } else {
             None
         }
@@ -3391,7 +3402,7 @@ mod tests {
             .filter_map(|e| {
                 parser
                     .resolve_include(&e.to, &file_index)
-                    .map(|(p, _confidence)| p.to_string_lossy().into_owned())
+                    .map(|(p, _confidence, _candidates)| p.to_string_lossy().into_owned())
             })
             .collect();
         assert_eq!(
@@ -3424,10 +3435,10 @@ mod tests {
         let resolved = parser.resolve_include(ABSOLUTE_FOO, &file_index);
         assert_eq!(
             resolved,
-            Some((PathBuf::from(ABSOLUTE_FOO), Confidence::Resolved)),
-            "indexed absolute path must resolve to itself with Resolved confidence — \
-             the Rust override never produces Heuristic (mod-decl + #[path] are \
-             definitive, not basename guesses)"
+            Some((PathBuf::from(ABSOLUTE_FOO), Confidence::Resolved, 1)),
+            "indexed absolute path must resolve to itself with Resolved confidence and \
+             candidate count 1 — the Rust override never produces Heuristic (mod-decl + \
+             #[path] are definitive declarative edges, exactly one target by construction)"
         );
     }
 

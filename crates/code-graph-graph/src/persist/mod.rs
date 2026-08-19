@@ -597,6 +597,48 @@ mod tests {
         );
     }
 
+    /// v11 (FR-48, D-0007): the per-edge candidate count survives the
+    /// cache round-trip with a NON-default value — a default-riding pass
+    /// would not distinguish "persisted" from "reconstructed", which is
+    /// exactly the failure the field's serde default must never mask.
+    #[test]
+    fn round_trip_preserves_candidate_count() {
+        let dir = TempDir::new().unwrap();
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("caller", SymbolKind::Function, "/a.cpp"),
+                sym("contested", SymbolKind::Function, "/a.cpp"),
+            ],
+            vec![code_graph_core::Edge {
+                from: "/a.cpp:caller".to_string(),
+                to: "/a.cpp:contested".to_string(),
+                kind: code_graph_core::EdgeKind::Calls,
+                file: "/a.cpp".to_string(),
+                line: 9,
+                confidence: code_graph_core::Confidence::Heuristic,
+                candidates: 3,
+            }],
+        ));
+        g.save(dir.path()).unwrap();
+
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        let edges = &loaded.adj["/a.cpp:caller"];
+        assert_eq!(edges.len(), 1, "exactly the one contested edge: {edges:?}");
+        assert_eq!(
+            edges[0].candidates, 3,
+            "the candidate count round-trips verbatim through the archive"
+        );
+        let reverse = &loaded.radj["/a.cpp:contested"];
+        assert_eq!(
+            reverse[0].candidates, 3,
+            "the reverse-adjacency copy carries the same count"
+        );
+    }
+
     #[test]
     fn save_persists_language_in_files_entry() {
         // FileEntry.language must survive round-trip — was the v4

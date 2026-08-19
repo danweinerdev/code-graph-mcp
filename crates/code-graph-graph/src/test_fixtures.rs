@@ -58,6 +58,7 @@ pub(crate) fn call_edge(from: &str, to: &str, file: &str, line: u32) -> Edge {
         file: file.to_string(),
         line,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 
@@ -72,6 +73,7 @@ pub(crate) fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
         file: file.to_string(),
         line: 0,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 
@@ -86,6 +88,7 @@ pub(crate) fn include_edge(from: &str, to: &str, file: &str) -> Edge {
         file: file.to_string(),
         line: 0,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 

@@ -67,12 +67,21 @@ use std::path::{Path, PathBuf};
 ///   `reliability="very_high"` would under-filter against a stale
 ///   cache. Bumping invalidates pre-v10 caches and forces a silent
 ///   re-index on next analyze.
+/// - v11: `PackedEdge` gains a `candidates: u32` field (FR-48, D-0007)
+///   recording how many same-named candidates competed for the edge's
+///   target at resolve time. The count cannot be reconstructed from a
+///   pre-v11 cache (the losing candidates are gone by the time the
+///   graph exists), and defaulting it would make "unambiguous"
+///   indistinguishable from "unknown" — exactly the failure the count
+///   exists to prevent. The layout change also shifts every archived
+///   edge, so pre-v11 caches fail the version check and route to the
+///   documented silent re-index before any decode is attempted.
 ///
 /// This constant is the single source of truth for the on-disk
 /// version. `super::CACHE_VERSION` is a re-export at the module
 /// boundary so the rest of the crate's call sites don't have to know
 /// which sub-module owns it.
-pub const CACHE_VERSION: u32 = 10;
+pub const CACHE_VERSION: u32 = 11;
 
 /// 4-byte native-endian probe at file offset 0. A reader whose host
 /// endianness disagrees with the writer's reads a different `u32`
@@ -190,6 +199,12 @@ pub(crate) struct PackedEdge {
     /// silent re-index on mismatch, so no migration is needed —
     /// every freshly-written packed entry carries its real confidence.
     pub confidence: Confidence,
+    /// Same-named candidate count for the `target` (FR-48, D-0007).
+    /// Round-trips [`EdgeEntry::candidates`] verbatim through the
+    /// archive; the v11 bump that introduced it forces pre-v11 caches
+    /// through the silent re-index path, so no entry is ever read with
+    /// a guessed count.
+    pub candidates: u32,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
@@ -452,6 +467,7 @@ fn encode_edge_map(
                 file: paths.intern_str_path(e.file.to_str().unwrap_or("")),
                 line: e.line,
                 confidence: e.confidence,
+                candidates: e.candidates,
             })
             .collect();
         out.insert(key_id, packed_entries);
@@ -651,6 +667,7 @@ fn decode_archived_edge_map(
                 file: PathBuf::from(resolver.path_to_string(pe.file.to_native())),
                 line: pe.line.to_native(),
                 confidence: unarchive_confidence(&pe.confidence),
+                candidates: pe.candidates.to_native(),
             });
         }
         out.insert(key, entries);

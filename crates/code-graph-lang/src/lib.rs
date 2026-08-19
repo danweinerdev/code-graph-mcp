@@ -205,14 +205,18 @@ pub(crate) fn default_scope_aware_resolve(
     callee: &str,
     ctx: &CallContext,
     index: &SymbolIndex,
-) -> Option<(SymbolId, Confidence)> {
+) -> Option<(SymbolId, Confidence, u32)> {
     let candidates = index.by_name.get(&(language, callee.to_string()))?;
     if candidates.is_empty() {
         return None;
     }
+    // The competing-candidate count (FR-48, D-0007): captured HERE, at
+    // the only moment it exists — by the time the graph is built the
+    // losing candidates are gone and the count cannot be reconstructed.
+    let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
     if candidates.len() == 1 {
         // Sole candidate — no ambiguity, no heuristic involved.
-        return Some((candidates[0].id.clone(), Confidence::Resolved));
+        return Some((candidates[0].id.clone(), Confidence::Resolved, 1));
     }
 
     let caller_parent = caller_id_parent(ctx.caller_id);
@@ -243,8 +247,9 @@ pub(crate) fn default_scope_aware_resolve(
                        // ≥ 2 candidates reached the scoring loop: every match here is a
                        // heuristic pick by definition, regardless of how decisive the
                        // winning score was. Agents asking for `min_confidence=resolved`
-                       // can filter these out.
-    best.map(|e| (e.id.clone(), Confidence::Heuristic))
+                       // can filter these out; the candidate count says how contested
+                       // the pick was.
+    best.map(|e| (e.id.clone(), Confidence::Heuristic, candidate_count))
 }
 
 /// Extract the parent class name from a caller's symbol ID.
@@ -300,20 +305,30 @@ fn caller_id_parent(caller_id: &str) -> String {
 pub(crate) fn default_basename_resolve(
     raw: &str,
     file_index: &FileIndex,
-) -> Option<(PathBuf, Confidence)> {
+) -> Option<(PathBuf, Confidence, u32)> {
     let base = std::path::Path::new(raw).file_name()?.to_str()?;
     let candidates = file_index.by_basename.get(base)?;
+    // Captured here for the same reason as the call resolver: the losing
+    // candidates are gone once the graph exists (FR-48, D-0007). A
+    // suffix-disambiguated pick still reports the real N — the count says
+    // how contested the name was; `Confidence` says whether the pick was
+    // structural.
+    let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
     if candidates.len() == 1 {
-        return Some((candidates[0].clone(), Confidence::Resolved));
+        return Some((candidates[0].clone(), Confidence::Resolved, 1));
     }
     if candidates.len() > 1 {
         for c in candidates {
             let cs = c.to_string_lossy();
             if cs.ends_with(&format!("/{raw}")) || cs.ends_with(&format!("\\{raw}")) {
-                return Some((c.clone(), Confidence::Resolved));
+                return Some((c.clone(), Confidence::Resolved, candidate_count));
             }
         }
-        return Some((candidates[0].clone(), Confidence::Heuristic));
+        return Some((
+            candidates[0].clone(),
+            Confidence::Heuristic,
+            candidate_count,
+        ));
     }
     None
 }
@@ -452,19 +467,21 @@ pub trait LanguagePlugin: Send + Sync {
     /// Python prefers same-module).
     ///
     /// Returns the resolved [`SymbolId`] paired with a [`Confidence`]
-    /// tag: [`Confidence::Resolved`] when the lookup had a sole
-    /// candidate (no ambiguity), [`Confidence::Heuristic`] when the
-    /// resolver picked from ≥ 2 same-name candidates via the scope
-    /// rule. Plugins that override and have their own ambiguity model
-    /// must produce the same distinction; an override returning
-    /// `Resolved` for an ambiguous match would defeat the per-tool
-    /// `min_confidence` filter.
+    /// tag and the competing-candidate count (FR-48, D-0007):
+    /// [`Confidence::Resolved`] when the lookup had a sole candidate
+    /// (count 1, no ambiguity), [`Confidence::Heuristic`] when the
+    /// resolver picked from N ≥ 2 same-name candidates via the scope
+    /// rule (count N). Plugins that override and have their own
+    /// ambiguity model must produce the same distinction AND the real
+    /// count; an override returning `Resolved`/1 for an ambiguous match
+    /// would defeat both the per-tool `min_confidence` filter and the
+    /// candidate count the reporting tools surface.
     fn resolve_call(
         &self,
         callee: &str,
         ctx: &CallContext,
         index: &SymbolIndex,
-    ) -> Option<(SymbolId, Confidence)> {
+    ) -> Option<(SymbolId, Confidence, u32)> {
         default_scope_aware_resolve(self.id(), callee, ctx, index)
     }
 
@@ -474,14 +491,22 @@ pub trait LanguagePlugin: Send + Sync {
     /// should override.
     ///
     /// Returns the resolved [`PathBuf`] paired with a [`Confidence`]
-    /// tag: [`Confidence::Resolved`] for a sole-candidate match OR a
-    /// suffix-disambiguated multi-candidate match (the suffix rule is
-    /// structural, not heuristic); [`Confidence::Heuristic`] when the
-    /// resolver picked the first of N same-basename headers without a
-    /// structural disambiguator. Overrides that always have a
-    /// definitive answer (e.g. Rust's `mod`-decl + `#[path]`
-    /// resolver) should return `Resolved` unconditionally.
-    fn resolve_include(&self, raw: &str, file_index: &FileIndex) -> Option<(PathBuf, Confidence)> {
+    /// tag and the competing-candidate count (FR-48, D-0007):
+    /// [`Confidence::Resolved`] for a sole-candidate match (count 1) OR
+    /// a suffix-disambiguated multi-candidate match (the suffix rule is
+    /// structural, not heuristic — but the count still reports the real
+    /// N so a caller can see how contested the basename was);
+    /// [`Confidence::Heuristic`] when the resolver picked the first of N
+    /// same-basename headers without a structural disambiguator.
+    /// Overrides that always have a definitive answer (e.g. Rust's
+    /// `mod`-decl + `#[path]` resolver) should return `Resolved`/1
+    /// unconditionally — declarative edges have exactly one target by
+    /// construction.
+    fn resolve_include(
+        &self,
+        raw: &str,
+        file_index: &FileIndex,
+    ) -> Option<(PathBuf, Confidence, u32)> {
         default_basename_resolve(raw, file_index)
     }
 
@@ -1012,13 +1037,14 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "helper", &ctx, &idx);
-        let (id, confidence) = resolved.expect("must resolve");
+        let (id, confidence, candidates) = resolved.expect("must resolve");
         assert_eq!(id, "/proj/a.cpp:helper");
         assert_eq!(
             confidence,
             Confidence::Heuristic,
             "multi-candidate pick is Heuristic by definition"
         );
+        assert_eq!(candidates, 2, "two same-name candidates competed (FR-48)");
     }
 
     #[test]
@@ -1042,13 +1068,14 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "tick", &ctx, &idx);
-        let (id, confidence) = resolved.expect("must resolve");
+        let (id, confidence, candidates) = resolved.expect("must resolve");
         assert_eq!(id, "/proj/b.cpp:Engine::tick");
         assert_eq!(
             confidence,
             Confidence::Heuristic,
             "multi-candidate pick is Heuristic even when the scope rule was decisive"
         );
+        assert_eq!(candidates, 2, "two same-name candidates competed (FR-48)");
     }
 
     #[test]
@@ -1083,10 +1110,10 @@ mod tests {
             language: Language::Cpp,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "init", &ctx, &idx);
-        // Single C++ candidate after language scoping: Resolved.
+        // Single C++ candidate after language scoping: Resolved, count 1.
         assert_eq!(
             resolved,
-            Some(("/proj/m.cpp:init".to_string(), Confidence::Resolved))
+            Some(("/proj/m.cpp:init".to_string(), Confidence::Resolved, 1))
         );
 
         // And the Python lookup returns the Python entry.
@@ -1099,7 +1126,7 @@ mod tests {
         let resolved_py = default_scope_aware_resolve(Language::Python, "init", &py_ctx, &idx);
         assert_eq!(
             resolved_py,
-            Some(("/proj/m.py:init".to_string(), Confidence::Resolved))
+            Some(("/proj/m.py:init".to_string(), Confidence::Resolved, 1))
         );
     }
 
@@ -1118,8 +1145,8 @@ mod tests {
         let resolved = default_scope_aware_resolve(Language::Cpp, "only_one", &ctx, &idx);
         assert_eq!(
             resolved,
-            Some(("/proj/x.cpp:only_one".to_string(), Confidence::Resolved)),
-            "single-candidate match is unambiguous → Confidence::Resolved"
+            Some(("/proj/x.cpp:only_one".to_string(), Confidence::Resolved, 1)),
+            "single-candidate match is unambiguous → Confidence::Resolved, count 1"
         );
     }
 
@@ -1133,8 +1160,12 @@ mod tests {
         let resolved = default_basename_resolve("foo.h", &idx);
         assert_eq!(
             resolved,
-            Some((PathBuf::from("/proj/include/foo.h"), Confidence::Resolved)),
-            "unique basename → Confidence::Resolved"
+            Some((
+                PathBuf::from("/proj/include/foo.h"),
+                Confidence::Resolved,
+                1
+            )),
+            "unique basename → Confidence::Resolved, count 1"
         );
     }
 
@@ -1155,8 +1186,9 @@ mod tests {
         let resolved = default_basename_resolve("foo/bar.h", &idx);
         assert_eq!(
             resolved,
-            Some((PathBuf::from("/proj/foo/bar.h"), Confidence::Resolved)),
-            "suffix disambiguation is a structural match, not heuristic → Resolved"
+            Some((PathBuf::from("/proj/foo/bar.h"), Confidence::Resolved, 2)),
+            "suffix disambiguation is a structural match, not heuristic → Resolved; \
+             the count still reports the real 2 contenders (FR-48)"
         );
     }
 

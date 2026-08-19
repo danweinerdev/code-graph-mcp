@@ -452,6 +452,7 @@ mod tests {
             file: file.to_string(),
             line,
             confidence: Confidence::Resolved,
+            candidates: 1,
         }
     }
 

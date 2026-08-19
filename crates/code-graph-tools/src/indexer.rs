@@ -409,13 +409,14 @@ pub fn resolve_edges_with_indexes(
             match edge.kind {
                 EdgeKind::Includes => {
                     match plugin.resolve_include(&edge.to, file_index) {
-                        Some((resolved, confidence))
+                        Some((resolved, confidence, candidates))
                             if registry
                                 .language_for_path_with_config(&resolved, extensions)
                                 .is_some() =>
                         {
                             edge.to = resolved.to_string_lossy().into_owned();
                             edge.confidence = confidence;
+                            edge.candidates = candidates;
                         }
                         // Unresolved, or resolved to a non-source target: this
                         // include does not point at an indexed source file
@@ -434,14 +435,16 @@ pub fn resolve_edges_with_indexes(
                         caller_file: &path_for_ctx,
                         language: fg.language,
                     };
-                    if let Some((id, confidence)) =
+                    if let Some((id, confidence, candidates)) =
                         plugin.resolve_call(&edge.to, &ctx, symbol_index)
                     {
                         edge.to = id;
                         edge.confidence = confidence;
+                        edge.candidates = candidates;
                     }
                     // Unresolved bare-token calls keep their pre-resolve
-                    // `Confidence::Resolved` mark; they're filtered at
+                    // `Confidence::Resolved` mark (and provisional
+                    // candidate count 1); they're filtered at
                     // BFS time via `is_resolved_node` and never surface
                     // to agent queries, so the confidence on them is
                     // observable only through cache introspection.
@@ -464,11 +467,12 @@ pub fn resolve_edges_with_indexes(
                         caller_file: &path_for_ctx,
                         language: fg.language,
                     };
-                    if let Some((id, confidence)) =
+                    if let Some((id, confidence, candidates)) =
                         plugin.resolve_call(&edge.to, &ctx, symbol_index)
                     {
                         edge.to = id;
                         edge.confidence = confidence;
+                        edge.candidates = candidates;
                     }
                 }
                 _ => {}
@@ -777,6 +781,7 @@ mod tests {
                     file: main_path.clone(),
                     line: 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 },
                 Edge {
                     from: format!("{main_path}:main"),
@@ -786,6 +791,7 @@ mod tests {
                     file: main_path.clone(),
                     line: 6,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 },
             ],
         };
@@ -869,6 +875,7 @@ mod tests {
                 file: path_a.clone(),
                 line: 2,
                 confidence: Confidence::Resolved,
+                candidates: 1,
             }],
         };
         let b = FileGraph {
@@ -953,6 +960,7 @@ mod tests {
                     file: main_path.clone(),
                     line: 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 },
                 Edge {
                     from: main_path.clone(),
@@ -962,6 +970,7 @@ mod tests {
                     file: main_path.clone(),
                     line: 2,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 },
             ],
         };
@@ -1050,6 +1059,7 @@ mod tests {
                     file: main_path.clone(),
                     line: 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 }],
             };
             vec![dep, main]

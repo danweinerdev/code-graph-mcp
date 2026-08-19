@@ -474,6 +474,7 @@ impl CppParser {
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -507,6 +508,7 @@ impl CppParser {
                     file: path.to_owned(),
                     line: cap_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -549,6 +551,7 @@ impl CppParser {
                     file: path.to_owned(),
                     line: 0,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -709,6 +712,7 @@ fn extract_overrides_global(graphs: &mut [FileGraph]) {
                             file: path.clone(),
                             line: sym.line,
                             confidence: Confidence::Resolved,
+                            candidates: 1,
                         });
                     }
                 }

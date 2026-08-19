@@ -69,6 +69,7 @@ fn call_edge(from: &str, to: &str, file: &str) -> Edge {
         file: file.to_string(),
         line: 1,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 
@@ -81,6 +82,7 @@ fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
         file: file.to_string(),
         line: 0,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 
@@ -94,6 +96,7 @@ fn include_edge(from: &str, to: &str) -> Edge {
         file: from.to_string(),
         line: 0,
         confidence: Confidence::Resolved,
+        candidates: 1,
     }
 }
 

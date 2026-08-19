@@ -482,6 +482,7 @@ mod tests {
             file: file.to_string(),
             line: 1,
             confidence: Confidence::Resolved,
+            candidates: 1,
         }
     }
 
@@ -493,6 +494,7 @@ mod tests {
             file: from.to_string(),
             line: 1,
             confidence: Confidence::Resolved,
+            candidates: 1,
         }
     }
 
@@ -504,6 +506,7 @@ mod tests {
             file: file.to_string(),
             line: 0,
             confidence: Confidence::Resolved,
+            candidates: 1,
         }
     }
 
@@ -1139,6 +1142,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 1,
                     confidence: code_graph_core::Confidence::Heuristic,
+                    candidates: 2,
                 },
             ],
         });
@@ -3308,6 +3312,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 1,
                     confidence: Confidence::Heuristic,
+                    candidates: 1,
                 },
                 call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp"),
             ],

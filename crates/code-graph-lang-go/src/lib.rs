@@ -406,6 +406,7 @@ impl GoParser {
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
@@ -488,6 +489,7 @@ impl GoParser {
                     file: path.to_owned(),
                     line,
                     confidence: Confidence::Resolved,
+                    candidates: 1,
                 });
             }
         }
