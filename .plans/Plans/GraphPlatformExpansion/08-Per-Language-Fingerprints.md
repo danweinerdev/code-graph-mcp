@@ -3,7 +3,7 @@ title: "Per-Language Fingerprints"
 type: phase
 plan: GraphPlatformExpansion
 phase: 8
-status: in-progress
+status: complete
 created: 2026-08-08
 updated: 2026-08-19
 deliverable: "AST-backed fingerprint_symbol overrides for all six language plugins, completing LiteralInsensitive support across the supported language set."
@@ -311,13 +311,39 @@ Cycle-1 findings NOT fixed here, accepted as recorded follow-ups: the sextuplica
 
 ## Acceptance Criteria
 
-- [ ] **AC-39**: For every one of the six languages, a literal-only change yields a changed fingerprint under the formatting-insensitive mode and an unchanged one under the literal-insensitive mode (FR-34).
-- [ ] **AC-38**: Reformatting remains invisible under both modes in every language (FR-34).
-- [ ] No language returns `None` for either fingerprint mode; FR-34 is complete across the supported set.
-- [ ] The per-language support matrix is documented in CLAUDE.md and reflected in the `symbol_history` description (NFR-11).
-- [ ] No new third-party dependency in `code-graph-lang` or any language plugin crate (NFR-02).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
+- [x] **AC-39**: For every one of the six languages, a literal-only change yields a changed fingerprint under the formatting-insensitive mode and an unchanged one under the literal-insensitive mode (FR-34). — `literal_only_change_tracks_the_mode` in each crate's `mod fingerprint`, string AND numeric per language, spans located via the real `parse_file` pipeline
+- [x] **AC-38**: Reformatting remains invisible under both modes in every language (FR-34). — per-language reformat fixtures including the formatter-shaped trailing-comma cases (rustfmt/gofmt) carried by the shared-walk comma rule; Python covers it via the cosmetic arm of its indentation discriminator
+- [x] No language returns `None` for either fingerprint mode; FR-34 is complete across the supported set. — `literal_insensitive_returns_some` per crate; the per-SPAN `None` for unlocatable spans is a visible skip, not a language gap (see the 8.6 Notes clarification, judged honest by the spec lane both cycles)
+- [x] The per-language support matrix is documented in CLAUDE.md and reflected in the `symbol_history` description (NFR-11). — matrix with the two cross-language boundaries; tool description + mode arg + CLI help all state both-modes-live
+- [x] No new third-party dependency in `code-graph-lang` or any language plugin crate (NFR-02). — empty Cargo.toml/Cargo.lock diff over the frozen range; `DefaultHasher` + the pre-existing tree-sitter dep
+- [x] **AC-27**: `make verify` passes (NFR-04). — green at the phase endpoint (tasks 8.1/8.2/8.6/8.7 evidence rows)
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `dc8020e837cb353a68790d23121d4f9878f4e022`
+- Identity recheck: `git rev-parse dc8020e` at 2026-08-19 16:14 matched `dc8020e837cb353a68790d23121d4f9878f4e022`
+- Focused review: four-lane frozen gate over `77f3cd47aba9a0d7d3750218caf5fc4548ba6d1e..dc8020e837cb353a68790d23121d4f9878f4e022` (two cycles; cycle-1 materials M1/M2 resolved as task 8.7)
+- Reviewed candidate / final: `dc8020e837cb353a68790d23121d4f9878f4e022`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, rustfmt check, full workspace tests (natively on Windows) including the six per-language fingerprint suites (7+6+4+4+4+4 = 29 tests) and the 13-test history suite with the live literal_insensitive mode, pending-snapshot check, and plugin-mirror sync all green at the phase endpoint (AC-27); only docs-only commits follow the last verified code commit f8553ba.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen 77f3cd4..dc8020e, planning 3ed4865` | PASS | `All four independent lanes returned PASS/Aligned on cycle 2; residual observations recorded as accepted follow-ups in the review artifact.` |
+
+### Completed task identities
+- `8.1`: `eb14751edf11325962bfe464a1a81d60024d7c36`
+- `8.2`: `63f7e7c96fb5a933d34b06cd770d1ab95aa16c3e`
+- `8.3`: `4367c572e054e517a717b92344a2cf55cf703c01`
+- `8.4`: `b39704f4e8f3d9089dafe18a61008f360fa30444`
+- `8.5`: `c9945e4830c42a1b642b657b6caf78adc831d661`
+- `8.6`: `784166c9ac0edf4ec5b05eb8e512e88362ba7a55`
+- `8.7`: `f8553ba6e8fc4a7c895fa298b1e11624528f7dcb`
+
+- Final aligned review: `reviews/20-per-language-fingerprints-final-review-77f3cd4-dc8020e.md`; frozen: `77f3cd47aba9a0d7d3750218caf5fc4548ba6d1e..dc8020e837cb353a68790d23121d4f9878f4e022`
