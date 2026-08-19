@@ -33,13 +33,13 @@ tasks:
     depends_on: ["8.1"]
   - id: "8.5"
     title: "AST fingerprint override for C#"
-    status: in-progress
+    status: complete
     justifies: "FR-34, AC-39. Completes literal-insensitive coverage for C#."
     verification: "cargo test -p code-graph-lang-csharp fingerprint:: — LiteralInsensitive returns Some; literal-only change invisible under LiteralInsensitive, visible under Normalized (AC-39); reformatting invisible under both."
     depends_on: ["8.1"]
   - id: "8.6"
     title: "AST fingerprint override for Java, and the support matrix"
-    status: planned
+    status: in-progress
     justifies: "FR-34, AC-39, NFR-11. Last language plus the documentation that tells an agent which modes work where — without the matrix, an unsupported-mode response reads as a bug rather than a known boundary."
     verification: "cargo test -p code-graph-lang-java fingerprint:: plus cargo test --workspace — LiteralInsensitive returns Some for Java (AC-39); no language returns None for either mode, completing FR-34 across the supported set; CLAUDE.md carries the per-language fingerprint support matrix and the symbol_history description reflects it (NFR-11); make verify passes."
     depends_on: ["8.2", "8.3", "8.4", "8.5"]
@@ -199,17 +199,34 @@ Python is where the text default is weakest and the AST override earns the most:
 ## 8.5: AST fingerprint override for C#
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `CSharpParser` following the 8.1 shape
-- [ ] Tests per the verification field
+- [x] Implement `fingerprint_symbol` on `CSharpParser` following the 8.1 shape
+- [x] Tests per the verification field
 
 ### Notes
 Revision boundary: C# supports both modes.
 
 Mechanical. Note that partial classes produce one symbol per declaration, so a fingerprint covers one declaration's span, not the merged type — consistent with how every other tool treats them.
 
+**One grammar surprise, caught by the test suite.** tree-sitter-c-sharp spells the literal text runs differently per string form: plain strings carry `string_literal_content`, interpolated strings carry `string_content` (verified against the pinned grammar's actual sexp output — the interpolated-text assertion failed until the predicate matched both). The token-level predicate keeps interpolation EXPRESSIONS visible as code, mirroring the Python f-string decision.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `c9945e4830c42a1b642b657b6caf78adc831d661`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:25 matched `c9945e4830c42a1b642b657b6caf78adc831d661`
+- Focused review: `git show c9945e4830c42a1b642b657b6caf78adc831d661`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `c9945e4830c42a1b642b657b6caf78adc831d661`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-csharp fingerprint:: && cargo clippy -p code-graph-lang-csharp --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `4 tests passed: LiteralInsensitive returns Some for C#; string AND numeric literal-only changes track the mode (AC-39); reformatting plus XML doc comments invisible under both modes (AC-38); interpolated-expression structural change visible under LiteralInsensitive while the surrounding text follows the mode. Clippy denied no warnings. Full make verify rides with task 8.6's workspace gate.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show c9945e4` | PASS | `1 file: the override mirrors the 8.1 shape verbatim; the two-spelling literal-run discovery is documented on the predicate with the verification method named; no shared-walk changes needed.` |
 
 ## 8.6: AST fingerprint override for Java, and the support matrix
 
