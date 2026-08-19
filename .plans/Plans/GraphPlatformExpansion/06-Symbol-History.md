@@ -23,8 +23,14 @@ tasks:
     title: "symbol_history tool: transition walk and exact symbol matching"
     status: complete
     justifies: "FR-33, FR-35, NFR-10, NFR-11, AC-19, AC-20, AC-37, AC-45. Distinguishing a logic change from a reformat is the whole value of the feature; without transition comparison the tool degenerates into git log for a file, which the agent could already get."
-    verification: "cargo test -p code-graph-tools symbol_history:: against the phase 5 fixture — a reformat-only commit is not reported while the logic commit is (AC-19); a commit moving the function without changing it is not reported (AC-20); historical bytes are parsed in memory with no temporary file written, asserted by watching the temp directory (AC-37); a case-only rename reports Removed then Introduced, matching the exact-match rule; a large-window call does not delay a concurrent non-history query (NFR-10); the tool description meets the agent-facing lens (AC-45)."
+    verification: "cargo test -p code-graph-tools --test symbol_history against a hermetic git fixture (phase 5's fixture pattern) — a reformat-only commit is not reported while the logic commit is (AC-19); a commit moving the function without changing it is not reported (AC-20); historical bytes are parsed in memory with no temporary file written, asserted by watching the temp directory (AC-37); a case-only rename reports Removed then Introduced, matching the exact-match rule; a large-window call does not delay a concurrent non-history query (NFR-10); the tool description meets the agent-facing lens (AC-45)."
     depends_on: ["6.2"]
+  - id: "6.4"
+    title: "Resolve the phase-gate review findings (gate artifact 18, cycle 1)"
+    status: complete
+    justifies: "Gate artifact 18 cycle 1: one material finding (historical parses skipped the config pipeline, so [cpp].macro_*-dependent symbols silently reported empty histories — the flagship UE configuration) plus confirmed minors (deletion commits downgraded to skips, boundary flag blind to skipped-oldest revisions, data-dependent literal_insensitive rejection, same-process temp-path collision, undocumented rename/duplicate-name/truncation caveats)."
+    verification: "cargo test -p code-graph-tools --test symbol_history — a [cpp].macro_strip-dependent class walks a real introduced/modified history; git rm reports removed at the deletion commit with no skips; a mock provider with an unreadable oldest blob labels the introduction at_window_boundary; literal_insensitive errors before any provider call; cargo test -p code-graph-tools --lib fingerprint_cache — a different config identity is a cache miss; make verify green."
+    depends_on: ["6.3"]
 ---
 
 # Phase 6: Symbol History
@@ -168,6 +174,44 @@ Historical code may not parse with today's grammar. That is expected, not except
 
 ### Trap
 Reporting every revision returned by `revisions_touching`. That is `git log -- <file>`, which the agent can already get and which answers a different question. The tool's entire value is the comparison step that drops revisions where the symbol did not change.
+
+## 6.4: Resolve the phase-gate review findings (gate artifact 18, cycle 1)
+
+### Subtasks
+- [x] M1: run historical bytes through the indexer's config pipeline (`preprocess` byte-rewrites feed the parse; `synthesize_symbols` sees the original bytes) so `[cpp].macro_*`-dependent symbols have real histories
+- [x] Add the effective config's identity to the fingerprint cache key (`FingerprintKey.config` via `config_identity`) — a config change reads as misses, exactly like a different binary
+- [x] Map `read_at` `NotFound` to an examined absence (`RevisionInput::Absent`, cached as a tombstone) so a file-deletion commit reports `removed` instead of a skip
+- [x] Extend `at_window_boundary` to the skipped-oldest case (skips preceding the first examined revision carry the same boundary uncertainty as a filled window)
+- [x] Reject `literal_insensitive` up front so the outcome is data-independent
+- [x] Per-process write sequence in shard temp names (same-process walks cannot share a temp path)
+- [x] Document in the tool description + CLAUDE.md: earliest-occurrence rule for duplicate `(name, kind)`, file renames not followed, deletions report `removed`, raising `window` cannot extend past `history_truncated`
+- [x] Tests per the verification field (3 new integration tests, 1 new cache unit test)
+
+### Notes
+Cycle-1 findings NOT fixed here, accepted as recorded follow-ups: unbounded prefetch memory on a cold cache (window × file size; cap or chunk later), NFR-10's test gates the provider await rather than the blocking pool (structural guarantee verified by inspection), `binary_identity` constant-fallback aliasing (requires two unreadable executables), Rust lifetime-list mis-lex in the default fingerprint (`<'a,'b>` vs `<'a, 'b>` hashes differ — phase 8 per-language override territory), shard-growth across rebuilds, and the theoretical `\u{1f}`-in-filename key injection.
+
+### Completion Evidence
+
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `d6b3d9c9813e67a41d4bf3b5208abfb9c10d3bbd`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 13:02 matched `d6b3d9c9813e67a41d4bf3b5208abfb9c10d3bbd`
+- Focused review: `git show d6b3d9c9813e67a41d4bf3b5208abfb9c10d3bbd`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `d6b3d9c9813e67a41d4bf3b5208abfb9c10d3bbd`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools --test symbol_history && cargo test -p code-graph-tools --lib fingerprint_cache` | `.` | PASS (`exit 0`) | `12 integration tests passed including the three new pins: a class extractable only under [cpp].macro_strip walks a real introduced/modified history with zero skips (M1); git rm reports removed at the deletion commit with no skips; a mock provider with an unreadable oldest blob labels the introduction at_window_boundary despite an unfilled, untruncated window. 7 cache unit tests passed including config-identity key isolation (same key under a different config is a miss).` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings clean; fmt clean; full workspace tests green; tools-list snapshot regenerated for the description caveats and accepted; no pending snapshots; plugin mirrors in sync.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show d6b3d9c` | PASS | `6 files, all within the gate-finding scope: the walk now mirrors indexer.rs's preprocess/parse/synthesize order exactly (synthesis over original bytes); the config rides into the blocking closure by value and its serialization-hash identity joins the key in BOTH construction sites (prefetch + walk); Absent caches a tombstone so the second walk stays answer-identical; the boundary condition reads skipped.is_empty() at a point where the list can only hold pre-first skips; the upfront mode rejection leaves the in-walk LiteralInsensitive arm as unreachable defense for phase 8.` |
+
+### Trap
+Fixing M1 by only changing the parse call. Without adding the config identity to the cache key, the fix itself would poison every cache written before it (pre-fix tombstones for macro symbols) and every future config edit would serve stale fingerprints — the invalidation story is half the fix.
 
 ## Acceptance Criteria
 
