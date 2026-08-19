@@ -43,6 +43,12 @@ tasks:
     justifies: "FR-34, AC-39, NFR-11. Last language plus the documentation that tells an agent which modes work where — without the matrix, an unsupported-mode response reads as a bug rather than a known boundary."
     verification: "cargo test -p code-graph-lang-java fingerprint:: plus cargo test --workspace — LiteralInsensitive returns Some for Java (AC-39); no language returns None for either mode, completing FR-34 across the supported set; CLAUDE.md carries the per-language fingerprint support matrix and the symbol_history description reflects it (NFR-11); make verify passes."
     depends_on: ["8.2", "8.3", "8.4", "8.5"]
+  - id: "8.7"
+    title: "Resolve the phase-gate review findings (gate artifact 20, cycle 1)"
+    status: complete
+    justifies: "Gate artifact 20 cycle 1: two material doc/behavior contradictions — the Rust 'a derive change is a logic change' claim is false for OUTER attributes (attribute_item is a sibling of the item node, outside the fingerprinted span), and locate_symbol_node's doc claimed template wrappers fingerprint whole declarations (unreachable by construction: extractors record the inner node) — plus minors (stale CLI --mode help, four phantom Rust literal-kind spellings, undocumented CRLF sensitivity of multi-line literal bytes)."
+    verification: "cargo test -p code-graph-lang-rust fingerprint:: — outer_attributes_are_outside_the_fingerprinted_span pins the derive-invisibility boundary under both modes; cargo test -p code-graph-lang-cpp fingerprint — template_parameter_list_is_outside_the_fingerprinted_span pins the template boundary (clause edit invisible, body edit visible); make verify green."
+    depends_on: ["8.6"]
 ---
 
 # Phase 8: Per-Language Fingerprints
@@ -266,6 +272,42 @@ The support matrix is the deliverable that closes the loop: once every language 
 | Tool / inspection | Context | Result | Observable evidence |
 |---|---|---|---|
 | `focused diff review` | `git show 784166c` | PASS | `6 files: the Java override mirrors the 8.1 shape verbatim; the upfront-rejection removal replaces a hard error with a comment naming the phase-8 state change; the in-walk None arm becomes a per-revision skip whose reason names the mode and language (Decision 5 honored — visible skip, not silent fallback); the tool description and mode arg description state both-modes-supported and reserve the mode error for unknown SPELLINGS; CLAUDE.md's support matrix documents the shared walk plus each plugin's decisions, and both stale 'until phase 8' passages are reconciled.` |
+
+## 8.7: Resolve the phase-gate review findings (gate artifact 20, cycle 1)
+
+### Subtasks
+- [x] Qualify the Rust attribute claim (override doc + CLAUDE.md matrix row): attributes INSIDE the located subtree are code; OUTER attributes on the symbol (`#[derive(...)]` above a struct/fn) are `attribute_item` siblings of the item node — outside the extractor-recorded span, so a derive-only edit is NOT a transition
+- [x] Pin the boundary deliberately: `outer_attributes_are_outside_the_fingerprinted_span` asserts derive-invisibility under both modes, so a future extractor-span change fails the test and forces the docs to flip with it
+- [x] Correct `locate_symbol_node`'s doc: the located node is the EXTRACTOR-recorded inner definition — the template-wrapper claim was unreachable by construction; state the extractor-span contract instead
+- [x] Pin the C++ template boundary: `template_parameter_list_is_outside_the_fingerprinted_span` (clause-only edit invisible under both modes; body edit visible)
+- [x] Fix the stale CLI `--mode` help text (`literal_insensitive arrives in a later phase` → both modes live)
+- [x] Remove the four phantom Rust literal-kind spellings (v0.24.2 folds byte/C-string forms into the covered kinds — verified against the vendored node-types.json)
+- [x] Document the two cross-language boundaries in the CLAUDE.md matrix intro (extractor-span wrappers; CRLF sensitivity of multi-line literal bytes under `normalized`)
+
+### Notes
+The severity of both materials was documentation-as-production-behavior (this repo's own agent-facing lens): the code was defensible, but the claims annotating it said the opposite of what it does — and the 8.2 test had been written around the gap rather than at it. The fixes pin both boundaries with tests that fail if the behavior ever changes, which converts silent limitations into enforced contracts.
+
+Cycle-1 findings NOT fixed here, accepted as recorded follow-ups: the sextuplicated ~25-line override body (consolidate into a shared helper before a seventh language); unlocatable-span degradation and cross-parser determinism unit-tested only in the C++ suite; no tool-level test drives the `literal_insensitive` skip arm end-to-end; the theoretical hash-stream framing ambiguity (leaf text containing raw `\x1f` + a kind spelling could mimic a sibling boundary — not constructible from realistic edits; a length prefix would close it).
+
+### Completion Evidence
+
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `f8553ba6e8fc4a7c895fa298b1e11624528f7dcb`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:56 matched `f8553ba6e8fc4a7c895fa298b1e11624528f7dcb`
+- Focused review: `git show f8553ba6e8fc4a7c895fa298b1e11624528f7dcb`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `f8553ba6e8fc4a7c895fa298b1e11624528f7dcb`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-rust fingerprint:: && cargo test -p code-graph-lang-cpp fingerprint` | `.` | PASS (`exit 0`) | `6 Rust tests passed including the new outer-attribute boundary pin (derive-only edit hashes equal under both modes); 7 C++ tests passed including the new template boundary pin (clause-only edit invisible, body edit visible).` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green after the doc/test/predicate changes.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show f8553ba` | PASS | `5 files, all within the gate-finding scope: both boundary pins carry comments naming gate artifact 20 and the doc-flip obligation; the phantom-kind removal documents HOW the folding was verified; no behavioral change to any fingerprint path — the diff is docs, help text, predicates (dead arms only), and tests.` |
 
 ## Acceptance Criteria
 
