@@ -15,7 +15,7 @@ tasks:
     verification: "cargo test -p code-graph-lang-cpp fingerprint:: — LiteralInsensitive returns Some for C++; a symbol whose only change is a string or numeric literal yields a changed fingerprint under Normalized and an unchanged one under LiteralInsensitive (AC-39); a reformatted symbol is unchanged under both; a macro-stripped symbol fingerprints consistently across repeated calls."
   - id: "8.2"
     title: "AST fingerprint override for Rust"
-    status: in-progress
+    status: complete
     justifies: "FR-34, AC-39. Rust is the workspace's own language, so its override is the one exercised most often in dogfooding and the first to surface a bad shared abstraction from 8.1."
     verification: "cargo test -p code-graph-lang-rust fingerprint:: — LiteralInsensitive returns Some; literal-only change is invisible under LiteralInsensitive and visible under Normalized (AC-39); a reformatted symbol is unchanged under both; attribute and doc-comment changes behave per the mode."
     depends_on: ["8.1"]
@@ -97,10 +97,10 @@ Re-parsing the whole file per symbol per revision. It is the obvious implementat
 ## 8.2: AST fingerprint override for Rust
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `RustParser` following the 8.1 shape
-- [ ] Decide and document how attributes and doc comments participate in each mode
-- [ ] Pin that the AST walk supersedes the text default's lifetime-list mis-lex (gate artifact 18 follow-up: `<'a,'b>` vs `<'a, 'b>` hash differently under the text default — a rustfmt-only commit reported `modified`; the AST walk must hash them equal under both modes)
-- [ ] Tests per the verification field
+- [x] Implement `fingerprint_symbol` on `RustParser` following the 8.1 shape
+- [x] Decide and document how attributes and doc comments participate in each mode
+- [x] Pin that the AST walk supersedes the text default's lifetime-list mis-lex (gate artifact 18 follow-up: `<'a,'b>` vs `<'a, 'b>` hash differently under the text default — a rustfmt-only commit reported `modified`; the AST walk must hash them equal under both modes)
+- [x] Tests per the verification field
 
 ### Notes
 Revision boundary: Rust supports both modes.
@@ -109,9 +109,27 @@ Rust is the workspace's own language, so this override gets the most incidental 
 
 Doc comments are comments and should be invisible under both modes; attributes are code and should not be. `#[derive(...)]` changes behaviour, so a derive change is a logic change.
 
+**The 8.1 abstraction DID show a gap here, exactly as predicted.** The Rust suite's rustfmt-shaped reformat fixture (multiline parameters + trailing comma) exposed that the shared walk hashed comma tokens: formatters ADD trailing commas when breaking lists (rustfmt always, gofmt necessarily), so a reformat-only commit would have reported `modified` — the AC-38 false positive. Fixed in the shared walk (commas invisible; the tree structure already encodes element boundaries; enter/exit brackets stay paired), so all six languages inherit the fix rather than five copies of the bug.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `63f7e7c96fb5a933d34b06cd770d1ab95aa16c3e`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:16 matched `63f7e7c96fb5a933d34b06cd770d1ab95aa16c3e`
+- Focused review: `git show 63f7e7c96fb5a933d34b06cd770d1ab95aa16c3e`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `63f7e7c96fb5a933d34b06cd770d1ab95aa16c3e`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-rust fingerprint:: && cargo test -p code-graph-lang-cpp fingerprint::` | `.` | PASS (`exit 0`) | `5 Rust tests passed: LiteralInsensitive returns Some; string AND numeric literal-only changes track the mode (AC-39); a rustfmt-shaped reformat (multiline + trailing comma) is invisible under both modes (AC-38); the artifact-18 lifetime-list mis-lex is superseded (<'a,'b> == <'a, 'b> under both modes); doc comments invisible / attributes visible under both. The 6 C++ tests stay green after the shared-walk comma fix.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 63f7e7c` | PASS | `2 files: the override mirrors the 8.1 shape verbatim (raw bytes — Rust has no preprocess pass — with the same per-mode locate-failure degradation); the mode-participation decisions are documented on the override itself; the shared-walk comma fix is scoped to the enter/exit pair with the rationale in a comment naming the AC-38 failure it prevents.` |
 
 ## 8.3: AST fingerprint override for Go
 
