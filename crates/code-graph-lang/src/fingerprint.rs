@@ -368,8 +368,14 @@ pub fn ast_fingerprint(
         let current = cursor.node();
         let kind = current.kind();
         let mut descend = true;
-        if is_comment(kind) {
-            descend = false; // invisible under both modes
+        if is_comment(kind) || kind == "," {
+            // Comments are invisible under both modes. So are commas:
+            // formatters ADD trailing commas when breaking a list across
+            // lines (rustfmt always, gofmt necessarily), and the tree
+            // structure already encodes element boundaries — hashing the
+            // separator would make a reformat-only commit report
+            // `modified`, exactly the false positive AC-38 forbids.
+            descend = false;
         } else {
             hasher.write(b"(");
             hasher.write(kind.as_bytes());
@@ -386,7 +392,9 @@ pub fn ast_fingerprint(
         if descend && cursor.goto_first_child() {
             continue;
         }
-        if !is_comment(kind) {
+        // The exit bracket pairs with the enter bracket: skipped nodes
+        // (comments, commas) wrote no `(`, so they get no `)`.
+        if !(is_comment(kind) || kind == ",") {
             hasher.write(b")");
         }
         loop {

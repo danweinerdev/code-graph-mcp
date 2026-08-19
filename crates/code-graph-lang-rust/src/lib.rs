@@ -1152,7 +1152,76 @@ impl LanguagePlugin for RustParser {
         }
     }
 
+    /// AST-backed fingerprint (phase 8.2, following the 8.1 shape).
+    /// Rust has no `preprocess` pass, so `content` is the raw revision
+    /// bytes — the same bytes `parse_file` saw.
+    ///
+    /// Mode participation decisions (task 8.2): doc comments (`///`,
+    /// `//!`, `/** */`) parse as comment nodes and are invisible under
+    /// BOTH modes — they are comments. Attributes (`#[derive(...)]`,
+    /// `#[cfg(...)]`) are code and contribute under both modes — a derive
+    /// change is a logic change. A string literal INSIDE an attribute
+    /// (`#[doc = "..."]`, `#[path = "..."]`) is still a literal node and
+    /// follows the mode like any other literal value.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                rust_literal_kind,
+                rust_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+
     fn close(&self) {}
+}
+
+/// Literal node kinds for the fingerprint walk (tree-sitter-rust v0.24):
+/// values whose CHANGE is invisible under `LiteralInsensitive`. The node
+/// kind still contributes, so adding or removing a literal stays visible
+/// under both modes.
+fn rust_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "raw_string_literal"
+            | "char_literal"
+            | "integer_literal"
+            | "float_literal"
+            | "boolean_literal"
+            | "byte_literal"
+            | "byte_string_literal"
+            | "raw_byte_string_literal"
+            | "c_string_literal"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38). Doc comments
+/// (`///`, `//!`, `/** */`) parse as these same kinds — comments are
+/// comments, whatever their audience.
+fn rust_comment_kind(kind: &str) -> bool {
+    matches!(kind, "line_comment" | "block_comment")
 }
 
 /// One external `mod_item`'s metadata, collected by [`scan_mod_decls`]
@@ -3476,5 +3545,160 @@ mod tests {
             "2.1 baseline must survive 2.2: parser still emits `to = \"b\"` \
              for `mod a {{ mod b; }}` (resolution behavior is post_index's job)"
         );
+    }
+}
+
+/// Phase 8.2 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-rust
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::RustParser;
+
+    fn symbol_in(parser: &RustParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.rs"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &RustParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for Rust")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = RustParser::new().unwrap();
+        let content = b"pub fn answer() -> u32 {\n    42\n}\n";
+        let symbol = symbol_in(&parser, content, "answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "Rust supports LiteralInsensitive after phase 8.2"
+        );
+    }
+
+    /// AC-39: literal-only changes (string and numeric) are visible under
+    /// Normalized and invisible under LiteralInsensitive.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = RustParser::new().unwrap();
+        let one: &[u8] = b"pub fn greet() -> &'static str {\n    \"hello\"\n}\n";
+        let two: &[u8] = b"pub fn greet() -> &'static str {\n    \"goodbye\"\n}\n";
+        assert_ne!(
+            fp(&parser, one, "greet", FingerprintMode::Normalized),
+            fp(&parser, two, "greet", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(&parser, one, "greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "greet", FingerprintMode::LiteralInsensitive),
+        );
+
+        let three: &[u8] = b"pub fn answer() -> u32 {\n    42\n}\n";
+        let four: &[u8] = b"pub fn answer() -> u32 {\n    43\n}\n";
+        assert_ne!(
+            fp(&parser, three, "answer", FingerprintMode::Normalized),
+            fp(&parser, four, "answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "answer", FingerprintMode::LiteralInsensitive),
+        );
+    }
+
+    /// AC-38: reformatting is invisible under both modes.
+    #[test]
+    fn reformat_is_invisible_under_both_modes() {
+        let parser = RustParser::new().unwrap();
+        let one: &[u8] = b"pub fn add(left: u32, right: u32) -> u32 {\n    left + right\n}\n";
+        let two: &[u8] =
+            b"pub fn add(\n    left: u32,\n    right: u32,\n) -> u32 {\n    left + right\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "add", mode),
+                fp(&parser, two, "add", mode),
+                "layout is not content ({mode:?})"
+            );
+        }
+    }
+
+    /// Gate artifact 18 follow-up: the text default mis-lexed lifetime
+    /// lists (`<'a,'b>` vs `<'a, 'b>` hashed differently — a rustfmt-only
+    /// commit reported `modified`). The AST walk supersedes it: both
+    /// spellings hash equal under both modes.
+    #[test]
+    fn lifetime_list_reformat_is_invisible() {
+        let parser = RustParser::new().unwrap();
+        let one: &[u8] =
+            b"pub fn pair<'a,'b>(left: &'a str, right: &'b str) -> (&'a str, &'b str) {\n    (left, right)\n}\n";
+        let two: &[u8] =
+            b"pub fn pair<'a, 'b>(left: &'a str, right: &'b str) -> (&'a str, &'b str) {\n    (left, right)\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "pair", mode),
+                fp(&parser, two, "pair", mode),
+                "a lifetime-list reformat is not a content change ({mode:?})"
+            );
+        }
+    }
+
+    /// Task 8.2's documented decision: doc comments are comments —
+    /// invisible under both modes; attributes are code — a derive change
+    /// is a logic change, visible under both modes.
+    #[test]
+    fn doc_comments_are_invisible_and_attributes_are_code() {
+        let parser = RustParser::new().unwrap();
+        let bare: &[u8] = b"pub fn item() -> u32 {\n    1\n}\n";
+        let documented: &[u8] = b"/// Returns the item count.\npub fn item() -> u32 {\n    1\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, bare, "item", mode),
+                fp(&parser, documented, "item", mode),
+                "doc comments are comments ({mode:?})"
+            );
+        }
+
+        // Attributes participate: structs carry derives in the fixture
+        // because the extractor's span for a fn does not include a
+        // preceding attribute line unless the node does — use an inline
+        // cfg attribute inside the body instead, which is unambiguous.
+        let plain: &[u8] = b"pub fn gated() -> u32 {\n    { 1 }\n}\n";
+        let gated: &[u8] = b"pub fn gated() -> u32 {\n    #[allow(unused)] { 1 }\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_ne!(
+                fp(&parser, plain, "gated", mode),
+                fp(&parser, gated, "gated", mode),
+                "attributes are code ({mode:?})"
+            );
+        }
     }
 }
