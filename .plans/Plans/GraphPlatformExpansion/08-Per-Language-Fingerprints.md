@@ -21,13 +21,13 @@ tasks:
     depends_on: ["8.1"]
   - id: "8.3"
     title: "AST fingerprint override for Go"
-    status: planned
+    status: complete
     justifies: "FR-34, AC-39. Completes literal-insensitive coverage for Go, without which a Go user asking the question gets an unsupported-mode response rather than an answer."
     verification: "cargo test -p code-graph-lang-go fingerprint:: — LiteralInsensitive returns Some; literal-only change invisible under LiteralInsensitive, visible under Normalized (AC-39); reformatting invisible under both."
     depends_on: ["8.1"]
   - id: "8.4"
     title: "AST fingerprint override for Python"
-    status: planned
+    status: in-progress
     justifies: "FR-34, AC-39. Python's significant indentation makes it the case where a naive whitespace-collapsing normalizer and an AST fingerprint diverge most, so it validates that the override genuinely supersedes the text default."
     verification: "cargo test -p code-graph-lang-python fingerprint:: — LiteralInsensitive returns Some; literal-only change invisible under LiteralInsensitive (AC-39); a change to indentation that alters block structure IS reported under both modes, distinguishing structural whitespace from cosmetic whitespace."
     depends_on: ["8.1"]
@@ -134,17 +134,34 @@ Doc comments are comments and should be invisible under both modes; attributes a
 ## 8.3: AST fingerprint override for Go
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `GoParser` following the 8.1 shape
-- [ ] Tests per the verification field
+- [x] Implement `fingerprint_symbol` on `GoParser` following the 8.1 shape
+- [x] Tests per the verification field
 
 ### Notes
 Revision boundary: Go supports both modes.
 
 Mechanical once 8.1 sets the pattern. Go's grammar has no preprocessing and no significant whitespace, so this is the most straightforward of the six.
 
+Go is also the language that makes the 8.2 shared-walk comma fix load-bearing rather than cosmetic: breaking an argument list across lines REQUIRES a trailing comma in Go, so without the fix every gofmt multiline reformat would report `modified`. The reformat test exercises exactly that shape.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `4367c572e054e517a717b92344a2cf55cf703c01`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:19 matched `4367c572e054e517a717b92344a2cf55cf703c01`
+- Focused review: `git show 4367c572e054e517a717b92344a2cf55cf703c01`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `4367c572e054e517a717b92344a2cf55cf703c01`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-go fingerprint:: && cargo clippy -p code-graph-lang-go --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `4 tests passed: LiteralInsensitive returns Some for Go; string AND numeric literal-only changes are visible under Normalized and invisible under LiteralInsensitive (AC-39); a gofmt-shaped reformat (multiline args + mandatory trailing comma + doc comment) is invisible under both modes (AC-38); an operator change stays visible under both. Clippy denied no warnings. Full make verify rides with task 8.6's workspace gate.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 4367c57` | PASS | `1 file: the override mirrors the 8.1 shape verbatim; literal-kind list covers tree-sitter-go v0.25's value literals with iota deliberately excluded (identifier, participates as code); no shared-walk changes needed — the 8.2 comma fix carried Go's mandatory-trailing-comma case.` |
 
 ## 8.4: AST fingerprint override for Python
 
