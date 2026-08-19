@@ -31,6 +31,12 @@ tasks:
     justifies: "Gate artifact 18 cycle 1: one material finding (historical parses skipped the config pipeline, so [cpp].macro_*-dependent symbols silently reported empty histories — the flagship UE configuration) plus confirmed minors (deletion commits downgraded to skips, boundary flag blind to skipped-oldest revisions, data-dependent literal_insensitive rejection, same-process temp-path collision, undocumented rename/duplicate-name/truncation caveats)."
     verification: "cargo test -p code-graph-tools --test symbol_history — a [cpp].macro_strip-dependent class walks a real introduced/modified history; git rm reports removed at the deletion commit with no skips; a mock provider with an unreadable oldest blob labels the introduction at_window_boundary; literal_insensitive errors before any provider call; cargo test -p code-graph-tools --lib fingerprint_cache — a different config identity is a cache miss; make verify green."
     depends_on: ["6.3"]
+  - id: "6.5"
+    title: "Resolve the cycle-2 material finding: unreadable blob is Operation, not NotFound"
+    status: complete
+    justifies: "Gate artifact 18 cycle 2: past a successful tree-entry lookup, a find_blob failure (partial clone without the blob, corrupt object store, gitlink) mapped to NotFound — which task 6.4 made the deterministic cacheable absence signal — would manufacture false removed/introduced transitions and cache a permanent false tombstone keyed by the immutable revision."
+    verification: "cargo test -p code-graph-vcs-git — a committed gitlink entry whose commit object is absent reports Operation while a genuinely absent path keeps NotFound; cargo test -p code-graph-tools --test symbol_history — a mock provider drives history_truncated:true through the tool (cycle-2 undispositioned test gap); make verify green."
+    depends_on: ["6.4"]
 ---
 
 # Phase 6: Symbol History
@@ -212,6 +218,42 @@ Cycle-1 findings NOT fixed here, accepted as recorded follow-ups: unbounded pref
 
 ### Trap
 Fixing M1 by only changing the parse call. Without adding the config identity to the cache key, the fix itself would poison every cache written before it (pre-fix tombstones for macro symbols) and every future config edit would serve stale fingerprints — the invalidation story is half the fix.
+
+## 6.5: Resolve the cycle-2 material finding: unreadable blob is Operation, not NotFound
+
+### Subtasks
+- [x] Map `read_at`'s `find_blob` failure arm to `VcsError::Operation`, reserving `NotFound` for the `lookup_entry`-returned-`None` arm (genuine path absence)
+- [x] Regression test: a committed gitlink entry whose commit object is absent reports `Operation`; a genuinely absent path keeps the `NotFound` contract
+- [x] Close the cycle-2 undispositioned test gap: drive `history_truncated: true` through the tool via a mock provider and pin that provider truncation alone makes an oldest introduction boundary-ambiguous
+- [x] Repair the `window_filled` field doc overclaim (a history exactly `window` revisions long also sets it — the flag is conservative)
+
+### Notes
+The severity came from composition: task 6.4 made `NotFound` the deterministic, *cacheable* absence signal (`RevisionInput::Absent` → permanent tombstone keyed by immutable rev). Any read failure mapped to `NotFound` after that turns transient object-store trouble into false `removed`/`introduced` transitions that never heal within a stable binary+config. The fix restores the invariant the deletion feature depends on: `NotFound` means "the tree at this revision provably has no entry at this path", everything else is `Operation` → skip.
+
+Cycle-2 findings NOT fixed here, accepted as recorded follow-ups (joining the 6.4 list): skip-adjacent transitions attribute to the first examined revision after the skip with no per-entry uncertainty marker (the global `skipped` list permits client-side reconstruction); synchronous shard reads in the async prefetch loop (latency, not correctness); config-identity over-invalidation from extraction-irrelevant knobs; the dead in-walk `literal_insensitive` arm's divergent wording; a shared key-builder to make the two `FingerprintKey` construction sites structurally identical.
+
+### Completion Evidence
+
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `e747b14ead60c663d1aba69d26b20b857873e337`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 13:18 matched `e747b14ead60c663d1aba69d26b20b857873e337`
+- Focused review: `git show e747b14ead60c663d1aba69d26b20b857873e337`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `e747b14ead60c663d1aba69d26b20b857873e337`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-vcs-git && cargo test -p code-graph-tools --test symbol_history` | `.` | PASS (`exit 0`) | `14 vcs-git tests passed including the new pin: a gitlink entry whose commit object is absent reports Operation while src/never_existed.rs keeps NotFound. 13 integration tests passed including the new provider-truncation pin: history_truncated:true reaches the wire and alone (window unfilled, nothing skipped) labels the oldest introduction at_window_boundary.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings clean; fmt clean; full workspace tests green; no pending snapshots; plugin mirrors in sync.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show e747b14` | PASS | `3 files, all within the cycle-2 finding scope: the find_blob arm now formats an Operation error naming the path and revision; the comment explains WHY the mapping is load-bearing (cacheable-absence contract); the new vcs-git test uses relative paths matching the oracle test's convention (the fixture's 8.3 short-form temp path defeats the ownership check otherwise); the truncation test's mock returns truncated:true with one readable commit so only the plumbing under test can produce the asserted flags.` |
+
+### Trap
+Mapping ALL of `read_at`'s early failure arms (`rev_parse_single`, `object()`, `peel_to_commit`) to `Operation` too. Those failures mean the *revision* could not be resolved — `revisions_touching` just produced it, so absence there is a provider-state problem the caller should see as a skip, but the `NotFound` wording is also what `blame_symbol`'s unavailability routing keys on. The fix deliberately touched only the blob arm, where the tree entry's existence makes the semantics unambiguous.
 
 ## Acceptance Criteria
 
