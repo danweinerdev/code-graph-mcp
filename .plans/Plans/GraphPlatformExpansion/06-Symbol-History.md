@@ -10,12 +10,12 @@ deliverable: "A symbol_history tool reporting the revisions at which a symbol's 
 tasks:
   - id: "6.1"
     title: "LanguagePlugin::fingerprint_symbol hook with a std-only text default"
-    status: in-progress
+    status: complete
     justifies: "FR-34 (Normalized half), NFR-02, AC-38. parse_file returns a FileGraph, not a syntax tree, so there is no way to fingerprint an AST from outside a plugin; the hook is what makes AST overrides possible in phase 8 without leaking tree-sitter across a crate boundary."
     verification: "cargo test -p code-graph-lang fingerprint:: — the default implementation returns an unchanged fingerprint for a symbol whose only change is whitespace or comments (AC-38); LiteralInsensitive returns None from the default rather than silently falling back to Normalized; all six existing plugins compile with no change, proving the hook is additive; cargo tree confirms code-graph-lang gained no third-party dependency (NFR-02)."
   - id: "6.2"
     title: "Fingerprint cache under .code-graph/fingerprints"
-    status: planned
+    status: in-progress
     justifies: "FR-37, AC-46. A history walk re-reads and re-parses every revision in the window and the parse dominates; without the cache a repeated query pays the whole cost again, and the tombstone case makes pre-existence revisions free."
     verification: "cargo test -p code-graph-tools fingerprint_cache:: — a second identical query is served from cache; deleting the cache directory recomputes the same answer; a corrupted shard recomputes rather than erroring (AC-46); a revision predating the symbol is cached as a tombstone and not re-parsed on the second walk; the cache is separate from .code-graph-cache.db and CACHE_VERSION is unchanged."
     depends_on: ["6.1"]
@@ -38,16 +38,26 @@ Depends on phase 5. Gates phase 8.
 ## 6.1: LanguagePlugin::fingerprint_symbol hook with a std-only text default
 
 ### Subtasks
-- [ ] Add `FingerprintMode { Normalized, LiteralInsensitive }` to `code-graph-lang`
-- [ ] Add `fingerprint_symbol(&self, content, symbol, mode) -> Option<u64>` with a default implementation
-- [ ] Implement the default: hash the symbol's line span with comments stripped and whitespace runs collapsed
-- [ ] Return `None` for `LiteralInsensitive` in the default — never fall back to `Normalized`
-- [ ] Use `std::collections::hash_map::DefaultHasher` and nothing else
-- [ ] Confirm all six plugins compile unchanged
-- [ ] Tests for the reformat-invariance property and the unsupported-mode path
+- [x] Add `FingerprintMode { Normalized, LiteralInsensitive }` to `code-graph-lang`
+- [x] Add `fingerprint_symbol(&self, content, symbol, mode) -> Option<u64>` with a default implementation
+- [x] Implement the default: hash the symbol's line span with comments stripped and inter-token whitespace normalized
+- [x] Return `None` for `LiteralInsensitive` in the default — never fall back to `Normalized`
+- [x] Use `std::collections::hash_map::DefaultHasher` and nothing else
+- [x] Confirm all six plugins compile unchanged
+- [x] Tests for the reformat-invariance property and the unsupported-mode path
 
 ### Notes
 Revision boundary: every language can be fingerprinted in `Normalized` mode; nothing consumes it yet.
+
+**Whitespace rule refined at implementation.** The design sketch said
+"whitespace runs collapsed", but pure collapse-to-one-space preserves the
+presence-vs-absence distinction, so the canonical reformat — a line break
+after `(`, exactly AC-38's fixture shape — would change the fingerprint.
+The shipped rule is token-aware: a separator survives only where two word
+tokens would otherwise merge (`fn add` stays two tokens; `add( left` and
+`add(left` normalize identically). Known cost, documented in the module:
+spacing-sensitive punctuation pairs (`a - -b` vs `a--b`) hash equal — a
+sensitivity loss, never an instability.
 
 The hook follows the trait's existing shape — `preprocess`, `synthesize_symbols`, `resolve_call`, and `post_index` are all default-provided hooks plugins may override — so this adds no new pattern and no plugin needs touching.
 
@@ -57,7 +67,23 @@ The **std-only** constraint is not stylistic. `code-graph-lang` is one of the fo
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-18
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `0baf6c65bf4e1dbe41c9ee16313f401bbcea95e3`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-18 20:05 matched `0baf6c65bf4e1dbe41c9ee16313f401bbcea95e3`
+- Focused review: `git show 0baf6c65bf4e1dbe41c9ee16313f401bbcea95e3`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `0baf6c65bf4e1dbe41c9ee16313f401bbcea95e3`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang && cargo clippy -p code-graph-lang --all-targets -- -D warnings && cargo fmt --all --check` | `.` | PASS (`exit 0`) | `65 tests passed including the twelve new fingerprint tests (reformat/comment invariance incl. AC-38's canonical line-break-after-paren shape, literal/code sensitivity, string verbatim-ness, Rust lifetimes and nested block comments, Python/Go string forms, span edges, determinism, LiteralInsensitive -> None); clippy denied no warnings.` |
+| `cargo tree -p code-graph-lang -e normal --depth 1 && cargo check -p code-graph-lang-{cpp,rust,go,python,csharp,java}` | `.` | PASS (`exit 0`) | `Dependency list unchanged (code-graph-core, thiserror, tree-sitter) — no third-party hash entered the NFR-02-protected crate; all six plugins compile unchanged, proving the hook is additive.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 0baf6c6` | PASS | `Two files: the new fingerprint module and the trait/enum addition; no plugin, indexer, or wire surface touched.` |
 
 ### Trap
 Making `LiteralInsensitive` fall back to `Normalized` when a plugin has no override. It feels helpful and it makes "the logic didn't change" mean two different things depending on the language, with no way for the caller to tell which they got. Return `None` and let the handler report the mode as unsupported.
