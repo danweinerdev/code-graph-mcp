@@ -822,6 +822,77 @@ impl LanguagePlugin for CSharpParser {
     // matches the C++/Rust/Go/Python plugins; default basename resolver
     // is a no-op for C#'s dotted namespace `using` paths, which is the
     // intended behavior).
+
+    /// AST-backed fingerprint (phase 8.5, following the 8.1 shape). C#
+    /// has no `preprocess` pass, so `content` is the raw revision bytes.
+    /// Interpolated strings mirror the Python f-string decision: the
+    /// literal predicate matches the TEXT runs
+    /// (`string_literal_content`), not the whole interpolated
+    /// expression, so `$"{x + y}"`'s interpolation stays code. A partial
+    /// class fingerprints one declaration's span, consistent with the
+    /// one-symbol-per-declaration extraction rule.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                csharp_literal_kind,
+                csharp_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+}
+
+/// Literal node kinds for the fingerprint walk (tree-sitter-c-sharp
+/// v0.23): values whose CHANGE is invisible under `LiteralInsensitive`.
+/// `string_literal_content`/`escape_sequence` cover the text runs inside
+/// both plain and interpolated strings, so interpolation EXPRESSIONS stay
+/// code; `boolean_literal`/`null_literal` are value literals.
+fn csharp_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Plain string literals carry `string_literal_content` text runs;
+        // interpolated strings carry `string_content` runs (verified
+        // against the pinned grammar's actual sexp output) — both are
+        // literal text, and matching the runs rather than the enclosing
+        // expression keeps interpolation EXPRESSIONS visible as code.
+        "string_literal_content"
+            | "string_content"
+            | "escape_sequence"
+            | "verbatim_string_literal"
+            | "raw_string_literal"
+            | "character_literal"
+            | "integer_literal"
+            | "real_literal"
+            | "boolean_literal"
+            | "null_literal"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38). XML doc
+/// comments (`///`) parse as ordinary `comment` nodes in this grammar.
+fn csharp_comment_kind(kind: &str) -> bool {
+    kind == "comment"
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the C# grammar.
@@ -2669,5 +2740,152 @@ class Outer {
         let fg = parse("");
         let edges = inherits(&fg);
         assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+}
+
+/// Phase 8.5 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-csharp
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::CSharpParser;
+
+    fn symbol_in(parser: &CSharpParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.cs"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &CSharpParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for C#")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = CSharpParser::new().unwrap();
+        let content = b"class Calc {\n    int Answer() { return 42; }\n}\n";
+        let symbol = symbol_in(&parser, content, "Answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "C# supports LiteralInsensitive after phase 8.5"
+        );
+    }
+
+    /// AC-39: literal-only changes (string and numeric) are visible under
+    /// Normalized and invisible under LiteralInsensitive.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = CSharpParser::new().unwrap();
+        let one: &[u8] = b"class Calc {\n    string Greet() { return \"hello\"; }\n}\n";
+        let two: &[u8] = b"class Calc {\n    string Greet() { return \"goodbye\"; }\n}\n";
+        assert_ne!(
+            fp(&parser, one, "Greet", FingerprintMode::Normalized),
+            fp(&parser, two, "Greet", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(&parser, one, "Greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "Greet", FingerprintMode::LiteralInsensitive),
+        );
+
+        let three: &[u8] = b"class Calc {\n    int Answer() { return 42; }\n}\n";
+        let four: &[u8] = b"class Calc {\n    int Answer() { return 43; }\n}\n";
+        assert_ne!(
+            fp(&parser, three, "Answer", FingerprintMode::Normalized),
+            fp(&parser, four, "Answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "Answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "Answer", FingerprintMode::LiteralInsensitive),
+        );
+    }
+
+    /// AC-38: reformatting and comments (XML doc comments included) are
+    /// invisible under both modes.
+    #[test]
+    fn reformat_and_comments_are_invisible_under_both_modes() {
+        let parser = CSharpParser::new().unwrap();
+        let one: &[u8] =
+            b"class Calc {\n    int Add(int left, int right) { return left + right; }\n}\n";
+        let two: &[u8] = b"class Calc {\n    /// <summary>Sums the operands.</summary>\n    int Add(\n        int left,\n        int right\n    )\n    {\n        return left + right;\n    }\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "Add", mode),
+                fp(&parser, two, "Add", mode),
+                "layout and doc comments are not content ({mode:?})"
+            );
+        }
+    }
+
+    /// Interpolated strings mirror the Python f-string decision: the
+    /// interpolation EXPRESSION is code (visible under both modes); the
+    /// literal text around it follows the mode.
+    #[test]
+    fn interpolated_string_expression_is_code_and_text_is_literal() {
+        let parser = CSharpParser::new().unwrap();
+        let expr_one: &[u8] =
+            b"class Calc {\n    string Show(int x, int y) { return $\"value {x + y}\"; }\n}\n";
+        let expr_two: &[u8] =
+            b"class Calc {\n    string Show(int x, int y) { return $\"value {x * y}\"; }\n}\n";
+        assert_ne!(
+            fp(
+                &parser,
+                expr_one,
+                "Show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(
+                &parser,
+                expr_two,
+                "Show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            "the interpolated expression is code even under LiteralInsensitive"
+        );
+
+        let text_one: &[u8] =
+            b"class Calc {\n    string Show(int x) { return $\"value {x}\"; }\n}\n";
+        let text_two: &[u8] =
+            b"class Calc {\n    string Show(int x) { return $\"result {x}\"; }\n}\n";
+        assert_eq!(
+            fp(
+                &parser,
+                text_one,
+                "Show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(
+                &parser,
+                text_two,
+                "Show",
+                FingerprintMode::LiteralInsensitive
+            ),
+            "the literal text around the interpolation follows the mode"
+        );
+        assert_ne!(
+            fp(&parser, text_one, "Show", FingerprintMode::Normalized),
+            fp(&parser, text_two, "Show", FingerprintMode::Normalized),
+        );
     }
 }
