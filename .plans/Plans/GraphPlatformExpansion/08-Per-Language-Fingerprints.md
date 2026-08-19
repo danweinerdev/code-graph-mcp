@@ -39,7 +39,7 @@ tasks:
     depends_on: ["8.1"]
   - id: "8.6"
     title: "AST fingerprint override for Java, and the support matrix"
-    status: in-progress
+    status: complete
     justifies: "FR-34, AC-39, NFR-11. Last language plus the documentation that tells an agent which modes work where — without the matrix, an unsupported-mode response reads as a bug rather than a known boundary."
     verification: "cargo test -p code-graph-lang-java fingerprint:: plus cargo test --workspace — LiteralInsensitive returns Some for Java (AC-39); no language returns None for either mode, completing FR-34 across the supported set; CLAUDE.md carries the per-language fingerprint support matrix and the symbol_history description reflects it (NFR-11); make verify passes."
     depends_on: ["8.2", "8.3", "8.4", "8.5"]
@@ -231,12 +231,12 @@ Mechanical. Note that partial classes produce one symbol per declaration, so a f
 ## 8.6: AST fingerprint override for Java, and the support matrix
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `JavaParser` following the 8.1 shape
-- [ ] Confirm no language returns `None` for either mode
-- [ ] Remove the upfront data-independent `literal_insensitive` rejection in `core::history::symbol_history` (it exists solely because no plugin supported the mode — gate artifact 18 follow-up) and align the retained in-walk `None` arm's wording with the guard it becomes (future-language defense, not a phase-8 promise)
-- [ ] Add the per-language fingerprint support matrix to CLAUDE.md
-- [ ] Update the `symbol_history` tool description to state both modes are supported for all six languages
-- [ ] Full workspace verification
+- [x] Implement `fingerprint_symbol` on `JavaParser` following the 8.1 shape
+- [x] Confirm no language returns `None` for either mode
+- [x] Remove the upfront data-independent `literal_insensitive` rejection in `core::history::symbol_history` (it exists solely because no plugin supported the mode — gate artifact 18 follow-up) and align the retained in-walk `None` arm's wording with the guard it becomes (future-language defense, not a phase-8 promise)
+- [x] Add the per-language fingerprint support matrix to CLAUDE.md
+- [x] Update the `symbol_history` tool description to state both modes are supported for all six languages
+- [x] Full workspace verification
 
 ### Notes
 Revision boundary: FR-34 is complete across the supported language set and documented.
@@ -245,9 +245,27 @@ Java's anonymous-class method-name collisions mean two symbols can share an id, 
 
 The support matrix is the deliverable that closes the loop: once every language supports both modes, the unsupported-mode path becomes unreachable in practice, and the documentation should say so rather than leaving agents to discover it.
 
+**What "no language returns `None`" means precisely.** Every plugin answers both modes for every locatable span — the per-language suites pin `LiteralInsensitive` returning `Some` and the history suite drives the live mode end to end. The overrides still return `None` under `LiteralInsensitive` for a span the AST cannot locate (synthesized `[cpp].macro_define_function` symbols, error-recovered regions): that is per-SPAN unavailability, surfaced as a VISIBLE skip naming the mode in the walk's `skipped` list — never a language-level gap and never a silent downgrade to `Normalized` (Design Decision 5). The upfront data-independent rejection is gone; an unknown mode SPELLING is the only remaining mode error.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `784166c9ac0edf4ec5b05eb8e512e88362ba7a55`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:37 matched `784166c9ac0edf4ec5b05eb8e512e88362ba7a55`
+- Focused review: `git show 784166c9ac0edf4ec5b05eb8e512e88362ba7a55`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `784166c9ac0edf4ec5b05eb8e512e88362ba7a55`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-java fingerprint:: && cargo test -p code-graph-tools --test symbol_history` | `.` | PASS (`exit 0`) | `4 Java tests passed (AC-39 string+numeric, AC-38 reformat+Javadoc, operator-change visibility, LiteralInsensitive Some). 13 history tests passed including the reworked mode test: literal_insensitive now walks the transition fixture END TO END (mode echoed, introduced@c1 + modified@c3 — adding a literal is structural so the logic commit stays visible; reformat/move/unrelated commits stay invisible).` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests (all six per-language fingerprint suites: 6+5+4+4+4+4 = 27 tests), tools-list snapshot regenerated for the description change and green, plugin mirrors in sync (AC-27).` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 784166c` | PASS | `6 files: the Java override mirrors the 8.1 shape verbatim; the upfront-rejection removal replaces a hard error with a comment naming the phase-8 state change; the in-walk None arm becomes a per-revision skip whose reason names the mode and language (Decision 5 honored — visible skip, not silent fallback); the tool description and mode arg description state both-modes-supported and reserve the mode error for unknown SPELLINGS; CLAUDE.md's support matrix documents the shared walk plus each plugin's decisions, and both stale 'until phase 8' passages are reconciled.` |
 
 ## Acceptance Criteria
 
