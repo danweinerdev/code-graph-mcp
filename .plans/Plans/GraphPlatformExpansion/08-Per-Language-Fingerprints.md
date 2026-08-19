@@ -10,12 +10,12 @@ deliverable: "AST-backed fingerprint_symbol overrides for all six language plugi
 tasks:
   - id: "8.1"
     title: "AST fingerprint override for C++"
-    status: in-progress
+    status: complete
     justifies: "FR-34, AC-39. C++ goes first because it is the only plugin with a preprocess pass, so it surfaces the interaction between byte-rewriting and AST fingerprinting before five other languages copy a pattern that ignores it."
     verification: "cargo test -p code-graph-lang-cpp fingerprint:: — LiteralInsensitive returns Some for C++; a symbol whose only change is a string or numeric literal yields a changed fingerprint under Normalized and an unchanged one under LiteralInsensitive (AC-39); a reformatted symbol is unchanged under both; a macro-stripped symbol fingerprints consistently across repeated calls."
   - id: "8.2"
     title: "AST fingerprint override for Rust"
-    status: planned
+    status: in-progress
     justifies: "FR-34, AC-39. Rust is the workspace's own language, so its override is the one exercised most often in dogfooding and the first to surface a bad shared abstraction from 8.1."
     verification: "cargo test -p code-graph-lang-rust fingerprint:: — LiteralInsensitive returns Some; literal-only change is invisible under LiteralInsensitive and visible under Normalized (AC-39); a reformatted symbol is unchanged under both; attribute and doc-comment changes behave per the mode."
     depends_on: ["8.1"]
@@ -56,11 +56,11 @@ Depends on phase 6. This phase exists as required rather than opportunistic work
 ## 8.1: AST fingerprint override for C++
 
 ### Subtasks
-- [ ] Implement `fingerprint_symbol` on `CppParser`, locating the symbol's subtree from its line span
-- [ ] Hash `(node_kind, identifier_text)` pairs in a deterministic walk order
-- [ ] Exclude literal node values under `LiteralInsensitive`; include them under `Normalized`
-- [ ] Establish the shared walk shape the other five plugins will follow
-- [ ] Tests per the verification field, including a macro-stripped symbol
+- [x] Implement `fingerprint_symbol` on `CppParser`, locating the symbol's subtree from its line span
+- [x] Hash `(node_kind, identifier_text)` pairs in a deterministic walk order
+- [x] Exclude literal node values under `LiteralInsensitive`; include them under `Normalized`
+- [x] Establish the shared walk shape the other five plugins will follow
+- [x] Tests per the verification field, including a macro-stripped symbol
 
 ### Notes
 Revision boundary: C++ supports both fingerprint modes; the other five still return `None` for `LiteralInsensitive`.
@@ -69,9 +69,27 @@ C++ goes first because it is the only plugin with a `preprocess` pass. The finge
 
 The walk must be deterministic in traversal order, the same discipline as phase 1's community detection: any iteration over a hash-ordered collection reintroduces per-run variation, and the symptom is a cache that never hits rather than an obvious failure.
 
+**How the interaction was settled.** The history walk now passes the SAME bytes the parse saw — the post-`preprocess` form — to `fingerprint_symbol`, and the trait doc states that as the contract (`core/history.rs` passes `&cleaned`; preprocess is byte-preserving, so line spans are identical either way for the text default). The shared walk lives in `code-graph-lang`'s now-public `fingerprint` module (`locate_symbol_node` + `ast_fingerprint`, iterative and recursion-free, enter/exit structure bytes, comments invisible under both modes, literal subtrees contributing kind always and text under `Normalized` only); plugins supply only their literal/comment kind predicates. Span-locate failure degrades per mode: `Normalized` falls back to the text default (continuity for `[cpp].macro_define_function` synthesized symbols), `LiteralInsensitive` returns `None` rather than pretending to know where literals are.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `eb14751edf11325962bfe464a1a81d60024d7c36`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 15:07 matched `eb14751edf11325962bfe464a1a81d60024d7c36`
+- Focused review: `git show eb14751edf11325962bfe464a1a81d60024d7c36`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `eb14751edf11325962bfe464a1a81d60024d7c36`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-lang-cpp fingerprint::` | `.` | PASS (`exit 0`) | `6 tests passed in the fingerprint module: LiteralInsensitive returns Some for C++; string AND numeric literal-only changes are visible under Normalized and invisible under LiteralInsensitive (AC-39); an operator change stays visible under both modes; reformatting and comment-only edits are invisible under both (AC-38); a macro-stripped class fingerprints identically across repeated calls and across parser instances; an unlocatable span degrades per mode (Normalized text fallback, LiteralInsensitive None).` |
+| `cargo test -p code-graph-tools --test symbol_history && cargo test -p code-graph-lang && make verify` | `.` | PASS (`exit 0`) | `13 history integration tests stay green after the cleaned-bytes contract change; 65 lang unit tests green; clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show eb14751` | PASS | `4 files: the shared helpers land in the NFR-02-protected crate using only DefaultHasher + the existing tree-sitter dep; the walk is cursor-iterative (no recursion, no hash-ordered iteration) with enter/exit brackets making sibling regrouping visible; the CppParser override parses content once per call and degrades per mode on locate failure; history.rs's one-line call change carries a comment naming the settled contract; the trait doc states content = the bytes the preceding parse saw.` |
 
 ### Trap
 Re-parsing the whole file per symbol per revision. It is the obvious implementation and it makes history walks quadratic on files with many symbols. Parse once per `(revision, file)` and locate subtrees within that tree; the fingerprint cache from phase 6 then makes repeat queries free.
