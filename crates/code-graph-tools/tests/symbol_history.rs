@@ -488,6 +488,195 @@ async fn symbol_history_cache_populates_and_second_walk_matches() {
     assert_eq!(first, second, "a cache-served walk is answer-identical");
 }
 
+/// Historical extraction runs the indexer's config pipeline: a class that
+/// only parses under `[cpp].macro_strip` has a real history instead of a
+/// silent all-tombstone "no history" (gate artifact 18, finding M1).
+#[tokio::test]
+async fn symbol_history_macro_config_symbols_have_real_history() {
+    let _guard = suite_guard().await;
+    let fixture = GitFixture::init();
+    std::fs::write(
+        fixture.path().join(".code-graph.toml"),
+        "[cpp]\nmacro_strip = [\"CORE_API\"]\n",
+    )
+    .expect("write fixture config");
+    let c1 = fixture.commit_file(
+        "widget.h",
+        "class CORE_API Widget {\npublic:\n    int size() const { return 1; }\n};\n",
+        "introduce macro-prefixed class",
+        "2001-01-01T00:00:00+0000",
+    );
+    let c2 = fixture.commit_file(
+        "widget.h",
+        "class CORE_API Widget {\npublic:\n    int size() const { return 2; }\n};\n",
+        "change the class body",
+        "2001-02-01T00:00:00+0000",
+    );
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(
+            code_graph_lang_cpp::CppParser::new().expect("CppParser::new"),
+        ))
+        .unwrap();
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(
+        GitProvider::open(fixture.path()).expect("fixture is a git working tree"),
+    ))
+    .unwrap();
+    let server = CodeGraphServer::with_vcs_registry(registry, vcs);
+    analyze(&server, fixture.path()).await;
+    let symbol = symbol_id(fixture.path(), "widget.h", "Widget");
+
+    let body = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert_eq!(body["available"], serde_json::json!(true));
+    assert!(
+        body["skipped"].as_array().unwrap().is_empty(),
+        "macro-stripped revisions parse, they are not skips: {body}"
+    );
+    assert_eq!(
+        changes(&body),
+        vec![("introduced".to_string(), c1), ("modified".to_string(), c2)],
+        "a [cpp].macro_strip-dependent symbol has a real history: {body}"
+    );
+}
+
+/// A commit that DELETES the file is an examined absence driving `removed`
+/// — not a skip (gate artifact 18 follow-through on the deletion arc).
+#[tokio::test]
+async fn symbol_history_file_deletion_reports_removed() {
+    let _guard = suite_guard().await;
+    let fixture = GitFixture::init();
+    let c1 = fixture.commit_file(
+        "lib.rs",
+        "pub fn target_function() -> u32 {\n    1\n}\n",
+        "introduce",
+        "2001-01-01T00:00:00+0000",
+    );
+    fixture.git(&["rm", "lib.rs"], None);
+    fixture.git(
+        &["commit", "--no-gpg-sign", "--message", "delete the file"],
+        Some("2001-02-01T00:00:00+0000"),
+    );
+    let c2 = fixture.rev_parse("HEAD");
+    let c3 = fixture.commit_file(
+        "lib.rs",
+        "pub fn target_function() -> u32 {\n    2\n}\n",
+        "restore the file",
+        "2001-03-01T00:00:00+0000",
+    );
+    let server = git_backed_server(fixture.path());
+    analyze(&server, fixture.path()).await;
+    let symbol = symbol_id(fixture.path(), "lib.rs", "target_function");
+
+    let body = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert!(
+        body["skipped"].as_array().unwrap().is_empty(),
+        "a deletion commit is examined absence, never a skip: {body}"
+    );
+    assert_eq!(
+        changes(&body),
+        vec![
+            ("introduced".to_string(), c1),
+            ("removed".to_string(), c2),
+            ("introduced".to_string(), c3),
+        ],
+        "the deletion commit itself carries the removal: {body}"
+    );
+}
+
+/// When every revision older than the first examined one was skipped, an
+/// `introduced` there carries the same boundary uncertainty as a filled
+/// window — `at_window_boundary` says so (gate artifact 18 boundary fix).
+#[tokio::test]
+async fn symbol_history_skipped_oldest_marks_boundary() {
+    use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+
+    struct SkipOldestProvider;
+
+    #[async_trait::async_trait]
+    impl VcsProvider for SkipOldestProvider {
+        fn id(&self) -> &'static str {
+            "skip-oldest"
+        }
+        fn detect(&self, _working_tree: &Path) -> bool {
+            true
+        }
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            // Newest first, per the trait contract.
+            Ok(RevisionWindow {
+                commits: vec![
+                    Commit {
+                        rev: RevId::new("rev-new"),
+                        author: "fixture".to_string(),
+                        timestamp_utc: 1,
+                        summary: "readable".to_string(),
+                    },
+                    Commit {
+                        rev: RevId::new("rev-old"),
+                        author: "fixture".to_string(),
+                        timestamp_utc: 0,
+                        summary: "unreadable".to_string(),
+                    },
+                ],
+                truncated: false,
+            })
+        }
+        async fn read_at(&self, rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            if rev.as_str() == "rev-old" {
+                return Err(VcsError::Operation("simulated unreadable blob".to_string()));
+            }
+            Ok(b"pub fn target_function() -> u32 {\n    1\n}\n".to_vec())
+        }
+        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec))
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(SkipOldestProvider)).unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 {\n    1\n}\n",
+    )
+    .unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let symbol = symbol_id(dir.path(), "lib.rs", "target_function");
+
+    let body = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert_eq!(body["window_filled"], serde_json::json!(false));
+    assert_eq!(body["history_truncated"], serde_json::json!(false));
+    assert_eq!(
+        body["skipped"].as_array().unwrap().len(),
+        1,
+        "the unreadable oldest revision is flagged: {body}"
+    );
+    assert_eq!(
+        changes(&body),
+        vec![("introduced".to_string(), "rev-new".to_string())]
+    );
+    assert_eq!(
+        body["entries"][0]["at_window_boundary"],
+        serde_json::json!(true),
+        "a skipped-away oldest revision leaves the introduction boundary-ambiguous: {body}"
+    );
+}
+
 /// NFR-10: a hung provider delays only the history tool; an unrelated query
 /// completes while the walk is gated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

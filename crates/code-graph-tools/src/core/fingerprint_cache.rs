@@ -57,6 +57,13 @@ pub struct FingerprintKey<'a> {
     /// The symbol kind's wire spelling.
     pub kind: &'a str,
     pub mode: FingerprintMode,
+    /// Identity of the effective [`code_graph_core::RootConfig`]
+    /// (see [`config_identity`]). Extraction is config-dependent — a
+    /// `[cpp].macro_*` or `[extensions]` change alters which symbols parse
+    /// out of the same revision bytes — so entries written under a
+    /// different config must read as misses, exactly like a different
+    /// binary.
+    pub config: u64,
 }
 
 impl FingerprintKey<'_> {
@@ -66,16 +73,31 @@ impl FingerprintKey<'_> {
     /// structurally impossible rather than detected.
     fn stored(&self) -> String {
         format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:016x}\u{1f}{:016x}",
             self.provider,
             self.rev,
             self.relative_path,
             self.symbol_name,
             self.kind,
             mode_key(self.mode),
+            self.config,
             binary_identity(),
         )
     }
+}
+
+/// Identity of the effective config for cache keying. Serialization-based
+/// so it needs no `Hash` impl on `RootConfig` and automatically covers
+/// every future knob; an unserializable config degrades to a constant,
+/// which (like the unreadable-executable arm of [`binary_identity`]) only
+/// widens the invalidation blast radius within one config generation.
+pub fn config_identity(config: &code_graph_core::RootConfig) -> u64 {
+    let Ok(encoded) = serde_json::to_vec(config) else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&encoded);
+    hasher.finish()
 }
 
 fn mode_key(mode: FingerprintMode) -> &'static str {
@@ -162,7 +184,12 @@ impl FingerprintCache {
         if std::fs::create_dir_all(&self.directory).is_err() {
             return;
         }
-        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+        // Process id alone is not enough: two walks in one process writing
+        // the same shard would share a temp path and could publish a torn
+        // file (self-healing, but avoidable for the cost of a counter).
+        static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
         if std::fs::write(&temp, encoded).is_err() {
             return;
         }
@@ -205,6 +232,7 @@ mod tests {
             symbol_name: name,
             kind: "function",
             mode,
+            config: 0,
         }
     }
 
@@ -253,6 +281,35 @@ mod tests {
             cache.get(&key("rev-a", "target", FingerprintMode::LiteralInsensitive)),
             None,
             "a different mode is a different key"
+        );
+        let differently_configured = FingerprintKey {
+            config: 1,
+            ..key("rev-a", "target", FingerprintMode::Normalized)
+        };
+        assert_eq!(
+            cache.get(&differently_configured),
+            None,
+            "a different config is a different key — extraction is \
+             config-dependent, so entries written under another config must \
+             read as misses"
+        );
+    }
+
+    #[test]
+    fn fingerprint_cache_config_identity_tracks_config_content() {
+        use code_graph_core::RootConfig;
+        let default_config = RootConfig::default();
+        let mut stripped = RootConfig::default();
+        stripped.cpp.macro_strip.push("CORE_API".to_string());
+        assert_eq!(
+            config_identity(&default_config),
+            config_identity(&RootConfig::default()),
+            "identity is deterministic for equal configs"
+        );
+        assert_ne!(
+            config_identity(&default_config),
+            config_identity(&stripped),
+            "a [cpp].macro_strip change produces a different identity"
         );
     }
 

@@ -1630,19 +1630,24 @@ impl CodeGraphServer {
                        `mode=\"normalized\"`; changed literals and code are. Matching is \
                        exact, case-sensitive (name, kind): ANY rename — including a case-only \
                        rename — reports as \"removed\" followed by \"introduced\" of the new \
-                       name, never \"modified\". `at_window_boundary: true` on an \
-                       \"introduced\" entry means the symbol was already present at the \
-                       oldest examined revision and older history may exist — raise `window` \
-                       to see further back; `window_filled: true` means more touching \
-                       revisions exist beyond the window; `history_truncated: true` means the \
-                       provider hit its internal examination bound. `skipped` lists revisions \
-                       that could not be read or parsed (historical code may not parse with \
-                       today's grammar); the transition state carries over them. \
-                       `available: false` + `reason` is a SUCCESS (no VCS at the indexed \
-                       root, or no committed history for this path); unknown `symbol` is a \
-                       tool error with did-you-mean suggestions; an unknown or unsupported \
-                       `mode` is a tool error naming the supported spelling. Results are \
-                       cached under .code-graph/fingerprints/, so repeated walks are cheap."
+                       name, never \"modified\". If a file has several symbols with the same \
+                       (name, kind), each revision fingerprints the EARLIEST occurrence \
+                       only. FILE renames are not followed: history stops at the commit that \
+                       created the current path, so a moved file's symbol reports \
+                       \"introduced\" there. A commit deleting the file reports \"removed\". \
+                       `at_window_boundary: true` on an \"introduced\" entry means the symbol \
+                       was already present at the oldest examined revision and older history \
+                       may exist (window filled, provider truncated, or older revisions \
+                       skipped) — raising `window` helps when `window_filled: true`, but \
+                       cannot extend past `history_truncated: true` (the provider's internal \
+                       examination bound). `skipped` lists revisions that could not be read \
+                       or parsed (historical code may not parse with today's grammar); the \
+                       transition state carries over them. `available: false` + `reason` is \
+                       a SUCCESS (no VCS at the indexed root, or no committed history for \
+                       this path); unknown `symbol` is a tool error with did-you-mean \
+                       suggestions; an unknown or unsupported `mode` is a tool error naming \
+                       the supported spelling. Results are cached under \
+                       .code-graph/fingerprints/, so repeated walks are cheap."
     )]
     async fn symbol_history(
         &self,

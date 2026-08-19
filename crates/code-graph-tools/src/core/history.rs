@@ -334,9 +334,10 @@ pub struct SymbolHistoryEntry {
     /// `"introduced"`, `"modified"`, or `"removed"`.
     pub change: &'static str,
     /// `true` only on an `introduced` entry at the window's oldest
-    /// examined revision when older history may exist (the window filled
-    /// or the provider truncated) — the symbol was *present at the window
-    /// boundary*, which is indistinguishable from a genuine introduction.
+    /// examined revision when older history may exist — the window filled,
+    /// the provider truncated, or every older windowed revision was
+    /// skipped — the symbol was *present at the window boundary*, which is
+    /// indistinguishable from a genuine introduction.
     pub at_window_boundary: bool,
 }
 
@@ -420,6 +421,10 @@ enum RevisionInput {
     /// Cache miss: the file's bytes at this revision, fetched via
     /// `read_at` (in memory, FR-35 — no temporary file is ever written).
     Bytes(Vec<u8>),
+    /// The provider reports the path does not exist at this revision —
+    /// typically a commit that DELETED the file. That is an examined
+    /// absence (it drives a `removed` transition), not a skip.
+    Absent,
     /// The revision's bytes could not be read; the walk skips it.
     ReadFailed(String),
 }
@@ -457,6 +462,17 @@ pub async fn symbol_history(
             )))
         }
     };
+    // Rejected up front so the outcome is data-independent: no plugin
+    // supports the mode today, and deferring the check to the walk would
+    // make the same request alternately error or succeed depending on
+    // whether any windowed revision contains the symbol.
+    if mode == FingerprintMode::LiteralInsensitive {
+        return Err(ToolError(
+            "fingerprint mode \"literal_insensitive\" is not supported for any language yet \
+             (per-language overrides arrive in phase 8); use \"normalized\""
+                .to_string(),
+        ));
+    }
     let window = match window {
         None | Some(0) => SYMBOL_HISTORY_DEFAULT_WINDOW,
         Some(requested) => requested.min(SYMBOL_HISTORY_MAX_WINDOW),
@@ -554,6 +570,14 @@ pub async fn symbol_history(
     let provider_id = provider.id().to_string();
     let kind = kind_str(target_kind);
 
+    // Historical extraction must see the same config-driven pipeline the
+    // indexer used (preprocess byte-rewrites + symbol synthesis) — without
+    // it every `[cpp].macro_*`-dependent symbol would silently report an
+    // empty history. The config is part of the cache key for the same
+    // reason (see `FingerprintKey.config`).
+    let config = inner.config.read().clone();
+    let config_id = super::fingerprint_cache::config_identity(&config);
+
     // Async phase: consult the cache, prefetch bytes only for misses. The
     // provider dispatches each read on its own blocking pool.
     let mut inputs: Vec<RevisionInput> = Vec::with_capacity(commits.len());
@@ -565,6 +589,7 @@ pub async fn symbol_history(
             symbol_name: &target_name,
             kind,
             mode,
+            config: config_id,
         };
         if let Some(cached) = cache.get(&key) {
             inputs.push(RevisionInput::Cached(match cached {
@@ -575,6 +600,9 @@ pub async fn symbol_history(
         }
         match provider.read_at(&commit.rev, Path::new(&file)).await {
             Ok(bytes) => inputs.push(RevisionInput::Bytes(bytes)),
+            // The path does not exist at this revision — a deletion commit.
+            // Examined absence, not a skip: it drives `removed`.
+            Err(VcsError::NotFound(_)) => inputs.push(RevisionInput::Absent),
             Err(error) => inputs.push(RevisionInput::ReadFailed(error.to_string())),
         }
     }
@@ -596,6 +624,8 @@ pub async fn symbol_history(
         relative_path,
         provider_id,
         kind,
+        config,
+        config_id,
     })
     .await
 }
@@ -618,6 +648,11 @@ struct WalkArgs {
     relative_path: String,
     provider_id: String,
     kind: &'static str,
+    /// The effective root config: historical parses must run the same
+    /// preprocess + synthesis pipeline the indexer ran.
+    config: code_graph_core::RootConfig,
+    /// [`super::fingerprint_cache::config_identity`] of `config`.
+    config_id: u64,
 }
 
 /// The CPU-bound half of `symbol_history`: parse + fingerprint each cache
@@ -642,6 +677,8 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
             relative_path,
             provider_id,
             kind,
+            config,
+            config_id,
         } = args;
         let Some(plugin) = inner.registry.plugin_for(language) else {
             return Err(ToolError(format!("no parser registered for {language:?}")));
@@ -654,8 +691,24 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
         let mut previous: Option<Option<u64>> = None;
 
         for (commit, input) in commits.iter().zip(inputs) {
+            let key = FingerprintKey {
+                provider: &provider_id,
+                rev: commit.rev.as_str(),
+                relative_path: &relative_path,
+                symbol_name: &target_name,
+                kind,
+                mode,
+                config: config_id,
+            };
             let current: Option<u64> = match input {
                 RevisionInput::Cached(cached) => cached,
+                RevisionInput::Absent => {
+                    // The file does not exist at this revision (deletion
+                    // commit): the symbol is absent, and that absence is as
+                    // cacheable as any parsed tombstone.
+                    cache.put(&key, Cached::Tombstone);
+                    None
+                }
                 RevisionInput::ReadFailed(reason) => {
                     skipped.push(SkippedRevision {
                         rev: commit.rev.to_string(),
@@ -664,9 +717,16 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                     continue;
                 }
                 RevisionInput::Bytes(bytes) => {
+                    // Mirror the indexer's extraction pipeline exactly
+                    // (indexer.rs parse phase): config-driven preprocess
+                    // byte-rewrites feed the parse, and synthesis sees the
+                    // ORIGINAL bytes. Without this, every symbol that only
+                    // extracts under `[cpp].macro_*` config would silently
+                    // report an empty history.
+                    let cleaned = plugin.preprocess(&bytes, &config);
                     // Historical code may not parse with today's grammar —
                     // expected, not exceptional: skip and flag.
-                    let parsed = match plugin.parse_file(Path::new(&file), &bytes) {
+                    let mut parsed = match plugin.parse_file(Path::new(&file), &cleaned) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             skipped.push(SkippedRevision {
@@ -676,6 +736,7 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                             continue;
                         }
                     };
+                    plugin.synthesize_symbols(Path::new(&file), &bytes, &config, &mut parsed);
                     // Exact, case-sensitive (name, kind) — D-0005. Several
                     // matches (overloads) resolve deterministically to the
                     // earliest occurrence.
@@ -684,14 +745,6 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                         .iter()
                         .filter(|s| s.name == target_name && s.kind == target_kind)
                         .min_by_key(|s| (s.line, s.column));
-                    let key = FingerprintKey {
-                        provider: &provider_id,
-                        rev: commit.rev.as_str(),
-                        relative_path: &relative_path,
-                        symbol_name: &target_name,
-                        kind,
-                        mode,
-                    };
                     match found {
                         None => {
                             cache.put(&key, Cached::Tombstone);
@@ -744,9 +797,13 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                 // Present at the window's oldest examined revision with
                 // older history possibly existing: indistinguishable from a
                 // genuine introduction — say so instead of mislabelling.
+                // Skips carry the same uncertainty: when every revision
+                // older than the first examined one was skipped, the symbol
+                // may have existed at the skipped revisions too (`skipped`
+                // holds exactly the pre-first skips at this point).
                 at_window_boundary: first_examined
                     && change == "introduced"
-                    && (window_filled || history_truncated),
+                    && (window_filled || history_truncated || !skipped.is_empty()),
             });
         }
 
