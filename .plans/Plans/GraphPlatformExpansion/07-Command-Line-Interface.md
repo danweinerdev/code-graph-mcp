@@ -3,14 +3,14 @@ title: "Command-Line Interface"
 type: phase
 plan: GraphPlatformExpansion
 phase: 7
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-19
 deliverable: "A code-graph CLI over the typed core, producing payloads identical to the MCP surface and working with or without a daemon."
 tasks:
   - id: "7.1"
     title: "CLI interface design: command surface, output modes, exit statuses"
-    status: planned
+    status: in-progress
     justifies: "FR-19, FR-20. Designs/RepoLocalDaemon Decision 8 deliberately deferred this because designing a command surface against a typed core that did not exist was guesswork; with phase 2 landed the signatures are known and the design is short."
     verification: "A design document exists at Designs/CommandLineInterface with status review or approved, covering: the subcommand surface mapped to typed core functions, the machine-readable output convention, the human-readable default, and the exit-status mapping for success, tool error, and operational failure. Reviewed by plan-reviewer or spec-reviewer with no unresolved Critical or Major findings."
   - id: "7.2"
@@ -62,6 +62,7 @@ Pending — not complete.
 ### Subtasks
 - [ ] Create the `code-graph` binary crate with `clap`, added to the workspace members
 - [ ] Implement subcommands calling `core::` functions directly
+- [ ] Route through `core::` with an HONEST `indexed` flag (gate artifact 17 follow-up: the `pub handlers::*` layer hardcodes `indexed=true` and is an unguarded entry surface — the CLI must not inherit that shortcut; revisit the guard shape here)
 - [ ] Implement daemon attachment reusing phase 3's discovery, with standalone as the fallback
 - [ ] Wire the three phase 1 queries through their `core::` functions — migrated there by phase 2 tasks 2.3 through 2.5 — so AC-33's CLI half is satisfied
 - [ ] Tests for daemon and standalone parity and the unindexed error path
