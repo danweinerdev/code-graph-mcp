@@ -584,7 +584,69 @@ impl LanguagePlugin for GoParser {
     // C++ and Rust plugins; default basename resolver is a no-op for Go's
     // module-path imports, which is the intended behavior).
 
+    /// AST-backed fingerprint (phase 8.3, following the 8.1 shape). Go has
+    /// no `preprocess` pass, so `content` is the raw revision bytes — the
+    /// same bytes `parse_file` saw. Span-locate failure degrades per mode
+    /// exactly as in 8.1: `Normalized` falls back to the text default,
+    /// `LiteralInsensitive` returns `None`.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                go_literal_kind,
+                go_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+
     fn close(&self) {}
+}
+
+/// Literal node kinds for the fingerprint walk (tree-sitter-go v0.25):
+/// values whose CHANGE is invisible under `LiteralInsensitive`. The node
+/// kind still contributes, so adding or removing a literal stays visible
+/// under both modes. `nil`/`true`/`false` are value literals in Go's
+/// grammar; `iota` is an identifier and participates as code.
+fn go_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "interpreted_string_literal"
+            | "raw_string_literal"
+            | "rune_literal"
+            | "int_literal"
+            | "float_literal"
+            | "imaginary_literal"
+            | "true"
+            | "false"
+            | "nil"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38). Go doc
+/// comments are ordinary comments preceding a declaration.
+fn go_comment_kind(kind: &str) -> bool {
+    kind == "comment"
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the Go grammar.
@@ -1295,5 +1357,120 @@ func Helper() {}
             "expected zero Includes edges, got: {:?}",
             fg.edges
         );
+    }
+}
+
+/// Phase 8.3 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-go
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::GoParser;
+
+    fn symbol_in(parser: &GoParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.go"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &GoParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for Go")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = GoParser::new().unwrap();
+        let content = b"package main\n\nfunc Answer() int {\n\treturn 42\n}\n";
+        let symbol = symbol_in(&parser, content, "Answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "Go supports LiteralInsensitive after phase 8.3"
+        );
+    }
+
+    /// AC-39: literal-only changes (string and numeric) are visible under
+    /// Normalized and invisible under LiteralInsensitive.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = GoParser::new().unwrap();
+        let one: &[u8] = b"package main\n\nfunc Greet() string {\n\treturn \"hello\"\n}\n";
+        let two: &[u8] = b"package main\n\nfunc Greet() string {\n\treturn \"goodbye\"\n}\n";
+        assert_ne!(
+            fp(&parser, one, "Greet", FingerprintMode::Normalized),
+            fp(&parser, two, "Greet", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(&parser, one, "Greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "Greet", FingerprintMode::LiteralInsensitive),
+        );
+
+        let three: &[u8] = b"package main\n\nfunc Answer() int {\n\treturn 42\n}\n";
+        let four: &[u8] = b"package main\n\nfunc Answer() int {\n\treturn 43\n}\n";
+        assert_ne!(
+            fp(&parser, three, "Answer", FingerprintMode::Normalized),
+            fp(&parser, four, "Answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "Answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "Answer", FingerprintMode::LiteralInsensitive),
+        );
+    }
+
+    /// AC-38: a gofmt-shaped reformat (argument list broken across lines,
+    /// which REQUIRES a trailing comma in Go) plus a doc comment is
+    /// invisible under both modes.
+    #[test]
+    fn reformat_and_comments_are_invisible_under_both_modes() {
+        let parser = GoParser::new().unwrap();
+        let one: &[u8] =
+            b"package main\n\nfunc Add(left int, right int) int {\n\treturn left + right\n}\n";
+        let two: &[u8] = b"package main\n\n// Add sums the operands.\nfunc Add(\n\tleft int,\n\tright int,\n) int {\n\treturn left + right\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "Add", mode),
+                fp(&parser, two, "Add", mode),
+                "layout, mandatory trailing comma, and comments are not content ({mode:?})"
+            );
+        }
+    }
+
+    /// Code changes stay visible under both modes.
+    #[test]
+    fn code_change_is_visible_under_both_modes() {
+        let parser = GoParser::new().unwrap();
+        let one: &[u8] = b"package main\n\nfunc Calc(x int) int {\n\treturn x + 1\n}\n";
+        let two: &[u8] = b"package main\n\nfunc Calc(x int) int {\n\treturn x * 1\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_ne!(
+                fp(&parser, one, "Calc", mode),
+                fp(&parser, two, "Calc", mode),
+                "operator change is structural ({mode:?})"
+            );
+        }
     }
 }
