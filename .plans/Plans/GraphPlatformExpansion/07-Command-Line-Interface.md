@@ -10,12 +10,12 @@ deliverable: "A code-graph CLI over the typed core, producing payloads identical
 tasks:
   - id: "7.1"
     title: "CLI interface design: command surface, output modes, exit statuses"
-    status: in-progress
+    status: complete
     justifies: "FR-19, FR-20. Designs/RepoLocalDaemon Decision 8 deliberately deferred this because designing a command surface against a typed core that did not exist was guesswork; with phase 2 landed the signatures are known and the design is short."
     verification: "A design document exists at Designs/CommandLineInterface with status review or approved, covering: the subcommand surface mapped to typed core functions, the machine-readable output convention, the human-readable default, and the exit-status mapping for success, tool error, and operational failure. Reviewed by plan-reviewer or spec-reviewer with no unresolved Critical or Major findings."
   - id: "7.2"
     title: "code-graph binary over the typed core"
-    status: planned
+    status: in-progress
     justifies: "FR-17, FR-18, AC-33 (CLI half), AC-40. FR-17's 'no duplicated query logic' is only achievable through the typed core; a CLI parsing JSON back out of CallToolResult would be a second place for response shapes to drift."
     verification: "cargo test -p code-graph-cli — every subcommand calls a core:: function with no rmcp type constructed; the three phase 1 queries are invocable from the CLI, completing AC-33; identical invocations produce identical machine-readable output with and without a running daemon (AC-40, FR-18); a query against an unindexed repository reports the same domain error the MCP surface does."
     depends_on: ["7.1"]
@@ -38,13 +38,13 @@ This phase opens with a design task rather than code — the CLI's interface was
 ## 7.1: CLI interface design: command surface, output modes, exit statuses
 
 ### Subtasks
-- [ ] Read the landed `core::` signatures and enumerate what each subcommand needs
-- [ ] Design the subcommand surface, mapped one-to-one onto core functions
-- [ ] Decide the machine-readable output convention and the human-readable default rendering
-- [ ] Define the exit-status mapping for the three outcome classes
-- [ ] Decide whether the CLI auto-spawns a daemon or only attaches, resolving the plan's open question
-- [ ] Write `Designs/CommandLineInterface/README.md` following the design template
-- [ ] Dispatch a reviewer and address Critical and Major findings
+- [x] Read the landed `core::` signatures and enumerate what each subcommand needs
+- [x] Design the subcommand surface, mapped one-to-one onto core functions
+- [x] Decide the machine-readable output convention and the human-readable default rendering
+- [x] Define the exit-status mapping for the three outcome classes
+- [x] Decide whether the CLI auto-spawns a daemon or only attaches, resolving the plan's open question
+- [x] Write `Designs/CommandLineInterface/README.md` following the design template
+- [x] Dispatch a reviewer and address Critical and Major findings
 
 ### Notes
 Revision boundary: an approved interface design exists; no CLI code is written. The artifact is the deliverable.
@@ -53,9 +53,29 @@ The starting sketch from Designs/RepoLocalDaemon Decision 8: a `--json` flag sel
 
 `ToolOk`'s three outcomes map naturally onto the exit-status classes, and `ToolOk::Text` is the case that needs thought: a mermaid diagram and a non-callable advisory are both text successes but want different human rendering.
 
+**What review changed.** The first review round returned Needs-changes with one Critical and two Majors, all substantive: (1) the "attach-only" claim was false against `daemon.rs` primary sources — the unmodified proxy spawns a detached `--serve` contender whenever no compatible daemon is attachable and runs the replacement protocol (up to hard-kill) against an incompatible one; resolved by specifying a new `--attach-only` proxy mode, scoped into task 7.2. (2) Two landed query tools (`find_overrides`, `find_class_candidates`) were silently dropped and the subcommand arithmetic was wrong; both added, count corrected to 21. (3) The daemon/standalone `indexed` asymmetry (a daemon never loads the cache at startup) created a reachable FR-18 violation; resolved by Decision 7's unindexed-daemon fallback, with the daemon-loads-cache-at-startup alternative recorded as a phase-3-owned follow-up candidate. Second round: Approve-with-minors; the minor (error-table exit codes for the fallback rows) and nits applied; status `approved`.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `e3a4cfdbf1697aeab9652cf03d83439cba7f797b`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 13:58 matched `e3a4cfdbf1697aeab9652cf03d83439cba7f797b`
+- Focused review: independent design review, two rounds (Needs-changes → all Critical/Major findings addressed → Approve-with-minors → minors applied)
+- Reviewed candidate / final: `e3a4cfdbf1697aeab9652cf03d83439cba7f797b`
+- Review result: PASS/Aligned (design status `approved`)
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `git show e3a4cfd --stat` | `.` | PASS | `Designs/CommandLineInterface/README.md exists (434 lines) with status: approved, covering the full task verification surface: 21-subcommand table mapped one-to-one onto core:: functions with landed-signature fidelity (find_overrides Page<CallChain> paging; find_class_candidates bare Vec<SymbolResult>); machine-readable convention (payload-defined, compact serde_json, ToolOk::Text verbatim); human default (one renderer fed from payload JSON); exit-status mapping 0/1/2 with the corrupt-vs-unreadable line drawn on the Graph::load contract.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `design review (independent)` | `two rounds against spec FR-17..20 / AC-11/12/33/40, phase traps, and primary sources (core/mod.rs, handlers/mod.rs tool_success_json, daemon.rs, mmap.rs)` | PASS | `Round 1: Needs-changes — 1 Critical (proxy auto-spawn contradiction), 2 Major (omitted tools; indexed asymmetry), 3 Minor, 1 Nit. All Critical/Major resolved substantively (verified against daemon.rs:723-735/1211-1223, core/query.rs:214, core/structure.rs:390, core/analyze.rs:324/584). Round 2: Approve-with-minors — remaining minor + nits applied (fallback-row exit codes, daemon.rs line count, fixture mechanism naming, watch-divergence observation recorded). No unresolved Critical or Major findings.` |
+
+### Trap
+The design's own first draft walked into it: claiming "attach-only" while delegating attachment to a component whose contract is attach-or-spawn-or-replace. Review against primary sources, not against the summary in another design's decision.
 
 ## 7.2: code-graph binary over the typed core
 
@@ -63,7 +83,8 @@ Pending — not complete.
 - [ ] Create the `code-graph` binary crate with `clap`, added to the workspace members
 - [ ] Implement subcommands calling `core::` functions directly
 - [ ] Route through `core::` with an HONEST `indexed` flag (gate artifact 17 follow-up: the `pub handlers::*` layer hardcodes `indexed=true` and is an unguarded entry surface — the CLI must not inherit that shortcut; revisit the guard shape here)
-- [ ] Implement daemon attachment reusing phase 3's discovery, with standalone as the fallback
+- [ ] Add `--attach-only` proxy mode to `code-graph-mcp` (design Decision 3: attach to a published, compatible, live daemon or serve in-process — never spawn a contender, never initiate the replacement protocol)
+- [ ] Implement daemon attachment by spawning `code-graph-mcp --attach-only` as a child (design Decision 3), with standalone as the fallback and the Decision 7 unindexed-daemon retry
 - [ ] Wire the three phase 1 queries through their `core::` functions — migrated there by phase 2 tasks 2.3 through 2.5 — so AC-33's CLI half is satisfied
 - [ ] Tests for daemon and standalone parity and the unindexed error path
 
