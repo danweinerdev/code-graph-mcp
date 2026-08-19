@@ -752,7 +752,14 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                             None
                         }
                         Some(historical) => {
-                            match plugin.fingerprint_symbol(&bytes, historical, mode) {
+                            // Fingerprint the SAME bytes the parse saw (the
+                            // preprocessed form) — phase 8.1's settled
+                            // contract: the AST overrides re-parse `content`
+                            // to locate the span, and raw-vs-cleaned bytes
+                            // would misalign macro-stripped spans. Preprocess
+                            // is byte-preserving, so line spans are identical
+                            // either way for the text default.
+                            match plugin.fingerprint_symbol(&cleaned, historical, mode) {
                                 Some(fingerprint) => {
                                     cache.put(&key, Cached::Fingerprint(fingerprint));
                                     Some(fingerprint)

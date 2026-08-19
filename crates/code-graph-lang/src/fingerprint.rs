@@ -30,15 +30,13 @@ use std::hash::Hasher;
 
 use code_graph_core::{Language, Symbol};
 
+use crate::FingerprintMode;
+
 /// Fingerprint the symbol's `[line, end_line]` span of `content` in the
 /// `Normalized` mode. Returns `None` when the span does not exist in this
 /// content (line 0, or a start line beyond EOF) — the caller treats that as
 /// "cannot fingerprint here", not as an empty hash.
-pub(crate) fn normalized_fingerprint(
-    content: &[u8],
-    symbol: &Symbol,
-    language: Language,
-) -> Option<u64> {
+pub fn normalized_fingerprint(content: &[u8], symbol: &Symbol, language: Language) -> Option<u64> {
     let span = span_bytes(content, symbol.line, symbol.end_line.max(symbol.line))?;
     let normalized = normalize(span, language);
     let mut hasher = DefaultHasher::new();
@@ -284,6 +282,127 @@ fn char_literal_end(span: &[u8], start: usize) -> Option<usize> {
         consumed += 1;
     }
     (i < span.len() && span[i] == b'\'').then_some(i + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Shared AST fingerprint walk (phase 8, Designs/VcsHistory Decision 5)
+// ---------------------------------------------------------------------------
+//
+// The per-language `fingerprint_symbol` overrides all share one shape: parse
+// the SAME bytes the preceding `parse_file` saw, locate the symbol's subtree
+// from its span, and hash a deterministic pre-order walk of node kinds and
+// leaf texts — comments invisible under both modes, literal VALUES included
+// under `Normalized` and excluded (kind only) under `LiteralInsensitive`.
+// The walk lives here so six plugins share one implementation; each plugin
+// supplies only its literal/comment kind predicates.
+//
+// Determinism discipline (phase-8 plan note): the walk is a tree-cursor
+// pre-order — sibling order comes from the tree, never from a hash-ordered
+// collection — so the same bytes always hash the same. Structure bytes
+// (`(`/`)` on enter/exit) make sibling regrouping visible: `(A (B))` and
+// `(A) (B)` hash differently even when their leaf texts concatenate
+// identically.
+
+/// Locates the AST node for `symbol`'s span in a freshly parsed tree of the
+/// same content the span was extracted from: exact start `(row, column)`
+/// and end-row match, outermost (first in pre-order) named node winning so
+/// wrapper nodes (e.g. `template_declaration`) fingerprint their whole
+/// declaration. Returns `None` when no node matches — synthesized symbols
+/// (`[cpp].macro_define_function`) and heavily error-recovered spans.
+pub fn locate_symbol_node<'t>(
+    root: tree_sitter::Node<'t>,
+    symbol: &Symbol,
+) -> Option<tree_sitter::Node<'t>> {
+    if symbol.line == 0 {
+        return None;
+    }
+    let start_row = symbol.line as usize - 1;
+    let start_column = symbol.column as usize;
+    let end_row = symbol.end_line.max(symbol.line) as usize - 1;
+
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        if node.is_named()
+            && node.start_position().row == start_row
+            && node.start_position().column == start_column
+            && node.end_position().row == end_row
+        {
+            return Some(node);
+        }
+        // Descend only into subtrees that can contain the span start.
+        let contains = node.start_position().row <= start_row && node.end_position().row >= end_row;
+        if contains && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'outer;
+            }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+        }
+    }
+    None
+}
+
+/// Hashes one subtree per the mode. `is_literal` and `is_comment` classify
+/// node KINDS (grammar spellings, e.g. `"string_literal"`, `"comment"`):
+/// a comment subtree is skipped entirely under both modes; a literal
+/// subtree contributes its kind plus (under `Normalized` only) its full
+/// source text; every other leaf contributes its text; every node
+/// contributes its kind and structure brackets.
+pub fn ast_fingerprint(
+    node: tree_sitter::Node<'_>,
+    content: &[u8],
+    mode: FingerprintMode,
+    is_literal: fn(&str) -> bool,
+    is_comment: fn(&str) -> bool,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // Iterative pre-order with explicit enter/exit marks; recursion-free so
+    // pathological nesting cannot overflow the stack.
+    let mut cursor = node.walk();
+    'outer: loop {
+        let current = cursor.node();
+        let kind = current.kind();
+        let mut descend = true;
+        if is_comment(kind) {
+            descend = false; // invisible under both modes
+        } else {
+            hasher.write(b"(");
+            hasher.write(kind.as_bytes());
+            hasher.write(b"\x1f");
+            if is_literal(kind) {
+                if mode == FingerprintMode::Normalized {
+                    hasher.write(&content[current.byte_range()]);
+                }
+                descend = false; // the value (or its absence) is the leaf
+            } else if current.child_count() == 0 {
+                hasher.write(&content[current.byte_range()]);
+            }
+        }
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        if !is_comment(kind) {
+            hasher.write(b")");
+        }
+        loop {
+            if cursor.node().id() == node.id() {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                continue 'outer;
+            }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            hasher.write(b")");
+        }
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]

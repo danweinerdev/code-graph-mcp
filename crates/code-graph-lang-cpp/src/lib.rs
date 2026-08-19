@@ -850,6 +850,79 @@ impl LanguagePlugin for CppParser {
     fn post_index(&self, graphs: &mut [FileGraph], _file_index: &code_graph_lang::FileIndex) {
         extract_overrides_global(graphs);
     }
+
+    /// AST-backed fingerprint (phase 8.1 — the shape the other five
+    /// plugins follow). Parses `content` — which MUST be the same bytes
+    /// the preceding `parse_file` saw, i.e. post-`preprocess` for C++
+    /// (the caller contract settled in phase 8.1: the history walk passes
+    /// the preprocessed bytes, so macro-stripped spans locate correctly) —
+    /// locates the symbol's subtree by its exact span, and hashes the
+    /// shared deterministic walk: comments invisible under both modes,
+    /// literal VALUES included under `Normalized` and excluded under
+    /// `LiteralInsensitive`.
+    ///
+    /// Span-locate failure (synthesized `[cpp].macro_define_function`
+    /// symbols, heavily error-recovered regions) degrades per mode:
+    /// `Normalized` falls back to the text default (behavioral continuity
+    /// with pre-phase-8 fingerprints); `LiteralInsensitive` returns `None`
+    /// — the walk cannot identify literal nodes without a subtree, and
+    /// pretending otherwise would silently re-enable the sensitivity the
+    /// caller asked to drop.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                cpp_literal_kind,
+                cpp_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+}
+
+/// Literal node kinds for the fingerprint walk: values whose CHANGE is
+/// invisible under `LiteralInsensitive`. `true`/`false`/`nullptr` are
+/// value literals too — swapping them is a literal change, not a
+/// structural one (the node kind still contributes, so adding or removing
+/// a literal remains visible under both modes).
+fn cpp_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "raw_string_literal"
+            | "char_literal"
+            | "number_literal"
+            | "user_defined_literal"
+            | "concatenated_string"
+            | "true"
+            | "false"
+            | "nullptr"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38).
+fn cpp_comment_kind(kind: &str) -> bool {
+    kind == "comment"
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the C++ grammar. The
@@ -991,5 +1064,194 @@ mod tests {
         assert_eq!(fg.path, "/tmp/test.cpp");
         assert_eq!(fg.language, Language::Cpp);
         assert!(!fg.symbols.is_empty(), "extraction must populate symbols");
+    }
+}
+
+/// Phase 8.1 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-cpp
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::{RootConfig, Symbol};
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::CppParser;
+
+    /// Parse `content` and return the named symbol plus the plugin, so the
+    /// fingerprint call sees a span located by the same parse pipeline the
+    /// indexer runs.
+    fn symbol_in(parser: &CppParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/fp.cpp"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &CppParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for C++")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = CppParser::new().unwrap();
+        let content = b"int answer() {\n    return 42;\n}\n";
+        let symbol = symbol_in(&parser, content, "answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "C++ supports LiteralInsensitive after phase 8.1"
+        );
+    }
+
+    /// AC-39: a literal-only change is visible under Normalized and
+    /// invisible under LiteralInsensitive — for both string and numeric
+    /// literals.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = CppParser::new().unwrap();
+        let one: &[u8] = b"void greet() {\n    log(\"hello\");\n}\n";
+        let two: &[u8] = b"void greet() {\n    log(\"goodbye\");\n}\n";
+        assert_ne!(
+            fp(&parser, one, "greet", FingerprintMode::Normalized),
+            fp(&parser, two, "greet", FingerprintMode::Normalized),
+            "a string literal change IS a content change under Normalized"
+        );
+        assert_eq!(
+            fp(&parser, one, "greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "greet", FingerprintMode::LiteralInsensitive),
+            "a string literal change is invisible under LiteralInsensitive"
+        );
+
+        let three: &[u8] = b"int answer() {\n    return 42;\n}\n";
+        let four: &[u8] = b"int answer() {\n    return 43;\n}\n";
+        assert_ne!(
+            fp(&parser, three, "answer", FingerprintMode::Normalized),
+            fp(&parser, four, "answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "answer", FingerprintMode::LiteralInsensitive),
+            "a numeric literal change is invisible under LiteralInsensitive"
+        );
+    }
+
+    /// Code changes stay visible under BOTH modes — the insensitivity is
+    /// to literal VALUES, not to structure around them.
+    #[test]
+    fn code_change_is_visible_under_both_modes() {
+        let parser = CppParser::new().unwrap();
+        let one: &[u8] = b"int calc(int x) {\n    return x + 1;\n}\n";
+        let two: &[u8] = b"int calc(int x) {\n    return x * 1;\n}\n";
+        assert_ne!(
+            fp(&parser, one, "calc", FingerprintMode::Normalized),
+            fp(&parser, two, "calc", FingerprintMode::Normalized),
+        );
+        assert_ne!(
+            fp(&parser, one, "calc", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "calc", FingerprintMode::LiteralInsensitive),
+            "operator change is structural, visible even ignoring literals"
+        );
+    }
+
+    /// AC-38: reformatting (line breaks, indentation) and comment-only
+    /// edits are invisible under both modes.
+    #[test]
+    fn reformat_and_comments_are_invisible_under_both_modes() {
+        let parser = CppParser::new().unwrap();
+        let one: &[u8] = b"int add(int a, int b) {\n    return a + b;\n}\n";
+        let two: &[u8] =
+            b"int add(\n    int a,\n    int b\n) {\n    // sum the operands\n    return a + b;\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "add", mode),
+                fp(&parser, two, "add", mode),
+                "layout and comments are not content ({mode:?})"
+            );
+        }
+    }
+
+    /// A macro-stripped symbol (the preprocess pass blanked `CORE_API`)
+    /// fingerprints deterministically across repeated calls and across
+    /// parser instances — the walk sees the SAME preprocessed bytes the
+    /// parse saw (phase 8.1's settled contract).
+    #[test]
+    fn macro_stripped_symbol_fingerprints_deterministically() {
+        let mut config = RootConfig::default();
+        config.cpp.macro_strip.push("CORE_API".to_string());
+        let parser = CppParser::new().unwrap();
+        let raw: &[u8] =
+            b"class CORE_API Widget {\npublic:\n    int size() const { return 1; }\n};\n";
+        let cleaned = parser.preprocess(raw, &config).into_owned();
+
+        let symbol = symbol_in(&parser, &cleaned, "Widget");
+        let first = parser
+            .fingerprint_symbol(&cleaned, &symbol, FingerprintMode::Normalized)
+            .expect("macro-stripped class fingerprints");
+        let second = parser
+            .fingerprint_symbol(&cleaned, &symbol, FingerprintMode::Normalized)
+            .expect("repeat call fingerprints");
+        assert_eq!(first, second, "same bytes, same fingerprint");
+
+        let other_parser = CppParser::new().unwrap();
+        let third = other_parser
+            .fingerprint_symbol(&cleaned, &symbol, FingerprintMode::Normalized)
+            .expect("fresh parser fingerprints");
+        assert_eq!(first, third, "determinism across parser instances");
+
+        assert!(
+            parser
+                .fingerprint_symbol(&cleaned, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "macro-stripped spans locate, so LiteralInsensitive works too"
+        );
+    }
+
+    /// Span-locate failure degrades per mode: Normalized falls back to the
+    /// text default (continuity), LiteralInsensitive reports honestly that
+    /// it cannot identify literals without a subtree.
+    #[test]
+    fn unlocatable_span_degrades_per_mode() {
+        let parser = CppParser::new().unwrap();
+        let content: &[u8] = b"int real() {\n    return 1;\n}\n";
+        let synthetic = Symbol {
+            name: "Ghost_Release".to_string(),
+            kind: code_graph_core::SymbolKind::Function,
+            file: "/tmp/fp.cpp".to_string(),
+            line: 1,
+            column: 99, // no node starts here
+            end_line: 1,
+            signature: "/* synthesized */".to_string(),
+            namespace: String::new(),
+            parent: String::new(),
+            language: code_graph_core::Language::Cpp,
+        };
+        assert!(
+            parser
+                .fingerprint_symbol(content, &synthetic, FingerprintMode::Normalized)
+                .is_some(),
+            "Normalized falls back to the text default"
+        );
+        assert_eq!(
+            parser.fingerprint_symbol(content, &synthetic, FingerprintMode::LiteralInsensitive),
+            None,
+            "LiteralInsensitive cannot pretend to know where literals are"
+        );
     }
 }

@@ -16,7 +16,7 @@
 //! [`SymbolIndex`], [`FileIndex`] carry real fields populated by the
 //! indexer.
 
-mod fingerprint;
+pub mod fingerprint;
 pub mod helpers;
 
 use code_graph_core::{
@@ -370,10 +370,15 @@ pub trait LanguagePlugin: Send + Sync {
     fn parse_file(&self, path: &Path, content: &[u8]) -> Result<FileGraph, ParseError>;
 
     /// Fingerprint one symbol's content for change detection (FR-34,
-    /// Designs/VcsHistory Decision 5). `content` is the raw bytes of the
-    /// file **at the revision being examined** (not necessarily on disk);
-    /// `symbol` carries the span located in that same content by a
-    /// preceding [`Self::parse_file`] call.
+    /// Designs/VcsHistory Decision 5). `content` is the bytes of the file
+    /// **at the revision being examined** (not necessarily on disk), in
+    /// the SAME form the preceding [`Self::parse_file`] call saw — i.e.
+    /// post-[`Self::preprocess`] for languages with a byte-rewriting pass
+    /// (phase 8.1's settled contract: AST overrides re-parse `content` to
+    /// locate the span, and raw-vs-preprocessed bytes would misalign
+    /// macro-stripped spans; `preprocess` is byte-preserving, so line
+    /// spans are identical either way for the text default). `symbol`
+    /// carries the span located in that same content.
     ///
     /// Returns `None` when the mode is not supported for this language —
     /// the default supports [`FingerprintMode::Normalized`] only, via a
