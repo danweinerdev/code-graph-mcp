@@ -3,14 +3,14 @@ title: "Symbol History"
 type: phase
 plan: GraphPlatformExpansion
 phase: 6
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-18
 deliverable: "A symbol_history tool reporting the revisions at which a symbol's content actually changed, with a fingerprint hook on LanguagePlugin and a content-addressed fingerprint cache."
 tasks:
   - id: "6.1"
     title: "LanguagePlugin::fingerprint_symbol hook with a std-only text default"
-    status: planned
+    status: in-progress
     justifies: "FR-34 (Normalized half), NFR-02, AC-38. parse_file returns a FileGraph, not a syntax tree, so there is no way to fingerprint an AST from outside a plugin; the hook is what makes AST overrides possible in phase 8 without leaking tree-sitter across a crate boundary."
     verification: "cargo test -p code-graph-lang fingerprint:: — the default implementation returns an unchanged fingerprint for a symbol whose only change is whitespace or comments (AC-38); LiteralInsensitive returns None from the default rather than silently falling back to Normalized; all six existing plugins compile with no change, proving the hook is additive; cargo tree confirms code-graph-lang gained no third-party dependency (NFR-02)."
   - id: "6.2"
@@ -87,6 +87,7 @@ Pending — not complete.
 
 ### Subtasks
 - [ ] Fetch revisions touching the file, bounded by a documented window
+- [ ] Give `revisions_touching` a truncation signal (gate artifact 15 follow-up: the revwalk cap currently truncates silently; this tool must not consume it blind) and surface it plus the window-filled state on the wire
 - [ ] Walk oldest to newest, computing the fingerprint at each revision
 - [ ] Emit only transitions: `Introduced`, `Modified`, `Removed`
 - [ ] Match the symbol at each revision by exact, case-sensitive `(name, kind)`
