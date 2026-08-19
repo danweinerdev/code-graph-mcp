@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 6
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-18
+updated: 2026-08-19
 deliverable: "A symbol_history tool reporting the revisions at which a symbol's content actually changed, with a fingerprint hook on LanguagePlugin and a content-addressed fingerprint cache."
 tasks:
   - id: "6.1"
@@ -21,7 +21,7 @@ tasks:
     depends_on: ["6.1"]
   - id: "6.3"
     title: "symbol_history tool: transition walk and exact symbol matching"
-    status: in-progress
+    status: complete
     justifies: "FR-33, FR-35, NFR-10, NFR-11, AC-19, AC-20, AC-37, AC-45. Distinguishing a logic change from a reformat is the whole value of the feature; without transition comparison the tool degenerates into git log for a file, which the agent could already get."
     verification: "cargo test -p code-graph-tools symbol_history:: against the phase 5 fixture — a reformat-only commit is not reported while the logic commit is (AC-19); a commit moving the function without changing it is not reported (AC-20); historical bytes are parsed in memory with no temporary file written, asserted by watching the temp directory (AC-37); a case-only rename reports Removed then Introduced, matching the exact-match rule; a large-window call does not delay a concurrent non-history query (NFR-10); the tool description meets the agent-facing lens (AC-45)."
     depends_on: ["6.2"]
@@ -127,15 +127,15 @@ Tombstones matter more than they look. "Not present at this revision" is a real,
 ## 6.3: symbol_history tool: transition walk and exact symbol matching
 
 ### Subtasks
-- [ ] Fetch revisions touching the file, bounded by a documented window
-- [ ] Give `revisions_touching` a truncation signal (gate artifact 15 follow-up: the revwalk cap currently truncates silently; this tool must not consume it blind) and surface it plus the window-filled state on the wire
-- [ ] Walk oldest to newest, computing the fingerprint at each revision
-- [ ] Emit only transitions: `Introduced`, `Modified`, `Removed`
-- [ ] Match the symbol at each revision by exact, case-sensitive `(name, kind)`
-- [ ] Run the whole per-revision loop inside `spawn_blocking`
-- [ ] Report unsupported modes and partial windows explicitly; skip and flag revisions that fail to parse
-- [ ] Register the tool with a description covering the rename behaviour and the window bound
-- [ ] Tests per the verification field
+- [x] Fetch revisions touching the file, bounded by a documented window
+- [x] Give `revisions_touching` a truncation signal (gate artifact 15 follow-up: the revwalk cap currently truncates silently; this tool must not consume it blind) and surface it plus the window-filled state on the wire
+- [x] Walk oldest to newest, computing the fingerprint at each revision
+- [x] Emit only transitions: `Introduced`, `Modified`, `Removed`
+- [x] Match the symbol at each revision by exact, case-sensitive `(name, kind)`
+- [x] Run the whole per-revision loop inside `spawn_blocking`
+- [x] Report unsupported modes and partial windows explicitly; skip and flag revisions that fail to parse
+- [x] Register the tool with a description covering the rename behaviour and the window bound
+- [x] Tests per the verification field
 
 ### Notes
 Revision boundary: the second history feature is live end to end.
@@ -148,7 +148,23 @@ Historical code may not parse with today's grammar. That is expected, not except
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `07b10d3e238821dc78c249359cf2c80657040f56`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 12:35 matched `07b10d3e238821dc78c249359cf2c80657040f56`
+- Focused review: `git show 07b10d3e238821dc78c249359cf2c80657040f56`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `07b10d3e238821dc78c249359cf2c80657040f56`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools --test symbol_history` | `.` | PASS (`exit 0`) | `9 tests passed: transitions-only over the reformat/move fixture (AC-19, AC-20); no-temp-file watch during a walk (AC-37); removed-then-reintroduced double transition; case-only rename reports removed + introduced under exact (name, kind) matching (D-0005); window boundary labelled at_window_boundary and a 9999 request clamps to 500; unavailability (no VCS, untracked file) is a SUCCESS shape with available: false + reason (FR-36); unknown and unsupported modes are tool errors naming "normalized"; a second identical walk is served from the fingerprint sidecar and matches byte-for-byte; a gated slow provider delays only history tools while a concurrent search_symbols completes first (NFR-10).` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings clean (suite mutex switched to tokio::sync::Mutex to satisfy await_holding_lock); fmt clean; full workspace tests green including the 24->25 tool-count assertions in smoke/daemon_serve/daemon_proxy/server unit tests and the new tools-list snapshot; no pending snapshots; plugin mirrors in sync.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 07b10d3` | PASS | `13 files: RevisionWindow trait change (vcs + vcs-git + all test doubles, truncation flagged at MAX_REVWALK_COMMITS with a comment distinguishing provider truncation from a filled caller limit); core walk in core/history.rs (async cache-consult + read_at prefetch phase, then one spawn_blocking for the CPU-bound parse+fingerprint loop); handler adapter takes Arc<ServerInner> (registry needed inside the 'static closure — core::analyze precedent); #[tool] description covers rename behaviour, window bound, and every response field (AC-45 lens); transition trichotomy guards correct (before is None on the first examined revision, so the !first_examined guards are belt-and-braces, not load-bearing); tombstones and fingerprints both written back to the cache; LiteralInsensitive never silently falls back to Normalized.` |
 
 ### Trap
 Reporting every revision returned by `revisions_touching`. That is `git log -- <file>`, which the agent can already get and which answers a different question. The tool's entire value is the comparison step that drops revisions where the symbol did not change.
