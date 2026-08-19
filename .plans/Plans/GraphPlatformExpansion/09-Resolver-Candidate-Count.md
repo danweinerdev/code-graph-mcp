@@ -10,12 +10,12 @@ deliverable: "Edges record how many same-named candidates competed for their tar
 tasks:
   - id: "9.1"
     title: "Record candidate count on the edge and bump the cache format"
-    status: in-progress
+    status: complete
     justifies: "FR-48, AC-57, D-0007. Confidence::Heuristic is a one-bit projection of 'N candidates competed'. The resolver knows N at the moment it picks, and then throws it away — so the information a caller needs to disambiguate is destroyed at index time and cannot be recovered by any downstream change."
-    verification: "cargo test -p code-graph-graph persist:: and cargo test -p code-graph-lang resolve:: — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
+    verification: "cargo test -p code-graph-graph persist and cargo test -p code-graph-lang resolve (substring filters — the suites live in in-file tests modules, so a module-path :: filter would select zero; wording corrected at completion per the phase-6/7 filter-drift lesson) — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
   - id: "9.2"
     title: "Surface candidate count on the edge-reporting tools"
-    status: planned
+    status: in-progress
     justifies: "FR-48, AC-57. Storing the count without exposing it satisfies nothing — AC-57 requires a caller to distinguish 'one candidate, unambiguous' from 'five candidates, one picked by scope rule' without another query."
     verification: "cargo test -p code-graph-tools — get_callers, get_callees, find_path, and generate_diagram each expose the count on the edges they report; a caller can tell a 1-candidate edge from an N-candidate one in a single response (AC-57); existing response snapshots are rebaselined deliberately and the change is additive, so a client reading only today's fields still parses."
     depends_on: ["9.1"]
@@ -40,11 +40,11 @@ Independent of every other phase except its own ordering; `depends_on: [1]` only
 ## 9.1: Record candidate count on the edge and bump the cache format
 
 ### Subtasks
-- [ ] Capture the candidate count in the resolver at the point the target is chosen
-- [ ] Add the count to the edge record and to its packed representation
-- [ ] Bump `CACHE_VERSION`; confirm the existing version-mismatch path silently re-indexes rather than misreading
-- [ ] Round-trip tests through save/load
-- [ ] Decide and document what the count is for a declarative edge (Inherits, Overrides, `mod`-resolved Includes) — these have exactly one candidate by construction
+- [x] Capture the candidate count in the resolver at the point the target is chosen
+- [x] Add the count to the edge record and to its packed representation
+- [x] Bump `CACHE_VERSION`; confirm the existing version-mismatch path silently re-indexes rather than misreading
+- [x] Round-trip tests through save/load
+- [x] Decide and document what the count is for a declarative edge (Inherits, Overrides, `mod`-resolved Includes) — these have exactly one candidate by construction
 
 ### Notes
 Revision boundary: edges carry the count and it survives the cache; nothing exposes it yet.
@@ -53,9 +53,27 @@ This is the only task in the plan that changes the cache format. That is accepte
 
 `Confidence` is `#[non_exhaustive]` specifically to allow future resolution variants. Consider whether the count belongs *in* the enum's `Heuristic` variant or as a sibling field — a count of 1 alongside `Resolved` is meaningful and uniform, which argues for a sibling field.
 
+**Decisions made at implementation.** (1) Sibling field, as the note argues: `candidates: u32` on `Edge`, `EdgeEntry`, and `PackedEdge`. (2) Declarative edges are `1` by construction — parse-time edges carry a provisional `1` and only the resolve pass overwrites call/include edges; the Rust `mod`-decl override returns `Resolved`/1 unconditionally. (3) A suffix-disambiguated include reports the REAL N with `Confidence::Resolved` — the count says how contested the name was, the confidence says whether the pick was structural; the two axes are deliberately independent. (4) The resolver signatures (`resolve_call`/`resolve_include`, trait + defaults + overrides) widened to carry the count, and BOTH resolve paths (analyze-path indexer loop, watch-path inline resolver) stamp it. (5) serde defaults (1) exist for hand-written fixtures only; cache safety is the v11 bump — the trap's default-instead-of-bump failure is explicitly rejected in the field docs.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `a8d1e2afae7d3b33194009d366e72de75aed0a3a`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 16:36 matched `a8d1e2afae7d3b33194009d366e72de75aed0a3a`
+- Focused review: `git show a8d1e2afae7d3b33194009d366e72de75aed0a3a`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `a8d1e2afae7d3b33194009d366e72de75aed0a3a`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-graph persist && cargo test -p code-graph-lang` | `.` | PASS (`exit 0`) | `29 persist tests passed including the new round_trip_preserves_candidate_count (a NON-default count of 3 survives save/load in both adjacency directions — a default-riding pass could not distinguish persisted from reconstructed) and the pre-existing load_version_mismatch_returns_false covering the pre-v11 silent re-index. 65 lang tests passed with the resolver suites now asserting count 1 for sole-candidate picks, 2 for contested picks, and 2 for suffix-disambiguated includes (Resolved + real N).` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green after the trait-signature change rippled through both resolve paths and all six plugins.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show a8d1e2a` | PASS | `20 files: the count is captured at the resolver's pick site (the only moment it exists — the comment names FR-48/D-0007); CACHE_VERSION 10->11 with a history entry explaining why defaulting is rejected (the phase trap); the two merge sites copy the count into both adjacency directions; every construction site carries an explicit count (1 for parse-time/declarative, real N in resolver tests); no wire surface changed — 9.2 owns that.` |
 
 ### Trap
 Defaulting the count to 0 or 1 for edges written before the bump, to avoid the version change. That silently makes "unambiguous" indistinguishable from "unknown" for every pre-existing cache, which is exactly the failure the count exists to prevent. Bump the version and re-index.
