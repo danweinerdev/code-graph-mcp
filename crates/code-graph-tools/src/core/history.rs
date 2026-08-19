@@ -463,17 +463,13 @@ pub async fn symbol_history(
             )))
         }
     };
-    // Rejected up front so the outcome is data-independent: no plugin
-    // supports the mode today, and deferring the check to the walk would
-    // make the same request alternately error or succeed depending on
-    // whether any windowed revision contains the symbol.
-    if mode == FingerprintMode::LiteralInsensitive {
-        return Err(ToolError(
-            "fingerprint mode \"literal_insensitive\" is not supported for any language yet \
-             (per-language overrides arrive in phase 8); use \"normalized\""
-                .to_string(),
-        ));
-    }
+    // Phase 8 removed the upfront `literal_insensitive` rejection: every
+    // shipped language plugin carries an AST override supporting both
+    // modes, so the mode flows through. Per-span unavailability (an
+    // unlocatable span — synthesized symbols, error-recovered regions — or
+    // a hypothetical future plugin without an override) surfaces as a
+    // VISIBLE skip in the walk, never as a silent fallback to Normalized
+    // (Designs/VcsHistory Decision 5).
     let window = match window {
         None | Some(0) => SYMBOL_HISTORY_DEFAULT_WINDOW,
         Some(requested) => requested.min(SYMBOL_HISTORY_MAX_WINDOW),
@@ -765,13 +761,25 @@ async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse
                                     Some(fingerprint)
                                 }
                                 None if mode == FingerprintMode::LiteralInsensitive => {
-                                    // Never silently fall back to Normalized
-                                    // (Designs/VcsHistory Decision 5).
-                                    return Err(ToolError(format!(
-                                        "fingerprint mode \"literal_insensitive\" is not \
-                                         supported for {language:?} yet (per-language \
-                                         overrides arrive in phase 8); use \"normalized\""
-                                    )));
+                                    // Post-phase-8 this arm is per-SPAN
+                                    // unavailability (unlocatable span:
+                                    // synthesized symbols, error-recovered
+                                    // regions) or a future plugin without an
+                                    // AST override. A VISIBLE skip — never a
+                                    // silent fallback to Normalized
+                                    // (Designs/VcsHistory Decision 5): the
+                                    // revision lands in `skipped` with the
+                                    // mode named, and the transition state
+                                    // carries over it.
+                                    skipped.push(SkippedRevision {
+                                        rev: commit.rev.to_string(),
+                                        reason: format!(
+                                            "span not fingerprintable under mode \
+                                             \"literal_insensitive\" at this revision \
+                                             ({language:?})"
+                                        ),
+                                    });
+                                    continue;
                                 }
                                 None => {
                                     skipped.push(SkippedRevision {

@@ -954,9 +954,10 @@ pub struct SymbolHistoryArgs {
     #[schemars(
         description = "Fingerprint sensitivity: \"normalized\" (default — formatting- and \
                        comment-insensitive; literal values count as changes) or \
-                       \"literal_insensitive\" (additionally ignores literal values; not yet \
-                       supported for any language — requesting it is a tool error until the \
-                       per-language overrides land)."
+                       \"literal_insensitive\" (additionally ignores literal VALUES — a \
+                       changed string/number/char/bool is not a transition; adding or \
+                       removing one, or any code change, still is). Both modes are supported \
+                       for all six languages via AST-backed fingerprints."
     )]
     pub mode: Option<String>,
     #[schemars(
@@ -1645,9 +1646,11 @@ impl CodeGraphServer {
                        transition state carries over them. `available: false` + `reason` is \
                        a SUCCESS (no VCS at the indexed root, or no committed history for \
                        this path); unknown `symbol` is a tool error with did-you-mean \
-                       suggestions; an unknown or unsupported `mode` is a tool error naming \
-                       the supported spelling. Results are cached under \
-                       .code-graph/fingerprints/, so repeated walks are cheap."
+                       suggestions; an unknown `mode` spelling is a tool error naming the \
+                       supported spellings (both modes work for all six languages — a span \
+                       that cannot be fingerprinted under the requested mode at some \
+                       revision lands in `skipped`, never silently downgrades). Results are \
+                       cached under .code-graph/fingerprints/, so repeated walks are cheap."
     )]
     async fn symbol_history(
         &self,

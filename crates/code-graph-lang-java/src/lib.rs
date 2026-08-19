@@ -788,7 +788,74 @@ impl LanguagePlugin for JavaParser {
     // is a no-op for Java's dotted package `import` paths, which is the
     // intended behavior).
 
+    /// AST-backed fingerprint (phase 8.6, following the 8.1 shape). Java
+    /// has no `preprocess` pass, so `content` is the raw revision bytes.
+    /// Java has no string interpolation, so whole string literals are
+    /// safe literal nodes (no token-level split needed). Anonymous-class
+    /// method-name collisions (two symbols sharing an ID, disambiguated
+    /// by line) fingerprint independently and correctly — the span, not
+    /// the ID, drives the walk; the phase-6 `(name, kind)` matcher's
+    /// earliest-occurrence pick is the documented exact-match limitation,
+    /// not a fingerprint defect.
+    fn fingerprint_symbol(
+        &self,
+        content: &[u8],
+        symbol: &code_graph_core::Symbol,
+        mode: code_graph_lang::FingerprintMode,
+    ) -> Option<u64> {
+        let Ok(tree) = parse_tree(&self.language, content) else {
+            return match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            };
+        };
+        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
+            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
+                node,
+                content,
+                mode,
+                java_literal_kind,
+                java_comment_kind,
+            )),
+            None => match mode {
+                code_graph_lang::FingerprintMode::Normalized => {
+                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
+                }
+                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
+            },
+        }
+    }
+
     fn close(&self) {}
+}
+
+/// Literal node kinds for the fingerprint walk (tree-sitter-java v0.23):
+/// values whose CHANGE is invisible under `LiteralInsensitive`. The node
+/// kind still contributes, so adding or removing a literal stays visible
+/// under both modes.
+fn java_literal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "character_literal"
+            | "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+            | "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "true"
+            | "false"
+            | "null_literal"
+    )
+}
+
+/// Comment node kinds: invisible under both modes (AC-38). Javadoc
+/// (`/** */`) parses as `block_comment` in this grammar.
+fn java_comment_kind(kind: &str) -> bool {
+    matches!(kind, "line_comment" | "block_comment")
 }
 
 /// Build a tree-sitter [`TsTree`] for `content` against the Java grammar.
@@ -2918,5 +2985,119 @@ class Outer {
         let fg = parse("");
         let edges = inherits(&fg);
         assert!(edges.is_empty(), "got: {:?}", edges);
+    }
+}
+
+/// Phase 8.6 AST fingerprint tests. Module named `fingerprint` so the
+/// phase verification filter `cargo test -p code-graph-lang-java
+/// fingerprint::` selects exactly this suite.
+#[cfg(test)]
+mod fingerprint {
+    use std::path::Path;
+
+    use code_graph_core::Symbol;
+    use code_graph_lang::{FingerprintMode, LanguagePlugin};
+
+    use crate::JavaParser;
+
+    fn symbol_in(parser: &JavaParser, content: &[u8], name: &str) -> Symbol {
+        let fg = parser
+            .parse_file(Path::new("/tmp/Fp.java"), content)
+            .expect("fixture parses");
+        fg.symbols
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("fixture must extract {name}"))
+    }
+
+    fn fp(parser: &JavaParser, content: &[u8], name: &str, mode: FingerprintMode) -> u64 {
+        let symbol = symbol_in(parser, content, name);
+        parser
+            .fingerprint_symbol(content, &symbol, mode)
+            .expect("mode supported for Java")
+    }
+
+    #[test]
+    fn literal_insensitive_returns_some() {
+        let parser = JavaParser::new().unwrap();
+        let content = b"class Calc {\n    int answer() { return 42; }\n}\n";
+        let symbol = symbol_in(&parser, content, "answer");
+        assert!(
+            parser
+                .fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive)
+                .is_some(),
+            "Java supports LiteralInsensitive after phase 8.6"
+        );
+    }
+
+    /// AC-39: literal-only changes (string and numeric) are visible under
+    /// Normalized and invisible under LiteralInsensitive.
+    #[test]
+    fn literal_only_change_tracks_the_mode() {
+        let parser = JavaParser::new().unwrap();
+        let one: &[u8] = b"class Calc {\n    String greet() { return \"hello\"; }\n}\n";
+        let two: &[u8] = b"class Calc {\n    String greet() { return \"goodbye\"; }\n}\n";
+        assert_ne!(
+            fp(&parser, one, "greet", FingerprintMode::Normalized),
+            fp(&parser, two, "greet", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(&parser, one, "greet", FingerprintMode::LiteralInsensitive),
+            fp(&parser, two, "greet", FingerprintMode::LiteralInsensitive),
+        );
+
+        let three: &[u8] = b"class Calc {\n    int answer() { return 42; }\n}\n";
+        let four: &[u8] = b"class Calc {\n    int answer() { return 43; }\n}\n";
+        assert_ne!(
+            fp(&parser, three, "answer", FingerprintMode::Normalized),
+            fp(&parser, four, "answer", FingerprintMode::Normalized),
+        );
+        assert_eq!(
+            fp(
+                &parser,
+                three,
+                "answer",
+                FingerprintMode::LiteralInsensitive
+            ),
+            fp(&parser, four, "answer", FingerprintMode::LiteralInsensitive),
+        );
+    }
+
+    /// AC-38: reformatting and comments (Javadoc included) are invisible
+    /// under both modes.
+    #[test]
+    fn reformat_and_comments_are_invisible_under_both_modes() {
+        let parser = JavaParser::new().unwrap();
+        let one: &[u8] =
+            b"class Calc {\n    int add(int left, int right) { return left + right; }\n}\n";
+        let two: &[u8] = b"class Calc {\n    /** Sums the operands. */\n    int add(\n        int left,\n        int right\n    )\n    {\n        return left + right;\n    }\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, one, "add", mode),
+                fp(&parser, two, "add", mode),
+                "layout and Javadoc are not content ({mode:?})"
+            );
+        }
+    }
+
+    /// Code changes stay visible under both modes.
+    #[test]
+    fn code_change_is_visible_under_both_modes() {
+        let parser = JavaParser::new().unwrap();
+        let one: &[u8] = b"class Calc {\n    int calc(int x) { return x + 1; }\n}\n";
+        let two: &[u8] = b"class Calc {\n    int calc(int x) { return x * 1; }\n}\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_ne!(
+                fp(&parser, one, "calc", mode),
+                fp(&parser, two, "calc", mode),
+                "operator change is structural ({mode:?})"
+            );
+        }
     }
 }

@@ -422,11 +422,14 @@ async fn symbol_history_unavailability_is_success_shaped() {
     );
 }
 
-/// Unknown and unsupported modes are tool errors that name the way out.
+/// Unknown modes are tool errors that name the way out;
+/// `literal_insensitive` is a WORKING mode after phase 8 (every language
+/// plugin carries an AST override) — the walk succeeds end to end and the
+/// resolved mode is echoed.
 #[tokio::test]
 async fn symbol_history_mode_errors_name_the_supported_spelling() {
     let _guard = suite_guard().await;
-    let (fixture, _) = transition_fixture();
+    let (fixture, [c1, _c2, c3, _c4, _c5]) = transition_fixture();
     let server = git_backed_server(fixture.path());
     analyze(&server, fixture.path()).await;
     let symbol = symbol_id(fixture.path(), "lib.rs", "target_function");
@@ -439,12 +442,18 @@ async fn symbol_history_mode_errors_name_the_supported_spelling() {
         first_text(&bogus)
     );
 
-    let unsupported = call_history(&server, &symbol, Some("literal_insensitive"), None).await;
-    assert_eq!(unsupported.is_error, Some(true));
-    let message = first_text(&unsupported);
-    assert!(
-        message.contains("not") && message.contains("supported") && message.contains("normalized"),
-        "the unsupported mode is reported, never silently downgraded: {message}"
+    // Phase 8: literal_insensitive flows through. The fixture's logic
+    // commit (c3) ADDS a `+ 1` expression — adding a literal is a
+    // structural change (the node appears), so it stays a transition even
+    // under the literal-insensitive mode; the reformat (c2), move (c4),
+    // and unrelated (c5) commits stay invisible.
+    let body = ok_json(&call_history(&server, &symbol, Some("literal_insensitive"), None).await);
+    assert_eq!(body["available"], serde_json::json!(true));
+    assert_eq!(body["mode"], serde_json::json!("literal_insensitive"));
+    assert_eq!(
+        changes(&body),
+        vec![("introduced".to_string(), c1), ("modified".to_string(), c3)],
+        "the AST walk answers under literal_insensitive: {body}"
     );
 }
 
