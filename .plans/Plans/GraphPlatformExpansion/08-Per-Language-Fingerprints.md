@@ -3,14 +3,14 @@ title: "Per-Language Fingerprints"
 type: phase
 plan: GraphPlatformExpansion
 phase: 8
-status: planned
+status: in-progress
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-19
 deliverable: "AST-backed fingerprint_symbol overrides for all six language plugins, completing LiteralInsensitive support across the supported language set."
 tasks:
   - id: "8.1"
     title: "AST fingerprint override for C++"
-    status: planned
+    status: in-progress
     justifies: "FR-34, AC-39. C++ goes first because it is the only plugin with a preprocess pass, so it surfaces the interaction between byte-rewriting and AST fingerprinting before five other languages copy a pattern that ignores it."
     verification: "cargo test -p code-graph-lang-cpp fingerprint:: — LiteralInsensitive returns Some for C++; a symbol whose only change is a string or numeric literal yields a changed fingerprint under Normalized and an unchanged one under LiteralInsensitive (AC-39); a reformatted symbol is unchanged under both; a macro-stripped symbol fingerprints consistently across repeated calls."
   - id: "8.2"
@@ -81,6 +81,7 @@ Re-parsing the whole file per symbol per revision. It is the obvious implementat
 ### Subtasks
 - [ ] Implement `fingerprint_symbol` on `RustParser` following the 8.1 shape
 - [ ] Decide and document how attributes and doc comments participate in each mode
+- [ ] Pin that the AST walk supersedes the text default's lifetime-list mis-lex (gate artifact 18 follow-up: `<'a,'b>` vs `<'a, 'b>` hash differently under the text default — a rustfmt-only commit reported `modified`; the AST walk must hash them equal under both modes)
 - [ ] Tests per the verification field
 
 ### Notes
@@ -145,6 +146,7 @@ Pending — not complete.
 ### Subtasks
 - [ ] Implement `fingerprint_symbol` on `JavaParser` following the 8.1 shape
 - [ ] Confirm no language returns `None` for either mode
+- [ ] Remove the upfront data-independent `literal_insensitive` rejection in `core::history::symbol_history` (it exists solely because no plugin supported the mode — gate artifact 18 follow-up) and align the retained in-walk `None` arm's wording with the guard it becomes (future-language defense, not a phase-8 promise)
 - [ ] Add the per-language fingerprint support matrix to CLAUDE.md
 - [ ] Update the `symbol_history` tool description to state both modes are supported for all six languages
 - [ ] Full workspace verification
