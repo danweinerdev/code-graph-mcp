@@ -15,13 +15,13 @@ tasks:
     verification: "A design document exists at Designs/CommandLineInterface with status review or approved, covering: the subcommand surface mapped to typed core functions, the machine-readable output convention, the human-readable default, and the exit-status mapping for success, tool error, and operational failure. Reviewed by plan-reviewer or spec-reviewer with no unresolved Critical or Major findings."
   - id: "7.2"
     title: "code-graph binary over the typed core"
-    status: in-progress
+    status: complete
     justifies: "FR-17, FR-18, AC-33 (CLI half), AC-40. FR-17's 'no duplicated query logic' is only achievable through the typed core; a CLI parsing JSON back out of CallToolResult would be a second place for response shapes to drift."
     verification: "cargo test -p code-graph-cli — every subcommand calls a core:: function with no rmcp type constructed; the three phase 1 queries are invocable from the CLI, completing AC-33; identical invocations produce identical machine-readable output with and without a running daemon (AC-40, FR-18); a query against an unindexed repository reports the same domain error the MCP surface does."
     depends_on: ["7.1"]
   - id: "7.3"
     title: "Output parity and exit-status behaviour"
-    status: planned
+    status: in-progress
     justifies: "FR-19, FR-20, AC-11, AC-12. Payload parity is the property that makes the CLI trustworthy for scripting; without per-shape coverage a divergence in one envelope type would go unnoticed until someone depended on it."
     verification: "cargo test -p code-graph-cli parity:: — machine-readable output equals the MCP payload for one query of each distinct shape: a Page envelope (get_callers), a non-Page tree (get_class_hierarchy), a flattened envelope with a conditional field (search_symbols, both with and without suggestions), a dual-page response (get_coupling direction=both), and a non-JSON body (generate_diagram format=mermaid) (AC-11); exit status distinguishes success, an unknown-symbol tool error, and an operational failure such as an unreadable cache (AC-12)."
     depends_on: ["7.2"]
@@ -80,13 +80,13 @@ The design's own first draft walked into it: claiming "attach-only" while delega
 ## 7.2: code-graph binary over the typed core
 
 ### Subtasks
-- [ ] Create the `code-graph` binary crate with `clap`, added to the workspace members
-- [ ] Implement subcommands calling `core::` functions directly
-- [ ] Route through `core::` with an HONEST `indexed` flag (gate artifact 17 follow-up: the `pub handlers::*` layer hardcodes `indexed=true` and is an unguarded entry surface — the CLI must not inherit that shortcut; revisit the guard shape here)
-- [ ] Add `--attach-only` proxy mode to `code-graph-mcp` (design Decision 3: attach to a published, compatible, live daemon or serve in-process — never spawn a contender, never initiate the replacement protocol)
-- [ ] Implement daemon attachment by spawning `code-graph-mcp --attach-only` as a child (design Decision 3), with standalone as the fallback and the Decision 7 unindexed-daemon retry
-- [ ] Wire the three phase 1 queries through their `core::` functions — migrated there by phase 2 tasks 2.3 through 2.5 — so AC-33's CLI half is satisfied
-- [ ] Tests for daemon and standalone parity and the unindexed error path
+- [x] Create the `code-graph` binary crate with `clap`, added to the workspace members
+- [x] Implement subcommands calling `core::` functions directly
+- [x] Route through `core::` with an HONEST `indexed` flag (gate artifact 17 follow-up: the `pub handlers::*` layer hardcodes `indexed=true` and is an unguarded entry surface — the CLI must not inherit that shortcut; revisit the guard shape here)
+- [x] Add `--attach-only` proxy mode to `code-graph-mcp` (design Decision 3: attach to a published, compatible, live daemon or serve in-process — never spawn a contender, never initiate the replacement protocol)
+- [x] Implement daemon attachment by spawning `code-graph-mcp --attach-only` as a child (design Decision 3), with standalone as the fallback and the Decision 7 unindexed-daemon retry
+- [x] Wire the three phase 1 queries through their `core::` functions — migrated there by phase 2 tasks 2.3 through 2.5 — so AC-33's CLI half is satisfied
+- [x] Tests for daemon and standalone parity and the unindexed error path
 
 ### Notes
 Revision boundary: the CLI answers queries end to end in both modes.
@@ -97,7 +97,23 @@ The CLI must not construct an rmcp type anywhere. If a subcommand finds itself d
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-19
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `43f1e0092ffdfb0f343278ba90bd7f59a3321eb6`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-19 14:24 matched `43f1e0092ffdfb0f343278ba90bd7f59a3321eb6`
+- Focused review: `git show 43f1e0092ffdfb0f343278ba90bd7f59a3321eb6`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `43f1e0092ffdfb0f343278ba90bd7f59a3321eb6`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-cli` | `.` | PASS (`exit 0`) | `5 integration tests passed: the three phase-1 queries invocable via the CLI with parsing machine payloads (AC-33 CLI half); exit statuses separate the three outcome classes including the byte-exact unindexed domain error computed from the core guard and the directory-shaped-cache operational fixture; the no-rmcp/no-handlers structural guard; AC-40 byte-identity with and without a daemon including the Decision 7 unindexed-daemon window; attach-only on stale metadata answers byte-identically and leaves no daemon.lock behind.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings clean across the workspace including the new crate; fmt clean; full workspace tests green; no pending snapshots; plugin mirrors in sync.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `focused diff review` | `git show 43f1e00` | PASS | `13 files: the new crate (args/exec/daemon_client/main — no rmcp dependency, no handlers import, #![forbid(unsafe_code)]); proxy_attach_only in daemon.rs reuses the full proxy's helpers with the same post-connect owner revalidation, fails fast on the outcomes retrying cannot change, and contains no spawn_contender/request_replacement call; main.rs gives --no-daemon and --serve precedence over --attach-only; the three core re-exports carry doc comments naming the design decision; adapter-owned bool defaults in exec.rs mirror server.rs's unwrap_or values verbatim (top_level_only false, brief true, count_only false, near false, styled false, force false).` |
 
 ### Trap
 Reaching for the MCP handlers because they are already wired and their signatures are familiar. That produces a CLI that parses JSON out of a wire envelope to re-render it — the exact duplication Track A existed to prevent, and it will pass every parity test while making the next response-shape change a two-place edit.
