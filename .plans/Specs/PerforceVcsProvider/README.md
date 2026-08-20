@@ -1,7 +1,7 @@
 ---
 title: "Perforce VCS Provider (code-graph-vcs-p4)"
 type: spec
-status: review
+status: approved
 created: 2026-08-20
 updated: 2026-08-20
 tags: [vcs, perforce, p4, subprocess, provider]
@@ -250,15 +250,4 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   their absence must degrade to auto-skip (FR-12), never to failure.
 
 ## Open Questions
-None remaining. The three questions raised during drafting were resolved by
-the user on 2026-08-20 and folded into requirements:
-
-- Blame metadata join: single batched `p4 changes` call per blame op
-  (per-CL `describe` rejected) — now in FR-08.
-- Case-insensitive servers: case-insensitive depot/client path matching
-  required when `p4 info` reports insensitive handling — now FR-14/AC-10.
-- CI provisioning: skip-only status quo — the harness auto-skips where
-  binaries are absent (FR-12/AC-08) and never downloads (Constraints);
-  fixture evidence is collected on developer machines with Perforce
-  installed, matching the dogfood-submodule posture. No CI lane is
-  required or planned by this spec.
+None.
