@@ -33,6 +33,8 @@ tasks:
 
 Deferred until after the Linux MVP. This phase turns the existing POSIX/transport/path/process seams into a supported macOS product surface. Linux results are inputs, not substitutes for native evidence.
 
+**Preparation (2026-08-20, done ahead of hardware):** the complete touch-point map lives at [`notes/10-platform-seams.md`](notes/10-platform-seams.md) — the 8 in-code `SEAM(phase10-macos)` decision markers (greppable), the three-tier platform model, the Linux-only mechanism inventory, the shared-`cfg(unix)` compile-first surface, and the platform-gated test census. The test-side scaffold is `crates/code-graph-mcp/tests/daemon_macos.rs`: 9 `#[ignore]`d stubs gated `#![cfg(target_os = "macos")]`, one per 10.2 verification bullet, each doc-commented with the existing suite whose assertions it mirrors. Note: the 10.2 second-account-denial bullet predates D-0014 (single-local-user scope) — reconcile with the ledger before implementing that stub.
+
 ## 10.1: Activate and repair macOS platform seams
 
 ### Subtasks
