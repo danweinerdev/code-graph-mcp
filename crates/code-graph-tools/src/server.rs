@@ -1791,12 +1791,18 @@ impl CodeGraphServer {
                        format returned by get_file_symbols/search_symbols. Returns the \
                        `Page<CallChain>` envelope {results, total, offset, limit, \
                        truncated, next_offset}, where each `CallChain` is \
-                       `{symbol_id, file, line, depth}` and is sorted by \
+                       `{symbol_id, file, line, depth, candidates}` and is sorted by \
                        (depth, symbol_id) ascending so the closest callers appear first. \
                        **CallChain field semantics:** `symbol_id` is the DEFINITION site \
                        (the caller being reported, in `file:name`/`file:Parent::name` \
                        form); `file` and `line` are the CALL site — the source file and \
-                       line of the `Calls` edge that reached this hop. At depth 1 the \
+                       line of the `Calls` edge that reached this hop; `candidates` is \
+                       how many same-named definitions competed for the traversed \
+                       edge's target — 1 means unambiguous, N ≥ 2 means the resolver's \
+                       scope rule picked one of N (verify with find_class_candidates / \
+                       search_symbols when it matters). `min_confidence=\"resolved\"` \
+                       drops exactly the N ≥ 2 hops at BFS time; reading `candidates` \
+                       lets you keep them AND know how contested each one was. At depth 1 the \
                        call site lives in the caller's own file by definition; at depth \
                        ≥ 2 `file` and the file segment of `symbol_id` routinely diverge \
                        across crates (a caller defined in crate `foo` may be reached \
@@ -1870,13 +1876,20 @@ impl CodeGraphServer {
                        get_file_symbols/search_symbols. Returns the `Page<CallChain>` \
                        envelope {results, total, offset, limit, truncated, \
                        next_offset}, where each `CallChain` is \
-                       `{symbol_id, file, line, depth}` and is sorted by \
+                       `{symbol_id, file, line, depth, candidates}` and is sorted by \
                        (depth, symbol_id) ascending so the closest callees appear \
                        first. **CallChain field semantics:** `symbol_id` is the \
                        DEFINITION site (the callee being reported, in \
                        `file:name`/`file:Parent::name` form); `file` and `line` are the \
                        CALL site — the source file and line of the `Calls` edge that \
-                       reached this hop. The call site (`file`) is always in the \
+                       reached this hop; `candidates` is how many same-named \
+                       definitions competed for the traversed edge's target — 1 means \
+                       unambiguous, N ≥ 2 means the resolver's scope rule picked one \
+                       of N (the OTHER N-1 definitions are real alternatives worth \
+                       checking when the answer looks wrong). \
+                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 hops at \
+                       BFS time; reading `candidates` keeps them AND says how \
+                       contested each one was. The call site (`file`) is always in the \
                        queried symbol's file — the function making the call — never \
                        in the callee's definition file. So `file` and the file segment \
                        of `symbol_id` diverge whenever the callee is defined outside \
@@ -1953,10 +1966,14 @@ impl CodeGraphServer {
                        {found, hops, hop_count, heuristic_hops, nodes_examined, node_cap, \
                        cap_reached} — NOT a `Page` envelope, since this is one shortest-path \
                        answer, not a list. `hops` is an array of `{symbol_id, file, line, \
-                       entered_by}`: `hops[0]` is `from` (its `entered_by` is null, since no \
-                       edge reached it), `hops[last]` is `to`, and every adjacent pair is a \
-                       real `Calls` edge; `hop_count = hops.length - 1` (the edge count, not \
-                       the node count). IMPORTANT CAVEAT: call resolution is a syntactic \
+                       entered_by, candidates}`: `hops[0]` is `from` (its `entered_by` and \
+                       `candidates` are null, since no edge reached it), `hops[last]` is \
+                       `to`, and every adjacent pair is a real `Calls` edge; `hop_count = \
+                       hops.length - 1` (the edge count, not the node count). `candidates` \
+                       on each later hop is how many same-named definitions competed for \
+                       the traversed edge's target (1 = unambiguous, N ≥ 2 = the scope rule \
+                       picked one of N) — the per-hop signal behind `heuristic_hops`, so \
+                       you can see WHICH hop was contested, not just how many were. IMPORTANT CAVEAT: call resolution is a syntactic \
                        heuristic (same file > same parent > same namespace > global, per \
                        CLAUDE.md), so a returned path is EVIDENCE that a call chain likely \
                        exists, not a proof — treat `heuristic_hops` (the count of edges on \
@@ -2437,8 +2454,16 @@ impl CodeGraphServer {
                        symbols not in the index are dropped from the diagram — they no longer \
                        appear as file-basename pseudo-nodes (an absent edge is a truer signal \
                        than a synthetic node with no symbol behind it). `format` is `\"edges\"` \
-                       (default; JSON array of `{from, to, label, direction}` objects, `[]` \
-                       when empty) or `\"mermaid\"` (Mermaid flowchart text). Every edge carries \
+                       (default; JSON array of `{from, to, label, direction, candidates?}` \
+                       objects, `[]` when empty) or `\"mermaid\"` (Mermaid flowchart text). \
+                       In `symbol=` mode every edge carries `candidates` — how many \
+                       same-named definitions competed for the traversed call edge's target \
+                       (1 = unambiguous, N ≥ 2 = the scope rule picked one of N; \
+                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 edges, reading \
+                       `candidates` keeps them and says how contested each was). `file=` and \
+                       `class=` edges OMIT the field entirely (not null) — include and \
+                       inheritance edges carry no resolver metadata, the same boundary that \
+                       makes `min_confidence` a symbol-mode-only knob. Every edge carries \
                        `direction`: `\"calls\"` (outgoing — the `from` endpoint calls `to`) or \
                        `\"called_by\"` (incoming — `from` is an inbound caller of `to`). In \
                        call-graph (`symbol=`) Mermaid output `\"calls\"` renders as a solid \

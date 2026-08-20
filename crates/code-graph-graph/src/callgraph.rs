@@ -533,6 +533,22 @@ struct IncomingRecord {
 /// for `hops[0]` (the source, reached by no edge) and
 /// `Some(confidence)` for every subsequent hop, naming the resolver
 /// confidence of the edge that was traversed to reach it.
+///
+/// **Why `entered_by` AND `candidates` both ride the wire (task 9.3's
+/// D-0007 disposition — kept deliberately, not an oversight):** for call
+/// edges TODAY the two coincide (`Resolved` ⇔ count 1, `Heuristic` ⇔
+/// count ≥ 2), and `candidates` is the signal agents should reason from —
+/// it names the next action ("3 candidates competed; disambiguate")
+/// where the one-bit tag does not. `entered_by` stays because (a)
+/// removing a shipped field breaks the phase's own additive-response
+/// contract; (b) the axes are independent by design — the include
+/// resolver already emits `Resolved` with count 2 for
+/// suffix-disambiguated picks, and [`Confidence`] is `#[non_exhaustive]`
+/// precisely so a future type-inference variant can mark a
+/// multi-candidate pick as definitively resolved, at which point
+/// deriving one field from the other would be wrong; (c) it is the
+/// per-hop form of the `heuristic_hops` tie-break cost, which explains
+/// WHY this path won over an alternative.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PathHop {
     pub symbol_id: SymbolId,
