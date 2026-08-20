@@ -2075,6 +2075,11 @@ pub(crate) fn save_cache(inner: &ServerInner, dir: &std::path::Path) -> Result<(
     // pathname-based save: validating the pathname and opening the cache are
     // separate operations, so root replacement could redirect the latter.
     // Direct servers are unbound and retain their existing logical-path save.
+    // SEAM(phase10-macos): this unanchored-save refusal is Linux-only
+    // because only Linux retains a procfd cache-I/O alias. On macOS a
+    // daemon-bound save always goes through the pathname; phase 10
+    // exercises root replacement mid-persist and either accepts the
+    // pathname write or adds a macOS anchoring equivalent.
     #[cfg(target_os = "linux")]
     if io_dir.is_none() && inner.daemon_project_root.get().is_some() {
         return Err(

@@ -793,6 +793,10 @@ impl ServerInner {
                 ))
             }
         }
+        // SEAM(phase10-macos): unconditional no-op off Linux — a replaced
+        // daemon project root is not detected before publish. Phase 10
+        // decides whether macOS gets the dev/ino comparison (the Metadata
+        // APIs exist under cfg(unix)) or documents pathname-trust semantics.
         #[cfg(not(target_os = "linux"))]
         Ok(())
     }

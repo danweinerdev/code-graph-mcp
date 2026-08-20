@@ -582,6 +582,12 @@ impl DaemonPaths {
         {
             self.uds_alias()
         }
+        // SEAM(phase10-macos): macOS has no procfd alias, so the raw socket
+        // path is bound directly and deep checkouts (> ~104-byte sun_path)
+        // fail here, degrading to loopback TCP in `bind_listener`. Phase 10
+        // decides whether to accept the documented TCP degrade or add a
+        // macOS-specific short-path strategy (e.g. a per-daemon socket under
+        // $TMPDIR with a symlink/metadata pointer back to the runtime dir).
         #[cfg(not(target_os = "linux"))]
         Ok(self.socket.clone())
     }
@@ -844,6 +850,10 @@ fn refresh_proxy_paths(paths: &mut DaemonPaths, root: &Path) -> anyhow::Result<b
         paths.open_runtime_dir_if_present()?;
         return Ok(true);
     }
+    // SEAM(phase10-macos): no retained-descriptor capability model off Linux,
+    // so a replaced runtime namespace is never detected here — the proxy
+    // keeps its original paths. Phase 10 decides whether macOS needs a
+    // dev/ino re-stat equivalent or accepts pathname-trust semantics.
     #[cfg(not(target_os = "linux"))]
     let _ = (paths, root);
     Ok(false)
@@ -854,6 +864,7 @@ fn proxy_namespace_is_current(paths: &DaemonPaths) -> bool {
     {
         paths.ownership_path_change() == OwnershipPathChange::Intact
     }
+    // SEAM(phase10-macos): always-current off Linux (see refresh_proxy_paths).
     #[cfg(not(target_os = "linux"))]
     {
         let _ = paths;
@@ -1930,6 +1941,9 @@ where
 
     #[cfg(target_os = "linux")]
     let ownership_watchdog = ownership_path_watchdog(&paths, &server);
+    // SEAM(phase10-macos): no ownership watchdog off Linux — a renamed or
+    // recreated project root is not detected while serving. Phase 10 decides
+    // whether macOS gets a kqueue/re-stat watchdog or documents the gap.
     #[cfg(not(target_os = "linux"))]
     let ownership_watchdog = std::future::pending::<()>();
     let shutdown_or_idle = async {
@@ -2016,6 +2030,10 @@ async fn graceful_shutdown(server: &CodeGraphServer, _daemon_root: &Path) {
             let cache_io_root = match cache_io_root {
                 Some(alias) => alias,
                 None if server.inner.daemon_project_root.get().is_none() => cache_root,
+                // SEAM(phase10-macos): no retained-root cache-I/O alias off
+                // Linux — the final save always goes through the pathname, so
+                // a root replaced mid-drain writes into the replacement.
+                // Phase 10 exercises this and either accepts or anchors it.
                 #[cfg(not(target_os = "linux"))]
                 None => cache_root,
                 #[cfg(target_os = "linux")]
@@ -2089,6 +2107,10 @@ fn write_owner_file(
     {
         write_owner_file_linux(paths, name, label, owner)
     }
+    // SEAM(phase10-macos): macOS takes the portable O_EXCL-create path, not
+    // Linux's serialized temp+rename exchange under shutdown.control.lock.
+    // Phase 10 exercises concurrent shutdown-request publication on macOS
+    // and decides whether the portable arm's races are acceptable there.
     #[cfg(not(target_os = "linux"))]
     {
         write_owner_file_portable(paths, name, label, owner)
@@ -2609,6 +2631,13 @@ async fn bind_listener(
             UdsBind::LiveListener => {
                 eprintln!("code-graph-mcp: live UDS listener retained; using loopback TCP")
             }
+            // SEAM(phase10-macos): on macOS this is the routine landing spot
+            // for deeply nested checkouts — the raw socket path exceeds the
+            // ~104-byte sun_path limit at `uds_bind_path`, so the daemon
+            // degrades to authenticated loopback TCP. Logged, not silent.
+            // Phase 10 measures how often real checkouts hit this and
+            // whether the degrade stays acceptable (CLAUDE.md "revisit in
+            // Phase 10").
             UdsBind::Unavailable(error) => {
                 eprintln!("code-graph-mcp: UDS unavailable ({error}); using loopback TCP")
             }
