@@ -108,9 +108,11 @@ the surface works on Windows NOW, at `ca2e7a8`, witnessed by the
 1,935-test green umbrella plus the dedicated rows above.
 
 **Linux-native acceptance criteria — explicit N/A rows** (the 11.3
-verification field requires an explicit rationale per criterion; these
-criteria are Linux-scoped by their own text and are certified on Linux
-runners, not here):
+verification field requires an explicit rationale per criterion.
+AC-25/AC-42/AC-47 are Linux-scoped by their own text; AC-48's text is
+transport-generic, but its owner-only-file arm is a `cfg(unix)`
+mechanism and its shared enforcement logic IS natively exercised on
+Windows — each row states its own precise basis):
 
 | AC | N/A rationale |
 |---|---|
@@ -130,9 +132,11 @@ own SD, which carries the default descriptor and is uninspected). Native
 Windows workspace (build/lint/test), daemon named-pipe/ACL/lifecycle,
 path contracts, and CLI parity all carry native evidence above.
 
-**Linux status, stated precisely:** no `#[cfg(unix)]` block was modified
-by the Windows repairs except the two deliberate test-suite un-gatings;
-`daemon.rs` did RESTRUCTURE some unix gates (statement-level →
+**Linux status, stated precisely:** no `#[cfg(unix)]`-gated code block
+was DELETED by the Windows repairs; two test suites were deliberately
+un-gated (their `#![cfg(unix)]` inner attributes removed so they run on
+both platforms — widening Linux coverage, not shrinking it);
+`daemon.rs` RESTRUCTURED some unix gates (statement-level →
 function-level, the UDS bind arm extracted into a cfg'd helper), and two
 shared-code changes touch Linux behavior (the `gix_tree_path`
 forward-slash join fix — a correctness fix on both platforms — and the
