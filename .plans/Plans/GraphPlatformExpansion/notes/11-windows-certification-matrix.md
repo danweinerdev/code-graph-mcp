@@ -11,7 +11,11 @@ runner identified here — no cross-compilation, no Linux substitution.
 - **Umbrella gate:** `make verify` — PASS (`exit 0`): clippy
   `-D warnings`, `cargo fmt --all --check`, full workspace tests
   (**1,935 passed, 0 failed** across all test binaries), pending-snapshot
-  check, plugin-mirror sync. Run 2026-08-20.
+  check, plugin-mirror sync. Run 2026-08-20. The tally includes the
+  dogfood baseline tests, which auto-skip (early-return as PASSED, with
+  an eprintln hint) when `external/` submodules are uninitialized on the
+  runner — disclosed here next to the headline number, with the
+  compensating parser coverage noted in the dogfood row below.
 - **Shell caveat recorded for reproducibility:** suites that spawn the
   daemon or CLI binaries require no live `code-graph-mcp.exe` /
   `code-graph.exe` processes (the daemon holds an exclusive lock on its
@@ -30,7 +34,7 @@ observed native counts). "N/A" rows carry their rationale inline.
 | Verbatim-UNC passthrough boundary | same run | PASS | `simplify_leaves_verbatim_unc_unchanged` — `\\?\UNC\server\share\…` rides unchanged by design (documented limitation, not a regression) |
 | PathTrie key semantics for drive-letter + verbatim forms | `cargo test -p code-graph-path-trie windows_` | PASS (2) | `windows_drive_letter_path_round_trips_via_keys`, `windows_verbatim_disk_prefix_is_a_distinct_trie_key` — the distinct-key property is exactly why the watch dispatch boundary must strip |
 | Watch-event path normalization at the dispatch boundary | `cargo test -p code-graph-tools canonicalize_event_path` | PASS (4, incl. the `#[cfg(windows)]` verbatim-strip pin) | `canonicalize_event_path_strips_verbatim_disk_prefix_on_windows` — `ReadDirectoryChangesW` delivers `\\?\D:\…` event paths; without the strip every watched edit would insert a duplicate `PathTrie` entry |
-| Watch normalization through REAL Windows notifications | `cargo test -p code-graph-tools --test watch_cpp_macro_strip --test watch_dangling_edges` | PASS (1 + suite) | End-to-end `notify-debouncer-full` watchers on native `ReadDirectoryChangesW`; the macro-strip test's sentinel-then-discriminator pattern proves reindex correctness, dangling-edge pruning proves graph mutation through real events |
+| Watch normalization through REAL Windows notifications | `cargo test -p code-graph-tools --test watch_cpp_macro_strip --test watch_race` | PASS | The two suites that traverse the real backend: both start the production watcher via `watch_start` (live `notify-debouncer-full` on native `ReadDirectoryChangesW`); the macro-strip test's sentinel-then-discriminator pattern proves reindex correctness through real events. (`watch_dangling_edges` also passes natively but deliberately calls `try_reindex_file` directly for determinism — it pins the reindex logic, NOT the OS-watcher path, and is cited under the umbrella, not here.) |
 | Incoming user-path normalization (`.`/`..`, mixed separators) | `cargo test -p code-graph-tools --test path_normalization` | PASS (2) | `four_file_taking_tools_resolve_dot_segment_paths` — the strongest cross-platform pin on `normalize_user_path` wraps |
 | 8.3 short-form TEMP vs canonical long form | umbrella + `cargo test -p code-graph-cli` | PASS | The CLI/daemon fixtures run under `DANIEL~1.WEI`-style short TEMP paths; canonicalize-at-boundary discipline (11.1 port work) is exercised by every tempdir fixture in the workspace |
 
@@ -41,7 +45,7 @@ observed native counts). "N/A" rows carry their rationale inline.
 | Daemon serve: named-pipe publication, admission (`CG-OK`), idle exit, cache save, warm restart, graceful stop via `shutdown.request` | `cargo test -p code-graph-mcp --test daemon_serve` | PASS (9) | Includes `runtime_directory_dacl_is_restricted_to_the_invoking_user` — deterministic security-descriptor inspection: no inherited ACEs, no broad built-in principals, exactly one grant naming the invoking user (D-0014 scope: one local user, one local project) |
 | Proxy: attachment, byte-pump, queue-through-proxy, replacement (grace→drain→hard-kill), contender convergence, stale-lock recovery, mid-session death exit-0 | `cargo test -p code-graph-mcp --test daemon_proxy` | PASS (15) | Windows mandatory-lock semantics exercised throughout (`is_lock_violation` as liveness proof; owner identity via `daemon.json`) |
 | TCP fallback + auth + credential rotation | same suites | PASS | Runs at process level via the debug-only `CODE_GRAPH_TEST_FORCE_TCP_ROOT` seam (per-PID pipe names cannot be occupied externally on Windows); constant-time `CG-AUTH` compare |
-| Daemon unit surface (locks, metadata, identity, handle sealing) | `cargo test -p code-graph-mcp` (unit) | PASS (23) | Includes the `seal_standard_handles_from_inheritance` seam (the workspace's one function-scoped unsafe outside `code-graph-graph`) |
+| Daemon unit surface (locks, metadata, identity, handle sealing) | `cargo test -p code-graph-mcp` | PASS (23 unit + the three integration binaries above — the command runs all four; the unit count is the `src/main.rs` binary's tally) | Includes the `seal_standard_handles_from_inheritance` seam (the workspace's one function-scoped unsafe outside `code-graph-graph`) |
 | Analyze queue/job model (phase 4) | `cargo test -p code-graph-tools --test analyze_async_lifecycle` + umbrella (queue unit tests in `code-graph-tools`) | PASS (1 + umbrella) | Async kickoff → poll → completed `AnalyzeJobView`; slot rotation and pending-FIFO semantics are unit-tested in the workspace set |
 | Second-local-account denial | N/A | N/A | Removed from scope by D-0014: the daemon serves one local user's sessions in one local project; cross-account isolation is not a claimed guarantee |
 
@@ -90,20 +94,56 @@ observed native counts). "N/A" rows carry their rationale inline.
 ## Acceptance-criteria coverage (phases 1–9)
 
 All phase 1–9 acceptance criteria were individually evidenced at their
-phases' closes (artifacts 13, 15–21) with `make verify` rows; every one
-of those `make verify` runs — and every per-task test command recorded in
-phases 5–9's evidence blocks — executed natively on THIS Windows runner
-(the phases were implemented on it). Phases 1–4 predate the pull-forward;
-their suites are members of today's umbrella set and pass natively at
-this identity, which is the certification claim AC-60 makes: the surface
-works on Windows NOW, at `ca2e7a8`, witnessed by the 1,935-test green
-umbrella plus the dedicated rows above.
+phases' closes (artifacts 13, 15–21) with `make verify` rows. Native
+provenance, scoped honestly (gate artifact 22 corrected the first
+draft's overclaim): phases 6–9 were implemented entirely on this runner
+after the pull-forward, so every one of their per-task commands and
+`make verify` runs executed natively; phase 5's LATER tasks (5.4–5.6,
+2026-08-18) are native, but 5.1–5.3 (2026-08-16) predate the
+pull-forward — the `ccd9e11` commit message itself records a native
+blame failure caught by a 5.2-era test — so phases 1–4 AND 5.1–5.3
+certify on the same basis: their suites are members of today's umbrella
+set and pass natively at this identity. That is the claim AC-60 makes —
+the surface works on Windows NOW, at `ca2e7a8`, witnessed by the
+1,935-test green umbrella plus the dedicated rows above.
+
+**Linux-native acceptance criteria — explicit N/A rows** (the 11.3
+verification field requires an explicit rationale per criterion; these
+criteria are Linux-scoped by their own text and are certified on Linux
+runners, not here):
+
+| AC | N/A rationale |
+|---|---|
+| AC-25 (UDS owner-only + TCP credential, Linux) | Scoped "On Linux" by its own text; the Windows analogues are the named-pipe admission + runtime-directory DACL rows above (D-0014 scope) plus the process-level TCP fallback/auth rows |
+| AC-42 (Linux MVP exercised natively on Linux) | Scoped "natively on Linux" — Windows execution can neither satisfy nor regress it; its suites remain `#[cfg(unix)]`-gated in the workspace set |
+| AC-47 (UDS default + forced TCP fallback, Linux) | UDS is a Linux transport; the Windows counterpart (named pipe default + `CODE_GRAPH_TEST_FORCE_TCP_ROOT`-forced TCP fallback) is natively exercised in the daemon rows above |
+| AC-48 (TCP secret refusal/rotation) | The enforcement logic is shared and natively exercised on Windows via the forcing seam (daemon rows); the UDS-adjacent arms are Linux-scoped |
 
 ## AC-60 disposition
 
-**PASS.** Native Windows workspace (build/lint/test), daemon
-named-pipe/ACL/lifecycle, path contracts, and CLI parity all carry
-native evidence above. Linux gates are unaffected (no Linux-gated code
-was modified by this task; the three Linux-runnable watch-dispatch pins
-and all `#[cfg(unix)]` suites remain in the workspace set for Linux
-runners).
+**PASS**, against AC-60 as amended 2026-08-20 per D-0014 (the amendment
+note in the spec records what changed and why: the another-local-account
+denial was removed from scope by D-0014, and the delivered deterministic
+security-descriptor inspection covers the runtime DIRECTORY's DACL — the
+state holding the TCP secret and daemon metadata — not the pipe object's
+own SD, which carries the default descriptor and is uninspected). Native
+Windows workspace (build/lint/test), daemon named-pipe/ACL/lifecycle,
+path contracts, and CLI parity all carry native evidence above.
+
+**Linux status, stated precisely:** no `#[cfg(unix)]` block was modified
+by the Windows repairs except the two deliberate test-suite un-gatings;
+`daemon.rs` did RESTRUCTURE some unix gates (statement-level →
+function-level, the UDS bind arm extracted into a cfg'd helper), and two
+shared-code changes touch Linux behavior (the `gix_tree_path`
+forward-slash join fix — a correctness fix on both platforms — and the
+~30 shared test-file ports). All of this is diff-visible in the
+pull-forward series and disclosed in the phase doc. A post-repair Linux
+run has NOT been executed from this Windows host; the phase AC's Linux
+arm is therefore certified as "diff-reviewed, cfg-scoped, no Linux gate
+deleted" with the full Linux re-run recorded as a follow-up for the next
+Linux runner session (gate artifact 22).
+
+**Known omission recorded:** NTFS case-insensitivity (two casings of one
+path resolving to one file) has no dedicated pin; canonicalize-at-boundary
+resolves to on-disk casing for existing files, which is the operative
+protection. Filed as a follow-up candidate, not a certified property.

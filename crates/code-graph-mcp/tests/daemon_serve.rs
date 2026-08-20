@@ -522,13 +522,14 @@ fn simultaneous_contenders_recover_one_stale_lock() {
     assert!(!runtime.join("daemon.lock").exists(), "lock cleanup");
 }
 
-/// Phase 11.2 security subset that runs without a second local account: the
-/// daemon's runtime directory DACL must be restricted to the invoking user.
-/// `restrict_windows_runtime_dir` strips inheritance and grants exactly one
-/// principal, so the `icacls` listing must show no inherited `(I)` ACEs, no
-/// broad built-in principals, and exactly one grant naming the current user.
-/// (The second-account denial check remains a manual phase-11.2 item — it
-/// needs a provisioned local account this harness cannot create.)
+/// Phase 11.2 security check: the daemon's runtime directory DACL must be
+/// restricted to the invoking user. `restrict_windows_runtime_dir` strips
+/// inheritance and grants exactly one principal, so the `icacls` listing
+/// must show no inherited `(I)` ACEs, no broad built-in principals, and
+/// exactly one grant naming the current user.
+/// (A second-account denial check is OUT OF SCOPE per D-0014 — the daemon
+/// serves one local user's sessions in one local project, and cross-account
+/// isolation is not a claimed guarantee; it is not a deferred manual item.)
 #[cfg(windows)]
 #[test]
 fn runtime_directory_dacl_is_restricted_to_the_invoking_user() {

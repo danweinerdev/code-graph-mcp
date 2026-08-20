@@ -94,7 +94,7 @@ own gate; the commit series is the durable identity):
 
 Revision boundary: one natively buildable Windows workspace with all platform branches compiling and Linux behavior preserved. This is a complete internal platform capability; daemon runtime acceptance remains task 11.2.
 
-The work landed in the pull-forward series `ccd9e11..89a2af2` (2026-08-18, detailed in the pull-forward note above); every phase implemented since (5–9) was BUILT on this runner, so the repairs have been continuously re-verified by every subsequent `make verify`. Linux gates: no Linux-gated code was modified by the repairs (cfg-additive throughout); the three Linux-runnable watch-dispatch pins and all `#[cfg(unix)]` suites remain in the workspace set.
+The work landed in the pull-forward series `ccd9e11..89a2af2` (2026-08-18, detailed in the pull-forward note above); every phase implemented since (5–9) was BUILT on this runner, so the repairs have been continuously re-verified by every subsequent `make verify`. Linux status, stated precisely (gate artifact 22 corrected the first draft's "cfg-additive throughout" overclaim): no `#[cfg(unix)]` block was deleted; two test suites were deliberately un-gated; `daemon.rs` RESTRUCTURED some unix gates (statement-level → function-level, the UDS bind arm extracted into a cfg'd helper); and two shared-code changes touch Linux behavior — the `gix_tree_path` forward-slash join (a correctness fix on both platforms) and the ~30 shared test-file ports. All diff-visible in the series; a post-repair Linux run has not been executed from this host and is a recorded follow-up.
 
 ### Completion Evidence
 
@@ -183,7 +183,7 @@ The matrix is persisted at `notes/11-windows-certification-matrix.md`: runner/to
 ## Acceptance Criteria
 
 - [ ] **AC-60**: Native Windows workspace, daemon named-pipe/ACL/lifecycle, path, and CLI parity evidence is complete (NFR-13).
-- [ ] Linux acceptance suites remain unchanged and green after Windows repairs.
+- [ ] Linux acceptance suites remain in the workspace set with their gates intact after the Windows repairs — verified by diff review (no `#[cfg(unix)]` block deleted; gate restructurings and the two shared-code changes disclosed in 11.1's evidence); a post-repair Linux `make verify` re-run is a recorded follow-up for the next Linux runner session (gate artifact 22), since "green on Linux" cannot be witnessed from this host. *[Reworded 2026-08-20 at the phase gate: the original "remain unchanged and green" claimed a Linux execution this phase never performed.]*
 - [ ] `make verify` passes on the native Windows runner.
 
 ## Phase Completion Evidence

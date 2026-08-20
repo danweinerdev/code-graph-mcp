@@ -115,6 +115,7 @@ Each is a reconciliation event, not drift — the code was right and the documen
 - **Decision 8** said "16 gated call sites"; phase 1's tools made it 19 sites over 18 functions. Restated as a set-equality invariant.
 - **`PathResult`** shipped with two fields where the design sketched four; the design was reconciled to the code.
 - **CLAUDE.md** carried three stale claims found incidentally: the cache is v10 not v8, `EdgeKind` has four variants not three, and the workspace is *not* C-compiler-free (the tree-sitter grammars compile C via the `cc` crate). The last of these had already been recorded as a decision on the false premise, so D-0004 restates it on the argument that actually holds — add no *further* native library, rather than stay C-free.
+- **AC-60** (amended 2026-08-20 at the phase 11 gate): the spec text still required "pipe-security-descriptor inspection and another-local-account denial" although D-0014 (2026-08-18, user-decided, spec in scope) had removed the cross-account check and the delivered inspection covers the runtime DIRECTORY's DACL, not the pipe object's own SD. The amendment note in the spec records both deltas; D-0014's own confirmation field had claimed the reconciliation without the edit ever landing. The phase 11 "Linux suites remain unchanged and green" AC line was reworded in the same pass — the original claimed a Linux execution the phase never performed; the reworded line states the diff-reviewed basis and records the Linux re-run as a follow-up.
 
 ### What a cold start should know before writing code
 

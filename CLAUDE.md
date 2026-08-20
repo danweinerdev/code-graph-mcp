@@ -26,7 +26,7 @@ Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs 
 | `code-graph-mcp` | `crates/code-graph-mcp` | Binary; rmcp stdio server entry |
 | `code-graph-core` | `crates/code-graph-core` | `Symbol`, `Edge`, `SymbolKind`, `EdgeKind`, `Confidence`, `RootConfig` (TOML) |
 | `code-graph-lang` | `crates/code-graph-lang` | `LanguagePlugin` trait, `LanguageRegistry`, `SymbolIndex` |
-| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v10) at `<project_root>/.code-graph-cache.db`. One of two `#![allow(unsafe_code)]` opt-ins in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs` (the other is the function-scoped Windows handle-inheritance seal in `code-graph-mcp`'s `daemon.rs`). |
+| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v11) at `<project_root>/.code-graph-cache.db`. One of two `#![allow(unsafe_code)]` opt-ins in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs` (the other is the function-scoped Windows handle-inheritance seal in `code-graph-mcp`'s `daemon.rs`). |
 | `code-graph-path-trie` | `crates/code-graph-path-trie` | Segment-keyed Patricia trie (`PathTrie<V>`), `PathSet`, `PathInterner`. Backs `Graph.files`/`Graph.includes` and the cache encoder's path interning. `#![forbid(unsafe_code)]`. |
 | `code-graph-tools` | `crates/code-graph-tools` | Tool handlers; parallel discovery+indexer; watcher (notify-debouncer-full) |
 | `code-graph-vcs` | `crates/code-graph-vcs` | `VcsProvider` trait (async, exactly four required ops), opaque `RevId`, `Commit`/`BlameHunk`, `VcsRegistry` with working-tree detection. No backend dependency. `#![forbid(unsafe_code)]`. |
@@ -338,7 +338,7 @@ itself; `--no-daemon` wins over `--serve` if both are passed.
 
 ### Cache invalidation
 
-- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `10`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
+- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `11`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
 - **Version mismatch** on `Graph::load` → `Ok(false)` → caller **silently re-indexes**. No `force=true` required, no transparent migration.
 - **mtime-based stale checking.** Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, `[cpp].macro_define_function`, `[cpp].macro_define_type`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime. Apply with `force=true`.
 - **Adding extensions:** new files brought in by `[extensions].<lang>` parse normally on next run (no `force=true`).
@@ -556,7 +556,7 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
                               |
                      +--------+--------+
                      |                 |
-              [Tool Handlers]     [Graph + rkyv v10 cache]
+              [Tool Handlers]     [Graph + rkyv v11 cache]
               (code-graph-tools)  (code-graph-graph)
                      |                 |
               [LanguageRegistry]
