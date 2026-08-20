@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-18
+updated: 2026-08-20
 tags: [decisions]
 related: []
 decisions:
@@ -261,3 +261,5 @@ Repository-wide validation still reports legacy structural debt through transiti
 ## D-0014 — Single-local-user daemon security scope
 
 Decided during the phase 11 pull-forward, when the remaining 11.2 security items were being enumerated. The daemon's reason to exist is multiple sessions of the *same* user sharing one graph instance in one local project (D-0001's repository-local shape), so the second-local-account denial check and any multi-user hardening are out of scope, not deferred work. What stays: the owner-only hygiene that already shipped — `0o600`/`0o700` on Unix, the SID-resolved owner-only DACL with inheritance stripped on Windows, and the per-instance TCP secret — plus the native regression test pinning that DACL shape. Any future scope expansion (shared machines, service accounts, CI runners with mixed users) requires explicit user approval first.
+
+*Amendment record (2026-08-20):* the phase 11 gate review (artifact 22) found that spec AC-60's original wording implied cross-account denial evidence this decision had already scoped out. AC-60 in Specs/GraphPlatformExpansion was amended in place citing D-0014, and NFR-06 gained a matching scope note; the plan README records the correction. This entry is the governing truth for that wording — any future re-broadening of AC-60 requires the explicit scope-expansion approval this decision names.
