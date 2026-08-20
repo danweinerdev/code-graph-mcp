@@ -5,14 +5,14 @@ plan: GraphPlatformExpansion
 phase: 9
 status: in-progress
 created: 2026-08-08
-updated: 2026-08-19
+updated: 2026-08-20
 deliverable: "Edges record how many same-named candidates competed for their target, and the tools that report edges surface it — replacing a one-bit heuristic tag with the number a caller can act on."
 tasks:
   - id: "9.1"
     title: "Record candidate count on the edge and bump the cache format"
     status: complete
     justifies: "FR-48, AC-57, D-0007. Confidence::Heuristic is a one-bit projection of 'N candidates competed'. The resolver knows N at the moment it picks, and then throws it away — so the information a caller needs to disambiguate is destroyed at index time and cannot be recovered by any downstream change."
-    verification: "cargo test -p code-graph-graph persist and cargo test -p code-graph-lang resolve (substring filters — the suites live in in-file tests modules, so a module-path :: filter would select zero; wording corrected at completion per the phase-6/7 filter-drift lesson) — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
+    verification: "cargo test -p code-graph-graph persist and cargo test -p code-graph-lang resolve (substring filters; wording corrected at completion per the phase-6/7 filter-drift lesson — the original `resolve::` filter selected zero tests because the lang suites live in in-file `tests` modules; the original `persist::` filter WAS functional since the persist tests live at `persist::tests::*`, so only the lang half was drift) — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
   - id: "9.2"
     title: "Surface candidate count on the edge-reporting tools"
     status: complete
@@ -53,7 +53,7 @@ This is the only task in the plan that changes the cache format. That is accepte
 
 `Confidence` is `#[non_exhaustive]` specifically to allow future resolution variants. Consider whether the count belongs *in* the enum's `Heuristic` variant or as a sibling field — a count of 1 alongside `Resolved` is meaningful and uniform, which argues for a sibling field.
 
-**Decisions made at implementation.** (1) Sibling field, as the note argues: `candidates: u32` on `Edge`, `EdgeEntry`, and `PackedEdge`. (2) Declarative edges are `1` by construction — parse-time edges carry a provisional `1` and only the resolve pass overwrites call/include edges; the Rust `mod`-decl override returns `Resolved`/1 unconditionally. (3) A suffix-disambiguated include reports the REAL N with `Confidence::Resolved` — the count says how contested the name was, the confidence says whether the pick was structural; the two axes are deliberately independent. (4) The resolver signatures (`resolve_call`/`resolve_include`, trait + defaults + overrides) widened to carry the count, and BOTH resolve paths (analyze-path indexer loop, watch-path inline resolver) stamp it. (5) serde defaults (1) exist for hand-written fixtures only; cache safety is the v11 bump — the trap's default-instead-of-bump failure is explicitly rejected in the field docs.
+**Decisions made at implementation.** (1) Sibling field, as the note argues: `candidates: u32` on `Edge`, `EdgeEntry`, and `PackedEdge`. (2) Declarative edges are `1` by construction — parse-time edges carry a provisional `1` and only the resolve pass overwrites resolvable edges; the Rust `mod`-decl override returns `Resolved`/1 unconditionally. **Correction to the planned subtask's framing (gate artifact 21):** the plan listed Overrides among the declarative kinds, but Overrides edges route through `resolve_call` exactly like calls — a `Parent::name` token can have same-named candidates in several ancestor classes — so they carry REAL counts (and real Heuristic tags) when contested; only Inherits and `mod`-resolved Includes are `1`-by-construction. The behavior shipped correctly (find_overrides hops surface real N); the `Edge.candidates` doc comment's declarative list repeats the plan's overclaim and is recorded as a follow-up. (3) A suffix-disambiguated include reports the REAL N with `Confidence::Resolved` — the count says how contested the name was, the confidence says whether the pick was structural; the two axes are deliberately independent. (4) The resolver signatures (`resolve_call`/`resolve_include`, trait + defaults + overrides) widened to carry the count, and BOTH resolve paths (analyze-path indexer loop, watch-path inline resolver) stamp it. (5) serde defaults (1) exist for hand-written fixtures only; cache safety is the v11 bump — the trap's default-instead-of-bump failure is explicitly rejected in the field docs.
 
 ### Completion Evidence
 
