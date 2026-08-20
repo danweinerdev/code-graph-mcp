@@ -1,10 +1,10 @@
 ---
 name: cg-survey
-description: Structural health survey of a codebase (or subtree) with code-graph — size and shape, dead code, dependency cycles, and coupling hotspots, as one report.
+description: Structural health survey of a codebase (or subtree) with code-graph -- size and shape, dead code, dependency cycles, and coupling hotspots, as one report.
 argument-hint: [subtree path]
 ---
 
-# cg-survey — structural health report
+# cg-survey -- structural health report
 
 Produce an orientation report for `${ARGUMENTS:-this repo}` from the `code-graph` MCP server.
 Use it to get oriented in an unfamiliar codebase before changing anything, or as a periodic
@@ -12,12 +12,12 @@ health check.
 
 ## Workflow
 
-1. **Shape.** `get_symbol_summary()` — `(namespace, kind, count)` rows. This is the cheapest
+1. **Shape.** `get_symbol_summary()` -- `(namespace, kind, count)` rows. This is the cheapest
    possible map of what exists and where the mass sits. Scope with `subtree` when given a path.
-2. **Dead code.** `get_orphans(reliability: "high", subtree: …)` — symbols with zero incoming
+2. **Dead code.** `get_orphans(reliability: "high", subtree: ...)` -- symbols with zero incoming
    call edges. `"high"` drops virtual methods and macro-synthesized symbols, which are the
    dominant false-positive classes.
-3. **Cycles.** `detect_cycles(subtree: …)` — circular include/import chains.
+3. **Cycles.** `detect_cycles(subtree: ...)` -- circular include/import chains.
 4. **Hotspots.** `get_coupling` on the files the previous steps flag as central.
 5. **Confirm before recommending deletion.** For anything from step 2 you would suggest removing,
    run `get_callers` on it. Orphan status is "no *resolved* inbound edge", which is not the same
@@ -26,7 +26,7 @@ health check.
 ## Reporting
 
 Give the user: total symbols by kind, the top namespaces by mass, a **ranked** orphan list with
-the caveats attached, each cycle as a file chain, and the top coupled pairs. Ranked, not dumped —
+the caveats attached, each cycle as a file chain, and the top coupled pairs. Ranked, not dumped --
 a 400-row orphan list is not a finding.
 
 ## What "orphan" does not mean
@@ -42,7 +42,7 @@ State these explicitly whenever you recommend a deletion:
 - **C++ macro-generated definitions** don't exist in the graph unless `[cpp].macro_define_*` is
   configured, so their callees look orphaned.
 - **The reliability filter is signature-driven, not confidence-based.** Heuristic-vs-resolved has
-  no leverage here — an orphan has no inbound edges to grade.
+  no leverage here -- an orphan has no inbound edges to grade.
 
 A survey finds *candidates*. The user decides.
 
