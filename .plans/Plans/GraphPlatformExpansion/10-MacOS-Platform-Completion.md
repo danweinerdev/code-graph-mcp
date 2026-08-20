@@ -90,7 +90,7 @@ Pending — not complete.
 ## Acceptance Criteria
 
 - [ ] **AC-59**: Native macOS workspace, daemon, security/lifecycle, and CLI parity evidence is complete (NFR-12).
-- [ ] Linux acceptance suites remain unchanged and green after macOS repairs.
+- [ ] Linux acceptance suites remain in the workspace set with their gates intact after the macOS repairs — verified by diff review (no `#[cfg(unix)]`/`#[cfg(target_os = "linux")]`-gated code block deleted; any gate restructurings and shared-code changes disclosed in the task evidence) — plus a post-repair Linux `make verify` run recorded from a Linux host, or an explicit deferral naming that run as a follow-up. *[Reworded 2026-08-20 before this phase opens, applying phase 11's gate lesson (artifact 22): the original "remain unchanged and green" wording claims a Linux execution a macOS-hosted phase cannot witness; state the diff-reviewed basis and the Linux run separately so each is honestly checkable.]*
 - [ ] `make verify` passes on the native macOS runner.
 
 ## Phase Completion Evidence
