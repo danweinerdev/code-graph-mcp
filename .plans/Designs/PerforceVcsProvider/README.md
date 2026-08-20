@@ -1,7 +1,7 @@
 ---
 title: "Perforce VCS Provider (code-graph-vcs-p4)"
 type: design
-status: review
+status: approved
 created: 2026-08-20
 updated: 2026-08-20
 tags: [vcs, perforce, p4, subprocess, provider]
