@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-18
+updated: 2026-08-20
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -82,7 +82,7 @@ Phases 1, 3, and 5 have no dependencies on each other and may run concurrently i
 Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deliberately deferred until the Linux implementation phases they certify are complete. The phase numbering is a suggested order; `depends_on` is the real constraint.
 
 ## Current State
-*Written for a cold start. Last updated 2026-08-18.*
+*Written for a cold start. Last updated 2026-08-20.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
