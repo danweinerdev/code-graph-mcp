@@ -13,7 +13,7 @@ Three parts:
    model at the right code-graph tool (`search_symbols`, `get_callers`, ...).
    It **never blocks**: grep/glob still run, and free-text/regex searches are
    left alone.
-2. **Five skills** that teach the model when and how to use the code-graph API:
+2. **Seven skills** that teach the model when and how to use the code-graph API:
 
    | Skill | Covers |
    |---|---|
@@ -22,6 +22,8 @@ Three parts:
    | `code-graph-dependencies` | Imports, coupling, cycles, communities, diagrams (get_dependencies, get_coupling, detect_cycles, detect_communities, generate_diagram) |
    | `code-graph-refactor-survey` | Dead code, blast radius, codebase orientation (get_orphans + workflows) |
    | `code-graph-indexing` | analyze_codebase (sync/async + get_analyze_status), watch mode, scoping, caching, config |
+   | `code-graph-configure` | Derive and WRITE a well-formed .code-graph.toml for the current project (survey -> analyze -> refine loop) |
+   | `code-graph-smoke-test` | End-to-end acceptance pass of the tool surface against the current repo, with contract checks and a findings report |
 
 3. **Six slash commands** for driving the toolset directly:
 

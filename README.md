@@ -46,7 +46,7 @@ Three agent-harness plugin trees ship in this repo. All of them need the `code-g
 
 ### Claude Code
 
-The plugin at [`plugin/`](plugin/) bundles five skills, six slash commands (`/cg`, `/cg-index`, `/cg-impact`, `/cg-deps`, `/cg-survey`, `/cg-status`), and a non-blocking `PreToolUse` nudge that steers symbol-shaped Grep/Glob searches toward the graph tools.
+The plugin at [`plugin/`](plugin/) bundles seven skills, six slash commands (`/cg`, `/cg-index`, `/cg-impact`, `/cg-deps`, `/cg-survey`, `/cg-status`), and a non-blocking `PreToolUse` nudge that steers symbol-shaped Grep/Glob searches toward the graph tools.
 
 Load it directly (no install step, no writes under `~/.claude`):
 

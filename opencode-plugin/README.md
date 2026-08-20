@@ -45,9 +45,10 @@ running the CLI attaches to it, otherwise it answers from the on-disk cache.
   surface: symbol search, call graph, call-path finding, inheritance, dependencies, coupling,
   cycles, communities, orphans, diagrams, VCS blame/history, sync + async indexing, watch mode,
   and status.
-- **Skills directory** -- five scenario skills documenting when and how to drive the toolset
+- **Skills directory** -- seven scenario skills documenting when and how to drive the toolset
   (`code-graph-navigator`, `code-graph-callgraph`, `code-graph-dependencies`,
-  `code-graph-refactor-survey`, `code-graph-indexing`).
+  `code-graph-refactor-survey`, `code-graph-indexing`, `code-graph-configure`,
+  `code-graph-smoke-test`).
 - **Commands directory** -- `/cg`, `/cg-index`, `/cg-impact`, `/cg-deps`, `/cg-survey`,
   `/cg-status`.
 - **A session-start check** that warns once if the repo has no `.code-graph-cache.db`, so the
