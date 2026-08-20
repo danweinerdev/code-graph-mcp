@@ -3,7 +3,7 @@ title: "Windows Platform Completion"
 type: phase
 plan: GraphPlatformExpansion
 phase: 11
-status: in-progress
+status: complete
 created: 2026-08-11
 updated: 2026-08-20
 deliverable: "Native Windows support across the completed Linux-MVP seams, including named pipes, ACLs, Windows paths, daemon lifecycle, and CLI parity."
@@ -182,10 +182,32 @@ The matrix is persisted at `notes/11-windows-certification-matrix.md`: runner/to
 
 ## Acceptance Criteria
 
-- [ ] **AC-60**: Native Windows workspace, daemon named-pipe/ACL/lifecycle, path, and CLI parity evidence is complete (NFR-13).
-- [ ] Linux acceptance suites remain in the workspace set with their gates intact after the Windows repairs — verified by diff review (no `#[cfg(unix)]`-gated code block deleted; the two deliberate test-suite un-gatings — `#![cfg(unix)]` inner attributes removed so those suites run on both platforms, widening Linux coverage — plus the gate restructurings and the two shared-code changes are all disclosed in 11.1's evidence); a post-repair Linux `make verify` re-run is a recorded follow-up for the next Linux runner session (gate artifact 22), since "green on Linux" cannot be witnessed from this host. *[Reworded 2026-08-20 at the phase gate: the original "remain unchanged and green" claimed a Linux execution this phase never performed.]*
-- [ ] `make verify` passes on the native Windows runner.
+- [x] **AC-60**: Native Windows workspace, daemon named-pipe/ACL/lifecycle, path, and CLI parity evidence is complete (NFR-13). — as amended 2026-08-20 per D-0014 (the amendment note in the spec records both deltas); persisted evidence is the certification matrix at `notes/11-windows-certification-matrix.md`, whose rows the gate's quality lane re-executed and statically verified across both cycles
+- [x] Linux acceptance suites remain in the workspace set with their gates intact after the Windows repairs — verified by diff review (no `#[cfg(unix)]`-gated code block deleted; the two deliberate test-suite un-gatings — `#![cfg(unix)]` inner attributes removed so those suites run on both platforms, widening Linux coverage — plus the gate restructurings and the two shared-code changes are all disclosed in 11.1's evidence); a post-repair Linux `make verify` re-run is a recorded follow-up for the next Linux runner session (gate artifact 22), since "green on Linux" cannot be witnessed from this host. *[Reworded 2026-08-20 at the phase gate: the original "remain unchanged and green" claimed a Linux execution this phase never performed.]* — diff-review basis verified by the gate's blind-spots lane against the pull-forward series; the follow-up sits first in artifact 22's list
+- [x] `make verify` passes on the native Windows runner. — PASS (`exit 0`), 1,935 passed / 0 failed at `ca2e7a8` (only docs plus one comment-only edit follow it)
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `385cc31ded8320dd54d0e094299e847bcaba1730` (certification endpoint; code identity = pull-forward series `ccd9e115c8b6242b07d00c21f734c808a23e9baa..89a2af2217bb5d87139fd57d27128908deefad66`)
+- Identity recheck: `git rev-parse 385cc31` at 2026-08-20 11:47 matched `385cc31ded8320dd54d0e094299e847bcaba1730`
+- Focused review: four-lane frozen gate over `3dc41a9b0a6dc4ca61bcab8cf66dfc5fdb255d7f..385cc31ded8320dd54d0e094299e847bcaba1730` (two cycles; cycle-1 spec-lane findings — the AC-60/D-0014 spec drift, the pipe-SD wording, the Linux-AC honesty — resolved in `385cc31`; cycle-2 sub-material findings repaired at the planning revision `1f819e4`)
+- Reviewed candidate / final: `385cc31ded8320dd54d0e094299e847bcaba1730`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (native Windows, MSVC) | `.` | PASS (`exit 0`) | `1,935 passed, 0 failed across all workspace test binaries at ca2e7a8 on Windows 10.0.26100.9106 / rustc 1.94.1; clippy -D warnings, fmt, snapshots, plugin mirrors all green. Certification rows re-executed and statically count-verified by the gate's quality lane in both cycles.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen 3dc41a9..385cc31, planning 1f819e4, code identity ccd9e11..89a2af2` | PASS | `All four independent lanes returned PASS/Aligned on cycle 2; the AC-60 amendment judged a legitimate reconciliation against D-0014's ledger fields; residual observations recorded as accepted follow-ups in the review artifact, led by the Linux re-verification.` |
+
+### Completed task identities
+- `11.1`: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series endpoint)
+- `11.2`: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series endpoint)
+- `11.3`: `089db2c88ec56fada6ee6a97d6840c3590912e69` (matrix + evidence)
+
+- Final aligned review: `reviews/22-windows-platform-completion-final-review-3dc41a9-385cc31.md`; frozen: `3dc41a9b0a6dc4ca61bcab8cf66dfc5fdb255d7f..385cc31ded8320dd54d0e094299e847bcaba1730`
