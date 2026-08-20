@@ -279,7 +279,29 @@ pub(crate) async fn run_analyze_job(
                 .iter()
                 .filter(|p| p.starts_with(&abs_path))
                 .collect();
-            if in_scope_stale.is_empty() {
+            // The staleness probe only sees files already IN the cache — a
+            // file created since the cache was written, or an invocation
+            // scope wider than the one that built the cache, is invisible
+            // to it. Walk the scope (discovery only, no parse — seconds on
+            // UE-scale trees, vs the minutes of parse the fast path exists
+            // to skip) and fall through to the slow path when anything on
+            // disk is missing from the cache. Found by dogfooding: a
+            // root-scope analyze over a subtree-scoped cache returned the
+            // subtree and never indexed the rest of the repo, and a file
+            // added after a full index was silently never indexed.
+            let scope_has_uncached_files = in_scope_stale.is_empty() && {
+                let discovered = crate::discovery::discover(
+                    &abs_path,
+                    &inner.registry,
+                    &cfg,
+                    &crate::indexer::NoopProgressSink,
+                );
+                discovered
+                    .files
+                    .iter()
+                    .any(|file| !probe.has_file(&file.path))
+            };
+            if in_scope_stale.is_empty() && !scope_has_uncached_files {
                 let mut fast_path_warnings: Vec<String> = Vec::new();
                 let now_nanos = now_nanos_u64();
                 let elapsed_since_sweep = now_nanos.saturating_sub(probe.last_sweep_at());
