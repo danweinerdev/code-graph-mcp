@@ -68,12 +68,18 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
 - **FR-02**: `detect(working_tree)` is offline and cheap: it reports true
   when a `P4CONFIG`-named file (default `.p4config`, honoring the `P4CONFIG`
   environment variable) exists on the upward walk from the working tree, or
-  when both `P4PORT` and `P4CLIENT` are present in the environment. It never
-  spawns `p4` and never contacts a server. The `.p4config` default is a
-  deliberate heuristic divergence from `p4` itself (which performs no config
-  lookup when `P4CONFIG` is unset): a detection-true tree whose `p4` cannot
-  actually connect surfaces the FR-10 actionable errors at op time rather
-  than being silently skipped.
+  when both `P4PORT` and `P4CLIENT` are discoverable from the environment —
+  where "environment" includes process environment variables, the
+  `P4ENVIRO` file, and (on Windows) the Perforce registry keys
+  (`HKCU\Software\Perforce\Environment`), because `p4 set` on Windows
+  writes the registry and produces neither a config file nor env vars
+  *[amended 2026-08-20, blind-review finding: the dominant Windows
+  configuration was undetectable]*. It never spawns `p4` and never
+  contacts a server. The `.p4config` default is a deliberate heuristic
+  divergence from `p4` itself (which performs no config lookup when
+  `P4CONFIG` is unset): a detection-true tree whose `p4` cannot actually
+  connect surfaces the FR-10 actionable errors at op time rather than
+  being silently skipped.
 - **FR-03**: Every Perforce interaction is a captured-output subprocess
   invocation of a user-provided `p4` executable (resolved from `PATH`);
   stdout and stderr are never inherited (MCP stdio purity — the daemon's
@@ -88,10 +94,18 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   (`P4CHARSET`) must never fail an op on undecodable metadata bytes;
   `read_at` file content stays raw bytes.
 - **FR-05**: `resolve_rev(spec)` resolves a user revision spec to a submitted
-  changelist number carried in `RevId`: numeric CL specs, `@date` forms, and
-  the provider-default revision (the highest submitted CL affecting the
-  client view) via `p4 changes -m1`. An unresolvable spec is a `VcsError`
-  naming the bad spec (parity with git's unresolvable-`at` tool error).
+  changelist number carried in `RevId`. A NUMERIC spec must resolve to
+  exactly that submitted changelist — a nonexistent, pending, or deleted
+  changelist number is a `VcsError` naming the bad spec, never a silent
+  nearest-earlier resolution (`@CL`'s native at-or-before semantics apply
+  to `@date` forms only) *[amended 2026-08-20, blind-review finding]*.
+  The provider-default revision is the workspace HAVE state
+  (`//<client>/...#have` — the true analog of git `HEAD`: attribution
+  reflects what this workspace is synced to, not server tip; tip-of-view
+  was rejected because actively-developed depots would report `stale` on
+  nearly every file). `@date` specs are interpreted in the SERVER's
+  timezone (Perforce semantics) — the provider documents this rather than
+  compensating.
 - **FR-06**: `revisions_touching(path, limit)` returns the submitted
   changelists that touched the depot path mapped from the file, **newest
   first** (matching the `RevisionWindow` trait contract — `symbol_history`
@@ -103,35 +117,50 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   file-absent-at-revision from I/O failure per the trait's error contract.
 - **FR-08**: `blame(path, lines: Option<(u32, u32)>, at: Option<&RevId>)`
   produces line-attributed hunks: `p4 annotate -c -q` supplies the
-  introducing changelist per line, joined with changelist metadata
-  (`p4 changes` or `describe -s` output) for author and UTC timestamp.
-  `lines: None` blames the whole file; `at: None` blames at the FR-05
+  introducing changelist per line, joined with changelist metadata for
+  author and UTC timestamp. `lines: None` blames the whole file; a `lines`
+  range extending past EOF at the blamed revision clips to EOF (git
+  parity, never an error); `at: None` blames at the FR-05
   provider-default revision. The metadata join is a SINGLE batched
   `p4 changes` invocation per blame op (per-changelist `describe` calls
-  rejected — resolved 2026-08-20). Spawn budget: annotate plus the batched
-  join, plus the depot-path mapping call (`p4 where`), which is cached per
-  path across calls — steady-state blame is two spawns, first touch of a
-  path is three. *[Amended 2026-08-20 during design review: the original
-  "exactly two subprocess spawns" wording did not count the mapping
-  call.]* Hunks are clipped to the requested range, in file order,
-  non-overlapping (`BlameHunk` parity with git).
+  rejected — resolved 2026-08-20), and its `CL -> (author, time)` result
+  is cached per provider instance so repeat blames over one file's
+  history (the `symbol_history` walk pattern) do not refetch it. Spawn
+  budget, enumerated exhaustively *[re-amended 2026-08-20 — the prior
+  amendment still undercounted; blind-review finding]*: one-time
+  `p4 info` probe (first op on the provider), per-path `p4 where`
+  (cached), `at: None` default-revision resolution (one `p4 changes -m1`
+  per blame call taking the default), the annotate call, and the batched
+  join (cached). Steady-state explicit-revision blame is therefore two
+  spawns; steady-state default-revision blame is three; first-ever call
+  on a fresh provider peaks at five. Hunks are clipped to the requested
+  range, in file order, non-overlapping (`BlameHunk` parity with git).
 - **FR-09**: The provider verifies a queried file belongs to its bound
   client workspace via `p4 where` semantics (exclusionary view lines
   respected); a path outside the client view reports the trait's
   unavailability shape (the git provider's belongs-to-a-different-repository
   precedent), which the tools already render as `available: false` +
   `reason`.
-- **FR-10**: Operational failures map to actionable `VcsError`s: missing
-  `p4` executable at op time, connection failure, and authentication
-  failure are distinct messages, and the authentication message names
-  `p4 login`. A path with no submitted history at the blamed revision is
-  unavailability, not an error (GraphPlatformExpansion:FR-36 parity).
-- **FR-11**: Every subprocess invocation is bounded by a timeout (default
-  chosen at design time, order tens of seconds, uniform across ops); a hung
-  or unreachable server fails the op instead of wedging the tool handler.
-  All FR-10/FR-11 failures map onto EXISTING `VcsError` variants
-  (`Operation` with distinguished message text) — no trait-crate change,
-  keeping the Dependencies claim consistent.
+- **FR-10**: Operational failures map to actionable `VcsError`s, classified
+  PRIMARILY on `p4 -G`'s structured error records (`code: "error"` dicts
+  carrying numeric `severity`/`generic` fields — stable across server
+  versions and locales) with English stderr text as the fallback signal
+  only *[amended 2026-08-20, blind-review finding: text-only matching
+  breaks on older servers and localized output]*. Missing `p4` executable
+  at op time, connection failure, authentication failure, and
+  SSL-trust-not-established are distinct messages; the authentication
+  message names `p4 login` and the trust message names `p4 trust`. A path
+  with no submitted history at the blamed revision is unavailability, not
+  an error (GraphPlatformExpansion:FR-36 parity).
+- **FR-11**: Every subprocess invocation is bounded by a timeout: default
+  30 seconds, overridable via the `CODE_GRAPH_P4_TIMEOUT_SECS` environment
+  variable (large generated files and WAN proxies legitimately exceed the
+  default; a hard-coded bound would kill healthy ops with no escape hatch
+  *[amended 2026-08-20, blind-review finding]*), and injectable in tests
+  without wall-clock waits. A hung or unreachable server fails the op
+  instead of wedging the tool handler. All FR-10/FR-11 failures map onto
+  EXISTING `VcsError` variants — no trait-crate change, keeping the
+  Dependencies claim consistent.
 - **FR-12**: A hermetic test harness provisions a throwaway local `p4d`
   server + client workspace per test (mirroring the git provider's
   git-CLI fixture harness), and auto-skips with an `eprintln!` setup hint
@@ -150,6 +179,13 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   the queried file; on case-sensitive servers matching stays exact. A
   casing mismatch on an insensitive server must never produce a false
   not-in-view unavailability.
+- **FR-15**: Every local or depot path placed in a `p4` argv is
+  filespec-encoded first: `@` → `%40`, `#` → `%23`, `%` → `%25`, `*` →
+  `%2A` (Perforce's reserved revision/wildcard characters). A file named
+  `foo@2x.png` or `bar#1.cpp` must round-trip through `where`, `print`,
+  `annotate`, and `changes` correctly — unencoded, `p4` would parse the
+  suffix as a revision spec and silently resolve the wrong file
+  *[added 2026-08-20, blind-review finding]*.
 
 ### Non-Functional Requirements
 - **NFR-01**: D-0004/D-0015 conformance: the dependency graph gains no
@@ -158,19 +194,24 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   in the new crate.
 - **NFR-02**: The provider builds and its unit tests pass on Windows,
   Linux, and macOS; the `p4d` harness runs on at least Windows and Linux
-  natively.
+  natively. AC-10's case-SENSITIVE arm is Linux-only by construction
+  (Windows `p4d` is case-insensitive unconditionally) and is gated
+  accordingly rather than claimed cross-platform *[noted 2026-08-20,
+  blind-review finding]*.
 - **NFR-03**: Workspace conventions hold: no `tracing` dependency
   (`eprintln!` for out-of-handler warnings), blocking subprocess work
   inside `spawn_blocking`, crate listed in the workspace map with its
   responsibility line.
 - **NFR-04**: Per-call subprocess overhead is accepted as the cost of
-  D-0015 (no persistent connection); the provider must not spawn more than
-  one `p4` process per trait-op call except (a) blame's single batched
-  metadata join and (b) the per-path depot-mapping call, which must be
-  cached per path so repeat ops on the same file do not respawn it
-  *[amended 2026-08-20, same design-review finding as FR-08]*, and
-  `symbol_history`'s window walk must reuse the existing fingerprint
-  sidecar cache rather than re-blaming.
+  D-0015 (no persistent connection); the provider must not spawn more
+  than one `p4` process per trait-op call except the enumerated,
+  individually-cached auxiliaries *[re-amended 2026-08-20 to close the
+  blind-review undercount]*: (a) blame's single batched metadata join,
+  cached per provider instance; (b) the per-path depot-mapping call,
+  cached per path; (c) the one-time `p4 info` probe, cached per provider
+  lifetime; (d) blame-at-default's revision resolution (one
+  `p4 changes -m1` when `at: None`). `symbol_history`'s window walk must
+  reuse the existing fingerprint sidecar cache rather than re-blaming.
 
 ## User Stories
 - As an engineer in a Perforce-hosted codebase (UE-style depot), I ask
@@ -213,7 +254,8 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   evidence); the new crate carries `#![forbid(unsafe_code)]`.
 - **AC-07**: An authentication-failure fixture run maps to the
   `p4 login`-naming error; a connection-refused fixture run maps to the
-  connection error; a deliberately hung listener trips the FR-11 timeout.
+  connection error; a deliberately hung listener trips the FR-11 timeout
+  (via the test-injectable timeout, not a wall-clock wait).
 - **AC-08**: `make verify` passes on a machine with no Perforce binaries
   installed: the harness auto-skips with the setup hint and no test fails.
 - **AC-09**: In a working tree that satisfies both detectors (a git
@@ -223,8 +265,19 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
 - **AC-10**: Against a case-insensitive fixture server (`p4d -C1`), a
   query path whose casing differs from the depot's stored casing still
   blames successfully (FR-14); the same mixed-casing query against a
-  case-sensitive fixture reports not-in-view unavailability, exercising
-  both matching modes.
+  case-sensitive fixture (Linux-only arm — Windows `p4d` cannot run
+  case-sensitive) reports not-in-view unavailability, exercising both
+  matching modes.
+- **AC-11**: `resolve_rev` with a numeric changelist that does not exist
+  as a submitted changelist on the fixture server (too high, pending, or
+  deleted) returns the FR-05 bad-spec error — never a silent
+  nearest-earlier resolution; blame at that spec is a tool error naming
+  it *[added 2026-08-20, blind-review finding]*.
+- **AC-12**: A fixture file whose name contains Perforce reserved
+  characters (`@`, `#`, `%`) submits, resolves through `where`, blames,
+  and reads back byte-identically via the FR-15 encoding; the same
+  operations without encoding would misparse — the test pins the encoded
+  argv *[added 2026-08-20, blind-review finding]*.
 
 ## Constraints
 - The `p4` executable is user-provided; the provider never downloads,
@@ -234,6 +287,11 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
 - Attribution reflects submitted state only; pending edits in the client
   workspace surface through the existing staleness channel
   (`stale`/`stale_reason`), not through pending-changelist inspection.
+- RCS keyword expansion (`+k`/`ktext` file types): `read_at` must fetch
+  with keyword expansion SUPPRESSED (`p4 print -k`, pinned by fixture
+  capture) so that `$Id$`/`$Change$` churn does not turn every submit
+  into a spurious `symbol_history` `modified` transition for symbols
+  containing keyword text *[added 2026-08-20, blind-review finding]*.
 - External contract pin: `p4 -G`/`-ztag` output shapes and the
   `annotate`/`filelog`/`print`/`changes`/`where` semantics are pinned to
   the Perforce Helix Core 2025.1 command reference

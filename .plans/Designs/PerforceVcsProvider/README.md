@@ -116,14 +116,20 @@ sequenceDiagram
     X-->>P: depot path row (FR-14 casing)
     P->>X: p4 -G annotate -c -q <depot>@<CL>
     X-->>P: per-line introducing changelists
-    P->>X: p4 -G changes -l <depot>@<=CL   (single batched join, FR-08)
+    P->>X: p4 -G changes -l <depot> (bounded at CL; single batched join, FR-08)
     X-->>P: CL -> (user, time, desc) table
     P-->>H: Vec<BlameHunk> (clipped, file order, non-overlapping)
 ```
 
-- `resolve_rev`: `p4 -G changes -m1 -s submitted <spec>` (or the client
-  view default when `spec` is the provider-default request) → CL number →
-  `RevId` (PerforceVcsProvider:FR-05).
+- `resolve_rev`: `p4 -G changes -m1 -s submitted <spec>` → CL number →
+  `RevId` (PerforceVcsProvider:FR-05). Numeric specs are verified
+  EXACT — the returned CL must equal the requested number, else the
+  bad-spec error (`@CL`'s native at-or-before semantics are accepted for
+  `@date` forms only). The provider-default revision is the workspace
+  HAVE state: `p4 -G changes -m1 -s submitted //<client>/...#have`
+  (client name from the `DD-6` probe) — the true `HEAD` analog; server
+  tip was rejected because synced-behind-tip workspaces (the UE norm)
+  would report `stale` on nearly every file.
 - `revisions_touching`: `p4 -G changes -m <limit> -l <depot path>` —
   already newest-first in p4's output, mapped 1:1 onto `RevisionWindow`
   with `truncated: false` unless the provider imposed its own bound
@@ -131,9 +137,15 @@ sequenceDiagram
   (PerforceVcsProvider:FR-06).
 - `read_at`: raw `p4 print -q <depot>@<CL>` WITHOUT `-G` — bytes pass
   through untouched (`DD-3`, PerforceVcsProvider:FR-07).
-- `blame` with `lines: None` annotates the whole file; `at: None` first
-  resolves the provider-default revision exactly as FR-05 defines it
-  (PerforceVcsProvider:FR-08).
+- `blame` with `lines: None` annotates the whole file; a range past EOF
+  at the blamed revision clips to EOF (git parity, never an error);
+  `at: None` first resolves the provider-default revision exactly as
+  FR-05 defines it — one additional `p4 changes -m1` spawn, counted in
+  the spec's enumerated budget (PerforceVcsProvider:FR-08).
+- Every local or depot path entering an argv passes through filespec
+  encoding first (`@`→`%40`, `#`→`%23`, `%`→`%25`, `*`→`%2A`,
+  PerforceVcsProvider:FR-15) — owned by `exec`'s argv builder so no call
+  site can bypass it.
 
 ### Interfaces
 - Public surface: `P4Provider::open(&Path) -> Result<P4Provider, VcsError>`
@@ -162,9 +174,15 @@ timeout via `try_wait` poll loop (50ms cadence) with explicit
 **Decision:** (b), with MANDATORY concurrent output draining: stdout and
 stderr are each drained to completion by a dedicated reader thread
 spawned immediately after the child, while the spawning thread runs the
-`try_wait` poll loop. The kill path fires on deadline; the reader
-threads are then joined (pipe EOF follows the kill), and only then is
-status + output assembled.
+`try_wait` poll loop. The kill path fires on deadline; the reader-thread
+joins after a kill are themselves BOUNDED (a grandchild — the harness's
+`rsh:`-spawned `p4d`, or a `.cmd` test stub whose tree TerminateProcess
+does not kill — can hold the write ends open past the parent's death;
+on join-timeout the pipe handles are dropped and the threads abandoned,
+never hanging the handler). The timeout is 30 seconds by default,
+overridable via `CODE_GRAPH_P4_TIMEOUT_SECS`, and carried as a field on
+the exec context so tests inject milliseconds instead of wall-clock
+waits (PerforceVcsProvider:FR-11).
 **Rationale:** Matches NFR-03's letter and the git provider's execution
 shape exactly; adds zero dependencies ((c) rejected for a new dep that a
 20-line poll loop replaces; (a) rejected because it moves process
@@ -174,8 +192,13 @@ that spawned it). The reader threads are load-bearing, not a nicety:
 without them any child producing more than the OS pipe buffer (~64KB —
 every real `p4 print`, every long `changes -l`) deadlocks against the
 undrained pipe, and the timeout would kill a healthy operation and
-misreport it as a hang (review finding). Timeout constant: 30 seconds
-per invocation, uniform across ops (FR-11's "order tens of seconds").
+misreport it as a hang (review finding). Residual risk, accepted
+explicitly: an abrupt daemon exit mid-op (crash, idle-timeout race)
+orphans an in-flight `p4` child — tokio shutdown does not wait for
+`spawn_blocking` threads, and `kill_on_drop` was rejected above. The
+orphan is bounded (the child dies at its own network timeout) and
+write-free; process-group/Job-Object containment is deliberately not
+built for it.
 
 ### DD-2 — Hand-rolled marshal subset parser, no fallback implementation
 **Context:** PerforceVcsProvider:FR-04 requires structured parsing without
@@ -208,9 +231,16 @@ stores them, which matches the git provider's read-at-revision semantics
 ### DD-4 — Blame metadata join: single `p4 changes -l` over the depot path
 **Context:** PerforceVcsProvider:FR-08 fixed the join at one batched call
 (user resolution 2026-08-20).
-**Decision:** `p4 -G changes -l <depot>@<=CL` — every submitted CL in the
-file's history up to the blamed revision, keyed into a `CL -> Commit`
-map; annotate rows join against it.
+**Decision:** one batched `p4 -G changes -l` over the depot path bounded
+at the blamed revision (argv spelling provisional until fixture-captured
+— `@CL` is at-or-before natively; `@<=CL` is NOT a real revspec, see
+fixture item 1) — every submitted CL in the file's history up to the
+blamed revision, keyed into a `CL -> Commit` map; annotate rows join
+against it. The map is cached per provider instance keyed on the depot
+path (PerforceVcsProvider:FR-08's amended budget): `symbol_history`'s
+walk blames one file repeatedly, and refetching a decades-long `changes
+-l` history per call is both the latency and the timeout hazard the
+blind review named.
 **Rationale:** Without `-I` (DD-5), `annotate -c` only ever attributes to
 changelists present in that file's own revision history, so the file's
 `changes` list is a complete join table by construction — no per-CL
@@ -261,18 +291,26 @@ directory. Skip logic: `which p4 && which p4d` at harness init, else
 ### DD-8 — Error classification: ordered stderr-pattern table onto existing variants
 **Context:** PerforceVcsProvider:FR-10/FR-11 require distinct actionable
 errors; the spec pins mapping onto existing `VcsError` variants.
-**Decision:** an ordered table checked top-down against combined
-stderr+marshal `data` fields, each row naming its target `VcsError`
-variant explicitly (the tool layer's rendering is variant-sensitive):
+**Decision:** classification keys PRIMARILY on `p4 -G`'s structured
+error records — marshal dicts with `code: "error"` carrying numeric
+`severity` and `generic` fields, stable across server versions and
+locales — with English stderr text as the fallback signal only for
+failures that never reach marshal output (spawn failure, kill, a
+non-`-G` `print` invocation) (PerforceVcsProvider:FR-10, blind-review
+finding: 2025.1-pinned English spellings misclassify on older servers,
+silently converting `symbol_history` `removed` transitions into
+`skipped`). Each row names its target `VcsError` variant explicitly
+(the tool layer's rendering is variant-sensitive):
 
-| Signal | Variant |
+| Signal (structured code first, text fallback) | Variant |
 |---|---|
-| `not in client view` / out-of-view `where` result / no Perforce config | `Unavailable` — success-shaped rendering (PerforceVcsProvider:FR-09) |
+| out-of-view `where` result / `not in client view` / no Perforce config | `Unavailable` — success-shaped rendering (PerforceVcsProvider:FR-09) |
 | `no such file(s)` at a revision (read_at/annotate absence) | `NotFound` — `symbol_history`'s `removed` transitions depend on distinguishable absence, exactly the git provider's absence-at-revision contract |
 | unresolvable revision spec (PerforceVcsProvider:FR-05) | `NotFound` naming the bad spec (git parity) |
 | session expired / password invalid | `Operation` naming `p4 login` |
+| SSL trust not established (first `ssl:` contact) | `Operation` naming `p4 trust` |
 | connect failure | `Operation` naming the endpoint |
-| DD-1 timeout kill | `Operation` naming the command and the 30s bound |
+| DD-1 timeout kill | `Operation` naming the command and the resolved timeout |
 | spawn failure (no `p4` on PATH) | `Operation` naming the missing executable |
 | unmatched | `Operation` with the raw first stderr line |
 
@@ -284,35 +322,51 @@ deliberate variant discipline (its absence-at-revision path routes
 `NotFound` into the success-shaped "no history" rendering), so the tool
 layer needs zero changes.
 
-### DD-10 — Per-path depot-mapping cache (spawn-budget conformance)
-**Context:** PerforceVcsProvider:FR-08's amended spawn budget (annotate +
-batched join + a cached mapping call) and PerforceVcsProvider:NFR-04's
-one-spawn-per-op rule with two named exceptions. An uncached `p4 where`
-per op would put every `read_at` and `revisions_touching` at two spawns
-permanently.
-**Decision:** `P4Provider` holds a `Mutex<HashMap<PathBuf, DepotMapping>>`
-(key normalized under the FR-14 casing rule; value = depot path or an
-out-of-view marker). One `where` spawn per distinct path per provider
-lifetime; steady-state ops are single-spawn (plus blame's join).
-**Rationale:** The client view is fixed for the life of a bound provider
-(a view changed mid-daemon is the same accepted-staleness class as
-DD-6's `caseHandling`); caching negatives keeps repeated unavailability
-probes (history walks over a deleted path) from respawning. The cache is
-per-instance and never persisted — a daemon restart re-resolves.
-
 ### DD-9 — Provider bound to one root; detect is identity + config presence
 **Context:** `GitProvider::detect` is an identity check against its bound
 root (phase-gate F1 lesson: a yes-for-any-tree provider hijacks the
 registry). PerforceVcsProvider:FR-02 defines offline detection signals.
 **Decision:** `P4Provider::open(root)` succeeds only when the FR-02
-signals are present at construction time (`.p4config` on the upward walk
-per `P4CONFIG`, or `P4PORT`+`P4CLIENT` env); `detect(tree)` re-checks
+signals are present at construction time (`.p4config` on the upward
+walk per `P4CONFIG`, or `P4PORT`+`P4CLIENT` discoverable from env /
+`P4ENVIRO` / the Windows registry per FR-02); `detect(tree)` re-checks
 those signals AND that `tree` resolves into the bound root — same
-identity discipline as git.
+identity discipline as git. For the env-var-only branch (no on-disk
+marker exists) the bound root's boundary IS the construction root: a
+`tree` is "inside" when it path-resolves under the root the binary
+opened the provider at. This is weaker than git's discovered-workdir
+identity and is documented as such — the offline constraint forbids
+consulting the client root from `p4 info` at detect time. The FR-02
+signal sources are read through an injectable lookup (a small trait
+over env/file/registry reads) so the detection test matrix runs
+without process-global `std::env::set_var` mutation (unsafe in edition
+2024, races parallel tests — blind-review finding).
 **Rationale:** Keeps registry semantics uniform across providers and
 makes PerforceVcsProvider:AC-09's dual-marker behavior a pure
 registration-order question (FR-13) instead of a detection-strength
 contest.
+
+### DD-10 — Per-path depot-mapping cache (spawn-budget conformance)
+**Context:** PerforceVcsProvider:FR-08's enumerated spawn budget and
+PerforceVcsProvider:NFR-04's one-spawn-per-op rule with enumerated
+cached auxiliaries. An uncached `p4 where` per op would put every
+`read_at` and `revisions_touching` at two spawns permanently.
+**Decision:** `P4Provider` holds a `Mutex<HashMap<PathBuf, DepotMapping>>`
+(key normalized under the FR-14 casing rule; value = depot path or an
+out-of-view marker). At most one cached SUCCESS per path — two
+concurrent first-touch ops may race to a duplicate `where` spawn, which
+is harmless and explicitly permitted (the mutex is not held across the
+subprocess). Out-of-view results are cached (negative cache);
+TRANSIENT failures (connect, timeout, auth) are NEVER cached — a dead
+server must not poison the map for the provider's lifetime. Ordering:
+the `DD-6` `p4 info` probe completes before the first cache-key
+normalization, so keys are folded under the correct `caseHandling` from
+the first entry.
+**Rationale:** The client view is fixed for the life of a bound provider
+(a view changed mid-daemon is the same accepted-staleness class as
+DD-6's `caseHandling`); caching negatives keeps repeated unavailability
+probes (history walks over a deleted path) from respawning. The cache is
+per-instance and never persisted — a daemon restart re-resolves.
 
 ## Error Handling
 - **Detection-time:** `open()` returning `Unavailable` is silent (provider
@@ -342,8 +396,11 @@ contest.
   truncated stream (error), non-UTF-8 bytes in values (lossy decode at
   the edge only).
 - **Classification unit tests** (no binaries): the `DD-8` table against
-  captured stderr fixtures — expired ticket, bad P4PORT, no-such-file,
-  missing executable, localized/unknown fall-through.
+  captured MARSHAL ERROR RECORDS (`code: "error"` dicts with
+  `severity`/`generic` — the primary signal) plus stderr-text fixtures
+  for the fallback rows — expired ticket, bad P4PORT, no-such-file,
+  trust-not-established, missing executable, localized/unknown
+  fall-through.
 - **Detection tests** (no binaries): FR-02 signal matrix including the
   poison-`p4`-on-PATH guard proving no spawn occurs
   (PerforceVcsProvider:AC-03), and the `DD-9` identity check.
@@ -353,8 +410,13 @@ contest.
   (symbol_history transitions via the tool layer against a p4-backed
   fixture), AC-05 (out-of-view path), AC-07 (auth failure via
   `P4PASSWD`-protected fixture; connect failure via dead endpoint;
-  timeout via a stub `p4` script that sleeps), AC-09 (dual-marker
-  registry order), AC-10 (`p4d -C1` casing matrix per FR-14).
+  timeout via the `DD-1` injectable bound — milliseconds, no wall-clock
+  wait), AC-09 (dual-marker registry order), AC-10 (`p4d -C1` casing
+  matrix per FR-14; the case-SENSITIVE arm is `#[cfg(unix)]` — Windows
+  `p4d` cannot run case-sensitive, per the spec's NFR-02 note), AC-11
+  (nonexistent numeric CL → bad-spec error, PerforceVcsProvider:FR-05),
+  and AC-12 (reserved-character filename round-trip,
+  PerforceVcsProvider:FR-15).
 - **Trait-conformance parity:** reuse `code-graph-vcs`'s existing
   registry tests' shape for ordering (AC-09) at the injection sites.
 - **Platform matrix (PerforceVcsProvider:NFR-02):** the binary-free
@@ -371,22 +433,36 @@ contest.
 - **Fixture-capture verification items** (spec Constraints: output
   behavior derives from captured `p4d` output, never memory — each
   becomes a pinned fixture assertion during implementation):
-  1. The changes-revspec spelling for "at or before CL" (`@<=CL` vs the
-     range form `@0,@CL`) — `DD-4`'s argv is provisional until captured.
+  0. `p4 -G annotate -c -q`'s FULL record shape — per-line vs. per-range
+     records, field names, `-q`/`-c` interaction with `-G`, the
+     zero-revisions-at-CL case, the deleted-at-revision case, and the
+     line-range clipping ground truth. The core of blame and
+     historically the least dict-per-object-like `-G` output; capturing
+     it is item ZERO for a reason (blind-review finding).
+  1. The changes-revspec spelling for "at or before CL" (`@CL` is
+     at-or-before natively; `@<=CL` is NOT a real revspec; the range
+     form `@0,@CL` is the candidate alternative) — `DD-4`'s argv is
+     provisional until captured.
   2. `DD-4`'s join-table completeness against a branched/integrated
      file.
-  3. `p4 print -q` byte fidelity for text-type files with CRLF content,
-     on Windows AND Linux, against the submitted bytes
-     (PerforceVcsProvider:FR-07) — if client-side line-ending
-     translation is observed, the design is amended with the mitigation
-     before implementation proceeds.
+  3. `p4 print -q -k` byte fidelity for text-type files with CRLF
+     content, on Windows AND Linux, against the submitted bytes
+     (PerforceVcsProvider:FR-07) — `-k` suppresses RCS keyword
+     expansion per the spec's ktext constraint (spelling provisional
+     until captured); if client-side line-ending translation is
+     observed, the design is amended with the mitigation before
+     implementation proceeds.
   4. The provider-default revision argv, provisionally
-     `p4 -G changes -m1 -s submitted //<client>/...` with the client
-     name from the cached `p4 info` probe (a bare `changes -m1` is
-     server-wide, not view-scoped).
+     `p4 -G changes -m1 -s submitted //<client>/...#have` with the
+     client name from the cached `p4 info` probe (a bare `changes -m1`
+     is server-wide, not view-scoped; `#have` is the workspace HAVE
+     state per PerforceVcsProvider:FR-05).
   5. `-s submitted` passed uniformly on every `changes` invocation
      (resolve_rev, revisions_touching, blame join) unless capture shows
      a filespec already excludes pending changes.
+  6. The marshal ERROR-record fields (`severity`/`generic` values) for
+     each `DD-8` row that has a structured signal, captured per class
+     against the fixture server.
 
 ### Structural Verification
 - `#![forbid(unsafe_code)]` (PerforceVcsProvider:NFR-01) — enforced at
