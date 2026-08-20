@@ -15,13 +15,13 @@ tasks:
     verification: "cargo test -p code-graph-graph persist and cargo test -p code-graph-lang resolve (substring filters — the suites live in in-file tests modules, so a module-path :: filter would select zero; wording corrected at completion per the phase-6/7 filter-drift lesson) — an edge resolved from a single candidate records 1; an edge resolved from N same-named candidates records N; the value survives a cache save/load round-trip; CACHE_VERSION is bumped and an older cache is silently re-indexed rather than misread (existing version-mismatch path); make verify passes."
   - id: "9.2"
     title: "Surface candidate count on the edge-reporting tools"
-    status: in-progress
+    status: complete
     justifies: "FR-48, AC-57. Storing the count without exposing it satisfies nothing — AC-57 requires a caller to distinguish 'one candidate, unambiguous' from 'five candidates, one picked by scope rule' without another query."
     verification: "cargo test -p code-graph-tools — get_callers, get_callees, find_path, and generate_diagram each expose the count on the edges they report; a caller can tell a 1-candidate edge from an N-candidate one in a single response (AC-57); existing response snapshots are rebaselined deliberately and the change is additive, so a client reading only today's fields still parses."
     depends_on: ["9.1"]
   - id: "9.3"
     title: "Retire or demote the binary confidence tag on the wire"
-    status: planned
+    status: in-progress
     justifies: "D-0007, FR-23. Once N is available, carrying both N and a derived one-bit tag gives an agent two overlapping signals and invites it to reason from the weaker one. Leaving both is the outcome D-0007 exists to prevent."
     verification: "Review each wire type that currently carries a binary confidence tag and either remove it or document why both are needed; cargo test -p code-graph-tools passes with the resulting shapes; CLAUDE.md's Response shapes section and every affected tool description state what the count means and how it relates to min_confidence filtering (NFR-11)."
     depends_on: ["9.2"]
@@ -81,20 +81,39 @@ Defaulting the count to 0 or 1 for edges written before the bump, to avoid the v
 ## 9.2: Surface candidate count on the edge-reporting tools
 
 ### Subtasks
-- [ ] Expose the count on `get_callers` and `get_callees` hops
-- [ ] Expose it on `find_path` hops
-- [ ] Expose it on `generate_diagram` edges
-- [ ] Rebaseline the affected response snapshots deliberately, confirming each change is additive
-- [ ] Update CLAUDE.md's Response shapes section
+- [x] Expose the count on `get_callers` and `get_callees` hops
+- [x] Expose it on `find_path` hops
+- [x] Expose it on `generate_diagram` edges
+- [x] Rebaseline the affected response snapshots deliberately, confirming each change is additive
+- [x] Update CLAUDE.md's Response shapes section
 
 ### Notes
 Revision boundary: every tool that reports a resolved edge reports how contested it was.
 
 Additive fields only — a client reading today's fields must keep parsing. This is the phase where the snapshots legitimately move, so review each diff rather than accepting in bulk.
 
+**Shape decisions made at implementation.** `CallChain.candidates` is a plain `u32` (every hop was reached by a real traversed edge). `PathHop.candidates` is `Option<u32>` mirroring `entered_by`'s convention EXACTLY — `null` only for `hops[0]`, which no edge reached. `DiagramEdge.candidates` is `Option<u32>` with `skip_serializing_if`: present on `symbol=` call edges, ABSENT (not `null`) on `file=`/`class=` edges, which come from the include map and the name-keyed hierarchy walk and carry no resolver metadata — deliberately the same boundary `min_confidence` already draws. `find_overrides` inherits the field through `CallChain` (declarative edges report 1). All eight snapshot diffs were reviewed individually: purely additive.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `a7631c5f5d46b07c6965129bce0770c1f4c0bb5c`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-20 10:08 matched `a7631c5f5d46b07c6965129bce0770c1f4c0bb5c`
+- Focused review: `git show a7631c5f5d46b07c6965129bce0770c1f4c0bb5c`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `a7631c5f5d46b07c6965129bce0770c1f4c0bb5c`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools --test candidate_count && cargo test -p code-graph-tools --test snapshot_responses` | `.` | PASS (`exit 0`) | `4 new tests pin AC-57 end to end on one fixture (two same-named definitions vs one unique helper): get_callees distinguishes 1 from 2 in a single response; get_callers carries the contested count through reverse adjacency; find_path hops mirror entered_by's null-for-source convention; generate_diagram symbol-mode edges report the real N. All 59 response snapshots green after the 8 deliberate rebaselines.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `snapshot rebaseline review` | `8 .snap diffs, each read individually` | PASS | `Every diff is purely additive: candidates: 1 on the fixture's unambiguous hops/edges, null on find_path's source hop (mirroring entered_by), no field removed or reordered — a client reading only pre-phase fields still parses.` |
+| `focused diff review` | `git show a7631c5` | PASS | `12 files: the three wire types gain the field with doc comments naming FR-48/D-0007 and the None conventions; the Dijkstra bookkeeping record carries the count alongside confidence so both stamp from the same traversed edge; the file=/class= diagram arms document WHY the field is absent there; no query logic changed — the diff is field plumbing, snapshots, tests, and docs.` |
 
 ## 9.3: Retire or demote the binary confidence tag on the wire
 
