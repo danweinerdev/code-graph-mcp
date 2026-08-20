@@ -21,7 +21,7 @@ tasks:
     depends_on: ["9.1"]
   - id: "9.3"
     title: "Retire or demote the binary confidence tag on the wire"
-    status: in-progress
+    status: complete
     justifies: "D-0007, FR-23. Once N is available, carrying both N and a derived one-bit tag gives an agent two overlapping signals and invites it to reason from the weaker one. Leaving both is the outcome D-0007 exists to prevent."
     verification: "Review each wire type that currently carries a binary confidence tag and either remove it or document why both are needed; cargo test -p code-graph-tools passes with the resulting shapes; CLAUDE.md's Response shapes section and every affected tool description state what the count means and how it relates to min_confidence filtering (NFR-11)."
     depends_on: ["9.2"]
@@ -118,19 +118,40 @@ Additive fields only — a client reading today's fields must keep parsing. This
 ## 9.3: Retire or demote the binary confidence tag on the wire
 
 ### Subtasks
-- [ ] Inventory every wire type carrying a binary confidence tag
-- [ ] For each, remove it or record why both signals are warranted
-- [ ] Keep `min_confidence` as a *filter* — it is an input, and unaffected
-- [ ] Update CLAUDE.md and every affected tool description
+- [x] Inventory every wire type carrying a binary confidence tag
+- [x] For each, remove it or record why both signals are warranted
+- [x] Keep `min_confidence` as a *filter* — it is an input, and unaffected
+- [x] Update CLAUDE.md and every affected tool description
 
 ### Notes
 Revision boundary: one signal per concept on the wire.
 
 `min_confidence` stays. It is a request-side filter with a documented spelling and pruning semantics; nothing here changes it. What is under review is the response-side tag that merely restates a count the response now carries.
 
+**Inventory (complete).** Exactly two wire surfaces carry a binary confidence tag: `PathHop.entered_by` (`find_path` hops) and the derived aggregate `FindPathResponse.heuristic_hops`. `CallChain` and `DiagramEdge` never carried one — the count is their FIRST resolver signal, so there is nothing to retire there. `min_confidence` is request-side and unaffected.
+
+**Disposition: demote and document, not remove.** Both fields stay, with the rationale recorded on `PathHop`'s doc (the authoritative statement) and in CLAUDE.md's renamed "Edge confidence and candidate count" section: (a) removing a shipped field breaks the phase's own additive-response AC; (b) the axes are independent by design — suffix-disambiguated includes already emit `Resolved` with count 2, and `Confidence` is `#[non_exhaustive]` precisely so a future type-inference variant can mark a multi-candidate pick as definitively resolved, at which point deriving the tag from the count would be wrong; (c) `heuristic_hops` is the fewest-heuristic-edges tie-break cost — it explains WHY `find_path` chose this path, which per-hop counts cannot replace without re-deriving the tie-break client-side. The DEMOTION is in the agent-facing prose: all four tool descriptions now present `candidates` as the signal to reason from ("N ≥ 2 means the scope rule picked one of N" + the exact `min_confidence` relationship), with the one-bit tag positioned as the filter's mechanism rather than a signal to read. This is the outcome D-0007 prescribes: the indicator that names the next action leads; the derived bit is documented as derived.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `7e581cc5655da7c10d82f5de2d71e96f060ed9d1`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-20 10:46 matched `7e581cc5655da7c10d82f5de2d71e96f060ed9d1`
+- Focused review: `git show 7e581cc5655da7c10d82f5de2d71e96f060ed9d1`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `7e581cc5655da7c10d82f5de2d71e96f060ed9d1`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-tools --test snapshot_tools_list && cargo test -p code-graph-tools` | `.` | PASS (`exit 0`) | `All 33 tools-list snapshots green after the four deliberate description rebaselines (get_callers, get_callees, find_path, generate_diagram); the full code-graph-tools suite passes with the resulting shapes — no wire type changed in this task, only doc comments, descriptions, and the two snapshot surfaces they feed.` |
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, fmt, full workspace tests, snapshots, and plugin mirrors all green.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `wire-type inventory` | `rg Confidence across graph/tools wire structs` | PASS | `Exactly two response-side surfaces carry the one-bit tag: PathHop.entered_by and FindPathResponse.heuristic_hops. CallChain and DiagramEdge never carried one. min_confidence is request-side and unaffected. The keep-both rationale is recorded on PathHop's doc and in CLAUDE.md's 'Edge confidence and candidate count' section; the demotion is in the four tool descriptions, which now lead with candidates and state the exact min_confidence relationship (NFR-11).` |
+| `focused diff review` | `git show 7e581cc` | PASS | `7 files, no behavior change: PathHop doc carries the authoritative three-part disposition (additive contract, independent axes with the suffix-disambiguation precedent and the #[non_exhaustive] future, heuristic_hops as tie-break cost); CLAUDE.md's section renamed and extended with the count bullet and the min_confidence-to-count relationship; each description edit presents the count as the signal to reason from.` |
 
 ## Acceptance Criteria
 
