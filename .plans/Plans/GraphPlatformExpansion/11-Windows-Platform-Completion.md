@@ -21,7 +21,7 @@ tasks:
     verification: "Native Windows process tests exercise named-pipe attachment, forced loopback-TCP fallback and credential rotation, simultaneous startup, binary replacement, idle exit/cache reuse, and repository-local cleanup. Deterministic security-descriptor inspection must prove the runtime state is restricted to the invoking user (owner-only DACL, no inherited ACEs). Cross-account checks — including second-local-account denial — are out of scope per D-0014: the daemon serves one local user's sessions in one local project."
   - id: "11.3"
     title: "Certify Windows paths, feature, and CLI parity"
-    status: deferred
+    status: in-progress
     depends_on: ["11.2"]
     justifies: "NFR-13, AC-60. Windows completion must include path normalization and the entire GraphPlatformExpansion surface, not only daemon startup."
     verification: "After phases 1–9 are complete, a checked matrix maps every completed task and acceptance criterion to a native Windows command/evidence row or an explicit not-applicable rationale. It must include daemon, watcher, cache, analyze queue/job, graph-tool, history, CLI, and Windows-path contracts; all applicable rows and `make verify` pass, and AC-60 receives persisted evidence."
