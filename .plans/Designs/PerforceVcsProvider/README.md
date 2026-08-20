@@ -92,11 +92,14 @@ graph TD
   Values stay `Vec<u8>`; metadata fields decode lossily at the edge
   (`String::from_utf8_lossy`), file content never passes through marshal
   (`DD-3`).
-- **`wherep`** — depot/client path correlation: one `p4 -G where <local>`
-  per op needing a depot path, selecting the un-excluded mapping row;
-  comparisons case-fold when the cached `caseHandling` says `insensitive`
-  (PerforceVcsProvider:FR-14). Out-of-view answers become the trait's
-  unavailability shape (PerforceVcsProvider:FR-09).
+- **`wherep`** — depot/client path correlation: `p4 -G where <local>`,
+  selecting the un-excluded mapping row; comparisons case-fold when the
+  cached `caseHandling` says `insensitive` (PerforceVcsProvider:FR-14).
+  Resolved mappings are cached per path on the provider instance
+  (`DD-10`), so repeat ops on the same file spawn no second `where`;
+  out-of-view answers become the trait's unavailability shape
+  (PerforceVcsProvider:FR-09) and are cached too (negative cache) —
+  `symbol_history`'s window walk probes the same path repeatedly.
 - **`classify`** — the exit-status + stderr pattern table producing
   existing `VcsError` variants only (`DD-8`, PerforceVcsProvider:FR-10).
 
@@ -133,8 +136,10 @@ sequenceDiagram
   (PerforceVcsProvider:FR-08).
 
 ### Interfaces
-- Public surface: `P4Provider::open(&Path) -> Option<P4Provider>` +
-  `impl VcsProvider` (`id() == "perforce"`, frozen —
+- Public surface: `P4Provider::open(&Path) -> Result<P4Provider, VcsError>`
+  (matching `GitProvider::open` exactly: `Unavailable` for the ordinary
+  no-config case, any other error earns the injection sites' existing
+  breadcrumb arm) + `impl VcsProvider` (`id() == "perforce"`, frozen —
   PerforceVcsProvider:FR-01). Nothing else is exported.
 - Environment contract: the child inherits the parent environment
   unmodified (`P4CONFIG`/`P4PORT`/`P4CLIENT`/`P4TICKETS` all flow
@@ -154,14 +159,23 @@ established pattern).
 `kill_on_drop`; (b) `std::process::Command` inside `spawn_blocking`,
 timeout via `try_wait` poll loop (50ms cadence) with explicit
 `child.kill()` on expiry; (c) `wait-timeout` crate.
-**Decision:** (b).
+**Decision:** (b), with MANDATORY concurrent output draining: stdout and
+stderr are each drained to completion by a dedicated reader thread
+spawned immediately after the child, while the spawning thread runs the
+`try_wait` poll loop. The kill path fires on deadline; the reader
+threads are then joined (pipe EOF follows the kill), and only then is
+status + output assembled.
 **Rationale:** Matches NFR-03's letter and the git provider's execution
 shape exactly; adds zero dependencies ((c) rejected for a new dep that a
 20-line poll loop replaces; (a) rejected because it moves process
 lifetime onto the async runtime where a daemon shutdown mid-call could
 orphan the child — the poll loop's kill path is owned by the same thread
-that spawned it). Timeout constant: 30 seconds per invocation, uniform
-across ops (FR-11's "order tens of seconds").
+that spawned it). The reader threads are load-bearing, not a nicety:
+without them any child producing more than the OS pipe buffer (~64KB —
+every real `p4 print`, every long `changes -l`) deadlocks against the
+undrained pipe, and the timeout would kill a healthy operation and
+misreport it as a hang (review finding). Timeout constant: 30 seconds
+per invocation, uniform across ops (FR-11's "order tens of seconds").
 
 ### DD-2 — Hand-rolled marshal subset parser, no fallback implementation
 **Context:** PerforceVcsProvider:FR-04 requires structured parsing without
@@ -248,16 +262,43 @@ directory. Skip logic: `which p4 && which p4d` at harness init, else
 **Context:** PerforceVcsProvider:FR-10/FR-11 require distinct actionable
 errors; the spec pins mapping onto existing `VcsError` variants.
 **Decision:** an ordered table checked top-down against combined
-stderr+marshal `data` fields: session-expired / password-invalid →
-`Operation` naming `p4 login`; connect-failure → `Operation` naming the
-endpoint; timeout (from DD-1's kill path) → `Operation` naming the
-timeout; `no such file(s)` / `not in client view` → the FR-09
-unavailability path; spawn `NotFound` (io kind) → `Operation` naming the
-missing `p4` executable; everything unmatched → generic `Operation` with
-the raw first stderr line.
+stderr+marshal `data` fields, each row naming its target `VcsError`
+variant explicitly (the tool layer's rendering is variant-sensitive):
+
+| Signal | Variant |
+|---|---|
+| `not in client view` / out-of-view `where` result / no Perforce config | `Unavailable` — success-shaped rendering (PerforceVcsProvider:FR-09) |
+| `no such file(s)` at a revision (read_at/annotate absence) | `NotFound` — `symbol_history`'s `removed` transitions depend on distinguishable absence, exactly the git provider's absence-at-revision contract |
+| unresolvable revision spec (PerforceVcsProvider:FR-05) | `NotFound` naming the bad spec (git parity) |
+| session expired / password invalid | `Operation` naming `p4 login` |
+| connect failure | `Operation` naming the endpoint |
+| DD-1 timeout kill | `Operation` naming the command and the 30s bound |
+| spawn failure (no `p4` on PATH) | `Operation` naming the missing executable |
+| unmatched | `Operation` with the raw first stderr line |
+
 **Rationale:** English-pattern matching is the only classification
 signal a subprocess offers; the fall-through design means an unmatched
 localized message degrades to generic, never misclassifies (Non-Goals).
+The `Unavailable`-vs-`NotFound` split mirrors the git provider's
+deliberate variant discipline (its absence-at-revision path routes
+`NotFound` into the success-shaped "no history" rendering), so the tool
+layer needs zero changes.
+
+### DD-10 — Per-path depot-mapping cache (spawn-budget conformance)
+**Context:** PerforceVcsProvider:FR-08's amended spawn budget (annotate +
+batched join + a cached mapping call) and PerforceVcsProvider:NFR-04's
+one-spawn-per-op rule with two named exceptions. An uncached `p4 where`
+per op would put every `read_at` and `revisions_touching` at two spawns
+permanently.
+**Decision:** `P4Provider` holds a `Mutex<HashMap<PathBuf, DepotMapping>>`
+(key normalized under the FR-14 casing rule; value = depot path or an
+out-of-view marker). One `where` spawn per distinct path per provider
+lifetime; steady-state ops are single-spawn (plus blame's join).
+**Rationale:** The client view is fixed for the life of a bound provider
+(a view changed mid-daemon is the same accepted-staleness class as
+DD-6's `caseHandling`); caching negatives keeps repeated unavailability
+probes (history walks over a deleted path) from respawning. The cache is
+per-instance and never persisted — a daemon restart re-resolves.
 
 ### DD-9 — Provider bound to one root; detect is identity + config presence
 **Context:** `GitProvider::detect` is an identity check against its bound
@@ -274,8 +315,10 @@ registration-order question (FR-13) instead of a detection-strength
 contest.
 
 ## Error Handling
-- **Detection-time:** `open()` returning `None` is silent (provider simply
-  not registered) — matching git.
+- **Detection-time:** `open()` returning `Unavailable` is silent (provider
+  simply not registered); other `open()` failures get the injection
+  sites' stderr breadcrumb — the exact match-arm split `main.rs` already
+  applies to `GitProvider::open`.
 - **Op-time:** every failure funnels through `classify` (`DD-8`) into
   existing `VcsError` variants; the tool layer's existing rendering
   (success-shaped unavailability vs. tool error) is unchanged. The
@@ -314,6 +357,36 @@ contest.
   registry order), AC-10 (`p4d -C1` casing matrix per FR-14).
 - **Trait-conformance parity:** reuse `code-graph-vcs`'s existing
   registry tests' shape for ordering (AC-09) at the injection sites.
+- **Platform matrix (PerforceVcsProvider:NFR-02):** the binary-free
+  tiers (marshal, classification, detection) run on Windows, Linux, and
+  macOS unconditionally. The harness tier targets Windows and Linux
+  natively: unix uses `DD-7`'s `rsh:` transport; Windows starts on the
+  documented TCP fallback (ephemeral `p4d -p 127.0.0.1:<picked-port>`)
+  until the first harness spike verifies `rsh:` on Windows p4 builds —
+  whichever the spike settles is recorded back into `DD-7`, and the
+  choice changes no test assertions (transport is a harness detail). A
+  timed-out child on Windows dies via the same `child.kill()` API
+  (TerminateProcess under std), covered by the AC-07 timeout row on
+  both platforms.
+- **Fixture-capture verification items** (spec Constraints: output
+  behavior derives from captured `p4d` output, never memory — each
+  becomes a pinned fixture assertion during implementation):
+  1. The changes-revspec spelling for "at or before CL" (`@<=CL` vs the
+     range form `@0,@CL`) — `DD-4`'s argv is provisional until captured.
+  2. `DD-4`'s join-table completeness against a branched/integrated
+     file.
+  3. `p4 print -q` byte fidelity for text-type files with CRLF content,
+     on Windows AND Linux, against the submitted bytes
+     (PerforceVcsProvider:FR-07) — if client-side line-ending
+     translation is observed, the design is amended with the mitigation
+     before implementation proceeds.
+  4. The provider-default revision argv, provisionally
+     `p4 -G changes -m1 -s submitted //<client>/...` with the client
+     name from the cached `p4 info` probe (a bare `changes -m1` is
+     server-wide, not view-scoped).
+  5. `-s submitted` passed uniformly on every `changes` invocation
+     (resolve_rev, revisions_touching, blame join) unless capture shows
+     a filespec already excludes pending changes.
 
 ### Structural Verification
 - `#![forbid(unsafe_code)]` (PerforceVcsProvider:NFR-01) — enforced at

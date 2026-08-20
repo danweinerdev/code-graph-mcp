@@ -108,8 +108,12 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   `lines: None` blames the whole file; `at: None` blames at the FR-05
   provider-default revision. The metadata join is a SINGLE batched
   `p4 changes` invocation per blame op (per-changelist `describe` calls
-  rejected — resolved 2026-08-20), so blame costs exactly two subprocess
-  spawns. Hunks are clipped to the requested range, in file order,
+  rejected — resolved 2026-08-20). Spawn budget: annotate plus the batched
+  join, plus the depot-path mapping call (`p4 where`), which is cached per
+  path across calls — steady-state blame is two spawns, first touch of a
+  path is three. *[Amended 2026-08-20 during design review: the original
+  "exactly two subprocess spawns" wording did not count the mapping
+  call.]* Hunks are clipped to the requested range, in file order,
   non-overlapping (`BlameHunk` parity with git).
 - **FR-09**: The provider verifies a queried file belongs to its bound
   client workspace via `p4 where` semantics (exclusionary view lines
@@ -161,9 +165,12 @@ Full option analysis: `Research/perforce-vcs-provider.md`.
   responsibility line.
 - **NFR-04**: Per-call subprocess overhead is accepted as the cost of
   D-0015 (no persistent connection); the provider must not spawn more than
-  one `p4` process per trait-op call except where a blame metadata join
-  requires a second call, and `symbol_history`'s window walk must reuse
-  the existing fingerprint sidecar cache rather than re-blaming.
+  one `p4` process per trait-op call except (a) blame's single batched
+  metadata join and (b) the per-path depot-mapping call, which must be
+  cached per path so repeat ops on the same file do not respawn it
+  *[amended 2026-08-20, same design-review finding as FR-08]*, and
+  `symbol_history`'s window walk must reuse the existing fingerprint
+  sidecar cache rather than re-blaming.
 
 ## User Stories
 - As an engineer in a Perforce-hosted codebase (UE-style depot), I ask
