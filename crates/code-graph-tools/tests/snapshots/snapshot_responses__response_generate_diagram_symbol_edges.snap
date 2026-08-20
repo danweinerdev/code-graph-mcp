@@ -1,21 +1,25 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1250
 expression: normalized
 ---
 [
   {
+    "candidates": 1,
     "direction": "calls",
     "from": "Engine::update",
     "label": "calls",
     "to": "clamp"
   },
   {
+    "candidates": 1,
     "direction": "calls",
     "from": "Engine::update",
     "label": "calls",
     "to": "lerp"
   },
   {
+    "candidates": 1,
     "direction": "called_by",
     "from": "main",
     "label": "calls",

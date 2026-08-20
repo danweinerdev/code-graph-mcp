@@ -40,6 +40,18 @@ pub struct CallChain {
     pub file: PathBuf,
     pub line: u32,
     pub depth: u32,
+    /// How many same-named candidates competed for the edge that reached
+    /// this hop (FR-48, D-0007): `1` = unambiguous, `N ≥ 2` = the scope
+    /// rule picked one of N. Copied from the traversed
+    /// [`EdgeEntry::candidates`]. Serde default (1) covers hand-written
+    /// fixtures only — cached graphs re-index across the v11 bump.
+    #[serde(default = "default_candidate_count")]
+    pub candidates: u32,
+}
+
+/// Serde default for [`CallChain::candidates`]: the unambiguous count.
+fn default_candidate_count() -> u32 {
+    1
 }
 
 impl Graph {
@@ -106,6 +118,7 @@ impl Graph {
                         file: entry.file.clone(),
                         line: entry.line,
                         depth: 1,
+                        candidates: entry.candidates,
                     });
                 }
             }
@@ -199,6 +212,7 @@ impl Graph {
                     file: entry.file.clone(),
                     line: entry.line,
                     depth: new_depth,
+                    candidates: entry.candidates,
                 });
                 queue.push_back((entry.target.clone(), new_depth));
             }
@@ -435,6 +449,7 @@ impl Graph {
                             file: entry.file.clone(),
                             line: entry.line,
                             confidence: entry.confidence,
+                            candidates: entry.candidates,
                         },
                     );
                     heap.push(Reverse((new_cost, entry.target.clone())));
@@ -458,6 +473,7 @@ impl Graph {
             file,
             line,
             entered_by: None,
+            candidates: None,
         }
     }
 }
@@ -488,6 +504,7 @@ fn chain_from_incoming(
             file: inc.file.clone(),
             line: inc.line,
             entered_by: Some(inc.confidence),
+            candidates: Some(inc.candidates),
         });
         cursor = inc.parent.clone();
     }
@@ -503,6 +520,9 @@ struct IncomingRecord {
     file: PathBuf,
     line: u32,
     confidence: Confidence,
+    /// Candidate count of the traversed edge, carried alongside the
+    /// confidence so [`chain_from_incoming`] can stamp both onto the hop.
+    candidates: u32,
 }
 
 /// One hop on a path returned by [`Graph::shortest_path`].
@@ -519,6 +539,13 @@ pub struct PathHop {
     pub file: PathBuf,
     pub line: u32,
     pub entered_by: Option<Confidence>,
+    /// How many same-named candidates competed for the traversed edge's
+    /// target (FR-48, D-0007). Mirrors `entered_by`'s convention exactly:
+    /// `None` only for `hops[0]` (the source — no edge was traversed to
+    /// reach it), `Some(n)` for every later hop, copied from the
+    /// traversed [`EdgeEntry::candidates`].
+    #[serde(default)]
+    pub candidates: Option<u32>,
 }
 
 /// Result of a successful [`Graph::shortest_path`] call.

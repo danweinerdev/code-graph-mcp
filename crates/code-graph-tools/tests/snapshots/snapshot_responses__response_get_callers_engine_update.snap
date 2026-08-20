@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 472
 expression: parsed
 ---
 {
@@ -8,6 +9,7 @@ expression: parsed
   "offset": 0,
   "results": [
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/main.cpp",
       "line": 11,

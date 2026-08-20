@@ -108,6 +108,15 @@ pub struct DiagramEdge {
     pub to: String,
     pub label: String,
     pub direction: EdgeDirection,
+    /// How many same-named candidates competed for the traversed call
+    /// edge's target (FR-48, D-0007). Present for `symbol=` mode call
+    /// edges only — `file=` and `class=` diagram edges come from the
+    /// include map and the name-keyed hierarchy walk, which carry no
+    /// resolver metadata today (the same boundary as `min_confidence`,
+    /// which those modes also ignore). Absent (not `null`) when
+    /// inapplicable, so pre-phase-9 consumers keep parsing unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<u32>,
 }
 
 /// BFS traversal result ready for [`DiagramResult::render_mermaid`].
@@ -270,7 +279,7 @@ impl Graph {
         // the per-edge orientation: an adj-arm edge is the seed calling
         // out (`Calls`); a radj-arm edge is an inbound caller of the
         // seed (`CalledBy`), regardless of the requested direction mode.
-        let mut raw_edges: Vec<(String, String, EdgeDirection)> = Vec::new();
+        let mut raw_edges: Vec<(String, String, EdgeDirection, u32)> = Vec::new();
 
         while let Some((curr_id, curr_depth)) = queue.pop_front() {
             if visited.len() >= max_nodes {
@@ -303,6 +312,7 @@ impl Graph {
                             curr_id.clone(),
                             entry.target.clone(),
                             EdgeDirection::Calls,
+                            entry.candidates,
                         ));
                         // Resolved-only filter (mirrors `Graph::bfs` in
                         // callgraph.rs). Unresolved targets are dropped
@@ -349,6 +359,7 @@ impl Graph {
                             entry.target.clone(),
                             curr_id.clone(),
                             EdgeDirection::CalledBy,
+                            entry.candidates,
                         ));
                         // Resolved-only filter; same rationale as the
                         // forward arm above. radj's `target` is the
@@ -396,7 +407,7 @@ impl Graph {
         // fidelity should call `get_callers`/`get_callees`. First
         // occurrence of each label pair wins — no merging, no tiebreak.
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for (from, to, direction) in raw_edges {
+        for (from, to, direction, candidates) in raw_edges {
             // Truncation guard: when max_nodes cuts mid-walk, one
             // endpoint may not be in `visited`. Dropping the edge keeps
             // the rendered graph fully connected through `visited`.
@@ -426,6 +437,7 @@ impl Graph {
                 to: to_label,
                 label: "calls".to_string(),
                 direction,
+                candidates: Some(candidates),
             });
         }
         Some(result)
@@ -531,6 +543,9 @@ impl Graph {
                 to: filename_only(&to),
                 label: "includes".to_string(),
                 direction: EdgeDirection::Calls,
+                // Include edges come from the include map, which carries
+                // no resolver metadata (same boundary as min_confidence).
+                candidates: None,
             });
         }
         Some(result)
@@ -646,6 +661,10 @@ impl Graph {
                 to,
                 label: "inherits".to_string(),
                 direction: EdgeDirection::Calls,
+                // Inheritance edges come from the name-keyed hierarchy
+                // walk, which carries no resolver metadata (same boundary
+                // as min_confidence).
+                candidates: None,
             });
         }
         Some(result)
@@ -1864,6 +1883,7 @@ mod tests {
                 to: "Bar".to_string(),
                 label: "calls".to_string(),
                 direction: EdgeDirection::Calls,
+                candidates: None,
             }],
         };
         let out = dr.render_mermaid("", false);
@@ -1892,6 +1912,7 @@ mod tests {
                 to: "Bar".to_string(),
                 label: "calls".to_string(),
                 direction: EdgeDirection::Calls,
+                candidates: None,
             }],
         };
         let out = dr.render_mermaid("TD", true);
@@ -1923,6 +1944,7 @@ mod tests {
                 to: "Y".to_string(),
                 label: "inherits".to_string(),
                 direction: EdgeDirection::Calls,
+                candidates: None,
             }],
         };
         let out = dr.render_mermaid("BT", false);
@@ -1944,24 +1966,28 @@ mod tests {
                     to: "a".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::Calls,
+                    candidates: None,
                 },
                 DiagramEdge {
                     from: "root".to_string(),
                     to: "b".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::Calls,
+                    candidates: None,
                 },
                 DiagramEdge {
                     from: "a".to_string(),
                     to: "c".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::Calls,
+                    candidates: None,
                 },
                 DiagramEdge {
                     from: "b".to_string(),
                     to: "c".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::Calls,
+                    candidates: None,
                 },
             ],
         };
@@ -1981,6 +2007,7 @@ mod tests {
                 to: "Y".to_string(),
                 label: String::new(),
                 direction: EdgeDirection::Calls,
+                candidates: None,
             }],
         };
         let out = dr.render_mermaid("TD", false);
@@ -2008,12 +2035,14 @@ mod tests {
                     to: "Callee".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::Calls,
+                    candidates: None,
                 },
                 DiagramEdge {
                     from: "Caller".to_string(),
                     to: "Seed".to_string(),
                     label: "calls".to_string(),
                     direction: EdgeDirection::CalledBy,
+                    candidates: None,
                 },
             ],
         };

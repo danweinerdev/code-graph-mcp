@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1546
 expression: parsed
 ---
 {
@@ -9,12 +10,14 @@ expression: parsed
   "hop_count": 1,
   "hops": [
     {
+      "candidates": null,
       "entered_by": null,
       "file": "[testdata]/main.cpp",
       "line": 9,
       "symbol_id": "[testdata]/main.cpp:main"
     },
     {
+      "candidates": 1,
       "entered_by": "resolved",
       "file": "[testdata]/main.cpp",
       "line": 14,

@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 1114
 expression: parsed
 ---
 {
@@ -8,18 +9,21 @@ expression: parsed
   "offset": 0,
   "results": [
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 3,
       "symbol_id": "[testdata]/hub.cpp:callee_000"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 4,
       "symbol_id": "[testdata]/hub.cpp:callee_001"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 5,

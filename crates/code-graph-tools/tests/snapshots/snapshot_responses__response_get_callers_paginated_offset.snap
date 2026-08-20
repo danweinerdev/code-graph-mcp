@@ -1,5 +1,6 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 995
 expression: parsed
 ---
 {
@@ -8,60 +9,70 @@ expression: parsed
   "offset": 50,
   "results": [
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 114,
       "symbol_id": "[testdata]/hub.cpp:caller_050"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 115,
       "symbol_id": "[testdata]/hub.cpp:caller_051"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 116,
       "symbol_id": "[testdata]/hub.cpp:caller_052"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 117,
       "symbol_id": "[testdata]/hub.cpp:caller_053"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 118,
       "symbol_id": "[testdata]/hub.cpp:caller_054"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 119,
       "symbol_id": "[testdata]/hub.cpp:caller_055"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 120,
       "symbol_id": "[testdata]/hub.cpp:caller_056"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 121,
       "symbol_id": "[testdata]/hub.cpp:caller_057"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 122,
       "symbol_id": "[testdata]/hub.cpp:caller_058"
     },
     {
+      "candidates": 1,
       "depth": 1,
       "file": "[testdata]/hub.cpp",
       "line": 123,
