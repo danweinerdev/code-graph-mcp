@@ -3,7 +3,7 @@ title: "Resolver Candidate Count"
 type: phase
 plan: GraphPlatformExpansion
 phase: 9
-status: in-progress
+status: complete
 created: 2026-08-08
 updated: 2026-08-20
 deliverable: "Edges record how many same-named candidates competed for their target, and the tools that report edges surface it — replacing a one-bit heuristic tag with the number a caller can act on."
@@ -155,12 +155,34 @@ Revision boundary: one signal per concept on the wire.
 
 ## Acceptance Criteria
 
-- [ ] **AC-57**: For an edge whose target was selected from N same-named candidates, the reporting tools expose N; a caller distinguishes an unambiguous edge from a contested one without another query (FR-48).
-- [ ] The count survives a cache round-trip, and a pre-bump cache is silently re-indexed rather than misread.
-- [ ] Response-shape changes are additive; a client reading only pre-phase fields still parses.
-- [ ] CLAUDE.md and the affected tool descriptions state what the count means and how it relates to `min_confidence` (NFR-11).
-- [ ] **AC-27**: `make verify` passes (NFR-04).
+- [x] **AC-57**: For an edge whose target was selected from N same-named candidates, the reporting tools expose N; a caller distinguishes an unambiguous edge from a contested one without another query (FR-48). — `candidate_count.rs` drives all four surfaces on one fixture with a real 2-candidate contest (callees 1-vs-2 in a single response; callers through reverse adjacency; find_path hops; diagram edges)
+- [x] The count survives a cache round-trip, and a pre-bump cache is silently re-indexed rather than misread. — `round_trip_preserves_candidate_count` (non-default 3, both adjacency directions); `load_version_mismatch_returns_false`; CACHE_VERSION 11 with the trap explicitly rejected in the field docs
+- [x] Response-shape changes are additive; a client reading only pre-phase fields still parses. — all 12 snapshot rebaselines reviewed individually: insertion-only; `file=`/`class=` diagram output byte-identical via `skip_serializing_if`
+- [x] CLAUDE.md and the affected tool descriptions state what the count means and how it relates to `min_confidence` (NFR-11). — the renamed "Edge confidence and candidate count" section + all four descriptions state "1 = unambiguous, N ≥ 2 = the scope rule picked one of N" and the operational relationship ("`resolved` drops exactly the `candidates ≥ 2` call-edge hops"), verified exactly true against the BFS filter by the spec lane
+- [x] **AC-27**: `make verify` passes (NFR-04). — green at the phase endpoint (all three task evidence rows)
 
 ## Phase Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `824cfa2f74b733f824a7dbfec8627bbd01cab15a`
+- Identity recheck: `git rev-parse 824cfa2` at 2026-08-20 10:58 matched `824cfa2f74b733f824a7dbfec8627bbd01cab15a`
+- Focused review: four-lane frozen gate over `f4b177931ef3ac3a87a09c7d0c331ca887088a1d..824cfa2f74b733f824a7dbfec8627bbd01cab15a` (one cycle, all four lanes PASS/Aligned; sub-material record inaccuracies repaired at the planning revision `0300576`)
+- Reviewed candidate / final: `824cfa2f74b733f824a7dbfec8627bbd01cab15a`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `clippy -D warnings, rustfmt check, full workspace tests (natively on Windows), pending-snapshot check, and plugin-mirror sync all green at the phase endpoint (AC-27); only docs-only commits follow the last verified code commit 7e581cc.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen f4b1779..824cfa2, planning 0300576` | PASS | `All four independent lanes returned PASS/Aligned on the first cycle; residual observations recorded as accepted follow-ups in the review artifact.` |
+
+### Completed task identities
+- `9.1`: `a8d1e2afae7d3b33194009d366e72de75aed0a3a`
+- `9.2`: `a7631c5f5d46b07c6965129bce0770c1f4c0bb5c`
+- `9.3`: `7e581cc5655da7c10d82f5de2d71e96f060ed9d1`
+
+- Final aligned review: `reviews/21-resolver-candidate-count-final-review-f4b1779-824cfa2.md`; frozen: `f4b177931ef3ac3a87a09c7d0c331ca887088a1d..824cfa2f74b733f824a7dbfec8627bbd01cab15a`
