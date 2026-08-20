@@ -5,23 +5,23 @@ plan: GraphPlatformExpansion
 phase: 11
 status: in-progress
 created: 2026-08-11
-updated: 2026-08-18
+updated: 2026-08-20
 deliverable: "Native Windows support across the completed Linux-MVP seams, including named pipes, ACLs, Windows paths, daemon lifecycle, and CLI parity."
 tasks:
   - id: "11.1"
     title: "Activate and repair Windows platform seams"
-    status: in-progress
+    status: complete
     justifies: "NFR-13, AC-60. The Linux MVP retains cfg-gated Windows seams, but cross-compilation cannot establish native tree-sitter toolchain, filesystem, process, or transport correctness."
     verification: "On a native Windows runner with the required MSVC C toolchain, `cargo test --workspace`, workspace clippy with warnings denied, and rustfmt pass; named-pipe/path/process/ACL branches compile and Linux gates remain unchanged."
   - id: "11.2"
     title: "Validate Windows daemon transport, ACL, and lifecycle"
-    status: in-progress
+    status: complete
     depends_on: ["11.1"]
     justifies: "NFR-13, NFR-06, AC-60. Named-pipe ACLs, `icacls`, TCP fallback, replacement, and idle behavior cannot be inferred from Linux UDS tests."
     verification: "Native Windows process tests exercise named-pipe attachment, forced loopback-TCP fallback and credential rotation, simultaneous startup, binary replacement, idle exit/cache reuse, and repository-local cleanup. Deterministic security-descriptor inspection must prove the runtime state is restricted to the invoking user (owner-only DACL, no inherited ACEs). Cross-account checks — including second-local-account denial — are out of scope per D-0014: the daemon serves one local user's sessions in one local project."
   - id: "11.3"
     title: "Certify Windows paths, feature, and CLI parity"
-    status: in-progress
+    status: complete
     depends_on: ["11.2"]
     justifies: "NFR-13, AC-60. Windows completion must include path normalization and the entire GraphPlatformExpansion surface, not only daemon startup."
     verification: "After phases 1–9 are complete, a checked matrix maps every completed task and acceptance criterion to a native Windows command/evidence row or an explicit not-applicable rationale. It must include daemon, watcher, cache, analyze queue/job, graph-tool, history, CLI, and Windows-path contracts; all applicable rows and `make verify` pass, and AC-60 receives persisted evidence."
@@ -85,18 +85,31 @@ own gate; the commit series is the durable identity):
 ## 11.1: Activate and repair Windows platform seams
 
 ### Subtasks
-- [ ] Provision a native Windows runner with Rust and the MSVC tools needed by all six tree-sitter grammars.
-- [ ] Run the complete workspace build/test/lint gates without bypassing native build scripts.
-- [ ] Repair cfg-gated named-pipe, process, filesystem, and ACL code behind existing seams.
-- [ ] Confirm Linux gates remain unchanged after every repair.
+- [x] Provision a native Windows runner with Rust and the MSVC tools needed by all six tree-sitter grammars.
+- [x] Run the complete workspace build/test/lint gates without bypassing native build scripts.
+- [x] Repair cfg-gated named-pipe, process, filesystem, and ACL code behind existing seams.
+- [x] Confirm Linux gates remain unchanged after every repair.
 
 ### Notes
 
 Revision boundary: one natively buildable Windows workspace with all platform branches compiling and Linux behavior preserved. This is a complete internal platform capability; daemon runtime acceptance remains task 11.2.
 
+The work landed in the pull-forward series `ccd9e11..89a2af2` (2026-08-18, detailed in the pull-forward note above); every phase implemented since (5–9) was BUILT on this runner, so the repairs have been continuously re-verified by every subsequent `make verify`. Linux gates: no Linux-gated code was modified by the repairs (cfg-additive throughout); the three Linux-runnable watch-dispatch pins and all `#[cfg(unix)]` suites remain in the workspace set.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series `ccd9e115c8b6242b07d00c21f734c808a23e9baa..89a2af2217bb5d87139fd57d27128908deefad66`); continuously re-verified through `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-20 11:19 matched `ca2e7a847fe64986e56473bb3fee402d629713dd`, which contains the full pull-forward series
+- Focused review: the pull-forward series was reviewed as part of the full-branch adversarial review (artifact 14) and re-exercised by every phase 5–9 gate since
+- Reviewed candidate / final: `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (native Windows, MSVC) | `.` | PASS (`exit 0`) | `clippy --workspace --all-targets -- -D warnings, cargo fmt --all --check, full workspace tests (1,935 passed, 0 failed across all test binaries at ca2e7a8), pending-snapshot check, and plugin-mirror sync — all natively, no cross-compilation, all six tree-sitter grammar build scripts compiled by the native MSVC toolchain (rustc 1.94.1, Windows 10.0.26100.9106).` |
 
 ### Trap
 
@@ -116,27 +129,56 @@ Do not claim success from `cargo check --target ...` on Linux. The grammar build
 
 Revision boundary: native Windows daemon transport/security/lifecycle is fully supported and regression-tested. Keep platform behavior behind the existing listener/client and permission seams rather than branching graph semantics.
 
+The work landed in the pull-forward series `ccd9e11..89a2af2` (CG-OK pipe admission, pipe EOF drain, handle-inheritance seal, captured `icacls`, SID-preferring grants, the DACL inspection test, process-level TCP fallback/auth/rotation via the debug-only forcing seam) and has been continuously re-exercised since: phase 7 added the `--attach-only` proxy mode on the same seams, and the CLI's daemon-parity test spawns a real `--serve` daemon over native named pipes.
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series); continuously re-verified through `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-20 11:19 matched `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Focused review: pull-forward series reviewed under artifact 14's full-branch adversarial review; the daemon suites re-run green natively at the current identity
+- Reviewed candidate / final: `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-mcp` (native Windows) | `.` | PASS (`exit 0`) | `23 unit + 15 daemon_proxy + 9 daemon_serve + 1 smoke, all green natively at ca2e7a8: named-pipe publication/attachment/multi-client/cleanup, CG-OK admission, queue-through-proxy, replacement (grace→drain→hard-kill with owner revalidation), idle exit + final cache save + warm restart, contender convergence, stale-lock recovery via mandatory-lock semantics, graceful stop via shutdown.request, and runtime_directory_dacl_is_restricted_to_the_invoking_user (no inherited ACEs, no broad built-in principals, exactly one grant naming the invoking user). TCP fallback/auth/rotation run at process level via CODE_GRAPH_TEST_FORCE_TCP_ROOT. Cross-account checks out of scope per D-0014.` |
 
 ## 11.3: Certify Windows paths, feature, and CLI parity
 
 ### Subtasks
-- [ ] Run Windows-only verbatim-disk-prefix and UNC boundary tests.
-- [ ] Exercise watch-event path normalization through real Windows notifications.
-- [ ] Build and check an acceptance matrix mapping every completed phases 1–9 task and acceptance criterion to native evidence or a justified not-applicable row.
-- [ ] Run all applicable daemon, watcher, cache, analyze queue/job, graph-tool, history, CLI, and Windows-path rows natively.
-- [ ] Compare representative CLI machine output with MCP payloads on Windows.
-- [ ] Run full `make verify` and persist AC-60 evidence.
+- [x] Run Windows-only verbatim-disk-prefix and UNC boundary tests.
+- [x] Exercise watch-event path normalization through real Windows notifications.
+- [x] Build and check an acceptance matrix mapping every completed phases 1–9 task and acceptance criterion to native evidence or a justified not-applicable row.
+- [x] Run all applicable daemon, watcher, cache, analyze queue/job, graph-tool, history, CLI, and Windows-path rows natively.
+- [x] Compare representative CLI machine output with MCP payloads on Windows.
+- [x] Run full `make verify` and persist AC-60 evidence.
 
 ### Notes
 
 Revision boundary: the complete GraphPlatformExpansion surface is certified on Windows, including native path and CLI behavior. This task waits for the Linux MVP and CLI phases it certifies.
 
+The matrix is persisted at `notes/11-windows-certification-matrix.md`: runner/toolchain/workspace identity, the 1,935-test native umbrella, dedicated rows for the Windows-path contracts (verbatim-disk strip, verbatim-UNC passthrough, PathTrie key semantics, watch dispatch boundary, real-notification watch suites, `normalize_user_path`), daemon transport/security/lifecycle, cache v11, queries, history, fingerprints, and CLI parity (the six-test parity suite mechanizes the "representative CLI output vs MCP payloads" comparison — byte equality through the real adapter on the same fixtures), plus a phase-by-phase task-coverage summary and the two N/A rows with rationale (second-local-account denial per D-0014; design task 7.1 as an artifact).
+
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-20
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-20 11:19 matched `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Focused review: the certification matrix (`notes/11-windows-certification-matrix.md`) cross-checked row by row against the native runs recorded in it, all executed on this runner at this identity
+- Reviewed candidate / final: `ca2e7a847fe64986e56473bb3fee402d629713dd`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (native Windows) | `.` | PASS (`exit 0`) | `1,935 tests passed, 0 failed across all workspace test binaries; clippy -D warnings, fmt, snapshots, plugin mirrors all green (AC-60 umbrella).` |
+| Windows-path rows | `.` | PASS | `cargo test -p code-graph-core simplify_ (3, incl. both #[cfg(windows)] pins); -p code-graph-path-trie windows_ (2); -p code-graph-tools canonicalize_event_path (4, incl. the verbatim-strip pin); --test watch_cpp_macro_strip --test watch_dangling_edges (real ReadDirectoryChangesW notifications); --test path_normalization (2).` |
+| Feature rows | `.` | PASS | `daemon: 23+15+9+1; vcs-git: 14; blame_symbol: 9; symbol_history: 13; candidate_count: 4; persist: 29; analyze_async_lifecycle: 1; fingerprints: 7+6+4+4+4+4.` |
+| CLI parity rows | `.` | PASS | `cargo test -p code-graph-cli: cli (5 — incl. AC-40 byte-identity against a real named-pipe daemon and the attach-only no-contender pin) + parity (6 — AC-11's five response shapes byte-compared between the built code-graph.exe --json output and the real to_call_tool_result adapter path).` |
 
 ## Acceptance Criteria
 
