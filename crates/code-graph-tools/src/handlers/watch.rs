@@ -434,6 +434,29 @@ pub async fn try_reindex_file(
             // Bare derived class names are the canonical form for inherits
             // edges; the graph engine resolves them at hierarchy-query time.
             EdgeKind::Inherits => {}
+            EdgeKind::Overrides => {
+                // Mirror the indexer's Overrides arm (gate artifact 21
+                // follow-up — this arm was missing, so a watch-reindexed
+                // file's override edges kept their bare `Parent::name`
+                // token and find_overrides missed them until the next
+                // analyze). Overrides share resolve_call's lookup: the
+                // token can have same-named candidates in several
+                // ancestor classes, so it carries a real confidence and
+                // count. An unresolved edge survives with its bare `to` —
+                // find_overrides filters via is_resolved_node.
+                let ctx = CallContext {
+                    caller_id: &edge.from,
+                    caller_file: &path_for_ctx,
+                    language: new_fg.language,
+                };
+                if let Some((id, confidence, candidates)) =
+                    plugin.resolve_call(&edge.to, &ctx, &symbol_index)
+                {
+                    edge.to = id;
+                    edge.confidence = confidence;
+                    edge.candidates = candidates;
+                }
+            }
             _ => {}
         }
         true
