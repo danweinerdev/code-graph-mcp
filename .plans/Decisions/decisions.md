@@ -225,6 +225,22 @@ decisions:
       - Designs/RepoLocalDaemon
     tags: [daemon, security, scope, windows]
     reversibility: two-way
+  - id: D-0015
+    kind: decision
+    status: accepted
+    date: 2026-08-20
+    decided_by: user
+    statement: "Perforce support ships as a subprocess CLI provider — a code-graph-vcs-p4 crate spawning the user's p4 executable with structured output and parsing it inside spawn_blocking — not as a p4api -sys binding; spawning p4 adds no linked native library, so D-0004 is untouched, and the -sys route is rejected until latency or connection-reuse evidence demands it, at which point it requires its own ledger decision superseding this one and an explicit D-0004 reconciliation."
+    rejected:
+      - "code-graph-vcs-p4-sys linking Perforce's prebuilt p4api binaries (per-toolchain/OpenSSL matrix, EULA-governed redistribution, mandatory OpenSSL linkage)"
+      - "code-graph-vcs-p4-sys building vendored p4source (~300 C++ translation units under a hand-replicated Jam configuration, vendored zlib/BLAKE3-asm/Lua, and either real OpenSSL linkage or an sslstub build that cannot reach ssl: servers)"
+    rationale: "The publisher API is C++-only (ClientApi/ClientUser virtuals — no C surface), so any -sys crate needs a hand-written shim layer like Perforce's own P4Go; both -sys variants import the OpenSSL and toolchain-matrix burden D-0004 exists to keep out. The subprocess route reuses the user's own p4 for TLS and ticket auth, fits the VcsProvider trait's spawn_blocking shape, matches the precedent of the workspace's captured-output subprocess calls (icacls/whoami) and the git-CLI test fixture harness, and requires zero wire-contract changes (opaque RevId fits changelist numbers; unavailability is already success-shaped). Full analysis: Research/perforce-vcs-provider.md."
+    confirmation: "code-graph-vcs-p4 (when implemented) depends on no Perforce library crate and compiles no Perforce C/C++ source; every Perforce interaction is a captured-output subprocess invocation of a user-provided p4 executable."
+    scope:
+      - Research/perforce-vcs-provider
+      - Specs/GraphPlatformExpansion
+    tags: [vcs, perforce, dependencies, subprocess]
+    reversibility: two-way
 ---
 
 
