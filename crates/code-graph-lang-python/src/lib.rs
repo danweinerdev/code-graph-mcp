@@ -2045,4 +2045,27 @@ mod fingerprint {
             fp(&parser, text_two, "show", FingerprintMode::Normalized),
         );
     }
+
+    /// Gate artifact 20 follow-up: pin the extractor-span boundary for
+    /// decorators, matching the Rust outer-attribute pin. The extractor
+    /// records the inner `function_definition`'s span, so the decorator
+    /// list above it is outside the fingerprinted bytes — a decorator-only
+    /// edit is NOT a `symbol_history` transition under either mode.
+    #[test]
+    fn decorators_are_outside_the_fingerprinted_span() {
+        let parser = PythonParser::new().unwrap();
+        let bare: &[u8] = b"def handler(x):\n    return x\n";
+        let decorated: &[u8] = b"@lru_cache(maxsize=128)\ndef handler(x):\n    return x\n";
+        for mode in [
+            FingerprintMode::Normalized,
+            FingerprintMode::LiteralInsensitive,
+        ] {
+            assert_eq!(
+                fp(&parser, bare, "handler", mode),
+                fp(&parser, decorated, "handler", mode),
+                "decorators wrap the definition node — outside the fingerprinted \
+                 span, same convention as Rust outer attributes ({mode:?})"
+            );
+        }
+    }
 }

@@ -476,7 +476,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 11,
                     confidence: Confidence::Heuristic,
-                    candidates: 1,
+                    candidates: 2,
                 },
             ],
         });
@@ -2351,7 +2351,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 1,
                     confidence: Confidence::Heuristic,
-                    candidates: 1,
+                    candidates: 2,
                 },
                 Edge {
                     from: "/x.cpp:h1".to_string(),
@@ -2360,7 +2360,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 2,
                     confidence: Confidence::Heuristic,
-                    candidates: 1,
+                    candidates: 2,
                 },
             ],
         });

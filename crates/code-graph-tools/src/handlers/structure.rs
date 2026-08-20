@@ -3312,7 +3312,7 @@ mod tests {
                     file: "/x.cpp".to_string(),
                     line: 1,
                     confidence: Confidence::Heuristic,
-                    candidates: 1,
+                    candidates: 2,
                 },
                 call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp"),
             ],

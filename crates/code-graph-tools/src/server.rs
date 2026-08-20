@@ -2032,9 +2032,13 @@ impl CodeGraphServer {
         description = "Find every method that overrides the given (virtual or pure-virtual) \
                        method. Returns the standard `Page<CallChain>` envelope \
                        {results, total, offset, limit, truncated, next_offset}, where each \
-                       row is `{symbol_id, file, line, depth}`. `depth` is always 1 — \
-                       override is a single-step language relation by design; for transitive \
-                       analysis compose `find_overrides` with `get_callers`. Sort is by \
+                       row is `{symbol_id, file, line, depth, candidates}`. `depth` is \
+                       always 1 — override is a single-step language relation by design; \
+                       for transitive analysis compose `find_overrides` with `get_callers`. \
+                       `candidates` is how many same-named definitions competed when the \
+                       override edge's target was resolved (Overrides route through the \
+                       same scope-rule lookup as calls, so a `Parent::name` token contested \
+                       across ancestor classes reports its real N). Sort is by \
                        `symbol_id` ascending. Unknown symbols return the standard \
                        'symbol not found' error with did-you-mean suggestions; a known \
                        method with no overrides returns the empty `Page<CallChain>` \

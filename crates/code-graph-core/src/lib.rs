@@ -175,16 +175,20 @@ pub struct Edge {
     pub confidence: Confidence,
     /// How many same-named candidates competed for `to` when the resolver
     /// picked it (FR-48, D-0007). `1` = unambiguous (sole candidate, or a
-    /// declarative edge — Inherits, Overrides, `mod`-resolved Includes —
-    /// which has exactly one target by construction); `N ≥ 2` = the scope
-    /// rule picked one of N. A count of 1 alongside `Resolved` is
+    /// declarative edge — Inherits, Rust `mod`-resolved Includes — which
+    /// has exactly one target by construction); `N ≥ 2` = the scope rule
+    /// picked one of N. Overrides edges are NOT declarative: they route
+    /// through `resolve_call` like calls (a `Parent::name` token can have
+    /// same-named candidates in several ancestor classes), so they carry
+    /// real counts when contested (gate artifact 21 corrected the
+    /// original framing here). A count of 1 alongside `Resolved` is
     /// meaningful and uniform, which is why this is a sibling field
     /// rather than payload on the `Heuristic` variant. Parse-time edges
-    /// carry the provisional `1`; the resolve pass overwrites call edges
-    /// with the real count. The serde default exists for hand-written
-    /// fixtures only — cache-format safety comes from the CACHE_VERSION
-    /// bump that landed with this field (a pre-bump cache re-indexes; it
-    /// is never read with a guessed count).
+    /// carry the provisional `1`; the resolve pass overwrites resolvable
+    /// edges with the real count. The serde default exists for
+    /// hand-written fixtures only — cache-format safety comes from the
+    /// CACHE_VERSION bump that landed with this field (a pre-bump cache
+    /// re-indexes; it is never read with a guessed count).
     #[serde(default = "default_candidate_count")]
     pub candidates: u32,
 }
