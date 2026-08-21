@@ -280,10 +280,12 @@ optional root after `--serve` means the same thing as the working directory
 for process-listing identity: Windows cannot rename a running image, so the
 argv shown in Task Manager's Details "Command line" column is the only
 per-instance surface — `spawn_contender` passes the root explicitly so every
-daemon names its repo there. Linux/macOS process-TITLE renaming (prctl
-comm + argv[0] rewrite on Linux; no supported API on macOS) is a documented
-no-op seam: `set_process_listing_identity` in `daemon.rs`, markers
-`SEAM(linux-proctitle)` and `SEAM(phase10-macos)`.
+daemon names its repo there. Linux sets its comm name via `prctl(PR_SET_NAME,
+"code-graph-d")` in `set_process_listing_identity_linux` (`daemon.rs`) — what
+`ps -o comm`/`top`/`/proc/<pid>/comm` show; argv/cmdline rewrite is a
+separate, deliberately-unaddressed seam (needs pre-runtime argv-buffer
+capture). macOS process-TITLE renaming remains a documented no-op:
+`set_process_listing_identity` in `daemon.rs`, marker `SEAM(phase10-macos)`.
 
 - **Runtime files** live under `<project_root>/.code-graph/` (gitignored):
   `daemon.lock` (exclusive-create + OS file lock; crash recovery via the OS

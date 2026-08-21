@@ -1811,17 +1811,16 @@ impl Drop for DaemonLock {
 /// "Command line" column (fed by the argv above) is the only
 /// per-instance surface. This arm is deliberately empty.
 ///
-/// SEAM(linux-proctitle): Linux CAN rename a running process in
-/// listings — `prctl(PR_SET_NAME, b"code-graph-d\0")` sets the comm
-/// name (15-byte cap; what `ps -o comm`, `top`, and /proc/<pid>/comm
-/// show), and overwriting the original argv[0] memory region updates
-/// /proc/<pid>/cmdline (what `ps -o args` shows). Implementing it
-/// needs the `libc` crate (or a setproctitle crate) plus a scoped
-/// unsafe block — acceptable in this crate (the Windows handle seal
-/// is the precedent) but deliberately left as a documented no-op
-/// until a Linux session picks it up and can verify against real
-/// `ps`/`top` output. Suggested spelling: comm = "code-graph-d",
-/// cmdline = "code-graph-mcp (daemon: <root basename>)".
+/// SEAM(linux-proctitle) — comm name set via `prctl(PR_SET_NAME, …)`;
+/// what `ps -o comm`, `top`, and /proc/<pid>/comm show (15-byte cap
+/// including the nul terminator, hence the truncated "code-graph-d"
+/// spelling). Left deliberately unaddressed: rewriting /proc/<pid>/cmdline
+/// (what `ps -o args` shows) requires locating and overwriting the
+/// original argv memory region in place, before anything else claims or
+/// moves it — real setproctitle implementations do this via a C
+/// constructor capturing raw argv/environ pointers ahead of the Rust
+/// runtime. That is meaningfully riskier unsafe code than the comm
+/// rename and is left as a follow-up rather than folded in here.
 ///
 /// SEAM(phase10-macos): macOS has no supported setproctitle — Activity
 /// Monitor shows the executable name, `pthread_setname_np` names
@@ -1830,7 +1829,24 @@ impl Drop for DaemonLock {
 /// (the Windows posture) or ships a renamed helper binary; either
 /// answer lands in this function.
 fn set_process_listing_identity(_root: &Path) {
-    // No-op on every platform today; see the per-platform seams above.
+    #[cfg(target_os = "linux")]
+    set_process_listing_identity_linux();
+    // Windows and macOS: no-op: see the per-platform seams above.
+}
+
+/// See [`set_process_listing_identity`]'s `SEAM(linux-proctitle)` doc.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn set_process_listing_identity_linux() {
+    const COMM: &[u8] = b"code-graph-d\0";
+    // SAFETY: `COMM` is a nul-terminated byte string within the 16-byte
+    // (including nul) buffer `PR_SET_NAME` copies from; the pointer is
+    // valid for the duration of this call and the kernel does not retain
+    // it afterward. A failed call (e.g. sandboxed/seccomp-restricted
+    // `prctl`) fails open: the process keeps its default comm name.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, COMM.as_ptr(), 0, 0, 0);
+    }
 }
 
 /// `serve_root` is the optional explicit root passed after `--serve`.
