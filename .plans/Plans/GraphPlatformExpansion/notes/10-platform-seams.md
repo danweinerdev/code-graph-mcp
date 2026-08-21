@@ -9,7 +9,8 @@ the function names and the greppable markers below.
 ## How to find every touch point
 
 ```
-rg -n "SEAM\(phase10-macos\)" crates/          # in-code decision points (8 sites)
+rg -n "SEAM\(phase10-macos\)" crates/          # in-code decision points (9 sites)
+rg -n "SEAM\(linux-proctitle\)" crates/        # Linux process-title seam (1 site)
 rg -n 'cfg\(target_os = "linux"\)' crates/     # Linux-only mechanisms macOS lacks
 rg -n 'cfg\(unix\)' crates/                    # shared POSIX arms macOS inherits
 ```
@@ -37,7 +38,7 @@ Phase 10.1's core question at every seam: does macOS accept tier-2 semantics
 (document it), or does it need a tier-1 equivalent built from macOS
 primitives (kqueue, `F_GETPATH`, `$TMPDIR` sockets)?
 
-## In-code SEAM markers (the 8 macOS decision points)
+## In-code SEAM markers (the 9 macOS decision points)
 
 All in production code, greppable via `SEAM(phase10-macos)`:
 
@@ -51,6 +52,7 @@ All in production code, greppable via `SEAM(phase10-macos)`:
 | 6 | Final cache save, non-linux `None` arm in `run` | same file | Pathname-based save; a root replaced mid-drain writes into the replacement | Exercise and accept, or anchor |
 | 7 | `write_owner_file` non-linux dispatch | same file | Portable `O_EXCL`-create arm, not Linux's serialized temp+rename exchange | Pin the portable arm's concurrency story natively |
 | 8 | `ServerInner::ensure_daemon_root_current` non-linux arm (+ the linux-only unanchored-save refusal in `core/analyze.rs::save_cache`) | `crates/code-graph-tools/src/server.rs`, `crates/code-graph-tools/src/core/analyze.rs` | Unconditional `Ok(())` — replaced daemon root not detected before publish; saves always pathname-based | dev/ino comparison (the `MetadataExt` APIs exist under `cfg(unix)`), or pathname-trust documented |
+| 9 | `set_process_listing_identity` (daemon startup) | `crates/code-graph-mcp/src/daemon.rs` | No-op — process-listing identity rides only in argv (`--serve <root>`), the Windows posture | macOS has no supported setproctitle; accept argv-only identity or ship a renamed helper binary. The companion `SEAM(linux-proctitle)` in the same function is Linux work (prctl PR_SET_NAME + argv[0] rewrite via `libc`), claimable by any Linux session, not gated on phase 10 |
 
 ## Linux-only mechanisms with no macOS counterpart (tier-1 inventory)
 
