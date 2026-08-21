@@ -53,12 +53,13 @@ series, one certification task), two gate cycles, final aligned review at
   once the host flipped to Windows, half the AC became unwitnessable.
   Phase 10 carries the same wording and should be reworded before it
   certifies (recorded in artifact 22).
-- **Open follow-ups** are in artifact 22, led by the Linux
-  re-verification (`make verify` on a Linux runner at or after this
-  identity), then the D-0014 ledger annotation for the DACL
-  substitution, the phase 10 AC reword, the NTFS case pin, the DACL
-  grant-line parse, the 8.3 short-form dedicated pin, and initializing
-  the dogfood submodules on the runner.
+- **Open follow-ups** are in artifact 22. The Linux re-verification
+  (`make verify` on a Linux runner at or after this identity) that led
+  the list is now DONE — see `notes/10-platform-seams.md` "Linux touch
+  points — CLOSED 2026-08-21". Still open: the D-0014 ledger annotation
+  for the DACL substitution, the phase 10 AC reword, the NTFS case pin,
+  the DACL grant-line parse, the 8.3 short-form dedicated pin, and
+  initializing the dogfood submodules on the runner.
 
 ## Plan state after this close
 

@@ -1,16 +1,17 @@
 # Phase 10 platform seams — macOS/Linux touch-point map
 
 Prepared 2026-08-20 on the Windows host, ahead of phase 10 (deferred, needs
-native macOS hardware) and the outstanding Linux `make verify` re-run. This is
-the exact work surface a future macOS or Linux session builds on. Line numbers
-are as of the commit that adds this file and will rot; the durable anchors are
-the function names and the greppable markers below.
+native macOS hardware). **Linux is now CLOSED** (2026-08-21): the process-title
+seam is implemented and the `make verify` re-run is done — see "Linux touch
+points" below. macOS is the only outstanding platform. This is the exact work
+surface a future macOS session builds on. Line numbers are as of the commit
+that adds this file and will rot; the durable anchors are the function names
+and the greppable markers below.
 
 ## How to find every touch point
 
 ```
-rg -n "SEAM\(phase10-macos\)" crates/          # in-code decision points (9 sites)
-rg -n "SEAM\(linux-proctitle\)" crates/        # Linux process-title seam (1 site)
+rg -n "SEAM\(phase10-macos\)" crates/          # in-code decision points (9 sites, all macOS now)
 rg -n 'cfg\(target_os = "linux"\)' crates/     # Linux-only mechanisms macOS lacks
 rg -n 'cfg\(unix\)' crates/                    # shared POSIX arms macOS inherits
 ```
@@ -52,7 +53,7 @@ All in production code, greppable via `SEAM(phase10-macos)`:
 | 6 | Final cache save, non-linux `None` arm in `run` | same file | Pathname-based save; a root replaced mid-drain writes into the replacement | Exercise and accept, or anchor |
 | 7 | `write_owner_file` non-linux dispatch | same file | Portable `O_EXCL`-create arm, not Linux's serialized temp+rename exchange | Pin the portable arm's concurrency story natively |
 | 8 | `ServerInner::ensure_daemon_root_current` non-linux arm (+ the linux-only unanchored-save refusal in `core/analyze.rs::save_cache`) | `crates/code-graph-tools/src/server.rs`, `crates/code-graph-tools/src/core/analyze.rs` | Unconditional `Ok(())` — replaced daemon root not detected before publish; saves always pathname-based | dev/ino comparison (the `MetadataExt` APIs exist under `cfg(unix)`), or pathname-trust documented |
-| 9 | `set_process_listing_identity` (daemon startup) | `crates/code-graph-mcp/src/daemon.rs` | No-op on Windows/macOS — process-listing identity there rides only in argv (`--serve <root>`), the Windows posture. **Linux done**: `set_process_listing_identity_linux` sets comm via `prctl(PR_SET_NAME, "code-graph-d")`, verified against real `ps -o comm`/`/proc/<pid>/comm` output | macOS has no supported setproctitle; accept argv-only identity or ship a renamed helper binary. cmdline rewrite (`ps -o args`/`/proc/<pid>/cmdline`) is intentionally NOT done on Linux — it needs pre-runtime argv-buffer capture, meaningfully riskier than the comm rename, left as a distinct future seam if wanted |
+| 9 | `set_process_listing_identity` (daemon startup) | `crates/code-graph-mcp/src/daemon.rs` | **Linux CLOSED**: `set_process_listing_identity_linux` sets comm via `prctl(PR_SET_NAME, "code-graph-d")`, verified against real `ps -o comm`/`/proc/<pid>/comm` output. cmdline rewrite (`ps -o args`/`/proc/<pid>/cmdline`) is intentionally NOT done — it needs pre-runtime argv-buffer capture, meaningfully riskier than the comm rename; left as a distinct future seam if ever wanted, not gating phase 10. No-op on Windows/macOS — process-listing identity there rides only in argv (`--serve <root>`), the Windows posture | macOS has no supported setproctitle; accept argv-only identity or ship a renamed helper binary |
 
 ## Linux-only mechanisms with no macOS counterpart (tier-1 inventory)
 
@@ -136,16 +137,42 @@ assumes. Highest-risk items first:
 - **10.3 (parity matrix)**: pattern exists — mirror
   `notes/11-windows-certification-matrix.md`.
 
-## Linux touch points (the other outstanding platform item)
+## Linux touch points — CLOSED 2026-08-21
 
-Linux code is complete; the outstanding work is verification, not stubbing:
+Linux is done, both the code and the verification:
 
-1. Run `make verify` on a Linux host at (or after) this commit — the standing
-   follow-up from gate artifacts 21/22. Everything since `ccd9e11` (the last
-   known Linux-green revision) has only been verified natively on Windows.
-2. The Linux-only suites listed above are the regression net for any phase 10
-   repair — the phase 10 AC requires a post-repair Linux run (or an explicit
-   deferral naming it).
-3. No Linux code stubs are needed: every `SEAM(phase10-macos)` site keeps its
-   linux arm untouched, and `daemon_macos.rs` is cfg'd out of Linux builds
-   entirely (parse-only).
+1. **Process-title seam implemented.** `SEAM(linux-proctitle)` is closed —
+   `set_process_listing_identity_linux` (`crates/code-graph-mcp/src/daemon.rs`)
+   sets the daemon's comm name via `prctl(PR_SET_NAME, "code-graph-d")`,
+   verified live against real `ps -o comm` and `/proc/<pid>/comm` output.
+   cmdline rewrite (`ps -o args`) is a distinct, deliberately deferred
+   follow-up (argv-buffer capture is meaningfully riskier), not a phase 10
+   blocker.
+2. **`make verify` re-run done natively on Linux**, closing the standing
+   follow-up from gate artifacts 21/22 (everything since `ccd9e11` had only
+   been verified on Windows). Two real pre-existing bugs surfaced and were
+   fixed along the way, both platform-general (not Linux-specific, not
+   phase-10-scoped):
+   - `read_bounded_record_path` (`daemon.rs`) had zero live callers on a
+     plain non-test Linux bin build — its only production caller is the
+     `#[cfg(not(unix))]` arm of `DaemonPaths::read_bounded_record`, and its
+     only unix caller was `#[cfg(test)]`-gated. Clippy's dead-code lint
+     correctly failed `-D warnings`; fixed by gating the function itself to
+     `#[cfg(any(not(unix), test))]`.
+   - `mmap_read_only` (`code-graph-graph/src/persist/mmap.rs`) treated a
+     directory shadowing `.code-graph-cache.db` as "cache absent" (exit 1)
+     instead of a genuine I/O error (exit 2), because some filesystems
+     (observed on overlayfs) report a directory's `File::metadata().len()`
+     as 0 — indistinguishable from a truncated cache file under the old
+     zero-byte check. Fixed with an explicit `is_dir()` check.
+   Remaining `cargo test --workspace` failures (`ignored_replacement_request_is_hard_killed_and_client_falls_back`,
+   `live_proxy_queue_cap_rejects_covered_followers_across_clients`,
+   `live_proxy_queue_compacts_pending_analyzes_and_shares_sync_terminal_outcomes`,
+   `live_proxy_shutdown_drains_queued_analyzes_before_cleaning_runtime`) are
+   confirmed sandbox-environment flakiness (PID-reaping/zombie-process
+   limitation, see memory `code-graph-env-test-failures.md`) — identical on
+   the pre-fix baseline, not a regression, not phase-10-blocking.
+3. No Linux code stubs were needed: every `SEAM(phase10-macos)` site kept its
+   linux arm untouched, and `daemon_macos.rs` stays cfg'd out of Linux builds
+   entirely (parse-only). **macOS is now the only outstanding platform item
+   in this document.**
