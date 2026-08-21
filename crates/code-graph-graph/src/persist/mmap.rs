@@ -28,8 +28,20 @@ pub(crate) fn mmap_read_only(path: &Path) -> io::Result<Option<MmapHolder>> {
         Err(e) => return Err(e),
     };
 
-    // Zero-byte files cannot be mmap'd. Treat as cache-absent.
     let metadata = file.metadata()?;
+    // A directory at the cache path is a genuine misconfiguration, not an
+    // absent cache — surface it as an I/O error rather than falling into
+    // the zero-byte "absent" branch below. Some filesystems (observed on
+    // overlayfs) report a directory's `len()` as 0, which would otherwise
+    // be indistinguishable from a legitimately empty/truncated cache file.
+    if metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected a file at {}, found a directory", path.display()),
+        ));
+    }
+
+    // Zero-byte files cannot be mmap'd. Treat as cache-absent.
     if metadata.len() == 0 {
         return Ok(None);
     }
