@@ -1,0 +1,50 @@
+# cargo-deny configuration — the dependency-policy gate (`make deny`).
+#
+# cargo-audit (`make audit`) is the authoritative security-advisory scanner; cargo-deny here
+# owns the license allow-list, banned/duplicate-crate policy, and source-registry policy (and
+# also runs the advisories check where the RustSec DB is reachable).
+
+[licenses]
+version = 2
+
+# How confident cargo-deny must be when it infers a license from license files.
+# 0.8 is a common starting point.
+confidence-threshold = 0.8
+
+# Don't surface a warning if a license is listed but not used by a dependency.
+unused-allowed-license = "allow"
+
+# Allow only these licenses.
+allow = [
+    "MIT",
+    "ISC",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unlicense",
+    "CC0-1.0",
+    "CC-BY-3.0",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+
+[advisories]
+# v2 schema: vulnerabilities are denied and unmaintained crates warn by default. cargo-audit
+# is the authoritative scanner; add advisory IDs here to acknowledge an accepted exception.
+version = 2
+ignore = []
+
+[bans]
+# A workspace's transitive graph commonly carries duplicate versions of a crate; warn rather
+# than fail the gate on that. Wildcards are left "allow": the internal workspace crates inherit
+# their path deps via `debugger-core.workspace = true`, which cargo-deny classifies as wildcard
+# dependencies (and `allow-wildcard-paths` does not exempt publishable crates). External
+# dependencies are all version-pinned in the root `[workspace.dependencies]`.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Crates must come from a known registry (crates.io) or an explicitly-allowed git source.
+unknown-registry = "deny"
+unknown-git = "deny"
