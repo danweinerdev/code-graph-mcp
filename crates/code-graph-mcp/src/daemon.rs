@@ -1282,8 +1282,13 @@ async fn spawn_contender(root: &Path) -> anyhow::Result<tokio::process::Child> {
     #[cfg(windows)]
     seal_standard_handles_from_inheritance();
     let executable = std::env::current_exe().context("locate code-graph-mcp executable")?;
+    // The root rides in argv IN ADDITION to `current_dir` (which remains
+    // authoritative-equivalent — the two always agree here) so the spawned
+    // daemon is identifiable per-repo in Task Manager / Process Explorer
+    // via the command line; the image name itself cannot vary at runtime.
     tokio::process::Command::new(executable)
         .arg("--serve")
+        .arg(root)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1798,10 +1803,19 @@ impl Drop for DaemonLock {
 /// Starts a daemon rooted at the nearest `.code-graph.toml` ancestor of the
 /// current working directory. With no config file, the working directory is
 /// the project root, matching [`RootConfig::load`].
-pub async fn run(server: CodeGraphServer) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir().context("read current directory for daemon root")?;
-    let cwd = paths::canonicalize(&cwd).context("canonicalize daemon root")?;
-    let (config, root) = RootConfig::load(&cwd).context("discover daemon project root")?;
+/// `serve_root` is the optional explicit root passed after `--serve`.
+/// Functionally it means the same thing as the working directory (the
+/// upward config walk starts there); it exists so a daemon's command line
+/// is self-documenting in process listings — Windows cannot rename a
+/// running image, so Task Manager's Details "Command line" column is the
+/// per-instance identity surface. Bare `--serve` keeps the cwd behavior.
+pub async fn run(server: CodeGraphServer, serve_root: Option<PathBuf>) -> anyhow::Result<()> {
+    let invocation = match serve_root {
+        Some(path) => path,
+        None => std::env::current_dir().context("read current directory for daemon root")?,
+    };
+    let invocation = paths::canonicalize(&invocation).context("canonicalize daemon root")?;
+    let (config, root) = RootConfig::load(&invocation).context("discover daemon project root")?;
     slow_test_contender_start(&root).await;
     run_until(
         server,

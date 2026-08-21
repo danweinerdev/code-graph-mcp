@@ -25,6 +25,17 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let no_daemon = args.iter().any(|arg| arg == "--no-daemon");
     let serve_daemon = !no_daemon && args.iter().any(|arg| arg == "--serve");
+    // Optional explicit root following `--serve`. Same meaning as the
+    // working directory (the config upward walk starts there); it exists so
+    // each daemon's command line names its repo in Task Manager / Process
+    // Explorer — the Windows image name cannot change at runtime, so argv
+    // is the per-instance identity surface. Bare `--serve` keeps cwd.
+    let serve_root: Option<std::path::PathBuf> = args
+        .iter()
+        .position(|arg| arg == "--serve")
+        .and_then(|i| args.get(i + 1))
+        .filter(|next| !next.to_string_lossy().starts_with("--"))
+        .map(std::path::PathBuf::from);
     // Attach-only proxy mode (Designs/CommandLineInterface Decision 3):
     // attach to a published, compatible, live daemon or serve in-process —
     // never spawn a contender, never initiate the replacement protocol.
@@ -73,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     let server = make_server()?;
 
     if serve_daemon {
-        return daemon::run(server).await;
+        return daemon::run(server, serve_root).await;
     }
 
     let service = server

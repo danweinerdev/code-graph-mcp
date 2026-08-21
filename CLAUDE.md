@@ -273,8 +273,14 @@ cache, and removes its repository-local runtime files before exit.
 ### Repository-local daemon (runtime model)
 
 Implementation: `crates/code-graph-mcp/src/daemon.rs`. The stdio binary
-default-runs as a byte-pump proxy to the daemon; `--serve` runs the daemon
-itself; `--no-daemon` wins over `--serve` if both are passed.
+default-runs as a byte-pump proxy to the daemon; `--serve [root]` runs the
+daemon itself; `--no-daemon` wins over `--serve` if both are passed. The
+optional root after `--serve` means the same thing as the working directory
+(the config upward walk starts there; bare `--serve` keeps cwd) and exists
+for process-listing identity: Windows cannot rename a running image, so the
+argv shown in Task Manager's Details "Command line" column is the only
+per-instance surface — `spawn_contender` passes the root explicitly so every
+daemon names its repo there.
 
 - **Runtime files** live under `<project_root>/.code-graph/` (gitignored):
   `daemon.lock` (exclusive-create + OS file lock; crash recovery via the OS
