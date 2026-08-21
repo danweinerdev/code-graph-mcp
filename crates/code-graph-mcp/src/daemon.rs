@@ -1803,6 +1803,36 @@ impl Drop for DaemonLock {
 /// Starts a daemon rooted at the nearest `.code-graph.toml` ancestor of the
 /// current working directory. With no config file, the working directory is
 /// the project root, matching [`RootConfig::load`].
+/// Best-effort process-listing identity for the daemon, beyond the argv
+/// identity `spawn_contender` already provides (`--serve <root>`).
+///
+/// Windows: nothing can be done here — the image name is fixed at
+/// `CreateProcess` for the life of the process, so the Details
+/// "Command line" column (fed by the argv above) is the only
+/// per-instance surface. This arm is deliberately empty.
+///
+/// SEAM(linux-proctitle): Linux CAN rename a running process in
+/// listings — `prctl(PR_SET_NAME, b"code-graph-d\0")` sets the comm
+/// name (15-byte cap; what `ps -o comm`, `top`, and /proc/<pid>/comm
+/// show), and overwriting the original argv[0] memory region updates
+/// /proc/<pid>/cmdline (what `ps -o args` shows). Implementing it
+/// needs the `libc` crate (or a setproctitle crate) plus a scoped
+/// unsafe block — acceptable in this crate (the Windows handle seal
+/// is the precedent) but deliberately left as a documented no-op
+/// until a Linux session picks it up and can verify against real
+/// `ps`/`top` output. Suggested spelling: comm = "code-graph-d",
+/// cmdline = "code-graph-mcp (daemon: <root basename>)".
+///
+/// SEAM(phase10-macos): macOS has no supported setproctitle — Activity
+/// Monitor shows the executable name, `pthread_setname_np` names
+/// threads not processes, and argv-region rewriting is unreliable
+/// there. Phase 10 decides whether macOS accepts argv-only identity
+/// (the Windows posture) or ships a renamed helper binary; either
+/// answer lands in this function.
+fn set_process_listing_identity(_root: &Path) {
+    // No-op on every platform today; see the per-platform seams above.
+}
+
 /// `serve_root` is the optional explicit root passed after `--serve`.
 /// Functionally it means the same thing as the working directory (the
 /// upward config walk starts there); it exists so a daemon's command line
@@ -1816,6 +1846,7 @@ pub async fn run(server: CodeGraphServer, serve_root: Option<PathBuf>) -> anyhow
     };
     let invocation = paths::canonicalize(&invocation).context("canonicalize daemon root")?;
     let (config, root) = RootConfig::load(&invocation).context("discover daemon project root")?;
+    set_process_listing_identity(&root);
     slow_test_contender_start(&root).await;
     run_until(
         server,
