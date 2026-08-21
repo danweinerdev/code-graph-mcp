@@ -924,6 +924,10 @@ fn read_metadata_payload(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// Opens a record by path only where descriptor-relative opening is not
 /// available. The initial check avoids opening a static special entry; the
 /// descriptor reader repeats validation after open to close substitution races.
+/// Production callers are non-unix only (`DaemonPaths::read_bounded_record`'s
+/// `#[cfg(not(unix))]` arm); on unix it is reachable only from
+/// `#[cfg(test)]` regression helpers, hence the matching gate here.
+#[cfg(any(not(unix), test))]
 fn read_bounded_record_path(
     path: &Path,
     max_bytes: usize,
