@@ -30,19 +30,18 @@
 //!
 //! # Default trait methods
 //!
-//! `GoParser` does NOT override [`LanguagePlugin::resolve_call`] or
-//! [`LanguagePlugin::resolve_include`].
+//! `GoParser` applies Go package/binding rules to every call target.
 //!
-//! - `resolve_call`: the default scope-aware heuristic (same file > same
-//!   parent > same namespace > global) is the right baseline for Go and
-//!   matches the C++ and Rust plugins.
-//! - `resolve_include`: the default basename match against the
-//!   [`code_graph_lang::FileIndex`] is **a no-op for Go import paths** because
-//!   they are module paths (e.g. `"github.com/sirupsen/logrus"`), not
-//!   filesystem paths. The wire format records the full import path
-//!   verbatim as the `to` field; leaving it unresolved is the intended
-//!   behavior. Module-path resolution (go.mod / vendor) is explicitly out
-//!   of scope (see the Go parser limitations below).
+//! - `resolve_call`: imported selectors resolve only to the imported package's
+//!   functions or statically typed methods; bare calls resolve only to one free
+//!   function in the caller's declared package. Unknown or chained receivers
+//!   stay unresolved.
+//! - `resolve_include`: module-qualified imports match indexed package paths
+//!   discovered from `go.mod`. Each import resolves to the lexicographically
+//!   first `.go` file in that package, giving the file graph one deterministic
+//!   edge without multiplying a package import by every source file it owns.
+//!   Standard-library and external imports have no indexed package match and
+//!   are dropped.
 //!
 //! # Known Go parser limitations
 //!
@@ -56,35 +55,42 @@
 //! 2. **Embedded struct fields produce no `Inherits` edge.** `type T struct
 //!    { Bar }` is structural composition (method-set promotion), not
 //!    inheritance — no edge is emitted (pinned by an anti-regression test).
-//! 3. **Method dispatch is heuristic.** Same as the C++ and Rust plugins —
-//!    call edges resolve via scope-aware heuristic matching, which is
-//!    syntactic, not semantic. Methods on different receiver types that
-//!    share a name may resolve to the wrong candidate.
-//! 4. **`go.mod` and vendor directories are not consulted.** Discovery walks
-//!    files and respects `.gitignore`; module-path resolution is out of
-//!    scope.
+//! 3. **Call resolution is package- and syntax-aware, not type-checked.** Bare
+//!    calls require one free function in the caller package, while selector
+//!    calls resolve only when their import binding or local static receiver
+//!    type is available. Dynamic and chained receivers remain unresolved.
+//! 4. **`replace`, `vendor`, and package-name overrides are not consulted.**
+//!    Indexed package paths come from the owning `go.mod`; an import whose
+//!    binding differs from its final path segment should use an explicit alias
+//!    for precise package-call resolution.
 
 pub(crate) mod helpers;
 pub(crate) mod module_model;
 pub(crate) mod queries;
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::find_enclosing_kind;
-use code_graph_lang::{LanguagePlugin, ParseError};
+use code_graph_lang::{CallContext, FileIndex, LanguagePlugin, ParseError, SymbolIndex};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
 };
 
 use crate::helpers::{
-    enclosing_function_id, extract_package_name, extract_receiver_type, truncate_signature,
+    enclosing_function_id, extract_bare_type_name, extract_named_parameter_type,
+    extract_package_name, extract_receiver_type, truncate_signature,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES};
 
 /// File extensions the Go parser claims.
 pub const EXTENSIONS: &[&str] = &[".go"];
+const METHOD_RECEIVER_PREFIX: &str = "@method-receiver::";
+const BOUND_RECEIVER_PREFIX: &str = "@bound-receiver::";
+const DOT_IMPORT_PREFIX: &str = "@dot-import::";
 
 /// Go source-file parser. Holds the tree-sitter `Language` and the three
 /// pre-compiled queries used to drive symbol/edge extraction.
@@ -102,6 +108,34 @@ pub struct GoParser {
     call_query: Query,
     /// Compiled import query (drives `extract_imports`).
     import_query: Query,
+    /// Parse-time metadata, keyed by path. A prepare pass may read/parse only
+    /// cache-loaded paths absent here; fresh paths are populated by
+    /// `parse_file` while their AST is already available.
+    metadata: RwLock<HashMap<PathBuf, GoFileMetadata>>,
+    /// Immutable state rebuilt from the complete resolution universe before
+    /// each resolution pass.
+    resolution: RwLock<GoResolutionState>,
+}
+
+#[derive(Clone, Default)]
+struct GoFileMetadata {
+    declared_package: String,
+    package_value_bindings: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PackageIdentity {
+    import_path: String,
+    declared_package: String,
+    is_test: bool,
+}
+
+#[derive(Default)]
+struct GoResolutionState {
+    files: HashMap<PathBuf, PackageIdentity>,
+    package_values: HashMap<PackageIdentity, HashSet<String>>,
+    imported_packages: HashMap<String, PackageIdentity>,
+    representatives: HashMap<String, PathBuf>,
 }
 
 impl GoParser {
@@ -127,6 +161,8 @@ impl GoParser {
             def_query,
             call_query,
             import_query,
+            metadata: RwLock::new(HashMap::new()),
+            resolution: RwLock::new(GoResolutionState::default()),
         })
     }
 
@@ -148,6 +184,14 @@ impl GoParser {
         let root = tree.root_node();
         let path_str = path.to_string_lossy().into_owned();
         let package_name = extract_package_name(root, content);
+        let metadata = GoFileMetadata {
+            declared_package: package_name.clone(),
+            package_value_bindings: extract_package_value_bindings(root, content),
+        };
+        self.metadata
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.to_path_buf(), metadata);
 
         let mut fg = FileGraph {
             path: path_str.clone(),
@@ -353,12 +397,11 @@ impl GoParser {
     /// - `call.name` from the direct-call pattern (`function: identifier`)
     ///   → edge `to` = identifier text (the callee name).
     /// - `call.name` from the selector pattern (`function: selector_expression
-    ///   > field: field_identifier`) → edge `to` = field text. This handles
-    ///   method calls (`obj.M()`), package-qualified calls (`fmt.Println()`),
-    ///   and chained calls (`a.B().C()`). For chains, tree-sitter produces
-    ///   one `call_expression` per chain link, each with its own selector,
-    ///   so two edges fall out naturally for `a.B().C()` (one for `B`, one
-    ///   for `C`).
+    ///   > field: field_identifier`) → edge `to` = field text for receiver
+    ///   and chained calls, or `import-path::field` when the operand is an
+    ///   imported package binding. For chains, tree-sitter produces one
+    ///   `call_expression` per chain link, each with its own selector, so two
+    ///   edges fall out naturally for `a.B().C()` (one for `B`, one for `C`).
     ///
     /// `go foo()` and `defer conn.Close()` produce edges naturally because
     /// the child of `go_statement` / `defer_statement` is a `call_expression`
@@ -371,6 +414,8 @@ impl GoParser {
     /// has no enclosing function, so the `from` falls back to the file path
     /// — matching the C++ lambda-at-global-scope behavior.
     fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        let imports = import_bindings(root, content);
+        let has_dot_import = has_dot_import(root, content);
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.call_query, root, content);
         let cap_names = self.call_query.capture_names();
@@ -397,11 +442,30 @@ impl GoParser {
                 // multi-line chains).
                 let call_node =
                     find_enclosing_kind(cap_node, "call_expression").unwrap_or(cap_node);
+                if is_direct_call(cap_node) && lexical_binding_exists(call_node, callee, content) {
+                    // A local function value or parameter is callable, but it
+                    // is not a project-symbol call. Never let a same-named
+                    // project definition turn that dynamic call into a false
+                    // resolved graph edge.
+                    continue;
+                }
+                let callee = selector_call_target(cap_node, call_node, callee, content, &imports)
+                    .unwrap_or_else(|| {
+                        if is_direct_call(cap_node) && has_dot_import {
+                            // A dot import makes a bare call's provenance
+                            // ambiguous. Preserve the marker so resolution can
+                            // conservatively retain only an unambiguous
+                            // same-package function, never guess the import.
+                            format!("{DOT_IMPORT_PREFIX}{callee}")
+                        } else {
+                            callee.to_owned()
+                        }
+                    });
                 let from = enclosing_function_id(cap_node, content, path);
 
                 fg.edges.push(Edge {
                     from,
-                    to: callee.to_owned(),
+                    to: callee,
                     kind: EdgeKind::Calls,
                     file: path.to_owned(),
                     line: call_node.start_position().row as u32 + 1,
@@ -534,9 +598,6 @@ impl LanguagePlugin for GoParser {
         graphs: &mut [code_graph_core::FileGraph],
         _file_index: &code_graph_lang::FileIndex,
     ) {
-        use std::collections::HashSet;
-        use std::path::PathBuf;
-
         let go_paths: Vec<PathBuf> = graphs
             .iter()
             .filter(|fg| fg.language == Language::Go)
@@ -546,45 +607,184 @@ impl LanguagePlugin for GoParser {
             return;
         }
 
-        // Walk to disk to find every `go.mod` reachable up each file's
-        // ancestor chain. Same pattern as the Rust plugin's RCMM
-        // discovery.
-        let mut manifest_paths: HashSet<PathBuf> = HashSet::new();
-        for go in &go_paths {
-            let mut ancestor: Option<&Path> = go.parent();
-            while let Some(dir) = ancestor {
-                let candidate = dir.join("go.mod");
-                if candidate.is_file() {
-                    manifest_paths.insert(candidate);
-                }
-                ancestor = dir.parent();
-            }
-        }
-
-        let combined = go_paths.iter().cloned().chain(manifest_paths);
-        let gmm = crate::module_model::GoModuleModel::build(combined, |p| {
-            std::fs::read_to_string(p).ok()
-        });
+        let gmm = crate::module_model::GoModuleModel::discover(go_paths);
 
         for fg in graphs.iter_mut() {
             if fg.language != Language::Go {
                 continue;
             }
             let file_path = PathBuf::from(&fg.path);
-            let Some(import_path) = gmm.namespace_for(&file_path) else {
-                continue; // No go.mod ancestor — preserve bare package name
+            let import_path = gmm
+                .namespace_for(&file_path)
+                .map(str::to_owned)
+                .or_else(|| fg.symbols.first().map(|symbol| symbol.namespace.clone()));
+            let Some(import_path) = import_path else {
+                continue;
             };
-            let import_path = import_path.to_owned();
             for sym in fg.symbols.iter_mut() {
                 sym.namespace = import_path.clone();
             }
         }
     }
 
-    // resolve_call and resolve_include intentionally NOT overridden — see the
-    // crate-level docstring for the rationale (default heuristic matches the
-    // C++ and Rust plugins; default basename resolver is a no-op for Go's
-    // module-path imports, which is the intended behavior).
+    fn prepare_resolution(&self, graphs: &[FileGraph], _file_index: &FileIndex) {
+        let mut paths: Vec<PathBuf> = graphs
+            .iter()
+            .filter(|graph| graph.language == Language::Go)
+            .map(|graph| PathBuf::from(&graph.path))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            *self
+                .resolution
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = GoResolutionState::default();
+            return;
+        }
+
+        // Fresh files populated metadata while their parse tree was live.
+        // A missing entry can therefore only be cache-loaded context. Parse it
+        // once with this parser's already-compiled language; never construct a
+        // second parser or compile queries during resolution.
+        let missing: Vec<_> = {
+            let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
+            paths
+                .iter()
+                .filter(|path| !metadata.contains_key(*path))
+                .cloned()
+                .collect()
+        };
+        let loaded_metadata: Vec<_> = missing
+            .into_iter()
+            .filter_map(|path| {
+                let content = std::fs::read(&path).ok()?;
+                let tree = parse_tree(&self.language, &content).ok()?;
+                let root = tree.root_node();
+                Some((
+                    path,
+                    GoFileMetadata {
+                        declared_package: extract_package_name(root, &content),
+                        package_value_bindings: extract_package_value_bindings(root, &content),
+                    },
+                ))
+            })
+            .collect();
+        if !loaded_metadata.is_empty() {
+            let mut metadata = self.metadata.write().unwrap_or_else(|p| p.into_inner());
+            for (path, value) in loaded_metadata {
+                metadata.entry(path).or_insert(value);
+            }
+        }
+
+        let model = crate::module_model::GoModuleModel::discover(paths.iter().cloned());
+        let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
+        let mut state = GoResolutionState::default();
+        let mut package_identities: BTreeMap<String, BTreeSet<PackageIdentity>> = BTreeMap::new();
+        let mut representative_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for path in paths {
+            let Some(file_metadata) = metadata.get(&path) else {
+                continue;
+            };
+            let identity = PackageIdentity {
+                import_path: model
+                    .namespace_for(&path)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        path.parent()
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
+                declared_package: file_metadata.declared_package.clone(),
+                // Internal tests can share the declared package text with
+                // production files but are a separate resolution universe;
+                // otherwise their duplicate helpers make production calls
+                // spuriously ambiguous.
+                is_test: is_test_file(&path),
+            };
+            state
+                .package_values
+                .entry(identity.clone())
+                .or_default()
+                .extend(file_metadata.package_value_bindings.iter().cloned());
+            state.files.insert(path.clone(), identity.clone());
+            if !is_test_file(&path) {
+                package_identities
+                    .entry(identity.import_path.clone())
+                    .or_default()
+                    .insert(identity.clone());
+                representative_candidates
+                    .entry(identity.import_path.clone())
+                    .or_insert(path);
+            }
+        }
+        for (import_path, identities) in package_identities {
+            if identities.len() == 1 {
+                state.imported_packages.insert(
+                    import_path.clone(),
+                    identities.into_iter().next().expect("one package identity"),
+                );
+                if let Some(path) = representative_candidates.remove(&import_path) {
+                    state.representatives.insert(import_path, path);
+                }
+            }
+        }
+        *self.resolution.write().unwrap_or_else(|p| p.into_inner()) = state;
+    }
+
+    fn resolve_include(
+        &self,
+        raw: &str,
+        _file_index: &FileIndex,
+    ) -> Option<(PathBuf, Confidence, u32)> {
+        self.resolution
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .representatives
+            .get(raw)
+            .cloned()
+            .map(|path| (path, Confidence::Resolved, 1))
+    }
+
+    fn resolve_call(
+        &self,
+        callee: &str,
+        ctx: &CallContext<'_>,
+        index: &SymbolIndex,
+    ) -> Option<(code_graph_core::SymbolId, Confidence, u32)> {
+        let state = self.resolution.read().unwrap_or_else(|p| p.into_inner());
+        let caller_identity = state.files.get(ctx.caller_file)?;
+        if callee.starts_with(BOUND_RECEIVER_PREFIX) {
+            return None;
+        }
+        if let Some(name) = callee.strip_prefix(DOT_IMPORT_PREFIX) {
+            return resolve_go_free(index, name, caller_identity, &state)
+                .map(|id| (id, Confidence::Resolved, 1));
+        }
+        if let Some((import_path, receiver, method)) = parse_method_target(callee) {
+            let identity = if import_path.is_empty() {
+                caller_identity
+            } else {
+                state.imported_packages.get(import_path)?
+            };
+            return resolve_go_method(index, method, receiver, identity, &state)
+                .map(|id| (id, Confidence::Resolved, 1));
+        }
+        if let Some((import_path, name)) = callee.rsplit_once("::") {
+            let identity = state.imported_packages.get(import_path)?;
+            return resolve_go_free(index, name, identity, &state)
+                .map(|id| (id, Confidence::Resolved, 1));
+        }
+        if package_value_binds(&state, caller_identity, callee) {
+            return None;
+        }
+        // Go bare calls are package-local only. In particular, do not defer to
+        // the language-generic same-file/global heuristic: builtins and an
+        // unrelated sole project candidate are both unresolved.
+        resolve_go_free(index, callee, caller_identity, &state)
+            .map(|id| (id, Confidence::Resolved, 1))
+    }
 
     /// AST-backed fingerprint (phase 8.3, following the 8.1 shape). Go has
     /// no `preprocess` pass, so `content` is the raw revision bytes — the
@@ -623,6 +823,624 @@ impl LanguagePlugin for GoParser {
     }
 
     fn close(&self) {}
+}
+
+fn unique_go_symbol(
+    candidates: &[code_graph_lang::SymbolEntry],
+    identity: &PackageIdentity,
+    state: &GoResolutionState,
+    predicate: impl Fn(&code_graph_lang::SymbolEntry) -> bool,
+) -> Option<code_graph_core::SymbolId> {
+    let mut matches = candidates.iter().filter(|candidate| {
+        state
+            .files
+            .get(&candidate.file)
+            .is_some_and(|candidate_identity| package_visible(identity, candidate_identity))
+            && predicate(candidate)
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.id.clone())
+}
+
+fn package_visible(caller: &PackageIdentity, candidate: &PackageIdentity) -> bool {
+    caller.import_path == candidate.import_path
+        && caller.declared_package == candidate.declared_package
+        // Internal tests (`package x`) may call production symbols, but
+        // production files must never see declarations that exist only in
+        // `_test.go` files. External tests (`package x_test`) remain isolated
+        // by the declared-package comparison above.
+        && (caller.is_test || !candidate.is_test)
+}
+
+fn package_value_binds(state: &GoResolutionState, caller: &PackageIdentity, name: &str) -> bool {
+    state
+        .package_values
+        .iter()
+        .any(|(identity, values)| package_visible(caller, identity) && values.contains(name))
+}
+
+fn resolve_go_free(
+    index: &SymbolIndex,
+    name: &str,
+    identity: &PackageIdentity,
+    state: &GoResolutionState,
+) -> Option<code_graph_core::SymbolId> {
+    let candidates = index.by_name.get(&(Language::Go, name.to_owned()))?;
+    unique_go_symbol(candidates, identity, state, |candidate| {
+        candidate.parent.is_empty()
+    })
+}
+
+fn resolve_go_method(
+    index: &SymbolIndex,
+    method: &str,
+    receiver: &str,
+    identity: &PackageIdentity,
+    state: &GoResolutionState,
+) -> Option<code_graph_core::SymbolId> {
+    let candidates = index
+        .by_name
+        .get(&(Language::Go, format!("{receiver}::{method}")))?;
+    unique_go_symbol(candidates, identity, state, |candidate| {
+        candidate.parent == receiver
+    })
+}
+
+fn parse_method_target(target: &str) -> Option<(&str, &str, &str)> {
+    let target = target.strip_prefix(METHOD_RECEIVER_PREFIX)?;
+    let mut pieces = target.split('\u{1f}');
+    Some((pieces.next()?, pieces.next()?, pieces.next()?))
+}
+
+fn extract_package_value_bindings(root: Node<'_>, content: &[u8]) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = root.walk();
+    for declaration in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "var_declaration")
+    {
+        collect_var_declaration_bindings(declaration, content, &mut bindings);
+    }
+    bindings
+}
+
+fn collect_var_declaration_bindings(
+    declaration: Node<'_>,
+    content: &[u8],
+    bindings: &mut HashSet<String>,
+) {
+    let mut cursor = declaration.walk();
+    let specs: Vec<_> = declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "var_spec")
+        .collect();
+    if specs.is_empty() {
+        collect_var_spec_binding(declaration, content, bindings);
+    } else {
+        for spec in specs {
+            collect_var_spec_binding(spec, content, bindings);
+        }
+    }
+}
+
+fn collect_var_spec_binding(node: Node<'_>, content: &[u8], bindings: &mut HashSet<String>) {
+    for name in declared_identifiers(node, content) {
+        if name != "_" {
+            bindings.insert(name);
+        }
+    }
+}
+
+fn is_test_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_test.go"))
+}
+
+/// Map usable import bindings to their raw import paths. Blank and dot imports
+/// have no selector binding, so neither belongs in this map.
+fn import_bindings(root: Node<'_>, content: &[u8]) -> HashMap<String, String> {
+    fn visit(node: Node<'_>, content: &[u8], bindings: &mut HashMap<String, String>) {
+        if node.kind() == "import_spec" {
+            let Some(path_node) = node.child_by_field_name("path") else {
+                return;
+            };
+            let raw = path_node.utf8_text(content).unwrap_or("");
+            let Some(import_path) = raw
+                .strip_prefix('"')
+                .and_then(|path| path.strip_suffix('"'))
+            else {
+                return;
+            };
+            let binding = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(content).ok())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    import_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(import_path)
+                        .to_owned()
+                });
+            if binding != "_" && binding != "." && !binding.is_empty() {
+                bindings.insert(binding, import_path.to_owned());
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, content, bindings);
+        }
+    }
+
+    let mut bindings = HashMap::new();
+    visit(root, content, &mut bindings);
+    bindings
+}
+
+fn has_dot_import(root: Node<'_>, content: &[u8]) -> bool {
+    if root.kind() == "import_spec"
+        && root
+            .child_by_field_name("name")
+            .is_some_and(|name| name.utf8_text(content).ok() == Some("."))
+    {
+        return true;
+    }
+    let mut cursor = root.walk();
+    let has_dot_import = root
+        .named_children(&mut cursor)
+        .any(|child| has_dot_import(child, content));
+    has_dot_import
+}
+
+fn is_direct_call(callee: Node<'_>) -> bool {
+    callee
+        .parent()
+        .is_some_and(|parent| parent.kind() == "call_expression")
+}
+
+/// Classify selector calls without discarding whether the operand is an import
+/// binding, a locally bound receiver, or an unknown/chained expression.
+fn selector_call_target(
+    field: Node<'_>,
+    call: Node<'_>,
+    callee: &str,
+    content: &[u8],
+    imports: &HashMap<String, String>,
+) -> Option<String> {
+    let selector = field.parent()?;
+    if selector.kind() != "selector_expression" {
+        return None;
+    }
+    let operand = selector.child_by_field_name("operand")?;
+    if let Some(receiver) = concrete_receiver_type(operand, content) {
+        return Some(method_target("", &receiver, callee, imports));
+    }
+    if operand.kind() != "identifier" {
+        // Calls and selectors are chained operands. Their result type is not
+        // known without type checking, so never collapse `.Method()` to a
+        // bare global method name.
+        return Some(format!("{BOUND_RECEIVER_PREFIX}{callee}"));
+    }
+    let binding = operand.utf8_text(content).ok()?;
+    if lexical_binding_exists(call, binding, content) {
+        if let Some(receiver) = method_receiver_type(call, binding, content) {
+            return Some(method_target("", &receiver, callee, imports));
+        }
+        // A local receiver's static type is not available from this syntax
+        // alone. Mark it so `resolve_call` cannot guess an unrelated method.
+        return Some(format!("{BOUND_RECEIVER_PREFIX}{callee}"));
+    }
+    Some(imports.get(binding).map_or_else(
+        || format!("{BOUND_RECEIVER_PREFIX}{callee}"),
+        |import_path| format!("{import_path}::{callee}"),
+    ))
+}
+
+fn method_target(
+    default_import_path: &str,
+    receiver: &str,
+    method: &str,
+    imports: &HashMap<String, String>,
+) -> String {
+    let (import_path, receiver) = receiver
+        .split_once('.')
+        .and_then(|(binding, type_name)| {
+            imports
+                .get(binding)
+                .map(|import_path| (import_path.as_str(), type_name))
+        })
+        .unwrap_or((default_import_path, receiver));
+    format!("{METHOD_RECEIVER_PREFIX}{import_path}\u{1f}{receiver}\u{1f}{method}")
+}
+
+fn concrete_receiver_type(node: Node<'_>, content: &[u8]) -> Option<String> {
+    match node.kind() {
+        "composite_literal" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(content).ok())
+            .map(strip_type_arguments),
+        "unary_expression" => {
+            let mut cursor = node.walk();
+            let receiver = node
+                .named_children(&mut cursor)
+                .next()
+                .and_then(|child| concrete_receiver_type(child, content));
+            receiver
+        }
+        _ => None,
+    }
+}
+
+fn strip_type_arguments(type_name: &str) -> String {
+    type_name
+        .split('[')
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+        .to_owned()
+}
+
+fn method_receiver_type(call: Node<'_>, binding: &str, content: &[u8]) -> Option<String> {
+    let mut branch = call;
+    let mut ancestor = call.parent();
+    while let Some(node) = ancestor {
+        match node.kind() {
+            "method_declaration" => {
+                let receiver = node.child_by_field_name("receiver")?;
+                return parameters_bind_name(receiver, binding, content)
+                    .then(|| extract_receiver_type(receiver, content));
+            }
+            "function_declaration" | "func_literal" => {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    if let Some(type_name) =
+                        extract_named_parameter_type(parameters, binding, content)
+                    {
+                        return Some(type_name);
+                    }
+                    if parameters_bind_name(parameters, binding, content) {
+                        return None;
+                    }
+                }
+                if node
+                    .child_by_field_name("result")
+                    .is_some_and(|result| parameters_bind_name(result, binding, content))
+                {
+                    return None;
+                }
+            }
+            "statement_list"
+                if prior_statement_declaration_binds(node, branch, binding, content) =>
+            {
+                return prior_binding_declaration(node, branch, binding, content).and_then(
+                    |declaration| declaration_receiver_type(declaration, binding, content),
+                );
+            }
+            "for_statement"
+            | "if_statement"
+            | "expression_switch_statement"
+            | "type_switch_statement"
+            | "communication_case"
+                if binding_scope_started(node, call, content)
+                    && control_header_binds(node, binding, content) =>
+            {
+                return None;
+            }
+            "range_clause" | "receive_statement" if declaration_binds(node, binding, content) => {
+                return None;
+            }
+            _ => {}
+        }
+        branch = node;
+        ancestor = node.parent();
+    }
+    None
+}
+
+fn prior_binding_declaration<'a>(
+    statements: Node<'a>,
+    branch: Node<'a>,
+    name: &str,
+    content: &[u8],
+) -> Option<Node<'a>> {
+    let mut direct_branch = branch;
+    while let Some(parent) = direct_branch.parent() {
+        if parent == statements {
+            break;
+        }
+        direct_branch = parent;
+    }
+    let mut cursor = statements.walk();
+    statements
+        .named_children(&mut cursor)
+        .take_while(|child| *child != direct_branch)
+        .filter(|child| declaration_binds(*child, name, content))
+        .last()
+}
+
+fn declaration_receiver_type(node: Node<'_>, name: &str, content: &[u8]) -> Option<String> {
+    if node.kind() == "expression_statement" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| declaration_binds(*child, name, content))
+            .and_then(|child| declaration_receiver_type(child, name, content));
+    }
+    if node.kind() == "var_declaration" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "var_spec" && declaration_binds(*child, name, content))
+            .and_then(|child| declaration_receiver_type(child, name, content));
+    }
+    if node.kind() == "var_spec" {
+        if let Some(type_node) = node.child_by_field_name("type") {
+            let type_name = extract_bare_type_name(type_node, content);
+            return (!type_name.is_empty()).then_some(type_name);
+        }
+        if declared_identifiers(node, content).len() != 1 {
+            return None;
+        }
+        let source = node.utf8_text(content).ok()?;
+        return source
+            .split_once('=')
+            .and_then(|(_, initializer)| composite_type_from_initializer(initializer));
+    }
+    if node.kind() == "short_var_declaration" {
+        if identifiers_before(node, ":=", content).len() != 1 {
+            return None;
+        }
+        let source = node.utf8_text(content).ok()?;
+        return source
+            .split_once(":=")
+            .and_then(|(_, initializer)| composite_type_from_initializer(initializer));
+    }
+    None
+}
+
+fn composite_type_from_initializer(initializer: &str) -> Option<String> {
+    let initializer = initializer
+        .trim_start()
+        .strip_prefix('&')
+        .unwrap_or(initializer.trim_start());
+    let type_name = initializer.split('{').next()?.trim();
+    (!type_name.is_empty()
+        && type_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'[' | b']')))
+    .then(|| strip_type_arguments(type_name))
+}
+
+/// Return whether a direct call name is shadowed by a lexical binding. The
+/// graph does not model values, so calls through such names must be omitted
+/// rather than incorrectly resolved as project functions with the same name.
+fn lexical_binding_exists(call: Node<'_>, name: &str, content: &[u8]) -> bool {
+    let mut branch = call;
+    let mut ancestor = call.parent();
+    while let Some(scope) = ancestor {
+        match scope.kind() {
+            "function_declaration" | "method_declaration" | "func_literal" => {
+                if scope
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| parameters_bind_name(parameters, name, content))
+                    || scope
+                        .child_by_field_name("receiver")
+                        .is_some_and(|receiver| parameters_bind_name(receiver, name, content))
+                    || scope
+                        .child_by_field_name("result")
+                        .is_some_and(|result| parameters_bind_name(result, name, content))
+                {
+                    return true;
+                }
+            }
+            "statement_list" if prior_statement_declaration_binds(scope, branch, name, content) => {
+                return true;
+            }
+            "for_statement"
+            | "if_statement"
+            | "expression_switch_statement"
+            | "type_switch_statement"
+            | "communication_case"
+                if binding_scope_started(scope, call, content)
+                    && control_header_binds(scope, name, content) =>
+            {
+                return true;
+            }
+            "range_clause" | "receive_statement" if declaration_binds(scope, name, content) => {
+                return true;
+            }
+            "source_file" if package_declaration_binds(scope, name, content) => return true,
+            _ => {}
+        }
+        branch = scope;
+        ancestor = scope.parent();
+    }
+    false
+}
+
+/// Go short declarations do not bind their own initializer. A receiver used
+/// on the RHS of `if s := s.Clone(); ...` still refers to the outer `s`, while
+/// uses after the header semicolon refer to the newly declared value.
+fn binding_scope_started(scope: Node<'_>, call: Node<'_>, content: &[u8]) -> bool {
+    let mut cursor = scope.walk();
+    if let Some(body) = scope
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "block")
+    {
+        if call.start_byte() >= body.start_byte() {
+            return true;
+        }
+    }
+    if !matches!(
+        scope.kind(),
+        "if_statement" | "expression_switch_statement" | "type_switch_statement"
+    ) {
+        return false;
+    }
+    let header = &content[scope.start_byte()..call.start_byte()];
+    match header.iter().rposition(|&byte| byte == b':') {
+        Some(declaration) => header[declaration..].contains(&b';'),
+        None => true,
+    }
+}
+
+fn package_declaration_binds(source_file: Node<'_>, name: &str, content: &[u8]) -> bool {
+    let mut cursor = source_file.walk();
+    let binds = source_file
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "var_declaration")
+        .any(|declaration| declaration_binds(declaration, name, content));
+    binds
+}
+
+fn control_header_binds(node: Node<'_>, name: &str, content: &[u8]) -> bool {
+    if declaration_binds(node, name, content) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let bound = node.named_children(&mut cursor).any(|child| {
+        !matches!(child.kind(), "block" | "statement_list")
+            && control_header_binds(child, name, content)
+    });
+    bound
+}
+
+fn parameters_bind_name(parameters: Node<'_>, name: &str, content: &[u8]) -> bool {
+    fn visit(node: Node<'_>, name: &str, content: &[u8]) -> bool {
+        if matches!(
+            node.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            return parameter_declares_name(node, name, content);
+        }
+        let mut cursor = node.walk();
+        let bound = node
+            .named_children(&mut cursor)
+            .any(|child| visit(child, name, content));
+        bound
+    }
+
+    visit(parameters, name, content)
+}
+
+fn parameter_declares_name(parameter: Node<'_>, name: &str, content: &[u8]) -> bool {
+    let mut cursor = parameter.walk();
+    let declares_name = parameter
+        .named_children(&mut cursor)
+        .take_while(|child| child.kind() == "identifier")
+        .any(|child| child.utf8_text(content).ok() == Some(name));
+    declares_name
+}
+
+fn prior_statement_declaration_binds(
+    statements: Node<'_>,
+    branch: Node<'_>,
+    name: &str,
+    content: &[u8],
+) -> bool {
+    let mut direct_branch = branch;
+    while let Some(parent) = direct_branch.parent() {
+        if parent == statements {
+            break;
+        }
+        direct_branch = parent;
+    }
+    let mut cursor = statements.walk();
+    let bound = statements
+        .named_children(&mut cursor)
+        .take_while(|child| *child != direct_branch)
+        .any(|child| declaration_binds(child, name, content));
+    bound
+}
+
+fn declaration_binds(node: Node<'_>, name: &str, content: &[u8]) -> bool {
+    if node.kind() == "expression_statement" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .any(|child| declaration_binds(child, name, content));
+    }
+    match node.kind() {
+        "var_declaration" => {
+            let mut cursor = node.walk();
+            let specs: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "var_spec")
+                .collect();
+            if specs.is_empty() {
+                declared_identifiers(node, content)
+                    .iter()
+                    .any(|identifier| identifier == name)
+            } else {
+                specs
+                    .into_iter()
+                    .any(|spec| declaration_binds(spec, name, content))
+            }
+        }
+        "var_spec" => declared_identifiers(node, content)
+            .iter()
+            .any(|identifier| identifier == name),
+        "short_var_declaration" => identifiers_before(node, ":=", content)
+            .iter()
+            .any(|identifier| identifier == name),
+        "range_clause" => identifiers_before(node, "range", content)
+            .iter()
+            .any(|identifier| identifier == name),
+        "receive_statement" => identifiers_before(node, "<-", content)
+            .iter()
+            .any(|identifier| identifier == name),
+        "type_switch_guard" => identifiers_before(node, ":=", content)
+            .iter()
+            .any(|identifier| identifier == name),
+        _ => false,
+    }
+}
+
+fn declared_identifiers(node: Node<'_>, content: &[u8]) -> Vec<String> {
+    let mut cursor = node.walk();
+    let cutoff = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "identifier")
+        .map(|child| child.start_byte())
+        .unwrap_or_else(|| {
+            node.utf8_text(content)
+                .ok()
+                .and_then(|source| source.find('='))
+                .map_or(node.end_byte(), |offset| node.start_byte() + offset)
+        });
+    identifiers_before_byte(node, cutoff, content)
+}
+
+fn identifiers_before(node: Node<'_>, delimiter: &str, content: &[u8]) -> Vec<String> {
+    let source = node.utf8_text(content).unwrap_or("");
+    let limit = node.start_byte() + source.find(delimiter).unwrap_or(source.len());
+    identifiers_before_byte(node, limit, content)
+}
+
+fn identifiers_before_byte(node: Node<'_>, limit: usize, content: &[u8]) -> Vec<String> {
+    fn visit(node: Node<'_>, limit: usize, content: &[u8], identifiers: &mut Vec<String>) {
+        if node.start_byte() >= limit {
+            return;
+        }
+        if node.kind() == "identifier" {
+            if let Ok(identifier) = node.utf8_text(content) {
+                identifiers.push(identifier.to_owned());
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, limit, content, identifiers);
+        }
+    }
+
+    let mut cursor = node.walk();
+    let mut identifiers = Vec::new();
+    for child in node.named_children(&mut cursor) {
+        visit(child, limit, content, &mut identifiers);
+    }
+    identifiers
 }
 
 /// Literal node kinds for the fingerprint walk (tree-sitter-go v0.25):
@@ -1042,34 +1860,68 @@ func Helper() {}
     }
 
     #[test]
-    fn selector_call_in_free_function_records_field_name_only() {
-        // `func f() { s.Start() }` → 1 edge; To=Start (field name only).
+    fn unknown_selector_call_is_marked_bound() {
+        // An unbound selector receiver has no static type, so it must not
+        // later resolve as an unrelated bare method name.
         let fg = parse("package main\nfunc f() { s.Start() }\n");
         let edges = calls(&fg);
         assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
-        assert_eq!(edges[0].to, "Start");
+        assert_eq!(edges[0].to, "@bound-receiver::Start");
         assert_eq!(edges[0].from, "/tmp/test.go:f");
     }
 
     #[test]
-    fn package_qualified_call_records_field_name_only() {
-        // `func f() { fmt.Println("x") }` → 1 edge; To=Println.
-        let fg = parse("package main\nfunc f() { fmt.Println(\"x\") }\n");
+    fn package_qualified_call_records_import_path() {
+        // Package bindings retain their import path so `fmt.Println` cannot
+        // resolve to an unrelated project function named `Println`.
+        let fg = parse("package main\nimport \"fmt\"\nfunc f() { fmt.Println(\"x\") }\n");
         let edges = calls(&fg);
         assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
-        assert_eq!(edges[0].to, "Println");
+        assert_eq!(edges[0].to, "fmt::Println");
         assert_eq!(edges[0].from, "/tmp/test.go:f");
+    }
+
+    #[test]
+    fn dot_import_marks_bare_call_provenance_ambiguous() {
+        let fg = parse("package main\nimport . \"pkg\"\nfunc f() { Func() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "@dot-import::Func");
     }
 
     #[test]
     fn method_call_inside_method_uses_receiver_qualified_from() {
-        // `func (s *Server) M() { s.Start() }` → 1 edge; To=Start;
-        // From=path:Server::M.
+        // `s` is the method receiver, so the extractor retains its concrete
+        // Server parent for resolution while preserving the method caller ID.
         let fg = parse("package main\nfunc (s *Server) M() { s.Start() }\n");
         let edges = calls(&fg);
         assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
-        assert_eq!(edges[0].to, "Start");
+        assert_eq!(edges[0].to, "@method-receiver::\u{1f}Server\u{1f}Start");
         assert_eq!(edges[0].from, "/tmp/test.go:Server::M");
+    }
+
+    #[test]
+    fn typed_parameter_receiver_uses_its_concrete_type() {
+        let fg = parse("package main\nfunc f(receiver Receiver) { receiver.Start() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "@method-receiver::\u{1f}Receiver\u{1f}Start");
+    }
+
+    #[test]
+    fn shadowed_method_receiver_is_not_qualified_as_the_outer_receiver() {
+        let fg = parse("package main\nfunc (s *Server) M() { s := Other{}; s.Start() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "@method-receiver::\u{1f}Other\u{1f}Start");
+    }
+
+    #[test]
+    fn short_declaration_initializer_keeps_the_outer_receiver() {
+        let fg = parse("package main\nfunc (s *Server) M() { if s := s.Clone(); s != nil {} }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "@method-receiver::\u{1f}Server\u{1f}Clone");
     }
 
     #[test]
@@ -1091,12 +1943,12 @@ func Helper() {}
         let fg = parse("package main\nfunc f() { defer conn.Close() }\n");
         let edges = calls(&fg);
         assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
-        assert_eq!(edges[0].to, "Close");
+        assert_eq!(edges[0].to, "@bound-receiver::Close");
         assert_eq!(edges[0].from, "/tmp/test.go:f");
     }
 
     #[test]
-    fn chained_call_produces_two_edges_one_per_link() {
+    fn chained_calls_are_marked_bound_without_bare_method_fallback() {
         // `a.B().C()` — tree-sitter produces nested call_expression nodes,
         // each with its own selector_expression. Two edges fall out
         // naturally: outer match To=C, inner match To=B.
@@ -1109,8 +1961,8 @@ func Helper() {}
             "expected exactly 2 Calls edges (one per chain link): {edges:?}"
         );
         assert!(
-            to.contains("B") && to.contains("C"),
-            "edges must cover both B and C, got: {to:?}"
+            to.contains("@bound-receiver::B") && to.contains("@bound-receiver::C"),
+            "chained operands must be unresolved markers, got: {to:?}"
         );
         for e in &edges {
             assert_eq!(e.from, "/tmp/test.go:f", "all chain edges share the From");
@@ -1122,32 +1974,43 @@ func Helper() {}
         // `func f() { fn := func() { inner() }; fn() }` — the call to
         // `inner` is inside a closure (`func_literal`) inside f. The
         // enclosing-walk must skip past the closure and report
-        // From=path:f. The trailing `fn()` is also a call edge to fn.
-        // Design intent is exactly two edges total: one for `inner`
-        // (inside the closure body) and one for `fn` (in f's body).
+        // From=path:f. The trailing `fn()` invokes a local function value,
+        // so it must not become a project-symbol call edge.
         let src = "package main\nfunc f() { fn := func() { inner() }; fn() }\n";
         let fg = parse(src);
         let edges = calls(&fg);
         let inner: Vec<_> = edges.iter().filter(|e| e.to == "inner").collect();
-        let fn_edges: Vec<_> = edges.iter().filter(|e| e.to == "fn").collect();
         assert_eq!(
             inner.len(),
             1,
             "expected exactly 1 edge with To=inner (closure-body call), got: {edges:?}"
         );
-        assert_eq!(
-            fn_edges.len(),
-            1,
-            "expected exactly 1 edge with To=fn (the closure invocation in f's body), got: {edges:?}"
+        assert!(
+            edges.iter().all(|edge| edge.to != "fn"),
+            "local function-value invocation must not emit a project call edge: {edges:?}"
         );
         assert_eq!(
             inner[0].from, "/tmp/test.go:f",
             "closure-body call must attribute to enclosing fn"
         );
-        assert_eq!(
-            fn_edges[0].from, "/tmp/test.go:f",
-            "fn() in f's body must attribute to f"
+    }
+
+    #[test]
+    fn package_variable_function_call_is_not_a_project_symbol_call() {
+        let fg = parse("package main\nvar callback = func() {}\nfunc f() { callback() }\n");
+        assert!(
+            calls(&fg).is_empty(),
+            "package-level function value must not emit a project call edge: {:?}",
+            fg.edges
         );
+    }
+
+    #[test]
+    fn variable_type_name_does_not_shadow_a_matching_function() {
+        let fg = parse("package main\nvar value external.Callback\nfunc f() { Callback() }\n");
+        let edges = calls(&fg);
+        assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
+        assert_eq!(edges[0].to, "Callback");
     }
 
     /// CRITICAL anti-regression for the package-level closure fallback.

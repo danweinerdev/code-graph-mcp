@@ -25,7 +25,7 @@
 //! [`PathTrie`]: code_graph_path_trie::PathTrie
 //! [`PathTrie::longest_prefix`]: code_graph_path_trie::PathTrie::longest_prefix
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Per-module data: the directory containing `go.mod` and the module
@@ -49,6 +49,33 @@ pub(crate) struct GoModuleModel {
 }
 
 impl GoModuleModel {
+    /// Discover the `go.mod` ancestors for an indexed Go-file set and build
+    /// the module model. Both namespace rewriting and import resolution use
+    /// this path so scoped indexes apply the same package-path rules.
+    pub(crate) fn discover<I>(files: I) -> Self
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let go_files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("go"))
+            .collect();
+        let mut manifests = HashSet::new();
+        for go_file in &go_files {
+            let mut ancestor = go_file.parent();
+            while let Some(directory) = ancestor {
+                let manifest = directory.join("go.mod");
+                if manifest.is_file() {
+                    manifests.insert(manifest);
+                }
+                ancestor = directory.parent();
+            }
+        }
+        Self::build(go_files.into_iter().chain(manifests), |path| {
+            std::fs::read_to_string(path).ok()
+        })
+    }
+
     /// Build the model from the indexed file set + a manifest reader.
     ///
     /// `files` is the complete indexed file set — `go.mod` files seed

@@ -59,7 +59,44 @@ pub fn extract_receiver_type(receiver: Node<'_>, content: &[u8]) -> String {
         return String::new();
     };
 
-    receiver_type_name(type_node, content)
+    extract_bare_type_name(type_node, content)
+}
+
+/// Return the declared bare type of a named parameter. The call extractor uses
+/// this only for selector receivers, where a concrete parameter type is enough
+/// to avoid guessing a same-named method from another type.
+pub fn extract_named_parameter_type(
+    parameters: Node<'_>,
+    name: &str,
+    content: &[u8],
+) -> Option<String> {
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(
+            parameter.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            continue;
+        }
+        let type_node = parameter.child_by_field_name("type")?;
+        if !parameter_declares_name(parameter, name, content) {
+            continue;
+        }
+        let type_name = extract_bare_type_name(type_node, content);
+        if !type_name.is_empty() {
+            return Some(type_name);
+        }
+    }
+    None
+}
+
+fn parameter_declares_name(parameter: Node<'_>, name: &str, content: &[u8]) -> bool {
+    let mut cursor = parameter.walk();
+    let declares_name = parameter
+        .named_children(&mut cursor)
+        .take_while(|child| child.kind() == "identifier")
+        .any(|child| child.utf8_text(content).ok() == Some(name));
+    declares_name
 }
 
 /// Resolve a receiver-type AST node to its bare type-identifier text.
@@ -68,7 +105,7 @@ pub fn extract_receiver_type(receiver: Node<'_>, content: &[u8]) -> String {
 /// pointer-of-generic and bare-generic forms share the same logic. Returns
 /// the empty string on any unexpected shape (matches the parent function's
 /// defensive posture).
-fn receiver_type_name(type_node: Node<'_>, content: &[u8]) -> String {
+pub fn extract_bare_type_name(type_node: Node<'_>, content: &[u8]) -> String {
     match type_node.kind() {
         "type_identifier" => type_node.utf8_text(content).unwrap_or("").to_owned(),
         "pointer_type" => {
@@ -78,7 +115,7 @@ fn receiver_type_name(type_node: Node<'_>, content: &[u8]) -> String {
             let mut cursor = type_node.walk();
             let inner = type_node.named_children(&mut cursor).next();
             match inner {
-                Some(n) => receiver_type_name(n, content),
+                Some(n) => extract_bare_type_name(n, content),
                 None => String::new(),
             }
         }
@@ -89,12 +126,13 @@ fn receiver_type_name(type_node: Node<'_>, content: &[u8]) -> String {
             let mut cursor = type_node.walk();
             let ident = type_node
                 .named_children(&mut cursor)
-                .find(|c| c.kind() == "type_identifier");
+                .find(|c| matches!(c.kind(), "type_identifier" | "qualified_type"));
             match ident {
-                Some(n) => n.utf8_text(content).unwrap_or("").to_owned(),
+                Some(n) => extract_bare_type_name(n, content),
                 None => String::new(),
             }
         }
+        "qualified_type" => type_node.utf8_text(content).unwrap_or("").to_owned(),
         _ => String::new(),
     }
 }

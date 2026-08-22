@@ -18,11 +18,11 @@ file; if you change a fixture, update both.
 | Interface |     6 |
 | Typedef   |     3 |
 
-### Edges by Kind (TOTAL = 41)
+### Edges by Kind (TOTAL = 36)
 
 | Kind     | Count |
 |----------|------:|
-| Calls    |    30 |
+| Calls    |    25 |
 | Includes |    11 |
 | Inherits |     0 |
 
@@ -61,8 +61,8 @@ package main
     `code-graph-go-corpus/models` (dot-imported — `.` dropped),
     `image/png` (blank — `_` dropped). All five share the line of the
     grouped `import (` block (line 33), per the line-anchoring rule.
-  - 4 `Calls`: `init -> Add` (resolved as `Add` from the aliased
-    selector `umath.Add`), `main -> New`, `main -> Run`, `main -> Println`
+  - 4 `Calls`: `init -> utils.Add` (from the aliased selector `umath.Add`),
+    `main -> models.New`, `main -> server.Run`, `main -> fmt.Println`
 
 ### `models/deps.go`
 
@@ -106,11 +106,11 @@ package main
 | Filter         | Function  |  122 | models    |        |
 
 - 10 symbols (2 Interfaces, 2 Structs, 4 Methods, 2 Functions)
-- 11 edges:
+- 8 edges:
   - 1 `Includes`: `code-graph-go-corpus/utils`
-  - 10 `Calls`: `Memo::Get -> Add`, `Memo::Hits -> Get`,
-    `KV::Set -> make`, `KV::Lookup -> ok`, `Map -> make`, `Map -> len`,
-    `Map -> append`, `Map -> f`, `Filter -> pred`, `Filter -> append`
+  - 7 `Calls`: `Memo::Get -> Add`, `Memo::Hits -> Get`,
+    `KV::Set -> make`, `Map -> make`, `Map -> len`, `Map -> append`,
+    `Filter -> append`. Calls through locally bound values stay unresolved.
 - `Repo` embeds `Closer` (interface-embedding-interface). The embedded
   interface produces no Symbol.
 - `Memo` has both a value-receiver method (`Get`) and a pointer-receiver
@@ -151,21 +151,19 @@ package main
 | withLog | Function |   49 | server    |        |
 
 - 2 symbols (2 Functions)
-- 5 edges:
+- 4 edges:
   - 1 `Includes`: `fmt`
-  - 4 `Calls`:
-    - `handler.go -> Println` — package-level closure assigned to
+  - 3 `Calls`:
+    - `handler.go -> fmt::Println` — package-level closure assigned to
       `var Logger`. The call's enclosing-fn walk reaches the source
       file root with no `function_declaration` / `method_declaration`
       ancestor, so `from` falls back to the bare file path. Mirrors the
       C++ lambda-at-global-scope rule. CRITICAL anti-regression at the
       corpus level.
-    - `handle -> Println`
-    - `withLog -> Println` (call inside the inner `func_literal`
+    - `handle -> fmt::Println`
+    - `withLog -> fmt::Println` (call inside the inner `func_literal`
       returned by withLog — closure-transparent walk attributes the
       call to `withLog`, NOT to the inner literal)
-    - `withLog -> inner` (parameter-name invocation inside the
-      returned closure)
 
 ### `server/server.go`
 
@@ -207,10 +205,10 @@ package main
 | init    | Function |   67 | utils     |        |
 
 - 9 symbols (3 Typedefs, 6 Functions)
-- 5 edges:
+- 4 edges:
   - 1 `Includes`: `fmt`
-  - 4 `Calls`: `Apply -> op`, `Greet -> Println`, `init -> Add`,
-    `init -> Mul`
+  - 3 `Calls`: `Greet -> fmt::Println`, `init -> Add`, `init -> Mul`.
+    `Apply -> op` is a function-value invocation and stays unresolved.
 - `Op` is a `type_alias` (Go 1.9+ `type X = T` form); `Handler` and
   `Count` are `type_spec`s with non-struct/non-interface bodies. All
   three produce `Typedef` symbols — exercises both AST-node forms

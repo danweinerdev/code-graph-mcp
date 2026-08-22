@@ -127,7 +127,7 @@ fn count_edges_by_kind(edges: &[Edge]) -> HashMap<EdgeKind, usize> {
 /// fixture changes, update both this constant and `testdata/go/MANIFEST.md`
 /// in the same commit.
 const TOTAL_SYMBOLS: usize = 42;
-const TOTAL_EDGES: usize = 41;
+const TOTAL_EDGES: usize = 36;
 
 #[test]
 fn corpus_aggregate_counts_match_manifest() {
@@ -187,8 +187,8 @@ fn corpus_aggregate_counts_match_manifest() {
     let edge_by_kind = count_edges_by_kind(&all_edges);
     assert_eq!(
         edge_by_kind.get(&EdgeKind::Calls).copied().unwrap_or(0),
-        30,
-        "MANIFEST claims 30 Calls edges"
+        25,
+        "MANIFEST claims 25 Calls edges"
     );
     assert_eq!(
         edge_by_kind.get(&EdgeKind::Includes).copied().unwrap_or(0),
@@ -217,11 +217,11 @@ fn corpus_per_file_counts_match_manifest() {
         ("empty.go", 0, 0),
         ("main.go", 2, 9),
         ("deps.go", 7, 1),
-        ("repo.go", 10, 11),
+        ("repo.go", 10, 8),
         ("user.go", 5, 2),
-        ("handler.go", 2, 5),
+        ("handler.go", 2, 4),
         ("server.go", 7, 8),
-        ("helpers.go", 9, 5),
+        ("helpers.go", 9, 4),
     ];
 
     let actual_files: Vec<&str> = corpus.keys().map(String::as_str).collect();
@@ -456,10 +456,12 @@ fn package_level_closure_call_attributes_to_file_path_in_handler_go() {
     let logger_edge = handler
         .edges
         .iter()
-        .find(|e| e.kind == EdgeKind::Calls && e.to == "Println" && e.from.ends_with("handler.go"))
+        .find(|e| {
+            e.kind == EdgeKind::Calls && e.to == "fmt::Println" && e.from.ends_with("handler.go")
+        })
         .unwrap_or_else(|| {
             panic!(
-                "expected one Calls edge with To=Println and bare-path \
+                "expected one Calls edge with To=fmt::Println and bare-path \
                  from; edges in handler.go: {:?}",
                 handler.edges
             )

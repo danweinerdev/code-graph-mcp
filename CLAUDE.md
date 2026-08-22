@@ -26,7 +26,7 @@ Rust workspace, MCP server (rmcp, stdio). Builds in-memory semantic code graphs 
 | `code-graph-mcp` | `crates/code-graph-mcp` | Binary; rmcp stdio server entry |
 | `code-graph-core` | `crates/code-graph-core` | `Symbol`, `Edge`, `SymbolKind`, `EdgeKind`, `Confidence`, `RootConfig` (TOML) |
 | `code-graph-lang` | `crates/code-graph-lang` | `LanguagePlugin` trait, `LanguageRegistry`, `SymbolIndex` |
-| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v11) at `<project_root>/.code-graph-cache.db`. One of two `#![allow(unsafe_code)]` opt-ins in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs` (the other is the function-scoped Windows handle-inheritance seal in `code-graph-mcp`'s `daemon.rs`). |
+| `code-graph-graph` | `crates/code-graph-graph` | In-memory `Graph` (forward+reverse adjacency, path-trie file/include indexes), rkyv binary cache (v12) at `<project_root>/.code-graph-cache.db`. One of two `#![allow(unsafe_code)]` opt-ins in the workspace lives here, scoped to the one mmap site in `persist/mmap.rs` (the other is the function-scoped Windows handle-inheritance seal in `code-graph-mcp`'s `daemon.rs`). |
 | `code-graph-path-trie` | `crates/code-graph-path-trie` | Segment-keyed Patricia trie (`PathTrie<V>`), `PathSet`, `PathInterner`. Backs `Graph.files`/`Graph.includes` and the cache encoder's path interning. `#![forbid(unsafe_code)]`. |
 | `code-graph-tools` | `crates/code-graph-tools` | Tool handlers; parallel discovery+indexer; watcher (notify-debouncer-full) |
 | `code-graph-vcs` | `crates/code-graph-vcs` | `VcsProvider` trait (async, exactly four required ops), opaque `RevId`, `Commit`/`BlameHunk`, `VcsRegistry` with working-tree detection. No backend dependency. `#![forbid(unsafe_code)]`. |
@@ -149,7 +149,7 @@ Every `EdgeEntry` carries a `Confidence` tag AND a `candidates: u32` count, both
 
 - **`Resolved`** (default): unambiguous target. Either the callee/include name had exactly one indexed candidate, OR the edge is declarative (Inherits / Rust `mod`-resolved Includes) or structurally disambiguated (suffix-matched includes). Overrides edges are NOT declarative — they route through `resolve_call` like calls (the `Parent::name` token can have same-named candidates in several ancestor classes), so they carry real Heuristic tags and real counts when contested.
 - **`Heuristic`**: ≥ 2 indexed candidates shared the callee/basename; resolver picked via scope rule (same file > same parent > same namespace > global) or first-of-N.
-- **`candidates`**: the real N those variants project down to one bit. `1` = sole candidate or declarative-by-construction; `N ≥ 2` = N same-named definitions competed. Captured at the resolver's pick site — it cannot be reconstructed later (the losing candidates are gone once the graph exists) — and persisted through the v11 cache. Surfaced on `CallChain` (callers/callees/overrides hops), `PathHop` (null for `hops[0]` only, mirroring `entered_by`), and `symbol=`-mode `DiagramEdge`s (absent, not null, in `file=`/`class=` modes). **The count is the signal to reason from** — "3 candidates competed, here is the one chosen" names the next action where the one-bit tag does not.
+- **`candidates`**: the real N those variants project down to one bit. `1` = sole candidate or declarative-by-construction; `N ≥ 2` = N same-named definitions competed. Captured at the resolver's pick site — it cannot be reconstructed later (the losing candidates are gone once the graph exists) — and persisted through the v12 cache. Surfaced on `CallChain` (callers/callees/overrides hops), `PathHop` (null for `hops[0]` only, mirroring `entered_by`), and `symbol=`-mode `DiagramEdge`s (absent, not null, in `file=`/`class=` modes). **The count is the signal to reason from** — "3 candidates competed, here is the one chosen" names the next action where the one-bit tag does not.
 
 **Why both signals stay on the wire (task 9.3's D-0007 disposition):** for call edges TODAY `Resolved` ⇔ count 1 and `Heuristic` ⇔ count ≥ 2, but the axes are independent by design — the include RESOLVER CONTRACT already produces `Resolved` with count 2 for suffix-disambiguated picks (visible at the trait layer and in its tests; the count is then dropped at merge because Includes become `IncludeEntry`, so no wire surface exhibits the combination today), and a future type-inference variant could mark a multi-candidate CALL pick as definitively resolved, at which point deriving one from the other would be wrong. Removing `entered_by`/`heuristic_hops` would also break the phase's additive-response contract. `heuristic_hops` additionally explains WHY `find_path` chose this path (the fewest-heuristic-edges tie-break); `candidates` per hop shows WHICH hop was contested.
 
@@ -350,7 +350,7 @@ capture). macOS process-TITLE renaming remains a documented no-op:
 
 ### Cache invalidation
 
-- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `11`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
+- **Format:** rkyv binary archive prefixed by an 8-byte header (`ENDIAN_PROBE: u32 native` = `0x01020304` + `CACHE_VERSION: u32 native`, currently `12`). Endian probe catches cross-endian mmap and routes to silent re-index. Single source of truth: `crates/code-graph-graph/src/persist/packed.rs::CACHE_VERSION`.
 - **Version mismatch** on `Graph::load` → `Ok(false)` → caller **silently re-indexes**. No `force=true` required, no transparent migration.
 - **mtime-based stale checking.** Changes to `[cpp].macro_strip`, `[cpp].macro_strip_with_args`, `[cpp].macro_define_function`, `[cpp].macro_define_type`, or `[extensions]` do NOT retroactively re-parse files with unchanged mtime. Apply with `force=true`.
 - **Adding extensions:** new files brought in by `[extensions].<lang>` parse normally on next run (no `force=true`).
@@ -360,6 +360,7 @@ capture). macOS process-TITLE renaming remains a documented no-op:
 - **Merge-not-clobber for scoped invocations.** `analyze_codebase(<subtree>)` (no `force`) loads the existing project cache, evicts in-scope files no longer on disk, parses in-scope files, and merges. Files outside scope preserved untouched. Subsequent scoped invocations at sibling subtrees accumulate into the same project graph.
 - **Scoped `force=true`** is scope-limited invalidation: drops only entries inside the invoked subtree before re-indexing. Sibling-subtree entries survive. `force=true` at the project root clobbers and rebuilds the whole project.
 - **Cross-scope edge resolution is asymmetric by design.** Fresh files' edges resolve against the union of cached + freshly-parsed symbols (fresh-to-cached works). Cached edges from prior invocations do NOT spontaneously re-resolve against newly-added symbols — `force=true` at the originating subtree to re-parse. Bounds resolve cost to the freshly-parsed set. Contract: `crates/code-graph-tools/src/indexer.rs::resolve_edges_with_indexes` doc-comment. The same staleness applies to the resolver-stamped `confidence` AND `candidates` on cached edges: both reflect the candidate set at THEIR resolve time, so a later scoped analyze (or watch edit of a different file) that adds a same-named definition leaves old edges underreporting N — same-name edges in one graph can legitimately disagree on the count until re-resolved.
+- **Cold-cache Go resolver metadata has an out-of-scope staleness seam.** `FileGraph`/the v12 cache do not persist Go's declared package name or package-level value bindings. After a process restart, `GoParser::prepare_resolution` reconstructs that metadata by parsing cache-loaded files from disk so fresh scoped files can still distinguish package values from callable symbols. If an OUT-OF-SCOPE Go file changed on disk without its cached graph being refreshed, its resolver metadata can therefore describe newer bytes than its cached symbols, producing a false-positive or false-negative fresh call edge. Re-analyze the changed file's subtree (use `force=true` when mtime-based refresh is insufficient) to reconcile it. An exact fix requires persisting per-file Go resolver metadata and another cache-version bump.
 - **Out-of-scope hygiene sweep.** Each `analyze_codebase` checks `Graph::last_sweep_at`; if ≥ `SWEEP_INTERVAL_NANOS` (default 24h, `crates/code-graph-graph/src/persist/mod.rs`) elapsed, runs `Graph::sweep_missing_out_of_scope(invocation_path)` to stat every cached file OUTSIDE the invocation scope and drop the ones no longer on disk. Timestamp persisted in the cache (`last_sweep_at`) so cadence survives restarts.
 
 ## Per-language parser facts
@@ -420,18 +421,21 @@ Supported:
 - Generic functions (Go 1.18+) — type-param list in captured signature; bare name as `Symbol.name`.
 - `init()` and `main()` extracted as ordinary functions; no special-casing.
 - `package_clause` → `Symbol.namespace`, **rewritten** to module-qualified path (`module_path::a::b`) by `GoParser::post_index` if `go.mod` is discoverable upward. Files outside any discoverable module fall back to bare package name.
-- Call patterns: direct, selector (`obj.M()`), package-qualified (`fmt.Println()`), chained, `go fn()`, `defer fn()`, inside `func_literal`.
+- Call extraction: direct, selectors (`obj.M()`), package-qualified (`fmt.Println()`), `go fn()`, `defer fn()`, and calls inside `func_literal`. Unknown and chained selector receivers are intentionally unresolved.
 - Import forms via `import_spec`: single, grouped, aliased (alias dropped, path captured), dot, blank.
+- Indexed module imports resolve to one deterministic file edge: the lexicographically first indexed `.go` file in the imported package. Standard-library/external imports still drop. An import is one package dependency, not one edge per source file in that package.
+- Selector calls through an imported binding carry its import path for resolution; direct calls through locally bound function values/parameters are omitted rather than matched to same-named project symbols. Unique same-package cross-file calls resolve before the generic fallback.
 - Package-level closure fallback: call inside `var H = func() { foo() }` → `from` = file path (mirrors C++ lambda-at-global-scope).
 
 Limitations:
 1. **Structural interface implementation → zero edges.** No `Inherits` for Go. `get_class_hierarchy` on a Go interface returns leaf.
 2. **Embedded struct fields → no `Inherits`.** `type T struct { Bar }` is composition.
-3. **Call resolution heuristic.**
-4. **`go.mod` consulted for namespace derivation only; vendor NOT consulted.** Import-path resolution to file edges is unchanged — import paths recorded verbatim in `Includes.to`; the default basename match against FileIndex is correctly a no-op for module paths. `get_dependencies` does NOT resolve cross-module imports to indexed Go files.
+3. **Conservative package-aware call resolution.** Bare calls resolve only to a unique free function in the caller package; imported selectors resolve only to the indexed imported package; unknown/chained receivers stay unresolved.
+4. **`replace`, vendor, and package-name overrides are not consulted.** Indexed package paths derive from the owning `go.mod`; use an explicit import alias when a package's declared name differs from its final import-path segment. Only indexed packages resolve to file edges.
 5. **Generic type parameters not in structured fields.** `(s *Server[T])` → parent `Server` (bare). `[T]`/`[T any]`/`[T comparable]` survive only in captured signature text.
 6. **Backtick-string imports NOT matched.** Query only matches `interpreted_string_literal`.
 7. **Forward declarations excluded.** `method_elem` (no body, interface method element) NOT matched; only `method_declaration`.
+8. **Dot-imported calls are conservative.** The import still contributes a file dependency when indexed. Bare calls resolve only when a unique same-package function is known; calls through the imported package are omitted because their provenance is unavailable without type checking.
 
 ### Python — tree-sitter-python v0.25.0
 
@@ -569,7 +573,7 @@ AI Agent <-stdio/MCP-> [code-graph-mcp (rmcp server)]
                               |
                      +--------+--------+
                      |                 |
-              [Tool Handlers]     [Graph + rkyv v11 cache]
+              [Tool Handlers]     [Graph + rkyv v12 cache]
               (code-graph-tools)  (code-graph-graph)
                      |                 |
               [LanguageRegistry]
