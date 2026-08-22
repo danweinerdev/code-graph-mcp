@@ -55,7 +55,7 @@ analysis, then retry instead of re-calling the same offset.
 - Read `AnalyzeResult.warnings`. A "no config found" warning means engine-style declarations
   (`class CORE_API Foo`) will not extract until `[cpp].macro_strip` is configured; an "orphan
   cache" warning means a stale cache sits at an invocation subdir and is being ignored.
-- Cache lives at `<project_root>/.code-graph-cache.db` (rkyv, v8), co-located with the discovered
+- Cache lives at `<project_root>/.code-graph-cache.db` (rkyv, v12), co-located with the discovered
   `.code-graph.toml`. A version mismatch silently re-indexes -- no `force` needed.
 - To keep the graph live while you edit, call `watch_start` (auto-reindex on change) and
   `watch_stop` when done.

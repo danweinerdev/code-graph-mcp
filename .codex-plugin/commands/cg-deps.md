@@ -55,8 +55,9 @@ server's include/import edges.
 - **Rust:** only intra-crate `mod foo;` produces file edges. `use` / `extern crate` are extracted
   then dropped at resolve -- by design. A Rust dependency answer is a module-tree answer, not a
   crate-graph answer.
-- **Go:** import paths are recorded verbatim and are **not** resolved to indexed files across
-  modules, so `get_dependencies` on Go is thin. `go.mod` is consulted for namespaces only.
+- **Go:** indexed imports within a discovered `go.mod` module resolve to the lexicographically
+  first indexed `.go` file in the imported package. Standard-library/external imports drop;
+  `replace`, vendor, and implicit package-name overrides are not consulted.
 - **Python:** `from foo import bar` records `"foo"` -- the module is the dependency, not the name.
   Conditional imports under `if TYPE_CHECKING:` / `try:` are not extracted.
 
