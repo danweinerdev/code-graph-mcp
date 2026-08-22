@@ -219,9 +219,12 @@ pub fn index_directory(
 /// Mirrors the Go `buildSymbolIndex` in `internal/tools/analyze.go`,
 /// indexing each symbol under multiple keys so the resolver can match
 /// callees written as bare names, `Parent::Name`, `Namespace::Name`, or
-/// the fully-qualified `Namespace::Parent::Name`. The Rust port differs
-/// from Go in one place: the lookup is keyed by `(Language, name)` rather
-/// than `name` alone, so cross-language collisions are impossible.
+/// the fully-qualified `Namespace::Parent::Name`. Methods whose parent
+/// carries a generic parameter list (`Page<T>`) additionally gain the
+/// de-genericized `Parent::Name` form (`Page::new`) so unparameterized
+/// call tokens resolve. The Rust port differs from Go in one place: the
+/// lookup is keyed by `(Language, name)` rather than `name` alone, so
+/// cross-language collisions are impossible.
 pub fn build_symbol_index(graphs: &[FileGraph]) -> SymbolIndex {
     let mut index = SymbolIndex::new();
     extend_symbol_index(&mut index, graphs);
@@ -235,9 +238,11 @@ pub fn build_symbol_index(graphs: &[FileGraph]) -> SymbolIndex {
 /// calls [`build_symbol_index`] against the cache snapshot, then
 /// extends with the fresh `FileGraph`s.
 ///
-/// Entries are pushed under the same four keys as `build_symbol_index`
+/// Entries are pushed under the same keys as `build_symbol_index`
 /// (bare name; `Parent::Name`; `Namespace::Name`;
-/// `Namespace::Parent::Name`). Duplicate keys accumulate in the
+/// `Namespace::Parent::Name`; plus the de-genericized `Parent::Name`
+/// and `Namespace::Parent::Name` forms when the parent carries a
+/// generic parameter list). Duplicate keys accumulate in the
 /// `Vec<SymbolEntry>` value — the resolver's scope-aware heuristic
 /// disambiguates at lookup time, so layering does not need to
 /// distinguish "cached" from "fresh" at index-build time.
@@ -259,6 +264,23 @@ pub fn extend_symbol_index(index: &mut SymbolIndex, graphs: &[FileGraph]) {
             if !s.parent.is_empty() {
                 let qualified = format!("{}::{}", s.parent, s.name);
                 push(index, fg.language, &qualified, entry.clone());
+                // De-genericized Parent::Name: an unparameterized call
+                // (`Page::new` against `impl<T> Page<T>`) never matches the
+                // verbatim generic parent, so also register the stripped
+                // form when the parent carries one. Collisions between
+                // distinct generic types (`Page<T>` / `Page<T, U>`)
+                // accumulate in the same bucket; the scope-aware scoring
+                // loop disambiguates and the candidate count reports the
+                // real N.
+                let bare_parent = strip_generic_params(&s.parent);
+                if bare_parent != s.parent {
+                    push(
+                        index,
+                        fg.language,
+                        &format!("{}::{}", bare_parent, s.name),
+                        entry.clone(),
+                    );
+                }
             }
 
             // Namespace::Name and Namespace::Parent::Name.
@@ -268,10 +290,49 @@ pub fn extend_symbol_index(index: &mut SymbolIndex, graphs: &[FileGraph]) {
                 if !s.parent.is_empty() {
                     let full = format!("{}::{}::{}", s.namespace, s.parent, s.name);
                     push(index, fg.language, &full, entry.clone());
+                    let bare_parent = strip_generic_params(&s.parent);
+                    if bare_parent != s.parent {
+                        push(
+                            index,
+                            fg.language,
+                            &format!("{}::{}::{}", s.namespace, bare_parent, s.name),
+                            entry.clone(),
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// Strip a trailing balanced generic parameter list from a type name:
+/// `Page<T>` -> `Page`, `Vec<HashMap<K, V>>` -> `Vec`, `Page` -> `Page`
+/// (returned unchanged). A trailing `>` with no balanced `<` (e.g. a
+/// malformed name) is not a parameter list and comes back unchanged.
+///
+/// Used to register the de-genericized `Parent::name` index key: an
+/// unparameterized call token (`Page::new`) written against
+/// `impl<T> Page<T> fn new` cannot match the verbatim generic parent,
+/// so the resolver would drop the edge without the stripped key.
+fn strip_generic_params(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.last() != Some(&b'>') {
+        return name;
+    }
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b'>' => depth += 1,
+            b'<' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &name[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    name
 }
 
 /// Build the basename → absolute-path file index used by the include
@@ -904,6 +965,187 @@ mod tests {
             "multi-candidate match must be marked Heuristic — the per-tool \
              min_confidence filter relies on this"
         );
+    }
+
+    /// A method whose parent carries a generic parameter list (`Page<T>`)
+    /// must be indexed under the de-genericized `Parent::name` key
+    /// (`Page::new`) in addition to the verbatim generic form, so an
+    /// unparameterized call token resolves. The bare-name, verbatim, and
+    /// namespace forms stay registered; a non-generic parent gains no
+    /// extra key (the stripped form is identical to the original).
+    #[test]
+    fn extend_symbol_index_registers_degenericized_parent_keys() {
+        let path = "/proj/src/page.rs".to_string();
+        let fg = FileGraph {
+            path: path.clone(),
+            language: Language::Rust,
+            symbols: vec![
+                Symbol {
+                    name: "new".to_string(),
+                    kind: SymbolKind::Method,
+                    file: path.clone(),
+                    line: 127,
+                    column: 0,
+                    end_line: 160,
+                    signature: "fn new()".to_string(),
+                    namespace: "m::page".to_string(),
+                    parent: "Page<T>".to_string(),
+                    language: Language::Rust,
+                },
+                Symbol {
+                    name: "is_empty".to_string(),
+                    kind: SymbolKind::Method,
+                    file: path.clone(),
+                    line: 200,
+                    column: 0,
+                    end_line: 201,
+                    signature: "fn is_empty()".to_string(),
+                    namespace: String::new(),
+                    parent: "AdapterRegistry".to_string(),
+                    language: Language::Rust,
+                },
+            ],
+            edges: Vec::new(),
+        };
+
+        let index = build_symbol_index(std::slice::from_ref(&fg));
+
+        // Generic-parent method: bare, verbatim, de-genericized, and the
+        // matching namespace-qualified forms.
+        for key in [
+            "new",
+            "Page<T>::new",
+            "Page::new",
+            "m::page::new",
+            "m::page::Page<T>::new",
+            "m::page::Page::new",
+        ] {
+            let entries = index
+                .by_name
+                .get(&(Language::Rust, key.to_string()))
+                .unwrap_or_else(|| panic!("missing index key {key:?}"));
+            assert_eq!(entries.len(), 1, "key {key:?} must hold exactly one entry");
+            assert_eq!(entries[0].id, format!("{path}:Page<T>::new"));
+        }
+
+        // Non-generic parent: the de-genericized form is identical to the
+        // verbatim one, so exactly two keys — no duplicate push.
+        for key in ["is_empty", "AdapterRegistry::is_empty"] {
+            assert!(
+                index
+                    .by_name
+                    .contains_key(&(Language::Rust, key.to_string())),
+                "missing index key {key:?}"
+            );
+        }
+
+        // The full key set is exactly the six above plus the two — the
+        // strip pass must add nothing for non-generic parents.
+        assert_eq!(
+            index.by_name.len(),
+            8,
+            "unexpected key set: {:?}",
+            index
+                .by_name
+                .keys()
+                .map(|(_, k)| k.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Unit checks for the generic-parameter stripper: plain names and
+    /// unbalanced trailing `>` come back unchanged; nested and
+    /// constrained parameter lists strip to the bare type.
+    #[test]
+    fn strip_generic_params_handles_nested_and_plain() {
+        assert_eq!(strip_generic_params("Page"), "Page");
+        assert_eq!(strip_generic_params("Page<T>"), "Page");
+        assert_eq!(
+            strip_generic_params("Page<T, U: Clone>"),
+            "Page",
+            "constrained parameter lists strip too"
+        );
+        assert_eq!(
+            strip_generic_params("Vec<HashMap<K, V>>"),
+            "Vec",
+            "nested generics strip to the outermost type"
+        );
+        assert_eq!(
+            strip_generic_params("Weird>"),
+            "Weird>",
+            "a trailing > without a balanced < is not a parameter list"
+        );
+    }
+
+    /// An unparameterized scoped call `Page::new` against a method whose
+    /// indexed parent is the generic `Page<T>` must resolve to the
+    /// method's symbol ID. Regression for the build-mcp smoke-test F1:
+    /// `get_callers(page.rs:Page<T>::new)` came back empty because the
+    /// raw token matched no indexed key and the edge was dropped at
+    /// resolve time, silently zeroing every caller query on generic
+    /// associated functions.
+    #[test]
+    fn resolve_all_edges_resolves_unparameterized_generic_assoc_call() {
+        let path = "/proj/src/page.rs".to_string();
+        fn rust_sym(name: &str, kind: SymbolKind, file: &str, parent: &str) -> Symbol {
+            Symbol {
+                name: name.to_string(),
+                kind,
+                file: file.to_string(),
+                line: 1,
+                column: 0,
+                end_line: 2,
+                signature: format!("fn {name}()"),
+                namespace: String::new(),
+                parent: parent.to_string(),
+                language: Language::Rust,
+            }
+        }
+        let fg = FileGraph {
+            path: path.clone(),
+            language: Language::Rust,
+            symbols: vec![
+                rust_sym("Page", SymbolKind::Struct, &path, ""),
+                rust_sym("new", SymbolKind::Method, &path, "Page<T>"),
+                rust_sym("make", SymbolKind::Function, &path, ""),
+            ],
+            edges: vec![Edge {
+                from: format!("{path}:make"),
+                // The token as written at the call site — no type params.
+                to: "Page::new".to_string(),
+                kind: EdgeKind::Calls,
+                file: path.clone(),
+                line: 30,
+                confidence: Confidence::Resolved,
+                candidates: 1,
+            }],
+        };
+
+        let mut graphs = vec![fg];
+        let mut reg = LanguageRegistry::new();
+        reg.register(Box::new(StubPlugin {
+            id: Language::Rust,
+            exts: &[".rs"],
+        }))
+        .unwrap();
+        resolve_all_edges(&mut graphs, &reg, &NoopProgressSink);
+
+        let call_edge = graphs
+            .iter()
+            .find(|g| g.path == path)
+            .and_then(|g| g.edges.iter().find(|e| matches!(e.kind, EdgeKind::Calls)))
+            .expect("call edge must survive resolve");
+        assert_eq!(
+            call_edge.to,
+            format!("{path}:Page<T>::new"),
+            "unparameterized `Page::new` must resolve to the generic-parent method's ID"
+        );
+        assert_eq!(
+            call_edge.confidence,
+            Confidence::Resolved,
+            "sole-candidate match must stay Resolved"
+        );
+        assert_eq!(call_edge.candidates, 1);
     }
 
     /// An include whose resolved target is not a file any language plugin
