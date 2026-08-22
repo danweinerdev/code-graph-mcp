@@ -532,6 +532,18 @@ pub trait LanguagePlugin: Send + Sync {
     /// generics. `Box<dyn LanguagePlugin>` storage is unaffected.
     fn post_index(&self, _graphs: &mut [FileGraph], _file_index: &FileIndex) {}
 
+    /// Prepare immutable resolver state derived from the complete file-graph
+    /// universe used for an edge-resolution pass. The production scoped path
+    /// supplies cached plus fresh graphs (fresh replaces same-path cached
+    /// graphs); watch and development paths supply their complete unions.
+    ///
+    /// This hook must not mutate `graphs`: cached graphs may be present solely
+    /// as resolver context and are not being re-indexed. Implementations may
+    /// retain thread-safe derived state on `self`; the default is a no-op.
+    /// Object-safe by construction, so registry storage remains
+    /// `Box<dyn LanguagePlugin>`.
+    fn prepare_resolution(&self, _graphs: &[FileGraph], _file_index: &FileIndex) {}
+
     /// Release any resources held by the plugin (e.g. tree-sitter queries).
     /// Default is a no-op; tree-sitter `Query` already drops cleanly.
     fn close(&self) {}

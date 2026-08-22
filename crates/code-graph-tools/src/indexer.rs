@@ -396,6 +396,7 @@ pub fn resolve_all_edges(
 ) {
     let symbol_index = build_symbol_index(graphs);
     let file_index = build_file_index(graphs);
+    let resolution_graphs = graphs.to_vec();
     // Built-in extensions only. This helper is the dev/bench + unit-test
     // entry point; the production analyze path calls
     // `resolve_edges_with_indexes` directly with the active
@@ -404,6 +405,7 @@ pub fn resolve_all_edges(
     // threading a `RootConfig` through the bench binary.
     resolve_edges_with_indexes(
         graphs,
+        &resolution_graphs,
         &symbol_index,
         &file_index,
         registry,
@@ -437,12 +439,16 @@ pub fn resolve_all_edges(
 /// updates lazily, never in the background.
 pub fn resolve_edges_with_indexes(
     graphs: &mut [FileGraph],
+    resolution_graphs: &[FileGraph],
     symbol_index: &SymbolIndex,
     file_index: &FileIndex,
     registry: &LanguageRegistry,
     progress: &dyn ProgressSink,
     extensions: &ExtensionsConfig,
 ) {
+    for plugin in registry.plugins() {
+        plugin.prepare_resolution(resolution_graphs, file_index);
+    }
     let total = graphs.len() as u32;
     let counter = AtomicU32::new(0);
 
@@ -1317,12 +1323,14 @@ mod tests {
         let mut graphs = make_graphs();
         let symbol_index = build_symbol_index(&graphs);
         let file_index = build_file_index(&graphs);
+        let resolution_graphs = graphs.clone();
         let ext_inc = ExtensionsConfig {
             cpp: vec![".inc".to_string()],
             ..Default::default()
         };
         resolve_edges_with_indexes(
             &mut graphs,
+            &resolution_graphs,
             &symbol_index,
             &file_index,
             &reg,
@@ -1344,8 +1352,10 @@ mod tests {
         let mut graphs = make_graphs();
         let symbol_index = build_symbol_index(&graphs);
         let file_index = build_file_index(&graphs);
+        let resolution_graphs = graphs.clone();
         resolve_edges_with_indexes(
             &mut graphs,
+            &resolution_graphs,
             &symbol_index,
             &file_index,
             &reg,

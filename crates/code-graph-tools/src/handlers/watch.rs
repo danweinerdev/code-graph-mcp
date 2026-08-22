@@ -353,6 +353,9 @@ pub async fn try_reindex_file(
     for plugin in inner.registry.plugins() {
         plugin.post_index(&mut all_graphs, &file_index);
     }
+    for plugin in inner.registry.plugins() {
+        plugin.prepare_resolution(&all_graphs, &file_index);
+    }
     // The freshly-parsed `FileGraph` is the LAST entry in `all_graphs`
     // (pushed just above). After the hook may have rewritten its symbols
     // in place, copy the post-hook version back into `new_fg` so the

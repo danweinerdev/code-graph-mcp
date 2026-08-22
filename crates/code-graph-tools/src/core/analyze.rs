@@ -41,8 +41,8 @@ use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
 use crate::handlers::status::format_unix_nanos_rfc3339;
 use crate::indexer::{
-    build_file_index, build_symbol_index, extend_file_index, extend_symbol_index, index_directory,
-    resolve_edges_with_indexes, NoopProgressSink, ProgressSink,
+    build_file_index, build_symbol_index, index_directory, resolve_edges_with_indexes,
+    NoopProgressSink, ProgressSink,
 };
 use crate::server::ServerInner;
 
@@ -518,13 +518,25 @@ pub(crate) async fn run_analyze_job(
         sink.transition_to(AnalyzePhase::Resolving);
         let phase_start = std::time::Instant::now();
         let cached_snapshot = merged_graph.file_graphs_snapshot();
-        let mut symbol_index = build_symbol_index(&cached_snapshot);
-        extend_symbol_index(&mut symbol_index, &fresh_graphs);
-        let mut file_index = build_file_index(&cached_snapshot);
-        extend_file_index(&mut file_index, &fresh_graphs);
+        // Every resolver input sees one graph per path: cached sibling graphs
+        // plus fresh graphs, with fresh replacing any stale same-path cache
+        // entry. Only fresh graphs are subsequently resolved and merged.
+        let fresh_paths: std::collections::HashSet<&str> = fresh_graphs
+            .iter()
+            .map(|graph| graph.path.as_str())
+            .collect();
+        let mut resolution_graphs: Vec<_> = cached_snapshot
+            .iter()
+            .filter(|graph| !fresh_paths.contains(graph.path.as_str()))
+            .cloned()
+            .collect();
+        resolution_graphs.extend(fresh_graphs.iter().cloned());
+        let symbol_index = build_symbol_index(&resolution_graphs);
+        let file_index = build_file_index(&resolution_graphs);
 
         resolve_edges_with_indexes(
             &mut fresh_graphs,
+            &resolution_graphs,
             &symbol_index,
             &file_index,
             &registry.registry,
