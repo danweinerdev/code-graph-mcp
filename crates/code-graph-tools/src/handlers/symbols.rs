@@ -1474,6 +1474,51 @@ mod tests {
         assert_eq!(parsed["limit"], serde_json::json!(20));
     }
 
+    /// Regression for the build-mcp smoke-test F3: an anchored regex on
+    /// the short name with `kind = method` must find the method. Pre-fix
+    /// the pattern matched only the qualified `Parent::name` form, so
+    /// `^is_empty$` returned total 0 even though the did-you-mean engine
+    /// (which compares short names) knew the exact symbol, and result
+    /// rows display the short name.
+    #[test]
+    fn search_symbols_anchored_short_name_with_method_kind() {
+        let mut g = Graph::new();
+        g.merge_file_graph(FileGraph {
+            path: "/registry.rs".to_string(),
+            language: Language::Rust,
+            symbols: vec![
+                sym(
+                    "is_empty",
+                    SymbolKind::Method,
+                    "/registry.rs",
+                    "AdapterRegistry",
+                ),
+                sym("new", SymbolKind::Function, "/registry.rs", ""),
+            ],
+            edges: Vec::new(),
+        });
+        let g = locked(g);
+        let r = search_symbols(
+            &g,
+            SearchSymbolsInput {
+                query: Some("^is_empty$"),
+                kind: Some("method"),
+                ..search_input()
+            },
+            NO_BYTE_BUDGET,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
+        assert_eq!(parsed["total"], serde_json::json!(1));
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "exact anchor must not leak other rows");
+        assert_eq!(results[0]["name"], serde_json::json!("is_empty"));
+        assert_eq!(
+            results[0]["parent"],
+            serde_json::json!("AdapterRegistry"),
+            "the row must be the method, not a same-named free function"
+        );
+    }
+
     /// Anchored exact-match query that's one edit off a real symbol
     /// must surface a Levenshtein suggestion. The substring matcher
     /// alone cannot find this (the typo doesn't contain a substring

@@ -1474,9 +1474,11 @@ impl CodeGraphServer {
                        offset, limit, truncated, next_offset} (flattened on the wire), \
                        sorted by symbol_id ascending, PLUS an optional `suggestions: \
                        string[]` field — see the suggestions block below. At least one \
-                       filter is expected: `query` (substring or regex on the symbol \
-                       name), `kind` (function, method, class, struct, enum, typedef, \
-                       interface, trait), `namespace` (substring match against the \
+                        filter is expected: `query` (substring or regex on the symbol \
+                        name; methods additionally match the qualified `Parent::name` \
+                        form, so both `^is_empty$` and `^Adapter::is_empty$` find the \
+                        method), `kind` (function, method, class, struct, enum, typedef, \
+                        interface, trait), `namespace` (substring match against the \
                        symbol's namespace path, e.g. 'Nfs' matches 'Ark::Nfs::V4'), \
                        and/or `language` (cpp, rust, go, python, csharp, java). `limit` \
                        defaults to 20 (max 1000, clamped silently — the echoed `limit` \

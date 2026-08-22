@@ -279,8 +279,13 @@ impl Graph {
     /// namespace → pattern. The pattern is tried as a case-insensitive
     /// regex (`(?i)<pattern>`); compile failures fall back to a
     /// case-insensitive substring match so user-supplied input never
-    /// crashes the search. Results are sorted by [`symbol_id`] for
-    /// deterministic pagination across repeat queries.
+    /// crashes the search. The pattern is tested against the short
+    /// symbol name AND, for methods (non-empty `parent`), additionally
+    /// against the qualified `Parent::name` form — so `^is_empty$`
+    /// finds methods and `^Adapter::is_empty$` keeps working; the
+    /// match is an OR of the two targets. Results are sorted by
+    /// [`symbol_id`] for deterministic pagination across repeat
+    /// queries.
     ///
     /// **Memory + time complexity (per the PaginationOverhaul retro):**
     /// The original implementation cloned every match into a `Vec<Symbol>`
@@ -358,19 +363,10 @@ impl Graph {
                     continue;
                 }
 
-                if !params.pattern.is_empty() {
-                    let full_name = if s.parent.is_empty() {
-                        s.name.clone()
-                    } else {
-                        format!("{}::{}", s.parent, s.name)
-                    };
-                    let matched = match &re {
-                        Some(r) => r.is_match(&full_name),
-                        None => full_name.to_lowercase().contains(&lower_pattern),
-                    };
-                    if !matched {
-                        continue;
-                    }
+                if !params.pattern.is_empty()
+                    && !pattern_matches_symbol(&re, &lower_pattern, &s.name, &s.parent)
+                {
+                    continue;
                 }
 
                 total = total.saturating_add(1);
@@ -424,19 +420,10 @@ impl Graph {
                 continue;
             }
 
-            if !params.pattern.is_empty() {
-                let full_name = if s.parent.is_empty() {
-                    s.name.clone()
-                } else {
-                    format!("{}::{}", s.parent, s.name)
-                };
-                let matched = match &re {
-                    Some(r) => r.is_match(&full_name),
-                    None => full_name.to_lowercase().contains(&lower_pattern),
-                };
-                if !matched {
-                    continue;
-                }
+            if !params.pattern.is_empty()
+                && !pattern_matches_symbol(&re, &lower_pattern, &s.name, &s.parent)
+            {
+                continue;
             }
 
             // This match counts toward `total` regardless of whether it
@@ -524,6 +511,35 @@ impl Graph {
                 .or_insert(0) += 1;
         }
         summary
+    }
+}
+
+/// Pattern match for [`Graph::search`]: the pattern is tested against
+/// the short symbol name first (no allocation), and — only for methods —
+/// additionally against the qualified `Parent::name` form. OR semantics:
+/// a hit on either target matches. Matching both keeps anchored
+/// short-name queries (`^is_empty$`) working for methods while preserving
+/// the qualified-form matches (`^Adapter::is_empty$`) the qualified
+/// target has always provided; the Levenshtein suggestion path already
+/// compares short names, so this closes the last "which name is the
+/// pattern on?" inconsistency in the tool.
+fn pattern_matches_symbol(
+    re: &Option<Regex>,
+    lower_pattern: &str,
+    name: &str,
+    parent: &str,
+) -> bool {
+    let short_hit = match re {
+        Some(r) => r.is_match(name),
+        None => name.to_lowercase().contains(lower_pattern),
+    };
+    if short_hit || parent.is_empty() {
+        return short_hit;
+    }
+    let qualified = format!("{}::{}", parent, name);
+    match re {
+        Some(r) => r.is_match(&qualified),
+        None => qualified.to_lowercase().contains(lower_pattern),
     }
 }
 
@@ -740,6 +756,88 @@ mod tests {
         let exact_names: Vec<&str> = exact.symbols.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(exact.total, 1);
         assert_eq!(exact_names, vec!["foo"]);
+    }
+
+    /// An anchored pattern on a method's SHORT name (`^is_empty$`) must
+    /// match the method — regression for the build-mcp smoke-test F3:
+    /// the pattern was tested only against the qualified `Parent::name`
+    /// form, so `^is_empty$` came back empty while the substring
+    /// `is_empty` found rows whose displayed name is the short one. The
+    /// qualified form must keep matching, symbols without a parent are
+    /// unaffected, and the count_only branch must agree with the
+    /// materializing one.
+    #[test]
+    fn search_anchored_short_name_matches_methods() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.rs",
+            Language::Rust,
+            vec![
+                sym_full(
+                    "is_empty",
+                    SymbolKind::Method,
+                    "/a.rs",
+                    "",
+                    "AdapterRegistry",
+                    Language::Rust,
+                ),
+                sym_full(
+                    "is_empty",
+                    SymbolKind::Function,
+                    "/a.rs",
+                    "",
+                    "",
+                    Language::Rust,
+                ),
+                sym_full("Page", SymbolKind::Struct, "/a.rs", "", "", Language::Rust),
+            ],
+            vec![],
+        ));
+
+        // Anchored short name: the free function AND the method match.
+        // Pre-fix the method was invisible to this pattern (only its
+        // qualified form was tested), so the total was 1.
+        let result = g.search(SearchParams {
+            pattern: "^is_empty$".to_string(),
+            ..SearchParams::default()
+        });
+        assert_eq!(
+            result.total,
+            2,
+            "short-name anchor must match the method too; got: {:?}",
+            result.symbols.iter().map(symbol_id).collect::<Vec<_>>()
+        );
+        let hits: Vec<(&str, &str)> = result
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.parent.as_str()))
+            .collect();
+        assert!(hits.contains(&("is_empty", "AdapterRegistry")));
+        assert!(hits.contains(&("is_empty", "")));
+
+        // The count_only branch must see the same match set.
+        let counted = g.search(SearchParams {
+            pattern: "^is_empty$".to_string(),
+            count_only: true,
+            ..SearchParams::default()
+        });
+        assert_eq!(counted.total, 2, "count_only must agree with materializing");
+
+        // The qualified form keeps matching (and only the method).
+        let qualified = g.search(SearchParams {
+            pattern: "^AdapterRegistry::is_empty$".to_string(),
+            ..SearchParams::default()
+        });
+        assert_eq!(qualified.total, 1);
+        assert_eq!(qualified.symbols[0].parent, "AdapterRegistry");
+
+        // No-parent symbols are untouched: `^Page$` still matches.
+        let page = g.search(SearchParams {
+            pattern: "^Page$".to_string(),
+            ..SearchParams::default()
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.symbols[0].name, "Page");
     }
 
     #[test]
