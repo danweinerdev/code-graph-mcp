@@ -1,7 +1,7 @@
 ---
 name: cg-index
 description: Build or refresh the code-graph index for this repo -- use when a code-graph tool reports the codebase is not indexed, results look stale after edits, or a huge tree needs the async path.
-argument-hint: [path] [force]
+argument-hint: "[path] [force]"
 ---
 
 # cg-index -- build or refresh the code-graph index

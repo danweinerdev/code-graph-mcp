@@ -1,9 +1,9 @@
 /**
  * code-graph plugin for OpenCode.ai
  *
- * Registers the code-graph MCP server (a stdio binary) and the skills +
- * commands directories shipped with the package. OpenCode discovers the plugin
- * via the `plugin` array in `opencode.json`; the function exported here is
+ * Registers the code-graph MCP server (a stdio binary) and the skills directory
+ * shipped with the package. OpenCode discovers the plugin via the `plugin`
+ * array in `opencode.json`; the function exported here is
  * called once at startup with the live client + directory and returns a config
  * hook that mutates OpenCode's resolved config in place.
  *
@@ -28,7 +28,6 @@ function resolveDir(name) {
 }
 
 const skillsDir = resolveDir("skills");
-const commandsDir = resolveDir("commands");
 
 // The server is a plain stdio binary. Honour an explicit override, otherwise
 // expect `code-graph-mcp` on PATH.
@@ -55,14 +54,6 @@ const hooks = ({ client, directory } = {}) => {
         config.skills.paths = config.skills.paths || [];
         if (!config.skills.paths.includes(skillsDir)) {
           config.skills.paths.push(skillsDir);
-        }
-      }
-
-      if (commandsDir) {
-        config.command = config.command || {};
-        config.command.paths = config.command.paths || [];
-        if (!config.command.paths.includes(commandsDir)) {
-          config.command.paths.push(commandsDir);
         }
       }
 

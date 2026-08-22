@@ -1,7 +1,7 @@
 ---
 name: cg-deps
 description: Inspect file-level dependencies, coupling, and circular includes with code-graph -- what a file imports, which files are most entangled, and where the dependency cycles are.
-argument-hint: [file path]
+argument-hint: "[file path]"
 ---
 
 # cg-deps -- file dependencies, coupling, and cycles

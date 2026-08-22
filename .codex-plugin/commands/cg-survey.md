@@ -1,7 +1,7 @@
 ---
 name: cg-survey
 description: Structural health survey of a codebase (or subtree) with code-graph -- size and shape, dead code, dependency cycles, and coupling hotspots, as one report.
-argument-hint: [subtree path]
+argument-hint: "[subtree path]"
 ---
 
 # cg-survey -- structural health report

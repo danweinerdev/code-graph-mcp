@@ -69,7 +69,7 @@ The generated tree at [`.codex-plugin/`](.codex-plugin/) carries the same skills
 
 ### OpenCode
 
-The npm package tree at [`opencode-plugin/`](opencode-plugin/) (`code-graph-opencode`) registers the MCP server, skills, commands, and a session-start cache check. Add to your `opencode.json` (global or project):
+The npm package tree at [`opencode-plugin/`](opencode-plugin/) (`code-graph-opencode`) registers the MCP server, skills, and a session-start cache check. It ships `/cg`, `/cg-index`, `/cg-impact`, `/cg-deps`, `/cg-survey`, and `/cg-status` command files; copy or symlink them into `~/.config/opencode/commands/` (or `.opencode/commands/` for a project) for OpenCode to discover them. Add the plugin to your `opencode.json` (global or project):
 
 ```json
 { "plugin": ["code-graph-opencode@latest"] }
