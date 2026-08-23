@@ -3,7 +3,7 @@ title: "Graph Platform Expansion"
 type: plan
 status: active
 created: 2026-08-08
-updated: 2026-08-20
+updated: 2026-08-23
 tags: [daemon, cli, vcs, graph-queries, refactor, architecture]
 related:
   - Specs/GraphPlatformExpansion
@@ -64,39 +64,47 @@ phases:
     status: complete
     doc: "11-Windows-Platform-Completion.md"
     depends_on: [4, 7, 8, 9]
+  - id: 12
+    title: "Accepted Technical Debt Closure"
+    status: planned
+    doc: "12-Accepted-Technical-Debt-Closure.md"
+    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]
 ---
 
 # Graph Platform Expansion
 
 ## Overview
-Five tracks that lift three constraints on the code graph: it is reachable only from an MCP client, only one session at a time can hold it, and it knows nothing about history. Delivered as eleven phases that interleave the implementation tracks, complete a fully supported Linux MVP first, and defer native macOS/Windows completion behind explicit platform seams.
+Five tracks that lift three constraints on the code graph: it is reachable only from an MCP client, only one session at a time can hold it, and it knows nothing about history. Delivered as twelve phases that interleave the implementation tracks, complete a fully supported Linux MVP first, certify Windows, retain an explicit deferred macOS seam, and close accepted review debt without reopening completed phases.
 
 - **Track A** (phase 2) — a typed core beneath the MCP handlers, so a CLI or socket front-end can reach structured results.
 - **Track B** (phases 3, 4, 7) — a repository-local daemon sharing one graph across sessions, an analyze queue, and a CLI.
 - **Track C** (phase 1) — three graph queries the current surface cannot answer at all.
 - **Track D** (phases 5, 6, 8) — version-control history behind a provider trait, git first, Perforce-ready.
-- **Track E** (phases 10, 11) — deferred native macOS and Windows completion after the Linux MVP, activating the transport/path/process/permission seams without reopening Linux semantics.
+- **Track E** (phases 10, 11) — native macOS and Windows completion after the Linux MVP, activating the transport/path/process/permission seams without reopening Linux semantics. Windows is complete; macOS remains deferred.
+
+Phase 12 is a cross-track closure phase for accepted non-gating follow-ups from the completed phase reviews. It excludes phase 10/macOS and the Perforce non-goal, and depends on completed phases 1–9 and 11.
 
 Phases 1, 3, and 5 have no dependencies on each other and may run concurrently in separate worktrees. Phase 2 follows phase 1 rather than running beside it: both edit `handlers/{query,symbols,structure}.rs` — phase 1 adds three handlers to them, phase 2 empties all three into `core/` — so concurrent worktrees would collide on every one of those files. Sequencing them also closes a coverage gap, since phase 2's migration is what puts the three new queries in the typed core where the CLI can reach them (AC-33, FR-17).
 
-Phases 4, 6, 7, and 8 are gated by their predecessors. Phases 10 and 11 are deliberately deferred until the Linux implementation phases they certify are complete. The phase numbering is a suggested order; `depends_on` is the real constraint.
+Phases 4, 6, 7, and 8 were gated by their predecessors. Phase 10 remains deliberately deferred; phase 11 was pulled forward and completed. Phase 12 follows all completed implementation and Windows-certification phases, but not phase 10. The phase numbering is a suggested order; `depends_on` is the real constraint.
 
 ## Current State
-*Written for a cold start. Last updated 2026-08-20.*
+*Written for a cold start. Last updated 2026-08-23.*
 
 | Phase | Status | Where it stands |
 |---|---|---|
 | 1 Graph Queries | complete / frozen reviewed | 3 tools shipped (19→22). Two review cycles, 9 findings resolved; certified 2026-08-18 by a fresh four-lane gate over the full range (`reviews/16-…`, frozen `1db21d6..a08ffcf`) — accepted follow-ups recorded there (find_path byte-budget exemption, cap_reached frontier edge, AC-32 spec reconciliation). |
 | 2 Typed Core Layering | complete / frozen reviewed | 6 modules migrated behind byte-identical adapters; `server.rs` zero-line diff. Certified 2026-08-18 by a fresh four-lane gate over the full range (`reviews/17-…`, frozen `a08ffcf..f2d6583`) — accepted follow-ups recorded there (cross-crate compile test, guard-surface shape for the phase 7 CLI). |
-| 3 Daemon Foundation | complete / frozen reviewed | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and frozen reviewed. Native platform completion remains deferred to phases 10/11. |
-| 4 Analyze Queue | complete / frozen reviewed | The superseded generic-job scheduler was rolled back (`2e5f343`) and replaced by the analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion; final aligned review at `reviews/13-…` (frozen `4eaccaa..72768ef`). One open follow-up from artifact 14: queued sync analyzes lose their progress sink (m5). |
+| 3 Daemon Foundation | complete / frozen reviewed | Linux daemon MVP is implemented through project-root inode ownership and metadata-temp cleanup (`dfc3884`), measured on two corpora, and frozen reviewed. Windows completion is certified by phase 11; only macOS phase 10 remains deferred. |
+| 4 Analyze Queue | complete / frozen reviewed | The superseded generic-job scheduler was rolled back (`2e5f343`) and replaced by the analyze-only, 32-entry, path-compacting pending FIFO with force OR and follower completion; final aligned review at `reviews/13-…` (frozen `4eaccaa..72768ef`). The queued-sync terminal-result path landed, but its original progress sink is still dropped on promotion; phase 12 task 12.2 owns that accepted follow-up. |
 | 5 VCS Foundation and Blame | complete / frozen reviewed | Six tasks: `code-graph-vcs` trait/registry, gix provider + hermetic harness, provider hardening (revwalk cap, shallow boundaries, honest blame contract — artifact 14 M3/M4/M5), and the `blame_symbol` tool (tool 24, oracle-tested, success-shaped unavailability, tri-state staleness). Two gate cycles; final aligned review at `reviews/15-…` (frozen `b75812e..5697222`), accepted follow-ups recorded there. Gates phase 6. |
 | 6 Symbol History | complete / frozen reviewed | Five tasks: `LanguagePlugin::fingerprint_symbol` hook (std-only token-aware default, AC-38), content-addressed fingerprint sidecar under `.code-graph/fingerprints/` (RevId+config+binary-identity keyed, tombstones), and the `symbol_history` tool (tool 25 — transition-only walk, D-0005 exact matching, success-shaped unavailability), plus two gate-driven fix tasks: 6.4 (historical parses run the indexer's config pipeline; deletion commits report `removed`; boundary flag covers skipped-oldest; config identity joins the cache key) and 6.5 (unreadable blob is `Operation`, never a cacheable `NotFound` absence). Three gate cycles; final aligned review at `reviews/18-…` (frozen `2627a51..3ee9810`), accepted follow-ups recorded there. Gates phase 8. |
 | 7 CLI | complete / frozen reviewed | Three tasks: the deferred interface design (Designs/CommandLineInterface, two review rounds — the Critical caught the unmodified proxy auto-spawning a contender, resolved by the new `code-graph-mcp --attach-only` mode), the `code-graph` binary over the typed core (crate `code-graph-cli`: 21 subcommands, honest `indexed` flag, daemon backend via a spawned attach-only child speaking byte-level JSON-RPC, Decision 7 unindexed-daemon fallback), and output parity (payload-defined `--json`, per-shape human renderer, exit 0/1/2, six-test AC-11 parity suite through the real adapter path). One gate cycle, all four lanes PASS/Aligned; final review at `reviews/19-…` (frozen `10a6253..35aa82f`), accepted follow-ups recorded there. Closes AC-33. |
 | 8 Per-Language Fingerprints | complete / frozen reviewed | Seven tasks: the shared AST walk (`code-graph-lang::fingerprint`: `locate_symbol_node` + `ast_fingerprint`, comma/comment-invisible, established by 8.1's C++ override which also settled the preprocess-bytes contract), five more per-language overrides (Rust surfaced the shared-walk trailing-comma fix; Python's f-string token-level literal predicate; C#'s dual literal-run spelling), and 8.6 making `LiteralInsensitive` live end to end (upfront rejection removed, visible per-span skips, CLAUDE.md support matrix), plus gate-driven 8.7 (both extractor-span boundaries — Rust outer attributes, C++ template clauses — qualified in docs AND pinned by tests). Two gate cycles; final aligned review at `reviews/20-…` (frozen `77f3cd4..dc8020e`), accepted follow-ups recorded there. Completes FR-34. |
 | 9 Resolver Candidate Count | complete / frozen reviewed | Three tasks: the count recorded at the resolver's pick site (sibling `candidates: u32` on `Edge`/`EdgeEntry`/`PackedEdge`, CACHE_VERSION 10→11 with the defaulting trap explicitly rejected), surfaced additively on all four edge-reporting tools (`CallChain`/`PathHop`/`DiagramEdge`, 12 snapshot rebaselines each reviewed individually, AC-57 driven end to end by `candidate_count.rs`), and the binary confidence tag demoted-and-documented rather than removed (task 9.3's D-0007 disposition, judged genuine by the gate's spec lane against FR-23's letter). One gate cycle, all four lanes PASS/Aligned; final review at `reviews/21-…` (frozen `f4b1779..824cfa2`), accepted follow-ups recorded there. Completes FR-48/AC-57. |
 | 10 macOS Platform Completion | deferred | Activates and certifies macOS seams after the Linux MVP; not part of current support acceptance. |
-| 11 Windows Platform Completion | complete / frozen reviewed | Pulled forward 2026-08-18 by user decision (Windows daemon mode required so large workspaces share a graph instance). Code identity = the pull-forward series `ccd9e11..89a2af2` (artifact-14-reviewed): full native workspace gates, `daemon_serve`/`daemon_proxy` un-gated and green, pipe admission ack + mandatory-lock semantics + handle-inheritance seal + SID-based owner-only DACL (natively regression-tested); security scope per D-0014 (one local user, one local project). 11.3's certification matrix (`notes/11-windows-certification-matrix.md`) maps the whole phases 1–9 surface to native evidence at `ca2e7a8` (1,935-test umbrella + dedicated path/daemon/history/CLI-parity rows). Two gate cycles; the gate's spec lane forced the AC-60/D-0014 spec reconciliation and the honest rewording of the Linux AC (re-run recorded as the lead follow-up). Final review at `reviews/22-…` (frozen `3dc41a9..385cc31`). AC-60 complete as amended. |
+| 11 Windows Platform Completion | complete / frozen reviewed | Pulled forward 2026-08-18 by user decision (Windows daemon mode required so large workspaces share a graph instance). Code identity = the pull-forward series `ccd9e11..89a2af2` (artifact-14-reviewed): full native workspace gates, `daemon_serve`/`daemon_proxy` un-gated and green, pipe admission ack + mandatory-lock semantics + handle-inheritance seal + SID-based owner-only DACL (natively regression-tested); security scope per D-0014 (one local user, one local project). 11.3's certification matrix (`notes/11-windows-certification-matrix.md`) maps the whole phases 1–9 surface to native evidence at `ca2e7a8` (1,935-test umbrella + dedicated path/daemon/history/CLI-parity rows). Two gate cycles; the gate's spec lane forced the AC-60/D-0014 spec reconciliation and the honest rewording of the Linux AC; its original rerun follow-up subsequently landed in `14e2681`. Final review at `reviews/22-…` (frozen `3dc41a9..385cc31`). AC-60 complete as amended. |
+| 12 Accepted Technical Debt Closure | planned | Eight tasks map every still-open non-macOS, non-Perforce product follow-up from final reviews 15–22 to graph-query contracts, typed-core boundaries, VCS/history, fingerprints, CLI/daemon behavior, resolver exposure, and native Windows certification. Already-resolved items and historical evidence bookkeeping are explicitly dispositioned in `12-Accepted-Technical-Debt-Closure.md`. |
 
 ### How phases 1 and 2 were certified after the fact
 
@@ -106,6 +114,7 @@ Both phases sat at "tasks complete, phase `in-progress`" for a week: findings ha
 
 - **Phase 9** and **FR-48 / AC-57** — candidate count. Phase 1's review asked whether `PathHop.entered_by` violated FR-23; reframing it around what an agent actually does with the field produced D-0007 and a better signal. The resolver knows how many candidates competed and discards it; recovering that needs a resolver change and a cache-format bump, so it is its own phase.
 - **Task 4.4** and **FR-49 / AC-58** — async whole-graph queries. `detect_communities` holds the read lock across label propagation, and `spawn_blocking` does not extend the client's wall-clock timeout. Landed in phase 4 because 4.1 already reshapes the job slot.
+- **Phase 12** — accepted technical-debt closure. The completed phase gates intentionally retained bounded non-blocking follow-ups; phase 12 groups every still-open product item from reviews 15–22 into eight executable tasks while excluding deferred macOS work, Perforce, already-resolved follow-ups, and historical evidence bookkeeping.
 
 ### Corrections made to approved artifacts
 
@@ -115,7 +124,7 @@ Each is a reconciliation event, not drift — the code was right and the documen
 - **Decision 8** said "16 gated call sites"; phase 1's tools made it 19 sites over 18 functions. Restated as a set-equality invariant.
 - **`PathResult`** shipped with two fields where the design sketched four; the design was reconciled to the code.
 - **CLAUDE.md** carried three stale claims found incidentally: the cache is v10 not v8, `EdgeKind` has four variants not three, and the workspace is *not* C-compiler-free (the tree-sitter grammars compile C via the `cc` crate). The last of these had already been recorded as a decision on the false premise, so D-0004 restates it on the argument that actually holds — add no *further* native library, rather than stay C-free.
-- **AC-60** (amended 2026-08-20 at the phase 11 gate): the spec text still required "pipe-security-descriptor inspection and another-local-account denial" although D-0014 (2026-08-18, user-decided, spec in scope) had removed the cross-account check and the delivered inspection covers the runtime DIRECTORY's DACL, not the pipe object's own SD. The amendment note in the spec records both deltas; D-0014's own confirmation field had claimed the reconciliation without the edit ever landing. The phase 11 "Linux suites remain unchanged and green" AC line was reworded in the same pass — the original claimed a Linux execution the phase never performed; the reworded line states the diff-reviewed basis and records the Linux re-run as a follow-up.
+- **AC-60** (amended 2026-08-20 at the phase 11 gate): the spec text still required "pipe-security-descriptor inspection and another-local-account denial" although D-0014 (2026-08-18, user-decided, spec in scope) had removed the cross-account check and the delivered inspection covers the runtime DIRECTORY's DACL, not the pipe object's own SD. The amendment note in the spec records both deltas; D-0014's own confirmation field had claimed the reconciliation without the edit ever landing. The phase 11 "Linux suites remain unchanged and green" AC line was reworded in the same pass — the original claimed a Linux execution the phase never performed; the reworded line states the diff-reviewed basis; that original Linux rerun subsequently landed in `14e2681`. Phase 12 requires a separate Linux rerun at its own final cross-platform candidate.
 
 ### What a cold start should know before writing code
 
@@ -157,7 +166,8 @@ graph TD
     P8["Phase 8<br/>Per-Language<br/>Fingerprints (Track D)"]
     P9["Phase 9<br/>Resolver Candidate<br/>Count"]
     P10["Phase 10<br/>macOS Completion<br/>(deferred)"]
-    P11["Phase 11<br/>Windows Completion<br/>(deferred)"]
+    P11["Phase 11<br/>Windows Completion"]
+    P12["Phase 12<br/>Accepted Debt<br/>Closure"]
 
     P1 --> P2
     P3 --> P4
@@ -174,11 +184,21 @@ graph TD
     P7 --> P11
     P8 --> P11
     P9 --> P11
+    P1 --> P12
+    P2 --> P12
+    P3 --> P12
+    P4 --> P12
+    P5 --> P12
+    P6 --> P12
+    P7 --> P12
+    P8 --> P12
+    P9 --> P12
+    P11 --> P12
 
     classDef free fill:#e8f5e9,stroke:#2e7d32
     classDef gated fill:#fff8e1,stroke:#f9a825
     class P1,P3,P5 free
-    class P2,P4,P6,P7,P8,P9,P10,P11 gated
+    class P2,P4,P6,P7,P8,P9,P10,P11,P12 gated
 ```
 
 Layering the phases build toward:
@@ -227,14 +247,13 @@ flowchart LR
 - **Dogfood submodules initialised** for the phase 1 and phase 3 performance measurements (`external/ripgrep`, `external/abseil-cpp`).
 - **A C compiler**, as today — the tree-sitter grammars compile `parser.c` via the `cc` crate. Unchanged by this plan (D-0004).
 - **Git fixture harness** (phase 5) — no test in the workspace currently creates a temporary git repository.
+- **Native Windows runner with dogfood submodules initialized** (phase 12) — required to close NTFS casing, short/long path, ACL, bounded shutdown, and baseline-execution evidence; Linux simulation cannot satisfy the gate.
+- **One phase-12 third-party addition:** `unicode-width`, scoped to `code-graph-cli` for correct terminal display width. No protected crate gains a dependency; every other phase-12 task uses existing workspace facilities.
 
 ## Plan Completion Evidence
 Pending — not complete.
 
 ## Open Questions
-- Default idle timeout of 1800s for the daemon — **non-blocking** — the config key, the `0` sentinel, and the timer semantics are fixed; only the number is a guess and it is tunable without touching an interface.
-- Whether the CLI auto-spawns a daemon or only attaches to a running one — **non-blocking** — FR-18 requires identical output in both modes either way, so this is latency, not correctness.
-- Default revision-window size for `symbol_history` — **non-blocking** — the bound and the partial-result flag are fixed; only the default is unsettled.
 - Timeout for a slow VCS provider — **non-blocking** — NFR-10's isolation comes from blocking-pool dispatch, which holds at any duration.
 - Whether `ToolError` gains a machine-readable code — **non-blocking** — the adapter renders the message identically either way and the CLI maps exit status without it; adding a field later is additive.
 - Whether shared response types move out of `handlers/mod.rs` — **non-blocking** — file organisation only; the layering is correct in either location.

@@ -3,9 +3,10 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-22
+updated: 2026-08-23
 tags: [decisions]
-related: []
+related:
+  - Specs/GraphPlatformExpansion
 decisions:
   - id: D-0001
     kind: answered-question
@@ -267,11 +268,6 @@ decisions:
     reversibility: two-way
 ---
 
-
-
-
-
-
 # Decision Ledger
 
 Machine-readable record of decided truths that outlive the document they were made in — design choices, concept definitions, and answered design questions that constrain work elsewhere. Choices a spec, design, or plan already states in full stay in that artifact. The frontmatter `decisions[]` array is canonical; see `shared/decision-log.md` in the plugin for the admission test, entry schema, lifecycle rules, and collision procedure.
@@ -279,7 +275,6 @@ Machine-readable record of decided truths that outlive the document they were ma
 Entries are append-only: an accepted entry is never edited except to mark it superseded. A change of mind is a new entry that supersedes the old one.
 
 ## D-0001 — Repository-local daemon
-
 Supersedes the artifact `Designs/SharedDaemon` (draft, deferred, 2026-04-28) rather than a prior ledger entry — no ledger existed when that design was written. That design's own Decision 1 rejected Unix domain sockets in favour of HTTP with a bearer token, on the grounds that sockets force a per-platform code path. That trade-off was made in service of the multi-tenant model; with a single daemon per repository the discovery problem it solved no longer exists, so the transport question reopens and is deferred to design (see `Specs/GraphPlatformExpansion` OQ-02).
 
 `Designs/SharedDaemon` has been marked `status: superseded`. Its multi-tenant content remains readable as the record of a considered alternative.
