@@ -783,6 +783,7 @@ pub fn detect_communities(
             next_offset,
         },
         granularity: resolved_granularity,
+        members_per_community: resolved_members_cap,
         termination,
         iterations,
         node_count: result.node_count,
@@ -909,6 +910,20 @@ mod tests {
             None,
             usize::MAX,
         ));
+    }
+
+    #[test]
+    fn detect_communities_echoes_resolved_members_per_community() {
+        let g = locked(graph_with_a_calls_b());
+        for (requested, expected) in [(None, 10), (Some(0), 10), (Some(101), 100)] {
+            match detect_communities(&g, true, None, None, requested, None, None, usize::MAX) {
+                Ok(ToolOk::Value(response)) => {
+                    assert_eq!(response.members_per_community, expected);
+                }
+                Ok(ToolOk::Text(text)) => panic!("detect_communities must not return text: {text}"),
+                Err(error) => panic!("detect_communities must succeed: {}", error.0),
+            }
+        }
     }
 
     // --- generate_diagram: mermaid -> Text, edges -> Value (Decision 2) ---

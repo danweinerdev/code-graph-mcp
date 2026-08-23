@@ -331,13 +331,16 @@ impl Graph {
     /// panics in debug and evaluates to `0` in release) never occurs.
     ///
     /// The heap key is `(cost, symbol_id)`, so equal-cost frontier nodes pop
-    /// in `symbol_id`-ascending order — the traversal, and therefore the
-    /// result, is deterministic across runs and process restarts (`HashMap`
-    /// iteration order never enters the decision).
+    /// in `symbol_id`-ascending order. The result is deterministic for a
+    /// fixed graph state, including the adjacency-entry order established at
+    /// merge time; equal-cost parent selection is not otherwise normalized
+    /// across differently merged but semantically equivalent graph states.
     ///
     /// `node_cap` bounds the number of nodes popped off the heap
     /// (`nodes_examined`). Reaching the cap before finding `to` returns
-    /// `(None, nodes_examined, true)` — a partial path is never returned;
+    /// `(None, nodes_examined, true)` only when it leaves a valid frontier
+    /// unexamined; exhausting the reachable frontier exactly at the cap
+    /// returns `cap_reached = false`. A partial path is never returned;
     /// `cap_reached` is the sole discriminator between "no path exists" and
     /// "the search was cut short".
     ///
@@ -405,55 +408,59 @@ impl Graph {
                 return (Some(result), nodes_examined, false);
             }
 
-            // Cap check AFTER the target check: a target found exactly on
-            // the cap-th examined node is still a success. Only a node_cap
-            // exhausted WITHOUT finding `to` is cap exhaustion.
-            if nodes_examined >= node_cap {
-                return (None, nodes_examined, true);
-            }
-
             let hops = (cost >> 32) as u32;
             let heuristic = (cost & 0xFFFF_FFFF) as u32;
 
-            let Some(entries) = self.adj.get(&curr_id) else {
-                continue;
-            };
-            for entry in entries {
-                if entry.kind != EdgeKind::Calls {
-                    continue;
-                }
-                if min_confidence == Some(Confidence::Resolved)
-                    && entry.confidence != Confidence::Resolved
-                {
-                    continue;
-                }
-                if !self.is_resolved_node(&entry.target) {
-                    continue;
-                }
+            if let Some(entries) = self.adj.get(&curr_id) {
+                for entry in entries {
+                    if entry.kind != EdgeKind::Calls {
+                        continue;
+                    }
+                    if min_confidence == Some(Confidence::Resolved)
+                        && entry.confidence != Confidence::Resolved
+                    {
+                        continue;
+                    }
+                    if !self.is_resolved_node(&entry.target) {
+                        continue;
+                    }
 
-                let new_hops = hops.saturating_add(1);
-                let new_heuristic =
-                    heuristic.saturating_add(u32::from(entry.confidence == Confidence::Heuristic));
-                let new_cost = ((new_hops as u64) << 32) | (new_heuristic as u64);
+                    let new_hops = hops.saturating_add(1);
+                    let new_heuristic = heuristic
+                        .saturating_add(u32::from(entry.confidence == Confidence::Heuristic));
+                    let new_cost = ((new_hops as u64) << 32) | (new_heuristic as u64);
 
-                let is_better = match best_cost.get(&entry.target) {
-                    None => true,
-                    Some(&existing) => new_cost < existing,
-                };
-                if is_better {
-                    best_cost.insert(entry.target.clone(), new_cost);
-                    incoming.insert(
-                        entry.target.clone(),
-                        IncomingRecord {
-                            parent: curr_id.clone(),
-                            file: entry.file.clone(),
-                            line: entry.line,
-                            confidence: entry.confidence,
-                            candidates: entry.candidates,
-                        },
-                    );
-                    heap.push(Reverse((new_cost, entry.target.clone())));
+                    let is_better = match best_cost.get(&entry.target) {
+                        None => true,
+                        Some(&existing) => new_cost < existing,
+                    };
+                    if is_better {
+                        best_cost.insert(entry.target.clone(), new_cost);
+                        incoming.insert(
+                            entry.target.clone(),
+                            IncomingRecord {
+                                parent: curr_id.clone(),
+                                file: entry.file.clone(),
+                                line: entry.line,
+                                confidence: entry.confidence,
+                                candidates: entry.candidates,
+                            },
+                        );
+                        heap.push(Reverse((new_cost, entry.target.clone())));
+                    }
                 }
+            }
+
+            // Cap check AFTER both the target check and this node's
+            // relaxation. A target found exactly on the cap-th examined node
+            // is still a success. If relaxing that node leaves no valid heap
+            // entry, the reachable frontier was exhausted exactly at the cap
+            // rather than truncated; stale heap entries do not count as work.
+            if nodes_examined >= node_cap {
+                let has_valid_frontier = heap
+                    .iter()
+                    .any(|Reverse((cost, id))| best_cost.get(id).is_some_and(|best| best == cost));
+                return (None, nodes_examined, has_valid_frontier);
             }
         }
 
@@ -1268,7 +1275,94 @@ mod tests {
     }
 
     #[test]
-    fn shortest_path_node_cap_smaller_than_graph_returns_cap_reached() {
+    fn shortest_path_equal_cost_uses_graph_state_frontier_order() {
+        // Both paths have the same `(hops, heuristic_hops)` cost. The edges
+        // intentionally insert `c` before `b`, but the heap's graph-state
+        // tie-break pops the symbol-id-smaller `b` frontier node first.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("start", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("c", SymbolKind::Function, "/x.cpp"),
+                sym("target", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:start", "/x.cpp:c", "/x.cpp", 1),
+                call_edge("/x.cpp:start", "/x.cpp:b", "/x.cpp", 2),
+                call_edge("/x.cpp:c", "/x.cpp:target", "/x.cpp", 3),
+                call_edge("/x.cpp:b", "/x.cpp:target", "/x.cpp", 4),
+            ],
+        ));
+
+        let (result, _nodes_examined, cap_reached) =
+            g.shortest_path("/x.cpp:start", "/x.cpp:target", 1000, None);
+        assert!(!cap_reached);
+        assert_eq!(
+            hop_ids(&result.expect("equal-cost paths must find one")),
+            vec![
+                "/x.cpp:start".to_string(),
+                "/x.cpp:b".to_string(),
+                "/x.cpp:target".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn shortest_path_target_found_on_cap_is_success() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("target", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp", 1),
+                call_edge("/x.cpp:b", "/x.cpp:target", "/x.cpp", 2),
+            ],
+        ));
+
+        let (result, nodes_examined, cap_reached) =
+            g.shortest_path("/x.cpp:a", "/x.cpp:target", 3, None);
+        assert!(
+            result.is_some(),
+            "target on the cap-th examined node must win"
+        );
+        assert_eq!(nodes_examined, 3);
+        assert!(!cap_reached);
+    }
+
+    #[test]
+    fn shortest_path_exactly_exhausted_frontier_is_not_cap_reached() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("target", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![call_edge("/x.cpp:a", "/x.cpp:b", "/x.cpp", 1)],
+        ));
+
+        let (result, nodes_examined, cap_reached) =
+            g.shortest_path("/x.cpp:a", "/x.cpp:target", 2, None);
+        assert!(result.is_none());
+        assert_eq!(nodes_examined, 2);
+        assert!(
+            !cap_reached,
+            "the cap did not leave reachable work unexamined"
+        );
+    }
+
+    #[test]
+    fn shortest_path_nonempty_frontier_at_cap_reports_cap_reached() {
         // Linear chain long enough that a cap of 2 cannot possibly reach
         // the target.
         let mut g = Graph::new();
@@ -1292,6 +1386,34 @@ mod tests {
         assert!(result.is_none(), "must never return a partial path");
         assert!(cap_reached, "cap must be reported as reached");
         assert_eq!(nodes_examined, 2);
+    }
+
+    #[test]
+    fn shortest_path_leaf_at_cap_still_checks_sibling_frontier() {
+        // The lexicographically smaller leaf `a` pops at the cap while `b`
+        // remains reachable in the frontier. A leaf must not bypass the cap
+        // check merely because it has no adjacency entry.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/x.cpp",
+            Language::Cpp,
+            vec![
+                sym("start", SymbolKind::Function, "/x.cpp"),
+                sym("a", SymbolKind::Function, "/x.cpp"),
+                sym("b", SymbolKind::Function, "/x.cpp"),
+                sym("target", SymbolKind::Function, "/x.cpp"),
+            ],
+            vec![
+                call_edge("/x.cpp:start", "/x.cpp:a", "/x.cpp", 1),
+                call_edge("/x.cpp:start", "/x.cpp:b", "/x.cpp", 2),
+            ],
+        ));
+
+        let (result, nodes_examined, cap_reached) =
+            g.shortest_path("/x.cpp:start", "/x.cpp:target", 2, None);
+        assert!(result.is_none());
+        assert_eq!(nodes_examined, 2, "the sibling must remain unexamined");
+        assert!(cap_reached, "the sibling is valid frontier work");
     }
 
     #[test]

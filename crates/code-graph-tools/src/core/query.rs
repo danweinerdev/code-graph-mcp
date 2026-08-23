@@ -343,6 +343,10 @@ pub fn get_dependencies(
 /// `find_path` body (phase 1). Body moved verbatim from
 /// `handlers::query::find_path`, plus the core `require_indexed` call at
 /// entry (Decision 8).
+///
+/// Deliberately exempt from `[response].max_bytes`: this response is one
+/// indivisible valid path, never a byte-truncated continuation. `node_cap`
+/// is the bounded-work lever.
 pub fn find_path(
     graph: &RwLock<Graph>,
     indexed: bool,

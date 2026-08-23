@@ -1979,8 +1979,10 @@ impl CodeGraphServer {
                        `Calls` edges answering 'how does A reach B', without walking \
                        `get_callers`/`get_callees` by hand. Returns a SINGLE JSON OBJECT \
                        {found, hops, hop_count, heuristic_hops, nodes_examined, node_cap, \
-                       cap_reached} — NOT a `Page` envelope, since this is one shortest-path \
-                       answer, not a list. `hops` is an array of `{symbol_id, file, line, \
+                        cap_reached} — NOT a `Page` envelope, since this is one shortest-path \
+                        answer, not a list. It is deliberately exempt from `[response].max_bytes`: \
+                        the response is an indivisible valid path, never a partial continuation; \
+                        `node_cap` is its bounded-work lever. `hops` is an array of `{symbol_id, file, line, \
                        entered_by, candidates}`: `hops[0]` is `from` (its `entered_by` and \
                        `candidates` are null, since no edge reached it), `hops[last]` is \
                        `to`, and every adjacent pair is a real `Calls` edge; `hop_count = \
@@ -2376,8 +2378,9 @@ impl CodeGraphServer {
                        propagation over the file-level call+include graph — answers 'what \
                        are the clusters here' for an unfamiliar codebase, which pairwise \
                        `get_coupling` alone cannot. Returns the flattened envelope \
-                       {results, total, offset, limit, truncated, next_offset, granularity, \
-                       termination, iterations, node_count, edge_count, degenerate} — the \
+                        {results, total, offset, limit, truncated, next_offset, granularity, \
+                        members_per_community, termination, iterations, node_count, edge_count, \
+                        degenerate} — the \
                        `Page<Community>` fields are flattened onto the top level (same \
                        precedent as `search_symbols`), where each `results[i]` is a \
                        `Community` {label, size, members, truncated, original_len?}: `label` \
@@ -2394,7 +2397,8 @@ impl CodeGraphServer {
                        neither the per-community `truncated` nor the envelope's `truncated` \
                        implies the other. `results` are sorted by descending `size`. \
                        `granularity` (default \"file\", the only supported value today; any \
-                       other non-empty value is a tool error) is echoed back. `termination` \
+                        other non-empty value is a tool error) is echoed back. The resolved \
+                        `members_per_community` cap is echoed at the top level. `termination` \
                        is `\"converged\"` (propagation reached a stable partition) or \
                        `\"iteration_ceiling\"` (cut off at `iterations` sweeps without \
                        converging — no tuning is required to get a result either way). \

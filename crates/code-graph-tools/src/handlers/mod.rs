@@ -234,7 +234,8 @@ pub struct Community {
 /// [`Page`]`<`[`Community`]`>` envelope (`#[serde(flatten)]`, same
 /// precedent as [`SearchSymbolsResponse`]) plus community-detection
 /// metadata that isn't per-row: the resolved `granularity` (echoes the
-/// validated argument — currently always `"file"`, AC-53), the
+/// validated argument — currently always `"file"`, AC-53), resolved
+/// `members_per_community` cap (default 10, `0` → 10, maximum 100), the
 /// termination condition and iteration count label propagation actually
 /// used (AC-54), the aggregated file graph's node/edge counts, and
 /// `degenerate` — `null` for an ordinary partition, or
@@ -242,13 +243,14 @@ pub struct Community {
 /// (AC-55; `share_permille` is only ever present on `"giant"`).
 ///
 /// Field order after the flattened `Page` fields —
-/// `granularity`, `termination`, `iterations`, `node_count`,
-/// `edge_count`, `degenerate` — is the wire-format contract.
+/// `granularity`, `members_per_community`, `termination`, `iterations`,
+/// `node_count`, `edge_count`, `degenerate` — is the wire-format contract.
 #[derive(Debug, Serialize)]
 pub struct DetectCommunitiesResponse {
     #[serde(flatten)]
     pub page: Page<Community>,
     pub granularity: &'static str,
+    pub members_per_community: u32,
     pub termination: &'static str,
     pub iterations: u32,
     pub node_count: u32,
@@ -385,6 +387,10 @@ pub struct CallChainResponse {
 /// unmodified). `hop_count` is the number of edges traversed
 /// (`hops.len() - 1`), NOT the node count — `from == to` yields a
 /// single-element `hops` and `hop_count: 0`.
+///
+/// This response is deliberately exempt from `[response].max_bytes`: it is
+/// an indivisible valid path, never a partial continuation. `node_cap` is its
+/// bounded-work lever.
 #[derive(Debug, Serialize)]
 pub struct FindPathResponse {
     pub found: bool,

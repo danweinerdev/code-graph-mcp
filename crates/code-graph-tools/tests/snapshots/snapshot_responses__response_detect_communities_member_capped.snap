@@ -8,6 +8,7 @@ expression: parsed
   "granularity": "file",
   "iterations": 2,
   "limit": 100,
+  "members_per_community": 2,
   "next_offset": null,
   "node_count": 8,
   "offset": 0,

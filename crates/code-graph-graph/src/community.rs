@@ -30,11 +30,19 @@
 //! order.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::PathBuf;
 
 use code_graph_core::EdgeKind;
 
 use crate::Graph;
+
+/// Add a non-negative weight without letting an unusually dense graph wrap
+/// an edge or label tally back to zero.
+fn saturating_add_weight<K: Eq + Hash>(weights: &mut HashMap<K, u32>, key: K, amount: u32) {
+    let weight = weights.entry(key).or_insert(0);
+    *weight = weight.saturating_add(amount);
+}
 
 /// How label propagation ended. Reported so a caller never has to guess
 /// whether a partition is a genuine fixed point or a ceiling cutoff
@@ -147,7 +155,7 @@ impl Graph {
                         continue;
                     }
                     let key = (i.min(j), i.max(j));
-                    *weights.entry(key).or_insert(0) += 1;
+                    saturating_add_weight(&mut weights, key, 1);
                 }
             }
 
@@ -160,7 +168,7 @@ impl Graph {
                         continue;
                     }
                     let key = (i.min(j), i.max(j));
-                    *weights.entry(key).or_insert(0) += 1;
+                    saturating_add_weight(&mut weights, key, 1);
                 }
             }
         }
@@ -206,7 +214,7 @@ impl Graph {
 
                 let mut tally: HashMap<u32, u32> = HashMap::new();
                 for &(j, w) in &neighbours[i] {
-                    *tally.entry(labels[j as usize]).or_insert(0) += w;
+                    saturating_add_weight(&mut tally, labels[j as usize], w);
                 }
                 if tally.is_empty() {
                     // Isolated node (no cross-file neighbours after the
@@ -487,6 +495,21 @@ mod tests {
             weights.is_empty(),
             "Inherits edges must not become community weight"
         );
+    }
+
+    #[test]
+    fn weight_accumulation_saturates_at_u32_max() {
+        // Seed the two accumulator shapes at the boundary instead of
+        // materializing billions of edges or neighbours.
+        let mut edge_weights = HashMap::from([((0, 1), u32::MAX - 1)]);
+        saturating_add_weight(&mut edge_weights, (0, 1), 1);
+        saturating_add_weight(&mut edge_weights, (0, 1), 1);
+        assert_eq!(edge_weights[&(0, 1)], u32::MAX);
+
+        let mut label_tallies = HashMap::from([(7, u32::MAX - 1)]);
+        saturating_add_weight(&mut label_tallies, 7, 1);
+        saturating_add_weight(&mut label_tallies, 7, 1);
+        assert_eq!(label_tallies[&7], u32::MAX);
     }
 
     // --- file_communities -------------------------------------------------
