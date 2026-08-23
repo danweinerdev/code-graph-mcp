@@ -2,7 +2,9 @@
 //! [`packed::CACHE_VERSION`] for the current version and history.
 //!
 //! The on-disk cache lives at `<dir>/.code-graph-cache.db` — a rkyv
-//! archive prepended by an 8-byte header (endian probe + version).
+//! archive prepended by an 8-byte header (endian probe + version). Cache v13
+//! may append a framed sparse resolver-metadata extension after the unchanged
+//! root archive; caches written before that extension remain readable.
 //! See [`packed`] for the schema and [`mmap`] for the load-time
 //! mmap boundary. Saves are atomic: write to a uniquely named sibling temporary
 //! file, `File::sync_all`, then rename over the final path. The rename is
@@ -30,6 +32,10 @@ mod mmap;
 pub mod packed;
 
 const CACHE_FILE_NAME: &str = ".code-graph-cache.db";
+const RESOLVER_METADATA_FOOTER_MAGIC: &[u8; 8] = b"CGMETA01";
+const RESOLVER_METADATA_FOOTER_SIZE: usize = 24;
+const RESOLVER_METADATA_ARCHIVE_ALIGNMENT: usize =
+    std::mem::align_of::<<packed::PackedResolverMetadataExtension as rkyv::Archive>::Archived>();
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Serializes saves in this process so a new save cannot scavenge an active
 /// unique temporary created by another save. This intentionally does not
@@ -276,13 +282,19 @@ impl Graph {
         // strings into compact tables; mtimes are stat'd fresh inside
         // the encoder (files that no longer exist record `0` so
         // `stale_paths` flags them next round).
-        let cache = packed::encode(self, self.last_sweep_at);
+        let encoded = packed::encode(self, self.last_sweep_at);
 
         // rkyv-serialize to an AlignedVec. The archive is the
         // post-header byte region; the loader will slice off the
         // first `HEADER_SIZE` bytes before calling `rkyv::access`.
-        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
+        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&encoded.main)
             .map_err(|e| io::Error::other(format!("rkyv serialize: {e}")))?;
+        let metadata_archive = encoded
+            .resolver_metadata
+            .as_ref()
+            .map(rkyv::to_bytes::<rkyv::rancor::Error>)
+            .transpose()
+            .map_err(|e| io::Error::other(format!("rkyv metadata serialize: {e}")))?;
 
         // Scavenging runs under SAVE_LOCK, so it cannot remove another thread's
         // active temp. Preserve safe recovery for the pre-unique-name path too,
@@ -300,6 +312,23 @@ impl Graph {
             writer.write_all(&packed::ENDIAN_PROBE.to_ne_bytes())?;
             writer.write_all(&CACHE_VERSION.to_ne_bytes())?;
             writer.write_all(&archive)?;
+            if let Some(metadata_archive) = metadata_archive.as_ref() {
+                let main_len = u64::try_from(archive.len())
+                    .map_err(|_| io::Error::other("cache archive length exceeds u64"))?;
+                let extension_start = (packed::HEADER_SIZE + archive.len())
+                    .next_multiple_of(RESOLVER_METADATA_ARCHIVE_ALIGNMENT)
+                    - packed::HEADER_SIZE;
+                let padding = [0_u8; RESOLVER_METADATA_ARCHIVE_ALIGNMENT - 1];
+                writer.write_all(&padding[..extension_start - archive.len()])?;
+                writer.write_all(metadata_archive)?;
+                writer.write_all(&main_len.to_ne_bytes())?;
+                writer.write_all(
+                    &u64::try_from(extension_start)
+                        .map_err(|_| io::Error::other("cache extension offset exceeds u64"))?
+                        .to_ne_bytes(),
+                )?;
+                writer.write_all(RESOLVER_METADATA_FOOTER_MAGIC)?;
+            }
             writer.flush()?;
             let f = writer
                 .into_inner()
@@ -355,14 +384,14 @@ impl Graph {
     /// when `loaded == true`; empty when `loaded == false` since there
     /// is no archive to walk).
     pub fn load_and_stale(&mut self, dir: &Path) -> Result<(bool, Vec<PathBuf>), PersistError> {
-        let outcome = with_validated_archive(dir, |archived| {
+        let outcome = with_validated_archive(dir, |archived, metadata_extension| {
             // Walk the archived view directly via
             // `packed::decode_archived`, skipping the intermediate
             // `rkyv::deserialize` pass that would have allocated a
             // full owned `PackedCacheV6` on the heap. The direct walk
             // allocates only the live Graph's HashMaps, saving one
             // O(N) allocation pass on every load.
-            let parts = packed::decode_archived(archived)?;
+            let parts = packed::decode_archived(archived, metadata_extension)?;
             let stale = compute_stale_paths(archived);
             Ok::<_, PersistError>((parts, stale))
         })?;
@@ -374,6 +403,7 @@ impl Graph {
                 self.radj = parts.radj;
                 self.files = parts.files;
                 self.includes = parts.includes;
+                self.resolver_metadata = parts.resolver_metadata;
                 self.last_sweep_at = parts.last_sweep_at;
                 Ok((true, stale))
             }
@@ -398,7 +428,10 @@ impl Graph {
 /// expected during normal operation and stay silent.
 fn with_validated_archive<F, R>(dir: &Path, f: F) -> Result<Option<R>, PersistError>
 where
-    F: FnOnce(&<packed::PackedCacheV6 as rkyv::Archive>::Archived) -> Result<R, PersistError>,
+    F: FnOnce(
+        &<packed::PackedCacheV6 as rkyv::Archive>::Archived,
+        Option<&<packed::PackedResolverMetadataExtension as rkyv::Archive>::Archived>,
+    ) -> Result<R, PersistError>,
 {
     let path = cache_path(dir);
 
@@ -425,7 +458,17 @@ where
         return Ok(None);
     }
 
-    let archive_bytes = &bytes[packed::HEADER_SIZE..];
+    let payload = &bytes[packed::HEADER_SIZE..];
+    let (archive_bytes, metadata_bytes) = match split_archive_sections(payload) {
+        Ok(sections) => sections,
+        Err(detail) => {
+            eprintln!(
+                "[code-graph] packed cache extension corrupted ({detail}); re-indexing {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
     let archived = match rkyv::access::<
         <packed::PackedCacheV6 as rkyv::Archive>::Archived,
         rkyv::rancor::Error,
@@ -455,7 +498,81 @@ where
         return Ok(None);
     }
 
-    Ok(Some(f(archived)?))
+    let metadata_extension = match metadata_bytes {
+        Some(metadata_bytes) => match rkyv::access::<
+            <packed::PackedResolverMetadataExtension as rkyv::Archive>::Archived,
+            rkyv::rancor::Error,
+        >(metadata_bytes)
+        {
+            Ok(extension)
+                if extension.version.to_native() == packed::RESOLVER_METADATA_EXTENSION_VERSION =>
+            {
+                Some(extension)
+            }
+            Ok(extension) => {
+                eprintln!(
+                    "[code-graph] unsupported packed cache metadata extension {}; re-indexing {}",
+                    extension.version.to_native(),
+                    path.display()
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[code-graph] packed cache metadata corrupted ({error}); re-indexing {}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+        },
+        None => None,
+    };
+
+    Ok(Some(f(archived, metadata_extension)?))
+}
+
+/// Split the unchanged v13 root archive from its optional sparse metadata
+/// extension. A payload without the footer magic is a pre-extension v13 cache.
+fn split_archive_sections(payload: &[u8]) -> Result<(&[u8], Option<&[u8]>), &'static str> {
+    if payload.len() < RESOLVER_METADATA_FOOTER_SIZE
+        || &payload[payload.len() - RESOLVER_METADATA_FOOTER_MAGIC.len()..]
+            != RESOLVER_METADATA_FOOTER_MAGIC
+    {
+        return Ok((payload, None));
+    }
+
+    let footer_start = payload.len() - RESOLVER_METADATA_FOOTER_SIZE;
+    let main_len = u64::from_ne_bytes(
+        payload[footer_start..footer_start + 8]
+            .try_into()
+            .expect("fixed footer field"),
+    );
+    let extension_start = u64::from_ne_bytes(
+        payload[footer_start + 8..footer_start + 16]
+            .try_into()
+            .expect("fixed footer field"),
+    );
+    let main_len = usize::try_from(main_len).map_err(|_| "main archive length overflows usize")?;
+    let extension_start = usize::try_from(extension_start)
+        .map_err(|_| "metadata extension offset overflows usize")?;
+    if main_len == 0 || main_len > extension_start || extension_start >= footer_start {
+        return Err("invalid metadata extension offsets");
+    }
+    if !(packed::HEADER_SIZE + extension_start).is_multiple_of(RESOLVER_METADATA_ARCHIVE_ALIGNMENT)
+    {
+        return Err("misaligned metadata extension offset");
+    }
+    if payload[main_len..extension_start]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err("non-zero metadata extension padding");
+    }
+
+    Ok((
+        &payload[..main_len],
+        Some(&payload[extension_start..footer_start]),
+    ))
 }
 
 /// Walk an already-validated archive's `paths` + `mtimes` columns and
@@ -505,7 +622,7 @@ fn compute_stale_paths(
 /// first-run.
 pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
     Ok(
-        with_validated_archive(dir, |archived| Ok(compute_stale_paths(archived)))?
+        with_validated_archive(dir, |archived, _| Ok(compute_stale_paths(archived)))?
             .unwrap_or_default(),
     )
 }
@@ -514,7 +631,7 @@ pub fn stale_paths(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
 mod tests {
     use super::*;
     use crate::test_fixtures::{call_edge, include_edge, inherit_edge, make_fg, sym};
-    use code_graph_core::{Language, SymbolKind};
+    use code_graph_core::{Language, ResolverMetadata, SymbolKind};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
     use std::sync::{Arc, Barrier};
@@ -569,11 +686,74 @@ mod tests {
         assert_eq!(loaded.radj, original.radj);
         assert_eq!(loaded.files, original.files);
         assert_eq!(loaded.includes, original.includes);
+        assert_eq!(loaded.resolver_metadata, original.resolver_metadata);
         // Stats sanity-check: 5 nodes, 3 adj edges + 1 include = 4, 2 files.
         let stats = loaded.stats();
         assert_eq!(stats.nodes, 5);
         assert_eq!(stats.edges, 4);
         assert_eq!(stats.files, 2);
+    }
+
+    #[test]
+    fn packed_round_trip_preserves_sparse_resolver_metadata() {
+        let dir = TempDir::new().unwrap();
+        let mut original = build_sample_graph();
+        original.merge_file_graph(make_fg(
+            "/go/package.go",
+            Language::Go,
+            vec![sym("Run", SymbolKind::Function, "/go/package.go")],
+            vec![],
+        ));
+        original.set_resolver_metadata(
+            PathBuf::from("/go/package.go"),
+            ResolverMetadata::Go {
+                declared_package: "package".to_string(),
+                package_value_bindings: vec!["Handler".to_string(), "Value".to_string()],
+            },
+        );
+        original.save(dir.path()).unwrap();
+
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        assert_eq!(loaded.resolver_metadata, original.resolver_metadata);
+    }
+
+    #[test]
+    fn packed_non_go_graph_has_no_sparse_metadata_table() {
+        let dir = TempDir::new().unwrap();
+        let graph = build_sample_graph();
+        let encoded = packed::encode(&graph, graph.last_sweep_at());
+        assert!(encoded.resolver_metadata.is_none());
+
+        let main_archive = rkyv::to_bytes::<rkyv::rancor::Error>(&encoded.main).unwrap();
+        graph.save(dir.path()).unwrap();
+        let bytes = std::fs::read(cache_path(dir.path())).unwrap();
+        assert_eq!(
+            bytes.len(),
+            packed::HEADER_SIZE + main_archive.len(),
+            "non-Go caches must pay no extension framing cost"
+        );
+        assert!(!bytes.ends_with(RESOLVER_METADATA_FOOTER_MAGIC));
+    }
+
+    #[test]
+    fn pre_extension_v13_cache_remains_readable() {
+        let dir = TempDir::new().unwrap();
+        let original = build_sample_graph();
+        let encoded = packed::encode(&original, original.last_sweep_at());
+        assert!(encoded.resolver_metadata.is_none());
+        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&encoded.main).unwrap();
+        let mut bytes = Vec::with_capacity(packed::HEADER_SIZE + archive.len());
+        bytes.extend_from_slice(&packed::ENDIAN_PROBE.to_ne_bytes());
+        bytes.extend_from_slice(&CACHE_VERSION.to_ne_bytes());
+        bytes.extend_from_slice(&archive);
+        std::fs::write(cache_path(dir.path()), bytes).unwrap();
+
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        assert_eq!(loaded.nodes, original.nodes);
+        assert_eq!(loaded.files, original.files);
+        assert!(loaded.resolver_metadata.is_empty());
     }
 
     #[test]

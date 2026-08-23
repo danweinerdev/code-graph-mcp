@@ -75,7 +75,9 @@ use std::sync::{
     Arc, Mutex, RwLock,
 };
 
-use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+use code_graph_core::{
+    Confidence, Edge, EdgeKind, FileGraph, Language, ResolverMetadata, Symbol, SymbolKind,
+};
 use code_graph_lang::helpers::find_enclosing_kind;
 use code_graph_lang::{CallContext, FileIndex, LanguagePlugin, ParseError, SymbolIndex};
 use streaming_iterator::StreamingIterator;
@@ -111,10 +113,10 @@ pub struct GoParser {
     call_query: Query,
     /// Compiled import query (drives `extract_imports`).
     import_query: Query,
-    /// Parse-time metadata, keyed by path. A prepare pass may read/parse only
-    /// cache-loaded paths absent here; fresh paths are populated by
-    /// `parse_file` while their AST is already available.
-    metadata: RwLock<HashMap<PathBuf, GoFileMetadata>>,
+    /// Parse-time metadata, keyed by path. Fresh parses populate this while
+    /// their AST is available; cache-loaded entries arrive through
+    /// `restore_resolver_metadata`.
+    metadata: RwLock<HashMap<PathBuf, ResolverMetadata>>,
     /// Immutable state rebuilt from the complete resolution universe before
     /// each resolution pass.
     resolution: RwLock<GoResolutionCache>,
@@ -124,12 +126,6 @@ pub struct GoParser {
     /// file.
     module_model: Mutex<GoModuleModelCache>,
     manifest_epoch: AtomicU64,
-}
-
-#[derive(Clone, Default, Eq, PartialEq)]
-struct GoFileMetadata {
-    declared_package: String,
-    package_value_bindings: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -172,7 +168,7 @@ struct GoModuleModelCache {
 #[derive(Clone, Eq, PartialEq)]
 struct GoResolutionKey {
     paths: Vec<PathBuf>,
-    metadata: Vec<(PathBuf, GoFileMetadata)>,
+    metadata: Vec<(PathBuf, ResolverMetadata)>,
     module: GoModuleModelKey,
 }
 
@@ -273,9 +269,14 @@ impl GoParser {
         let root = tree.root_node();
         let path_str = path.to_string_lossy().into_owned();
         let package_name = extract_package_name(root, content);
-        let metadata = GoFileMetadata {
+        let mut package_value_bindings: Vec<_> = extract_package_value_bindings(root, content)
+            .into_iter()
+            .collect();
+        package_value_bindings.sort();
+        package_value_bindings.dedup();
+        let metadata = ResolverMetadata::Go {
             declared_package: package_name.clone(),
-            package_value_bindings: extract_package_value_bindings(root, content),
+            package_value_bindings,
         };
         self.metadata
             .write()
@@ -747,45 +748,11 @@ impl LanguagePlugin for GoParser {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|path, _| active_paths.contains(path.as_path()));
 
-        // Fresh files populated metadata while their parse tree was live.
-        // A missing entry can therefore only be cache-loaded context. Parse it
-        // once with this parser's already-compiled language; never construct a
-        // second parser or compile queries during resolution.
-        let missing: Vec<_> = {
-            let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
-            paths
-                .iter()
-                .filter(|path| !metadata.contains_key(*path))
-                .cloned()
-                .collect()
-        };
-        let loaded_metadata: Vec<_> = missing
-            .into_iter()
-            .filter_map(|path| {
-                let content = std::fs::read(&path).ok()?;
-                let tree = parse_tree(&self.language, &content).ok()?;
-                let root = tree.root_node();
-                Some((
-                    path,
-                    GoFileMetadata {
-                        declared_package: extract_package_name(root, &content),
-                        package_value_bindings: extract_package_value_bindings(root, &content),
-                    },
-                ))
-            })
-            .collect();
-        if !loaded_metadata.is_empty() {
-            let mut metadata = self.metadata.write().unwrap_or_else(|p| p.into_inner());
-            for (path, value) in loaded_metadata {
-                metadata.entry(path).or_insert(value);
-            }
-        }
-
         // Snapshot metadata before looking up the module cache. No lock is
         // held while acquiring another cache lock: parsing may run in parallel
         // with this preparation pass, and the caches deliberately have no
         // lock-order dependency.
-        let metadata: Vec<(PathBuf, GoFileMetadata)> = {
+        let metadata: Vec<(PathBuf, ResolverMetadata)> = {
             let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
             paths
                 .iter()
@@ -815,7 +782,11 @@ impl LanguagePlugin for GoParser {
         let mut package_identities: BTreeMap<String, BTreeSet<PackageIdentity>> = BTreeMap::new();
         let mut representative_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
         for path in &paths {
-            let Some(file_metadata) = metadata.get(path) else {
+            let Some(ResolverMetadata::Go {
+                declared_package,
+                package_value_bindings,
+            }) = metadata.get(path)
+            else {
                 continue;
             };
             let identity =
@@ -823,7 +794,7 @@ impl LanguagePlugin for GoParser {
                     import_path: model.namespace_for(path).map(str::to_owned).unwrap_or_else(
                         || path.parent().unwrap_or(path).to_string_lossy().into_owned(),
                     ),
-                    declared_package: file_metadata.declared_package.clone(),
+                    declared_package: declared_package.clone(),
                     // Internal tests can share the declared package text with
                     // production files but are a separate resolution universe;
                     // otherwise their duplicate helpers make production calls
@@ -834,7 +805,7 @@ impl LanguagePlugin for GoParser {
                 .package_values
                 .entry(identity.clone())
                 .or_default()
-                .extend(file_metadata.package_value_bindings.iter().cloned());
+                .extend(package_value_bindings.iter().cloned());
             state.files.insert(path.clone(), identity.clone());
             if !is_test_file(path) {
                 package_identities
@@ -861,6 +832,29 @@ impl LanguagePlugin for GoParser {
             key: Some(key),
             state: Arc::new(state),
         };
+    }
+
+    fn resolver_metadata_for_path(&self, path: &Path) -> Option<ResolverMetadata> {
+        self.metadata
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(path)
+            .cloned()
+    }
+
+    fn restore_resolver_metadata(&self, metadata: &[(PathBuf, ResolverMetadata)]) {
+        let mut current = self
+            .metadata
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The supplied slice is the authoritative graph/cache snapshot. Fresh
+        // parses run after restoration and overwrite their own paths.
+        current.clear();
+        for (path, value) in metadata {
+            if matches!(value, ResolverMetadata::Go { .. }) {
+                current.insert(path.clone(), value.clone());
+            }
+        }
     }
 
     fn resolve_include(
@@ -1776,6 +1770,35 @@ mod tests {
 
         parser.prepare_resolution(&[], &FileIndex::new());
         assert!(parser.metadata.read().expect("metadata").is_empty());
+    }
+
+    #[test]
+    fn resolver_metadata_hooks_clone_restore_and_sort_go_bindings() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let path = Path::new("/__code_graph_go_metadata_tests/package.go");
+        parser
+            .parse_file(
+                path,
+                b"package sample\nvar Zebra = 1\nvar Alpha = 2\nvar Zebra = 3\n",
+            )
+            .expect("parse Go metadata source");
+
+        let metadata = parser
+            .resolver_metadata_for_path(path)
+            .expect("parsed path metadata");
+        assert_eq!(
+            metadata,
+            ResolverMetadata::Go {
+                declared_package: "sample".to_string(),
+                package_value_bindings: vec!["Alpha".to_string(), "Zebra".to_string()],
+            },
+            "fresh parses store deterministic sorted and deduplicated bindings"
+        );
+
+        let restored = GoParser::new().expect("GoParser::new");
+        let snapshot = vec![(path.to_path_buf(), metadata.clone())];
+        restored.restore_resolver_metadata(&snapshot);
+        assert_eq!(restored.resolver_metadata_for_path(path), Some(metadata));
     }
 
     fn cached_module_model(parser: &GoParser) -> Arc<crate::module_model::GoModuleModel> {

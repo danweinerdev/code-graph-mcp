@@ -20,7 +20,8 @@ pub mod fingerprint;
 pub mod helpers;
 
 use code_graph_core::{
-    Confidence, ExtensionsConfig, FileGraph, Language, RootConfig, Symbol, SymbolId,
+    Confidence, ExtensionsConfig, FileGraph, Language, ResolverMetadata, RootConfig, Symbol,
+    SymbolId,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -543,6 +544,25 @@ pub trait LanguagePlugin: Send + Sync {
     /// Object-safe by construction, so registry storage remains
     /// `Box<dyn LanguagePlugin>`.
     fn prepare_resolution(&self, _graphs: &[FileGraph], _file_index: &FileIndex) {}
+
+    /// Clone sparse facts retained for one parsed path. Indexing layers call
+    /// this after merging a fresh [`FileGraph`] so only participating files
+    /// gain a graph/cache metadata entry. The default has no such facts.
+    ///
+    /// This is object-safe so indexing layers can collect plugin state before
+    /// persisting it without knowing a concrete parser type.
+    fn resolver_metadata_for_path(&self, _path: &Path) -> Option<ResolverMetadata> {
+        None
+    }
+
+    /// Restore sparse resolver facts loaded from a graph cache. The default
+    /// ignores them because most languages do not need resolver state beyond
+    /// the supplied [`FileGraph`] universe.
+    ///
+    /// This hook is object-safe and deliberately takes an owned-value slice:
+    /// plugins may selectively clone entries for their language without any
+    /// lifetime coupling to graph storage.
+    fn restore_resolver_metadata(&self, _metadata: &[(PathBuf, ResolverMetadata)]) {}
 
     /// Notify the plugin that a non-source path whose contents can affect its
     /// resolver universe changed, was created, or was removed.

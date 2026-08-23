@@ -489,6 +489,7 @@ pub async fn try_reindex_file(
         }
         true
     });
+    let resolver_metadata = plugin.resolver_metadata_for_path(path);
 
     // Merge + dangling-edge prune under one write lock. `merge_file_graph`
     // calls `remove_file_unsafe` internally which scrubs *outbound* edges
@@ -508,6 +509,9 @@ pub async fn try_reindex_file(
     let _publication = inner.status_publication.write();
     let mut g = inner.graph.write();
     g.merge_file_graph(new_fg);
+    if let Some(metadata) = resolver_metadata {
+        g.set_resolver_metadata(path.to_path_buf(), metadata);
+    }
     g.prune_dangling_edges(&removed_ids);
     ReindexOutcome::Reindexed
 }
@@ -649,6 +653,14 @@ pub async fn try_reindex_go_manifest(
         .into_iter()
         .filter(|id| !new_ids.contains(id))
         .collect();
+    let fresh_metadata: Vec<_> = fresh
+        .iter()
+        .map(|file_graph| {
+            let path = PathBuf::from(&file_graph.path);
+            let metadata = go_plugin.resolver_metadata_for_path(&path);
+            (path, metadata)
+        })
+        .collect();
 
     if let Err(error) = inner.ensure_daemon_root_current() {
         return ReindexOutcome::Error(error);
@@ -658,8 +670,11 @@ pub async fn try_reindex_go_manifest(
     for path in affected_paths {
         graph.remove_file(&path);
     }
-    for file_graph in fresh {
+    for (file_graph, (path, resolver_metadata)) in fresh.into_iter().zip(fresh_metadata) {
         graph.merge_file_graph(file_graph);
+        if let Some(metadata) = resolver_metadata {
+            graph.set_resolver_metadata(path, metadata);
+        }
     }
     graph.prune_dangling_edges(&removed_ids);
     ReindexOutcome::Reindexed

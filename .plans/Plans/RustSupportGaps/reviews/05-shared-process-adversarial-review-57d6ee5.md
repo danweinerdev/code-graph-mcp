@@ -350,7 +350,7 @@ receiver-resolution defect class.
 | F-9 | Fixed | Replaced fragile line-number citations with symbol-level references to the two Calls-resolution arms. |
 | F-10 | Fixed | Corrected crate paths and explicitly labeled corpus edge counts/targets as provisional extraction output. |
 | F-11 | Fixed | Prune parse metadata to the active Go path universe on every preparation pass and clear it for an empty universe; added unit coverage. |
-| F-12 | Accepted limitation; stale-sibling test deferred | Cold-cache out-of-scope divergence is already an explicit contract requiring persisted metadata and another cache bump to eliminate. The F-2 follow-up now covers module-backed watch invalidation thoroughly, including nested manifests and external importers. A cold-restart stale-sibling characterization remains useful follow-up coverage; the production fix is still persistence of per-file Go resolver metadata. |
+| F-12 | Fixed in follow-up | Cache v13 now persists declared packages and sorted/deduplicated package-level value bindings in a sparse path-keyed framed extension; the original v13 rkyv root and `PackedFile`/`FileGraph` remain unchanged, and non-Go caches add no extension bytes. Analyze fast/slow paths restore the cached snapshot before resolution, and watch reindex updates each changed file's entry. Footerless v13 caches remain readable and trigger a one-time coherent full-file Go refresh, including ignored/out-of-scope entries, before fast-path eligibility. Two cold-restart stale-sibling regressions pin both divergence directions; compatibility tests pin footerless load, divergent-byte migration, unchanged-cache migration, and fast-path watch hydration. |
 | F-13 | No action | Rewording existing commit subjects requires history rewriting and adds no product value. Future commits should continue using behavior-specific subjects. |
 | F-14 | Fixed | Reworded Go call resolution to name the package-aware resolver rather than a nonexistent generic fallback. |
 | F-15 | Fixed | Documented `near=false`, `max_distance` defaults/ceiling, `count_only=false`, and `subtree` behavior in the production tool description and schema; updated the tool-list snapshot. |
@@ -366,6 +366,12 @@ Verification after the fixes:
 - `make lint`, `make fmt-check`, `make snapshot-clean`, `make plugin-sync-check`: passed.
 - `sdd doctor --check --json` and `git diff --check`: passed.
 
-The original blocker and F-2 follow-up are resolved. F-12's cold-cache
-metadata persistence remains non-blocking follow-up scope for the reasons
-above.
+The original blocker and all accepted resolver follow-ups, including F-12's
+cold-cache metadata persistence, are resolved.
+
+F-12 follow-up verification:
+
+- `make test`: passed; `go_resolution` 15/15 and `watch_go_reindex` 5/5.
+- `make lint`, `make fmt-check`, `make snapshot-clean`, and `make plugin-sync-check`: passed.
+- `git diff --check`: passed.
+- Independent quality and blind-spot reviews found no remaining actionable findings after the compatibility, coherence, alignment, and progress fixes.

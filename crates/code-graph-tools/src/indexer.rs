@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use code_graph_core::{symbol_id, EdgeKind, ExtensionsConfig, FileGraph, RootConfig};
+use code_graph_core::{symbol_id, EdgeKind, ExtensionsConfig, FileGraph, Language, RootConfig};
 use code_graph_lang::{CallContext, FileIndex, LanguageRegistry, SymbolEntry, SymbolIndex};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rayon::ThreadPoolBuildError;
@@ -147,8 +147,49 @@ pub fn index_directory(
     cfg: &RootConfig,
     progress: &dyn ProgressSink,
 ) -> Result<(Vec<FileGraph>, Vec<String>), IndexError> {
+    index_directory_with_extra(root, &[], registry, cfg, progress)
+}
+
+/// Discover `root` and parse it together with explicit, already-classified
+/// files outside that discovery scope. Duplicate paths are parsed once.
+pub fn index_directory_with_extra(
+    root: &Path,
+    extra_files: &[(PathBuf, Language)],
+    registry: &LanguageRegistry,
+    cfg: &RootConfig,
+    progress: &dyn ProgressSink,
+) -> Result<(Vec<FileGraph>, Vec<String>), IndexError> {
     let discovered = discovery::discover(root, registry, cfg, progress);
     let mut warnings = discovered.warnings.clone();
+    let mut files: Vec<_> = discovered
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.language))
+        .collect();
+    let mut seen: std::collections::HashSet<_> =
+        files.iter().map(|(path, _)| path.clone()).collect();
+    files.extend(
+        extra_files
+            .iter()
+            .filter(|(path, _)| seen.insert(path.clone()))
+            .cloned(),
+    );
+    let (graphs, parse_warnings) = index_files(&files, registry, cfg, progress)?;
+    warnings.extend(parse_warnings);
+    Ok((graphs, warnings))
+}
+
+/// Parse an explicit set of already-classified source paths in parallel.
+/// Used by cache-schema compatibility migrations that must refresh complete
+/// file graphs even when those paths are outside the invocation's discovery
+/// scope or newly ignored.
+pub fn index_files(
+    files: &[(PathBuf, Language)],
+    registry: &LanguageRegistry,
+    cfg: &RootConfig,
+    progress: &dyn ProgressSink,
+) -> Result<(Vec<FileGraph>, Vec<String>), IndexError> {
+    let mut warnings = Vec::new();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.parsing.max_threads)
@@ -156,27 +197,22 @@ pub fn index_directory(
         .build()
         .map_err(IndexError::PoolInit)?;
 
-    let total = discovered.files.len() as u32;
+    let total = files.len() as u32;
     let counter = AtomicU32::new(0);
 
     let results: Vec<Result<FileGraph, String>> = pool.install(|| {
-        discovered
-            .files
+        files
             .par_iter()
-            .map(|df| {
-                let plugin = registry.plugin_for(df.language).ok_or_else(|| {
-                    format!(
-                        "{}: no plugin for language {:?}",
-                        df.path.display(),
-                        df.language
-                    )
+            .map(|(path, language)| {
+                let plugin = registry.plugin_for(*language).ok_or_else(|| {
+                    format!("{}: no plugin for language {:?}", path.display(), language)
                 })?;
-                let content = std::fs::read(&df.path)
-                    .map_err(|e| format!("{}: read error: {e}", df.path.display()))?;
+                let content = std::fs::read(path)
+                    .map_err(|e| format!("{}: read error: {e}", path.display()))?;
                 let cleaned = plugin.preprocess(&content, cfg);
                 let mut fg = plugin
-                    .parse_file(&df.path, &cleaned)
-                    .map_err(|e| format!("{}: parse error: {e}", df.path.display()))?;
+                    .parse_file(path, &cleaned)
+                    .map_err(|e| format!("{}: parse error: {e}", path.display()))?;
                 // Per-file post-parse synthesis hook. Sees the ORIGINAL
                 // bytes (NOT the preprocessed `cleaned`) so language
                 // plugins running secondary extractors over source
@@ -184,9 +220,9 @@ pub fn index_directory(
                 // (e.g. `[cpp].macro_define_function` invocations that
                 // `macro_strip` could otherwise blank) can append the
                 // synthesized symbols.
-                plugin.synthesize_symbols(&df.path, &content, cfg, &mut fg);
+                plugin.synthesize_symbols(path, &content, cfg, &mut fg);
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                progress.report(n, total, &format!("Parsing: {}", df.path.display()));
+                progress.report(n, total, &format!("Parsing: {}", path.display()));
                 Ok(fg)
             })
             .collect()
@@ -770,6 +806,37 @@ mod tests {
         for e in parse_events.iter() {
             assert_eq!(e.total, n);
         }
+    }
+
+    #[test]
+    fn index_directory_extra_files_share_one_progress_total() {
+        let dir = TempDir::new().unwrap();
+        let scope = dir.path().join("scope");
+        let discovered = scope.join("current.cpp");
+        let extra = dir.path().join("cached.cpp");
+        touch(&discovered, b"void current() {}\n");
+        touch(&extra, b"void cached() {}\n");
+
+        let reg = real_cpp_registry();
+        let cfg = cfg_with_threads(2);
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let (graphs, warnings) =
+            index_directory_with_extra(&scope, &[(extra, Language::Cpp)], &reg, &cfg, &sink)
+                .unwrap();
+        assert_eq!(graphs.len(), 2);
+        assert!(warnings.is_empty());
+
+        let events = sink.0.lock().unwrap();
+        let parse_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.message.starts_with("Parsing: "))
+            .collect();
+        assert_eq!(parse_events.len(), 2);
+        assert!(parse_events.iter().all(|event| event.total == 2));
+        assert_eq!(
+            parse_events.iter().map(|event| event.progress).max(),
+            Some(2)
+        );
     }
 
     #[test]

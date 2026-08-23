@@ -593,3 +593,62 @@ async fn live_watch_dispatches_go_mod_events() {
         "go.mod modify event never crossed the non-source dispatch boundary"
     );
 }
+
+#[tokio::test]
+async fn cache_fast_path_hydrates_go_metadata_before_watch_edit() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join(".code-graph.toml"), "").unwrap();
+    std::fs::write(dir.path().join("go.mod"), b"module example.com/cache\n").unwrap();
+    let main = dir.path().join("main.go");
+    let candidate = dir.path().join("candidate.go");
+    std::fs::write(&main, b"package cache\nfunc Main() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("values.go"),
+        b"package cache\nvar callback = func() {}\n",
+    )
+    .unwrap();
+    std::fs::write(&candidate, b"package cache\nfunc callback() {}\n").unwrap();
+
+    let first = fresh_server();
+    let analyzed = analyze_codebase(
+        first.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(
+        analyzed.is_error,
+        Some(true),
+        "initial analyze: {analyzed:?}"
+    );
+    drop(first);
+
+    // No source changed, so this new process-shaped server takes the cache
+    // fast path and never enters the parse/resolve pipeline. Metadata must be
+    // restored during that fast load for the following watch edit.
+    let server = fresh_server();
+    let loaded = analyze_codebase(
+        server.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        false,
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(loaded.is_error, Some(true), "cache load: {loaded:?}");
+
+    std::fs::write(&main, b"package cache\nfunc Main() { callback() }\n").unwrap();
+    let main = code_graph_core::paths::canonicalize(&main).unwrap();
+    let candidate = code_graph_core::paths::canonicalize(&candidate).unwrap();
+    assert_reindexed(try_reindex_file(&server.inner, &main, false).await);
+    assert!(
+        !has_direct_callee(
+            &server,
+            &format!("{}:Main", main.display()),
+            &format!("{}:callback", candidate.display())
+        ),
+        "cache-fast-path metadata must keep the package value from resolving to the candidate"
+    );
+}

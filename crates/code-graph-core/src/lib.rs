@@ -134,6 +134,23 @@ pub enum Confidence {
     Heuristic,
 }
 
+/// Sparse, language-specific facts retained for a later resolver pass.
+///
+/// This deliberately lives outside [`FileGraph`]: most languages have no
+/// resolver metadata, and the facts are not part of the parsed symbol/edge
+/// payload. Graph persistence stores entries only for paths that need them.
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ResolverMetadata {
+    /// Go package facts needed to distinguish package-level values from
+    /// callable symbols during package-aware resolution.
+    Go {
+        declared_package: String,
+        /// Sorted and deduplicated by the Go parser before storage.
+        package_value_bindings: Vec<String>,
+    },
+}
+
 /// A named code entity (function, class, etc.). The shape mirrors the Go
 /// `parser.Symbol` exactly (snake_case JSON field names, `namespace`/`parent`
 /// elided when empty) and adds the `language` tag.
@@ -517,6 +534,17 @@ mod tests {
             serde_json::to_value(Confidence::Heuristic).unwrap(),
             json!("heuristic")
         );
+    }
+
+    #[test]
+    fn resolver_metadata_go_round_trips() {
+        let metadata = ResolverMetadata::Go {
+            declared_package: "widgets".to_string(),
+            package_value_bindings: vec!["Factory".to_string(), "Default".to_string()],
+        };
+        let value = serde_json::to_value(&metadata).unwrap();
+        let back: ResolverMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(back, metadata);
     }
 
     #[test]

@@ -32,7 +32,9 @@
 //!   "absent" at decode time.
 
 use crate::graph::{EdgeEntry, FileEntry, Graph, IncludeEntry, Node};
-use code_graph_core::{symbol_id, Confidence, EdgeKind, Language, Symbol, SymbolId, SymbolKind};
+use code_graph_core::{
+    symbol_id, Confidence, EdgeKind, Language, ResolverMetadata, Symbol, SymbolId, SymbolKind,
+};
 use lasso::{Key, Rodeo, Spur};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::{BTreeMap, HashMap};
@@ -81,6 +83,9 @@ use std::path::{Path, PathBuf};
 ///   Re-index rather than retain edges resolved under the older lookup rules.
 /// - v13: Go control-declaration scope resolution changed. Re-index rather
 ///   than retain false receiver edges produced by the token-blind v12 logic.
+///   Sparse Go resolver metadata was added later as an optional framed
+///   extension while preserving this exact v13 root layout, so pre-extension
+///   v13 caches remain readable without another version bump.
 ///
 /// This constant is the single source of truth for the on-disk version.
 /// `super::CACHE_VERSION` is a re-export at the module
@@ -218,6 +223,33 @@ pub(crate) struct PackedFile {
     pub symbol_ids: Vec<u32>, // NameId values
 }
 
+/// Packed language-specific resolver facts. Strings use the shared name
+/// interner; unlike [`PackedFile`], this table is sparse and top-level.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
+pub(crate) enum PackedResolverMetadata {
+    Go {
+        declared_package: u32,
+        package_value_bindings: Vec<u32>,
+    },
+}
+
+/// Optional sparse extension appended after the unchanged v13 root archive.
+/// Its entries reuse the root archive's path and name interner IDs.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
+pub(crate) struct PackedResolverMetadataExtension {
+    pub version: u32,
+    pub entries: BTreeMap<u32, PackedResolverMetadata>,
+}
+
+pub(crate) const RESOLVER_METADATA_EXTENSION_VERSION: u32 = 1;
+
+/// Build result kept outside the archived root so v13's original rkyv layout
+/// remains byte-compatible with caches written before resolver metadata.
+pub(crate) struct EncodedCache {
+    pub main: PackedCacheV6,
+    pub resolver_metadata: Option<PackedResolverMetadataExtension>,
+}
+
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 pub(crate) struct PackedInclude {
     pub path: u32, // PathId of the included file
@@ -341,7 +373,7 @@ impl EncodingPathInterner {
 /// order over the source maps below. The encoder pre-sorts the live
 /// `HashMap` keys before interning so that two saves of the same graph
 /// produce byte-identical output (matches design Goal 4).
-pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
+pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> EncodedCache {
     let mut paths = EncodingPathInterner::new();
     let mut names = EncodingStringInterner::new();
 
@@ -364,6 +396,9 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
 
     let mut sorted_include_keys: Vec<PathBuf> = graph.includes.keys().collect();
     sorted_include_keys.sort();
+
+    let mut sorted_metadata_paths: Vec<PathBuf> = graph.resolver_metadata.keys().collect();
+    sorted_metadata_paths.sort();
 
     let mut sorted_adj_keys: Vec<&SymbolId> = graph.adj.keys().collect();
     sorted_adj_keys.sort();
@@ -437,18 +472,50 @@ pub(crate) fn encode(graph: &Graph, last_sweep_at: u64) -> PackedCacheV6 {
         packed_mtimes.insert(path_id, nanos);
     }
 
-    PackedCacheV6 {
-        version: CACHE_VERSION,
-        generator: GENERATOR.to_string(),
-        last_sweep_at,
-        paths: paths.into_vec(),
-        names: names.into_vec(),
-        nodes: packed_nodes,
-        adj: packed_adj,
-        radj: packed_radj,
-        files: packed_files,
-        includes: packed_includes,
-        mtimes: packed_mtimes,
+    // ----- Encode sparse resolver metadata. -----
+    let mut packed_resolver_metadata = BTreeMap::new();
+    for path in &sorted_metadata_paths {
+        let metadata = graph
+            .resolver_metadata
+            .get(path)
+            .expect("path was just iterated");
+        let path_id = paths.intern(path);
+        let packed = match metadata {
+            ResolverMetadata::Go {
+                declared_package,
+                package_value_bindings,
+            } => PackedResolverMetadata::Go {
+                declared_package: names.intern(declared_package),
+                package_value_bindings: package_value_bindings
+                    .iter()
+                    .map(|binding| names.intern(binding))
+                    .collect(),
+            },
+            _ => continue,
+        };
+        packed_resolver_metadata.insert(path_id, packed);
+    }
+
+    EncodedCache {
+        main: PackedCacheV6 {
+            version: CACHE_VERSION,
+            generator: GENERATOR.to_string(),
+            last_sweep_at,
+            paths: paths.into_vec(),
+            names: names.into_vec(),
+            nodes: packed_nodes,
+            adj: packed_adj,
+            radj: packed_radj,
+            files: packed_files,
+            includes: packed_includes,
+            mtimes: packed_mtimes,
+        },
+        resolver_metadata: (!packed_resolver_metadata.is_empty()).then_some(
+            PackedResolverMetadataExtension {
+                version: RESOLVER_METADATA_EXTENSION_VERSION,
+                entries: packed_resolver_metadata,
+            },
+        ),
     }
 }
 
@@ -493,6 +560,7 @@ pub(crate) struct DecodedParts {
     pub radj: HashMap<SymbolId, Vec<EdgeEntry>>,
     pub files: code_graph_path_trie::PathTrie<FileEntry>,
     pub includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>>,
+    pub resolver_metadata: code_graph_path_trie::PathTrie<ResolverMetadata>,
     pub last_sweep_at: u64,
 }
 
@@ -558,6 +626,25 @@ fn unarchive_confidence(a: &<Confidence as rkyv::Archive>::Archived) -> Confiden
     }
 }
 
+fn unarchive_resolver_metadata(
+    metadata: &<PackedResolverMetadata as rkyv::Archive>::Archived,
+    resolver: &ArchivedResolver,
+) -> Result<ResolverMetadata, DecodeError> {
+    use ArchivedPackedResolverMetadata as A;
+    match metadata {
+        A::Go {
+            declared_package,
+            package_value_bindings,
+        } => Ok(ResolverMetadata::Go {
+            declared_package: resolver.name(declared_package.to_native())?.to_string(),
+            package_value_bindings: package_value_bindings
+                .iter()
+                .map(|binding| resolver.name(binding.to_native()).map(str::to_string))
+                .collect::<Result<_, _>>()?,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Direct-archived decode (zero intermediate owned-PackedCacheV6 alloc)
 // ---------------------------------------------------------------------------
@@ -577,6 +664,7 @@ fn unarchive_confidence(a: &<Confidence as rkyv::Archive>::Archived) -> Confiden
 /// the `unarchive_*` converters above.
 pub(crate) fn decode_archived(
     cache: &<PackedCacheV6 as rkyv::Archive>::Archived,
+    metadata_extension: Option<&<PackedResolverMetadataExtension as rkyv::Archive>::Archived>,
 ) -> Result<DecodedParts, DecodeError> {
     let resolver = ArchivedResolver {
         paths: &cache.paths,
@@ -647,12 +735,34 @@ pub(crate) fn decode_archived(
         includes.insert(path, entries);
     }
 
+    let mut resolver_metadata = code_graph_path_trie::PathTrie::new();
+    if let Some(extension) = metadata_extension {
+        let version = extension.version.to_native();
+        if version != RESOLVER_METADATA_EXTENSION_VERSION {
+            return Err(DecodeError::UnsupportedMetadataExtension(version));
+        }
+        for (path_id, packed) in extension.entries.iter() {
+            let path = PathBuf::from(resolver.path(path_id.to_native())?);
+            let Some(file) = files.get(&path) else {
+                return Err(DecodeError::MetadataPathNotIndexed(path));
+            };
+            if file.language != Language::Go {
+                return Err(DecodeError::MetadataLanguageMismatch {
+                    path,
+                    language: file.language,
+                });
+            }
+            resolver_metadata.insert(path, unarchive_resolver_metadata(packed, &resolver)?);
+        }
+    }
+
     Ok(DecodedParts {
         nodes,
         adj,
         radj,
         files,
         includes,
+        resolver_metadata,
         last_sweep_at: cache.last_sweep_at.to_native(),
     })
 }
@@ -745,6 +855,12 @@ pub(crate) enum DecodeError {
     NameOutOfRange(u32),
     #[error("stored symbol_id {stored:?} disagrees with derived {derived:?}")]
     InconsistentSymbolId { stored: String, derived: String },
+    #[error("unsupported resolver metadata extension version {0}")]
+    UnsupportedMetadataExtension(u32),
+    #[error("resolver metadata path {0} is not indexed")]
+    MetadataPathNotIndexed(PathBuf),
+    #[error("resolver metadata path {path} belongs to {language:?}, not Go")]
+    MetadataLanguageMismatch { path: PathBuf, language: Language },
 }
 
 impl From<DecodeError> for super::PersistError {

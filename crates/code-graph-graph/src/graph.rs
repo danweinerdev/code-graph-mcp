@@ -17,7 +17,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use code_graph_core::{symbol_id, Confidence, EdgeKind, FileGraph, Language, Symbol, SymbolId};
+use code_graph_core::{
+    symbol_id, Confidence, EdgeKind, FileGraph, Language, ResolverMetadata, Symbol, SymbolId,
+};
 use serde::{Deserialize, Serialize};
 
 /// In-memory directed graph of code symbols.
@@ -50,6 +52,10 @@ pub struct Graph {
     /// Per-file include lists. Same trie shape and rationale as
     /// `files`.
     pub(crate) includes: code_graph_path_trie::PathTrie<Vec<IncludeEntry>>,
+    /// Sparse language-specific resolver facts. Kept out of [`FileEntry`] and
+    /// [`FileGraph`] so files that do not need them pay no in-memory or cache
+    /// payload cost.
+    pub(crate) resolver_metadata: code_graph_path_trie::PathTrie<ResolverMetadata>,
     /// Nanoseconds since UNIX_EPOCH when the out-of-scope hygiene
     /// sweep last ran across this graph. Persisted in the cache
     /// (`GraphCache.last_sweep_at`) so the cadence survives process
@@ -190,6 +196,9 @@ impl Graph {
         if self.files.contains_path(&path) {
             self.remove_file_unsafe(&path);
         }
+        // Metadata describes the previous parse of this path. A caller that
+        // has fresh parser metadata must set it after merging the new graph.
+        self.resolver_metadata.remove(&path);
 
         // Add symbols as nodes.
         let mut symbol_ids: Vec<SymbolId> = Vec::with_capacity(fg.symbols.len());
@@ -397,6 +406,7 @@ impl Graph {
         // file above (and `Includes` edges live in `includes`, not
         // adj/radj).
         let _ = self.includes.remove_subtree(prefix);
+        let _ = self.resolver_metadata.remove_subtree(prefix);
         removed_ids
     }
 
@@ -418,6 +428,7 @@ impl Graph {
 
         self.includes.remove(path);
         self.files.remove(path);
+        self.resolver_metadata.remove(path);
     }
 
     /// Filter edge map entries: drop edges whose `file` equals `path`, and
@@ -477,7 +488,7 @@ impl Graph {
         });
     }
 
-    /// Reset the graph to empty. All five maps are cleared and the
+    /// Reset the graph to empty. All sparse storage maps are cleared and the
     /// sweep timestamp is reset to `0` (never-swept). After a
     /// `clear()` the graph is structurally equivalent to a fresh
     /// [`Graph::new`].
@@ -487,6 +498,7 @@ impl Graph {
         self.radj.clear();
         self.files.clear();
         self.includes.clear();
+        self.resolver_metadata.clear();
         self.last_sweep_at = 0;
     }
 
@@ -558,6 +570,50 @@ impl Graph {
     /// persists to the cache via the next [`Graph::save`].
     pub fn set_last_sweep_at(&mut self, nanos: u64) {
         self.last_sweep_at = nanos;
+    }
+
+    /// Associate sparse resolver metadata with an indexed path. This is kept
+    /// separate from [`FileGraph`] because only selected language plugins use
+    /// it. A subsequent [`Self::merge_file_graph`] for the same path clears
+    /// the old value; set fresh metadata after that merge.
+    pub fn set_resolver_metadata(&mut self, path: PathBuf, metadata: ResolverMetadata) {
+        if self.files.contains_path(&path) {
+            self.resolver_metadata.insert(path, metadata);
+        }
+    }
+
+    /// Remove sparse resolver metadata for one path. Unknown paths are a
+    /// no-op, mirroring [`Self::remove_file`].
+    pub fn remove_resolver_metadata(&mut self, path: &Path) {
+        self.resolver_metadata.remove(path);
+    }
+
+    /// Clone all sparse resolver metadata in deterministic path order for
+    /// restoration into language plugins after a cache load.
+    pub fn resolver_metadata_snapshot(&self) -> Vec<(PathBuf, ResolverMetadata)> {
+        let mut out: Vec<_> = self
+            .resolver_metadata
+            .iter()
+            .map(|(path, metadata)| (path, metadata.clone()))
+            .collect();
+        out.sort_by(|(left, _), (right, _)| left.cmp(right));
+        out
+    }
+
+    /// Return indexed files of `language` that have no persisted resolver
+    /// metadata. This identifies caches written before a language introduced
+    /// its sparse metadata extension without exposing the metadata table.
+    pub fn files_missing_resolver_metadata(&self, language: Language) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = self
+            .files
+            .iter()
+            .filter_map(|(path, entry)| {
+                (entry.language == language && !self.resolver_metadata.contains_path(&path))
+                    .then_some(path)
+            })
+            .collect();
+        paths.sort();
+        paths
     }
 
     /// Reconstruct a `Vec<FileGraph>` from internal storage with the
@@ -635,6 +691,11 @@ impl Graph {
     #[cfg(test)]
     fn includes(&self) -> &code_graph_path_trie::PathTrie<Vec<IncludeEntry>> {
         &self.includes
+    }
+
+    #[cfg(test)]
+    fn resolver_metadata(&self) -> &code_graph_path_trie::PathTrie<ResolverMetadata> {
+        &self.resolver_metadata
     }
 }
 
@@ -973,6 +1034,55 @@ mod tests {
         assert!(g.radj().is_empty());
         assert!(g.files().is_empty());
         assert!(g.includes().is_empty());
+    }
+
+    #[test]
+    fn sparse_resolver_metadata_follows_merge_remove_subtree_and_clear() {
+        let mut g = Graph::new();
+        let a = PathBuf::from("/a/x.go");
+        let b = PathBuf::from("/b/y.go");
+        let metadata = || ResolverMetadata::Go {
+            declared_package: "example".to_string(),
+            package_value_bindings: vec!["Value".to_string()],
+        };
+
+        g.merge_file_graph(make_fg(
+            "/a/x.go",
+            Language::Go,
+            vec![sym("X", SymbolKind::Function, "/a/x.go")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b/y.go",
+            Language::Go,
+            vec![sym("Y", SymbolKind::Function, "/b/y.go")],
+            vec![],
+        ));
+        g.set_resolver_metadata(a.clone(), metadata());
+        g.set_resolver_metadata(b.clone(), metadata());
+        assert_eq!(g.resolver_metadata_snapshot().len(), 2);
+
+        // Fresh file data invalidates its prior parse metadata.
+        g.merge_file_graph(make_fg(
+            "/a/x.go",
+            Language::Go,
+            vec![sym("X", SymbolKind::Function, "/a/x.go")],
+            vec![],
+        ));
+        assert!(!g.resolver_metadata().contains_path(&a));
+        assert!(g.resolver_metadata().contains_path(&b));
+
+        g.set_resolver_metadata(a.clone(), metadata());
+        let _ = g.remove_files_under(Path::new("/a"));
+        assert!(!g.resolver_metadata().contains_path(&a));
+        assert!(g.resolver_metadata().contains_path(&b));
+
+        g.remove_file(&b);
+        assert!(g.resolver_metadata().is_empty());
+
+        g.set_resolver_metadata(a, metadata());
+        g.clear();
+        assert!(g.resolver_metadata().is_empty());
     }
 
     #[test]

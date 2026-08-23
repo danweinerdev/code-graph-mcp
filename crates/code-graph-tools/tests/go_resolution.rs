@@ -54,6 +54,27 @@ fn write_go(dir: &Path, relative: &str, source: &str) -> PathBuf {
     code_graph_core::paths::canonicalize(&path).expect("canonicalize Go source")
 }
 
+fn strip_resolver_metadata_extension(dir: &Path) {
+    const HEADER_SIZE: usize = 8;
+    const FOOTER_SIZE: usize = 24;
+    const MAGIC: &[u8; 8] = b"CGMETA01";
+
+    let cache = dir.join(".code-graph-cache.db");
+    let mut bytes = std::fs::read(&cache).expect("read extended cache");
+    assert!(
+        bytes.ends_with(MAGIC),
+        "cache must contain metadata extension"
+    );
+    let footer_start = bytes.len() - FOOTER_SIZE;
+    let main_len = u64::from_ne_bytes(
+        bytes[footer_start..footer_start + 8]
+            .try_into()
+            .expect("main archive length footer"),
+    ) as usize;
+    bytes.truncate(HEADER_SIZE + main_len);
+    std::fs::write(cache, bytes).expect("write footerless v13 cache");
+}
+
 /// Materialize one module that has a package with multiple files, a second
 /// imported package, and unrelated collision symbols. The caller exercises all
 /// resolver branches in one graph while the assertions below keep each contract
@@ -846,16 +867,16 @@ async fn go_scoped_analyze_uses_cached_sibling_package_bindings() {
     std::fs::write(dir.path().join(".code-graph.toml"), "").expect("write project config");
     std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
         .expect("write go.mod");
-    write_go(
+    let values = write_go(
         dir.path(),
         "pkg/current/values.go",
         "package current\nvar callback = func() {}\n",
     );
     let caller_path = dir.path().join("pkg/current/main.go");
-    let noise = write_go(
+    let candidate = write_go(
         dir.path(),
-        "pkg/noise/noise.go",
-        "package noise\nfunc callback() {}\n",
+        "pkg/current/candidate.go",
+        "package current\nfunc callback() {}\n",
     );
     let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
     let server = go_only_server();
@@ -864,6 +885,12 @@ async fn go_scoped_analyze_uses_cached_sibling_package_bindings() {
     // cached graph survives while the newly-created caller is fresh.
     analyze_with_force(&server, &root, true).await;
     drop(server);
+    // Diverge the ignored sibling on disk after the cache was written. The
+    // cached graph still says `callback` is a package value, so resolver
+    // metadata must come from that same cache snapshot rather than these newer
+    // bytes (which would incorrectly enable the candidate function below).
+    std::fs::write(&values, "package current\nvar renamed = func() {}\n")
+        .expect("mutate ignored sibling after cache write");
     std::fs::write(
         &caller_path,
         "package current\nfunc Main() { callback() }\n",
@@ -876,8 +903,8 @@ async fn go_scoped_analyze_uses_cached_sibling_package_bindings() {
     .expect("ignore cached sibling on second pass");
     let main = code_graph_core::paths::canonicalize(&caller_path).expect("canonicalize caller");
     // A new parser instance has no process-local metadata. The second analyze
-    // must reconstruct resolver context from the cache-loaded file universe,
-    // not accidentally rely on state retained by the first server.
+    // must restore resolver context from the cache-loaded file universe, not
+    // parse the newer ignored sibling from disk.
     let server = go_only_server();
     analyze_with_force(&server, &root, false).await;
 
@@ -900,8 +927,158 @@ async fn go_scoped_analyze_uses_cached_sibling_package_bindings() {
             .all(|row| !row["symbol_id"]
                 .as_str()
                 .expect("symbol ID")
-                .contains(noise.to_string_lossy().as_ref())),
+                .contains(candidate.to_string_lossy().as_ref())),
         "cached sibling package value must block fresh caller fallback: {result}"
+    );
+}
+
+#[tokio::test]
+async fn go_scoped_analyze_keeps_cached_function_when_ignored_disk_file_becomes_value() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join(".code-graph.toml"), "").expect("write project config");
+    std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
+        .expect("write go.mod");
+    let target = write_go(
+        dir.path(),
+        "pkg/current/target.go",
+        "package current\nfunc callback() {}\n",
+    );
+    let caller_path = dir.path().join("pkg/current/main.go");
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
+    let server = go_only_server();
+    analyze_with_force(&server, &root, true).await;
+    drop(server);
+
+    // The disk file now declares a value, but it is excluded from the scoped
+    // refresh. Cached symbols and cached resolver metadata must remain one
+    // coherent old snapshot, so the fresh caller still resolves to the cached
+    // function instead of being suppressed by newer on-disk metadata.
+    std::fs::write(&target, "package current\nvar callback = func() {}\n")
+        .expect("mutate ignored target after cache write");
+    std::fs::write(
+        &caller_path,
+        "package current\nfunc Main() { callback() }\n",
+    )
+    .expect("write fresh caller");
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[discovery]\nextra_ignore = [\"pkg/current/target.go\"]\n",
+    )
+    .expect("ignore cached target on second pass");
+    let main = code_graph_core::paths::canonicalize(&caller_path).expect("canonicalize caller");
+
+    let server = go_only_server();
+    analyze_with_force(&server, &root, false).await;
+    let caller = format!("{}:Main", main.to_string_lossy());
+    let result = ok_json(&callers_or_callees(
+        &server.inner.graph,
+        &caller,
+        Some(1),
+        Direction::Callees,
+        Some(50),
+        Some(0),
+        NO_BYTE_BUDGET,
+        None,
+    ));
+    assert!(
+        result["results"]
+            .as_array()
+            .expect("callee rows")
+            .iter()
+            .any(|row| row["symbol_id"]
+                .as_str()
+                .is_some_and(|id| id == format!("{}:callback", target.to_string_lossy()))),
+        "cached function and metadata must remain coherent despite newer ignored bytes: {result}"
+    );
+}
+
+#[tokio::test]
+async fn footerless_v13_go_cache_upgrades_during_scoped_resolution() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join(".code-graph.toml"), "").expect("write project config");
+    std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
+        .expect("write go.mod");
+    let target = write_go(
+        dir.path(),
+        "pkg/current/target.go",
+        "package current\nvar callback = func() {}\n",
+    );
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
+    let server = go_only_server();
+    analyze_with_force(&server, &root, true).await;
+    drop(server);
+    strip_resolver_metadata_extension(dir.path());
+
+    // Diverge the ignored file after the footerless cache was written. The
+    // migration must refresh its complete graph and metadata together rather
+    // than pair this new function metadata with the old value-only graph.
+    std::fs::write(&target, "package current\nfunc callback() {}\n")
+        .expect("mutate legacy cached target");
+
+    let main = write_go(
+        dir.path(),
+        "pkg/current/main.go",
+        "package current\nfunc Main() { callback() }\n",
+    );
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[discovery]\nextra_ignore = [\"pkg/current/target.go\"]\n",
+    )
+    .expect("ignore cached target during upgrade pass");
+    let server = go_only_server();
+    analyze_with_force(&server, &root, false).await;
+
+    let result = ok_json(&callers_or_callees(
+        &server.inner.graph,
+        &format!("{}:Main", main.to_string_lossy()),
+        Some(1),
+        Direction::Callees,
+        Some(50),
+        Some(0),
+        NO_BYTE_BUDGET,
+        None,
+    ));
+    let target_id = format!("{}:callback", target.display());
+    assert!(
+        result["results"]
+            .as_array()
+            .expect("callee rows")
+            .iter()
+            .any(|row| row["symbol_id"].as_str() == Some(target_id.as_str())),
+        "fresh caller must resolve against a footerless-v13 cached Go target: {result}"
+    );
+    assert!(
+        std::fs::read(dir.path().join(".code-graph-cache.db"))
+            .expect("read upgraded cache")
+            .ends_with(b"CGMETA01"),
+        "the compatibility metadata must be persisted immediately"
+    );
+}
+
+#[tokio::test]
+async fn footerless_v13_go_cache_bypasses_unchanged_fast_path_for_upgrade() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join(".code-graph.toml"), "").expect("write project config");
+    std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
+        .expect("write go.mod");
+    write_go(
+        dir.path(),
+        "pkg/current/target.go",
+        "package current\nfunc callback() {}\n",
+    );
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
+    let server = go_only_server();
+    analyze_with_force(&server, &root, true).await;
+    drop(server);
+    strip_resolver_metadata_extension(dir.path());
+
+    let server = go_only_server();
+    analyze_with_force(&server, &root, false).await;
+    assert!(
+        std::fs::read(dir.path().join(".code-graph-cache.db"))
+            .expect("read upgraded cache")
+            .ends_with(b"CGMETA01"),
+        "an unchanged footerless Go cache must still run the metadata upgrade"
     );
 }
 

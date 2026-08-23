@@ -30,7 +30,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use code_graph_core::{paths, ConfigError, RootConfig};
+use code_graph_core::{paths, ConfigError, Language, RootConfig};
 use code_graph_graph::Graph;
 
 use crate::analyze_job::{
@@ -41,7 +41,7 @@ use crate::core::{ToolError, ToolOk, ToolResult};
 use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
 use crate::handlers::status::format_unix_nanos_rfc3339;
 use crate::indexer::{
-    build_file_index, build_symbol_index, index_directory, resolve_edges_with_indexes,
+    build_file_index, build_symbol_index, index_directory_with_extra, resolve_edges_with_indexes,
     NoopProgressSink, ProgressSink,
 };
 use crate::server::ServerInner;
@@ -274,7 +274,18 @@ pub(crate) async fn run_analyze_job(
         let (load_ok, all_stale) = probe
             .load_and_stale(&project_root)
             .unwrap_or((false, Vec::new()));
-        if load_ok && probe.files_in_scope_count(&abs_path) > 0 {
+        let needs_resolver_metadata_upgrade = load_ok
+            && !probe
+                .files_missing_resolver_metadata(Language::Go)
+                .is_empty();
+        if load_ok {
+            let cached_resolver_metadata = probe.resolver_metadata_snapshot();
+            for plugin in inner.registry.plugins() {
+                plugin.restore_resolver_metadata(&cached_resolver_metadata);
+            }
+        }
+        if load_ok && !needs_resolver_metadata_upgrade && probe.files_in_scope_count(&abs_path) > 0
+        {
             let in_scope_stale: Vec<_> = all_stale
                 .iter()
                 .filter(|p| p.starts_with(&abs_path))
@@ -483,6 +494,16 @@ pub(crate) async fn run_analyze_job(
             }
         }
 
+        // Hydrate plugin-owned resolver state from the same cached snapshot
+        // that supplies out-of-scope symbols. This keeps scoped resolution
+        // internally consistent after restart instead of combining cached
+        // symbols with metadata reparsed from newer on-disk bytes.
+        let cached_resolver_metadata = merged_graph.resolver_metadata_snapshot();
+        let legacy_go_paths = merged_graph.files_missing_resolver_metadata(Language::Go);
+        for plugin in registry.registry.plugins() {
+            plugin.restore_resolver_metadata(&cached_resolver_metadata);
+        }
+
         eprintln!(
             "[code-graph] phase: discovering + parsing under {}",
             abs_path_for_pool.display()
@@ -509,11 +530,24 @@ pub(crate) async fn run_analyze_job(
         for plugin in registry.registry.plugins() {
             plugin.invalidate_resolution_cache();
         }
-        let (mut fresh_graphs, parse_warnings) =
-            match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
-                Ok(v) => v,
-                Err(e) => return Err(e.to_string()),
-            };
+        let mut migration_files = Vec::new();
+        for path in legacy_go_paths {
+            if path.is_file() {
+                migration_files.push((path, Language::Go));
+            } else {
+                merged_graph.remove_file(&path);
+            }
+        }
+        let (mut fresh_graphs, parse_warnings) = match index_directory_with_extra(
+            &abs_path_for_pool,
+            &migration_files,
+            &registry.registry,
+            &cfg_for_pool,
+            &sink,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(e.to_string()),
+        };
         blocking_warnings.extend(parse_warnings);
         eprintln!(
             "[code-graph] phase: discover+parse done ({:.1}s, {} files parsed)",
@@ -561,6 +595,19 @@ pub(crate) async fn run_analyze_job(
         let phase_start = std::time::Instant::now();
         for fg in fresh_graphs {
             merged_graph.merge_file_graph(fg);
+        }
+        // Persist metadata for the complete resolver universe, not only fresh
+        // files. This upgrades footerless v13 Go cache entries reconstructed
+        // by the compatibility path during prepare_resolution.
+        for fg in &resolution_graphs {
+            let path = std::path::PathBuf::from(&fg.path);
+            if let Some(metadata) = registry
+                .registry
+                .plugin_for(fg.language)
+                .and_then(|plugin| plugin.resolver_metadata_for_path(&path))
+            {
+                merged_graph.set_resolver_metadata(path, metadata);
+            }
         }
         eprintln!(
             "[code-graph] phase: merge done ({:.1}s, total {} files in graph)",
