@@ -120,9 +120,10 @@ Rationale:
   parse-time call-shape field (e.g.
   `receiver_typed: bool`, or a small enum: free / receiver / qualified) to the
   provisional `Edge` or to a per-edge extension of `CallContext`. Set at
-  extraction in the five affected `code-graph-lang-*` crates. The resolve loop already
-  builds `CallContext` per edge (`crates/code-graph-tools/src/indexer.rs:494`,
-  mirrored in `handlers/watch.rs:427,453`), so the ctx side is local. Decide
+  extraction in the five affected `code-graph-lang-*` crates. The Calls arms
+  in `indexer::resolve_edges_with_indexes` and
+  `handlers::watch::try_reindex_file` already build `CallContext` per edge, so
+  the context-side change is local. Decide
   whether the field rides into the rkyv cache or is parse-only — if the cache
   encoder serializes `Edge` directly, the version bump below subsumes it.
 - **Resolver change.** In `default_scope_aware_resolve`, when the call is
@@ -131,10 +132,10 @@ Rationale:
   today's shortcut. (C++: "unqualified call whose caller is a method" should
   count as receiver-typed per the implicit-`this` note above — flag this as a
   per-language decision at implementation time.)
-- **Cache.** `confidence` is persisted in the v12 cache, and mtime-based
+- **Cache.** `confidence` is persisted in the v13 cache, and mtime-based
   invalidation does NOT re-resolve unchanged files — so the tag flip will not
-  propagate to cached edges without a `CACHE_VERSION` bump (12 → 13,
-  `crates/code-graph-graph/src/persist/packed.rs:86`). A bump forces a one-time
+  propagate to cached edges without a `CACHE_VERSION` bump (13 → 14,
+  `crates/code-graph-graph/src/persist/packed.rs`). A bump forces a one-time
   full re-index per project on next run; that is the price of making the fix
   real rather than force-only.
 - **Go precedent.** Go now encodes selector provenance in provisional call
@@ -167,7 +168,7 @@ Rationale:
 3. Unqualified free-function sole-candidate resolution is byte-identical to
    today (`Resolved, 1`) — pinned by a test so a future "safety" change cannot
    silently widen the downgrade.
-4. `CACHE_VERSION` bumped to 13; the divergence note and CLAUDE.md updates land in
+4. `CACHE_VERSION` bumped to 14; the divergence note and CLAUDE.md updates land in
    the same commit as the resolver change (wire-visible behavior change →
    docs move with it).
 
@@ -178,3 +179,61 @@ Agents querying callers of common method names (`is_empty`, `len`, `push`,
 `Resolved/1` callers skeptically and cross-check the receiver type at the call
 site. Optional zero-risk first step, independent of B: land Option A's
 CLAUDE.md limitation entry so the hazard is at least documented.
+
+---
+
+## F3 — Unresolved provisional call markers persist in the graph cache
+
+**Status:** open follow-up opportunity (surfaced 2026-08-22 during the
+shared-process adversarial review). No public query currently exposes these
+markers.
+
+### Symptom and evidence
+
+The Go parser uses internal call-target markers to preserve syntax that the
+resolver needs:
+
+- `@method-receiver::` for a statically named receiver type;
+- `@bound-receiver::` for a local/function-value or otherwise shadowing
+  binding that must not fall through to a same-named project symbol;
+- `@dot-import::` for a bare call whose provenance may be a dot import.
+
+When `resolve_call` returns `None`, the shared resolve loop intentionally keeps
+the provisional target. `PackedEdge` then serializes it like any other edge, so
+unresolved markers remain in `Graph.adj`/`Graph.radj` and
+`.code-graph-cache.db` until their source file is re-parsed. Public call-graph,
+diagram, path, and community traversals filter targets that are not graph
+nodes, so this is currently an internal storage/diagnostic issue rather than a
+wire-contract defect.
+
+### Follow-up opportunities
+
+1. **Document the internal invariant.** State that unresolved Calls edges keep
+   their provisional token and that clients never receive non-node targets.
+   Correct the watch-path comment that currently implies all stored edges are
+   resolved.
+2. **Drop permanently terminal markers.** `@bound-receiver::` always resolves
+   to `None` by design and can be discarded after resolution. Do not
+   indiscriminately drop `@method-receiver::` or `@dot-import::`: scoped cache
+   growth can add the missing target later, and the cache contract deliberately
+   preserves provisional calls from cached source files.
+3. **Measure before broader cleanup.** Record marker counts and packed-cache
+   bytes on a large Go repository before adding a generalized unresolved-edge
+   compaction policy.
+
+### Recommended first step
+
+Land opportunity 1 plus selective `@bound-receiver::` removal. It has a
+provable terminal predicate, reduces useless adjacency/cache entries, and does
+not weaken future cross-scope resolution. Treat any broader compaction as a
+separate design because it changes cached-edge retention semantics.
+
+### Acceptance criteria
+
+1. No `@bound-receiver::` target survives the resolve/merge path or a cache
+   round trip.
+2. Resolvable `@method-receiver::` and `@dot-import::` behavior remains
+   unchanged, including scoped-analysis cases.
+3. All public traversals continue to emit only real graph nodes.
+4. The watch-path and cache documentation accurately distinguish resolved
+   edges from retained provisional tokens.
