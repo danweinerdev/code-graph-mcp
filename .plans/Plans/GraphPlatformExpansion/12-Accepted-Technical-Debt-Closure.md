@@ -28,7 +28,7 @@ tasks:
       cargo test -p code-graph-vcs-git and cargo test -p code-graph-tools --test blame_symbol pass; ownership checks fail closed for deleted nested-clone and broken-gitlink fixtures, linked-worktree and provider-bound-elsewhere reasons are exact, every provider detection runs through spawn_blocking with no cache, the core no longer spells git-specific HEAD while the trait still has exactly four required operations, inert diagnostics are removed or made reachable, and empty-span attribution remains observable alongside divergence; make verify passes.
   - id: "12.4"
     title: "Bound symbol-history work and make uncertainty explicit"
-    status: planned
+    status: complete
     depends_on: ["12.3"]
     justifies: "FR-29, FR-33, FR-35, FR-36, AC-19, AC-20, AC-37, AC-44, and NFR-10; prevents provider failures from becoming false absence tombstones, deep histories from buffering hundreds of full snapshots, and synchronous cache I/O from blocking runtime workers, as recorded by review 18."
     verification: >-
@@ -197,13 +197,13 @@ Do not “fix” ownership by accepting any path whose lexical parent lies under
 
 ## 12.4: Bound symbol-history work and make uncertainty explicit
 ### Subtasks
-- [ ] Map revision parse/object/peel/blob failures to `Operation`; emit `NotFound` only after proving the immutable revision tree lacks the path.
-- [ ] Add partial-clone, pruned-object, and missing-blob regressions proving failures are not cached as absence tombstones or described as “no history.”
-- [ ] Keep the global `skipped` list as the sole uncertainty signal because it already lets clients reconstruct skip-adjacent uncertainty from the same response; document that reconstruction and pin it through the wire response instead of adding a redundant per-entry boolean.
-- [ ] Replace whole-window snapshot prefetch with ordered batches retaining at most 8 source snapshots and targeting at most 32 MiB of source bytes; admit one oversized source alone so every revision remains examinable, parse/fingerprint one snapshot at a time, drop its AST before advancing, and preserve oldest-to-newest transition semantics across batch boundaries.
-- [ ] Move shard reads and parse/fingerprint CPU work into batched blocking boundaries; inject a gated slow parser/cache double proving runtime isolation rather than relying on source inspection.
-- [ ] Instrument tests to assert a `window=500` walk’s live source-buffer high-water mark is at most 8 snapshots and 32 MiB unless one source itself exceeds 32 MiB; then assert it is the only retained source and only one AST/fingerprint operation is active. Do not claim a hard bound below the largest individual input.
-- [ ] Clarify rename-to-HEAD observability: the current ID can report its introduction, while the old removed ID is no longer queryable from the current graph.
+- [x] Map revision parse/object/peel/blob failures to `Operation`; emit `NotFound` only after proving the immutable revision tree lacks the path.
+- [x] Add partial-clone, pruned-object, and missing-blob regressions proving failures are not cached as absence tombstones or described as “no history.”
+- [x] Keep the global `skipped` list as the sole uncertainty signal because it already lets clients reconstruct skip-adjacent uncertainty from the same response; document that reconstruction and pin it through the wire response instead of adding a redundant per-entry boolean.
+- [x] Replace whole-window snapshot prefetch with ordered batches retaining at most 8 source snapshots and targeting at most 32 MiB of source bytes; admit one oversized source alone so every revision remains examinable, parse/fingerprint one snapshot at a time, drop its AST before advancing, and preserve oldest-to-newest transition semantics across batch boundaries.
+- [x] Move shard reads and parse/fingerprint CPU work into batched blocking boundaries; inject a gated slow parser/cache double proving runtime isolation rather than relying on source inspection.
+- [x] Instrument tests to assert a `window=500` walk’s live source-buffer high-water mark is at most 8 snapshots and 32 MiB unless one source itself exceeds 32 MiB; then assert it is the only retained source and only one AST/fingerprint operation is active. Do not claim a hard bound below the largest individual input.
+- [x] Clarify rename-to-HEAD observability: the current ID can report its introduction, while the old removed ID is no longer queryable from the current graph.
 
 ### Notes
 Revision boundary: a deep cold history walk has bounded source prefetch and one-at-a-time AST work, is async-safe, and never converts provider failure into authoritative absence. Public entry ordering and exact `(name, kind)` matching remain unchanged.
@@ -212,7 +212,22 @@ Chunking must carry the previous symbol state across boundaries and must not emi
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd`
+- Focused review: `git show eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): clippy denied warnings, formatting passed, all workspace tests passed, no pending snapshots remained, and generated plugin mirrors were synchronized.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted task verification: cargo test -p code-graph-vcs-git; cargo test -p code-graph-tools --test symbol_history; cargo test -p code-graph-tools --test snapshot_tools_list tools_list_symbol_history; cargo test -p code-graph-tools --lib; cargo check --workspace --release; git diff --check` | `task 12.4 implementation and focused multi-lane review at eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd` | PASS | `PASS: 21 Git-provider tests, 16 symbol-history tests, 499 tool-library tests with 1 ignored, the symbol_history production-description snapshot, release compilation, and whitespace checks all passed; regressions pin operational object failures, no false tombstones, skip uncertainty, one-source/32 MiB bounded retention with oversized exception, one active AST operation, blocking isolation, shallow-boundary truncation, and rename-to-HEAD observability.` |
 
 ## 12.5: Consolidate fingerprints and bound sidecar lifecycle
 ### Subtasks
