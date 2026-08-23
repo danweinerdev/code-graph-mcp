@@ -22,7 +22,7 @@ tasks:
       cargo test -p code-graph-tools and cargo test -p code-graph-cli pass; a cross-crate compile fixture imports the typed core without rmcp, every public query entry either receives the honest indexed flag or is visibility-restricted so it cannot bypass the guard, all queued synchronous followers retain and drive their abstract progress sinks after promotion without notifying async aliases or reporting under the slot lock, the structural source scan covers the complete relevant source tree, and one canonical contract location replaces duplicated or contradictory guard prose; make verify passes.
   - id: "12.3"
     title: "Harden VCS ownership, detection, and blame semantics"
-    status: planned
+    status: complete
     justifies: "FR-27, FR-29, FR-32, FR-36, AC-21, AC-22, AC-34, AC-35, AC-44, and NFR-10; prevents deleted nested repositories from being treated as owned, misleading unavailability, and VCS discovery from blocking unrelated async queries, as recorded by review 15."
     verification: >-
       cargo test -p code-graph-vcs-git and cargo test -p code-graph-tools --test blame_symbol pass; ownership checks fail closed for deleted nested-clone and broken-gitlink fixtures, linked-worktree and provider-bound-elsewhere reasons are exact, every provider detection runs through spawn_blocking with no cache, the core no longer spells git-specific HEAD while the trait still has exactly four required operations, inert diagnostics are removed or made reachable, and empty-span attribution remains observable alongside divergence; make verify passes.
@@ -160,13 +160,13 @@ No public API compatibility promise exists for workspace-internal handler functi
 
 ## 12.3: Harden VCS ownership, detection, and blame semantics
 ### Subtasks
-- [ ] Make repository ownership fail closed when parent discovery errors and the queried path is missing, including deleted nested clones and broken gitlinks over outer-repository paths.
-- [ ] Distinguish provider-bound-elsewhere, linked-worktree/different-checkout, no-provider, and genuinely untracked-path unavailability reasons.
-- [ ] Remove the unreachable non-`Unavailable` startup breadcrumb or preserve actionable provider-open errors so the branch is real and testable.
-- [ ] Run `gix::discover` and equivalent provider detection in `spawn_blocking` on each history request; do not add provider caching or an invalidation policy in this phase.
-- [ ] Change the existing required resolve operation to `resolve_rev(spec: Option<&str>)`, where `None` requests the provider default, and remove the core’s literal `HEAD`; retain exactly four required `VcsProvider` operations under FR-27/AC-34.
-- [ ] Preserve both divergence and no-attributable-lines information when a blamed span produces no hunks.
-- [ ] Add hermetic fixtures for all ownership and reason branches plus a concurrency test proving slow detection delays only history tools.
+- [x] Make repository ownership fail closed when parent discovery errors and the queried path is missing, including deleted nested clones and broken gitlinks over outer-repository paths.
+- [x] Distinguish provider-bound-elsewhere, linked-worktree/different-checkout, no-provider, and genuinely untracked-path unavailability reasons.
+- [x] Remove the unreachable non-`Unavailable` startup breadcrumb or preserve actionable provider-open errors so the branch is real and testable.
+- [x] Run `gix::discover` and equivalent provider detection in `spawn_blocking` on each history request; do not add provider caching or an invalidation policy in this phase.
+- [x] Change the existing required resolve operation to `resolve_rev(spec: Option<&str>)`, where `None` requests the provider default, and remove the core’s literal `HEAD`; retain exactly four required `VcsProvider` operations under FR-27/AC-34.
+- [x] Preserve both divergence and no-attributable-lines information when a blamed span produces no hunks.
+- [x] Add hermetic fixtures for all ownership and reason branches plus a concurrency test proving slow detection delays only history tools.
 
 ### Notes
 Revision boundary: provider selection and ownership are fail-closed and provider-neutral, blame errors say what happened, and no detection work blocks unrelated async queries. The git implementation remains confined to `code-graph-vcs-git`; no Perforce implementation or fifth required trait method is introduced.
@@ -178,7 +178,22 @@ Do not “fix” ownership by accepting any path whose lexical parent lies under
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb`
+- Focused review: `git show dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `full repository gate passed: clippy denied warnings, formatting passed, all workspace tests passed, pending snapshots were absent, and generated plugin mirrors were synchronized.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted verification: cargo test -p code-graph-vcs; cargo test -p code-graph-vcs-git; cargo test -p code-graph-tools --test blame_symbol; cargo test -p code-graph-tools --test symbol_history; cargo test -p code-graph-cli; cargo test -p code-graph-mcp; cargo clippy --workspace --all-targets -- -D warnings; cargo tree -p code-graph-vcs-git` | `task 12.3 implementation and four-lane focused review at dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb` | PASS | `all targeted commands passed; 8 VCS tests, 18 Git-provider tests, 14 blame tests, and 13 symbol-history tests pin fail-closed ownership, exact selection reasons, uncached blocking-isolated detection, provider-neutral defaults, detector error propagation, and composed empty-span/divergence diagnostics; dependency inspection showed no new native library.` |
 
 ## 12.4: Bound symbol-history work and make uncertainty explicit
 ### Subtasks
