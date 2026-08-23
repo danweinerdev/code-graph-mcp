@@ -629,17 +629,25 @@ fn unarchive_confidence(a: &<Confidence as rkyv::Archive>::Archived) -> Confiden
 fn unarchive_resolver_metadata(
     metadata: &<PackedResolverMetadata as rkyv::Archive>::Archived,
     resolver: &ArchivedResolver,
-) -> Result<ResolverMetadata, DecodeError> {
+) -> Result<ResolverMetadata, MetadataDecodeError> {
     use ArchivedPackedResolverMetadata as A;
     match metadata {
         A::Go {
             declared_package,
             package_value_bindings,
         } => Ok(ResolverMetadata::Go {
-            declared_package: resolver.name(declared_package.to_native())?.to_string(),
+            declared_package: resolver
+                .name(declared_package.to_native())
+                .map_err(MetadataDecodeError::InvalidReference)?
+                .to_string(),
             package_value_bindings: package_value_bindings
                 .iter()
-                .map(|binding| resolver.name(binding.to_native()).map(str::to_string))
+                .map(|binding| {
+                    resolver
+                        .name(binding.to_native())
+                        .map(str::to_string)
+                        .map_err(MetadataDecodeError::InvalidReference)
+                })
                 .collect::<Result<_, _>>()?,
         }),
     }
@@ -664,7 +672,6 @@ fn unarchive_resolver_metadata(
 /// the `unarchive_*` converters above.
 pub(crate) fn decode_archived(
     cache: &<PackedCacheV6 as rkyv::Archive>::Archived,
-    metadata_extension: Option<&<PackedResolverMetadataExtension as rkyv::Archive>::Archived>,
 ) -> Result<DecodedParts, DecodeError> {
     let resolver = ArchivedResolver {
         paths: &cache.paths,
@@ -735,36 +742,53 @@ pub(crate) fn decode_archived(
         includes.insert(path, entries);
     }
 
-    let mut resolver_metadata = code_graph_path_trie::PathTrie::new();
-    if let Some(extension) = metadata_extension {
-        let version = extension.version.to_native();
-        if version != RESOLVER_METADATA_EXTENSION_VERSION {
-            return Err(DecodeError::UnsupportedMetadataExtension(version));
-        }
-        for (path_id, packed) in extension.entries.iter() {
-            let path = PathBuf::from(resolver.path(path_id.to_native())?);
-            let Some(file) = files.get(&path) else {
-                return Err(DecodeError::MetadataPathNotIndexed(path));
-            };
-            if file.language != Language::Go {
-                return Err(DecodeError::MetadataLanguageMismatch {
-                    path,
-                    language: file.language,
-                });
-            }
-            resolver_metadata.insert(path, unarchive_resolver_metadata(packed, &resolver)?);
-        }
-    }
-
     Ok(DecodedParts {
         nodes,
         adj,
         radj,
         files,
         includes,
-        resolver_metadata,
+        resolver_metadata: code_graph_path_trie::PathTrie::new(),
         last_sweep_at: cache.last_sweep_at.to_native(),
     })
+}
+
+/// Decode the optional resolver-metadata extension after the main archive has
+/// loaded successfully. The extension is independently recoverable: callers
+/// may discard a [`MetadataDecodeError`] without rejecting the valid graph.
+pub(crate) fn decode_archived_resolver_metadata(
+    cache: &<PackedCacheV6 as rkyv::Archive>::Archived,
+    extension: &<PackedResolverMetadataExtension as rkyv::Archive>::Archived,
+    files: &code_graph_path_trie::PathTrie<FileEntry>,
+) -> Result<code_graph_path_trie::PathTrie<ResolverMetadata>, MetadataDecodeError> {
+    let version = extension.version.to_native();
+    if version != RESOLVER_METADATA_EXTENSION_VERSION {
+        return Err(MetadataDecodeError::UnsupportedVersion(version));
+    }
+
+    let resolver = ArchivedResolver {
+        paths: &cache.paths,
+        names: &cache.names,
+    };
+    let mut resolver_metadata = code_graph_path_trie::PathTrie::new();
+    for (path_id, packed) in extension.entries.iter() {
+        let path = PathBuf::from(
+            resolver
+                .path(path_id.to_native())
+                .map_err(MetadataDecodeError::InvalidReference)?,
+        );
+        let Some(file) = files.get(&path) else {
+            return Err(MetadataDecodeError::PathNotIndexed(path));
+        };
+        if file.language != Language::Go {
+            return Err(MetadataDecodeError::LanguageMismatch {
+                path,
+                language: file.language,
+            });
+        }
+        resolver_metadata.insert(path, unarchive_resolver_metadata(packed, &resolver)?);
+    }
+    Ok(resolver_metadata)
 }
 
 fn decode_archived_edge_map(
@@ -855,12 +879,20 @@ pub(crate) enum DecodeError {
     NameOutOfRange(u32),
     #[error("stored symbol_id {stored:?} disagrees with derived {derived:?}")]
     InconsistentSymbolId { stored: String, derived: String },
+}
+
+/// Semantic errors confined to the optional resolver-metadata extension.
+/// These must not reject an independently validated main archive.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MetadataDecodeError {
+    #[error("invalid metadata interner reference: {0}")]
+    InvalidReference(DecodeError),
     #[error("unsupported resolver metadata extension version {0}")]
-    UnsupportedMetadataExtension(u32),
+    UnsupportedVersion(u32),
     #[error("resolver metadata path {0} is not indexed")]
-    MetadataPathNotIndexed(PathBuf),
+    PathNotIndexed(PathBuf),
     #[error("resolver metadata path {path} belongs to {language:?}, not Go")]
-    MetadataLanguageMismatch { path: PathBuf, language: Language },
+    LanguageMismatch { path: PathBuf, language: Language },
 }
 
 impl From<DecodeError> for super::PersistError {

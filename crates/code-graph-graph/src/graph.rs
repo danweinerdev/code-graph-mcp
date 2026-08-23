@@ -575,9 +575,12 @@ impl Graph {
     /// Associate sparse resolver metadata with an indexed path. This is kept
     /// separate from [`FileGraph`] because only selected language plugins use
     /// it. A subsequent [`Self::merge_file_graph`] for the same path clears
-    /// the old value; set fresh metadata after that merge.
+    /// the old value; set fresh metadata after that merge. Unknown paths and
+    /// metadata whose language does not match the indexed file are no-ops.
     pub fn set_resolver_metadata(&mut self, path: PathBuf, metadata: ResolverMetadata) {
-        if self.files.contains_path(&path) {
+        if matches!(&metadata, ResolverMetadata::Go { .. })
+            && matches!(self.files.get(&path), Some(file) if file.language == Language::Go)
+        {
             self.resolver_metadata.insert(path, metadata);
         }
     }
@@ -1083,6 +1086,39 @@ mod tests {
         g.set_resolver_metadata(a, metadata());
         g.clear();
         assert!(g.resolver_metadata().is_empty());
+    }
+
+    #[test]
+    fn resolver_metadata_accepts_only_indexed_go_files() {
+        let mut g = Graph::new();
+        let go_path = PathBuf::from("/a.go");
+        let cpp_path = PathBuf::from("/b.cpp");
+        let unknown_path = PathBuf::from("/missing.go");
+        let metadata = || ResolverMetadata::Go {
+            declared_package: "example".to_string(),
+            package_value_bindings: vec!["Value".to_string()],
+        };
+
+        g.merge_file_graph(make_fg(
+            "/a.go",
+            Language::Go,
+            vec![sym("A", SymbolKind::Function, "/a.go")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("B", SymbolKind::Function, "/b.cpp")],
+            vec![],
+        ));
+
+        g.set_resolver_metadata(go_path.clone(), metadata());
+        g.set_resolver_metadata(cpp_path.clone(), metadata());
+        g.set_resolver_metadata(unknown_path.clone(), metadata());
+
+        assert!(g.resolver_metadata().contains_path(&go_path));
+        assert!(!g.resolver_metadata().contains_path(&cpp_path));
+        assert!(!g.resolver_metadata().contains_path(&unknown_path));
     }
 
     #[test]

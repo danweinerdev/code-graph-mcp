@@ -543,9 +543,6 @@ pub async fn try_reindex_go_manifest(
     let Ok(_index_guard) = inner.index_lock.try_lock() else {
         return ReindexOutcome::LockContended;
     };
-    if let Err(error) = inner.ensure_daemon_root_current() {
-        return ReindexOutcome::Error(error);
-    }
     let Some(go_plugin) = inner.registry.plugin_for(Language::Go) else {
         return ReindexOutcome::NotASource;
     };
@@ -554,6 +551,9 @@ pub async fn try_reindex_go_manifest(
     // retries this all-Go transaction instead of publishing one file against
     // stale module ownership.
     go_plugin.invalidate_resolution_for_path(manifest_path);
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        return ReindexOutcome::Error(error);
+    }
 
     let config = inner.config.read().clone();
     let config_for_blocking = config.clone();
@@ -677,6 +677,10 @@ pub async fn try_reindex_go_manifest(
         }
     }
     graph.prune_dangling_edges(&removed_ids);
+    // The pending state is transaction-scoped: only commit it after every Go
+    // graph has been atomically published. Every earlier return, including
+    // either daemon-root recheck, deliberately leaves it set for a retry.
+    go_plugin.commit_resolution_invalidation();
     ReindexOutcome::Reindexed
 }
 

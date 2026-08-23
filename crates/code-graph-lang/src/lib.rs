@@ -587,13 +587,22 @@ pub trait LanguagePlugin: Send + Sync {
     fn invalidate_resolution_cache(&self) {}
 
     /// Report whether a prior semantic-input invalidation has not yet been
-    /// consumed by a successful preparation pass. Watch implementations use
-    /// this to retry a failed semantic batch before allowing an ordinary
-    /// per-file merge. Plugins without independently invalidated inputs remain
-    /// permanently ready.
+    /// committed by publishing its complete replacement graph. Watch
+    /// implementations use this to retry a failed semantic batch before
+    /// allowing an ordinary per-file merge. Plugins without independently
+    /// invalidated inputs remain permanently ready.
     fn resolution_cache_invalidated(&self) -> bool {
         false
     }
+
+    /// Commit a pending semantic-input invalidation after its complete
+    /// replacement graph has been published successfully. A preparation pass
+    /// alone must not call this hook: it may derive state for an unrelated
+    /// incremental update without publishing every graph affected by the
+    /// semantic input.
+    ///
+    /// This remains object-safe: it takes only `&self` and returns `()`.
+    fn commit_resolution_invalidation(&self) {}
 
     /// Release any resources held by the plugin (e.g. tree-sitter queries).
     /// Default is a no-op; tree-sitter `Query` already drops cleanly.

@@ -71,7 +71,7 @@ pub(crate) mod queries;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, RwLock,
 };
 
@@ -126,6 +126,10 @@ pub struct GoParser {
     /// file.
     module_model: Mutex<GoModuleModelCache>,
     manifest_epoch: AtomicU64,
+    /// A watched `go.mod` event requires an atomic all-Go publication. This
+    /// remains set across failed transactions and unrelated preparation passes
+    /// until that publication succeeds.
+    manifest_reindex_pending: AtomicBool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -213,6 +217,7 @@ impl GoParser {
             resolution: RwLock::new(GoResolutionCache::default()),
             module_model: Mutex::new(GoModuleModelCache::default()),
             manifest_epoch: AtomicU64::new(0),
+            manifest_reindex_pending: AtomicBool::new(false),
         })
     }
 
@@ -923,26 +928,30 @@ impl LanguagePlugin for GoParser {
 
     fn invalidate_resolution_for_path(&self, path: &Path) {
         if path.file_name().and_then(|name| name.to_str()) == Some("go.mod") {
-            // The epoch belongs in the module-model key, not in a blanket
-            // cache clear: an in-flight reader may safely finish on its Arc,
-            // while the next preparation pass must build against the changed
-            // manifest universe.
+            // Mark the watch transaction before its caller performs fallible
+            // I/O. The epoch makes prior derived state ineligible; the pending
+            // bit prevents an unrelated post_index/prepare_resolution pass
+            // from treating that new derived state as a published all-Go
+            // graph.
+            self.manifest_reindex_pending.store(true, Ordering::Release);
             self.manifest_epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn invalidate_resolution_cache(&self) {
+        // Explicit analysis is a derived-cache refresh boundary, not a watch
+        // transaction. In particular, it must not make the next ordinary Go
+        // event demand an all-Go retry unless a manifest event already did.
         self.manifest_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     fn resolution_cache_invalidated(&self) -> bool {
-        let epoch = self.manifest_epoch.load(Ordering::Acquire);
-        self.module_model
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry
-            .as_ref()
-            .is_some_and(|entry| entry.key.manifest_epoch != epoch)
+        self.manifest_reindex_pending.load(Ordering::Acquire)
+    }
+
+    fn commit_resolution_invalidation(&self) {
+        self.manifest_reindex_pending
+            .store(false, Ordering::Release);
     }
 
     /// AST-backed fingerprint (phase 8.3, following the 8.1 shape). Go has
@@ -1916,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_invalidation_rebuilds_module_model() {
+    fn manifest_invalidation_stays_pending_until_publication_commit() {
         let parser = GoParser::new().expect("GoParser::new");
         let file_index = FileIndex::new();
         let graph = parse_cache_graph(
@@ -1928,11 +1937,24 @@ mod tests {
         let first_model = cached_module_model(&parser);
 
         parser.invalidate_resolution_for_path(Path::new("/__code_graph_go_cache_tests/go.mod"));
+        assert!(
+            parser.resolution_cache_invalidated(),
+            "a go.mod event must remain pending until its all-Go publication"
+        );
         parser.prepare_resolution(std::slice::from_ref(&graph), &file_index);
 
         assert!(
             !Arc::ptr_eq(&first_model, &cached_module_model(&parser)),
             "a go.mod invalidation must advance the module-model epoch"
+        );
+        assert!(
+            parser.resolution_cache_invalidated(),
+            "prepare_resolution must not consume a pending manifest transaction"
+        );
+        parser.commit_resolution_invalidation();
+        assert!(
+            !parser.resolution_cache_invalidated(),
+            "only successful all-Go publication may commit the transaction"
         );
     }
 

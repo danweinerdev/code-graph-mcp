@@ -237,3 +237,46 @@ separate design because it changes cached-edge retention semantics.
 3. All public traversals continue to emit only real graph nodes.
 4. The watch-path and cache documentation accurately distinguish resolved
    edges from retained provisional tokens.
+
+---
+
+## F4 — Go manifest changes conservatively rebuild every indexed Go file
+
+**Status:** open performance opportunity (tracked from D-0017's deferred
+optimization boundary; correctness behavior is intentional).
+
+### Current behavior and reason
+
+A watched `go.mod` create, modify, or remove event atomically reparses and
+re-resolves every indexed Go file. This is conservative but correctness-
+preserving: a changed nested module can alter ownership or newly enable an
+importer outside the manifest's directory, while previously unresolved imports
+leave no reverse graph edge from which to select affected files.
+
+The resolver currently persists each file's declared package name and
+package-level value bindings, but it does not persist reverse manifest-
+dependency metadata.
+Without that reverse index, narrowing the transaction by directory or by
+existing import edges can silently miss external importers and imports that
+were unresolved under the old manifest universe.
+
+### Replacement criterion
+
+Replace the all-Go transaction only after the cache can identify, for each
+manifest change, every indexed Go file whose module ownership, package import
+binding, or previously unresolved import may change. The metadata must remain
+coherent across scoped analyzes, nested modules, cache reloads, manifest
+removal, and watch failures; the selected subset must publish atomically just
+as the current all-Go transaction does.
+
+### Acceptance criteria
+
+1. Nested-module create/modify/remove tests prove importers both inside and
+   outside the changed manifest directory are selected.
+2. A previously unresolved import that becomes resolvable after a manifest
+   change is selected despite having no old reverse edge.
+3. Scoped-cache and cold-restart tests prove the reverse metadata survives and
+   remains coherent with cached symbols.
+4. Benchmarks on a multi-module repository demonstrate a material watch-
+   latency improvement over the all-Go rebuild before the added cache and
+   invalidation complexity is accepted.

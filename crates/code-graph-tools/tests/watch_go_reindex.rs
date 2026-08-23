@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_go::GoParser;
+use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::query::{callers_or_callees, Direction};
 use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_detail};
@@ -44,6 +45,20 @@ fn fresh_server() -> CodeGraphServer {
     let mut registry = LanguageRegistry::new();
     registry
         .register(Box::new(GoParser::new().expect("GoParser::new")))
+        .unwrap();
+    CodeGraphServer::new(registry)
+}
+
+/// Fresh server with Go plus an unrelated source plugin. This lets the
+/// manifest-retry regression exercise a successful non-Go watch preparation
+/// between the failed all-Go transaction and its Go-event retry.
+fn fresh_server_with_rust() -> CodeGraphServer {
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(GoParser::new().expect("GoParser::new")))
+        .unwrap();
+    registry
+        .register(Box::new(RustParser::new().expect("RustParser::new")))
         .unwrap();
     CodeGraphServer::new(registry)
 }
@@ -423,7 +438,7 @@ async fn go_mod_create_modify_remove_rebuilds_go_universe() {
     std::fs::write(&root_manifest, b"module example.com/root/v1\n").unwrap();
     std::fs::write(&nested_manifest, b"module example.com/nested/v1\n").unwrap();
 
-    let server = fresh_server();
+    let server = fresh_server_with_rust();
     let result = analyze_codebase(
         server.inner.clone(),
         dir.path().to_string_lossy().into_owned(),
@@ -526,9 +541,9 @@ async fn go_mod_create_modify_remove_rebuilds_go_universe() {
         );
     }
 
-    // A transient all-Go read failure leaves the manifest epoch dirty. The
-    // next ordinary Go event must retry the transaction rather than merge one
-    // file against the old module model.
+    // A transient all-Go read failure leaves the manifest transaction pending.
+    // A successful non-Go reindex still runs the Go plugin's post-index and
+    // preparation hooks, but must not consume that pending all-Go work.
     std::fs::write(&nested_manifest, b"module example.com/nested/v5\n").unwrap();
     let target_backup = nested.join("target.go.backup");
     std::fs::rename(&target_go, &target_backup).unwrap();
@@ -541,6 +556,20 @@ async fn go_mod_create_modify_remove_rebuilds_go_universe() {
     std::fs::remove_dir(&target_go).unwrap();
     std::fs::rename(&target_backup, &target_go).unwrap();
 
+    let unrelated_rust = dir.path().join("unrelated.rs");
+    std::fs::write(&unrelated_rust, b"fn unrelated() {}\n").unwrap();
+    let unrelated_rust = code_graph_core::paths::canonicalize(&unrelated_rust).unwrap();
+    assert_reindexed(try_reindex_file(&server.inner, &unrelated_rust, false).await);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v4",
+            "the non-Go publication must not partially publish manifest v5"
+        );
+    }
+
+    // This Go event must retry the complete manifest transaction, not take the
+    // ordinary one-file path after the Rust preparation pass above.
     assert_reindexed(try_reindex_file(&server.inner, &root_go, false).await);
     for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
         assert_eq!(

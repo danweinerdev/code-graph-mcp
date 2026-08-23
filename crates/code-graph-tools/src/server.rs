@@ -911,16 +911,16 @@ pub struct SearchSymbolsArgs {
     #[schemars(
         description = "Edit-distance (fuzzy) search mode (default false). When true, `query` is matched by \
                        Levenshtein distance against symbol names rather than regex/substring. \
-                       `query` must be a plain identifier (no regex metacharacters). \
+                       `query` must be a non-empty plain identifier (no regex metacharacters). \
                        `max_distance` controls the threshold (or length-adaptive default). \
                        Results sorted by closest match first. Incompatible with count_only."
     )]
     #[serde(default)]
     pub near: Option<bool>,
     #[schemars(
-        description = "Max edit distance for near=true mode (default: length-adaptive — 1 edit \
-                       at length 2-11, 2 at 12-17, 3 at 18+). Clamped to 8. Ignored when \
-                       near=false."
+        description = "Max edit distance for near=true mode (default: length-adaptive — 0 edits \
+                       at length 1, 1 at 2-11, 2 at 12-17, 3 at 18+). Clamped to 8. \
+                       Ignored when near=false."
     )]
     #[serde(default)]
     pub max_distance: Option<u32>,
@@ -1492,11 +1492,11 @@ impl CodeGraphServer {
                        resume after a truncated page. `brief` (default true) omits \
                         signature, column, and end_line; set false for full detail. `near` \
                         defaults to false; set it true for Levenshtein fuzzy matching of a \
-                        required plain-identifier `query` instead of regex/substring matching. \
+                         required non-empty plain-identifier `query` instead of regex/substring matching. \
                         Fuzzy results sort closest-first and cannot be combined with \
                         `count_only=true`. In near mode, `max_distance` defaults by query \
-                        length (1 edit at length 2-11, 2 at 12-17, 3 at 18+) and is clamped \
-                        to 8; it is ignored when `near=false`. `count_only` defaults to false; \
+                         length (0 edits at length 1, 1 at 2-11, 2 at 12-17, 3 at 18+) and \
+                        is clamped to 8; it is ignored when `near=false`. `count_only` defaults to false; \
                         `count_only=true` returns the match total with an empty \
                        `results` array in a < 1KB bounded response — use it to size a \
                        search before committing to paging. **`suggestions: string[]` \

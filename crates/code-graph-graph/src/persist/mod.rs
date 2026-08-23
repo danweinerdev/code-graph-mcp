@@ -391,7 +391,23 @@ impl Graph {
             // full owned `PackedCacheV6` on the heap. The direct walk
             // allocates only the live Graph's HashMaps, saving one
             // O(N) allocation pass on every load.
-            let parts = packed::decode_archived(archived, metadata_extension)?;
+            let mut parts = packed::decode_archived(archived)?;
+            if let Some(extension) = metadata_extension {
+                parts.resolver_metadata = match packed::decode_archived_resolver_metadata(
+                    archived,
+                    extension,
+                    &parts.files,
+                ) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!(
+                            "[code-graph] discarding corrupt packed cache metadata ({error}) for {}",
+                            cache_path(dir).display()
+                        );
+                        code_graph_path_trie::PathTrie::new()
+                    }
+                };
+            }
             let stale = compute_stale_paths(archived);
             Ok::<_, PersistError>((parts, stale))
         })?;
@@ -511,18 +527,18 @@ where
             }
             Ok(extension) => {
                 eprintln!(
-                    "[code-graph] unsupported packed cache metadata extension {}; re-indexing {}",
+                    "[code-graph] discarding unsupported packed cache metadata extension {} for {}",
                     extension.version.to_native(),
                     path.display()
                 );
-                return Ok(None);
+                None
             }
             Err(error) => {
                 eprintln!(
-                    "[code-graph] packed cache metadata corrupted ({error}); re-indexing {}",
+                    "[code-graph] discarding corrupt packed cache metadata ({error}) for {}",
                     path.display()
                 );
-                return Ok(None);
+                None
             }
         },
         None => None,
@@ -667,6 +683,79 @@ mod tests {
         g
     }
 
+    fn build_graph_with_go_metadata() -> Graph {
+        let mut graph = build_sample_graph();
+        graph.merge_file_graph(make_fg(
+            "/go/package.go",
+            Language::Go,
+            vec![sym("Run", SymbolKind::Function, "/go/package.go")],
+            vec![],
+        ));
+        graph.set_resolver_metadata(
+            PathBuf::from("/go/package.go"),
+            ResolverMetadata::Go {
+                declared_package: "package".to_string(),
+                package_value_bindings: vec!["Handler".to_string(), "Value".to_string()],
+            },
+        );
+        graph
+    }
+
+    fn write_packed_cache(
+        dir: &Path,
+        main: &packed::PackedCacheV6,
+        metadata: Option<&packed::PackedResolverMetadataExtension>,
+    ) {
+        let main_archive = rkyv::to_bytes::<rkyv::rancor::Error>(main).unwrap();
+        let metadata_archive = metadata
+            .map(rkyv::to_bytes::<rkyv::rancor::Error>)
+            .transpose()
+            .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&packed::ENDIAN_PROBE.to_ne_bytes());
+        bytes.extend_from_slice(&CACHE_VERSION.to_ne_bytes());
+        bytes.extend_from_slice(&main_archive);
+        if let Some(metadata_archive) = metadata_archive {
+            let extension_start = (packed::HEADER_SIZE + main_archive.len())
+                .next_multiple_of(RESOLVER_METADATA_ARCHIVE_ALIGNMENT)
+                - packed::HEADER_SIZE;
+            bytes.resize(packed::HEADER_SIZE + extension_start, 0);
+            bytes.extend_from_slice(&metadata_archive);
+            bytes.extend_from_slice(&u64::try_from(main_archive.len()).unwrap().to_ne_bytes());
+            bytes.extend_from_slice(&u64::try_from(extension_start).unwrap().to_ne_bytes());
+            bytes.extend_from_slice(RESOLVER_METADATA_FOOTER_MAGIC);
+        }
+        fs::write(cache_path(dir), bytes).unwrap();
+    }
+
+    fn assert_corrupt_metadata_is_discarded(
+        mutate: impl FnOnce(&packed::PackedCacheV6, &mut packed::PackedResolverMetadataExtension),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let original = build_graph_with_go_metadata();
+        let encoded = packed::encode(&original, original.last_sweep_at());
+        let mut metadata = encoded
+            .resolver_metadata
+            .expect("Go metadata produces an extension");
+        mutate(&encoded.main, &mut metadata);
+        write_packed_cache(dir.path(), &encoded.main, Some(&metadata));
+
+        let mut loaded = Graph::new();
+        assert!(
+            loaded.load(dir.path()).unwrap(),
+            "a corrupt metadata extension must not reject its valid main archive"
+        );
+        assert_eq!(loaded.nodes, original.nodes);
+        assert_eq!(loaded.adj, original.adj);
+        assert_eq!(loaded.radj, original.radj);
+        assert_eq!(loaded.files, original.files);
+        assert_eq!(loaded.includes, original.includes);
+        assert!(
+            loaded.resolver_metadata.is_empty(),
+            "discarded metadata must load as absent"
+        );
+    }
+
     // ---- shape-stable behaviors (v4 → v6 carry-over) ----
 
     #[test]
@@ -716,6 +805,134 @@ mod tests {
         let mut loaded = Graph::new();
         assert!(loaded.load(dir.path()).unwrap());
         assert_eq!(loaded.resolver_metadata, original.resolver_metadata);
+    }
+
+    #[test]
+    fn non_go_resolver_metadata_is_ignored_and_cache_remains_loadable() {
+        let dir = TempDir::new().unwrap();
+        let mut original = build_sample_graph();
+        original.set_resolver_metadata(
+            PathBuf::from("/a.cpp"),
+            ResolverMetadata::Go {
+                declared_package: "not_cpp".to_string(),
+                package_value_bindings: vec!["Value".to_string()],
+            },
+        );
+        assert!(original.resolver_metadata.is_empty());
+
+        original.save(dir.path()).unwrap();
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        assert!(loaded.resolver_metadata.is_empty());
+        assert_eq!(loaded.files, original.files);
+    }
+
+    #[test]
+    fn metadata_extension_out_of_range_path_id_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|_, metadata| {
+            let (_, entry) = metadata.entries.pop_first().unwrap();
+            metadata.entries.insert(u32::MAX, entry);
+        });
+    }
+
+    #[test]
+    fn metadata_extension_out_of_range_declared_package_id_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|_, metadata| {
+            let entry = metadata.entries.values_mut().next().unwrap();
+            let packed::PackedResolverMetadata::Go {
+                declared_package, ..
+            } = entry;
+            *declared_package = u32::MAX;
+        });
+    }
+
+    #[test]
+    fn metadata_extension_out_of_range_binding_name_id_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|_, metadata| {
+            let entry = metadata.entries.values_mut().next().unwrap();
+            let packed::PackedResolverMetadata::Go {
+                package_value_bindings,
+                ..
+            } = entry;
+            package_value_bindings[0] = u32::MAX;
+        });
+    }
+
+    #[test]
+    fn metadata_extension_path_not_in_files_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|main, metadata| {
+            let path_id = main
+                .paths
+                .iter()
+                .enumerate()
+                .map(|(index, _)| u32::try_from(index + 1).unwrap())
+                .find(|path_id| !main.files.contains_key(path_id))
+                .expect("sample graph has an include path that is not indexed");
+            let (_, entry) = metadata.entries.pop_first().unwrap();
+            metadata.entries.insert(path_id, entry);
+        });
+    }
+
+    #[test]
+    fn metadata_extension_non_go_file_path_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|main, metadata| {
+            let path_id = main
+                .files
+                .iter()
+                .find_map(|(path_id, file)| (file.language != Language::Go).then_some(*path_id))
+                .expect("sample graph has a non-Go indexed file");
+            let (_, entry) = metadata.entries.pop_first().unwrap();
+            metadata.entries.insert(path_id, entry);
+        });
+    }
+
+    #[test]
+    fn metadata_extension_unsupported_version_is_discarded() {
+        assert_corrupt_metadata_is_discarded(|_, metadata| {
+            metadata.version = packed::RESOLVER_METADATA_EXTENSION_VERSION + 1;
+        });
+    }
+
+    #[test]
+    fn metadata_extension_failed_bytecheck_is_discarded() {
+        let dir = TempDir::new().unwrap();
+        let original = build_graph_with_go_metadata();
+        let encoded = packed::encode(&original, original.last_sweep_at());
+        write_packed_cache(
+            dir.path(),
+            &encoded.main,
+            encoded.resolver_metadata.as_ref(),
+        );
+
+        let mut bytes = fs::read(cache_path(dir.path())).unwrap();
+        let footer_start = bytes.len() - RESOLVER_METADATA_FOOTER_SIZE;
+        let extension_start = usize::try_from(u64::from_ne_bytes(
+            bytes[footer_start + 8..footer_start + 16]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        bytes[packed::HEADER_SIZE + extension_start..footer_start].fill(0xff);
+        fs::write(cache_path(dir.path()), bytes).unwrap();
+
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        assert_eq!(loaded.files, original.files);
+        assert!(loaded.resolver_metadata.is_empty());
+    }
+
+    #[test]
+    fn main_archive_semantic_id_failure_remains_corrupted_cache_error() {
+        let dir = TempDir::new().unwrap();
+        let original = build_sample_graph();
+        let mut main = packed::encode(&original, original.last_sweep_at()).main;
+        let (_, file) = main.files.pop_first().unwrap();
+        main.files.insert(u32::MAX, file);
+        write_packed_cache(dir.path(), &main, None);
+
+        let error = Graph::new().load(dir.path()).unwrap_err();
+        assert!(matches!(error, PersistError::CorruptedCache { .. }));
+        assert!(error.to_string().contains("path id"));
     }
 
     #[test]
