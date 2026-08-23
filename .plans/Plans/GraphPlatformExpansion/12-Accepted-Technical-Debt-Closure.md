@@ -16,7 +16,7 @@ tasks:
       cargo test -p code-graph-graph callgraph and cargo test -p code-graph-tools --test snapshot_responses and cargo test -p code-graph-tools --test query_perf pass; an exact-frontier exhausted search reports cap_reached=false, community accumulation saturates deterministically, DetectCommunitiesResponse emits top-level members_per_community: u32 immediately after granularity with 10 default, 0-to-default, and max-100 clamp semantics, equal-cost path behavior is documented and test-pinned, and find_path's deliberate max_bytes exemption is stated in its production description and CLAUDE.md; make verify passes.
   - id: "12.2"
     title: "Harden the typed-core boundary and indexed-state contract"
-    status: planned
+    status: complete
     justifies: "FR-01, FR-02, FR-04, AC-01, AC-28, NFR-02, and NFR-10; prevents a future rmcp dependency leak or direct handler consumer from bypassing the honest indexed-state guard, and retains the queued synchronous caller's progress sink, as recorded by reviews 15 and 17."
     verification: >-
       cargo test -p code-graph-tools and cargo test -p code-graph-cli pass; a cross-crate compile fixture imports the typed core without rmcp, every public query entry either receives the honest indexed flag or is visibility-restricted so it cannot bypass the guard, all queued synchronous followers retain and drive their abstract progress sinks after promotion without notifying async aliases or reporting under the slot lock, the structural source scan covers the complete relevant source tree, and one canonical contract location replaces duplicated or contradictory guard prose; make verify passes.
@@ -125,14 +125,14 @@ Do not run a serialized `find_path` through `byte_budget_take` or truncate `hops
 
 ## 12.2: Harden the typed-core boundary and indexed-state contract
 ### Subtasks
-- [ ] Add a cross-crate compile fixture or doctest that consumes every typed-core family without importing or depending directly on `rmcp`.
-- [ ] Audit public handler and core entry points; make bypass-only wrappers crate-private or require the real indexed state so no public consumer silently hardcodes `indexed=true`.
-- [ ] Retain each queued synchronous analyze request’s original `Arc<dyn ProgressSink>` through pending compaction and promotion; fan progress to all synchronous followers without attaching sinks to async aliases or holding the slot lock while reporting.
-- [ ] Add a deterministic test with two synchronous followers plus one async alias; use a blocking/reentrant sink to prove both sync sinks receive promoted phase/progress events, the async alias receives none, reporting holds no slot lock, and every waiter receives the same terminal result.
-- [ ] Reconcile `core/mod.rs`, handler, CLI, and CLAUDE.md guard wording with the actual single honest guard boundary.
-- [ ] Replace hardcoded source-file allowlists in architecture tests with complete directory traversal so newly added files cannot evade dependency scans.
-- [ ] Consolidate duplicated adapter/core contract prose into one canonical comment per contract and link the thin adapter rather than copying it.
-- [ ] Correct the parent plan’s stale accepted-followup prose where later work already closed resolver and platform items; never edit frozen review findings to simulate closure.
+- [x] Add a cross-crate compile fixture or doctest that consumes every typed-core family without importing or depending directly on `rmcp`.
+- [x] Audit public handler and core entry points; make bypass-only wrappers crate-private or require the real indexed state so no public consumer silently hardcodes `indexed=true`.
+- [x] Retain each queued synchronous analyze request’s original `Arc<dyn ProgressSink>` through pending compaction and promotion; fan progress to all synchronous followers without attaching sinks to async aliases or holding the slot lock while reporting.
+- [x] Add a deterministic test with two synchronous followers plus one async alias; use a blocking/reentrant sink to prove both sync sinks receive promoted phase/progress events, the async alias receives none, reporting holds no slot lock, and every waiter receives the same terminal result.
+- [x] Reconcile `core/mod.rs`, handler, CLI, and CLAUDE.md guard wording with the actual single honest guard boundary.
+- [x] Replace hardcoded source-file allowlists in architecture tests with complete directory traversal so newly added files cannot evade dependency scans.
+- [x] Consolidate duplicated adapter/core contract prose into one canonical comment per contract and link the thin adapter rather than copying it.
+- [x] Correct the parent plan’s stale accepted-followup prose where later work already closed resolver and platform items; never edit frozen review findings to simulate closure.
 
 ### Notes
 Revision boundary: the typed core is mechanically consumable without MCP, every externally reachable query path has an honest indexed-state contract, queued synchronous callers retain progress after promotion, and structural tests cover future source additions. Wire behavior remains byte-identical.
@@ -141,7 +141,22 @@ No public API compatibility promise exists for workspace-internal handler functi
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`
+- Focused review: `git show 75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `full repository gate passed: clippy denied warnings, formatting passed, workspace tests passed, snapshots were clean, and generated plugin mirrors were synchronized.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted verification: cargo test -p code-graph-tools; cargo test -p code-graph-cli; cargo test -p code-graph-tools --test typed_core_consumer; cargo test -p code-graph-tools --test blame_symbol; cargo test -p code-graph-tools --test symbol_history; cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings` | `task 12.2 implementation at 75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1` | PASS | `all targeted commands passed with exit 0; the fixture compiled every typed-core family without rmcp, recursive architecture scans covered nested Rust sources, history adapters honored real indexed state, and progress fan-out tests passed.` |
 
 ## 12.3: Harden VCS ownership, detection, and blame semantics
 ### Subtasks
