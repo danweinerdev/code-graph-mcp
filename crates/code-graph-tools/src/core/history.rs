@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::handlers::{kind_str, suggest_symbols};
 use crate::server::ServerInner;
 
-use super::fingerprint_cache::{Cached, FingerprintCache, FingerprintKey};
+use super::fingerprint_cache::{Cached, FingerprintCache, FingerprintKey, FingerprintKeyBuilder};
 use super::{require_indexed, ToolError, ToolOk, ToolResult};
 
 /// One contiguous attribution range within the symbol's span.
@@ -609,7 +609,7 @@ pub fn set_parser_hook_for_test(hook: ParserHook) -> ParserHookGuard {
 }
 
 enum SnapshotInput {
-    Cached(Option<u64>),
+    Cached(Cached),
     /// The provider reports the path does not exist at this revision. This is
     /// an examined absence, not uncertainty.
     Absent,
@@ -767,7 +767,6 @@ pub async fn symbol_history(
         .read()
         .clone()
         .unwrap_or_else(|| root.clone());
-    let cache = FingerprintCache::open(&cache_root);
     let relative_path = Path::new(&file)
         .strip_prefix(&cache_root)
         .map(|relative| relative.to_string_lossy().into_owned())
@@ -781,7 +780,21 @@ pub async fn symbol_history(
     // empty history. The config is part of the cache key for the same
     // reason (see `FingerprintKey.config`).
     let config = inner.config.read().clone();
-    let config_id = super::fingerprint_cache::config_identity(&config);
+    let (cache, cache_keys) = prepare_fingerprint_cache(CachePreparation {
+        cache_root,
+        revisions: commits
+            .iter()
+            .map(|commit| commit.rev.to_string())
+            .collect(),
+        provider_id,
+        relative_path,
+        target_name: target_name.clone(),
+        kind: kind.to_string(),
+        language,
+        mode,
+        config: config.clone(),
+    })
+    .await?;
 
     let mut state = TransitionState::default();
     #[cfg(debug_assertions)]
@@ -789,23 +802,16 @@ pub async fn symbol_history(
     // Probe cache shards in bounded ordered batches. This keeps disk I/O out
     // of runtime workers without turning a 500-revision walk into a 500-source
     // prefetch. A cache hit has no source snapshot at all.
-    for batch in commits.chunks(SOURCE_BATCH_MAX_SNAPSHOTS) {
-        let cached = cache_get_batch(
-            cache.clone(),
-            batch.iter().map(|commit| commit.rev.to_string()).collect(),
-            provider_id.clone(),
-            relative_path.clone(),
-            target_name.clone(),
-            kind,
-            mode,
-            config_id,
-        )
-        .await?;
+    for (batch, key_batch) in commits
+        .chunks(SOURCE_BATCH_MAX_SNAPSHOTS)
+        .zip(cache_keys.chunks(SOURCE_BATCH_MAX_SNAPSHOTS))
+    {
+        let cached = cache_get_batch(cache.clone(), key_batch.to_vec()).await?;
 
         let mut snapshots = Vec::with_capacity(batch.len());
-        for (commit, cached) in batch.iter().zip(cached) {
+        for ((commit, cached), key) in batch.iter().zip(cached).zip(key_batch) {
             let input = match cached {
-                Some(cached) => SnapshotInput::Cached(cached_value(cached)),
+                Some(cached) => SnapshotInput::Cached(cached),
                 None => {
                     // `read_at` returns a whole opaque Vec. Flush any prior
                     // source BEFORE awaiting another read, so the returned
@@ -853,11 +859,8 @@ pub async fn symbol_history(
                 language,
                 mode,
                 cache: cache.clone(),
-                relative_path: relative_path.clone(),
-                provider_id: provider_id.clone(),
-                kind,
+                cache_key: key.clone(),
                 config: config.clone(),
-                config_id,
                 #[cfg(debug_assertions)]
                 meter: Arc::clone(&meter),
             });
@@ -905,38 +908,55 @@ pub async fn symbol_history(
     }))
 }
 
-fn cached_value(cached: Cached) -> Option<u64> {
-    match cached {
-        Cached::Fingerprint(fingerprint) => Some(fingerprint),
-        Cached::Tombstone => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cache_get_batch(
-    cache: FingerprintCache,
+struct CachePreparation {
+    cache_root: PathBuf,
     revisions: Vec<String>,
     provider_id: String,
     relative_path: String,
     target_name: String,
-    kind: &'static str,
+    kind: String,
+    language: code_graph_core::Language,
     mode: FingerprintMode,
-    config_id: u64,
+    config: code_graph_core::RootConfig,
+}
+
+async fn prepare_fingerprint_cache(
+    args: CachePreparation,
+) -> Result<(FingerprintCache, Vec<Option<FingerprintKey>>), ToolError> {
+    tokio::task::spawn_blocking(move || {
+        let builder = FingerprintKeyBuilder::new(
+            args.provider_id,
+            args.relative_path,
+            args.target_name,
+            args.kind,
+            args.language,
+            args.mode,
+            &args.config,
+        );
+        let keys: Vec<_> = args
+            .revisions
+            .iter()
+            .map(|revision| builder.build(revision))
+            .collect();
+        let protected = keys
+            .iter()
+            .flatten()
+            .map(|key| key.relative_shard().to_path_buf())
+            .collect();
+        let cache = FingerprintCache::open(&args.cache_root, protected);
+        (cache, keys)
+    })
+    .await
+    .map_err(|error| ToolError(format!("symbol_history cache worker failed: {error}")))
+}
+
+async fn cache_get_batch(
+    cache: FingerprintCache,
+    keys: Vec<Option<FingerprintKey>>,
 ) -> Result<Vec<Option<Cached>>, ToolError> {
     tokio::task::spawn_blocking(move || {
-        revisions
-            .iter()
-            .map(|rev| {
-                cache.get(&FingerprintKey {
-                    provider: &provider_id,
-                    rev,
-                    relative_path: &relative_path,
-                    symbol_name: &target_name,
-                    kind,
-                    mode,
-                    config: config_id,
-                })
-            })
+        keys.iter()
+            .map(|key| key.as_ref().and_then(|key| cache.get(key)))
             .collect()
     })
     .await
@@ -955,14 +975,10 @@ struct SnapshotArgs {
     language: code_graph_core::Language,
     mode: FingerprintMode,
     cache: FingerprintCache,
-    relative_path: String,
-    provider_id: String,
-    kind: &'static str,
+    cache_key: Option<FingerprintKey>,
     /// The effective root config: historical parses must run the same
     /// preprocess + synthesis pipeline the indexer ran.
     config: code_graph_core::RootConfig,
-    /// [`super::fingerprint_cache::config_identity`] of `config`.
-    config_id: u64,
     #[cfg(debug_assertions)]
     meter: WorkMeter,
 }
@@ -1045,7 +1061,7 @@ fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
     (|| {
         let SnapshotArgs {
             inner,
-            commit,
+            commit: _,
             input,
             file,
             target_name,
@@ -1053,30 +1069,26 @@ fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
             language,
             mode,
             cache,
-            relative_path,
-            provider_id,
-            kind,
+            cache_key,
             config,
-            config_id,
             #[cfg(debug_assertions)]
             meter,
         } = args;
         let Some(plugin) = inner.registry.plugin_for(language) else {
             return Err(ToolError(format!("no parser registered for {language:?}")));
         };
-        let key = FingerprintKey {
-            provider: &provider_id,
-            rev: commit.rev.as_str(),
-            relative_path: &relative_path,
-            symbol_name: &target_name,
-            kind,
-            mode,
-            config: config_id,
-        };
         let current = match input {
-            SnapshotInput::Cached(cached) => cached,
+            SnapshotInput::Cached(Cached::Fingerprint(fingerprint)) => Some(fingerprint),
+            SnapshotInput::Cached(Cached::Tombstone) => None,
+            SnapshotInput::Cached(Cached::UnfingerprintableV1) => {
+                return Ok(SnapshotResult::Skipped(unfingerprintable_reason(
+                    mode, language,
+                )))
+            }
             SnapshotInput::Absent => {
-                cache.put(&key, Cached::Tombstone);
+                if let Some(key) = &cache_key {
+                    cache.put(key, Cached::Tombstone);
+                }
                 None
             }
             SnapshotInput::ReadFailed(reason) => {
@@ -1124,7 +1136,9 @@ fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
                     .min_by_key(|s| (s.line, s.column));
                 match found {
                     None => {
-                        cache.put(&key, Cached::Tombstone);
+                        if let Some(key) = &cache_key {
+                            cache.put(key, Cached::Tombstone);
+                        }
                         None
                     }
                     Some(historical) => {
@@ -1137,29 +1151,23 @@ fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
                         // either way for the text default.
                         match plugin.fingerprint_symbol(&cleaned, historical, mode) {
                             Some(fingerprint) => {
-                                cache.put(&key, Cached::Fingerprint(fingerprint));
+                                if let Some(key) = &cache_key {
+                                    cache.put(key, Cached::Fingerprint(fingerprint));
+                                }
                                 Some(fingerprint)
                             }
-                            None if mode == FingerprintMode::LiteralInsensitive => {
-                                // Post-phase-8 this arm is per-SPAN
-                                // unavailability (unlocatable span:
-                                // synthesized symbols, error-recovered
-                                // regions) or a future plugin without an
-                                // AST override. A VISIBLE skip — never a
-                                // silent fallback to Normalized
-                                // (Designs/VcsHistory Decision 5): the
-                                // revision lands in `skipped` with the
-                                // mode named, and the transition state
-                                // carries over it.
-                                return Ok(SnapshotResult::Skipped(format!(
-                                    "span not fingerprintable under mode \
-                                     \"literal_insensitive\" at this revision ({language:?})"
-                                )));
-                            }
                             None => {
-                                return Ok(SnapshotResult::Skipped(
-                                    "span not fingerprintable at this revision".to_string(),
-                                ))
+                                // Per-span unavailability (synthesized
+                                // symbols, error-recovered or invalid spans)
+                                // is uncertainty, not absence. Cache the
+                                // versioned negative outcome for either mode
+                                // and preserve the visible skip on every walk.
+                                if let Some(key) = &cache_key {
+                                    cache.put(key, Cached::UnfingerprintableV1);
+                                }
+                                return Ok(SnapshotResult::Skipped(unfingerprintable_reason(
+                                    mode, language,
+                                )));
                             }
                         }
                     }
@@ -1168,4 +1176,14 @@ fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
         };
         Ok(SnapshotResult::Current(current))
     })()
+}
+
+fn unfingerprintable_reason(mode: FingerprintMode, language: code_graph_core::Language) -> String {
+    match mode {
+        FingerprintMode::LiteralInsensitive => format!(
+            "span not fingerprintable under mode \"literal_insensitive\" at this revision \
+             ({language:?})"
+        ),
+        FingerprintMode::Normalized => "span not fingerprintable at this revision".to_string(),
+    }
 }

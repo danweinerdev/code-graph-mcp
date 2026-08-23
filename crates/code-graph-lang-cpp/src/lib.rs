@@ -878,29 +878,15 @@ impl LanguagePlugin for CppParser {
         symbol: &code_graph_core::Symbol,
         mode: code_graph_lang::FingerprintMode,
     ) -> Option<u64> {
-        let Ok(tree) = parse_tree(&self.language, content) else {
-            return match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            };
-        };
-        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
-            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
-                node,
-                content,
-                mode,
-                cpp_literal_kind,
-                cpp_comment_kind,
-            )),
-            None => match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            },
-        }
+        code_graph_lang::fingerprint::fingerprint_symbol_ast(
+            &self.language,
+            content,
+            symbol,
+            self.id(),
+            mode,
+            cpp_literal_kind,
+            cpp_comment_kind,
+        )
     }
 }
 

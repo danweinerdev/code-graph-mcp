@@ -29,6 +29,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use code_graph_core::{Language, Symbol};
+use tree_sitter::{Language as TsLanguage, Parser as TsParser};
 
 use crate::FingerprintMode;
 
@@ -298,10 +299,9 @@ fn char_literal_end(span: &[u8], start: usize) -> Option<usize> {
 //
 // Determinism discipline (phase-8 plan note): the walk is a tree-cursor
 // pre-order — sibling order comes from the tree, never from a hash-ordered
-// collection — so the same bytes always hash the same. Structure bytes
-// (`(`/`)` on enter/exit) make sibling regrouping visible: `(A (B))` and
-// `(A) (B)` hash differently even when their leaf texts concatenate
-// identically.
+// collection — so the same bytes always hash the same. Framed enter/exit
+// records make sibling regrouping visible: `(A (B))` and `(A) (B)` hash
+// differently even when their leaf texts concatenate identically.
 
 /// Locates the AST node for `symbol`'s span in a freshly parsed tree of the
 /// same content the span was extracted from: exact start `(row, column)`
@@ -390,25 +390,23 @@ pub fn ast_fingerprint(
             // `modified`, exactly the false positive AC-38 forbids.
             descend = false;
         } else {
-            hasher.write(b"(");
-            hasher.write(kind.as_bytes());
-            hasher.write(b"\x1f");
+            write_frame(&mut hasher, b'E', kind.as_bytes());
             if is_literal(kind) {
                 if mode == FingerprintMode::Normalized {
-                    hasher.write(&content[current.byte_range()]);
+                    write_frame(&mut hasher, b'L', &content[current.byte_range()]);
                 }
                 descend = false; // the value (or its absence) is the leaf
             } else if current.child_count() == 0 {
-                hasher.write(&content[current.byte_range()]);
+                write_frame(&mut hasher, b'T', &content[current.byte_range()]);
             }
         }
         if descend && cursor.goto_first_child() {
             continue;
         }
-        // The exit bracket pairs with the enter bracket: skipped nodes
-        // (comments, commas) wrote no `(`, so they get no `)`.
+        // The exit frame pairs with the enter frame: skipped nodes
+        // (comments, commas) wrote neither.
         if !(is_comment(kind) || kind == ",") {
-            hasher.write(b")");
+            write_frame(&mut hasher, b'X', &[]);
         }
         loop {
             if cursor.node().id() == node.id() {
@@ -420,10 +418,52 @@ pub fn ast_fingerprint(
             if !cursor.goto_parent() {
                 break 'outer;
             }
-            hasher.write(b")");
+            write_frame(&mut hasher, b'X', &[]);
         }
     }
     hasher.finish()
+}
+
+/// Fingerprint a symbol using a freshly constructed parser for the plugin's
+/// grammar. This is the sole AST-fingerprint degradation boundary: parsing or
+/// locating failure uses the text fingerprint only for `Normalized`;
+/// `LiteralInsensitive` returns `None` rather than reintroducing literal
+/// sensitivity through the text fallback.
+pub fn fingerprint_symbol_ast(
+    language: &TsLanguage,
+    content: &[u8],
+    symbol: &Symbol,
+    source_language: Language,
+    mode: FingerprintMode,
+    is_literal: fn(&str) -> bool,
+    is_comment: fn(&str) -> bool,
+) -> Option<u64> {
+    let mut parser = TsParser::new();
+    let tree = if parser.set_language(language).is_ok() {
+        parser.parse(content, None)
+    } else {
+        None
+    };
+    let fingerprint = tree.and_then(|tree| {
+        locate_symbol_node(tree.root_node(), symbol)
+            .map(|node| ast_fingerprint(node, content, mode, is_literal, is_comment))
+    });
+    match fingerprint {
+        Some(fingerprint) => Some(fingerprint),
+        None if mode == FingerprintMode::Normalized => {
+            normalized_fingerprint(content, symbol, source_language)
+        }
+        None => None,
+    }
+}
+
+/// Write one unambiguous AST field. Tags distinguish node kinds, literal
+/// values, ordinary leaf text, and exits; the fixed-width length means raw
+/// bytes (including the former `0x1f` delimiter) can never alter framing.
+fn write_frame(hasher: &mut DefaultHasher, tag: u8, bytes: &[u8]) {
+    hasher.write(&[tag]);
+    hasher.write(&(bytes.len() as u64).to_le_bytes());
+    hasher.write(bytes);
 }
 
 #[cfg(test)]
@@ -573,6 +613,25 @@ mod tests {
         assert_eq!(
             fp(content, 1, 3, Language::Rust),
             fp(content, 1, 3, Language::Rust)
+        );
+    }
+
+    #[test]
+    fn raw_unit_separator_is_payload_not_a_frame_delimiter() {
+        let mut separator_payload = DefaultHasher::new();
+        write_frame(&mut separator_payload, b'E', b"string_literal");
+        write_frame(&mut separator_payload, b'L', b"\x1f");
+        write_frame(&mut separator_payload, b'X', &[]);
+
+        let mut structural_boundary = DefaultHasher::new();
+        write_frame(&mut structural_boundary, b'E', b"string_literal");
+        write_frame(&mut structural_boundary, b'L', &[]);
+        write_frame(&mut structural_boundary, b'X', &[]);
+
+        assert_ne!(
+            separator_payload.finish(),
+            structural_boundary.finish(),
+            "a raw 0x1f byte belongs to literal payload, never AST framing"
         );
     }
 }

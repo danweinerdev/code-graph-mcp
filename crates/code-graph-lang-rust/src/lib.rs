@@ -1188,29 +1188,15 @@ impl LanguagePlugin for RustParser {
         symbol: &code_graph_core::Symbol,
         mode: code_graph_lang::FingerprintMode,
     ) -> Option<u64> {
-        let Ok(tree) = parse_tree(&self.language, content) else {
-            return match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            };
-        };
-        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
-            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
-                node,
-                content,
-                mode,
-                rust_literal_kind,
-                rust_comment_kind,
-            )),
-            None => match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            },
-        }
+        code_graph_lang::fingerprint::fingerprint_symbol_ast(
+            &self.language,
+            content,
+            symbol,
+            self.id(),
+            mode,
+            rust_literal_kind,
+            rust_comment_kind,
+        )
     }
 
     fn close(&self) {}
@@ -1221,6 +1207,9 @@ impl LanguagePlugin for RustParser {
 /// kind still contributes, so adding or removing a literal stays visible
 /// under both modes.
 fn rust_literal_kind(kind: &str) -> bool {
+    // `negative_literal` deliberately remains a structural node: its sign is
+    // operator/code structure, while its literal child supplies the value
+    // that follows the selected fingerprint mode.
     // tree-sitter-rust v0.24.2 folds byte/C-string forms into the kinds
     // below: `b"…"`/`c"…"` lex as `string_literal`, `br`/`cr` forms as
     // `raw_string_literal`, `b'x'` as `char_literal` — there are no
@@ -3746,5 +3735,37 @@ mod fingerprint {
                  fingerprinted span, same convention as Python decorators ({mode:?})"
             );
         }
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_across_parser_instances() {
+        let content = b"pub fn answer() -> u32 {\n    42\n}\n";
+        let parser = RustParser::new().unwrap();
+        let symbol = symbol_in(&parser, content, "answer");
+        let first = parser
+            .fingerprint_symbol(content, &symbol, FingerprintMode::Normalized)
+            .unwrap();
+        let second = RustParser::new()
+            .unwrap()
+            .fingerprint_symbol(content, &symbol, FingerprintMode::Normalized)
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unlocatable_span_degrades_per_mode_without_literal_fallback() {
+        let content = b"pub fn answer() -> u32 {\n    42\n}\n";
+        let parser = RustParser::new().unwrap();
+        let mut symbol = symbol_in(&parser, content, "answer");
+        symbol.column = 99;
+        assert_eq!(
+            parser.fingerprint_symbol(content, &symbol, FingerprintMode::Normalized),
+            code_graph_lang::fingerprint::normalized_fingerprint(content, &symbol, parser.id())
+        );
+        assert_eq!(
+            parser.fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive),
+            None,
+            "LiteralInsensitive never falls back to the text fingerprint"
+        );
     }
 }

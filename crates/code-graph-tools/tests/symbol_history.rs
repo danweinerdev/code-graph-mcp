@@ -16,9 +16,11 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
-use code_graph_lang::LanguageRegistry;
+use code_graph_lang::{FingerprintMode, LanguagePlugin, LanguageRegistry};
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::CodeGraphServer;
@@ -547,6 +549,123 @@ async fn symbol_history_macro_config_symbols_have_real_history() {
         changes(&body),
         vec![("introduced".to_string(), c1), ("modified".to_string(), c2)],
         "a [cpp].macro_strip-dependent symbol has a real history: {body}"
+    );
+}
+
+/// A parser double returns a real symbol with an intentionally unlocatable
+/// span. Under `literal_insensitive` that is a visible skip, never a
+/// text-fingerprint fallback, and the versioned negative cache outcome
+/// prevents reparsing on the second identical walk.
+#[tokio::test]
+async fn symbol_history_caches_literal_insensitive_unfingerprintable_spans() {
+    struct UnlocatableRustParser(RustParser);
+
+    impl LanguagePlugin for UnlocatableRustParser {
+        fn id(&self) -> code_graph_core::Language {
+            self.0.id()
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            self.0.extensions()
+        }
+
+        fn parse_file(
+            &self,
+            path: &Path,
+            content: &[u8],
+        ) -> Result<code_graph_core::FileGraph, code_graph_lang::ParseError> {
+            let mut parsed = self.0.parse_file(path, content)?;
+            for symbol in &mut parsed.symbols {
+                if symbol.name == "target_function" {
+                    symbol.line = 999;
+                    symbol.end_line = 999;
+                }
+            }
+            Ok(parsed)
+        }
+
+        fn fingerprint_symbol(
+            &self,
+            content: &[u8],
+            symbol: &code_graph_core::Symbol,
+            mode: FingerprintMode,
+        ) -> Option<u64> {
+            self.0.fingerprint_symbol(content, symbol, mode)
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let fixture = GitFixture::init();
+    fixture.commit_file(
+        "lib.rs",
+        "pub fn target_function() -> u32 {\n    1\n}\n",
+        "introduce target",
+        "2001-01-01T00:00:00+0000",
+    );
+    fixture.commit_file(
+        "lib.rs",
+        "// unrelated source edit\npub fn target_function() -> u32 {\n    1\n}\n",
+        "touch target file",
+        "2001-02-01T00:00:00+0000",
+    );
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(UnlocatableRustParser(
+            RustParser::new().expect("RustParser::new"),
+        )))
+        .unwrap();
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(
+        GitProvider::open(fixture.path()).expect("fixture is a git working tree"),
+    ))
+    .unwrap();
+    let server = CodeGraphServer::with_vcs_registry(registry, vcs);
+    analyze(&server, fixture.path()).await;
+    let symbol = symbol_id(fixture.path(), "lib.rs", "target_function");
+
+    let parses = Arc::new(AtomicUsize::new(0));
+    let parse_counter = Arc::clone(&parses);
+    let _hook = code_graph_tools::core::history::set_parser_hook_for_test(Arc::new(move || {
+        parse_counter.fetch_add(1, Ordering::Relaxed);
+    }));
+
+    let first = ok_json(&call_history(&server, &symbol, Some("literal_insensitive"), None).await);
+    let skipped = first["skipped"].as_array().expect("skipped array");
+    assert_eq!(
+        skipped.len(),
+        2,
+        "each revision is visibly uncertain: {first}"
+    );
+    assert!(skipped.iter().all(|row| row["reason"].as_str().is_some_and(
+        |reason| reason.contains("span not fingerprintable under mode \"literal_insensitive\"")
+    )));
+    let cold_parses = parses.load(Ordering::Relaxed);
+    assert_eq!(cold_parses, 2, "the cold walk parses both revisions");
+
+    let second = ok_json(&call_history(&server, &symbol, Some("literal_insensitive"), None).await);
+    assert_eq!(second, first, "the cached skip outcome is wire-identical");
+    assert_eq!(
+        parses.load(Ordering::Relaxed),
+        cold_parses,
+        "the versioned unfingerprintable outcome avoids every repeat parse"
+    );
+
+    let normalized_first = ok_json(&call_history(&server, &symbol, Some("normalized"), None).await);
+    assert_eq!(
+        normalized_first["skipped"].as_array().unwrap().len(),
+        2,
+        "an invalid span is visibly unfingerprintable in normalized mode too"
+    );
+    let after_normalized_cold = parses.load(Ordering::Relaxed);
+    assert_eq!(after_normalized_cold, cold_parses + 2);
+    let normalized_second =
+        ok_json(&call_history(&server, &symbol, Some("normalized"), None).await);
+    assert_eq!(normalized_second, normalized_first);
+    assert_eq!(
+        parses.load(Ordering::Relaxed),
+        after_normalized_cold,
+        "normalized unfingerprintable outcomes are cached too"
     );
 }
 

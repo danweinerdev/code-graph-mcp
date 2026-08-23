@@ -840,29 +840,15 @@ impl LanguagePlugin for CSharpParser {
         symbol: &code_graph_core::Symbol,
         mode: code_graph_lang::FingerprintMode,
     ) -> Option<u64> {
-        let Ok(tree) = parse_tree(&self.language, content) else {
-            return match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            };
-        };
-        match code_graph_lang::fingerprint::locate_symbol_node(tree.root_node(), symbol) {
-            Some(node) => Some(code_graph_lang::fingerprint::ast_fingerprint(
-                node,
-                content,
-                mode,
-                csharp_literal_kind,
-                csharp_comment_kind,
-            )),
-            None => match mode {
-                code_graph_lang::FingerprintMode::Normalized => {
-                    code_graph_lang::fingerprint::normalized_fingerprint(content, symbol, self.id())
-                }
-                code_graph_lang::FingerprintMode::LiteralInsensitive => None,
-            },
-        }
+        code_graph_lang::fingerprint::fingerprint_symbol_ast(
+            &self.language,
+            content,
+            symbol,
+            self.id(),
+            mode,
+            csharp_literal_kind,
+            csharp_comment_kind,
+        )
     }
 }
 
@@ -2889,6 +2875,38 @@ mod fingerprint {
         assert_ne!(
             fp(&parser, text_one, "Show", FingerprintMode::Normalized),
             fp(&parser, text_two, "Show", FingerprintMode::Normalized),
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_across_parser_instances() {
+        let content = b"class Calc {\n    int Answer() { return 42; }\n}\n";
+        let parser = CSharpParser::new().unwrap();
+        let symbol = symbol_in(&parser, content, "Answer");
+        let first = parser
+            .fingerprint_symbol(content, &symbol, FingerprintMode::Normalized)
+            .unwrap();
+        let second = CSharpParser::new()
+            .unwrap()
+            .fingerprint_symbol(content, &symbol, FingerprintMode::Normalized)
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unlocatable_span_degrades_per_mode_without_literal_fallback() {
+        let content = b"class Calc {\n    int Answer() { return 42; }\n}\n";
+        let parser = CSharpParser::new().unwrap();
+        let mut symbol = symbol_in(&parser, content, "Answer");
+        symbol.column = 99;
+        assert_eq!(
+            parser.fingerprint_symbol(content, &symbol, FingerprintMode::Normalized),
+            code_graph_lang::fingerprint::normalized_fingerprint(content, &symbol, parser.id())
+        );
+        assert_eq!(
+            parser.fingerprint_symbol(content, &symbol, FingerprintMode::LiteralInsensitive),
+            None,
+            "LiteralInsensitive never falls back to the text fingerprint"
         );
     }
 }

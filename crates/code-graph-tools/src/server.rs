@@ -1625,7 +1625,10 @@ impl CodeGraphServer {
                        summary, change, at_window_boundary} with change one of \
                        \"introduced\" | \"modified\" | \"removed\", oldest first. A \
                        reformat-only or comment-only commit is NOT reported under the default \
-                       `mode=\"normalized\"`; changed literals and code are. Matching is \
+                       `mode=\"normalized\"`; changed literals and code inside the \
+                       extractor-recorded symbol span are. Outer wrappers outside that span \
+                       (C++ template clauses, Rust outer attributes, Python decorators) are \
+                       invisible in both modes. Matching is \
                        exact, case-sensitive (name, kind): ANY rename — including a case-only \
                        rename — is modeled as removal of the old symbol plus introduction of \
                        the new one, never \"modified\". For a rename that reaches HEAD, only \
