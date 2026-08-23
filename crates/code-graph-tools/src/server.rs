@@ -909,7 +909,7 @@ pub struct SearchSymbolsArgs {
     #[serde(default)]
     pub count_only: Option<bool>,
     #[schemars(
-        description = "Edit-distance (fuzzy) search mode. When true, `query` is matched by \
+        description = "Edit-distance (fuzzy) search mode (default false). When true, `query` is matched by \
                        Levenshtein distance against symbol names rather than regex/substring. \
                        `query` must be a plain identifier (no regex metacharacters). \
                        `max_distance` controls the threshold (or length-adaptive default). \
@@ -1480,15 +1480,24 @@ impl CodeGraphServer {
                         method), `kind` (function, method, class, struct, enum, typedef, \
                         interface, trait), `namespace` (substring match against the \
                        symbol's namespace path, e.g. 'Nfs' matches 'Ark::Nfs::V4'), \
-                       and/or `language` (cpp, rust, go, python, csharp, java). `limit` \
+                        and/or `language` (cpp, rust, go, python, csharp, java). `subtree` \
+                        optionally restricts those matches to files at or below a directory \
+                        prefix (absent or empty searches the whole graph); it composes with, \
+                        but does not replace, the required query/kind/namespace/language filter. `limit` \
                        defaults to 20 (max 1000, clamped silently — the echoed `limit` \
                        reflects the resolved value); raise `limit` for broad searches \
                        expected to return many hits, and use `offset` to advance \
                        through the remainder. `offset` defaults to 0; raise `offset` \
                        to skip past previous results, or set `offset = next_offset` to \
                        resume after a truncated page. `brief` (default true) omits \
-                       signature, column, and end_line; set false for full detail. \
-                       `count_only=true` returns the match total with an empty \
+                        signature, column, and end_line; set false for full detail. `near` \
+                        defaults to false; set it true for Levenshtein fuzzy matching of a \
+                        required plain-identifier `query` instead of regex/substring matching. \
+                        Fuzzy results sort closest-first and cannot be combined with \
+                        `count_only=true`. In near mode, `max_distance` defaults by query \
+                        length (1 edit at length 2-11, 2 at 12-17, 3 at 18+) and is clamped \
+                        to 8; it is ignored when `near=false`. `count_only` defaults to false; \
+                        `count_only=true` returns the match total with an empty \
                        `results` array in a < 1KB bounded response — use it to size a \
                        search before committing to paging. **`suggestions: string[]` \
                        (did-you-mean field):** included in the response ONLY when (a) \

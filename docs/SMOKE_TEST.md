@@ -2,9 +2,9 @@
 
 This document describes the manual end-to-end smoke test for `code-graph-mcp` against a real MCP client. The same behaviors have automated coverage:
 
-- `crates/codegraph-tools/tests/watch_race.rs` — watch + analyze concurrency, atomic-save coalescing, removal end-to-end
-- `crates/codegraph-tools/tests/watch_dangling_edges.rs` — re-index does not leave dangling cross-file edges after rename
-- `crates/codegraph-tools/tests/testdata_cpp_baseline.rs` — analyze_codebase baseline counts on `testdata/cpp`
+- `crates/code-graph-tools/tests/watch_race.rs` — watch + analyze concurrency, atomic-save coalescing, removal end-to-end
+- `crates/code-graph-tools/tests/watch_dangling_edges.rs` — re-index does not leave dangling cross-file edges after rename
+- `crates/code-graph-tools/tests/testdata_cpp_baseline.rs` — analyze_codebase baseline counts on `testdata/cpp`
 
 Documented for human verification — automated coverage of the same behaviors lives in `tests/watch_race.rs` and `tests/watch_dangling_edges.rs`.
 
@@ -64,7 +64,7 @@ Quit the MCP client (or restart the server entry). Re-issue:
 analyze_codebase(path="/absolute/path/to/code-graph-mcp/testdata/cpp")
 ```
 
-Expect zero parse time / a "cache hit" indication in the response — the JSON cache at `testdata/cpp/.code-graph-cache.json` should be loaded directly since no files have changed by mtime.
+Expect the same graph counts. The response does not expose parse time or a cache-hit flag; as a best-effort fast-path check, compare the mtime of `<project_root>/.code-graph-cache.db` before and after the call. It normally remains unchanged, but the periodic out-of-scope hygiene sweep can legitimately rewrite the cache without re-parsing source files. Legacy `.code-graph-cache.json` files are ignored.
 
 ## Pass criteria
 
@@ -79,8 +79,8 @@ In addition to the MCP smoke test above, the `parse-test` developer harness can 
 ### Procedure
 
 ```bash
-cargo build --release -p codegraph-parse-test
-./target/release/codegraph-parse-test crates/
+cargo build --release -p code-graph-parse-test
+./target/release/code-graph-parse-test crates/
 ```
 
 ### Pass criteria
@@ -88,10 +88,10 @@ cargo build --release -p codegraph-parse-test
 - 0 crashes (the binary exits with status 0).
 - 0 warnings (the `=== Warnings (N) ===` section is absent or empty).
 - The trailing `Done:` line reports a non-zero file/symbol/edge count.
-- Spot-check that `LanguagePlugin` appears as a `[trait]` symbol in `crates/codegraph-lang/src/lib.rs`.
+- Spot-check that `LanguagePlugin` appears as a `[trait]` symbol in `crates/code-graph-lang/src/lib.rs`.
 - Spot-check that an `[inherits]` edge `CppParser -> LanguagePlugin` is present.
 - Spot-check that an `[inherits]` edge `RustParser -> LanguagePlugin` is present.
-- Spot-check that `Graph::merge_file_graph` appears as a `[method]` with parent `Graph` (line in `crates/codegraph-graph/src/graph.rs`).
+- Spot-check that `Graph::merge_file_graph` appears as a `[method]` with parent `Graph` (line in `crates/code-graph-graph/src/graph.rs`).
 - Phase 5.5 baseline (host-target, this repo, `crates/`): 43 files, 835 symbols, 7651 edges, 0 warnings — drift here is a sign the Rust parser changed behavior, not necessarily a regression. Update this number when the workspace itself changes.
 
-The harness is exploratory by design — there is no automated assertion for the workspace-wide totals (the workspace evolves; the assertion would either be brittle or meaningless). The Phase 5.5 corpus test (`crates/codegraph-lang-rust/tests/corpus.rs`) is the deterministic regression gate; this dogfood pass is the "does it survive contact with reality" check.
+The harness is exploratory by design — there is no automated assertion for the workspace-wide totals (the workspace evolves; the assertion would either be brittle or meaningless). The Phase 5.5 corpus test (`crates/code-graph-lang-rust/tests/corpus.rs`) is the deterministic regression gate; this dogfood pass is the "does it survive contact with reality" check.
