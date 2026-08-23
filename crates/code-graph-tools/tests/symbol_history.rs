@@ -849,6 +849,7 @@ async fn symbol_history_slow_provider_delays_only_history_tools() {
 
     let symbols = code_graph_tools::handlers::symbols::get_file_symbols(
         &server.inner.graph,
+        true,
         &file.to_string_lossy(),
         false,
         true,

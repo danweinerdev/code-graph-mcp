@@ -1,0 +1,11 @@
+[package]
+name = "typed-core-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+code-graph-tools = { path = "../.." }
+code-graph-graph = { path = "../../../code-graph-graph" }
+code-graph-vcs = { path = "../../../code-graph-vcs" }
+parking_lot = { workspace = true }

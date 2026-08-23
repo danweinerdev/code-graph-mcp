@@ -90,6 +90,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     // Pre-rename sanity: B's caller has A:old_fn as a callee.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &caller_id,
         Some(1),
         Direction::Callees,
@@ -130,6 +131,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     // of scope) OR rebound to A:new_fn (no-op forward-compatible).
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &caller_id,
         Some(1),
         Direction::Callees,
@@ -168,7 +170,7 @@ async fn watch_reindex_does_not_leave_dangling_cross_file_edge_after_rename() {
     // not-found wording. Pre-fix this test still passes (the node is
     // gone), but it's the agent-visible half of the bug — the dangling
     // edge promised a symbol that detail can't deliver.
-    let r = get_symbol_detail(&server.inner.graph, &old_fn_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &old_fn_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(

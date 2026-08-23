@@ -126,6 +126,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // callees include beta.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &lib_str,
         false,
         true,
@@ -148,6 +149,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
 
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &caller_id,
         Some(1),
         Direction::Callees,
@@ -194,6 +196,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // must NOT contain beta.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &lib_str,
         false,
         true,
@@ -223,6 +226,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // calls) — anything else (notably `beta` returning) is a regression.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &caller_id,
         Some(1),
         Direction::Callees,
@@ -267,7 +271,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // not-found wording. This is the agent-visible half of the dangling
     // bug — without the dangling-node sweep, this lookup would return a
     // result for a node that no longer existed in the index.
-    let r = get_symbol_detail(&server.inner.graph, &beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -278,7 +282,7 @@ async fn watch_rust_reindex_drops_removed_symbol_and_no_dangling_edge() {
     // alpha and gamma both lookup-able. caller is too. Belt-and-suspenders
     // for the over-prune check above.
     for id in [&alpha_id, &gamma_id, &caller_id] {
-        let r = get_symbol_detail(&server.inner.graph, id);
+        let r = get_symbol_detail(&server.inner.graph, true, id);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "post-edit symbol detail for {id} must succeed: {r:?}"

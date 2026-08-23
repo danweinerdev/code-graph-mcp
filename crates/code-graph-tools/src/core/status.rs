@@ -8,8 +8,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::core::{ToolError, ToolOk, ToolResult};
-use crate::handlers::status::{format_unix_nanos_rfc3339, AnalyzeJobView, StatusResult};
+use crate::handlers::status::format_unix_nanos_rfc3339;
 use crate::server::ServerInner;
+
+pub use crate::handlers::status::{AnalyzeJobView, StatusResult};
 
 /// `get_status` body. Pure read — no locks held across the return.
 ///

@@ -276,6 +276,7 @@ async fn response_get_file_symbols_engine_cpp() {
         .into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file,
         false,
         true,
@@ -297,6 +298,7 @@ async fn response_search_symbols_query_engine() {
     let fx = build_indexed_fixture().await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("Engine"),
@@ -345,6 +347,7 @@ async fn response_search_symbols_byte_budget_truncated() {
     let search_args = |max_bytes: usize| {
         search_symbols(
             &fx.inner.graph,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("func"),
@@ -386,6 +389,7 @@ async fn response_count_only_search_symbols() {
     let fx = build_indexed_fixture_with_many_file_symbols(1000).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("func"),
@@ -427,7 +431,7 @@ async fn response_get_symbol_detail_engine_update() {
         "{}:Engine::update",
         fx.indexed_root.join("engine.cpp").display()
     );
-    let r = get_symbol_detail(&fx.inner.graph, &id);
+    let r = get_symbol_detail(&fx.inner.graph, true, &id);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -439,7 +443,15 @@ async fn response_get_symbol_detail_engine_update() {
 #[tokio::test]
 async fn response_get_symbol_summary_whole_graph() {
     let fx = build_indexed_fixture().await;
-    let r = get_symbol_summary(&fx.inner.graph, None, None, None, false, NO_BYTE_BUDGET);
+    let r = get_symbol_summary(
+        &fx.inner.graph,
+        true,
+        None,
+        None,
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -457,6 +469,7 @@ async fn response_get_callers_engine_update() {
     );
     let r = callers_or_callees(
         &fx.inner.graph,
+        true,
         &id,
         Some(2),
         Direction::Callers,
@@ -482,6 +495,7 @@ async fn response_get_callees_engine_update() {
     );
     let r = callers_or_callees(
         &fx.inner.graph,
+        true,
         &id,
         Some(2),
         Direction::Callees,
@@ -514,7 +528,7 @@ async fn response_get_dependencies_engine_cpp() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_dependencies(&fx.inner.graph, &file, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(&fx.inner.graph, true, &file, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -526,7 +540,7 @@ async fn response_get_dependencies_engine_cpp() {
 #[tokio::test]
 async fn response_detect_cycles() {
     let fx = build_indexed_fixture().await;
-    let r = detect_cycles(&fx.inner.graph, None, None, None, None);
+    let r = detect_cycles(&fx.inner.graph, true, None, None, None, None);
     // The handler now sorts each cycle's inner paths in canonical order
     // and sorts the outer cycle list by first path, then wraps in the
     // shared Page<Cycle> envelope (each cycle is {files, truncated,
@@ -547,6 +561,7 @@ async fn response_get_orphans_default_callables() {
     let fx = build_indexed_fixture().await;
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         None,
         None,
         None,
@@ -573,6 +588,7 @@ async fn response_get_orphans_paginated_offset() {
     let fx = build_indexed_fixture_with_many_orphans(25).await;
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         Some("function"),
         None,
         Some(20),
@@ -595,6 +611,7 @@ async fn response_get_orphans_brief_false() {
     let fx = build_indexed_fixture().await;
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         None,
         None,
         None,
@@ -616,6 +633,7 @@ async fn response_get_orphans_offset_beyond_total() {
     let fx = build_indexed_fixture().await;
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         None,
         None,
         None,
@@ -656,6 +674,7 @@ async fn response_get_orphans_byte_budget_truncated() {
     let orphan_args = |max_bytes: usize| {
         get_orphans(
             &fx.inner.graph,
+            true,
             Some("function"),
             None,
             Some(20),
@@ -694,6 +713,7 @@ async fn response_count_only_orphans() {
     let fx = build_indexed_fixture_with_many_orphans(1000).await;
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         Some("function"),
         None,
         None,
@@ -855,6 +875,7 @@ async fn response_get_file_symbols_paginated_offset() {
         .into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file,
         false,
         true,
@@ -899,6 +920,7 @@ async fn response_get_file_symbols_byte_budget_truncated() {
     let symbol_args = |max_bytes: usize| {
         get_file_symbols(
             &fx.inner.graph,
+            true,
             &file,
             false,
             true,
@@ -940,6 +962,7 @@ async fn response_count_only_file_symbols() {
         .into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file,
         false,
         true,
@@ -982,6 +1005,7 @@ async fn response_get_callers_paginated_offset() {
     let id = format!("{}:target", fx.indexed_root.join("hub.cpp").display());
     let r = callers_or_callees(
         &fx.inner.graph,
+        true,
         &id,
         Some(1),
         Direction::Callers,
@@ -1025,6 +1049,7 @@ async fn response_get_callers_byte_budget_truncated() {
     let caller_args = |max_bytes: usize| {
         callers_or_callees(
             &fx.inner.graph,
+            true,
             &id,
             Some(1),
             Direction::Callers,
@@ -1053,6 +1078,7 @@ async fn response_get_callees_paginated_offset() {
     let id = format!("{}:entry", fx.indexed_root.join("hub.cpp").display());
     let r = callers_or_callees(
         &fx.inner.graph,
+        true,
         &id,
         Some(1),
         Direction::Callees,
@@ -1097,6 +1123,7 @@ async fn response_get_callees_byte_budget_truncated() {
     let callee_args = |max_bytes: usize| {
         callers_or_callees(
             &fx.inner.graph,
+            true,
             &id,
             Some(1),
             Direction::Callees,
@@ -1120,7 +1147,7 @@ async fn response_get_callees_byte_budget_truncated() {
 #[tokio::test]
 async fn response_get_class_hierarchy_engine() {
     let fx = build_indexed_fixture().await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Engine", Some(1), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Engine", Some(1), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1143,7 +1170,7 @@ async fn response_get_class_hierarchy_engine() {
 #[tokio::test]
 async fn response_get_class_hierarchy_truncated() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Compute", Some(3), Some(2));
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Compute", Some(3), Some(2));
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1162,6 +1189,7 @@ async fn response_get_coupling_engine_cpp_outgoing() {
         .into_owned();
     let r = get_coupling(
         &fx.inner.graph,
+        true,
         &file,
         Some("outgoing"),
         None,
@@ -1184,6 +1212,7 @@ async fn response_get_coupling_engine_cpp_incoming() {
         .into_owned();
     let r = get_coupling(
         &fx.inner.graph,
+        true,
         &file,
         Some("incoming"),
         None,
@@ -1206,6 +1235,7 @@ async fn response_get_coupling_engine_cpp_both() {
         .into_owned();
     let r = get_coupling(
         &fx.inner.graph,
+        true,
         &file,
         Some("both"),
         None,
@@ -1233,6 +1263,7 @@ async fn response_generate_diagram_symbol_edges() {
     );
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             symbol: Some(&id),
             format: Some("edges"),
@@ -1260,6 +1291,7 @@ async fn response_generate_diagram_symbol_mermaid() {
     );
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             symbol: Some(&id),
             format: Some("mermaid"),
@@ -1286,6 +1318,7 @@ async fn response_generate_diagram_file_edges() {
         .into_owned();
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             file: Some(&file),
             format: Some("edges"),
@@ -1311,6 +1344,7 @@ async fn response_generate_diagram_file_mermaid() {
         .into_owned();
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             file: Some(&file),
             format: Some("mermaid"),
@@ -1329,6 +1363,7 @@ async fn response_generate_diagram_class_edges() {
     let fx = build_indexed_fixture().await;
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             class: Some("Engine"),
             format: Some("edges"),
@@ -1349,6 +1384,7 @@ async fn response_generate_diagram_class_mermaid() {
     let fx = build_indexed_fixture().await;
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             class: Some("Engine"),
             format: Some("mermaid"),
@@ -1504,7 +1540,7 @@ async fn response_get_symbol_at_engine_update_body_line() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_symbol_at(&fx.inner.graph, &file, 8, None, None, NO_BYTE_BUDGET);
+    let r = get_symbol_at(&fx.inner.graph, true, &file, 8, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1522,7 +1558,7 @@ async fn response_get_symbol_at_no_enclosing_symbol() {
         .join("engine.cpp")
         .to_string_lossy()
         .into_owned();
-    let r = get_symbol_at(&fx.inner.graph, &file, 2, None, None, NO_BYTE_BUDGET);
+    let r = get_symbol_at(&fx.inner.graph, true, &file, 2, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1540,7 +1576,7 @@ async fn response_find_path_main_to_utils_clamp() {
     let fx = build_indexed_fixture().await;
     let from = format!("{}:main", fx.indexed_root.join("main.cpp").display());
     let to = format!("{}:clamp", fx.indexed_root.join("utils.cpp").display());
-    let r = find_path(&fx.inner.graph, &from, &to, None, None);
+    let r = find_path(&fx.inner.graph, true, &from, &to, None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1561,7 +1597,7 @@ async fn response_find_path_not_found() {
         "{}:alsoOrphaned",
         fx.indexed_root.join("orphan.cpp").display()
     );
-    let r = find_path(&fx.inner.graph, &from, &to, None, None);
+    let r = find_path(&fx.inner.graph, true, &from, &to, None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1581,6 +1617,7 @@ async fn response_detect_communities_default() {
     let fx = build_indexed_fixture().await;
     let r = detect_communities(
         &fx.inner.graph,
+        true,
         None,
         None,
         None,
@@ -1604,6 +1641,7 @@ async fn response_detect_communities_member_capped() {
     let fx = build_indexed_fixture().await;
     let r = detect_communities(
         &fx.inner.graph,
+        true,
         None,
         None,
         Some(2),
@@ -1720,6 +1758,7 @@ async fn response_search_symbols_helper_language_rust() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -1742,7 +1781,7 @@ async fn response_get_class_hierarchy_rust_trait_greet() {
     // This snapshot pins the wire format for the trait-rooted hierarchy
     // walk and is the wire-format counterpart to the integration test
     // `get_class_hierarchy_for_rust_trait`.
-    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Greet", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1754,6 +1793,7 @@ async fn response_generate_diagram_rust_trait_compute() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_rust_path()).await;
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             class: Some("Compute"),
             format: Some("edges"),
@@ -1793,6 +1833,7 @@ async fn response_search_symbols_helper_language_go() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -1861,7 +1902,7 @@ async fn response_get_class_hierarchy_go_interface_reader() {
     // integration test in `mixed_language.rs`. Locks in the leaf-node
     // shape (just `{"name":"Reader"}`) — `bases` and `derived` are
     // skipped because they are empty (Go produces no Inherits edges).
-    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Reader", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -1878,6 +1919,7 @@ async fn response_get_file_symbols_go_reader() {
         .into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file,
         false,
         true,
@@ -2017,6 +2059,7 @@ async fn response_search_symbols_helper_language_python() {
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -2042,6 +2085,7 @@ async fn response_get_file_symbols_python_models() {
         .into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file,
         false,
         true,
@@ -2062,7 +2106,7 @@ async fn response_get_class_hierarchy_python_dog() {
     // `Dog` inherits from `Animal`. The hierarchy snapshot locks both
     // `bases` (Dog -> Animal) and the leaf-node shape for the upward
     // walk (Animal has no bases, so it serializes without the field).
-    let r = get_class_hierarchy(&fx.inner.graph, "Dog", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Dog", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -2080,7 +2124,7 @@ async fn response_get_dependencies_python_models() {
     // models.py imports `abc` and `typing` — both record verbatim as the
     // dotted module path (the from-form points at the module, not the
     // imported name). The snapshot pins this contract for Python.
-    let r = get_dependencies(&fx.inner.graph, &file, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(&fx.inner.graph, true, &file, None, None, NO_BYTE_BUDGET);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -2117,7 +2161,7 @@ async fn response_get_class_hierarchy_ue_aactor() {
     // locks the chained-inheritance shape: AActor -> UObject upward, and
     // AActor -> {APawn -> ACharacter, UDoubleMacro, UNoMacro} downward.
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_ue_path()).await;
-    let r = get_class_hierarchy(&fx.inner.graph, "AActor", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "AActor", Some(2), None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
@@ -2133,7 +2177,7 @@ async fn response_get_class_hierarchy_ue_double_macro() {
     // the public tool surface — proving multi-macro stripping works
     // end-to-end and not just at the unit-test layer.
     let fx = build_indexed_fixture_for_dir_with_all_parsers(&testdata_ue_path()).await;
-    let r = get_class_hierarchy(&fx.inner.graph, "UDoubleMacro", None, None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "UDoubleMacro", None, None);
     let parsed = parsed_sorted(&r);
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);

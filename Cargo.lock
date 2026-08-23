@@ -3303,6 +3303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-core-consumer"
+version = "0.0.0"
+dependencies = [
+ "code-graph-graph",
+ "code-graph-tools",
+ "code-graph-vcs",
+ "parking_lot",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

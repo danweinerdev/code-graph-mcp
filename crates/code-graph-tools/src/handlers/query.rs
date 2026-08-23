@@ -90,29 +90,11 @@ pub enum Direction {
     Callees,
 }
 
-/// Shared body for `get_callers` and `get_callees` — same shape, only the
-/// adjacency direction differs.
-///
-/// Output is the shared [`Page`]`<`[`CallChain`]`>` envelope. The BFS
-/// returns rows in HashMap-iteration order (non-deterministic across
-/// runs); the handler sorts by `(depth, symbol_id)` ascending so page 1
-/// holds the closest callers/callees and same-depth rows tie-break by
-/// `symbol_id` for stable pagination across calls. `total` reports the
-/// pre-pagination match count.
-///
-/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
-/// default" (mirrors `search_symbols` and `get_orphans`); `limit` is
-/// silently clamped at 1000. The existing `depth` parameter still
-/// constrains the BFS scope (default 1) and is unchanged.
-///
-/// The symbol-not-found error path is unchanged: an unknown symbol
-/// surfaces a did-you-mean error before pagination is consulted. A known
-/// symbol with no callers/callees returns the envelope with `results: []`
-/// and `total: 0` — that distinction lets agents tell "wrong symbol"
-/// apart from "no callers in scope".
+/// Thin MCP adapter for [`crate::core::query::callers_or_callees`].
 #[allow(clippy::too_many_arguments)]
 pub fn callers_or_callees(
     graph: &RwLock<Graph>,
+    indexed: bool,
     symbol: &str,
     depth: Option<u32>,
     direction: Direction,
@@ -123,7 +105,7 @@ pub fn callers_or_callees(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::query::callers_or_callees(
         graph,
-        true,
+        indexed,
         symbol,
         depth,
         direction,
@@ -148,86 +130,38 @@ pub(crate) fn is_virtual_signature(signature: &str) -> bool {
     signature.starts_with("virtual ") || signature.contains(" virtual ")
 }
 
-/// `find_overrides` body. Returns the set of method symbols whose
-/// `EdgeKind::Overrides` edges target `symbol` — i.e. the concrete
-/// implementations of a virtual / pure-virtual method.
-///
-/// Returns the standard `Page<CallChain>` envelope so the wire shape
-/// matches `get_callers` / `get_callees`. `depth` is fixed at 1 by
-/// design: override is a single-step relation per the language
-/// semantics (a method overrides exactly one method per base, not a
-/// transitive chain). A caller wanting "every override of every
-/// override" can iterate `find_overrides` themselves.
-///
-/// Unknown symbols return the standard `symbol not found` tool error
-/// with a did-you-mean suggestion list — same pattern
-/// `callers_or_callees` uses. A known symbol with no overrides
-/// returns an empty `Page<CallChain>` envelope; the
-/// non-callable-soft-hint and `is_virtual_signature` warnings do NOT
-/// apply here because the tool's semantics already imply "I asked
-/// about a method that has overrides" — surfacing those hints would
-/// be noise.
+/// Thin MCP adapter for [`crate::core::query::find_overrides`].
 pub fn find_overrides(
     graph: &RwLock<Graph>,
+    indexed: bool,
     symbol: &str,
     limit: Option<u32>,
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::query::find_overrides(
-        graph, true, symbol, limit, offset, max_bytes,
+        graph, indexed, symbol, limit, offset, max_bytes,
     ))
 }
 
-/// `get_dependencies` body. Returns the shared [`Page`]`<`[`DependencyEntry`]`>`
-/// envelope: one row per included file carrying the included path, the
-/// edge kind (`"includes"`), and the source line of the `#include`
-/// directive. An unknown file is not an error — it yields an empty page
-/// (`results: []`, `total: 0`), preserving the prior "never `null`"
-/// contract in the reshaped envelope form.
-///
-/// Rows are sorted by `(file, line)` ascending so pagination partitions
-/// the result deterministically across calls. `total` is the
-/// pre-pagination match count; the page itself is byte-budgeted via
-/// [`byte_budget_take`] so a file with thousands of includes cannot blow
-/// the response-size cap.
-///
-/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
-/// default" (mirrors the other paginated handlers); `limit` is silently
-/// clamped at 1000.
+/// Thin MCP adapter for [`crate::core::query::get_dependencies`].
 pub fn get_dependencies(
     graph: &RwLock<Graph>,
+    indexed: bool,
     file: &str,
     limit: Option<u32>,
     offset: Option<u32>,
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::query::get_dependencies(
-        graph, true, file, limit, offset, max_bytes,
+        graph, indexed, file, limit, offset, max_bytes,
     ))
 }
 
-/// `find_path` body (1.2). Shortest call-path from `from` to `to`,
-/// returned as a single JSON object (NOT a `Page`) — see
-/// [`super::FindPathResponse`].
-///
-/// `node_cap`: zero-or-missing resolves to the default `100_000`; clamped
-/// at a hard ceiling of `5_000_000` regardless of caller input (design
-/// Decision 9 — the ceiling is what makes the `((hops as u64) << 32) |
-/// heuristic_hops` packing provably overflow-safe, since both components
-/// are bounded by nodes examined, which is bounded by `node_cap`). The
-/// resolved value is always echoed back on the response.
-///
-/// `min_confidence`: parsed via the shared [`parse_min_confidence`]
-/// helper; an unrecognized spelling is a tool error, matching
-/// `get_callers`/`get_callees`.
-///
-/// Either endpoint unknown is a tool error naming WHICH one failed, with
-/// the same did-you-mean affordance `callers_or_callees` uses.
-/// `from == to` and "no path within the cap" both succeed — the caller
-/// distinguishes the latter two via `cap_reached`.
+/// Thin MCP adapter for [`crate::core::query::find_path`].
 pub fn find_path(
     graph: &RwLock<Graph>,
+    indexed: bool,
     from: &str,
     to: &str,
     node_cap: Option<u32>,
@@ -235,7 +169,7 @@ pub fn find_path(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::query::find_path(
         graph,
-        true,
+        indexed,
         from,
         to,
         node_cap,
@@ -316,6 +250,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = callers_or_callees(
             &g,
+            true,
             "",
             None,
             Direction::Callers,
@@ -333,6 +268,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = callers_or_callees(
             &g,
+            true,
             "",
             None,
             Direction::Callees,
@@ -350,6 +286,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:c",
             Some(1),
             Direction::Callers,
@@ -368,6 +305,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:c",
             None,
             Direction::Callers,
@@ -385,6 +323,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:a",
             Some(2),
             Direction::Callees,
@@ -410,6 +349,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:a",
             Some(1),
             Direction::Callers,
@@ -432,6 +372,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:c",
             Some(1),
             Direction::Callees,
@@ -490,6 +431,7 @@ mod tests {
         let g = locked(graph_with_mixed_confidence_callees());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:caller",
             Some(1),
             Direction::Callees,
@@ -513,6 +455,7 @@ mod tests {
         let g = locked(graph_with_mixed_confidence_callees());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:caller",
             Some(1),
             Direction::Callees,
@@ -538,6 +481,7 @@ mod tests {
         let g = locked(graph_with_mixed_confidence_callees());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:heur_target",
             Some(1),
             Direction::Callers,
@@ -555,6 +499,7 @@ mod tests {
 
         let r2 = callers_or_callees(
             &g,
+            true,
             "/x.cpp:res_target",
             Some(1),
             Direction::Callers,
@@ -573,6 +518,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:a",
             Some(1),
             Direction::Callees,
@@ -595,6 +541,7 @@ mod tests {
         let g = locked(graph_with_mixed_confidence_callees());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:caller",
             Some(1),
             Direction::Callees,
@@ -614,6 +561,7 @@ mod tests {
         // — `a` should be suggested via search_symbols substring matching.
         let r = callers_or_callees(
             &g,
+            true,
             "a",
             None,
             Direction::Callers,
@@ -633,6 +581,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = callers_or_callees(
             &g,
+            true,
             "nope",
             None,
             Direction::Callers,
@@ -698,6 +647,7 @@ mod tests {
         let g = locked(graph_with_kind_only("Foo", "/lib.rs", SymbolKind::Struct));
         let r = callers_or_callees(
             &g,
+            true,
             "/lib.rs:Foo",
             Some(1),
             Direction::Callers,
@@ -733,6 +683,7 @@ mod tests {
         let g = locked(graph_with_kind_only("Color", "/lib.rs", SymbolKind::Enum));
         let r = callers_or_callees(
             &g,
+            true,
             "/lib.rs:Color",
             Some(1),
             Direction::Callees,
@@ -767,6 +718,7 @@ mod tests {
         ));
         let r = callers_or_callees(
             &g,
+            true,
             "/lib.rs:Lifecycle",
             Some(1),
             Direction::Callers,
@@ -801,6 +753,7 @@ mod tests {
         ));
         let r = callers_or_callees(
             &g,
+            true,
             "/lib.rs:ByteBuf",
             Some(1),
             Direction::Callers,
@@ -838,6 +791,7 @@ mod tests {
         ));
         let r = callers_or_callees(
             &g,
+            true,
             "/lib.cs:IDisposable",
             Some(1),
             Direction::Callers,
@@ -900,6 +854,7 @@ mod tests {
         let g = locked(g);
         let r = callers_or_callees(
             &g,
+            true,
             "/engine/UEngine.h:UEngine::Tick",
             Some(1),
             Direction::Callers,
@@ -921,6 +876,7 @@ mod tests {
         // Same warning fires for the `Callees` direction.
         let r2 = callers_or_callees(
             &g,
+            true,
             "/engine/UEngine.h:UEngine::Tick",
             Some(1),
             Direction::Callees,
@@ -950,6 +906,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:a",
             Some(1),
             Direction::Callers,
@@ -979,6 +936,7 @@ mod tests {
         let g = locked(graph_with_calls());
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:a",
             Some(1),
             Direction::Callers,
@@ -1028,6 +986,7 @@ mod tests {
         let g = locked(g);
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:caller",
             Some(1),
             Direction::Callees,
@@ -1152,6 +1111,7 @@ mod tests {
         let g = locked(graph_with_n_callers(120));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1174,6 +1134,7 @@ mod tests {
         let g = locked(graph_with_n_callers(150));
         let p1 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1184,6 +1145,7 @@ mod tests {
         );
         let p2 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1218,6 +1180,7 @@ mod tests {
         let g = locked(graph_with_n_callers(150));
         let r1 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1228,6 +1191,7 @@ mod tests {
         );
         let r2 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1238,6 +1202,7 @@ mod tests {
         );
         let r3 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1259,6 +1224,7 @@ mod tests {
         let g = locked(graph_with_n_callers(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1277,6 +1243,7 @@ mod tests {
         let g = locked(graph_with_n_callers(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1294,6 +1261,7 @@ mod tests {
         let g = locked(graph_with_n_callers(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1341,6 +1309,7 @@ mod tests {
         let g = locked(g);
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:target",
             Some(2),
             Direction::Callers,
@@ -1448,6 +1417,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 800;
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(3), // walk all 3 BFS depths so 30 chains are produced
             Direction::Callers,
@@ -1520,6 +1490,7 @@ mod tests {
         // truncates).
         let r_next = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(3),
             Direction::Callers,
@@ -1546,6 +1517,7 @@ mod tests {
         let g = locked(graph_with_n_callers(30));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:target",
             Some(1),
             Direction::Callers,
@@ -1569,6 +1541,7 @@ mod tests {
         let g = locked(graph_with_n_callees(120));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1589,6 +1562,7 @@ mod tests {
         let g = locked(graph_with_n_callees(150));
         let p1 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1599,6 +1573,7 @@ mod tests {
         );
         let p2 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1629,6 +1604,7 @@ mod tests {
         let g = locked(graph_with_n_callees(150));
         let r1 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1639,6 +1615,7 @@ mod tests {
         );
         let r2 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1649,6 +1626,7 @@ mod tests {
         );
         let r3 = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1670,6 +1648,7 @@ mod tests {
         let g = locked(graph_with_n_callees(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1688,6 +1667,7 @@ mod tests {
         let g = locked(graph_with_n_callees(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1705,6 +1685,7 @@ mod tests {
         let g = locked(graph_with_n_callees(5));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1817,6 +1798,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 800;
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(3), // walk all 3 BFS depths so 30 chains are produced
             Direction::Callees,
@@ -1889,6 +1871,7 @@ mod tests {
         // truncates).
         let r_next = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(3),
             Direction::Callees,
@@ -1916,6 +1899,7 @@ mod tests {
         let g = locked(graph_with_n_callees(30));
         let r = callers_or_callees(
             &g,
+            true,
             "/hub.cpp:entry",
             Some(1),
             Direction::Callees,
@@ -1958,6 +1942,7 @@ mod tests {
         let g = locked(g);
         let r = callers_or_callees(
             &g,
+            true,
             "/x.cpp:entry",
             Some(2),
             Direction::Callees,
@@ -1996,7 +1981,7 @@ mod tests {
     #[test]
     fn dependencies_missing_param_errors() {
         let g = locked(Graph::new());
-        let r = get_dependencies(&g, "", None, None, NO_BYTE_BUDGET);
+        let r = get_dependencies(&g, true, "", None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -2004,7 +1989,7 @@ mod tests {
     #[test]
     fn dependencies_unknown_file_returns_empty_page() {
         let g = locked(Graph::new());
-        let r = get_dependencies(&g, "/never-merged.cpp", None, None, NO_BYTE_BUDGET);
+        let r = get_dependencies(&g, true, "/never-merged.cpp", None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         // Unknown file is not an error: it yields an empty Page envelope
         // (results=[], total=0), not the legacy `[]` bare array.
@@ -2028,7 +2013,7 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = get_dependencies(&g, "/a.cpp", None, None, NO_BYTE_BUDGET);
+        let r = get_dependencies(&g, true, "/a.cpp", None, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 2);
         assert_eq!(total, 2);
@@ -2064,7 +2049,7 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = get_dependencies(&g, "/a.cpp", None, None, NO_BYTE_BUDGET);
+        let r = get_dependencies(&g, true, "/a.cpp", None, None, NO_BYTE_BUDGET);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
         assert_eq!(total, 3);
@@ -2127,7 +2112,7 @@ mod tests {
         let g = locked(g);
 
         // (1) Canonical form — baseline.
-        let r_canonical = get_dependencies(&g, canonical_str, None, None, NO_BYTE_BUDGET);
+        let r_canonical = get_dependencies(&g, true, canonical_str, None, None, NO_BYTE_BUDGET);
         assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
         let (arr_canonical, _, _, _) = page_parts(&r_canonical);
         assert_eq!(arr_canonical.len(), 2);
@@ -2146,7 +2131,7 @@ mod tests {
             "messy fixture must differ from canonical for the test to be meaningful"
         );
 
-        let r_messy = get_dependencies(&g, messy_str, None, None, NO_BYTE_BUDGET);
+        let r_messy = get_dependencies(&g, true, messy_str, None, None, NO_BYTE_BUDGET);
         assert!(
             r_messy.is_error.is_none() || r_messy.is_error == Some(false),
             "messy form must succeed after normalize: body={}",
@@ -2173,7 +2158,7 @@ mod tests {
     #[test]
     fn find_path_missing_from_errors() {
         let g = locked(Graph::new());
-        let r = find_path(&g, "", "/x.cpp:c", None, None);
+        let r = find_path(&g, true, "", "/x.cpp:c", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'from' is required");
     }
@@ -2181,7 +2166,7 @@ mod tests {
     #[test]
     fn find_path_missing_to_errors() {
         let g = locked(Graph::new());
-        let r = find_path(&g, "/x.cpp:a", "", None, None);
+        let r = find_path(&g, true, "/x.cpp:a", "", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'to' is required");
     }
@@ -2189,7 +2174,7 @@ mod tests {
     #[test]
     fn find_path_unknown_from_names_which_endpoint() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "nonexistent", "/x.cpp:c", None, None);
+        let r = find_path(&g, true, "nonexistent", "/x.cpp:c", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(
@@ -2201,7 +2186,7 @@ mod tests {
     #[test]
     fn find_path_unknown_to_names_which_endpoint() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "nonexistent", None, None);
+        let r = find_path(&g, true, "/x.cpp:a", "nonexistent", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(
@@ -2214,7 +2199,7 @@ mod tests {
     fn find_path_unknown_from_offers_did_you_mean() {
         let g = locked(graph_with_calls());
         // "a" substring-matches "/x.cpp:a".
-        let r = find_path(&g, "a", "/x.cpp:c", None, None);
+        let r = find_path(&g, true, "a", "/x.cpp:c", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.contains("Did you mean: "), "got: {text}");
@@ -2223,7 +2208,7 @@ mod tests {
     #[test]
     fn find_path_invalid_min_confidence_errors() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", None, Some("low"));
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:c", None, Some("low"));
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(
@@ -2236,7 +2221,7 @@ mod tests {
     fn find_path_connected_pair_returns_found_true_with_chain() {
         // graph_with_calls(): a -> b -> c.
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", None, None);
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:c", None, None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["found"], serde_json::json!(true));
@@ -2259,7 +2244,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:b", None, None);
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:b", None, None);
         // Not-found is a SUCCESS, never a tool error.
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
@@ -2272,7 +2257,7 @@ mod tests {
     #[test]
     fn find_path_source_equals_target_is_success_zero_hop_count() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:a", None, None);
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:a", None, None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["found"], serde_json::json!(true));
@@ -2285,7 +2270,7 @@ mod tests {
     #[test]
     fn find_path_node_cap_zero_uses_default() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", Some(0), None);
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:c", Some(0), None);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["node_cap"], serde_json::json!(100_000));
     }
@@ -2293,7 +2278,7 @@ mod tests {
     #[test]
     fn find_path_node_cap_clamped_at_ceiling() {
         let g = locked(graph_with_calls());
-        let r = find_path(&g, "/x.cpp:a", "/x.cpp:c", Some(10_000_000), None);
+        let r = find_path(&g, true, "/x.cpp:a", "/x.cpp:c", Some(10_000_000), None);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["node_cap"], serde_json::json!(5_000_000));
     }
@@ -2324,7 +2309,7 @@ mod tests {
             edges,
         });
         let g = locked(g);
-        let r = find_path(&g, "/x.cpp:n0", "/x.cpp:n19", Some(2), None);
+        let r = find_path(&g, true, "/x.cpp:n0", "/x.cpp:n19", Some(2), None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["found"], serde_json::json!(false));
@@ -2365,7 +2350,14 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = find_path(&g, "/x.cpp:start", "/x.cpp:target", None, Some("resolved"));
+        let r = find_path(
+            &g,
+            true,
+            "/x.cpp:start",
+            "/x.cpp:target",
+            None,
+            Some("resolved"),
+        );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(

@@ -1,19 +1,9 @@
 //! Typed core for `get_callers`/`get_callees` (via `callers_or_callees`),
 //! `find_overrides`, `get_dependencies`, and `find_path`.
 //!
-//! All four are GATED tools (confirmed against the `server.rs` call
-//! sites): each function here calls the core-level [`require_indexed`] at
-//! its own entry — a NEW call site per Design Decision 8, since
-//! `handlers::query` never contained one.
-//!
-//! `handlers::query`'s four public functions keep their exact signatures
-//! (no `ServerInner`/indexed-flag parameter — Decision 3), so they cannot
-//! supply a real indexed flag to the core. Each adapter hardcodes
-//! `indexed = true`: the MCP path already ran `ServerInner::require_indexed`
-//! in `server.rs` before ever reaching the handler, so `true` is always
-//! correct on that path. The `indexed` parameter exists so a future direct
-//! caller (e.g. Track B's CLI) can pass its own real flag and get the
-//! domain error `handlers::query`'s existing tests never had to exercise.
+//! Indexed-state behavior is defined once by [`crate::core::require_indexed`].
+//! Each public operation receives the caller's real state and checks it at
+//! entry; handler adapters are not typed-core entry points.
 //!
 //! Pure-logic helpers (`Direction`, `is_non_callable_kind`,
 //! `symbol_id_basename`, `article`, `alternative_tool_hint`,
@@ -34,12 +24,12 @@ use crate::handlers::query::{
 };
 use crate::handlers::{
     byte_budget_take, edge_kind_str, kind_str, parse_min_confidence, suggest_symbols,
-    CallChainResponse, DependencyEntry, FindPathResponse, Page,
 };
 
 /// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
 /// Decision 1) can select the walk arm without importing `handlers`.
 pub use crate::handlers::query::Direction as CallDirection;
+pub use crate::handlers::{CallChainResponse, DependencyEntry, FindPathResponse, Page};
 
 /// `callers_or_callees` body. Body moved verbatim from
 /// `handlers::query::callers_or_callees`, plus the core `require_indexed`

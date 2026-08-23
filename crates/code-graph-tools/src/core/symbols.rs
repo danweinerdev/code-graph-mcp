@@ -1,20 +1,9 @@
 //! Typed core for `get_file_symbols`, `search_symbols`, `get_symbol_detail`,
 //! `get_symbol_summary`, and phase 1's `get_symbol_at`.
 //!
-//! All five are GATED tools (confirmed against the `server.rs` call sites at
-//! `get_file_symbols`, `search_symbols`, `get_symbol_detail`,
-//! `get_symbol_summary`, `get_symbol_at`): each function here calls the
-//! core-level [`require_indexed`] at its own entry — a NEW call site per
-//! Design Decision 8, since `handlers::symbols` never contained one.
-//!
-//! `handlers::symbols`'s five public functions keep their exact signatures
-//! (no `ServerInner`/indexed-flag parameter — Decision 3), so they cannot
-//! supply a real indexed flag to the core. Each adapter hardcodes
-//! `indexed = true`: the MCP path already ran `ServerInner::require_indexed`
-//! in `server.rs` before ever reaching the handler, so `true` is always
-//! correct on that path. The `indexed` parameter exists so a future direct
-//! caller (e.g. Track B's CLI) can pass its own real flag and get the
-//! domain error `handlers::symbols`'s existing tests never had to exercise.
+//! Indexed-state behavior is defined once by [`crate::core::require_indexed`].
+//! Each public operation receives the caller's real state and checks it at
+//! entry; handler adapters are not typed-core entry points.
 //!
 //! `SearchSymbolsInput<'a>` stays in `handlers::symbols` (Decision 4); this
 //! module imports it rather than moving it.
@@ -42,20 +31,17 @@ use crate::handlers::symbols::{
 };
 use crate::handlers::{
     byte_budget_take, kind_str, parse_kind, parse_language, suggest_symbols, symbol_to_result,
-    EnclosingSymbol, Page, SearchSymbolsResponse, SummaryRow, SymbolResult,
     ENVELOPE_OVERHEAD_BYTES,
 };
 
 /// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
-/// Decision 1) can construct the input without importing `handlers` — the
-/// layer that carries the unguarded hardcoded-`indexed` adapters.
+/// Decision 1) can construct the input without importing the MCP adapters.
 pub use crate::handlers::symbols::SearchSymbolsInput as SearchInput;
+pub use crate::handlers::{EnclosingSymbol, Page, SearchSymbolsResponse, SummaryRow, SymbolResult};
 
-/// `get_file_symbols` body. Body moved verbatim from
-/// `handlers::symbols::get_file_symbols`, plus the core `require_indexed`
-/// call at entry (Decision 8). See the handler doc-comment (unchanged, and
-/// authoritative) for the full behavioural contract — empty-raw-set error
-/// wording, `count_only` sentinel shape, and default/clamp resolution.
+/// Typed `get_file_symbols` operation. An empty raw symbol set is an error;
+/// `count_only` uses the sentinel page shape and pagination resolves the
+/// shared defaults and clamps.
 #[allow(clippy::too_many_arguments)]
 pub fn get_file_symbols(
     graph: &RwLock<Graph>,
@@ -192,11 +178,8 @@ pub fn get_symbol_at(
     Ok(ToolOk::Value(response))
 }
 
-/// `search_symbols` body. Body moved verbatim from
-/// `handlers::symbols::search_symbols`, plus the core `require_indexed`
-/// call at entry (Decision 8). See the handler doc-comment (unchanged, and
-/// authoritative) for the byte-budget-trim architectural exception this
-/// function preserves.
+/// Typed `search_symbols` operation, including byte-budgeted pagination and
+/// the anchored-query suggestion behavior.
 pub fn search_symbols(
     graph: &RwLock<Graph>,
     indexed: bool,

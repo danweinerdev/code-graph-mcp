@@ -220,6 +220,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
     // likely root causes are listed in the assertion message.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -253,7 +254,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
         );
     }
 
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit class hierarchy for Alpha must succeed: {r:?}"
@@ -273,6 +274,7 @@ async fn watch_java_reindex_drops_removed_class_and_no_dangling_edges() {
     // / Python watch test pattern.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -326,6 +328,7 @@ class Gamma extends Alpha { public void m() { } }\n",
     // m methods), and must NOT contain Beta, Delta, or useBeta.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -357,7 +360,7 @@ class Gamma extends Alpha { public void m() { } }\n",
     // must surface Gamma as derived AND must NOT surface Beta. This
     // is the load-bearing assertion for the Inherits-edge half of
     // the pruner.
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit class_hierarchy(Alpha) must succeed: {r:?}"
@@ -377,7 +380,7 @@ class Gamma extends Alpha { public void m() { } }\n",
     // class_hierarchy("Beta") is the agent-visible probe for "is
     // there any structure pointing at Beta?". Post-fix, Beta and all
     // its adj/radj entries are pruned, so this must report not-found.
-    let r = get_class_hierarchy(&server.inner.graph, "Beta", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Beta", Some(1), None);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -397,6 +400,7 @@ class Gamma extends Alpha { public void m() { } }\n",
     // callers_or_callees fails with the standard not-found message.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -430,7 +434,7 @@ class Gamma extends Alpha { public void m() { } }\n",
 
     // get_symbol_detail on the removed Beta ID must return the
     // canonical not-found wording.
-    let r = get_symbol_detail(&server.inner.graph, &beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -439,7 +443,7 @@ class Gamma extends Alpha { public void m() { } }\n",
     );
 
     // Same for the deleted Delta::useBeta method ID.
-    let r = get_symbol_detail(&server.inner.graph, &delta_use_beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &delta_use_beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -450,7 +454,7 @@ class Gamma extends Alpha { public void m() { } }\n",
 
     // Belt-and-suspenders: Alpha and Gamma both lookup-able post-edit.
     for id in [format!("{models_str}:Alpha"), format!("{models_str}:Gamma")] {
-        let r = get_symbol_detail(&server.inner.graph, &id);
+        let r = get_symbol_detail(&server.inner.graph, true, &id);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "post-edit symbol detail for {id} must succeed: {r:?}"
@@ -507,6 +511,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     let sentinel_str = sentinel_path.to_string_lossy().into_owned();
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &sentinel_str,
         false,
         true,
@@ -541,6 +546,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
 
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &anon_str,
         false,
         true,
@@ -565,6 +571,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
 
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &anon_run_id,
         Some(1),
         Direction::Callees,
@@ -612,6 +619,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     // file's symbols.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &anon_str,
         false,
         true,
@@ -635,7 +643,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
 
     // The anonymous `run` Method (which lived only in AnonHost.java)
     // must be gone entirely — its symbol_id no longer resolves.
-    let r = get_symbol_detail(&server.inner.graph, &anon_run_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &anon_run_id);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -657,6 +665,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     // not-found".
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &anon_run_id,
         Some(1),
         Direction::Callees,
@@ -676,7 +685,7 @@ async fn watch_java_anonymous_class_removal_prunes_method_and_call_edge() {
     // Sentinel must still resolve — pruning AnonHost.java must NOT
     // collateral-damage Sentinel.java.
     let sentinel_id = format!("{sentinel_str}:Sentinel");
-    let r = get_symbol_detail(&server.inner.graph, &sentinel_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &sentinel_id);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-remove Sentinel must still resolve (pruning AnonHost.java \

@@ -185,6 +185,7 @@ async fn go_project_imports_resolve_to_deterministic_package_representatives() {
 
     let first = ok_json(&get_dependencies(
         &server.inner.graph,
+        true,
         &main,
         Some(1),
         Some(0),
@@ -202,6 +203,7 @@ async fn go_project_imports_resolve_to_deterministic_package_representatives() {
 
     let second = ok_json(&get_dependencies(
         &server.inner.graph,
+        true,
         &main,
         Some(1),
         Some(1),
@@ -231,6 +233,7 @@ async fn go_resolution_rejects_bound_and_external_calls_without_losing_valid_cal
 
     let any = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -272,6 +275,7 @@ async fn go_resolution_rejects_bound_and_external_calls_without_losing_valid_cal
 
     let resolved = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -311,6 +315,7 @@ async fn go_resolution_rejects_bound_and_external_calls_without_losing_valid_cal
 
     let coupling = ok_json(&get_coupling(
         &server.inner.graph,
+        true,
         &main,
         Some("outgoing"),
         Some(50),
@@ -352,6 +357,7 @@ async fn go_dot_import_calls_do_not_fall_back_to_unrelated_project_symbols() {
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -404,6 +410,7 @@ async fn go_package_variables_in_sibling_files_block_generic_call_resolution() {
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -447,6 +454,7 @@ async fn go_bare_calls_do_not_resolve_builtins_or_unrelated_single_candidates() 
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -488,6 +496,7 @@ async fn go_without_module_keeps_same_named_packages_directory_local() {
 
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:Caller", caller.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -590,6 +599,7 @@ func SelectAssign(s Outer) {
     ] {
         let result = ok_json(&callers_or_callees(
             &server.inner.graph,
+            true,
             &format!("{}:{caller}", source.to_string_lossy()),
             Some(1),
             Direction::Callees,
@@ -613,6 +623,7 @@ func SelectAssign(s Outer) {
     for caller in ["ForRangeAssign", "SelectAssign"] {
         let result = ok_json(&callers_or_callees(
             &server.inner.graph,
+            true,
             &format!("{}:{caller}", source.to_string_lossy()),
             Some(1),
             Direction::Callees,
@@ -685,6 +696,7 @@ func MultiLocal() {
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -717,6 +729,7 @@ func MultiLocal() {
 
     let pointer_result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:PointerLocal", main.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -738,6 +751,7 @@ func MultiLocal() {
 
     let multi_result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:MultiLocal", main.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -779,6 +793,7 @@ async fn go_internal_test_package_can_call_production_without_leaking_back() {
 
     let production_result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:Main", production.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -797,6 +812,7 @@ async fn go_internal_test_package_can_call_production_without_leaking_back() {
 
     let test_result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:TestMain", internal_test.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -839,6 +855,7 @@ async fn go_external_test_package_duplicate_does_not_ambiguate_production_call()
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -911,6 +928,7 @@ async fn go_scoped_analyze_uses_cached_sibling_package_bindings() {
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -972,6 +990,7 @@ async fn go_scoped_analyze_keeps_cached_function_when_ignored_disk_file_becomes_
     let caller = format!("{}:Main", main.to_string_lossy());
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &caller,
         Some(1),
         Direction::Callees,
@@ -1030,6 +1049,7 @@ async fn footerless_v13_go_cache_upgrades_during_scoped_resolution() {
 
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:Main", main.to_string_lossy()),
         Some(1),
         Direction::Callees,
@@ -1108,6 +1128,7 @@ async fn go_non_force_analyze_replaces_cached_symbols_before_resolution() {
 
     let result = ok_json(&callers_or_callees(
         &server.inner.graph,
+        true,
         &format!("{}:Caller", caller.to_string_lossy()),
         Some(1),
         Direction::Callees,

@@ -189,6 +189,7 @@ async fn get_symbol_summary_byte_budget_is_load_bearing() {
     // every row.
     let uncapped = get_symbol_summary(
         &fx.inner.graph,
+        true,
         None,
         Some(1_000_000),
         Some(0),
@@ -218,6 +219,7 @@ async fn get_symbol_summary_byte_budget_is_load_bearing() {
     // (truncated=true + non-null next_offset), not silently drop rows.
     let capped = get_symbol_summary(
         &fx.inner.graph,
+        true,
         None,
         Some(1_000_000),
         Some(0),
@@ -346,7 +348,7 @@ async fn get_class_hierarchy_emits_diamond_ref_stub() {
     // through two arms, so the second reach must be a ref-stub. depth is
     // generous and max_nodes is well above the 7-name fixture so neither
     // depth nor the node budget can mask the dedupe behavior.
-    let r = get_class_hierarchy(&fx.inner.graph, "Root", Some(8), Some(1000));
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Root", Some(8), Some(1000));
     let body = first_text(&r);
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("class hierarchy body must be valid JSON");
@@ -417,6 +419,7 @@ async fn generate_diagram_both_directions_and_no_file_node_leak() {
 
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             symbol: Some(&symbol_id),
             direction: Some("both"),

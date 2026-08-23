@@ -63,7 +63,7 @@ MCP server name must stay `code-graph` in every tree: the skills and the nudge r
 ## Core invariants
 
 - **Tool handler return type:** `Result<CallToolResult, McpError>`. User-visible errors travel as `CallToolResult` with error flag, NOT as `Err`.
-- **State guard:** query handlers must call `ServerInner::require_indexed()` first.
+- **State guard:** [`crates/code-graph-tools/src/core/mod.rs::require_indexed`] is the canonical indexed-state contract. Public typed query/watch entry points call it with real state; MCP server checks before dispatch to build the wire envelope, and handlers are MCP adapters.
 - **Paths:** stored file paths are absolute and `\\?\`-prefix-stripped via `dunce` at index time (`code_graph_core::paths::canonicalize`). Incoming file-path args on `get_file_symbols`, `get_coupling`, `get_dependencies`, `generate_diagram(file=…)` are normalized through `code_graph_core::paths::normalize_user_path`. `dunce::simplified` strips `VerbatimDisk` only — `VerbatimUNC` (`\\?\UNC\server\share\…`) passes through unchanged by design; that form rides in symbol IDs for network-share-hosted code.
 - **Symbol ID format:** `file:name` (free function) or `file:Parent::name` (method). Paginated tool records omit a separate `file` field — clients recover it by rsplit on the rightmost `:` not part of `::`.
 - **Enums:** `SymbolKind`, `EdgeKind` derive Serde and serialize as readable JSON strings (`"function"`, `"calls"`).

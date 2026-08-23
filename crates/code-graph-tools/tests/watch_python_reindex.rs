@@ -149,6 +149,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // derived.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -169,7 +170,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
         );
     }
 
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit class hierarchy for Alpha must succeed: {r:?}"
@@ -190,6 +191,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // (`watch_go_reindex.rs:136-151`).
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -243,6 +245,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // methods), and must NOT contain Beta, Delta, or Delta::use_beta.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -273,7 +276,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // Inheritance dangling-edge invariant: class_hierarchy(Alpha) must
     // surface Gamma as derived AND must NOT surface Beta. This is the
     // load-bearing assertion for the Inherits-edge half of the pruner.
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit class_hierarchy(Alpha) must succeed: {r:?}"
@@ -299,7 +302,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // or surface a stale list. Post-fix, both Beta's `nodes` entry and
     // every adj/radj entry referencing Beta are pruned, so
     // class_hierarchy("Beta") must report not-found.
-    let r = get_class_hierarchy(&server.inner.graph, "Beta", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Beta", Some(1), None);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -321,6 +324,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // not-found for it.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -361,7 +365,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
     // not-found wording. This is the agent-visible half of the dangling
     // bug — without the dangling-node sweep, this lookup would return a
     // result for a node that no longer existed in the index.
-    let r = get_symbol_detail(&server.inner.graph, &beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -371,7 +375,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Same for the deleted Delta::use_beta method ID — agent-visible
     // confirmation that the Calls-edge `from` symbol was scrubbed.
-    let r = get_symbol_detail(&server.inner.graph, &delta_use_beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &delta_use_beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -382,7 +386,7 @@ async fn watch_python_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Belt-and-suspenders: Alpha and Gamma both lookup-able post-edit.
     for id in [format!("{models_str}:Alpha"), format!("{models_str}:Gamma")] {
-        let r = get_symbol_detail(&server.inner.graph, &id);
+        let r = get_symbol_detail(&server.inner.graph, true, &id);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "post-edit symbol detail for {id} must succeed: {r:?}"

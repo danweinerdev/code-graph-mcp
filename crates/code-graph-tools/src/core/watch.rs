@@ -16,9 +16,11 @@ use tokio::sync::oneshot;
 
 use crate::core::{require_indexed, ToolOk, ToolResult};
 use crate::handlers::watch::{
-    forward_events, watch_loop, WatchResponse, DEBOUNCE_TIMEOUT, EVENT_CHANNEL_CAPACITY,
+    forward_events, watch_loop, DEBOUNCE_TIMEOUT, EVENT_CHANNEL_CAPACITY,
 };
 use crate::server::{ServerInner, WatchHandle};
+
+pub use crate::handlers::watch::WatchResponse;
 
 /// `watch_start` body. Body moved verbatim from
 /// `handlers::watch::watch_start`, plus the core `require_indexed` call

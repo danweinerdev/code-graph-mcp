@@ -150,6 +150,7 @@ public:
 
     let r = find_overrides(
         &server.inner.graph,
+        true,
         &base_tick,
         None,
         None,
@@ -227,6 +228,7 @@ async fn find_overrides_unknown_symbol_returns_error() {
     .await;
     let r = find_overrides(
         &server.inner.graph,
+        true,
         "/does/not/exist.cpp:NotAMethod",
         None,
         None,

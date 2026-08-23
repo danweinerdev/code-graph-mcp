@@ -151,7 +151,8 @@ fn out<T: serde::Serialize>(r: ToolResult<T>) -> Result<Outcome, CliError> {
 }
 
 /// Standalone dispatch: every arm calls exactly the `core::` function the
-/// MCP adapter calls, with the same argument resolution.
+/// MCP adapter calls, with the same argument resolution and the honest
+/// indexed state required by `code_graph_tools::core::require_indexed`.
 pub async fn run(app: &App, command: &Command) -> Result<Outcome, CliError> {
     let inner = &app.server.inner;
     let indexed = app.indexed;

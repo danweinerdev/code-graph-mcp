@@ -141,6 +141,7 @@ async fn watch_and_analyze_concurrent_no_panic_no_deadlock() {
                     let p = root.join(format!("f{i}.cpp"));
                     let r = get_file_symbols(
                         &server.inner.graph,
+                        true,
                         &p.to_string_lossy(),
                         false,
                         true,
@@ -219,6 +220,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
     common::wait_until(Duration::from_secs(10), || {
         let r = get_file_symbols(
             &server.inner.graph,
+            true,
             &final_path.to_string_lossy(),
             false,
             true,
@@ -237,6 +239,7 @@ async fn editor_atomic_save_rename_coalesces_to_single_reindex() {
     // The file should now be queryable with exactly the expected symbol.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &final_path.to_string_lossy(),
         false,
         true,
@@ -278,6 +281,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
     // Sanity: file is in the graph pre-delete.
     let pre = get_file_symbols(
         &server.inner.graph,
+        true,
         &target.to_string_lossy(),
         false,
         true,
@@ -305,6 +309,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
     common::wait_until(Duration::from_secs(10), || {
         let r = get_file_symbols(
             &server.inner.graph,
+            true,
             &target.to_string_lossy(),
             false,
             true,
@@ -320,6 +325,7 @@ async fn watch_loop_handles_file_removal_end_to_end() {
     let path_str = target.to_string_lossy().into_owned();
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &path_str,
         false,
         true,

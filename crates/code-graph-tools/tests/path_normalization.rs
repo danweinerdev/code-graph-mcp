@@ -205,6 +205,7 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // ---------- get_file_symbols --------------------------------------
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &fx.main_cpp,
         false,
         true,
@@ -236,6 +237,7 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // successful normalize + lookup yields a non-empty results page.
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &fx.util_h,
         false,
         true,
@@ -270,6 +272,7 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // coupling response carries `util.h` as a key.
     let r = get_coupling(
         &fx.inner.graph,
+        true,
         &fx.main_cpp,
         None,
         None,
@@ -306,7 +309,14 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // absolute `<util_h>` path. We assert the SPECIFIC resolved
     // dependency row — `file == <util_h>` — is present, the same strength
     // as the resolved-edge assertion the other arms use.
-    let r = get_dependencies(&fx.inner.graph, &fx.main_cpp, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(
+        &fx.inner.graph,
+        true,
+        &fx.main_cpp,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_dependencies: expected non-error result for short-form path {:?}, got: {:?}",
@@ -337,6 +347,7 @@ async fn four_file_taking_tools_resolve_short_form_paths() {
     // before the graph lookup.
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             file: Some(&fx.main_cpp),
             ..Default::default()
@@ -407,6 +418,7 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     // get_file_symbols
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &dotty,
         false,
         true,
@@ -431,7 +443,15 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     );
 
     // get_coupling
-    let r = get_coupling(&fx.inner.graph, &dotty, None, None, None, NO_BYTE_BUDGET);
+    let r = get_coupling(
+        &fx.inner.graph,
+        true,
+        &dotty,
+        None,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_coupling: dotty path {dotty:?} must resolve; got: {r:?}",
@@ -451,7 +471,7 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     );
 
     // get_dependencies
-    let r = get_dependencies(&fx.inner.graph, &dotty, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(&fx.inner.graph, true, &dotty, None, None, NO_BYTE_BUDGET);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_dependencies: dotty path {dotty:?} must resolve; got: {r:?}",
@@ -468,6 +488,7 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
     // generate_diagram(file=…)
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             file: Some(&dotty),
             ..Default::default()

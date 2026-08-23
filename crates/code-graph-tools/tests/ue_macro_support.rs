@@ -137,6 +137,7 @@ async fn build_indexed(override_toml: Option<&str>) -> Indexed {
 fn search_for(inner: &Arc<ServerInner>, pattern: &str) -> serde_json::Value {
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some(pattern),
@@ -218,7 +219,7 @@ async fn ue_fixture_extracts_uclass_with_preset() {
     // Order is implementation-defined (diamond walk uses BFS but the
     // sibling order at a given level isn't part of the wire contract); we
     // assert membership via a HashSet rather than positional equality.
-    let r = get_class_hierarchy(&fx.inner.graph, "UObject", Some(1), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "UObject", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy(\"UObject\") returned error: {r:?}",
@@ -284,6 +285,7 @@ async fn ue_fixture_extracts_uclass_with_preset() {
     let actor_h = fx.root.join("Actor.h").to_string_lossy().into_owned();
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &actor_h,
         false,
         true,
@@ -383,7 +385,7 @@ macro_strip_with_args = []
     // must return a tool-level error (either "class not found" or the
     // fuzzy-suggestion variant). We don't pin the exact wording — only that
     // the call surfaces an error result rather than a successful hierarchy.
-    let r = get_class_hierarchy(&fx.inner.graph, "UObject", Some(1), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "UObject", Some(1), None);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -458,6 +460,7 @@ macro_strip_with_args = [\"UCLASS\", \"GENERATED_BODY\"]
     let inner = server.inner.clone();
     let envelope = serde_json::from_str::<serde_json::Value>(&first_text(&search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("^CleanClass$"),
@@ -478,6 +481,7 @@ macro_strip_with_args = [\"UCLASS\", \"GENERATED_BODY\"]
     // Bonus: the method `DoSomething` survives the GENERATED_BODY() strip.
     let envelope = serde_json::from_str::<serde_json::Value>(&first_text(&search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("^CleanClass::DoSomething$"),

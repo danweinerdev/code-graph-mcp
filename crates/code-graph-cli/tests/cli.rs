@@ -225,13 +225,31 @@ fn cli_depends_on_the_typed_core_only() {
         "code-graph-cli must not depend on rmcp (FR-17): the CLI would be \
          parsing wire envelopes instead of calling the typed core"
     );
-    for source in ["main.rs", "args.rs", "exec.rs", "daemon_client.rs"] {
-        let text = std::fs::read_to_string(manifest_dir.join("src").join(source))
-            .expect("read CLI source");
+    fn rust_sources(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read CLI source directory") {
+            let entry = entry.expect("read CLI source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    rust_sources(&manifest_dir.join("src"), &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "CLI source tree must contain Rust files"
+    );
+    for source in sources {
+        let text = std::fs::read_to_string(&source).expect("read CLI source");
         assert!(
             !text.contains("handlers::") && !text.contains("::handlers"),
-            "{source} imports the handlers layer — the unguarded \
-             hardcoded-indexed surface the design forbids (Decision 1)"
+            "{} imports the handlers layer — the unguarded \
+              hardcoded-indexed surface the design forbids (Decision 1)",
+            source.display()
         );
     }
 }

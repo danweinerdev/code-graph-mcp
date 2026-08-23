@@ -200,6 +200,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // likely root causes are listed in the assertion message.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -233,7 +234,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
         );
     }
 
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "pre-edit class hierarchy for Alpha must succeed: {r:?}"
@@ -253,6 +254,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // reason. Mirrors the Python watch test pattern.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -306,6 +308,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // M methods), and must NOT contain Beta, Delta, or UseBeta.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &models_str,
         false,
         true,
@@ -337,7 +340,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // must surface Gamma as derived AND must NOT surface Beta. This
     // is the load-bearing assertion for the Inherits-edge half of
     // the pruner.
-    let r = get_class_hierarchy(&server.inner.graph, "Alpha", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Alpha", Some(1), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-edit class_hierarchy(Alpha) must succeed: {r:?}"
@@ -357,7 +360,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // class_hierarchy("Beta") is the agent-visible probe for "is
     // there any structure pointing at Beta?". Post-fix, Beta and all
     // its adj/radj entries are pruned, so this must report not-found.
-    let r = get_class_hierarchy(&server.inner.graph, "Beta", Some(1), None);
+    let r = get_class_hierarchy(&server.inner.graph, true, "Beta", Some(1), None);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -377,6 +380,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     // callers_or_callees fails with the standard not-found message.
     let r = callers_or_callees(
         &server.inner.graph,
+        true,
         &delta_use_beta_id,
         Some(1),
         Direction::Callees,
@@ -411,7 +415,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // get_symbol_detail on the removed Beta ID must return the
     // canonical not-found wording.
-    let r = get_symbol_detail(&server.inner.graph, &beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -420,7 +424,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
     );
 
     // Same for the deleted Delta::UseBeta method ID.
-    let r = get_symbol_detail(&server.inner.graph, &delta_use_beta_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &delta_use_beta_id);
     assert_eq!(r.is_error, Some(true));
     let body = first_text(&r);
     assert!(
@@ -431,7 +435,7 @@ async fn watch_csharp_reindex_drops_removed_class_and_no_dangling_edges() {
 
     // Belt-and-suspenders: Alpha and Gamma both lookup-able post-edit.
     for id in [format!("{models_str}:Alpha"), format!("{models_str}:Gamma")] {
-        let r = get_symbol_detail(&server.inner.graph, &id);
+        let r = get_symbol_detail(&server.inner.graph, true, &id);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "post-edit symbol detail for {id} must succeed: {r:?}"
@@ -486,6 +490,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     let sentinel_str = sentinel_path.to_string_lossy().into_owned();
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &sentinel_str,
         false,
         true,
@@ -517,6 +522,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
 
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &foo_a_str,
         false,
         true,
@@ -533,6 +539,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
 
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &foo_b_str,
         false,
         true,
@@ -568,6 +575,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
 
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &foo_c_str,
         false,
         true,
@@ -585,7 +593,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // The original two partials must still be visible — adding the
     // third does not perturb them.
     let foo_a_method_id = format!("{foo_a_str}:Foo::A");
-    let r = get_symbol_detail(&server.inner.graph, &foo_a_method_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &foo_a_method_id);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "post-add Foo::A from Foo_a.cs must still resolve: {r:?}"
@@ -606,6 +614,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // means the prune did not fully remove the file's symbols.
     let r = get_file_symbols(
         &server.inner.graph,
+        true,
         &foo_b_str,
         false,
         true,
@@ -630,7 +639,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // Method `B` (which lived only in Foo_b.cs) must be gone from the
     // graph entirely — its symbol_id no longer resolves.
     let foo_b_method_id = format!("{foo_b_str}:Foo::B");
-    let r = get_symbol_detail(&server.inner.graph, &foo_b_method_id);
+    let r = get_symbol_detail(&server.inner.graph, true, &foo_b_method_id);
     assert_eq!(
         r.is_error,
         Some(true),
@@ -646,7 +655,7 @@ async fn watch_csharp_partial_class_lifecycle_add_and_remove() {
     // must still resolve — pruning the b file's symbols must NOT
     // collateral-damage the other partials' methods.
     for id in [format!("{foo_a_str}:Foo::A"), format!("{foo_c_str}:Foo::C")] {
-        let r = get_symbol_detail(&server.inner.graph, &id);
+        let r = get_symbol_detail(&server.inner.graph, true, &id);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "post-remove surviving partial method {id} must still \

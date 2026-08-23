@@ -22,7 +22,7 @@
 //! divergence triggers `cargo insta review`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 #[cfg(target_os = "linux")]
@@ -621,31 +621,9 @@ impl CodeGraphServer {
         })
     }
 
-    /// Returns `Ok(())` if a codebase has been indexed; otherwise returns
-    /// `Err(CallToolResult)` carrying the tool-level error envelope so the
-    /// caller can hand it straight back to the MCP runtime.
-    ///
-    /// Handlers use the early-return pattern:
-    ///
-    /// ```ignore
-    /// async fn my_handler(...) -> Result<CallToolResult, McpError> {
-    ///     if let Err(r) = self.require_indexed() {
-    ///         return Ok(r);
-    ///     }
-    ///     // ... happy path ...
-    /// }
-    /// ```
-    ///
-    /// The wire envelope mirrors `mcp.NewToolResultError` from the Go
-    /// binary exactly: a `CallToolResult` with `is_error: true` and a
-    /// single text content. Returning the error this way (instead of via
-    /// `?` on a `McpError`) keeps `{"result":{"content":[…],"isError":true}}`
-    /// on the wire instead of the JSON-RPC protocol-error envelope
-    /// (`{"error":{"code":-32603,…}}`) that `McpError` propagates to.
-    ///
-    /// The error message itself matches the Go reference byte-for-byte;
-    /// the em-dash is U+2014 (not a hyphen-minus) and the snapshot
-    /// suite locks the byte sequence in across all error paths.
+    /// MCP-envelope form of the canonical [`crate::core::require_indexed`]
+    /// contract. Tool methods call this before dispatch so a domain failure
+    /// remains a successful JSON-RPC response carrying `is_error: true`.
     pub fn require_indexed(&self) -> Result<(), CallToolResult> {
         if self
             .inner
@@ -1452,6 +1430,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::symbols::get_file_symbols(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 &args.file,
                 args.top_level_only.unwrap_or(false),
                 args.brief.unwrap_or(true),
@@ -1568,6 +1547,7 @@ impl CodeGraphServer {
         };
         Ok(handlers::symbols::search_symbols(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             input,
             max_bytes,
         ))
@@ -1583,6 +1563,7 @@ impl CodeGraphServer {
         }
         Ok(handlers::symbols::get_symbol_detail(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.symbol,
         ))
     }
@@ -1623,6 +1604,7 @@ impl CodeGraphServer {
         let root = self.inner.root_path.read().clone();
         Ok(handlers::history::blame_symbol(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &self.inner.vcs,
             root,
             &args.symbol,
@@ -1729,6 +1711,7 @@ impl CodeGraphServer {
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::symbols::get_symbol_summary(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             args.file.as_deref(),
             args.limit,
             args.offset,
@@ -1786,6 +1769,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::symbols::get_symbol_at(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 &args.file,
                 args.line,
                 args.limit,
@@ -1874,6 +1858,7 @@ impl CodeGraphServer {
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::query::callers_or_callees(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.symbol,
             args.depth,
             handlers::query::Direction::Callers,
@@ -1964,6 +1949,7 @@ impl CodeGraphServer {
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::query::callers_or_callees(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.symbol,
             args.depth,
             handlers::query::Direction::Callees,
@@ -2032,6 +2018,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::query::find_path(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 &from,
                 &to,
                 args.node_cap,
@@ -2080,6 +2067,7 @@ impl CodeGraphServer {
         let max_bytes = self.inner.config.read().response.max_bytes;
         Ok(handlers::query::find_overrides(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.symbol,
             args.limit,
             args.offset,
@@ -2132,6 +2120,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::query::get_dependencies(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 &args.file,
                 args.limit,
                 args.offset,
@@ -2163,6 +2152,7 @@ impl CodeGraphServer {
         };
         Ok(handlers::structure::detect_cycles(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             validated_subtree.as_deref(),
             args.limit,
             args.offset,
@@ -2209,6 +2199,7 @@ impl CodeGraphServer {
         };
         Ok(handlers::structure::get_orphans(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             args.kind.as_deref(),
             validated_subtree.as_deref(),
             args.limit,
@@ -2264,6 +2255,7 @@ impl CodeGraphServer {
         }
         Ok(handlers::structure::get_class_hierarchy(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.class,
             args.depth,
             args.max_nodes,
@@ -2291,6 +2283,7 @@ impl CodeGraphServer {
         }
         Ok(handlers::structure::find_class_candidates(
             &self.inner.graph,
+            self.inner.indexed.load(Ordering::Acquire),
             &args.name,
         ))
     }
@@ -2359,6 +2352,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::structure::get_coupling(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 &args.file,
                 args.direction.as_deref(),
                 args.offset,
@@ -2443,6 +2437,7 @@ impl CodeGraphServer {
         let result = tokio::task::spawn_blocking(move || {
             handlers::structure::detect_communities(
                 &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
                 args.granularity.as_deref(),
                 args.max_iterations,
                 args.members_per_community,
@@ -2535,7 +2530,11 @@ impl CodeGraphServer {
                 direction: args.direction.as_deref(),
                 min_confidence: args.min_confidence.as_deref(),
             };
-            handlers::structure::generate_diagram(&inner.graph, input)
+            handlers::structure::generate_diagram(
+                &inner.graph,
+                inner.indexed.load(Ordering::Acquire),
+                input,
+            )
         })
         .await;
         Ok(match result {

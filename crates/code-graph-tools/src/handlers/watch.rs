@@ -57,7 +57,8 @@ pub struct WatchResponse {
     pub watching: bool,
 }
 
-/// `watch_start` body. Caller must already have passed `require_indexed`.
+/// Thin MCP adapter; indexed-state behavior is defined by
+/// [`crate::core::require_indexed`].
 ///
 /// Steps:
 /// 1. Acquire `inner.watch` for write and refuse if a [`WatchHandle`] is
@@ -79,7 +80,8 @@ pub fn watch_start(inner: &Arc<ServerInner>) -> rmcp::model::CallToolResult {
     crate::core::to_call_tool_result(crate::core::watch::watch_start(inner))
 }
 
-/// `watch_stop` body. Caller must already have passed `require_indexed`.
+/// Thin MCP adapter; indexed-state behavior is defined by
+/// [`crate::core::require_indexed`].
 ///
 /// Takes the live [`WatchHandle`] out of `inner.watch`, sends the cancel
 /// signal so the watch_loop task exits, then drops the debouncer (which
@@ -1174,6 +1176,7 @@ mod tests {
         let abs_a_cpp = code_graph_core::paths::canonicalize(&a_cpp).unwrap();
         let r = get_file_symbols(
             &inner.graph,
+            true,
             &abs_a_cpp.to_string_lossy(),
             false,
             true,
@@ -1295,6 +1298,7 @@ mod tests {
 
         let r = get_file_symbols(
             &inner.graph,
+            true,
             &a_cpp.to_string_lossy(),
             false,
             true,
@@ -1347,6 +1351,7 @@ mod tests {
         let path_str = a_cpp.to_string_lossy().into_owned();
         let r = get_file_symbols(
             &inner.graph,
+            true,
             &path_str,
             false,
             true,

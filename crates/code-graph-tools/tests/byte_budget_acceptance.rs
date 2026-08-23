@@ -167,6 +167,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
 
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         None,
         None,
         Some(1000),
@@ -246,6 +247,7 @@ async fn get_orphans_under_budget_at_limit_1000() {
             cur_next_offset.expect("truncated=true must always come with Some(next_offset)");
         let r = get_orphans(
             &fx.inner.graph,
+            true,
             None,
             None,
             Some(1000),
@@ -317,6 +319,7 @@ async fn search_symbols_under_budget_at_limit_1000() {
 
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some(query),
@@ -378,6 +381,7 @@ async fn search_symbols_under_budget_at_limit_1000() {
             cur_next_offset.expect("truncated=true must always come with Some(next_offset)");
         let r = search_symbols(
             &fx.inner.graph,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some(query),
@@ -453,6 +457,7 @@ async fn count_only_under_1kb_orphans() {
 
     let r = get_orphans(
         &fx.inner.graph,
+        true,
         None,
         None,
         None,
@@ -496,6 +501,7 @@ async fn count_only_under_1kb_search_symbols() {
 
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("orphan"),
@@ -543,6 +549,7 @@ async fn count_only_under_1kb_file_symbols() {
 
     let r = get_file_symbols(
         &fx.inner.graph,
+        true,
         &file_path,
         false,
         true,

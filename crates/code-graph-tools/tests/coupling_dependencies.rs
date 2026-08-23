@@ -132,6 +132,7 @@ async fn get_coupling_both_split_shape() {
     let hub_h = canonical.join("hub.h").to_string_lossy().into_owned();
     let r = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("both"),
         None,
@@ -256,6 +257,7 @@ async fn get_coupling_byte_budget_sequential() {
     let max_bytes = 512 + 80;
     let r = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("both"),
         None,
@@ -321,6 +323,7 @@ async fn get_coupling_byte_budget_sequential() {
     let nonzero_offset = 1;
     let r = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("both"),
         Some(nonzero_offset),
@@ -381,6 +384,7 @@ async fn get_coupling_directional_pagination_resume() {
     // complete, untruncated reference list.
     let full = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("incoming"),
         None,
@@ -401,6 +405,7 @@ async fn get_coupling_directional_pagination_resume() {
     let max_bytes = 512 + 120;
     let p1 = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("both"),
         None,
@@ -428,6 +433,7 @@ async fn get_coupling_directional_pagination_resume() {
     // Page 2: re-call direction=incoming with offset = next_offset.
     let p2 = get_coupling(
         &server.inner.graph,
+        true,
         &hub_h,
         Some("incoming"),
         Some(next),
@@ -489,7 +495,14 @@ async fn get_dependencies_line_numbers_preserved() {
     analyze(&server, &canonical).await;
 
     let main_cpp = canonical.join("main.cpp").to_string_lossy().into_owned();
-    let r = get_dependencies(&server.inner.graph, &main_cpp, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(
+        &server.inner.graph,
+        true,
+        &main_cpp,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let body = ok_json(&r);
     let rows = body["results"]
         .as_array()
@@ -575,7 +588,14 @@ async fn indexer_ini_filter_drops_non_source_edges() {
     analyze(&server, &canonical).await;
 
     let main_cpp = canonical.join("main.cpp").to_string_lossy().into_owned();
-    let r = get_dependencies(&server.inner.graph, &main_cpp, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(
+        &server.inner.graph,
+        true,
+        &main_cpp,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let body = ok_json(&r);
     let files: Vec<String> = body["results"]
         .as_array()
@@ -628,7 +648,14 @@ async fn get_dependencies_ini_excluded_from_response() {
     analyze(&server, &canonical).await;
 
     let app_cpp = canonical.join("app.cpp").to_string_lossy().into_owned();
-    let r = get_dependencies(&server.inner.graph, &app_cpp, None, None, NO_BYTE_BUDGET);
+    let r = get_dependencies(
+        &server.inner.graph,
+        true,
+        &app_cpp,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let body = ok_json(&r);
     let rows = body["results"].as_array().expect("results array");
 
@@ -706,6 +733,7 @@ async fn watch_reindex_applies_ini_filter() {
     {
         let r = get_dependencies(
             &server.inner.graph,
+            true,
             &app_cpp.to_string_lossy(),
             None,
             None,
@@ -774,6 +802,7 @@ async fn watch_reindex_applies_ini_filter() {
     // NOT config.ini — proving the watch-path filter fired.
     let r = get_dependencies(
         &server.inner.graph,
+        true,
         &app_cpp.to_string_lossy(),
         None,
         None,

@@ -177,6 +177,7 @@ async fn async_kickoff_poll_then_query_symbols_end_to_end() {
     let engine_cpp = path.join("engine.cpp").to_string_lossy().into_owned();
     let symbols = get_file_symbols(
         &inner_async.graph,
+        true,
         &engine_cpp,
         false,
         true,

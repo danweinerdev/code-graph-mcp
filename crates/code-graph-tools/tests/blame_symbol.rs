@@ -206,6 +206,7 @@ async fn call_blame(
     let root = server.inner.root_path.read().clone();
     code_graph_tools::handlers::history::blame_symbol(
         &server.inner.graph,
+        true,
         &server.inner.vcs,
         root,
         symbol,
@@ -375,6 +376,7 @@ async fn blame_symbol_reports_unavailability_without_vcs_and_degrades_nothing() 
     // AC-22: every other tool behaves normally.
     let symbols = code_graph_tools::handlers::symbols::get_file_symbols(
         &server.inner.graph,
+        true,
         &file.to_string_lossy(),
         false,
         true,
@@ -531,6 +533,7 @@ async fn blame_symbol_slow_provider_delays_only_history_tools() {
     let blame = tokio::spawn(async move {
         code_graph_tools::handlers::history::blame_symbol(
             &inner.graph,
+            true,
             &inner.vcs,
             root,
             &blame_symbol_id,
@@ -544,6 +547,7 @@ async fn blame_symbol_slow_provider_delays_only_history_tools() {
     // A non-history query completes while the provider hangs.
     let symbols = code_graph_tools::handlers::symbols::get_file_symbols(
         &server.inner.graph,
+        true,
         &file.to_string_lossy(),
         false,
         true,

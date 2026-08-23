@@ -21,40 +21,10 @@ use rmcp::model::CallToolResult;
 
 // ----- detect_cycles -----
 
-/// `detect_cycles` body. Returns the SCCs (size > 1) of the include
-/// graph wrapped in the shared [`Page`] envelope so a UE-scale codebase
-/// with many circular includes doesn't blow the MCP token ceiling.
-///
-/// Each cycle is a [`Cycle`] whose `files` is a list of file path
-/// strings (PathBuf → String via `to_string_lossy` for cross-platform
-/// stability). For deterministic pagination the inner cycle paths are
-/// sorted, then the outer cycle list is sorted by each cycle's first
-/// path — Tarjan's SCC output order is stable per build but not
-/// lexicographic, so we canonicalize both axes to keep page boundaries
-/// reproducible.
-///
-/// Defaults: `limit = 20`, `offset = 0`. `limit = 0` resolves to 20
-/// (mirrors `search_symbols` / `get_orphans`); `limit` clamps at 1000.
-/// `offset >= total` returns an empty `results` page with the correct
-/// `total`.
-///
-/// The envelope's `truncated`/`next_offset` are honest: when the slice
-/// stops short of `total`, `truncated` is `true` and `next_offset`
-/// points one past the last emitted cycle so a client can resume
-/// paging. Pagination is purely by COUNT — the byte-budget cap that
-/// governs the symbol-list tools is intentionally NOT consulted here.
-///
-/// `max_cycle_size` (default 50, clamped at 500; `0` resolves to the
-/// default) caps the number of file paths kept *within* each cycle on
-/// the page. This is an axis orthogonal to envelope pagination: a cycle
-/// whose `files` list exceeds the cap is shortened in place, its
-/// `truncated` flag set, and `original_len` set to the pre-truncation
-/// count; the envelope's `truncated`/`next_offset` are unaffected. Per-
-/// cycle truncation is applied AFTER the page slice, so only cycles
-/// actually returned on the page pay the cost. Cycles at or under the
-/// cap keep `truncated: false` / `original_len: None`.
+/// MCP adapter for [`crate::core::structure::detect_cycles`].
 pub fn detect_cycles(
     graph: &RwLock<Graph>,
+    indexed: bool,
     subtree: Option<&str>,
     limit: Option<u32>,
     offset: Option<u32>,
@@ -62,7 +32,7 @@ pub fn detect_cycles(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::detect_cycles(
         graph,
-        true,
+        indexed,
         subtree,
         limit,
         offset,
@@ -72,36 +42,14 @@ pub fn detect_cycles(
 
 // ----- get_orphans -----
 
-/// `get_orphans` body. `kind = None` defaults to callables (Function and
-/// Method). `kind = Some("class")` etc. parses through [`parse_kind`].
-/// Unknown kind strings return `"invalid kind: <kind>"` in line with
-/// `search_symbols`.
-///
-/// Output is the shared [`Page`]`<`[`SymbolResult`]`>` envelope — the full
-/// match set is collected from `Graph::orphans`, sorted by `symbol_id`
-/// ascending for stable pagination across calls, then sliced by the
-/// resolved offset/limit. `total` reports the pre-pagination match count
-/// so clients can render "page X of Y" UIs.
-///
-/// Defaults: `limit = 20`, `offset = 0`, `brief = true`. `limit = 0`
-/// means "use the default" (mirrors `search_symbols`); `limit` is
-/// silently clamped at 1000. `offset >= total` returns an empty `results`
-/// page with the correct `total`.
-///
-/// When `count_only = true`, the handler returns the sentinel response
-/// shape `Page { results: [],
-/// total, offset: 0, limit: 0, truncated: false, next_offset: None }`
-/// without ever materializing `SymbolResult`s or invoking the byte-budget
-/// helper. `total` reflects the true pre-pagination match count after the
-/// kind filter. `count_only` callers opt out of paging, so `limit: 0` is a
-/// deliberate exception to the "envelope echoes resolved limit" contract
-/// (see CLAUDE.md).
+/// MCP adapter for [`crate::core::structure::get_orphans`].
 #[allow(clippy::too_many_arguments)] // Mirrors `search_symbols` shape; the
                                      // unified Input-struct pattern is a
                                      // follow-up refactor across all paginated
                                      // handlers.
 pub fn get_orphans(
     graph: &RwLock<Graph>,
+    indexed: bool,
     kind: Option<&str>,
     subtree: Option<&str>,
     limit: Option<u32>,
@@ -113,7 +61,7 @@ pub fn get_orphans(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::get_orphans(
         graph,
-        true,
+        indexed,
         kind,
         subtree,
         limit,
@@ -127,45 +75,23 @@ pub fn get_orphans(
 
 // ----- get_class_hierarchy -----
 
-/// `get_class_hierarchy` body. Required `class` string; optional `depth`
-/// (default 1) and `max_nodes` (default 250, clamped at 1000; `0` is
-/// treated as "use default"). Unknown class produces a did-you-mean
-/// message filtered to class-like kinds (`Class`, `Struct`, `Interface`,
-/// `Trait`).
-///
-/// The did-you-mean wording mirrors the symbol_detail / callers
-/// patterns: `class not found: "<name>". Did you mean: a, b, c?`
-/// when suggestions exist; otherwise just `class not found: "<name>"`.
-///
-/// On success, returns the `{hierarchy, truncated, max_nodes,
-/// total_nodes_seen}` envelope. The Graph layer's unique-name budget
-/// guarantees diamond inheritance doesn't burn the budget twice for
-/// shared ancestors — see `Graph::class_hierarchy`.
+/// MCP adapter for [`crate::core::structure::get_class_hierarchy`].
 pub fn get_class_hierarchy(
     graph: &RwLock<Graph>,
+    indexed: bool,
     class: &str,
     depth: Option<u32>,
     max_nodes: Option<u32>,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::get_class_hierarchy(
-        graph, true, class, depth, max_nodes,
+        graph, indexed, class, depth, max_nodes,
     ))
 }
 
-/// `find_class_candidates` body. Returns every class-like symbol
-/// whose `name` exactly equals the requested `name`, as a JSON array
-/// of `SymbolResult`s. Used to disambiguate when
-/// `get_class_hierarchy` reports the name as ambiguous, or as a
-/// general discovery tool for "how many classes share this
-/// short name?"
-///
-/// Sorted by `(file, line)` ascending for deterministic output.
-/// Empty result for unknown names is returned as `[]` (NOT an
-/// error) so clients building UI on top can treat zero hits as
-/// "nothing to disambiguate" rather than special-casing an error.
-pub fn find_class_candidates(graph: &RwLock<Graph>, name: &str) -> CallToolResult {
+/// MCP adapter for [`crate::core::structure::find_class_candidates`].
+pub fn find_class_candidates(graph: &RwLock<Graph>, indexed: bool, name: &str) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::find_class_candidates(
-        graph, true, name,
+        graph, indexed, name,
     ))
 }
 
@@ -298,35 +224,10 @@ pub(crate) fn is_unreliable_orphan(sym: &Symbol, mode: ReliabilityMode, graph: &
 
 // ----- get_coupling -----
 
-/// `get_coupling` body. Required `file` string; optional `direction` in
-/// `{outgoing(default), incoming, both}`; optional `offset`/`limit`
-/// pagination.
-///
-/// `incoming` / `outgoing` return a `Page<CouplingEntry>` — rows sorted
-/// by `count` descending then `file` ascending, then sliced+byte-budgeted
-/// via `byte_budget_take`. `both` returns a `CouplingBoth` carrying two
-/// independently-paginated pages; the budget is allocated sequentially
-/// (incoming first against the full `max_bytes`, outgoing against the
-/// remainder after the incoming page plus a fixed wrapper overhead).
-/// When incoming exhausts the budget, outgoing is an empty page flagged
-/// `truncated: true` with `next_offset` equal to the resolved request offset
-/// so a client can re-request the outgoing side with a larger budget.
-///
-/// Defaults: `limit = 50` per side (zero-or-missing resolves to the
-/// default; mirrors `get_orphans` / `search_symbols`), clamped at 1000;
-/// `offset = 0`. An unknown file is not an error — it yields empty
-/// page(s), matching the previous empty-object contract.
-///
-/// Unknown direction returns
-/// `"invalid direction: <direction>. Expected one of: outgoing, incoming, both"`
-/// — this is a deliberate divergence from the Go wording
-/// `"'direction' must be 'incoming', 'outgoing', or 'both'"`. The Rust
-/// form matches the `invalid kind: <kind>` and `invalid format: <fmt>`
-/// shapes used elsewhere in the handler suite (and `generate_diagram`'s
-/// own `invalid direction:` message), and includes the bad value
-/// verbatim so users can self-correct.
+/// MCP adapter for [`crate::core::structure::get_coupling`].
 pub fn get_coupling(
     graph: &RwLock<Graph>,
+    indexed: bool,
     file: &str,
     direction: Option<&str>,
     offset: Option<u32>,
@@ -334,7 +235,7 @@ pub fn get_coupling(
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::get_coupling(
-        graph, true, file, direction, offset, limit, max_bytes,
+        graph, indexed, file, direction, offset, limit, max_bytes,
     ))
 }
 
@@ -367,66 +268,24 @@ pub struct GenerateDiagramInput<'a> {
     pub min_confidence: Option<&'a str>,
 }
 
-/// `generate_diagram` body. Dispatches on the exclusive parameter
-/// (`symbol` | `file` | `class`) to the matching `Graph::diagram_*`
-/// method, then formats the result as either JSON edges or a Mermaid
-/// flowchart.
-///
-/// **Direction**: hardcoded to `"TD"` for all three diagram types. The
-/// Go reference uses `"BT"` for inheritance and `"TD"` otherwise; the
-/// Rust port unifies on `"TD"` for all three diagram types. This is a Rust-idiom
-/// divergence — having a single direction makes diagrams visually
-/// consistent regardless of which view a user requested. The snapshot
-/// suite locks this in.
-///
-/// **Exactly-one-of**: when 0 or >1 of `symbol`/`file`/`class` are set,
-/// returns an error. The Go reference accepted multiple parameters and
-/// silently picked one by precedence (class > symbol > file); the Rust
-/// port rejects ambiguous calls so silent precedence ambiguity can't
-/// produce surprising results.
-///
-/// Empty edges in `edges` format serialize as `[]` (never `null`) —
-/// `DiagramResult::edges` is a `Vec`, not `Option`, so this falls out
-/// of the type system.
-pub fn generate_diagram(graph: &RwLock<Graph>, input: GenerateDiagramInput<'_>) -> CallToolResult {
-    crate::core::to_call_tool_result(crate::core::structure::generate_diagram(graph, true, input))
+/// MCP adapter for [`crate::core::structure::generate_diagram`].
+pub fn generate_diagram(
+    graph: &RwLock<Graph>,
+    indexed: bool,
+    input: GenerateDiagramInput<'_>,
+) -> CallToolResult {
+    crate::core::to_call_tool_result(crate::core::structure::generate_diagram(
+        graph, indexed, input,
+    ))
 }
 
 // ----- detect_communities -----
 
-/// `detect_communities` body (`Designs/GraphQueries` Decision 4/9). Runs
-/// [`Graph::file_communities`] and reshapes the result into a flattened
-/// [`Page<Community>`] envelope plus community-detection metadata
-/// (`granularity`, `termination`, `iterations`, `node_count`,
-/// `edge_count`, `degenerate`).
-///
-/// **`granularity`** — default (`None` or `""`) resolves to `"file"`, the
-/// only supported value today (Decision 4). Any other non-empty value is
-/// a tool error listing the accepted value, so the parameter is
-/// forward-compatible with a future symbol-granularity mode without a
-/// silent no-op.
-///
-/// **Three independent numeric knobs, each clamped and echoed
-/// (Decision 9):**
-/// - `max_iterations`: default 50, `0` resolves to the default, ceiling 500.
-/// - `members_per_community`: default 10, `0` resolves to the default,
-///   ceiling 100. Caps each community's `members` list IN PLACE —
-///   independent of `limit`/`offset` page-level pagination, mirroring
-///   [`Cycle`]'s per-cycle `max_cycle_size` axis exactly (see
-///   [`Community`]).
-/// - `limit`/`offset`: standard envelope pagination, default 100, ceiling
-///   1000 (same convention as every other `Page<T>` tool). Unlike
-///   `detect_cycles`, this envelope IS byte-budgeted via
-///   [`byte_budget_take`] — the member cap is applied to every community
-///   BEFORE byte-budget pagination runs, so the byte count the budget
-///   sees matches the payload actually emitted (the two caps stay
-///   independent in effect, not just in the wire shape).
-///
-/// `total` is the pre-pagination community count; `node_count`/
-/// `edge_count` describe the aggregated file graph itself (not a
-/// per-page quantity), so they are NOT affected by pagination.
+/// MCP adapter for [`crate::core::structure::detect_communities`].
+#[allow(clippy::too_many_arguments)] // Thin adapter mirrors the typed operation.
 pub fn detect_communities(
     graph: &RwLock<Graph>,
+    indexed: bool,
     granularity: Option<&str>,
     max_iterations: Option<u32>,
     members_per_community: Option<u32>,
@@ -436,7 +295,7 @@ pub fn detect_communities(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::structure::detect_communities(
         graph,
-        true,
+        indexed,
         granularity,
         max_iterations,
         members_per_community,
@@ -552,7 +411,7 @@ mod tests {
     #[test]
     fn detect_cycles_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -577,7 +436,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -599,7 +458,7 @@ mod tests {
             edges: vec![include_edge(&native("/b.h"), &native("/a.h"))],
         });
         let g = locked(g);
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1, "exactly one cycle in results");
         assert_eq!(total, 1, "total reports the full cycle count");
@@ -649,7 +508,7 @@ mod tests {
         let g = locked(g);
 
         let subtree = native("/a");
-        let r = detect_cycles(&g, Some(&subtree), None, None, None);
+        let r = detect_cycles(&g, true, Some(&subtree), None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(total, 1);
@@ -657,7 +516,7 @@ mod tests {
         let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(names, vec![native("/a/x.h"), native("/a/y.h")]);
 
-        let r_all = detect_cycles(&g, None, None, None, None);
+        let r_all = detect_cycles(&g, true, None, None, None, None);
         let (arr_all, total_all, _, _) = page_parts(&r_all);
         assert_eq!(arr_all.len(), 2);
         assert_eq!(total_all, 2);
@@ -683,7 +542,7 @@ mod tests {
         });
         let g = locked(g);
 
-        let r = detect_cycles(&g, Some("/a"), None, None, None);
+        let r = detect_cycles(&g, true, Some("/a"), None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -692,7 +551,7 @@ mod tests {
     #[test]
     fn detect_cycles_default_limit_is_20() {
         let g = locked(graph_with_n_cycles(25));
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         let (arr, total, _, limit) = page_parts(&r);
         assert_eq!(arr.len(), 20);
         assert_eq!(total, 25);
@@ -707,9 +566,9 @@ mod tests {
     #[test]
     fn detect_cycles_page_1_and_page_2_cover_full_set_no_overlap() {
         let g = locked(graph_with_n_cycles(30));
-        let r1 = detect_cycles(&g, None, Some(20), Some(0), None);
+        let r1 = detect_cycles(&g, true, None, Some(20), Some(0), None);
         let (arr1, total1, _, _) = page_parts(&r1);
-        let r2 = detect_cycles(&g, None, Some(20), Some(20), None);
+        let r2 = detect_cycles(&g, true, None, Some(20), Some(20), None);
         let (arr2, total2, _, _) = page_parts(&r2);
         assert_eq!(total1, 30);
         assert_eq!(total2, 30, "total invariant across pages");
@@ -755,7 +614,7 @@ mod tests {
         // the full set, so the envelope must advertise that more cycles
         // exist (truncated=true) and where to resume (next_offset=10).
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, None, Some(10), Some(0), None);
+        let r = detect_cycles(&g, true, None, Some(10), Some(0), None);
         let (arr, total, offset, limit) = page_parts(&r);
         assert_eq!(arr.len(), 10, "limit caps the page at 10 cycles");
         assert_eq!(total, 100, "total is the pre-pagination cycle count");
@@ -772,7 +631,7 @@ mod tests {
         // than the limit. offset(95) + emitted(5) == total(100), so this
         // is the natural tail — truncated=false, next_offset=None.
         let g = locked(graph_with_n_cycles(100));
-        let r = detect_cycles(&g, None, Some(10), Some(95), None);
+        let r = detect_cycles(&g, true, None, Some(10), Some(95), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert_eq!(arr.len(), 5, "only the trailing 5 cycles remain");
         assert_eq!(total, 100);
@@ -785,7 +644,7 @@ mod tests {
     #[test]
     fn detect_cycles_offset_beyond_total_returns_empty_envelope() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, None, None, Some(999), None);
+        let r = detect_cycles(&g, true, None, None, Some(999), None);
         let (arr, total, offset, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 3, "total still reports full cycle count");
@@ -800,7 +659,7 @@ mod tests {
     #[test]
     fn detect_cycles_limit_clamps_at_1000() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, None, Some(999_999), None, None);
+        let r = detect_cycles(&g, true, None, Some(999_999), None, None);
         let (arr, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000, "echo the clamped limit");
         assert_eq!(arr.len(), 3, "all 3 cycles returned when data < cap");
@@ -809,7 +668,7 @@ mod tests {
     #[test]
     fn detect_cycles_zero_limit_uses_default() {
         let g = locked(graph_with_n_cycles(3));
-        let r = detect_cycles(&g, None, Some(0), None, None);
+        let r = detect_cycles(&g, true, None, Some(0), None, None);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 20);
     }
@@ -856,7 +715,7 @@ mod tests {
         // cycle on the page is clipped to 50 paths and self-reports the
         // truncation via truncated:true + original_len:Some(100).
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, None, None, None, Some(50));
+        let r = detect_cycles(&g, true, None, None, None, Some(50));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1, "still exactly one cycle");
         assert_eq!(arr.len(), 1);
@@ -880,7 +739,7 @@ mod tests {
         // must apply, producing the identical clip/flag/original_len as
         // the explicit-50 case above. Pins the default resolution.
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         let (arr, _, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         let files = arr[0]["files"].as_array().unwrap();
@@ -896,7 +755,7 @@ mod tests {
         // original_len ABSENT (skipped when None). Pins the not-truncated
         // path and the orthogonality of the two truncation axes.
         let g = locked(graph_with_one_cycle_of_n_files(10));
-        let r = detect_cycles(&g, None, None, None, None);
+        let r = detect_cycles(&g, true, None, None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1);
         assert_eq!(arr.len(), 1);
@@ -922,7 +781,7 @@ mod tests {
         // axes are orthogonal: a non-truncated envelope can carry a
         // per-cycle-truncated cycle.
         let g = locked(graph_with_one_cycle_of_n_files(100));
-        let r = detect_cycles(&g, None, Some(1000), Some(0), Some(50));
+        let r = detect_cycles(&g, true, None, Some(1000), Some(0), Some(50));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 1);
         assert_eq!(arr.len(), 1);
@@ -1013,6 +872,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1039,6 +899,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1059,6 +920,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1078,6 +940,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1149,6 +1012,7 @@ mod tests {
         let g = locked(g);
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1214,6 +1078,7 @@ mod tests {
 
         let r_high = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1235,6 +1100,7 @@ mod tests {
 
         let r_vh = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1308,6 +1174,7 @@ mod tests {
 
         let r_vh = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1351,6 +1218,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1373,6 +1241,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1401,6 +1270,7 @@ mod tests {
         let g = locked(graph_with_reliable_and_unreliable_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1599,6 +1469,7 @@ mod tests {
         let g = locked(graph_with_orphans_two_dirs());
         let r = get_orphans(
             &g,
+            true,
             None,
             Some("/a"),
             None,
@@ -1622,6 +1493,7 @@ mod tests {
         // No subtree → both orphans.
         let r_all = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1641,6 +1513,7 @@ mod tests {
         let g = locked(graph_with_orphans_two_dirs());
         let r = get_orphans(
             &g,
+            true,
             None,
             Some("/nowhere"),
             None,
@@ -1664,6 +1537,7 @@ mod tests {
         let g = locked(graph_with_orphans_two_dirs());
         let r = get_orphans(
             &g,
+            true,
             None,
             Some("/a"),
             None,
@@ -1683,6 +1557,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1711,6 +1586,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             Some("class"),
             None,
             None,
@@ -1732,6 +1608,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_orphans(
             &g,
+            true,
             Some("widget"),
             None,
             None,
@@ -1750,6 +1627,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1774,6 +1652,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             Some(""),
             None,
             None,
@@ -1795,6 +1674,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1845,6 +1725,7 @@ mod tests {
         let g = locked(graph_with_n_orphan_functions(25));
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -1869,6 +1750,7 @@ mod tests {
 
         let p1 = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -1881,6 +1763,7 @@ mod tests {
         let (a1, t1, _, _) = page_parts(&p1);
         let p2 = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -1914,6 +1797,7 @@ mod tests {
         let g = locked(graph_with_n_orphan_functions(30));
         let r1 = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -1925,6 +1809,7 @@ mod tests {
         );
         let r2 = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -1936,6 +1821,7 @@ mod tests {
         );
         let r3 = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(5),
@@ -1962,6 +1848,7 @@ mod tests {
         let g = locked(graph_with_n_orphan_functions(5));
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(999_999),
@@ -1982,6 +1869,7 @@ mod tests {
         let g = locked(graph_with_n_orphan_functions(5));
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(0),
@@ -2001,6 +1889,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -2039,6 +1928,7 @@ mod tests {
         let g = locked(g);
         let r = get_orphans(
             &g,
+            true,
             Some("class"),
             None,
             Some(10),
@@ -2062,6 +1952,7 @@ mod tests {
         let g = locked(graph_with_orphans());
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             None,
@@ -2108,6 +1999,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -2156,6 +2048,7 @@ mod tests {
         let g = locked(graph_with_n_orphan_functions(30));
         let r = get_orphans(
             &g,
+            true,
             None,
             None,
             Some(20),
@@ -2191,7 +2084,18 @@ mod tests {
         // (d) truncated=false and next_offset is None, (e) serialized body
         // is well under 1024 bytes regardless of input scale.
         let g = locked(graph_with_n_orphan_functions(1000));
-        let r = get_orphans(&g, None, None, None, None, None, true, None, NO_BYTE_BUDGET);
+        let r = get_orphans(
+            &g,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            NO_BYTE_BUDGET,
+        );
 
         let body = body_text(&r);
         assert!(
@@ -2234,6 +2138,7 @@ mod tests {
         // kind=function => 2 orphans (foo, baz).
         let r = get_orphans(
             &g,
+            true,
             Some("function"),
             None,
             None,
@@ -2250,6 +2155,7 @@ mod tests {
         // kind=class => 1 orphan (cls).
         let r = get_orphans(
             &g,
+            true,
             Some("class"),
             None,
             None,
@@ -2271,6 +2177,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_orphans(
             &g,
+            true,
             Some("widget"),
             None,
             None,
@@ -2313,7 +2220,7 @@ mod tests {
     #[test]
     fn class_hierarchy_missing_class_param_errors() {
         let g = locked(Graph::new());
-        let r = get_class_hierarchy(&g, "", None, None);
+        let r = get_class_hierarchy(&g, true, "", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'class' is required");
     }
@@ -2340,7 +2247,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_class_hierarchy(&g, "SharedName", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "SharedName", Some(1), None);
         assert_eq!(r.is_error, Some(true));
         let body = body_text(&r);
         assert!(body.contains("ambiguous"), "must say 'ambiguous': {body}");
@@ -2355,7 +2262,7 @@ mod tests {
     #[test]
     fn class_hierarchy_single_class_unambiguous_walks_as_before() {
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Base", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "Base", Some(1), None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
     }
 
@@ -2379,7 +2286,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = find_class_candidates(&g, "Foo");
+        let r = find_class_candidates(&g, true, "Foo");
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let arr = parsed.as_array().unwrap();
@@ -2398,10 +2305,10 @@ mod tests {
     #[test]
     fn find_class_candidates_empty_name_errors_unknown_name_returns_empty_array() {
         let g = locked(class_graph());
-        let r = find_class_candidates(&g, "");
+        let r = find_class_candidates(&g, true, "");
         assert_eq!(r.is_error, Some(true));
 
-        let r = find_class_candidates(&g, "NoSuchClass");
+        let r = find_class_candidates(&g, true, "NoSuchClass");
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         assert_eq!(body_text(&r), "[]");
     }
@@ -2427,7 +2334,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = find_class_candidates(&g, "Widget");
+        let r = find_class_candidates(&g, true, "Widget");
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1, "function must not surface as class candidate");
@@ -2437,7 +2344,7 @@ mod tests {
     #[test]
     fn class_hierarchy_returns_node_tree() {
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Mid", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "Mid", Some(1), None);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // The response is wrapped in {hierarchy, truncated, max_nodes,
@@ -2460,7 +2367,7 @@ mod tests {
     #[test]
     fn class_hierarchy_unknown_with_no_suggestions() {
         let g = locked(Graph::new());
-        let r = get_class_hierarchy(&g, "Nope", None, None);
+        let r = get_class_hierarchy(&g, true, "Nope", None, None);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "class not found: \"Nope\"");
     }
@@ -2470,7 +2377,7 @@ mod tests {
         // "B" is a substring of "Base" (Class) and of nothing else. The
         // function `looks_like_a_class_but_isnt` does not contain "B".
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "B", None, None);
+        let r = get_class_hierarchy(&g, true, "B", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.starts_with("class not found: \"B\""), "got: {text}");
@@ -2496,7 +2403,7 @@ mod tests {
             edges: vec![],
         });
         let g = locked(g);
-        let r = get_class_hierarchy(&g, "looks", None, None);
+        let r = get_class_hierarchy(&g, true, "looks", None, None);
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         // No class-like candidates → bare not-found.
@@ -2507,8 +2414,8 @@ mod tests {
     fn class_hierarchy_depth_zero_normalized_to_one() {
         // A None depth and a Some(0) both become 1.
         let g = locked(class_graph());
-        let with_zero = get_class_hierarchy(&g, "Mid", Some(0), None);
-        let with_none = get_class_hierarchy(&g, "Mid", None, None);
+        let with_zero = get_class_hierarchy(&g, true, "Mid", Some(0), None);
+        let with_none = get_class_hierarchy(&g, true, "Mid", None, None);
         assert_eq!(body_text(&with_zero), body_text(&with_none));
     }
 
@@ -2521,7 +2428,7 @@ mod tests {
         // receives a non-zero u32; this assertion belongs to the
         // handler, not the Graph layer.
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(0));
+        let r = get_class_hierarchy(&g, true, "Mid", Some(1), Some(0));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(
             parsed["max_nodes"],
@@ -2537,7 +2444,7 @@ mod tests {
         // resolves to the 1000 ceiling and the response echoes the
         // clamped value.
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(999_999));
+        let r = get_class_hierarchy(&g, true, "Mid", Some(1), Some(999_999));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["max_nodes"], serde_json::json!(1000));
     }
@@ -2550,7 +2457,7 @@ mod tests {
     #[test]
     fn class_hierarchy_accepts_symbol_id() {
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "/cls.cpp:Base", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "/cls.cpp:Base", Some(1), None);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "symbol_id input must walk the hierarchy: {r:?}"
@@ -2588,11 +2495,11 @@ mod tests {
         });
         let g = locked(g);
         // Bare-name still errors as ambiguous.
-        let bare = get_class_hierarchy(&g, "SharedName", Some(1), None);
+        let bare = get_class_hierarchy(&g, true, "SharedName", Some(1), None);
         assert_eq!(bare.is_error, Some(true));
 
         // Fully-qualified symbol_id walks successfully.
-        let r = get_class_hierarchy(&g, "/lib_a/object.h:SharedName", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "/lib_a/object.h:SharedName", Some(1), None);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "symbol_id input must bypass the ambiguity gate: {r:?}"
@@ -2617,7 +2524,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_class_hierarchy(&g, "/x.cpp:Helper", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "/x.cpp:Helper", Some(1), None);
         assert_eq!(r.is_error, Some(true));
         let body = body_text(&r);
         assert!(body.contains("\"/x.cpp:Helper\""), "names id: {body}");
@@ -2636,7 +2543,7 @@ mod tests {
     #[test]
     fn class_hierarchy_unknown_symbol_id_falls_through_to_not_found() {
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "/does/not/exist.cpp:Foo", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "/does/not/exist.cpp:Foo", Some(1), None);
         assert_eq!(r.is_error, Some(true));
         let body = body_text(&r);
         assert!(
@@ -2666,7 +2573,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_class_hierarchy(&g, "Foo", Some(1), None);
+        let r = get_class_hierarchy(&g, true, "Foo", Some(1), None);
         assert_eq!(r.is_error, Some(true));
         let body = body_text(&r);
         assert!(body.contains("ambiguous"));
@@ -2689,7 +2596,7 @@ mod tests {
         // derived side. Asserts the handler propagates `truncated=true`
         // and the budget cap echo.
         let g = locked(class_graph());
-        let r = get_class_hierarchy(&g, "Mid", Some(1), Some(2));
+        let r = get_class_hierarchy(&g, true, "Mid", Some(1), Some(2));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["truncated"], serde_json::json!(true));
         assert_eq!(parsed["max_nodes"], serde_json::json!(2));
@@ -2746,7 +2653,7 @@ mod tests {
     #[test]
     fn coupling_missing_file_param_errors() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "", None, None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(&g, true, "", None, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -2754,7 +2661,7 @@ mod tests {
     #[test]
     fn coupling_outgoing_default_returns_page() {
         let g = locked(coupling_graph());
-        let r = get_coupling(&g, "/a.cpp", None, None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(&g, true, "/a.cpp", None, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (rows, total, truncated, next) = coupling_page(&r);
         // 1 call + 1 include into /b.cpp -> a single row with count 2.
@@ -2767,7 +2674,15 @@ mod tests {
     #[test]
     fn coupling_incoming_returns_callers_and_includers_page() {
         let g = locked(coupling_graph());
-        let r = get_coupling(&g, "/b.cpp", Some("incoming"), None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(
+            &g,
+            true,
+            "/b.cpp",
+            Some("incoming"),
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         let (rows, total, _, _) = coupling_page(&r);
         assert_eq!(rows, vec![("/a.cpp".to_string(), 2)]);
         assert_eq!(total, 1);
@@ -2797,7 +2712,15 @@ mod tests {
             ],
         });
         let g = locked(g);
-        let r = get_coupling(&g, "/hub.cpp", Some("outgoing"), None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(
+            &g,
+            true,
+            "/hub.cpp",
+            Some("outgoing"),
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         let (rows, total, _, _) = coupling_page(&r);
         assert_eq!(
             rows,
@@ -2836,7 +2759,7 @@ mod tests {
             edges: vec![include_edge("/c.cpp", "/a.cpp")],
         });
         let g = locked(g);
-        let r = get_coupling(&g, "/a.cpp", Some("both"), None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(&g, true, "/a.cpp", Some("both"), None, None, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let incoming = &parsed["incoming"]["results"];
         let outgoing = &parsed["outgoing"]["results"];
@@ -2892,7 +2815,7 @@ mod tests {
             });
         }
         let g = locked(g);
-        let r = get_coupling(&g, "/target.cpp", Some("both"), None, None, 560);
+        let r = get_coupling(&g, true, "/target.cpp", Some("both"), None, None, 560);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // Incoming has all 4 includers as `total`; whatever fits is fine,
         // the discriminator is the outgoing starvation.
@@ -2920,7 +2843,15 @@ mod tests {
     #[test]
     fn coupling_invalid_direction_errors() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "/a.cpp", Some("sideways"), None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(
+            &g,
+            true,
+            "/a.cpp",
+            Some("sideways"),
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             body_text(&r),
@@ -2931,7 +2862,7 @@ mod tests {
     #[test]
     fn coupling_unknown_file_returns_empty_page() {
         let g = locked(Graph::new());
-        let r = get_coupling(&g, "/never.cpp", None, None, None, NO_BYTE_BUDGET);
+        let r = get_coupling(&g, true, "/never.cpp", None, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (rows, total, truncated, next) = coupling_page(&r);
         assert!(rows.is_empty());
@@ -2993,7 +2924,7 @@ mod tests {
     #[test]
     fn diagram_no_param_errors() {
         let g = locked(Graph::new());
-        let r = generate_diagram(&g, GenerateDiagramInput::default());
+        let r = generate_diagram(&g, true, GenerateDiagramInput::default());
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             body_text(&r),
@@ -3006,6 +2937,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 file: Some("/x.cpp"),
@@ -3024,6 +2956,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("a"),
                 file: Some("/x.cpp"),
@@ -3040,6 +2973,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some(""),
                 file: Some(""),
@@ -3059,6 +2993,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 ..GenerateDiagramInput::default()
@@ -3078,6 +3013,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 file: Some("/x.cpp"),
                 ..GenerateDiagramInput::default()
@@ -3095,6 +3031,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 class: Some("Base"),
                 ..GenerateDiagramInput::default()
@@ -3113,6 +3050,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 format: Some("mermaid"),
@@ -3129,6 +3067,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 format: Some("mermaid"),
@@ -3146,6 +3085,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 format: Some("svg"),
@@ -3164,6 +3104,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 direction: Some("calle_es"),
@@ -3185,6 +3126,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 file: Some("/x.cpp"),
                 direction: Some("not-a-direction"),
@@ -3205,6 +3147,7 @@ mod tests {
         // "a" is a substring of `/x.cpp:a` — should suggest.
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("a"),
                 ..GenerateDiagramInput::default()
@@ -3221,6 +3164,7 @@ mod tests {
         let g = locked(diagram_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 file: Some("/never.cpp"),
                 ..GenerateDiagramInput::default()
@@ -3237,6 +3181,7 @@ mod tests {
         // "B" → "Base" (Class).
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 class: Some("B"),
                 ..GenerateDiagramInput::default()
@@ -3261,6 +3206,7 @@ mod tests {
         let g = locked(g);
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 class: Some("Solo"),
                 ..GenerateDiagramInput::default()
@@ -3328,6 +3274,7 @@ mod tests {
         let g = locked(directional_call_graph_with_heuristic_outbound());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 direction: Some("both"),
@@ -3346,6 +3293,7 @@ mod tests {
         let g = locked(directional_call_graph_with_heuristic_outbound());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 direction: Some("both"),
@@ -3368,6 +3316,7 @@ mod tests {
         let g = locked(directional_call_graph_with_heuristic_outbound());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 min_confidence: Some("low"),
@@ -3390,6 +3339,7 @@ mod tests {
         let g = locked(directional_call_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 direction: Some("callees"),
@@ -3418,6 +3368,7 @@ mod tests {
         let g = locked(directional_call_graph());
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 direction: Some("callers"),
@@ -3472,6 +3423,7 @@ mod tests {
         let g = locked(g);
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/shared.cpp:Update"),
                 direction: Some("callers"),
@@ -3525,6 +3477,7 @@ mod tests {
         let g = locked(g);
         let r = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 symbol: Some("/x.cpp:a"),
                 ..GenerateDiagramInput::default()
@@ -3612,7 +3565,7 @@ mod tests {
 
         // (1) Canonical form — the baseline. Asserts the fixture is sound
         // before we exercise the normalize path.
-        let r_canonical = get_coupling(&g, canonical_str, None, None, None, NO_BYTE_BUDGET);
+        let r_canonical = get_coupling(&g, true, canonical_str, None, None, None, NO_BYTE_BUDGET);
         assert!(r_canonical.is_error.is_none() || r_canonical.is_error == Some(false));
         let (rows_canonical, _, _, _) = coupling_page(&r_canonical);
         assert_eq!(rows_canonical, vec![("/b.cpp".to_string(), 1)]);
@@ -3627,7 +3580,7 @@ mod tests {
             "messy fixture must differ from canonical for the test to be meaningful"
         );
 
-        let r_messy = get_coupling(&g, messy_str, None, None, None, NO_BYTE_BUDGET);
+        let r_messy = get_coupling(&g, true, messy_str, None, None, None, NO_BYTE_BUDGET);
         assert!(
             r_messy.is_error.is_none() || r_messy.is_error == Some(false),
             "messy form must succeed after normalize: body={}",
@@ -3681,6 +3634,7 @@ mod tests {
         // (1) Canonical form — baseline.
         let r_canonical = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 file: Some(canonical_str),
                 ..GenerateDiagramInput::default()
@@ -3703,6 +3657,7 @@ mod tests {
 
         let r_messy = generate_diagram(
             &g,
+            true,
             GenerateDiagramInput {
                 file: Some(messy_str),
                 ..GenerateDiagramInput::default()
@@ -3763,7 +3718,7 @@ mod tests {
         let g = locked(communities_fixture());
 
         // limit = 0 resolves to the default (100); offset defaults to 0.
-        let r = detect_communities(&g, None, None, None, Some(0), None, NO_BYTE_BUDGET);
+        let r = detect_communities(&g, true, None, None, None, Some(0), None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(v["limit"], serde_json::json!(100));
@@ -3776,7 +3731,7 @@ mod tests {
 
         // A limit above the 1000 ceiling clamps and the clamp is visible
         // on the wire.
-        let r2 = detect_communities(&g, None, None, None, Some(5000), None, NO_BYTE_BUDGET);
+        let r2 = detect_communities(&g, true, None, None, None, Some(5000), None, NO_BYTE_BUDGET);
         let v2: serde_json::Value = serde_json::from_str(&body_text(&r2)).unwrap();
         assert_eq!(v2["limit"], serde_json::json!(1000));
     }
@@ -3785,7 +3740,7 @@ mod tests {
     fn detect_communities_member_capped_community_carries_truncated_and_original_len() {
         let g = locked(communities_fixture());
 
-        let r = detect_communities(&g, None, None, Some(2), None, None, NO_BYTE_BUDGET);
+        let r = detect_communities(&g, true, None, None, Some(2), None, None, NO_BYTE_BUDGET);
         let (results, total, _offset, _limit) = page_parts(&r);
         assert_eq!(total, 2);
 
@@ -3809,7 +3764,16 @@ mod tests {
     #[test]
     fn detect_communities_unknown_granularity_is_a_tool_error() {
         let g = locked(communities_fixture());
-        let r = detect_communities(&g, Some("symbol"), None, None, None, None, NO_BYTE_BUDGET);
+        let r = detect_communities(
+            &g,
+            true,
+            Some("symbol"),
+            None,
+            None,
+            None,
+            None,
+            NO_BYTE_BUDGET,
+        );
         assert_eq!(r.is_error, Some(true));
         assert!(body_text(&r).contains("granularity"));
     }

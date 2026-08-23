@@ -119,7 +119,14 @@ async fn get_dependencies_and_diagram_non_empty_for_rust() {
 
     // get_dependencies(lib.rs) must surface a.rs and b.rs (and nothing
     // else — there are no use/extern_crate edges in this fixture).
-    let deps = get_dependencies(&server.inner.graph, &lib_str, None, None, NO_BYTE_BUDGET);
+    let deps = get_dependencies(
+        &server.inner.graph,
+        true,
+        &lib_str,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let body = ok_json(&deps);
     let rows = body["results"]
         .as_array()
@@ -153,6 +160,7 @@ async fn get_dependencies_and_diagram_non_empty_for_rust() {
     // edge originating at the requested file.
     let r = generate_diagram(
         &server.inner.graph,
+        true,
         GenerateDiagramInput {
             file: Some(&lib_str),
             format: Some("edges"),
@@ -225,7 +233,7 @@ async fn detect_cycles_finds_mod_a_mod_b_mod_a_cycle() {
     let server = rust_only_server();
     analyze(&server, &root).await;
 
-    let cycles = detect_cycles(&server.inner.graph, None, None, None, None);
+    let cycles = detect_cycles(&server.inner.graph, true, None, None, None, None);
     let parsed: serde_json::Value =
         serde_json::from_str(&first_text(&cycles)).expect("detect_cycles JSON");
     let results = parsed["results"]
@@ -280,7 +288,14 @@ async fn use_and_extern_crate_still_drop_after_2_2() {
     analyze(&server, &root).await;
 
     let lib_str = lib.to_string_lossy().into_owned();
-    let deps = get_dependencies(&server.inner.graph, &lib_str, None, None, NO_BYTE_BUDGET);
+    let deps = get_dependencies(
+        &server.inner.graph,
+        true,
+        &lib_str,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let body = ok_json(&deps);
     let rows = body["results"]
         .as_array()

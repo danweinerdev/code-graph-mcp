@@ -70,6 +70,7 @@ async fn analyze_then_query_pipeline() {
     let engine_cpp = path.join("engine.cpp").to_string_lossy().into_owned();
     let sr = get_file_symbols(
         &server.inner.graph,
+        true,
         &engine_cpp,
         false,
         true,
@@ -86,14 +87,29 @@ async fn analyze_then_query_pipeline() {
 
     // Summary returns the `Page<SummaryRow>` envelope; assert the envelope
     // shape is present and `results` is non-empty for the indexed fixture.
-    let summary = get_symbol_summary(&server.inner.graph, None, None, None, false, NO_BYTE_BUDGET);
+    let summary = get_symbol_summary(
+        &server.inner.graph,
+        true,
+        None,
+        None,
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&summary)).unwrap();
     let results = parsed["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "indexed fixture has at least one row");
 
     // Dependencies returns engine.h + utils.h for engine.cpp, now as a
     // Page<DependencyEntry> envelope ({file, kind, line} rows).
-    let deps = get_dependencies(&server.inner.graph, &engine_cpp, None, None, NO_BYTE_BUDGET);
+    let deps = get_dependencies(
+        &server.inner.graph,
+        true,
+        &engine_cpp,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+    );
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&deps)).unwrap();
     let arr = parsed["results"].as_array().expect("results array");
     let dep_files: Vec<&str> = arr.iter().filter_map(|v| v["file"].as_str()).collect();
@@ -113,7 +129,7 @@ async fn analyze_then_query_pipeline() {
     // detect_cycles surfaces the circular_a/circular_b cycle. Wrapped in
     // the Page<Vec<String>> envelope — the cycle is in `results[0]`,
     // count in `total`.
-    let cycles = detect_cycles(&server.inner.graph, None, None, None, None);
+    let cycles = detect_cycles(&server.inner.graph, true, None, None, None, None);
     let parsed: serde_json::Value = serde_json::from_str(&first_text(&cycles)).unwrap();
     let arr = parsed["results"].as_array().expect("results array");
     assert_eq!(

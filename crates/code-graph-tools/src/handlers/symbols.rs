@@ -24,51 +24,11 @@ use std::path::Path;
 #[cfg(test)]
 use super::{Page, SymbolResult};
 
-/// `get_file_symbols` body. Returns a tool error when `file` is empty or
-/// when the file has no symbols at all (raw set empty — the Go binary's
-/// wording is preserved verbatim: `"no symbols found in file: <file>"`).
-///
-/// Output is the shared [`Page`]`<`[`SymbolResult`]`>` envelope. The
-/// post-filter result set is sorted by `symbol_id` ascending so page 1 +
-/// page 2 partition the rows deterministically across calls, then sliced
-/// by the resolved offset/limit. `total` reports the post-filter,
-/// pre-pagination count so callers can render "page X of Y" UIs.
-///
-/// Order of operations is load-bearing: the empty-raw-set check runs
-/// **before** filtering and pagination so a misspelled file path always
-/// surfaces the existing diagnostic error wording. A non-empty raw set
-/// that filters to empty (e.g. `top_level_only=true` on a file containing
-/// only methods) returns an envelope with `results: []` and `total: 0`,
-/// not an error — that distinction is what lets the agent tell "wrong
-/// file" apart from "filter excluded everything".
-///
-/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
-/// default" (mirrors `search_symbols` and `get_orphans`); `limit` is
-/// silently clamped at 1000. `offset >= total` returns an empty `results`
-/// page with the correct `total`.
-///
-/// When `count_only = true`, the handler returns the sentinel response
-/// shape `Page { results: [], total, offset: 0, limit: 0,
-/// truncated: false, next_offset: None }` after computing `total` via the
-/// cheap path (filter + count), without ever materializing
-/// `SymbolResult`s or invoking the byte-budget helper. The empty-raw-set
-/// check still runs first, so a misspelled file path surfaces the
-/// diagnostic error wording even on a count_only call. `limit: 0` is a
-/// deliberate exception to the "envelope echoes resolved limit" contract
-/// (documented in CLAUDE.md).
-///
-/// `#[allow(clippy::too_many_arguments)]`: the existing call-site
-/// convention for `get_file_symbols` (and `get_orphans`) is positional
-/// args. `count_only` is the 8th positional parameter, preserving that
-/// convention for the ~25 existing call sites (tests, watch handlers,
-/// integration). The
-/// `GenerateDiagramInput` / `SearchSymbolsInput` struct pattern is used
-/// elsewhere in this module where the arg count crossed the threshold
-/// before any consumers existed; here, we accept the lint to avoid a
-/// breaking refactor across every caller.
+/// MCP adapter for [`crate::core::symbols::get_file_symbols`].
 #[allow(clippy::too_many_arguments)]
 pub fn get_file_symbols(
     graph: &RwLock<Graph>,
+    indexed: bool,
     file: &str,
     top_level_only: bool,
     brief: bool,
@@ -79,7 +39,7 @@ pub fn get_file_symbols(
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::symbols::get_file_symbols(
         graph,
-        true,
+        indexed,
         file,
         top_level_only,
         brief,
@@ -90,37 +50,10 @@ pub fn get_file_symbols(
     ))
 }
 
-/// `get_symbol_at` body. Answers "what symbol encloses this line?" by
-/// span containment — **not** goto-definition: it does not resolve an
-/// identifier to its binding (scope resolution is a documented Non-Goal).
-/// Delegates the containment scan + total ordering to
-/// [`code_graph_graph::Graph::symbols_at_line`].
-///
-/// `line` is 1-based; `line == 0` is rejected as a tool error rather than
-/// silently clamped, since a caller passing `0` almost certainly has an
-/// off-by-one bug worth surfacing immediately. An unknown `file` is a tool
-/// error naming the path (mirrors the `generate_diagram(file=…)` wording:
-/// `"file not found: {file:?}"`) — this handler distinguishes "file isn't
-/// indexed at all" from "file is indexed but nothing encloses this line"
-/// via [`code_graph_graph::Graph::has_file`], a real presence check on the
-/// `files` PathTrie — NOT `file_symbols(path).is_empty()`, which conflates
-/// "no `FileEntry`" with "`FileEntry` exists but the file has zero
-/// symbols" (a forward-declaration-only header, a comment-only file, an
-/// unconfigured macro invocation — all legitimately indexed, all
-/// zero-symbol). A file present in the graph with zero symbols, or with
-/// symbols but none enclosing `line`, is SUCCESS with an empty `Page`,
-/// never a tool error and never a nearest-neighbour guess (the trap this
-/// handler exists to avoid). Only a file genuinely absent from the graph
-/// is the tool error.
-///
-/// Defaults: `limit = 100`, `offset = 0`, mirroring [`get_file_symbols`];
-/// `limit = 0` means "use the default" and `limit` is clamped at 1000.
-/// Results are already in [`code_graph_graph::Graph::symbols_at_line`]'s
-/// total order (`span_lines` asc, `line` desc, `symbol_id` asc — innermost
-/// first) before pagination, so page boundaries are deterministic across
-/// calls without re-sorting here.
+/// MCP adapter for [`crate::core::symbols::get_symbol_at`].
 pub fn get_symbol_at(
     graph: &RwLock<Graph>,
+    indexed: bool,
     file: &str,
     line: u32,
     limit: Option<u32>,
@@ -128,7 +61,7 @@ pub fn get_symbol_at(
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::symbols::get_symbol_at(
-        graph, true, file, line, limit, offset, max_bytes,
+        graph, indexed, file, line, limit, offset, max_bytes,
     ))
 }
 
@@ -176,32 +109,15 @@ pub struct SearchSymbolsInput<'a> {
     pub max_distance: Option<u32>,
 }
 
-/// `search_symbols` body. Validates that at least one filter was supplied,
-/// parses string-typed filters into their typed forms, then delegates to
-/// `Graph::search`. The pagination envelope is always present — `total`
-/// is reported pre-pagination so callers can render "page X of Y" UIs.
-///
-/// **Architectural exception:**
-/// unlike the four materializing handlers (orphans, file_symbols, callers,
-/// callees) that operate on a full match set before pagination, this handler
-/// receives an already-sliced page from `Graph::search` (the heap inside
-/// `search` keeps only `offset + limit` records). The byte-budget trim is
-/// applied at the handler layer here as a post-process on `sr.symbols`,
-/// NOT via `byte_budget_take` (whose `offset`/`limit` semantics don't apply
-/// to an already-paginated page).
-///
-/// Truncation distinction matters: `sr.total > offset + emitted` means the
-/// page stopped before the match set was exhausted, whether the count limit
-/// or byte budget cut it. A naturally exhausted final page reports
-/// `truncated=false`. `total` always carries `sr.total` (the pre-pagination
-/// match count from `Graph::search`).
+/// MCP adapter for [`crate::core::symbols::search_symbols`].
 pub fn search_symbols(
     graph: &RwLock<Graph>,
+    indexed: bool,
     input: SearchSymbolsInput<'_>,
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::symbols::search_symbols(
-        graph, true, input, max_bytes,
+        graph, indexed, input, max_bytes,
     ))
 }
 
@@ -273,45 +189,17 @@ pub(crate) fn levenshtein(a: &[char], b: &[char], cap: usize) -> usize {
     prev[m]
 }
 
-/// `get_symbol_detail` body. Returns full detail (brief=false) on hit; on
-/// miss, attaches a did-you-mean suggestion when any candidate symbols
-/// match the substring.
-pub fn get_symbol_detail(graph: &RwLock<Graph>, symbol: &str) -> CallToolResult {
-    crate::core::to_call_tool_result(crate::core::symbols::get_symbol_detail(graph, true, symbol))
+/// MCP adapter for [`crate::core::symbols::get_symbol_detail`].
+pub fn get_symbol_detail(graph: &RwLock<Graph>, indexed: bool, symbol: &str) -> CallToolResult {
+    crate::core::to_call_tool_result(crate::core::symbols::get_symbol_detail(
+        graph, indexed, symbol,
+    ))
 }
 
-/// `get_symbol_summary` body. Returns a [`Page`]`<`[`SummaryRow`]`>`
-/// envelope where each row is one `(namespace, kind, count)` triple.
-///
-/// The response is the shared `Page<T>` envelope rather than a nested
-/// `HashMap<String, HashMap<&'static str, u32>>` so the summary handler
-/// reuses the existing pagination + byte-budget machinery (the nested
-/// shape caused a 196 KB UE-scale rejection). Pagination flow:
-/// flatten → sort by `(namespace, kind)` → `byte_budget_take`. Empty
-/// namespaces display as `<global>` via a row-build-time substitution;
-/// the graph's `Symbol.namespace` field is never mutated, and
-/// `search_symbols(namespace="")` still filters by the empty string.
-///
-/// Defaults: `limit = 100`, `offset = 0`. `limit = 0` means "use the
-/// default" (mirrors `get_orphans` and `get_file_symbols`); `limit` is
-/// silently clamped at 1000. `offset >= total` returns an empty `results`
-/// page with the correct `total`. Rows are sorted by `(namespace, kind)`
-/// ascending so page 1 + page 2 partition the rows deterministically
-/// across calls. The `<global>` substitution happens BEFORE the sort, so
-/// `<global>` rows sort wherever `<` lands in ASCII (between `;` and `=`).
-///
-/// When `count_only = true`, the handler returns the sentinel
-/// response shape `Page { results: [], total, offset: 0, limit: 0,
-/// truncated: false, next_offset: None }` without flattening, sorting, or
-/// invoking the byte-budget helper. `total` is the count of distinct
-/// `(namespace, kind)` pairs across the summary — i.e. the row count the
-/// paginated path would emit — NOT the sum of per-pair symbol counts.
-/// Mirrors `get_orphans` / `search_symbols` / `get_file_symbols` count_only
-/// semantics. `count_only` callers opt out of paging, so `limit: 0` is a
-/// deliberate exception to the "envelope echoes resolved limit" contract
-/// (see CLAUDE.md).
+/// MCP adapter for [`crate::core::symbols::get_symbol_summary`].
 pub fn get_symbol_summary(
     graph: &RwLock<Graph>,
+    indexed: bool,
     file: Option<&str>,
     limit: Option<u32>,
     offset: Option<u32>,
@@ -319,7 +207,7 @@ pub fn get_symbol_summary(
     max_bytes: usize,
 ) -> CallToolResult {
     crate::core::to_call_tool_result(crate::core::symbols::get_symbol_summary(
-        graph, true, file, limit, offset, count_only, max_bytes,
+        graph, indexed, file, limit, offset, count_only, max_bytes,
     ))
 }
 
@@ -369,7 +257,7 @@ mod tests {
     #[test]
     fn file_symbols_missing_file_param_errors() {
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "", false, true, None, None, false, NO_BYTE_BUDGET);
+        let r = get_file_symbols(&g, true, "", false, true, None, None, false, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -379,6 +267,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_file_symbols(
             &g,
+            true,
             "/missing.cpp",
             false,
             true,
@@ -401,6 +290,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_file_symbols(
             &g,
+            true,
             "/missing.cpp",
             false,
             true,
@@ -437,6 +327,7 @@ mod tests {
         let g = locked(g);
         let r = get_file_symbols(
             &g,
+            true,
             "/methods_only.cpp",
             true,
             true,
@@ -457,7 +348,17 @@ mod tests {
     #[test]
     fn file_symbols_returns_full_list_in_brief_mode() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, false, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            true,
+            "/a.cpp",
+            false,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 3);
@@ -481,7 +382,17 @@ mod tests {
     #[test]
     fn file_symbols_top_level_only_filters_out_methods() {
         let g = locked(small_graph());
-        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, false, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            true,
+            "/a.cpp",
+            true,
+            true,
+            None,
+            None,
+            false,
+            NO_BYTE_BUDGET,
+        );
         let (arr, total, _, _) = page_parts(&r);
         // 3 symbols total, but `do_thing` has parent="Bar" so it's filtered.
         assert_eq!(arr.len(), 2);
@@ -499,6 +410,7 @@ mod tests {
         let g = locked(small_graph());
         let r = get_file_symbols(
             &g,
+            true,
             "/a.cpp",
             false,
             false,
@@ -546,6 +458,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(120));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -566,6 +479,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(150));
         let p1 = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -576,6 +490,7 @@ mod tests {
         );
         let p2 = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -610,6 +525,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(150));
         let r1 = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -620,6 +536,7 @@ mod tests {
         );
         let r2 = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -630,6 +547,7 @@ mod tests {
         );
         let r3 = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -654,6 +572,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(5));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -672,6 +591,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(5));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -689,6 +609,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(5));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -731,6 +652,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 300;
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -778,6 +700,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(30));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -804,7 +727,7 @@ mod tests {
         let g = locked(Graph::new());
         // Even with a pathologically tight budget that would normally
         // truncate everything, the empty-raw-set branch is preserved.
-        let r = get_file_symbols(&g, "/missing.cpp", false, true, None, None, false, 0);
+        let r = get_file_symbols(&g, true, "/missing.cpp", false, true, None, None, false, 0);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "no symbols found in file: /missing.cpp");
     }
@@ -853,6 +776,7 @@ mod tests {
         // before we exercise the normalize path.
         let r_canonical = get_file_symbols(
             &g,
+            true,
             canonical_str,
             false,
             true,
@@ -881,6 +805,7 @@ mod tests {
 
         let r_messy = get_file_symbols(
             &g,
+            true,
             messy_str,
             false,
             true,
@@ -924,6 +849,7 @@ mod tests {
         let g = locked(graph_with_n_file_symbols(1000));
         let r = get_file_symbols(
             &g,
+            true,
             "/big.cpp",
             false,
             true,
@@ -972,13 +898,33 @@ mod tests {
         let g = locked(small_graph());
 
         // top_level_only=false => 3 symbols.
-        let r = get_file_symbols(&g, "/a.cpp", false, true, None, None, true, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            true,
+            "/a.cpp",
+            false,
+            true,
+            None,
+            None,
+            true,
+            NO_BYTE_BUDGET,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["total"].as_u64().unwrap(), 3);
         assert!(parsed["results"].as_array().unwrap().is_empty());
 
         // top_level_only=true => 2 symbols (foo, Bar; Bar::do_thing has parent=Bar).
-        let r = get_file_symbols(&g, "/a.cpp", true, true, None, None, true, NO_BYTE_BUDGET);
+        let r = get_file_symbols(
+            &g,
+            true,
+            "/a.cpp",
+            true,
+            true,
+            None,
+            None,
+            true,
+            NO_BYTE_BUDGET,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["total"].as_u64().unwrap(), 2);
         assert!(parsed["results"].as_array().unwrap().is_empty());
@@ -993,6 +939,7 @@ mod tests {
         let g = locked(Graph::new());
         let r = get_file_symbols(
             &g,
+            true,
             "/missing.cpp",
             false,
             true,
@@ -1011,7 +958,7 @@ mod tests {
         // file param still surfaces the canonical "'file' is required"
         // tool error.
         let g = locked(Graph::new());
-        let r = get_file_symbols(&g, "", false, true, None, None, true, NO_BYTE_BUDGET);
+        let r = get_file_symbols(&g, true, "", false, true, None, None, true, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -1057,7 +1004,7 @@ mod tests {
     #[test]
     fn symbol_at_line_zero_errors() {
         let g = locked(nested_graph());
-        let r = get_symbol_at(&g, "/a.cpp", 0, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "/a.cpp", 0, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'line' must be >= 1 (lines are 1-based)");
     }
@@ -1065,7 +1012,7 @@ mod tests {
     #[test]
     fn symbol_at_unknown_file_errors() {
         let g = locked(nested_graph());
-        let r = get_symbol_at(&g, "/missing.cpp", 5, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "/missing.cpp", 5, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "file not found: \"/missing.cpp\"");
     }
@@ -1073,7 +1020,7 @@ mod tests {
     #[test]
     fn symbol_at_empty_file_param_errors() {
         let g = locked(nested_graph());
-        let r = get_symbol_at(&g, "", 5, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "", 5, None, None, NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'file' is required");
     }
@@ -1083,7 +1030,7 @@ mod tests {
         // Known file, but no symbol spans this line: SUCCESS with an
         // empty Page, NOT an error, NOT a nearest-neighbour guess.
         let g = locked(nested_graph());
-        let r = get_symbol_at(&g, "/a.cpp", 500, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "/a.cpp", 500, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, offset, limit) = page_parts(&r);
         assert!(arr.is_empty());
@@ -1095,7 +1042,7 @@ mod tests {
     #[test]
     fn symbol_at_nesting_returns_method_before_class() {
         let g = locked(nested_graph());
-        let r = get_symbol_at(&g, "/a.cpp", 7, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "/a.cpp", 7, None, None, NO_BYTE_BUDGET);
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(total, 2);
@@ -1120,7 +1067,7 @@ mod tests {
         });
         assert!(g.has_file(Path::new("/empty.cpp")));
         let g = locked(g);
-        let r = get_symbol_at(&g, "/empty.cpp", 5, None, None, NO_BYTE_BUDGET);
+        let r = get_symbol_at(&g, true, "/empty.cpp", 5, None, None, NO_BYTE_BUDGET);
         assert!(
             r.is_error.is_none() || r.is_error == Some(false),
             "zero-symbol indexed file must be SUCCESS, not a tool error"
@@ -1200,7 +1147,7 @@ mod tests {
             subtree: Some(&subtree),
             ..search_input()
         };
-        let r = search_symbols(&g, input, NO_BYTE_BUDGET);
+        let r = search_symbols(&g, true, input, NO_BYTE_BUDGET);
         let body: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = body["results"].as_array().unwrap();
         assert_eq!(
@@ -1223,7 +1170,7 @@ mod tests {
             query: Some("foo"),
             ..search_input()
         };
-        let r_all = search_symbols(&g, input_all, NO_BYTE_BUDGET);
+        let r_all = search_symbols(&g, true, input_all, NO_BYTE_BUDGET);
         let body_all: serde_json::Value = serde_json::from_str(&body_text(&r_all)).unwrap();
         assert_eq!(body_all["results"].as_array().unwrap().len(), 2);
         assert_eq!(body_all["total"].as_u64().unwrap(), 2);
@@ -1242,7 +1189,7 @@ mod tests {
             count_only: true,
             ..search_input()
         };
-        let r = search_symbols(&g, input, NO_BYTE_BUDGET);
+        let r = search_symbols(&g, true, input, NO_BYTE_BUDGET);
         let body: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(body["total"].as_u64().unwrap(), 1);
         assert!(body["results"].as_array().unwrap().is_empty());
@@ -1363,7 +1310,7 @@ mod tests {
     #[test]
     fn search_symbols_no_filter_errors() {
         let g = locked(small_graph());
-        let r = search_symbols(&g, search_input(), NO_BYTE_BUDGET);
+        let r = search_symbols(&g, true, search_input(), NO_BYTE_BUDGET);
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             body_text(&r),
@@ -1377,7 +1324,7 @@ mod tests {
         // language filter too). Locked in here so future edits to the message
         // are caught.
         let g = locked(small_graph());
-        let r = search_symbols(&g, search_input(), NO_BYTE_BUDGET);
+        let r = search_symbols(&g, true, search_input(), NO_BYTE_BUDGET);
         assert_eq!(
             body_text(&r),
             "'query', 'kind', 'namespace', or 'language' is required"
@@ -1389,6 +1336,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some(""),
@@ -1407,6 +1355,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 kind: Some("widget"),
@@ -1423,6 +1372,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 language: Some("ruby"),
@@ -1439,6 +1389,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("foo"),
@@ -1461,6 +1412,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("foo"),
@@ -1500,6 +1452,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("^is_empty$"),
                 kind: Some("method"),
@@ -1541,6 +1494,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("^AActr$"), // 1 edit from "AActor" (insert 'o' between 't' and 'r')
                 ..search_input()
@@ -1578,6 +1532,7 @@ mod tests {
         // Missing 'e' AND wrong case on 'c' = 2 edits.
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("^FAchievmentsClient$"),
                 ..search_input()
@@ -1617,6 +1572,7 @@ mod tests {
         // The inner pattern contains `.*` — a regex, not an identifier.
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("^.*ZZZNoSuchSymbol.*$"),
                 ..search_input()
@@ -1700,6 +1656,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actor"),
                 near: true,
@@ -1738,6 +1695,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("^Foo.*$"),
                 near: true,
@@ -1760,6 +1718,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some(""),
                 kind: Some("function"), // satisfy the at-least-one-filter check
@@ -1799,6 +1758,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actor"),
                 kind: Some("class"),
@@ -1839,6 +1799,7 @@ mod tests {
         // length 5 is 1, so this should match.
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("AActr"),
                 near: true,
@@ -1877,6 +1838,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actr"),
                 near: true,
@@ -1923,6 +1885,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actr"),
                 near: true,
@@ -1966,6 +1929,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actrx"),
                 near: true,
@@ -2026,6 +1990,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actr"),
                 near: true,
@@ -2091,6 +2056,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 query: Some("Actr"),
                 near: true,
@@ -2118,6 +2084,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 kind: Some("function"),
@@ -2135,6 +2102,7 @@ mod tests {
         let g = locked(small_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 language: Some("cpp"),
@@ -2195,6 +2163,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2247,6 +2216,7 @@ mod tests {
         let max_bytes = ENVELOPE_OVERHEAD_BYTES + 400;
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2296,6 +2266,7 @@ mod tests {
         // First call: tight budget, expect truncation.
         let r1 = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2321,6 +2292,7 @@ mod tests {
         // first record of the returned page is the one the trim DROPPED.
         let r2 = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2378,6 +2350,7 @@ mod tests {
         let g = locked(graph_with_n_broad_matches(100));
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2410,6 +2383,7 @@ mod tests {
         // reaches the natural end, so it has no further continuation.
         let r2 = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2441,6 +2415,7 @@ mod tests {
         let g = locked(graph_with_n_broad_matches(5));
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2474,6 +2449,7 @@ mod tests {
         let g = locked(graph_with_n_broad_matches(5));
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2518,6 +2494,7 @@ mod tests {
         let g = locked(graph_with_n_broad_matches(1000));
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2567,6 +2544,7 @@ mod tests {
 
         let r_count = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2580,6 +2558,7 @@ mod tests {
 
         let r_full = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("match"),
@@ -2607,6 +2586,7 @@ mod tests {
         // No filter supplied -> validation error even with count_only=true.
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 count_only: true,
@@ -2623,6 +2603,7 @@ mod tests {
         // Bad kind -> "invalid kind: widget" even with count_only=true.
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 kind: Some("widget"),
@@ -2669,6 +2650,7 @@ mod tests {
         let g = locked(suggestion_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^NotFoundClass$"),
@@ -2708,6 +2690,7 @@ mod tests {
         let g = locked(suggestion_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("Zzz_absent_Zzz"),
@@ -2739,6 +2722,7 @@ mod tests {
         let g = locked(suggestion_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^ExistingClass$"),
@@ -2775,6 +2759,7 @@ mod tests {
         let g = locked(suggestion_graph());
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^$"),
@@ -2822,6 +2807,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^Actr$"),
@@ -2871,6 +2857,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^DistantName$"),
@@ -2913,6 +2900,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^Foo.*Bar$"),
@@ -2952,6 +2940,7 @@ mod tests {
         let g = locked(g);
         let r = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("^FAchievmentsClient$"),
@@ -2974,7 +2963,7 @@ mod tests {
     #[test]
     fn get_symbol_detail_missing_param_errors() {
         let g = locked(Graph::new());
-        let r = get_symbol_detail(&g, "");
+        let r = get_symbol_detail(&g, true, "");
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "'symbol' is required");
     }
@@ -2982,7 +2971,7 @@ mod tests {
     #[test]
     fn get_symbol_detail_known_id_returns_full_symbol() {
         let g = locked(small_graph());
-        let r = get_symbol_detail(&g, "/a.cpp:foo");
+        let r = get_symbol_detail(&g, true, "/a.cpp:foo");
         assert!(r.is_error.is_none() || r.is_error == Some(false));
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         assert_eq!(parsed["name"], serde_json::json!("foo"));
@@ -2995,7 +2984,7 @@ mod tests {
     fn get_symbol_detail_unknown_id_with_suggestions() {
         let g = locked(small_graph());
         // "fo" is a substring of "foo" — graph.search_symbols should suggest it.
-        let r = get_symbol_detail(&g, "fo");
+        let r = get_symbol_detail(&g, true, "fo");
         assert_eq!(r.is_error, Some(true));
         let text = body_text(&r);
         assert!(text.starts_with("symbol not found: \"fo\""), "got: {text}");
@@ -3005,7 +2994,7 @@ mod tests {
     #[test]
     fn get_symbol_detail_unknown_id_no_suggestions() {
         let g = locked(Graph::new());
-        let r = get_symbol_detail(&g, "nope");
+        let r = get_symbol_detail(&g, true, "nope");
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
     }
@@ -3045,7 +3034,7 @@ mod tests {
     #[test]
     fn symbol_summary_whole_graph() {
         let g = locked(small_graph());
-        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // The response is a `Page<SummaryRow>`. All 3 sample symbols
         // carry namespace="" in the graph; the display rename surfaces
@@ -3066,7 +3055,7 @@ mod tests {
     #[test]
     fn symbol_summary_empty_graph_returns_empty_envelope() {
         let g = locked(Graph::new());
-        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         // An empty graph yields an empty Page envelope, NOT a bare
         // empty object. The shape is intentional.
@@ -3085,7 +3074,7 @@ mod tests {
             edges: Vec::new(),
         });
         let g = locked(g);
-        let r = get_symbol_summary(&g, Some("/b.cpp"), None, None, false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, Some("/b.cpp"), None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
         // An empty namespace renders as `<global>` in the response.
@@ -3182,7 +3171,7 @@ mod tests {
         });
         let g = locked(g);
 
-        let r1 = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r1 = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (results1, total1, offset1, limit1) = page_parts(&r1);
         let (truncated1, next1) = page_extras(&r1);
 
@@ -3197,7 +3186,7 @@ mod tests {
         assert_eq!(next1, None);
 
         // Determinism: a second call yields identical row order.
-        let r2 = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r2 = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (results2, _, _, _) = page_parts(&r2);
         assert_eq!(
             results1, results2,
@@ -3243,12 +3232,12 @@ mod tests {
         // assert equality with the full sorted result.
         let g = locked(multi_namespace_graph(8));
 
-        let full = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let full = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (full_rows, full_total, _, _) = page_parts(&full);
         assert_eq!(full_total, 8);
         assert_eq!(full_rows.len(), 8);
 
-        let p1 = get_symbol_summary(&g, None, Some(4), Some(0), false, NO_BYTE_BUDGET);
+        let p1 = get_symbol_summary(&g, true, None, Some(4), Some(0), false, NO_BYTE_BUDGET);
         let (p1_rows, p1_total, p1_offset, p1_limit) = page_parts(&p1);
         let (p1_truncated, p1_next) = page_extras(&p1);
         assert_eq!(p1_total, 8);
@@ -3260,7 +3249,7 @@ mod tests {
         assert!(p1_truncated);
         assert_eq!(p1_next, Some(4));
 
-        let p2 = get_symbol_summary(&g, None, Some(4), Some(4), false, NO_BYTE_BUDGET);
+        let p2 = get_symbol_summary(&g, true, None, Some(4), Some(4), false, NO_BYTE_BUDGET);
         let (p2_rows, p2_total, p2_offset, p2_limit) = page_parts(&p2);
         assert_eq!(p2_total, 8);
         assert_eq!(p2_rows.len(), 4);
@@ -3287,9 +3276,9 @@ mod tests {
         // Mirrors `get_orphans` (Decision documented on the handler).
         let g = locked(multi_namespace_graph(50));
 
-        let r_zero = get_symbol_summary(&g, None, Some(0), None, false, NO_BYTE_BUDGET);
+        let r_zero = get_symbol_summary(&g, true, None, Some(0), None, false, NO_BYTE_BUDGET);
         let (rows_zero, total_zero, offset_zero, limit_zero) = page_parts(&r_zero);
-        let r_none = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r_none = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (rows_none, total_none, offset_none, limit_none) = page_parts(&r_none);
 
         // Both report 50 rows, default-resolved limit=100, no truncation.
@@ -3309,7 +3298,7 @@ mod tests {
         // pre-pagination row count, truncated=false, next_offset=None.
         let g = locked(multi_namespace_graph(5));
 
-        let r = get_symbol_summary(&g, None, Some(10), Some(99), false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, Some(10), Some(99), false, NO_BYTE_BUDGET);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
         assert!(rows.is_empty(), "offset past total yields empty page");
@@ -3325,7 +3314,7 @@ mod tests {
         // limit values above 1000 are silently clamped to 1000; the echoed
         // `limit` in the envelope reflects the resolved value.
         let g = locked(multi_namespace_graph(3));
-        let r = get_symbol_summary(&g, None, Some(5000), None, false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, Some(5000), None, false, NO_BYTE_BUDGET);
         let (_, _, _, limit) = page_parts(&r);
         assert_eq!(limit, 1000, "limit must clamp at 1000");
     }
@@ -3348,7 +3337,7 @@ mod tests {
 
         // Use the production default `max_bytes` to mirror real callers.
         let default_max_bytes = code_graph_core::RootConfig::default().response.max_bytes;
-        let r = get_symbol_summary(&g, None, None, None, false, default_max_bytes);
+        let r = get_symbol_summary(&g, true, None, None, None, false, default_max_bytes);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
 
@@ -3377,7 +3366,7 @@ mod tests {
         // 1200 rows and overflowed any client harness's response budget.
         let g = locked(multi_namespace_graph(1200));
 
-        let r = get_symbol_summary(&g, None, Some(1000), None, false, 2048);
+        let r = get_symbol_summary(&g, true, None, Some(1000), None, false, 2048);
         let (rows, total, offset, limit) = page_parts(&r);
         let (truncated, next) = page_extras(&r);
 
@@ -3456,7 +3445,7 @@ mod tests {
         //   * no row carries the bare empty string (rename is complete).
         let g = locked(global_and_namespaced_graph());
 
-        let r = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let results = parsed["results"].as_array().expect("results array");
 
@@ -3511,7 +3500,7 @@ mod tests {
         let g = locked(global_and_namespaced_graph());
 
         // Run the summary first; assert the `<global>` rename surfaces.
-        let r_summary = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r_summary = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let parsed_summary: serde_json::Value =
             serde_json::from_str(&body_text(&r_summary)).unwrap();
         let summary_results = parsed_summary["results"].as_array().expect("results array");
@@ -3529,6 +3518,7 @@ mod tests {
         // never touched the graph state, only the summary's row builder.
         let r_search = search_symbols(
             &g,
+            true,
             SearchSymbolsInput {
                 subtree: None,
                 query: Some("foo"),
@@ -3704,7 +3694,7 @@ mod tests {
         // sentinel shape regresses on any field.
         let g = locked(five_pair_graph());
 
-        let r = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, None, None, true, NO_BYTE_BUDGET);
 
         let body = body_text(&r);
         // count_only must produce a sub-1KB response regardless of input
@@ -3754,11 +3744,11 @@ mod tests {
         // it in count_only), the assertion fails.
         let g = locked(five_pair_graph());
 
-        let r_count = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+        let r_count = get_symbol_summary(&g, true, None, None, None, true, NO_BYTE_BUDGET);
         let parsed_count: serde_json::Value = serde_json::from_str(&body_text(&r_count)).unwrap();
         let total_count = parsed_count["total"].as_u64().unwrap();
 
-        let r_page = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r_page = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (_results, total_page, _offset, _limit) = page_parts(&r_page);
 
         assert_eq!(
@@ -3783,7 +3773,7 @@ mod tests {
         // are easy to swap by mistake.
         let g = locked(many_symbols_one_pair_graph(50));
 
-        let r = get_symbol_summary(&g, None, None, None, true, NO_BYTE_BUDGET);
+        let r = get_symbol_summary(&g, true, None, None, None, true, NO_BYTE_BUDGET);
         let parsed: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
         let total = parsed["total"].as_u64().unwrap();
 
@@ -3797,7 +3787,7 @@ mod tests {
         // semantics — one row, count=50. This isn't the assertion that
         // protects against the symbol-sum bug (that's the count_only check
         // above), but it pins the per-row `count` field stays correct.
-        let r_page = get_symbol_summary(&g, None, None, None, false, NO_BYTE_BUDGET);
+        let r_page = get_symbol_summary(&g, true, None, None, None, false, NO_BYTE_BUDGET);
         let (results, total_page, _offset, _limit) = page_parts(&r_page);
         assert_eq!(total_page, 1, "paginated total must also be 1 row");
         assert_eq!(results.len(), 1, "exactly one row materialized");

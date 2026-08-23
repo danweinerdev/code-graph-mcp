@@ -79,6 +79,7 @@ async fn near_search_without_subtree_finds_both_widgets() {
     // test below is measuring the subtree filter and not an empty result.
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             query: Some("widgrt"), // 1 edit from "widget"
             near: true,
@@ -102,6 +103,7 @@ async fn near_search_honors_subtree_filter() {
     let subtree_str = subtree.to_string_lossy().into_owned();
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             query: Some("widgrt"),
             near: true,
@@ -132,6 +134,7 @@ async fn near_with_count_only_is_rejected() {
     let (inner, _root, _dir) = fixture_two_subtrees().await;
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             query: Some("widget"),
             near: true,

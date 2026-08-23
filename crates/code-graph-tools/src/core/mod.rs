@@ -1,14 +1,9 @@
-//! Typed core layer beneath the MCP handlers (Phase 2, Typed Core Layering).
+//! Typed domain core beneath the MCP adapters.
 //!
-//! `handlers/*.rs` speak `CallToolResult`, an rmcp wire type carrying
-//! pre-serialized JSON. This module introduces a domain-typed result shape
-//! so tool logic is reachable without any rmcp type in the signature — the
-//! first step toward a CLI or socket front-end that never touches rmcp.
-//!
-//! Nothing in this module is wired up yet: no handler has been migrated
-//! (that is tasks 2.2 through 2.6). This is scaffolding only —
-//! `ToolOk`/`ToolError`/`ToolResult`, the single adapter that knows about
-//! rmcp, and a core-level `require_indexed`.
+//! Public typed operations use [`ToolResult`] and have no rmcp types in their
+//! signatures. [`to_call_tool_result`] is the sole adapter boundary; it is
+//! intentionally separate from the domain operations so the CLI and other
+//! consumers never need an rmcp dependency.
 
 use crate::handlers::{tool_error, tool_success_json};
 use rmcp::model::{CallToolResult, Content};
@@ -74,29 +69,14 @@ pub fn to_call_tool_result<T: Serialize>(r: ToolResult<T>) -> CallToolResult {
     }
 }
 
-/// Core-level indexed-state guard.
+/// Canonical indexed-state contract.
 ///
-/// This is a NEW call site, not a moved one (design Decision 8): today
-/// `require_indexed` is called only from `server.rs`, before a handler
-/// runs — `handlers/*.rs` contain zero occurrences of it. A mechanical
-/// "move the body into `core`" migration would therefore leave every
-/// gated core function with no guard at all, because there was never one
-/// in the handler to move. The invariant is set equality, not a fixed
-/// count: the set of core functions that call `require_indexed` at their
-/// own entry must equal the set of gated `#[tool]` call sites (all query
-/// and watch tools; `get_status`, `analyze_codebase`, and
-/// `analyze_codebase_async` are ungated by design). Verify this by
-/// diffing the two sets directly — never by counting to a remembered
-/// total, since a remembered total silently goes stale the moment either
-/// side gains or loses a member (this comment has already done that
-/// once).
-///
-/// The message is copied verbatim from
-/// `CodeGraphServer::require_indexed` in `server.rs` so the two guards
-/// (wire-layer and core) produce byte-identical text — the double check
-/// on the MCP path is deliberate and cheap (one `Ordering::Acquire`
-/// atomic load, no lock), not a bug to be "fixed" by removing either
-/// side.
+/// Every public typed query and watch operation calls this guard at entry
+/// using the caller's real indexed state. Analyze and status operations are
+/// deliberately ungated. The MCP server repeats the check before dispatch so
+/// it can construct the wire error envelope; that adapter check and this
+/// domain error must keep the same text. Public consumers should call the
+/// typed core rather than its MCP adapters.
 pub fn require_indexed(indexed: bool) -> Result<(), ToolError> {
     if indexed {
         Ok(())

@@ -20,6 +20,7 @@ use parking_lot::RwLock as PlRwLock;
 use code_graph_core::RootConfig;
 
 use crate::handlers::analyze::AnalyzeResult;
+use crate::indexer::ProgressSink;
 
 /// Filesystem-derived facts captured before an asynchronous analyze request is
 /// admitted. They belong to the canonical request only: path containment, not
@@ -147,6 +148,9 @@ pub(crate) struct PendingAnalyze {
     /// Canonical request plus every synchronous or asynchronous follower
     /// compacted into this pending scan.
     pub(crate) request_count: usize,
+    /// Original synchronous request sinks. Async aliases are represented only
+    /// in `AnalyzeSlot::aliases` and therefore never appear here.
+    pub(crate) sync_sinks: Vec<Arc<dyn ProgressSink>>,
 }
 
 pub(crate) struct AnalyzeJob {

@@ -38,13 +38,15 @@ use crate::analyze_job::{
     JobStatus,
 };
 use crate::core::{ToolError, ToolOk, ToolResult};
-use crate::handlers::analyze::{now_nanos_u64, AnalyzeResult, AsyncKickoffResponse};
+use crate::handlers::analyze::now_nanos_u64;
 use crate::handlers::status::format_unix_nanos_rfc3339;
 use crate::indexer::{
     build_file_index, build_symbol_index, index_directory_with_extra, resolve_edges_with_indexes,
     NoopProgressSink, ProgressSink,
 };
 use crate::server::ServerInner;
+
+pub use crate::handlers::analyze::{AnalyzeResult, AsyncKickoffResponse};
 
 /// Wraps any [`ProgressSink`] so each `report()` ALSO writes the latest
 /// progress triple into the owning [`AnalyzeJob`]'s mutable state.
@@ -100,6 +102,21 @@ impl<S: ProgressSink> JobAwareProgressSink<S> {
             (s.progress, s.progress_total, s.progress_message.clone())
         };
         self.inner.report(progress, total, &message);
+    }
+}
+
+/// Delivers a promoted pending scan's progress to each compacted synchronous
+/// request. It is created after `promote_next` releases the analyze-slot
+/// lock, so sinks may safely re-enter slot-reading code while reporting.
+struct FanoutProgressSink {
+    sinks: Vec<Arc<dyn ProgressSink>>,
+}
+
+impl ProgressSink for FanoutProgressSink {
+    fn report(&self, progress: u32, total: u32, message: &str) {
+        for sink in &self.sinks {
+            sink.report(progress, total, message);
+        }
     }
 }
 
@@ -844,7 +861,7 @@ pub async fn analyze_codebase(
         return Err(ToolError("'path' is required".to_string()));
     }
     let path = canonicalize_admission_path(&inner, &path_raw)?;
-    let admission = admit_sync(&inner, path, force)?;
+    let admission = admit_sync(&inner, path, force, Arc::clone(&sink))?;
 
     let job = match admission {
         SyncAdmission::RunNow { job, guard } => {
@@ -1046,6 +1063,7 @@ fn compact_pending(
     force: bool,
     admission: Option<AnalyzeAdmission>,
     guard: crate::server::AnalyzeGuard,
+    sync_sink: Option<Arc<dyn ProgressSink>>,
 ) -> Result<PendingAdmission, ToolError> {
     // Capacity is by every live request, before compaction. A covered
     // follower is still a pending request and cannot bypass the 32-request
@@ -1064,6 +1082,9 @@ fn compact_pending(
         let entry = &mut slot.pending[index];
         entry.job.or_force(force);
         entry.request_count += 1;
+        if let Some(sink) = sync_sink {
+            entry.sync_sinks.push(sink);
+        }
         return Ok(PendingAdmission::Attached(Arc::clone(&entry.job)));
     }
 
@@ -1079,6 +1100,7 @@ fn compact_pending(
             job: Arc::clone(&job),
             guard,
             request_count: 1,
+            sync_sinks: sync_sink.into_iter().collect(),
         });
         return Ok(PendingAdmission::Canonical(job));
     }
@@ -1093,9 +1115,11 @@ fn compact_pending(
         );
     }
     let mut request_count = 1;
+    let mut sync_sinks: Vec<Arc<dyn ProgressSink>> = sync_sink.into_iter().collect();
     for displaced in removed {
         request_count += displaced.request_count;
         job.or_force(displaced.job.force());
+        sync_sinks.extend(displaced.sync_sinks);
         displaced.job.replace_with(Arc::clone(&job));
         slot.aliases
             .insert(displaced.job.job_id.clone(), job.job_id.clone());
@@ -1113,6 +1137,7 @@ fn compact_pending(
             job: Arc::clone(&job),
             guard,
             request_count,
+            sync_sinks,
         },
     );
     Ok(PendingAdmission::Canonical(job))
@@ -1122,6 +1147,7 @@ fn admit_sync(
     inner: &Arc<ServerInner>,
     path: String,
     force: bool,
+    sink: Arc<dyn ProgressSink>,
 ) -> Result<SyncAdmission, ToolError> {
     let mut slot = inner.analyze_slot.write();
     if slot
@@ -1134,7 +1160,7 @@ fn admit_sync(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, None, guard)?;
+        let pending = compact_pending(&mut slot, path, force, None, guard, Some(sink))?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         let job = match pending {
@@ -1167,7 +1193,7 @@ fn admit_async_with_admission(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, Some(admission), guard)?;
+        let pending = compact_pending(&mut slot, path, force, Some(admission), guard, None)?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         return match pending {
@@ -1283,12 +1309,13 @@ fn promote_next(
 }
 
 fn spawn_pending_worker(inner: Arc<ServerInner>, pending: crate::analyze_job::PendingAnalyze) {
-    spawn_analyze_worker(
-        inner,
-        pending.job,
-        Arc::new(NoopProgressSink),
-        pending.guard,
-    );
+    // `promote_next` returns only after releasing the slot write guard. Build
+    // the fan-out here so a blocking or re-entrant sink never reports while
+    // that guard is held.
+    let sink: Arc<dyn ProgressSink> = Arc::new(FanoutProgressSink {
+        sinks: pending.sync_sinks,
+    });
+    spawn_analyze_worker(inner, pending.job, sink, pending.guard);
 }
 
 #[cfg(test)]
@@ -1316,11 +1343,170 @@ mod queue_tests {
             force,
             None,
             guard,
+            None,
         )
         .map(|admission| match admission {
             PendingAdmission::Canonical(job) | PendingAdmission::Attached(job) => job,
         })
         .unwrap()
+    }
+
+    struct ReentrantSink {
+        name: &'static str,
+        inner: Arc<ServerInner>,
+        events: std::sync::mpsc::Sender<(&'static str, bool, String)>,
+        block_once: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
+    }
+
+    impl ProgressSink for ReentrantSink {
+        fn report(&self, _progress: u32, _total: u32, message: &str) {
+            // A promoted sink must run after `promote_next` drops its slot
+            // write guard. Re-entering the slot is the deadlock regression.
+            let slot_unlocked = self.inner.analyze_slot.try_read().is_some();
+            self.events
+                .send((self.name, slot_unlocked, message.to_string()))
+                .expect("test event receiver remains live");
+            if let Some(barrier) = self.block_once.lock().unwrap().take() {
+                barrier.wait();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn promoted_sync_followers_fan_out_sinks_without_slot_lock_or_async_sink() {
+        let server = server();
+        let running = AnalyzeJob::new_running("running".into(), "/active".into(), false, 0);
+        server.inner.analyze_slot.write().current = Some(Arc::clone(&running));
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let release_first = Arc::new(std::sync::Barrier::new(2));
+        let first_sink: Arc<dyn ProgressSink> = Arc::new(ReentrantSink {
+            name: "first",
+            inner: Arc::clone(&server.inner),
+            events: events_tx.clone(),
+            block_once: std::sync::Mutex::new(Some(Arc::clone(&release_first))),
+        });
+        let second_sink: Arc<dyn ProgressSink> = Arc::new(ReentrantSink {
+            name: "second",
+            inner: Arc::clone(&server.inner),
+            events: events_tx,
+            block_once: std::sync::Mutex::new(None),
+        });
+
+        let first =
+            match admit_sync(&server.inner, "/queued/child".into(), false, first_sink).unwrap() {
+                SyncAdmission::Follower(job) => job,
+                SyncAdmission::RunNow { .. } => panic!("running work must queue sync follower"),
+            };
+        let second = match admit_sync(
+            &server.inner,
+            "/queued/child/deeper".into(),
+            false,
+            second_sink,
+        )
+        .unwrap()
+        {
+            SyncAdmission::Follower(job) => job,
+            SyncAdmission::RunNow { .. } => panic!("covered sync work must be a follower"),
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+        let alias = match admit_async(&server.inner, "/queued/child/async".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("async follower must remain pending"),
+        };
+        let replacement_id = match admit_async(&server.inner, "/queued".into(), false).unwrap() {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("ancestor must replace queued descendant"),
+        };
+
+        finish_completed(&running, completed_result("/active"));
+        let pending = promote_next(&server.inner, &running).expect("replacement must promote");
+        assert_eq!(pending.job.job_id, replacement_id);
+        assert_eq!(
+            pending.sync_sinks.len(),
+            2,
+            "only the two synchronous followers contribute promoted sinks"
+        );
+        let promoted = Arc::clone(&pending.job);
+        let sinks = pending.sync_sinks.clone();
+        let reporter = std::thread::spawn(move || {
+            let sink = JobAwareProgressSink {
+                inner: FanoutProgressSink { sinks },
+                job: promoted,
+            };
+            sink.transition_to(AnalyzePhase::Parsing);
+            sink.report(1, 1, "Parsing: queued.cpp");
+        });
+        let first_event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first synchronous sink receives promoted phase event");
+        assert_eq!(first_event.0, "first");
+        assert!(
+            first_event.1,
+            "reporting must not hold the analyze-slot lock"
+        );
+        release_first.wait();
+        let mut remaining = Vec::new();
+        for _ in 0..3 {
+            remaining.push(
+                events_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("both synchronous sinks receive phase and progress events"),
+            );
+        }
+        let all_events = std::iter::once(first_event)
+            .chain(remaining)
+            .collect::<Vec<_>>();
+        for name in ["first", "second"] {
+            let sink_events = all_events
+                .iter()
+                .filter(|event| event.0 == name)
+                .collect::<Vec<_>>();
+            assert_eq!(sink_events.len(), 2, "{name} must receive both events");
+            assert!(
+                sink_events.iter().all(|event| event.1),
+                "{name} must be called without the analyze-slot lock"
+            );
+            assert!(
+                sink_events
+                    .iter()
+                    .any(|event| event.2 == "Parsing source files"),
+                "{name} must receive the promoted phase boundary"
+            );
+            assert!(
+                sink_events
+                    .iter()
+                    .any(|event| event.2 == "Parsing: queued.cpp"),
+                "{name} must receive promoted file progress"
+            );
+        }
+        reporter.join().expect("promoted reporter must not panic");
+
+        finish_completed(&pending.job, completed_result("/queued"));
+        assert!(promote_next(&server.inner, &pending.job).is_none());
+        let first_terminal = AnalyzeJob::wait_for_terminal(first).await;
+        let second_terminal = AnalyzeJob::wait_for_terminal(second).await;
+        assert!(Arc::ptr_eq(&first_terminal, &second_terminal));
+        let alias_terminal = server
+            .inner
+            .analyze_slot
+            .read()
+            .resolve_async_job(&alias)
+            .expect("async alias remains pollable but owns no sink");
+        assert!(Arc::ptr_eq(&first_terminal, &alias_terminal));
+        assert!(matches!(
+            &alias_terminal.state.read().status,
+            JobStatus::Completed(AnalyzeResult { root_path, .. }) if root_path == "/queued"
+        ));
+    }
+
+    fn completed_result(root_path: &str) -> AnalyzeResult {
+        AnalyzeResult {
+            files: 1,
+            symbols: 1,
+            edges: 0,
+            root_path: root_path.to_string(),
+            warnings: Vec::new(),
+        }
     }
 
     #[test]
@@ -1555,6 +1741,7 @@ mod queue_tests {
                 true,
                 None,
                 guard,
+                None,
             ) {
                 Ok(_) => panic!("a covered 33rd request must be rejected before compaction"),
                 Err(error) => error,
@@ -1599,6 +1786,7 @@ mod queue_tests {
             false,
             None,
             guard,
+            None,
         )
         .is_err());
     }
@@ -1635,7 +1823,14 @@ mod queue_tests {
         let first = queue(&server, "/queue/first", false);
         let second = queue(&server, "/queue/second", false);
 
-        let third = match admit_sync(&server.inner, "/queue/third".into(), false).unwrap() {
+        let third = match admit_sync(
+            &server.inner,
+            "/queue/third".into(),
+            false,
+            Arc::new(NoopProgressSink),
+        )
+        .unwrap()
+        {
             SyncAdmission::Follower(job) => job,
             SyncAdmission::RunNow { .. } => {
                 panic!("terminal current must not overtake pending FIFO")

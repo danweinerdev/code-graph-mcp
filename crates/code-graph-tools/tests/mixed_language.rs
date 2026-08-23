@@ -223,6 +223,7 @@ async fn search_helper_no_filter_returns_all_four_languages() {
     let fx = build_indexed(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -261,6 +262,7 @@ async fn search_helper_language_cpp_returns_only_cpp() {
     let fx = build_indexed(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -284,6 +286,7 @@ async fn search_helper_language_rust_returns_only_rust() {
     let fx = build_indexed(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -307,6 +310,7 @@ async fn search_helper_language_go_returns_only_go() {
     let fx = build_indexed(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -330,6 +334,7 @@ async fn search_helper_language_python_returns_only_python() {
     let fx = build_indexed(&testdata_mixed_path()).await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("helper"),
@@ -360,7 +365,7 @@ async fn get_class_hierarchy_for_rust_trait() {
     // `testdata/rust/src/traits.rs`). With a root filter narrowed to
     // {Class, Struct, Interface} the lookup would skip the trait — so
     // the success of this lookup is the regression assertion.
-    let r = get_class_hierarchy(&fx.inner.graph, "Greet", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Greet", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy must succeed for a Rust trait: {r:?}",
@@ -432,7 +437,7 @@ async fn build_rust_supertrait_fixture() -> IndexedFixture {
 #[tokio::test]
 async fn get_class_hierarchy_for_rust_trait_with_multiple_supertraits() {
     let fx = build_rust_supertrait_fixture().await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Sub", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Sub", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy must succeed for a Rust trait with \
@@ -496,6 +501,7 @@ async fn generate_diagram_for_rust_trait_inheritance() {
     let fx = build_indexed(&testdata_rust_path()).await;
     let r = generate_diagram(
         &fx.inner.graph,
+        true,
         GenerateDiagramInput {
             class: Some("Compute"),
             format: Some("edges"),
@@ -630,6 +636,7 @@ async fn search_init_returns_all_five_languages() {
     let fx = build_init_collision_fixture().await;
     let r = search_symbols(
         &fx.inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some("init"),
@@ -743,6 +750,7 @@ async fn cross_language_init_callers_stay_isolated() {
     ) {
         let resp = callers_or_callees(
             graph,
+            true,
             init_id,
             Some(1),
             Direction::Callers,
@@ -836,7 +844,7 @@ async fn build_go_interface_fixture() -> IndexedFixture {
 #[tokio::test]
 async fn get_class_hierarchy_for_go_interface() {
     let fx = build_go_interface_fixture().await;
-    let r = get_class_hierarchy(&fx.inner.graph, "Reader", Some(2), None);
+    let r = get_class_hierarchy(&fx.inner.graph, true, "Reader", Some(2), None);
     assert!(
         r.is_error.is_none() || r.is_error == Some(false),
         "get_class_hierarchy must succeed for a Go interface (root \

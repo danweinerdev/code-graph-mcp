@@ -112,6 +112,7 @@ async fn build_indexed() -> Indexed {
 fn all_symbol_names(inner: &Arc<ServerInner>) -> HashSet<String> {
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             language: Some("cpp"),
@@ -136,6 +137,7 @@ fn all_symbol_names(inner: &Arc<ServerInner>) -> HashSet<String> {
 fn count_exact(inner: &Arc<ServerInner>, name: &str) -> u64 {
     let r = search_symbols(
         &inner.graph,
+        true,
         SearchSymbolsInput {
             subtree: None,
             query: Some(&format!("^{name}$")),

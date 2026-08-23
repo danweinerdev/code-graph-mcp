@@ -2,20 +2,9 @@
 //! `find_class_candidates`, `get_coupling`, `generate_diagram`, and phase
 //! 1's `detect_communities`.
 //!
-//! All seven are GATED tools (confirmed against the `server.rs` call
-//! sites): each function here calls the core-level [`require_indexed`] at
-//! its own entry — a NEW call site per Design Decision 8, since
-//! `handlers::structure` never contained one.
-//!
-//! `handlers::structure`'s seven public functions keep their exact
-//! signatures (no `ServerInner`/indexed-flag parameter — Decision 3), so
-//! they cannot supply a real indexed flag to the core. Each adapter
-//! hardcodes `indexed = true`: the MCP path already ran
-//! `ServerInner::require_indexed` in `server.rs` before ever reaching the
-//! handler, so `true` is always correct on that path. The `indexed`
-//! parameter exists so a future direct caller (e.g. Track B's CLI) can
-//! pass its own real flag and get the domain error
-//! `handlers::structure`'s existing tests never had to exercise.
+//! Indexed-state behavior is defined once by [`crate::core::require_indexed`].
+//! Each public operation receives the caller's real state and checks it at
+//! entry; handler adapters are not typed-core entry points.
 //!
 //! **`generate_diagram(format="mermaid")` is the second plain-text
 //! producer in the codebase** (Design Decision 2) — `format="edges"` maps
@@ -57,24 +46,23 @@ use parking_lot::RwLock;
 use serde::Serialize;
 
 use crate::core::{require_indexed, ToolError, ToolOk, ToolResult};
-use crate::handlers::structure::{is_unreliable_orphan, GenerateDiagramInput, ReliabilityMode};
+use crate::handlers::structure::{is_unreliable_orphan, ReliabilityMode};
 
 /// Re-exported so a second front-end (the CLI, Designs/CommandLineInterface
 /// Decision 1) can construct the input without importing `handlers`.
 pub use crate::handlers::structure::GenerateDiagramInput as DiagramInput;
 use crate::handlers::{
-    byte_budget_take, kind_str, parse_kind, parse_min_confidence, suggest_symbols,
-    symbol_to_result, Community, CouplingBoth, CouplingEntry, Cycle, DegenerateInfo,
-    DetectCommunitiesResponse, Page, SymbolResult,
+    byte_budget_take, kind_str, parse_kind, parse_min_confidence, suggest_symbols, symbol_to_result,
+};
+pub use crate::handlers::{
+    Community, CouplingBoth, CouplingEntry, Cycle, DegenerateInfo, DetectCommunitiesResponse, Page,
+    SymbolResult,
 };
 
 // ----- detect_cycles -----
 
-/// `detect_cycles` body. Body moved verbatim from
-/// `handlers::structure::detect_cycles`, plus the core `require_indexed`
-/// call at entry (Decision 8). See the handler doc-comment (unchanged,
-/// and authoritative) for the full behavioural contract — pagination is
-/// purely by COUNT, deliberately not byte-budgeted.
+/// Typed `detect_cycles` operation. Pagination is purely by count and is
+/// deliberately not byte-budgeted.
 pub fn detect_cycles(
     graph: &RwLock<Graph>,
     indexed: bool,
@@ -160,10 +148,8 @@ pub fn detect_cycles(
 
 // ----- get_orphans -----
 
-/// `get_orphans` body. Body moved verbatim from
-/// `handlers::structure::get_orphans`, plus the core `require_indexed`
-/// call at entry (Decision 8). See the handler doc-comment (unchanged,
-/// and authoritative) for the full behavioural contract.
+/// Typed `get_orphans` operation with reliability, subtree, count-only, and
+/// byte-budgeted pagination filters.
 #[allow(clippy::too_many_arguments)]
 pub fn get_orphans(
     graph: &RwLock<Graph>,
@@ -587,7 +573,7 @@ pub fn get_coupling(
 pub fn generate_diagram(
     graph: &RwLock<Graph>,
     indexed: bool,
-    input: GenerateDiagramInput<'_>,
+    input: DiagramInput<'_>,
 ) -> ToolResult<Vec<DiagramEdge>> {
     require_indexed(indexed)?;
 
@@ -890,7 +876,7 @@ mod tests {
     #[test]
     fn generate_diagram_unindexed_returns_typed_error() {
         let g = locked(Graph::new());
-        let input = GenerateDiagramInput {
+        let input = DiagramInput {
             symbol: Some("/a.cpp:foo"),
             ..Default::default()
         };
@@ -953,7 +939,7 @@ mod tests {
     #[test]
     fn generate_diagram_mermaid_returns_text_success() {
         let g = locked(graph_with_a_calls_b());
-        let input = GenerateDiagramInput {
+        let input = DiagramInput {
             symbol: Some("/x.cpp:a"),
             format: Some("mermaid"),
             ..Default::default()
@@ -968,7 +954,7 @@ mod tests {
     #[test]
     fn generate_diagram_edges_returns_value_success() {
         let g = locked(graph_with_a_calls_b());
-        let input = GenerateDiagramInput {
+        let input = DiagramInput {
             symbol: Some("/x.cpp:a"),
             format: Some("edges"),
             ..Default::default()
