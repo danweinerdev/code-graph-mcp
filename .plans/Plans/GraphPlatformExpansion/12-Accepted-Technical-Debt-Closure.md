@@ -35,7 +35,7 @@ tasks:
       cargo test -p code-graph-tools --test symbol_history and cargo test -p code-graph-vcs-git pass; provider object/peel/blob failures are Operation unless tree absence is proven, skip-adjacent transitions have a test-pinned uncertainty contract through the existing skipped list, a maximum-window history walk retains at most 8 source snapshots targeting 32 MiB with one oversized source admitted alone and only one active AST/fingerprint operation, shard reads and parse/fingerprint CPU work execute through blocking-safe boundaries, and rename-to-HEAD observability is documented without promising the unqueryable removed ID; make verify passes.
   - id: "12.5"
     title: "Consolidate fingerprints and bound sidecar lifecycle"
-    status: planned
+    status: complete
     depends_on: ["12.4"]
     justifies: "FR-34, FR-37, AC-38, AC-39, AC-46, and NFR-02; prevents six language implementations from drifting, repeated reparsing of known unfingerprintable spans, key aliasing, and unbounded dead-identity sidecar growth, as recorded by reviews 18 and 20."
     verification: >-
@@ -231,16 +231,16 @@ Chunking must carry the previous symbol state across boundaries and must not emi
 
 ## 12.5: Consolidate fingerprints and bound sidecar lifecycle
 ### Subtasks
-- [ ] Extract one shared `code-graph-lang::fingerprint` helper for the six plugin overrides while retaining each language’s node-location and literal predicates.
-- [ ] Add unlocatable-span degradation and cross-parser-instance determinism tests for Rust, Go, Python, C#, and Java, matching the existing C++ discrimination.
-- [ ] Add a tool-level `literal_insensitive` unfingerprintable-span regression asserting the visible skip reason through `symbol_history`.
-- [ ] Persist a versioned cache outcome for known unfingerprintable spans so repeated walks do not reparse them; corruption still recomputes rather than errors under FR-37.
-- [ ] Narrow `config_identity` to extraction-relevant configuration and centralize all `FingerprintKey` construction in one builder.
-- [ ] Replace executable-identity fallback `0` with a deterministic non-aliasing fallback that does not claim two unreadable binaries are the same build.
-- [ ] Replace delimiter-only key and AST streams with unambiguous length-prefix or equivalent framing, including raw `0x1f` adversarial tests.
-- [ ] Add a process-shared sidecar maintenance lock and trim when completed shards exceed 256 MiB or 100,000 files, selecting oldest eligible completed shards toward both 192 MiB and 75,000-file low-water marks; trigger at sidecar open and after each 256 successful writes.
-- [ ] Never prune temp files or keys retained by the current walk. Concurrent readers treat a missing pruned shard as a cache miss and recompute; tests must pin atomic reads/writes and harmless cross-process eviction rather than promise permanent retention of every live identity.
-- [ ] Make the LiteralInsensitive no-fallback property explicit in the boundary tests, document why `negative_literal` is traversed rather than classified as a literal node, and add the extractor-span caveat to the agent-facing history description within its byte budget.
+- [x] Extract one shared `code-graph-lang::fingerprint` helper for the six plugin overrides while retaining each language’s node-location and literal predicates.
+- [x] Add unlocatable-span degradation and cross-parser-instance determinism tests for Rust, Go, Python, C#, and Java, matching the existing C++ discrimination.
+- [x] Add a tool-level `literal_insensitive` unfingerprintable-span regression asserting the visible skip reason through `symbol_history`.
+- [x] Persist a versioned cache outcome for known unfingerprintable spans so repeated walks do not reparse them; corruption still recomputes rather than errors under FR-37.
+- [x] Narrow `config_identity` to extraction-relevant configuration and centralize all `FingerprintKey` construction in one builder.
+- [x] Replace executable-identity fallback `0` with a deterministic non-aliasing fallback that does not claim two unreadable binaries are the same build.
+- [x] Replace delimiter-only key and AST streams with unambiguous length-prefix or equivalent framing, including raw `0x1f` adversarial tests.
+- [x] Add a process-shared sidecar maintenance lock and trim when completed shards exceed 256 MiB or 100,000 files, selecting oldest eligible completed shards toward both 192 MiB and 75,000-file low-water marks; trigger at sidecar open and after each 256 successful writes.
+- [x] Never prune temp files or keys retained by the current walk. Concurrent readers treat a missing pruned shard as a cache miss and recompute; tests must pin atomic reads/writes and harmless cross-process eviction rather than promise permanent retention of every live identity.
+- [x] Make the LiteralInsensitive no-fallback property explicit in the boundary tests, document why `negative_literal` is traversed rather than classified as a literal node, and add the extractor-span caveat to the agent-facing history description within its byte budget.
 
 ### Notes
 Revision boundary: all language plugins share one fingerprint control flow, cache outcomes are deterministic and unambiguously keyed, and dead sidecar state is bounded without weakening corruption self-healing or concurrent reads.
@@ -252,7 +252,22 @@ Do not make pruning “delete every identity except the current process.” Prun
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `359847bd9e6e88bab3c21011d237e55feefaa848`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `359847bd9e6e88bab3c21011d237e55feefaa848`
+- Focused review: `git show 359847bd9e6e88bab3c21011d237e55feefaa848`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `359847bd9e6e88bab3c21011d237e55feefaa848`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): clippy denied warnings, formatting passed, all workspace tests passed, no pending snapshots remained, and generated plugin mirrors were synchronized.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted task verification and four-lane review` | `task 12.5 implementation at 359847bd9e6e88bab3c21011d237e55feefaa848` | PASS | `PASS: six language-crate suites, 19 fingerprint-cache tests, 17 symbol-history tests, the symbol_history production-description snapshot, release compilation, and whitespace checks passed; spec-compliance and plan-drift reviews aligned, and quality findings were fixed or adjudicated as same-user local-cache residuals without a privilege boundary.` |
 
 ## 12.6: Harden CLI and daemon fallback, cleanup, and rendering
 ### Subtasks
