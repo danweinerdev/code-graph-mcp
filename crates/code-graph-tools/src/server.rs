@@ -1506,8 +1506,8 @@ impl CodeGraphServer {
                        the anchored query). Holds up to 5 candidate symbol-id strings. \
                        When the inner pattern is a plain identifier (no regex \
                        metacharacters), candidates are sorted by ascending Levenshtein \
-                       distance to the inner pattern (length-adaptive threshold: 1 edit \
-                       at length 2-11, 2 at 12-17, 3 at 18+), then by common-prefix \
+                        distance to the inner pattern (length-adaptive threshold: 0 edits \
+                        at length 1, 1 at 2-11, 2 at 12-17, 3 at 18+), then by common-prefix \
                        length DESC (so obvious-intent names like `Actor` surface for \
                        a `^Actr$` typo instead of getting buried under alphabetically- \
                        earlier same-length candidates), then by `is_shorter_than_query` \

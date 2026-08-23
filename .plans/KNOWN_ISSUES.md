@@ -280,3 +280,29 @@ as the current all-Go transaction does.
 4. Benchmarks on a multi-module repository demonstrate a material watch-
    latency improvement over the all-Go rebuild before the added cache and
    invalidation complexity is accepted.
+
+---
+
+## F5 — Non-watch analyze does not detect manifest-only Go changes
+
+**Status:** known limitation (surfaced 2026-08-22 during resolution
+verification). Use watch mode or `analyze_codebase(<project_root>, force=true)`
+after editing `go.mod`.
+
+### Current behavior
+
+The non-forced analyze fast path compares indexed source-file mtimes and
+discovers uncached source files. No language plugin claims `go.mod`, and the
+cache does not persist manifest mtimes, so a manifest-only edit can take the
+fast path and retain the prior module-qualified Go namespaces. The graph stays
+internally consistent under the old module model; the limitation is stale
+metadata rather than mixed identities or malformed edges.
+
+Watch-delivered manifest events perform the all-Go transaction when they
+acquire the index lock. A contended event records a pending transaction that
+the next Go source or manifest event retries; without a later Go event, a
+forced analyze at the project root is the guaranteed refresh. Scoped force
+only rebuilds that invocation's subtree. A future automatic fix requires
+persisting enough manifest identity (path plus mtime or content identity) to
+include the relevant manifest set in analyze staleness without weakening
+scoped-cache and nested-module behavior.

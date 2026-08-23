@@ -155,7 +155,7 @@ cannot mask a payload divergence — the thing AC-11 exists to catch.
 |---|---|---|
 | `0` | Success — including success-shaped "negative" answers | empty page; `found: false`; `available: false` + reason; `count_only` totals |
 | `1` | Tool error (`ToolError` / `is_error: true`) | unknown symbol (did-you-mean text on stderr), bad `mode` spelling, line 0, unindexed repository |
-| `2` | Operational failure — the query never ran or the channel died | cache file present but unreadable (genuine I/O error — a readable-but-corrupt cache is `Ok(None)` in `Graph::load`, i.e. "not present" → honest unindexed → `1`), daemon connection lost mid-call, child spawn failure, clap usage error |
+| `2` | Operational failure — the query never ran or the channel died | cache file present but unreadable; bytecheck-valid main archive with semantically invalid path/name/symbol IDs (structurally invalid or version-mismatched caches are "not present" → honest unindexed → `1`; bytecheck/version/semantic failure inside an independently framed resolver-metadata payload is discarded, while malformed extension framing remains structural invalidity); daemon connection lost mid-call; child spawn failure; clap usage error |
 
 Clap usage errors exit `2` (clap's own convention, and honest: the query
 never executed). `available: false` and `found: false` are exit `0`
@@ -379,7 +379,8 @@ and from this fallback (it is ungated and never returns "not indexed").
 |---|---|---|
 | No cache, no daemon | Gated subcommands return the MCP "not indexed" domain error verbatim (stderr) | 1 |
 | Cache unreadable (I/O error on an existing file) | Operational message on stderr naming the path | 2 |
-| Cache version/endian mismatch or corrupt bytes | Treated as "not present" (existing `Graph::load` contract: `Ok(false)`) → honest unindexed | 1 |
+| Cache version/endian mismatch or structurally invalid/bytecheck-failed bytes | Treated as "not present" (existing `Graph::load` contract: `Ok(false)`) → honest unindexed | 1 |
+| Bytecheck-valid main archive with semantically invalid path/name/symbol IDs | Operational corruption | 2 |
 | `daemon.json` present, daemon dead | `--attach-only` child revalidates, serves in-process (no contender spawn); the child's in-process server is unindexed, so gated queries answer via the Decision 7 standalone retry; breadcrumb on stderr unless `--quiet` | per query (0 when a loadable cache exists, 1 otherwise) |
 | `daemon.json` present, daemon binary-incompatible | `--attach-only` child leaves the daemon untouched (no replacement protocol), serves in-process; same Decision 7 retry path; breadcrumb | per query (0 when a loadable cache exists, 1 otherwise) |
 | Daemon attached but never analyzed (unindexed) | Query subcommands retry standalone read-only (Decision 7); breadcrumb | per query |
@@ -405,8 +406,9 @@ and from this fallback (it is ungated and never returns "not indexed").
   produces output byte-equal to the no-daemon invocation. `get-status`
   is excluded from byte-identity (Decision 7 carve-out).
 - **Exit statuses (AC-12):** success, unknown symbol (1), unreadable
-  cache file (2). The exit-2 fixture must be a genuine I/O error, not
-  corrupt bytes (those are exit 1 by the `Graph::load` contract);
+  cache file (2). The existing exit-2 fixture is a genuine I/O error;
+  structurally invalid/bytecheck-failed bytes are exit 1, while a
+  bytecheck-valid main archive with semantic ID corruption is exit 2;
   cross-platform trick: a DIRECTORY named `.code-graph-cache.db` fails
   the cache read path (`File::open` on Windows with `PermissionDenied`,
   `Mmap::map` on Unix with `ENODEV` — both non-`NotFound`, both

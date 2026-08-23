@@ -112,10 +112,10 @@ pub fn bootstrap(invocation_root: &Path, load_cache: bool) -> Result<App, CliErr
     let server = make_server(&project_root)?;
     let mut indexed = false;
     if load_cache {
-        // Ok(false) covers absent, version/endian-mismatched, and
-        // readable-but-corrupt caches — all "not present", all honest
-        // unindexed (exit 1 at the guard). Err is a genuine I/O failure:
-        // operational (exit 2).
+        // Ok(false) covers absent, version/endian-mismatched, and structurally
+        // invalid caches: all "not present", all honest unindexed (exit 1 at
+        // the guard). Err covers genuine I/O failures and semantic corruption
+        // in an otherwise bytecheck-valid main archive: operational (exit 2).
         match server.inner.graph.write().load(&project_root) {
             Ok(loaded) => indexed = loaded,
             Err(error) => {

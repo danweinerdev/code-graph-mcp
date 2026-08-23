@@ -540,17 +540,17 @@ pub async fn try_reindex_go_manifest(
             manifest_path.display()
         ));
     }
-    let Ok(_index_guard) = inner.index_lock.try_lock() else {
-        return ReindexOutcome::LockContended;
-    };
     let Some(go_plugin) = inner.registry.plugin_for(Language::Go) else {
         return ReindexOutcome::NotASource;
     };
-    // Mark the old universe ineligible before any fallible IO. If this batch
-    // fails, the next ordinary Go event sees the pending invalidation and
-    // retries this all-Go transaction instead of publishing one file against
-    // stale module ownership.
+    // Mark the old universe ineligible before lock acquisition or fallible IO.
+    // A contended manifest event is dropped, but its pending state makes the
+    // next ordinary Go event retry the all-Go transaction instead of publishing
+    // one file against stale module ownership.
     go_plugin.invalidate_resolution_for_path(manifest_path);
+    let Ok(_index_guard) = inner.index_lock.try_lock() else {
+        return ReindexOutcome::LockContended;
+    };
     if let Err(error) = inner.ensure_daemon_root_current() {
         return ReindexOutcome::Error(error);
     }

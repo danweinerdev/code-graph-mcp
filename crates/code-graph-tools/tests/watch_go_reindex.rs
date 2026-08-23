@@ -577,6 +577,31 @@ async fn go_mod_create_modify_remove_rebuilds_go_universe() {
             "example.com/nested/v5"
         );
     }
+
+    // A manifest event dropped while analyze owns the index lock must still
+    // leave a retry demand for the next ordinary Go event.
+    std::fs::write(&nested_manifest, b"module example.com/nested/v6\n").unwrap();
+    let index_guard = server.inner.index_lock.lock().await;
+    let contended = try_reindex_go_manifest(&server.inner, &nested_manifest).await;
+    assert!(
+        matches!(contended, ReindexOutcome::LockContended),
+        "held index lock must reject immediate manifest reindex: {contended:?}"
+    );
+    drop(index_guard);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v5",
+            "lock contention must not partially publish manifest v6"
+        );
+    }
+    assert_reindexed(try_reindex_file(&server.inner, &root_go, false).await);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v6"
+        );
+    }
 }
 
 #[tokio::test]
