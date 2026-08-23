@@ -688,6 +688,364 @@ async fn symbol_history_skipped_oldest_marks_boundary() {
     );
 }
 
+/// An operational read failure is uncertainty, not a durable absence. The
+/// second walk must retry that revision and recover without manufacturing a
+/// removal/introduction around it; the assertions inspect the actual tool
+/// payload, not an internal transition helper.
+#[tokio::test]
+async fn symbol_history_retries_operation_failures_without_tombstones() {
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct RecoveringProvider(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl VcsProvider for RecoveringProvider {
+        fn id(&self) -> &'static str {
+            "recovering-history"
+        }
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::Selected
+        }
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: ["new", "failed", "old"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, rev)| Commit {
+                        rev: RevId::new(rev),
+                        author: "fixture".to_string(),
+                        timestamp_utc: i as i64,
+                        summary: rev.to_string(),
+                    })
+                    .collect(),
+                truncated: false,
+            })
+        }
+        async fn read_at(&self, rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            if rev.as_str() == "failed" && self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(VcsError::Operation(
+                    "partial clone blob not present yet".to_string(),
+                ));
+            }
+            Ok(if rev.as_str() == "new" {
+                b"pub fn target_function() -> u32 { 2 }\n".to_vec()
+            } else {
+                b"pub fn target_function() -> u32 { 1 }\n".to_vec()
+            })
+        }
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(RecoveringProvider(Arc::clone(&attempts))))
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let symbol = symbol_id(dir.path(), "lib.rs", "target_function");
+
+    let first = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert_eq!(first["skipped"][0]["rev"], serde_json::json!("failed"));
+    assert_eq!(
+        changes(&first),
+        vec![
+            ("introduced".to_string(), "old".to_string()),
+            ("modified".to_string(), "new".to_string())
+        ]
+    );
+    assert!(
+        first["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.get("uncertain").is_none()),
+        "skipped is the sole uncertainty signal: {first}"
+    );
+
+    let recovered = ok_json(&call_history(&server, &symbol, None, None).await);
+    assert!(
+        recovered["skipped"].as_array().unwrap().is_empty(),
+        "the recovered revision was recomputed: {recovered}"
+    );
+    assert_eq!(
+        changes(&recovered),
+        changes(&first),
+        "state carries across the formerly skipped revision without synthetic edge transitions"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the failed revision was retried rather than served from an absence tombstone"
+    );
+}
+
+/// The bounded walk must never retain a whole 500-revision source window or
+/// more than one parser AST. The final source is intentionally >32 MiB and
+/// is admitted by itself rather than rejected or combined with prior bytes.
+#[tokio::test]
+async fn symbol_history_window_is_source_and_ast_bounded() {
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
+
+    struct ManySnapshots;
+    #[async_trait::async_trait]
+    impl VcsProvider for ManySnapshots {
+        fn id(&self) -> &'static str {
+            "many-snapshots"
+        }
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::Selected
+        }
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: (0..500)
+                    .rev()
+                    .map(|n| Commit {
+                        rev: RevId::new(format!("rev-{n}")),
+                        author: "fixture".to_string(),
+                        timestamp_utc: n,
+                        summary: format!("revision {n}"),
+                    })
+                    .collect(),
+                truncated: false,
+            })
+        }
+        async fn read_at(&self, rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            let mut source = b"pub fn target_function() -> u32 { 1 }\n".to_vec();
+            if rev.as_str() == "rev-499" {
+                source.resize(33 * 1024 * 1024, b' ');
+            }
+            Ok(source)
+        }
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(ManySnapshots)).unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let symbol = symbol_id(dir.path(), "lib.rs", "target_function");
+    code_graph_tools::core::history::reset_history_work_metrics_for_test();
+    let body = ok_json(&call_history(&server, &symbol, None, Some(500)).await);
+    assert_eq!(body["revisions_examined"], serde_json::json!(500));
+    let metrics = code_graph_tools::core::history::history_work_metrics_for_test();
+    assert_eq!(
+        metrics.retained_sources_high_water, 1,
+        "a source is flushed before the next opaque read_at buffer: {metrics:?}"
+    );
+    assert!(
+        metrics.non_oversized_source_bytes_high_water <= 32 * 1024 * 1024,
+        "ordinary source retention stays inside the byte target: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.oversized_sources_admitted_alone, 1,
+        "the >32 MiB source was retained alone: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.active_ast_high_water, 1,
+        "parse/fingerprint AST work is serial: {metrics:?}"
+    );
+}
+
+/// Cache shard I/O and parser/fingerprint work are both gated from their
+/// blocking boundaries. A normal Tokio task completes while each gate holds;
+/// this observes runtime behavior instead of inferring it from source layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symbol_history_slow_cache_and_parser_leave_async_runtime_responsive() {
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
+    use std::sync::{mpsc, Arc, Condvar, Mutex as StdMutex};
+    use std::time::Duration;
+
+    struct ReleaseGate {
+        released: StdMutex<bool>,
+        wake: Condvar,
+    }
+    impl ReleaseGate {
+        fn wait(&self) {
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+    struct ReleaseOnDrop(Arc<ReleaseGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    struct OneRevision;
+    #[async_trait::async_trait]
+    impl VcsProvider for OneRevision {
+        fn id(&self) -> &'static str {
+            "gated-cache-parser"
+        }
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::Selected
+        }
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: vec![Commit {
+                    rev: RevId::new("only"),
+                    author: "fixture".to_string(),
+                    timestamp_utc: 0,
+                    summary: "only".to_string(),
+                }],
+                truncated: false,
+            })
+        }
+        async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            Ok(b"pub fn target_function() -> u32 { 1 }\n".to_vec())
+        }
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
+        }
+    }
+
+    let _guard = suite_guard().await;
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(OneRevision)).unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let symbol = symbol_id(dir.path(), "lib.rs", "target_function");
+
+    let (cache_started_tx, cache_started_rx) = mpsc::channel();
+    let cache_started_tx = Arc::new(StdMutex::new(Some(cache_started_tx)));
+    let cache_gate = Arc::new(ReleaseGate {
+        released: StdMutex::new(false),
+        wake: Condvar::new(),
+    });
+    let cache_release = ReleaseOnDrop(Arc::clone(&cache_gate));
+    let hook_sender = Arc::clone(&cache_started_tx);
+    let hook_gate = Arc::clone(&cache_gate);
+    let _cache_hook =
+        code_graph_tools::core::fingerprint_cache::set_get_hook_for_test(Arc::new(move || {
+            if let Some(sender) = hook_sender.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            hook_gate.wait();
+        }));
+
+    let (parser_started_tx, parser_started_rx) = mpsc::channel();
+    let parser_started_tx = Arc::new(StdMutex::new(Some(parser_started_tx)));
+    let parser_gate = Arc::new(ReleaseGate {
+        released: StdMutex::new(false),
+        wake: Condvar::new(),
+    });
+    let parser_release = ReleaseOnDrop(Arc::clone(&parser_gate));
+    let hook_sender = Arc::clone(&parser_started_tx);
+    let hook_gate = Arc::clone(&parser_gate);
+    let _parser_hook =
+        code_graph_tools::core::history::set_parser_hook_for_test(Arc::new(move || {
+            if let Some(sender) = hook_sender.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            hook_gate.wait();
+        }));
+
+    let inner = server.inner.clone();
+    let walk_symbol = symbol.clone();
+    let walk = tokio::spawn(async move {
+        code_graph_tools::handlers::history::symbol_history(&inner, &walk_symbol, None, None).await
+    });
+    tokio::task::spawn_blocking(move || cache_started_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .expect("cache hook reached");
+    assert_eq!(
+        tokio::spawn(async { 7_u8 }).await.unwrap(),
+        7,
+        "async work progressed while cache I/O was gated"
+    );
+    cache_release.0.release();
+
+    tokio::task::spawn_blocking(move || parser_started_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .expect("parser hook reached");
+    assert_eq!(
+        tokio::spawn(async { 9_u8 }).await.unwrap(),
+        9,
+        "async work progressed while parser work was gated"
+    );
+    parser_release.0.release();
+    assert_eq!(
+        ok_json(&walk.await.unwrap())["available"],
+        serde_json::json!(true)
+    );
+}
+
 /// `history_truncated` is plumbed from `RevisionWindow.truncated` to the
 /// wire, and it alone (window unfilled, nothing skipped) makes an oldest
 /// `introduced` boundary-ambiguous (gate artifact 18 cycle-2 test gap).

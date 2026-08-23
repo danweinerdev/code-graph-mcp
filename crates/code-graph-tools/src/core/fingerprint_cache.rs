@@ -27,6 +27,9 @@ use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[cfg(debug_assertions)]
+use std::sync::{Arc, Mutex};
+
 use code_graph_lang::FingerprintMode;
 
 /// One cached answer: the symbol's fingerprint at a revision, or a
@@ -139,8 +142,43 @@ fn binary_identity() -> u64 {
 /// leading byte so a large history does not produce one directory with a
 /// hundred thousand entries. Shard value schema: `key -> u64 | null`,
 /// where `null` is the tombstone.
+#[derive(Clone)]
 pub struct FingerprintCache {
     directory: PathBuf,
+}
+
+/// Debug-test seam for proving cache shard I/O is off Tokio runtime workers.
+/// It is intentionally not enabled in release builds and never affects cache
+/// answers.
+#[cfg(debug_assertions)]
+type GetHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(debug_assertions)]
+static GET_HOOK: OnceLock<Mutex<Option<GetHook>>> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub struct GetHookGuard(Option<GetHook>);
+
+#[cfg(debug_assertions)]
+impl Drop for GetHookGuard {
+    fn drop(&mut self) {
+        *GET_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("fingerprint cache test hook mutex poisoned") = self.0.take();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_get_hook_for_test(hook: GetHook) -> GetHookGuard {
+    let previous = (*GET_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("fingerprint cache test hook mutex poisoned"))
+    .replace(hook);
+    GetHookGuard(previous)
 }
 
 type Shard = HashMap<String, Option<u64>>;
@@ -158,6 +196,15 @@ impl FingerprintCache {
     /// unreadable or corrupt shard — is a miss; a corrupt shard is deleted
     /// so the next write starts clean.
     pub fn get(&self, key: &FingerprintKey<'_>) -> Option<Cached> {
+        #[cfg(debug_assertions)]
+        if let Some(hook) = GET_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("fingerprint cache test hook mutex poisoned")
+            .clone()
+        {
+            hook();
+        }
         let stored = key.stored();
         let shard = self.read_shard(&self.shard_path(&stored))?;
         match shard.get(&stored)? {

@@ -134,12 +134,12 @@ fn resolve_rev(project_root: &Path, spec: Option<&str>) -> Result<RevId, VcsErro
     let spec = spec.unwrap_or("HEAD");
     let object = repository
         .rev_parse_single(spec)
-        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
+        .map_err(|error| VcsError::Operation(format!("resolve {spec}: {error}")))?;
     let commit = object
         .object()
-        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?
+        .map_err(|error| VcsError::Operation(format!("read {spec}: {error}")))?
         .peel_to_commit()
-        .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
+        .map_err(|error| VcsError::Operation(format!("peel {spec} to commit: {error}")))?;
     Ok(RevId::new(commit.id.to_string()))
 }
 
@@ -155,12 +155,12 @@ fn read_at(project_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>, 
     let repository = open_repository(project_root)?;
     let object = repository
         .rev_parse_single(revision)
-        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?;
+        .map_err(|error| VcsError::Operation(format!("resolve {revision}: {error}")))?;
     let commit = object
         .object()
-        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?
+        .map_err(|error| VcsError::Operation(format!("read {revision}: {error}")))?
         .peel_to_commit()
-        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?;
+        .map_err(|error| VcsError::Operation(format!("peel {revision} to commit: {error}")))?;
     let tree = commit
         .tree()
         .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
@@ -200,7 +200,7 @@ fn blame(
         .map(|spec| {
             repository
                 .rev_parse_single(spec)
-                .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))
+                .map_err(|error| VcsError::Operation(format!("resolve {spec}: {error}")))
         })
         .transpose()?
         .map(gix::Id::detach);
@@ -208,7 +208,7 @@ fn blame(
         Some(revision) => revision,
         None => repository
             .head_id()
-            .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
+            .map_err(|error| VcsError::Operation(format!("resolve HEAD: {error}")))?
             .detach(),
     };
     // Absence at the blamed revision is `NotFound` (an untracked file, or a
@@ -217,7 +217,7 @@ fn blame(
     // outcome (FR-36). Same membership check `read_at` performs.
     let tree = repository
         .find_commit(revision)
-        .map_err(|error| VcsError::NotFound(format!("{revision}: {error}")))?
+        .map_err(|error| VcsError::Operation(format!("read {revision}: {error}")))?
         .tree()
         .map_err(|error| VcsError::Operation(format!("read tree for {revision}: {error}")))?;
     let entry = tree
@@ -232,7 +232,10 @@ fn blame(
     // layer reports the divergence through its staleness flag — not an
     // error (phase-gate review F4).
     let blob = repository.find_blob(entry.oid()).map_err(|error| {
-        VcsError::NotFound(format!("{} at {revision}: {error}", path.display()))
+        VcsError::Operation(format!(
+            "read blob for {} at {revision}: {error}",
+            path.display()
+        ))
     })?;
     let revision_line_count = blob_line_count(&blob.data);
     let requested = lines.unwrap_or((1, u32::MAX));
@@ -313,9 +316,9 @@ fn blob_line_count(data: &[u8]) -> u32 {
 /// `limit` touches — including a path that no longer exists — so without a
 /// cap a single call on an engine-scale repository (10⁵–10⁶ commits) is
 /// minutes of CPU inside one blocking task. Hitting the cap returns what was
-/// found rather than erroring. Unlike `find_path`'s `cap_reached`, nothing
-/// signals truncation on this trait yet — `symbol_history` (phase 6) must
-/// add a partial-result flag at its wire layer before consuming this.
+/// found rather than erroring and sets [`RevisionWindow::truncated`]. An
+/// explicit shallow-clone boundary sets the same flag because older reachable
+/// history is unavailable there too.
 const MAX_REVWALK_COMMITS: usize = 100_000;
 
 fn revisions_touching(
@@ -335,8 +338,9 @@ fn revisions_touching(
     let relative_path = repository_relative_path(project_root, path)?;
     let head = repository
         .head_id()
-        .map_err(|error| VcsError::NotFound(format!("HEAD: {error}")))?
+        .map_err(|error| VcsError::Operation(format!("resolve HEAD: {error}")))?
         .detach();
+    let shallow = shallow_commit_ids(&repository)?;
     let mut revisions = Vec::new();
     let mut pending = BinaryHeap::new();
     let mut sequence = 0;
@@ -357,11 +361,14 @@ fn revisions_touching(
         let commit = repository.find_commit(pending_commit.id).map_err(|error| {
             VcsError::Operation(format!("read commit {}: {error}", pending_commit.id))
         })?;
-        let parent_ids = commit.parent_ids().collect::<Vec<_>>();
-        for parent_id in parent_ids {
-            enqueue_commit(&repository, &mut pending, parent_id.detach(), &mut sequence)?;
+        if shallow.contains(&pending_commit.id) {
+            truncated = true;
+        } else {
+            for parent_id in commit.parent_ids() {
+                enqueue_commit(&repository, &mut pending, parent_id.detach(), &mut sequence)?;
+            }
         }
-        if commit_changes_path(&repository, &commit, &relative_path)? {
+        if commit_changes_path(&repository, &shallow, &commit, &relative_path)? {
             revisions.push(commit_metadata(&commit)?);
             if revisions.len() == limit as usize {
                 break;
@@ -399,21 +406,18 @@ impl PartialOrd for PendingCommit {
     }
 }
 
-/// Queue `id` for the walk. A commit whose object cannot be read is a
-/// history **boundary**, not an error: the ubiquitous cause is a shallow
-/// clone, where parents beyond the fetch depth are referenced but absent,
-/// and `git log` terminates there rather than failing. Consequence worth
-/// naming: an unreadable HEAD object yields an empty history instead of an
-/// error, trading a corrupt-repository diagnostic for shallow tolerance.
+/// Queue `id` for the walk. A missing commit object is an `Operation`; the
+/// caller skips parent traversal only for IDs proven by the explicit shallow
+/// boundary set.
 fn enqueue_commit(
     repository: &gix::Repository,
     pending: &mut BinaryHeap<PendingCommit>,
     id: gix::ObjectId,
     sequence: &mut u64,
 ) -> Result<(), VcsError> {
-    let Ok(commit) = repository.find_commit(id) else {
-        return Ok(());
-    };
+    let commit = repository
+        .find_commit(id)
+        .map_err(|error| VcsError::Operation(format!("read commit {id}: {error}")))?;
     pending.push(PendingCommit {
         timestamp_utc: commit_timestamp(&commit)?,
         sequence: *sequence,
@@ -425,6 +429,7 @@ fn enqueue_commit(
 
 fn commit_changes_path(
     repository: &gix::Repository,
+    shallow: &HashSet<gix::ObjectId>,
     commit: &gix::Commit<'_>,
     path: &Path,
 ) -> Result<bool, VcsError> {
@@ -435,16 +440,18 @@ fn commit_changes_path(
         .lookup_entry_by_path(path)
         .map_err(|error| VcsError::Operation(format!("read commit tree entry: {error}")))?
         .map(|entry| (entry.oid().to_owned(), entry.mode()));
+    if shallow.contains(&commit.id) {
+        return Ok(current.is_some());
+    }
     let mut parent_ids = commit.parent_ids();
     let Some(first_parent_id) = parent_ids.next() else {
         return Ok(current.is_some());
     };
-    // An unreadable first parent is a shallow-clone boundary: treat the
-    // commit like a root, the same way `git log` reports a boundary commit
-    // as introducing the paths it carries.
-    let Ok(first_parent) = repository.find_commit(first_parent_id) else {
-        return Ok(current.is_some());
-    };
+    // This commit is not explicitly shallow, so a missing parent is an
+    // operational failure rather than an implicit history boundary.
+    let first_parent = repository.find_commit(first_parent_id).map_err(|error| {
+        VcsError::Operation(format!("read parent commit {first_parent_id}: {error}"))
+    })?;
 
     if first_parent
         .tree()
@@ -458,10 +465,10 @@ fn commit_changes_path(
     }
 
     for parent_id in parent_ids {
-        // Same boundary rule for the remaining parents of a merge.
-        let Ok(parent) = repository.find_commit(parent_id) else {
-            continue;
-        };
+        // Every parent of a non-shallow merge must be readable.
+        let parent = repository.find_commit(parent_id).map_err(|error| {
+            VcsError::Operation(format!("read parent commit {parent_id}: {error}"))
+        })?;
         if parent
             .tree()
             .map_err(|error| VcsError::Operation(format!("read parent tree: {error}")))?
@@ -474,6 +481,35 @@ fn commit_changes_path(
         }
     }
     Ok(false)
+}
+
+/// Read Git's explicit shallow-boundary set from the common Git directory.
+/// Missing boundary metadata means complete history; malformed or unreadable
+/// metadata is operational corruption, not permission to hide missing objects.
+fn shallow_commit_ids(repository: &gix::Repository) -> Result<HashSet<gix::ObjectId>, VcsError> {
+    let path = repository.common_dir().join("shallow");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => {
+            return Err(VcsError::Operation(format!(
+                "read shallow boundary {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse().map_err(|error| {
+                VcsError::Operation(format!(
+                    "parse shallow boundary {line:?} in {}: {error}",
+                    path.display()
+                ))
+            })
+        })
+        .collect()
 }
 
 fn commit_metadata(commit: &gix::Commit<'_>) -> Result<Commit, VcsError> {
@@ -1490,6 +1526,10 @@ mod harness {
             [boundary_revision.as_str()],
             "exactly the boundary commit is reported, as git log does"
         );
+        assert!(
+            history.truncated,
+            "a shallow boundary must expose that older history was not exhausted"
+        );
     }
 
     /// Gate artifact 18 (cycle 2, M1): a tree entry that EXISTS but whose
@@ -1541,6 +1581,131 @@ mod harness {
         assert!(
             matches!(absent, VcsError::NotFound(_)),
             "genuine path absence keeps the NotFound contract, got: {absent:?}"
+        );
+    }
+
+    /// Missing revision objects and blobs are operational failures. In
+    /// particular, a partial clone can advertise a tree entry while the blob
+    /// is still absent locally; neither that nor a pruned loose object may be
+    /// described to history consumers as "no history".
+    #[tokio::test]
+    async fn revision_and_pruned_blob_failures_are_operations_not_absence() {
+        use super::GitProvider;
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+
+        let missing_revision = provider
+            .resolve_rev(Some("definitely-not-a-revision"))
+            .await
+            .expect_err("an unresolved revision is not a path absence");
+        assert!(
+            matches!(missing_revision, VcsError::Operation(_)),
+            "revision parse/object/peel failures must be operational: {missing_revision:?}"
+        );
+
+        let head = provider
+            .resolve_rev(Some("HEAD"))
+            .await
+            .expect("resolve HEAD");
+        let blob_oid = fixture
+            .git_stdout(&["rev-parse", "HEAD:src/calculator.rs"])
+            .expect("resolve fixture blob")
+            .trim()
+            .to_owned();
+        let object = fixture
+            .path()
+            .join(".git/objects")
+            .join(&blob_oid[..2])
+            .join(&blob_oid[2..]);
+        assert!(object.exists(), "fixture blob must be loose before pruning");
+        std::fs::remove_file(&object).expect("prune fixture blob object");
+
+        let pruned_blob = provider
+            .read_at(&head, Path::new("src/calculator.rs"))
+            .await
+            .expect_err("a tree entry with a missing blob is unreadable");
+        assert!(
+            matches!(pruned_blob, VcsError::Operation(_)),
+            "partial-clone/pruned/missing-blob failures must not become no-history: {pruned_blob:?}"
+        );
+    }
+
+    /// A pruned parent commit is corruption unless the current commit is
+    /// explicitly listed in Git's shallow boundary metadata.
+    #[tokio::test]
+    async fn revisions_touching_reports_pruned_non_shallow_parent_as_operation() {
+        use super::GitProvider;
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(provider_script()).expect("fixture must build");
+        let parent = fixture
+            .git_stdout(&["rev-parse", "HEAD^"])
+            .expect("resolve fixture parent")
+            .trim()
+            .to_owned();
+        let object = fixture
+            .path()
+            .join(".git/objects")
+            .join(&parent[..2])
+            .join(&parent[2..]);
+        assert!(object.exists(), "fixture parent must be a loose object");
+        std::fs::remove_file(&object).expect("prune non-shallow parent commit");
+
+        let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
+        let path = fixture.path().join("src/calculator.rs");
+        let error = provider
+            .revisions_touching(&path, 10)
+            .await
+            .expect_err("a pruned non-shallow parent is not a history boundary");
+        assert!(
+            matches!(error, VcsError::Operation(_)),
+            "pruned commit object must be operational, got: {error:?}"
+        );
+    }
+
+    /// A real `--filter=blob:none` clone retains the commit tree while its
+    /// source blob is a promisor object. gix must report that unreadable blob
+    /// as an operational failure, never as an absent path/no-history result.
+    #[tokio::test]
+    async fn partial_clone_missing_blob_is_operation_not_absence() {
+        use super::GitProvider;
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture must build");
+        fixture
+            .git(&["config", "uploadpack.allowFilter", "true"])
+            .expect("allow local partial-clone filtering");
+        let source = fixture.path().to_string_lossy().replace('\\', "/");
+        let url = if source.starts_with('/') {
+            format!("file://{source}")
+        } else {
+            format!("file:///{source}")
+        };
+        fixture
+            .git(&[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                &url,
+                "partial-clone",
+            ])
+            .expect("create blob-filtered clone");
+        let clone_root = fixture.path().join("partial-clone");
+        let provider = GitProvider::open(&clone_root).expect("partial clone has a work tree");
+        let head = provider
+            .resolve_rev(Some("HEAD"))
+            .await
+            .expect("resolve partial-clone HEAD");
+
+        let error = provider
+            .read_at(&head, Path::new("src/calculator.rs"))
+            .await
+            .expect_err("filtered source blob must not be treated as path absence");
+        assert!(
+            matches!(error, VcsError::Operation(_)),
+            "partial clone's missing blob is operational, got: {error:?}"
         );
     }
 

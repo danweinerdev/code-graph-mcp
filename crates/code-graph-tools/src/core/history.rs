@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
+use std::sync::{Mutex, OnceLock};
+
 use code_graph_graph::Graph;
 use code_graph_lang::FingerprintMode;
 use code_graph_vcs::{VcsDetection, VcsError, VcsProvider, VcsRegistry};
@@ -405,8 +408,9 @@ pub struct SymbolHistoryResponse {
     /// this file MAY exist beyond the window (a history exactly `window`
     /// revisions long also sets this; the flag is conservative).
     pub window_filled: bool,
-    /// The provider stopped examining history at its internal bound before
-    /// exhausting reachable history (distinct from `window_filled`).
+    /// The provider stopped before exhausting older history, such as at an
+    /// internal examination cap or shallow boundary (distinct from
+    /// `window_filled`).
     pub history_truncated: bool,
     /// Transitions only, oldest first. Revisions where the symbol did not
     /// change are deliberately absent — that filtering is the tool's value.
@@ -444,19 +448,197 @@ fn mode_wire(mode: FingerprintMode) -> &'static str {
     }
 }
 
-/// Per-revision input for the blocking walk, resolved in the async phase.
-enum RevisionInput {
-    /// The fingerprint (or tombstone) came from the cache; no bytes needed.
+/// Revision records and cache probes are batched at eight. Because `read_at`
+/// returns an opaque whole buffer, a batch retains at most one source: it is
+/// flushed before another source read begins. This makes the 32 MiB target
+/// honest without changing the four-operation provider trait.
+const SOURCE_BATCH_MAX_SNAPSHOTS: usize = 8;
+const SOURCE_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Internal debug-test instrumentation; it is not part of any tool response.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Default)]
+#[doc(hidden)]
+pub struct HistoryWorkMetrics {
+    pub retained_sources_high_water: usize,
+    pub retained_source_bytes_high_water: usize,
+    pub non_oversized_source_bytes_high_water: usize,
+    pub oversized_sources_admitted_alone: usize,
+    pub active_ast_high_water: usize,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct MutableHistoryWorkMetrics {
+    metrics: HistoryWorkMetrics,
+    retained_sources: usize,
+    retained_source_bytes: usize,
+    active_ast: usize,
+}
+
+#[cfg(debug_assertions)]
+type WorkMeter = Arc<Mutex<MutableHistoryWorkMetrics>>;
+
+#[cfg(debug_assertions)]
+static LAST_COMPLETED_WORK_METRICS: OnceLock<Mutex<HistoryWorkMetrics>> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_history_work_metrics_for_test() {
+    *LAST_COMPLETED_WORK_METRICS
+        .get_or_init(|| Mutex::new(HistoryWorkMetrics::default()))
+        .lock()
+        .expect("history work metrics mutex poisoned") = HistoryWorkMetrics::default();
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn history_work_metrics_for_test() -> HistoryWorkMetrics {
+    *LAST_COMPLETED_WORK_METRICS
+        .get_or_init(|| Mutex::new(HistoryWorkMetrics::default()))
+        .lock()
+        .expect("history work metrics mutex poisoned")
+}
+
+#[cfg(debug_assertions)]
+struct SourceSnapshotGuard {
+    meter: WorkMeter,
+    bytes: usize,
+}
+
+#[cfg(debug_assertions)]
+impl SourceSnapshotGuard {
+    fn admit(meter: WorkMeter, bytes: usize) -> Self {
+        let mut state = meter.lock().expect("history work metrics mutex poisoned");
+        debug_assert_eq!(state.retained_sources, 0);
+        state.retained_sources = 1;
+        state.retained_source_bytes += bytes;
+        state.metrics.retained_sources_high_water = state
+            .metrics
+            .retained_sources_high_water
+            .max(state.retained_sources);
+        state.metrics.retained_source_bytes_high_water = state
+            .metrics
+            .retained_source_bytes_high_water
+            .max(state.retained_source_bytes);
+        if bytes <= SOURCE_BATCH_MAX_BYTES {
+            state.metrics.non_oversized_source_bytes_high_water = state
+                .metrics
+                .non_oversized_source_bytes_high_water
+                .max(state.retained_source_bytes);
+        }
+        debug_assert!(state.retained_sources <= SOURCE_BATCH_MAX_SNAPSHOTS);
+        debug_assert!(
+            state.retained_source_bytes <= SOURCE_BATCH_MAX_BYTES || state.retained_sources == 1
+        );
+        if bytes > SOURCE_BATCH_MAX_BYTES {
+            state.metrics.oversized_sources_admitted_alone += 1;
+        }
+        drop(state);
+        Self { meter, bytes }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for SourceSnapshotGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .meter
+            .lock()
+            .expect("history work metrics mutex poisoned");
+        state.retained_sources -= 1;
+        state.retained_source_bytes -= self.bytes;
+    }
+}
+
+#[cfg(debug_assertions)]
+struct AstWorkGuard(WorkMeter);
+
+#[cfg(debug_assertions)]
+impl AstWorkGuard {
+    fn begin(meter: WorkMeter) -> Self {
+        let mut state = meter.lock().expect("history work metrics mutex poisoned");
+        state.active_ast += 1;
+        state.metrics.active_ast_high_water =
+            state.metrics.active_ast_high_water.max(state.active_ast);
+        drop(state);
+        Self(meter)
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for AstWorkGuard {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .expect("history work metrics mutex poisoned")
+            .active_ast -= 1;
+    }
+}
+
+/// Debug-test seam for deterministic slow parser/fingerprint coverage.
+#[cfg(debug_assertions)]
+type ParserHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(debug_assertions)]
+static PARSER_HOOK: OnceLock<Mutex<Option<ParserHook>>> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub struct ParserHookGuard(Option<ParserHook>);
+
+#[cfg(debug_assertions)]
+impl Drop for ParserHookGuard {
+    fn drop(&mut self) {
+        *PARSER_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("history parser test hook mutex poisoned") = self.0.take();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_parser_hook_for_test(hook: ParserHook) -> ParserHookGuard {
+    let previous = (*PARSER_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("history parser test hook mutex poisoned"))
+    .replace(hook);
+    ParserHookGuard(previous)
+}
+
+enum SnapshotInput {
     Cached(Option<u64>),
-    /// Cache miss: the file's bytes at this revision, fetched via
-    /// `read_at` (in memory, FR-35 — no temporary file is ever written).
-    Bytes(Vec<u8>),
-    /// The provider reports the path does not exist at this revision —
-    /// typically a commit that DELETED the file. That is an examined
-    /// absence (it drives a `removed` transition), not a skip.
+    /// The provider reports the path does not exist at this revision. This is
+    /// an examined absence, not uncertainty.
     Absent,
-    /// The revision's bytes could not be read; the walk skips it.
+    /// The provider could not read an otherwise unknown snapshot.
     ReadFailed(String),
+    /// One owned source buffer, metered from `read_at` return until the batch
+    /// drops it after parsing.
+    Bytes(SourceSnapshot),
+}
+
+struct SourceSnapshot {
+    bytes: Vec<u8>,
+    oversized: bool,
+    #[cfg(debug_assertions)]
+    _guard: SourceSnapshotGuard,
+}
+
+impl SourceSnapshot {
+    fn new(bytes: Vec<u8>, #[cfg(debug_assertions)] meter: WorkMeter) -> Self {
+        let oversized = bytes.len() > SOURCE_BATCH_MAX_BYTES;
+        #[cfg(debug_assertions)]
+        let guard = SourceSnapshotGuard::admit(meter, bytes.len());
+        Self {
+            bytes,
+            oversized,
+            #[cfg(debug_assertions)]
+            _guard: guard,
+        }
+    }
 }
 
 /// `symbol_history` body: when did this symbol's *content* actually change,
@@ -466,10 +648,10 @@ enum RevisionInput {
 /// touching the symbol's file, computes the symbol's fingerprint at each
 /// (exact, case-sensitive `(name, kind)` match — D-0005: any rename,
 /// including case-only, reports as `removed` + `introduced`), and emits
-/// only transitions. The CPU-bound half — parse + fingerprint per revision
-/// — runs inside one `spawn_blocking` so a large window cannot starve the
-/// runtime (NFR-10); revision bytes are prefetched through the provider's
-/// own blocking-pool dispatch, and cache hits skip the fetch entirely.
+/// only transitions. Cache shard reads and each parse/fingerprint run in
+/// Tokio blocking tasks. Revision records are batched oldest-to-newest at
+/// eight, but opaque whole-buffer reads retain at most one source at a time;
+/// parsing drops that source's AST before the next source read is admitted.
 pub async fn symbol_history(
     inner: &Arc<ServerInner>,
     indexed: bool,
@@ -601,72 +783,177 @@ pub async fn symbol_history(
     let config = inner.config.read().clone();
     let config_id = super::fingerprint_cache::config_identity(&config);
 
-    // Async phase: consult the cache, prefetch bytes only for misses. The
-    // provider dispatches each read on its own blocking pool.
-    let mut inputs: Vec<RevisionInput> = Vec::with_capacity(commits.len());
-    for commit in &commits {
-        let key = FingerprintKey {
-            provider: &provider_id,
-            rev: commit.rev.as_str(),
-            relative_path: &relative_path,
-            symbol_name: &target_name,
+    let mut state = TransitionState::default();
+    #[cfg(debug_assertions)]
+    let meter: WorkMeter = Arc::new(Mutex::new(MutableHistoryWorkMetrics::default()));
+    // Probe cache shards in bounded ordered batches. This keeps disk I/O out
+    // of runtime workers without turning a 500-revision walk into a 500-source
+    // prefetch. A cache hit has no source snapshot at all.
+    for batch in commits.chunks(SOURCE_BATCH_MAX_SNAPSHOTS) {
+        let cached = cache_get_batch(
+            cache.clone(),
+            batch.iter().map(|commit| commit.rev.to_string()).collect(),
+            provider_id.clone(),
+            relative_path.clone(),
+            target_name.clone(),
             kind,
             mode,
-            config: config_id,
-        };
-        if let Some(cached) = cache.get(&key) {
-            inputs.push(RevisionInput::Cached(match cached {
-                Cached::Fingerprint(fingerprint) => Some(fingerprint),
-                Cached::Tombstone => None,
-            }));
-            continue;
+            config_id,
+        )
+        .await?;
+
+        let mut snapshots = Vec::with_capacity(batch.len());
+        for (commit, cached) in batch.iter().zip(cached) {
+            let input = match cached {
+                Some(cached) => SnapshotInput::Cached(cached_value(cached)),
+                None => {
+                    // `read_at` returns a whole opaque Vec. Flush any prior
+                    // source BEFORE awaiting another read, so the returned
+                    // bytes can never coexist with a retained source.
+                    if snapshots.iter().any(|snapshot: &SnapshotArgs| {
+                        matches!(snapshot.input, SnapshotInput::Bytes(_))
+                    }) {
+                        state = process_snapshot_batch(
+                            std::mem::take(&mut snapshots),
+                            state,
+                            window_filled,
+                            history_truncated,
+                        )
+                        .await?;
+                    }
+                    match provider.read_at(&commit.rev, Path::new(&file)).await {
+                        Ok(bytes) => SnapshotInput::Bytes(SourceSnapshot::new(
+                            bytes,
+                            #[cfg(debug_assertions)]
+                            Arc::clone(&meter),
+                        )),
+                        Err(VcsError::NotFound(_)) => SnapshotInput::Absent,
+                        Err(error) => SnapshotInput::ReadFailed(error.to_string()),
+                    }
+                }
+            };
+            let oversized_source =
+                matches!(&input, SnapshotInput::Bytes(source) if source.oversized);
+            if oversized_source && !snapshots.is_empty() {
+                state = process_snapshot_batch(
+                    std::mem::take(&mut snapshots),
+                    state,
+                    window_filled,
+                    history_truncated,
+                )
+                .await?;
+            }
+            snapshots.push(SnapshotArgs {
+                inner: Arc::clone(inner),
+                commit: commit.clone(),
+                input,
+                file: file.clone(),
+                target_name: target_name.clone(),
+                target_kind,
+                language,
+                mode,
+                cache: cache.clone(),
+                relative_path: relative_path.clone(),
+                provider_id: provider_id.clone(),
+                kind,
+                config: config.clone(),
+                config_id,
+                #[cfg(debug_assertions)]
+                meter: Arc::clone(&meter),
+            });
+            // An oversized source is admitted and processed alone; normal
+            // sources may share the record batch only with non-source rows.
+            if oversized_source {
+                state = process_snapshot_batch(
+                    std::mem::take(&mut snapshots),
+                    state,
+                    window_filled,
+                    history_truncated,
+                )
+                .await?;
+            }
         }
-        match provider.read_at(&commit.rev, Path::new(&file)).await {
-            Ok(bytes) => inputs.push(RevisionInput::Bytes(bytes)),
-            // The path does not exist at this revision — a deletion commit.
-            // Examined absence, not a skip: it drives `removed`.
-            Err(VcsError::NotFound(_)) => inputs.push(RevisionInput::Absent),
-            Err(error) => inputs.push(RevisionInput::ReadFailed(error.to_string())),
+        if !snapshots.is_empty() {
+            state =
+                process_snapshot_batch(snapshots, state, window_filled, history_truncated).await?;
         }
     }
 
-    run_transition_walk(WalkArgs {
-        inner: Arc::clone(inner),
+    #[cfg(debug_assertions)]
+    {
+        *LAST_COMPLETED_WORK_METRICS
+            .get_or_init(|| Mutex::new(HistoryWorkMetrics::default()))
+            .lock()
+            .expect("history work metrics mutex poisoned") = meter
+            .lock()
+            .expect("history work metrics mutex poisoned")
+            .metrics;
+    }
+
+    Ok(ToolOk::Value(SymbolHistoryResponse {
+        available: true,
+        reason: None,
         symbol_id: symbol.to_string(),
-        commits,
-        inputs,
         file,
-        target_name,
-        target_kind,
-        language,
-        mode,
+        mode: mode_wire(mode).to_string(),
         window,
+        revisions_examined: commits.len() as u32,
         window_filled,
         history_truncated,
-        cache,
-        relative_path,
-        provider_id,
-        kind,
-        config,
-        config_id,
-    })
-    .await
+        entries: state.entries,
+        skipped: state.skipped,
+    }))
 }
 
-/// Everything the blocking walk needs, owned, so the closure is `'static`.
-struct WalkArgs {
+fn cached_value(cached: Cached) -> Option<u64> {
+    match cached {
+        Cached::Fingerprint(fingerprint) => Some(fingerprint),
+        Cached::Tombstone => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cache_get_batch(
+    cache: FingerprintCache,
+    revisions: Vec<String>,
+    provider_id: String,
+    relative_path: String,
+    target_name: String,
+    kind: &'static str,
+    mode: FingerprintMode,
+    config_id: u64,
+) -> Result<Vec<Option<Cached>>, ToolError> {
+    tokio::task::spawn_blocking(move || {
+        revisions
+            .iter()
+            .map(|rev| {
+                cache.get(&FingerprintKey {
+                    provider: &provider_id,
+                    rev,
+                    relative_path: &relative_path,
+                    symbol_name: &target_name,
+                    kind,
+                    mode,
+                    config: config_id,
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| ToolError(format!("symbol_history cache worker failed: {error}")))
+}
+
+/// Everything one blocking parse/fingerprint task needs, owned, so the
+/// closure is `'static`. It owns exactly one source snapshot.
+struct SnapshotArgs {
     inner: Arc<ServerInner>,
-    symbol_id: String,
-    commits: Vec<code_graph_vcs::Commit>,
-    inputs: Vec<RevisionInput>,
+    commit: code_graph_vcs::Commit,
+    input: SnapshotInput,
     file: String,
     target_name: String,
     target_kind: code_graph_core::SymbolKind,
     language: code_graph_core::Language,
     mode: FingerprintMode,
-    window: u32,
-    window_filled: bool,
-    history_truncated: bool,
     cache: FingerprintCache,
     relative_path: String,
     provider_id: String,
@@ -676,195 +963,209 @@ struct WalkArgs {
     config: code_graph_core::RootConfig,
     /// [`super::fingerprint_cache::config_identity`] of `config`.
     config_id: u64,
+    #[cfg(debug_assertions)]
+    meter: WorkMeter,
 }
 
-/// The CPU-bound half of `symbol_history`: parse + fingerprint each cache
-/// miss and assemble the transition walk, inside one `spawn_blocking`.
-async fn run_transition_walk(args: WalkArgs) -> ToolResult<SymbolHistoryResponse> {
-    let revisions_examined = args.commits.len() as u32;
-    let walk = tokio::task::spawn_blocking(move || {
-        let WalkArgs {
+enum SnapshotResult {
+    Current(Option<u64>),
+    Skipped(String),
+}
+
+#[derive(Default)]
+struct TransitionState {
+    entries: Vec<SymbolHistoryEntry>,
+    skipped: Vec<SkippedRevision>,
+    previous: Option<Option<u64>>,
+}
+
+fn apply_current(
+    state: &mut TransitionState,
+    commit: &code_graph_vcs::Commit,
+    current: Option<u64>,
+    window_filled: bool,
+    history_truncated: bool,
+) {
+    let first_examined = state.previous.is_none();
+    let before = state.previous.flatten();
+    state.previous = Some(current);
+    let change = match (before, current) {
+        (None, Some(_)) => "introduced",
+        (Some(_), None) if !first_examined => "removed",
+        (Some(a), Some(b)) if a != b && !first_examined => "modified",
+        _ => return,
+    };
+    state.entries.push(SymbolHistoryEntry {
+        rev: commit.rev.to_string(),
+        author: commit.author.clone(),
+        timestamp_utc: commit.timestamp_utc,
+        summary: commit.summary.clone(),
+        change,
+        at_window_boundary: first_examined
+            && change == "introduced"
+            && (window_filled || history_truncated || !state.skipped.is_empty()),
+    });
+}
+
+/// Process an ordered source batch in one blocking task. Each `ParsedFile`
+/// stays local to [`process_snapshot`] and drops before the next entry.
+async fn process_snapshot_batch(
+    snapshots: Vec<SnapshotArgs>,
+    mut state: TransitionState,
+    window_filled: bool,
+    history_truncated: bool,
+) -> Result<TransitionState, ToolError> {
+    tokio::task::spawn_blocking(move || {
+        for snapshot in snapshots {
+            let commit = snapshot.commit.clone();
+            match process_snapshot(snapshot)? {
+                SnapshotResult::Current(current) => apply_current(
+                    &mut state,
+                    &commit,
+                    current,
+                    window_filled,
+                    history_truncated,
+                ),
+                SnapshotResult::Skipped(reason) => state.skipped.push(SkippedRevision {
+                    rev: commit.rev.to_string(),
+                    reason,
+                }),
+            }
+        }
+        Ok(state)
+    })
+    .await
+    .map_err(|error| ToolError(format!("symbol_history worker failed: {error}")))?
+}
+
+/// Parse and fingerprint one admitted source snapshot. The `ParsedFile` is a
+/// local variable in this blocking closure, so its AST drops before the next
+/// source snapshot can be processed.
+fn process_snapshot(args: SnapshotArgs) -> Result<SnapshotResult, ToolError> {
+    (|| {
+        let SnapshotArgs {
             inner,
-            symbol_id,
-            commits,
-            inputs,
+            commit,
+            input,
             file,
             target_name,
             target_kind,
             language,
             mode,
-            window,
-            window_filled,
-            history_truncated,
             cache,
             relative_path,
             provider_id,
             kind,
             config,
             config_id,
+            #[cfg(debug_assertions)]
+            meter,
         } = args;
         let Some(plugin) = inner.registry.plugin_for(language) else {
             return Err(ToolError(format!("no parser registered for {language:?}")));
         };
-
-        let mut entries: Vec<SymbolHistoryEntry> = Vec::new();
-        let mut skipped: Vec<SkippedRevision> = Vec::new();
-        // None = nothing examined yet; Some(None) = absent at the previous
-        // examined revision; Some(Some(fp)) = present with that fingerprint.
-        let mut previous: Option<Option<u64>> = None;
-
-        for (commit, input) in commits.iter().zip(inputs) {
-            let key = FingerprintKey {
-                provider: &provider_id,
-                rev: commit.rev.as_str(),
-                relative_path: &relative_path,
-                symbol_name: &target_name,
-                kind,
-                mode,
-                config: config_id,
-            };
-            let current: Option<u64> = match input {
-                RevisionInput::Cached(cached) => cached,
-                RevisionInput::Absent => {
-                    // The file does not exist at this revision (deletion
-                    // commit): the symbol is absent, and that absence is as
-                    // cacheable as any parsed tombstone.
-                    cache.put(&key, Cached::Tombstone);
-                    None
+        let key = FingerprintKey {
+            provider: &provider_id,
+            rev: commit.rev.as_str(),
+            relative_path: &relative_path,
+            symbol_name: &target_name,
+            kind,
+            mode,
+            config: config_id,
+        };
+        let current = match input {
+            SnapshotInput::Cached(cached) => cached,
+            SnapshotInput::Absent => {
+                cache.put(&key, Cached::Tombstone);
+                None
+            }
+            SnapshotInput::ReadFailed(reason) => {
+                return Ok(SnapshotResult::Skipped(format!(
+                    "unreadable at revision: {reason}"
+                )));
+            }
+            SnapshotInput::Bytes(bytes) => {
+                // The source was metered immediately after `read_at` and is
+                // the only retained source in this revision-record batch.
+                // Mirror the indexer's extraction pipeline exactly
+                // (indexer.rs parse phase): config-driven preprocess
+                // byte-rewrites feed the parse, and synthesis sees the
+                // ORIGINAL bytes. Without this, every symbol that only
+                // extracts under `[cpp].macro_*` config would silently
+                // report an empty history.
+                let cleaned = plugin.preprocess(&bytes.bytes, &config);
+                // Historical code may not parse with today's grammar —
+                // expected, not exceptional: skip and flag.
+                #[cfg(debug_assertions)]
+                let _ast_guard = AstWorkGuard::begin(Arc::clone(&meter));
+                #[cfg(debug_assertions)]
+                if let Some(hook) = PARSER_HOOK
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("history parser test hook mutex poisoned")
+                    .clone()
+                {
+                    hook();
                 }
-                RevisionInput::ReadFailed(reason) => {
-                    skipped.push(SkippedRevision {
-                        rev: commit.rev.to_string(),
-                        reason: format!("unreadable at revision: {reason}"),
-                    });
-                    continue;
-                }
-                RevisionInput::Bytes(bytes) => {
-                    // Mirror the indexer's extraction pipeline exactly
-                    // (indexer.rs parse phase): config-driven preprocess
-                    // byte-rewrites feed the parse, and synthesis sees the
-                    // ORIGINAL bytes. Without this, every symbol that only
-                    // extracts under `[cpp].macro_*` config would silently
-                    // report an empty history.
-                    let cleaned = plugin.preprocess(&bytes, &config);
-                    // Historical code may not parse with today's grammar —
-                    // expected, not exceptional: skip and flag.
-                    let mut parsed = match plugin.parse_file(Path::new(&file), &cleaned) {
-                        Ok(parsed) => parsed,
-                        Err(error) => {
-                            skipped.push(SkippedRevision {
-                                rev: commit.rev.to_string(),
-                                reason: format!("parse failed: {error}"),
-                            });
-                            continue;
-                        }
-                    };
-                    plugin.synthesize_symbols(Path::new(&file), &bytes, &config, &mut parsed);
-                    // Exact, case-sensitive (name, kind) — D-0005. Several
-                    // matches (overloads) resolve deterministically to the
-                    // earliest occurrence.
-                    let found = parsed
-                        .symbols
-                        .iter()
-                        .filter(|s| s.name == target_name && s.kind == target_kind)
-                        .min_by_key(|s| (s.line, s.column));
-                    match found {
-                        None => {
-                            cache.put(&key, Cached::Tombstone);
-                            None
-                        }
-                        Some(historical) => {
-                            // Fingerprint the SAME bytes the parse saw (the
-                            // preprocessed form) — phase 8.1's settled
-                            // contract: the AST overrides re-parse `content`
-                            // to locate the span, and raw-vs-cleaned bytes
-                            // would misalign macro-stripped spans. Preprocess
-                            // is byte-preserving, so line spans are identical
-                            // either way for the text default.
-                            match plugin.fingerprint_symbol(&cleaned, historical, mode) {
-                                Some(fingerprint) => {
-                                    cache.put(&key, Cached::Fingerprint(fingerprint));
-                                    Some(fingerprint)
-                                }
-                                None if mode == FingerprintMode::LiteralInsensitive => {
-                                    // Post-phase-8 this arm is per-SPAN
-                                    // unavailability (unlocatable span:
-                                    // synthesized symbols, error-recovered
-                                    // regions) or a future plugin without an
-                                    // AST override. A VISIBLE skip — never a
-                                    // silent fallback to Normalized
-                                    // (Designs/VcsHistory Decision 5): the
-                                    // revision lands in `skipped` with the
-                                    // mode named, and the transition state
-                                    // carries over it.
-                                    skipped.push(SkippedRevision {
-                                        rev: commit.rev.to_string(),
-                                        reason: format!(
-                                            "span not fingerprintable under mode \
-                                             \"literal_insensitive\" at this revision \
-                                             ({language:?})"
-                                        ),
-                                    });
-                                    continue;
-                                }
-                                None => {
-                                    skipped.push(SkippedRevision {
-                                        rev: commit.rev.to_string(),
-                                        reason: "span not fingerprintable at this revision"
-                                            .to_string(),
-                                    });
-                                    continue;
-                                }
+                let mut parsed = match plugin.parse_file(Path::new(&file), &cleaned) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return Ok(SnapshotResult::Skipped(format!("parse failed: {error}")))
+                    }
+                };
+                plugin.synthesize_symbols(Path::new(&file), &bytes.bytes, &config, &mut parsed);
+                // Exact, case-sensitive (name, kind) — D-0005. Several
+                // matches (overloads) resolve deterministically to the
+                // earliest occurrence.
+                let found = parsed
+                    .symbols
+                    .iter()
+                    .filter(|s| s.name == target_name && s.kind == target_kind)
+                    .min_by_key(|s| (s.line, s.column));
+                match found {
+                    None => {
+                        cache.put(&key, Cached::Tombstone);
+                        None
+                    }
+                    Some(historical) => {
+                        // Fingerprint the SAME bytes the parse saw (the
+                        // preprocessed form) — phase 8.1's settled
+                        // contract: the AST overrides re-parse `content`
+                        // to locate the span, and raw-vs-cleaned bytes
+                        // would misalign macro-stripped spans. Preprocess
+                        // is byte-preserving, so line spans are identical
+                        // either way for the text default.
+                        match plugin.fingerprint_symbol(&cleaned, historical, mode) {
+                            Some(fingerprint) => {
+                                cache.put(&key, Cached::Fingerprint(fingerprint));
+                                Some(fingerprint)
+                            }
+                            None if mode == FingerprintMode::LiteralInsensitive => {
+                                // Post-phase-8 this arm is per-SPAN
+                                // unavailability (unlocatable span:
+                                // synthesized symbols, error-recovered
+                                // regions) or a future plugin without an
+                                // AST override. A VISIBLE skip — never a
+                                // silent fallback to Normalized
+                                // (Designs/VcsHistory Decision 5): the
+                                // revision lands in `skipped` with the
+                                // mode named, and the transition state
+                                // carries over it.
+                                return Ok(SnapshotResult::Skipped(format!(
+                                    "span not fingerprintable under mode \
+                                     \"literal_insensitive\" at this revision ({language:?})"
+                                )));
+                            }
+                            None => {
+                                return Ok(SnapshotResult::Skipped(
+                                    "span not fingerprintable at this revision".to_string(),
+                                ))
                             }
                         }
                     }
                 }
-            };
-
-            let first_examined = previous.is_none();
-            let before = previous.flatten();
-            previous = Some(current);
-            let change = match (before, current) {
-                (None, Some(_)) => "introduced",
-                (Some(_), None) if !first_examined => "removed",
-                (Some(a), Some(b)) if a != b && !first_examined => "modified",
-                _ => continue,
-            };
-            entries.push(SymbolHistoryEntry {
-                rev: commit.rev.to_string(),
-                author: commit.author.clone(),
-                timestamp_utc: commit.timestamp_utc,
-                summary: commit.summary.clone(),
-                change,
-                // Present at the window's oldest examined revision with
-                // older history possibly existing: indistinguishable from a
-                // genuine introduction — say so instead of mislabelling.
-                // Skips carry the same uncertainty: when every revision
-                // older than the first examined one was skipped, the symbol
-                // may have existed at the skipped revisions too (`skipped`
-                // holds exactly the pre-first skips at this point).
-                at_window_boundary: first_examined
-                    && change == "introduced"
-                    && (window_filled || history_truncated || !skipped.is_empty()),
-            });
-        }
-
-        Ok(SymbolHistoryResponse {
-            available: true,
-            reason: None,
-            symbol_id,
-            file,
-            mode: mode_wire(mode).to_string(),
-            window,
-            revisions_examined,
-            window_filled,
-            history_truncated,
-            entries,
-            skipped,
-        })
-    })
-    .await
-    .map_err(|error| ToolError(format!("symbol_history worker failed: {error}")))??;
-
-    Ok(ToolOk::Value(walk))
+            }
+        };
+        Ok(SnapshotResult::Current(current))
+    })()
 }

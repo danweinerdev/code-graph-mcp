@@ -1627,8 +1627,11 @@ impl CodeGraphServer {
                        reformat-only or comment-only commit is NOT reported under the default \
                        `mode=\"normalized\"`; changed literals and code are. Matching is \
                        exact, case-sensitive (name, kind): ANY rename — including a case-only \
-                       rename — reports as \"removed\" followed by \"introduced\" of the new \
-                       name, never \"modified\". If a file has several symbols with the same \
+                       rename — is modeled as removal of the old symbol plus introduction of \
+                       the new one, never \"modified\". For a rename that reaches HEAD, only \
+                       the current (new) symbol ID is queryable, so this tool can show its \
+                       introduction but cannot return a removal entry for the old ID. If a file \
+                       has several symbols with the same \
                        (name, kind), each revision fingerprints the EARLIEST occurrence \
                        only. FILE renames are not followed: history stops at the commit that \
                        created the current path, so a moved file's symbol reports \
@@ -1637,10 +1640,13 @@ impl CodeGraphServer {
                        was already present at the oldest examined revision and older history \
                        may exist (window filled, provider truncated, or older revisions \
                        skipped) — raising `window` helps when `window_filled: true`, but \
-                       cannot extend past `history_truncated: true` (the provider's internal \
-                       examination bound). `skipped` lists revisions that could not be read \
-                       or parsed (historical code may not parse with today's grammar); the \
-                       transition state carries over them. `available: false` + `reason` is \
+                       cannot extend past `history_truncated: true` (the provider stopped before \
+                       exhausting older history, for example at its examination cap or a shallow \
+                       boundary). `skipped` lists revisions that could not be read or parsed in \
+                       oldest-to-newest walk order (historical code may not parse with today's \
+                       grammar); transition state carries over them, so a transition after a skip \
+                       is observed at the first readable revision but may have occurred in a \
+                       skipped revision. `available: false` + `reason` is \
                        a SUCCESS (no VCS at the indexed root, or no committed history for \
                        this path); unknown `symbol` is a tool error with did-you-mean \
                        suggestions; an unknown `mode` spelling is a tool error naming the \

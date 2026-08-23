@@ -60,19 +60,18 @@ pub struct Commit {
 
 /// A bounded window of revisions that changed one file, newest first.
 ///
-/// `truncated` distinguishes "the provider stopped examining history at an
-/// internal bound with unexamined history remaining" (the git revwalk cap)
+/// `truncated` distinguishes "the provider stopped before exhausting older
+/// history" (for example, the git revwalk cap or a shallow-clone boundary)
 /// from the window merely filling to the requested `limit` — a caller can
 /// detect the latter itself via `commits.len() == limit`, but only the
 /// provider knows about the former. Consumers building user-facing results
-/// must surface both states rather than presenting a truncated walk as
+/// must surface both states rather than presenting an incomplete walk as
 /// complete history.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RevisionWindow {
     /// Up to `limit` revisions that changed the path, newest first.
     pub commits: Vec<Commit>,
-    /// The walk stopped at a provider-internal examination bound before
-    /// exhausting reachable history.
+    /// The provider stopped before exhausting older history.
     pub truncated: bool,
 }
 
@@ -178,9 +177,9 @@ pub trait VcsProvider: Send + Sync {
         at: Option<&RevId>,
     ) -> Result<Vec<BlameHunk>, VcsError>;
 
-    /// List up to `limit` revisions that changed `path`, newest first,
-    /// with an explicit signal when the provider's own examination bound
-    /// (not the caller's `limit`) cut the walk short.
+    /// List up to `limit` revisions that changed `path`, newest first, with
+    /// an explicit signal when the provider stopped before exhausting older
+    /// history (independent of the caller's `limit`).
     async fn revisions_touching(&self, path: &Path, limit: u32)
         -> Result<RevisionWindow, VcsError>;
 
