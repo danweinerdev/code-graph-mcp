@@ -10,7 +10,7 @@ deliverable: "Every still-open, non-macOS, non-Perforce follow-up accepted by th
 tasks:
   - id: "12.1"
     title: "Close graph-query correctness and response-contract debt"
-    status: planned
+    status: complete
     justifies: "FR-05, FR-22, FR-24, FR-25, AC-16, AC-29, AC-32, NFR-03, and NFR-08; prevents false cap diagnostics, overflow-dependent community output, and undocumented response-size behavior recorded by review 16."
     verification: >-
       cargo test -p code-graph-graph callgraph and cargo test -p code-graph-tools --test snapshot_responses and cargo test -p code-graph-tools --test query_perf pass; an exact-frontier exhausted search reports cap_reached=false, community accumulation saturates deterministically, DetectCommunitiesResponse emits top-level members_per_community: u32 immediately after granularity with 10 default, 0-to-default, and max-100 clamp semantics, equal-cost path behavior is documented and test-pinned, and find_path's deliberate max_bytes exemption is stated in its production description and CLAUDE.md; make verify passes.
@@ -84,12 +84,12 @@ Execution may proceed in parallel for 12.1, 12.2, 12.3, 12.6, and 12.7. Task 12.
 
 ## 12.1: Close graph-query correctness and response-contract debt
 ### Subtasks
-- [ ] Make exact-frontier exhaustion report `cap_reached: false` when no work remains; retain `true` only when the cap actually stops a non-empty frontier.
-- [ ] Add graph-level tests for target found at the cap, unreachable target with exactly cap-sized reachability, and a genuinely truncated non-empty frontier.
-- [ ] Use saturating community weight accumulation and pin the overflow boundary without constructing billions of edges.
-- [ ] Add top-level `members_per_community: u32` immediately after `granularity` in `DetectCommunitiesResponse`; echo the resolved default 10 (`0` also resolves to 10) clamped to max 100 in MCP/CLI rendering, schemas, descriptions, and snapshots as an additive field satisfying FR-24/AC-32.
-- [ ] Tighten shortest-path determinism prose to graph-state determinism unless a stable merge-order-independent parent rule is implemented and regression-tested.
-- [ ] Document `find_path` as a deliberate `[response].max_bytes` exemption in both its production tool description and CLAUDE.md; retain `node_cap` as its bounded-work lever and state that the response is an indivisible valid path, never a partial continuation.
+- [x] Make exact-frontier exhaustion report `cap_reached: false` when no work remains; retain `true` only when the cap actually stops a non-empty frontier.
+- [x] Add graph-level tests for target found at the cap, unreachable target with exactly cap-sized reachability, and a genuinely truncated non-empty frontier.
+- [x] Use saturating community weight accumulation and pin the overflow boundary without constructing billions of edges.
+- [x] Add top-level `members_per_community: u32` immediately after `granularity` in `DetectCommunitiesResponse`; echo the resolved default 10 (`0` also resolves to 10) clamped to max 100 in MCP/CLI rendering, schemas, descriptions, and snapshots as an additive field satisfying FR-24/AC-32.
+- [x] Tighten shortest-path determinism prose to graph-state determinism unless a stable merge-order-independent parent rule is implemented and regression-tested.
+- [x] Document `find_path` as a deliberate `[response].max_bytes` exemption in both its production tool description and CLAUDE.md; retain `node_cap` as its bounded-work lever and state that the response is an indivisible valid path, never a partial continuation.
 
 ### Notes
 Revision boundary: graph queries have honest cap, overflow, determinism, and response-shape contracts, with one additive community field and no partial-path wire state. `find_path` remains a single `FindPathResponse`; this task closes the review finding by making the exemption explicit rather than inventing invalid pagination semantics.
@@ -101,7 +101,27 @@ Do not run a serialized `find_path` through `byte_budget_take` or truncate `hops
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `~/Development/Code/code-graph-mcp`
+- VCS: `git`
+- Revision / checkpoint: `97078e1d54c1639c4d8855d296af53974478ed8a`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23T00:44:57-07:00 matched `97078e1d54c1639c4d8855d296af53974478ed8a`
+- Focused review: `git show 97078e1d54c1639c4d8855d296af53974478ed8a`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `97078e1d54c1639c4d8855d296af53974478ed8a`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `cargo test -p code-graph-graph callgraph` | `.` | PASS (`exit 0`) | 28 callgraph tests passed, including exact-frontier, target-at-cap, nonempty-frontier, leaf-at-cap, and equal-cost regressions. |
+| `cargo test -p code-graph-tools --test snapshot_responses` | `.` | PASS (`exit 0`) | 59 response snapshot tests passed; default and member-capped community responses include the resolved cap. |
+| `cargo test -p code-graph-tools --test query_perf` | `.` | PASS (`exit 0`) | Harness passed; its opt-in dogfood benchmark remained ignored as designed. |
+| `cargo test -p code-graph-tools --test snapshot_tools_list` | `.` | PASS (`exit 0`) | 33 description snapshots passed, including both changed production descriptions. |
+| `cargo fmt --all --check` | `.` | PASS (`exit 0`) | Rust formatting check passed. |
+| `make verify` | `.` | PASS (`exit 0`) | Full gate passed: clippy denied warnings, formatting, workspace tests, no pending snapshots, and plugin mirrors in sync. |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `intent-blind review-quality pass` | Complete task diff at `97078e1d54c1639c4d8855d296af53974478ed8a` | PASS | Initial cap-bypass finding was fixed; a second fresh review reported no findings and PASS/Aligned. |
 
 ## 12.2: Harden the typed-core boundary and indexed-state contract
 ### Subtasks
