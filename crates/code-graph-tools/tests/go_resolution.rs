@@ -494,6 +494,126 @@ async fn go_without_module_keeps_same_named_packages_directory_local() {
 }
 
 #[tokio::test]
+async fn go_control_initializer_shadowing_never_resolves_the_outer_receiver() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
+        .expect("write go.mod");
+    let source = write_go(
+        dir.path(),
+        "control.go",
+        r#"package control
+import "strings"
+type Outer struct{}
+func (Outer) Check() bool { return true }
+func (Outer) Stream() []Inner { return nil }
+func (Outer) Channel() <-chan Inner { return nil }
+func (Outer) OuterStream() []Outer { return nil }
+func (Outer) OuterChannel() <-chan Outer { return nil }
+func (Outer) AsAny() any { return nil }
+type Inner struct{}
+func (Inner) Check() bool { return true }
+func makeInner() Inner { return Inner{} }
+func IfString(s Outer) {
+    if s := makeInner(); strings.Contains("a:b", ":") && s.Check() {}
+}
+func IfComment(s Outer) {
+    if s := makeInner(); true /* a:b */ && s.Check() {}
+}
+func SwitchBody(s Outer) {
+    switch s := makeInner(); true {
+    case true:
+        s.Check()
+    }
+}
+func ForClause(s Outer) {
+    for s := makeInner(); s.Check(); { s.Check() }
+}
+func ForRange(s Outer) {
+    for _, s := range s.Stream() { s.Check() }
+}
+func ForRangeAssign(s Outer) {
+    for s = range s.OuterStream() { s.Check() }
+}
+func TypeSwitch(s Outer) {
+    switch s := s.AsAny().(type) {
+    case Outer:
+        s.Check()
+    }
+}
+func SelectReceive(s Outer) {
+    select {
+    case s := <-s.Channel():
+        s.Check()
+    }
+}
+func SelectAssign(s Outer) {
+    select {
+    case s = <-s.OuterChannel():
+        s.Check()
+    }
+}
+"#,
+    );
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
+    let server = go_only_server();
+    analyze(&server, &root).await;
+
+    for caller in [
+        "IfString",
+        "IfComment",
+        "SwitchBody",
+        "ForClause",
+        "ForRange",
+        "TypeSwitch",
+        "SelectReceive",
+    ] {
+        let result = ok_json(&callers_or_callees(
+            &server.inner.graph,
+            &format!("{}:{caller}", source.to_string_lossy()),
+            Some(1),
+            Direction::Callees,
+            Some(50),
+            Some(0),
+            NO_BYTE_BUDGET,
+            None,
+        ));
+        assert!(
+            result["results"]
+                .as_array()
+                .expect("callee rows")
+                .iter()
+                .all(|row| !row["symbol_id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with("control.go:Outer::Check"))),
+            "{caller} must not resolve its shadowed receiver to Outer::Check: {result}"
+        );
+    }
+
+    for caller in ["ForRangeAssign", "SelectAssign"] {
+        let result = ok_json(&callers_or_callees(
+            &server.inner.graph,
+            &format!("{}:{caller}", source.to_string_lossy()),
+            Some(1),
+            Direction::Callees,
+            Some(50),
+            Some(0),
+            NO_BYTE_BUDGET,
+            None,
+        ));
+        assert!(
+            result["results"]
+                .as_array()
+                .expect("callee rows")
+                .iter()
+                .any(|row| row["symbol_id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with("control.go:Outer::Check"))),
+            "{caller} assigns rather than declares and must retain Outer::Check: {result}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn go_typed_local_and_composite_receivers_resolve_but_unknown_and_chained_do_not() {
     let dir = TempDir::new().expect("TempDir");
     std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")

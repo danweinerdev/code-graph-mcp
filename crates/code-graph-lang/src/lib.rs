@@ -544,6 +544,37 @@ pub trait LanguagePlugin: Send + Sync {
     /// `Box<dyn LanguagePlugin>`.
     fn prepare_resolution(&self, _graphs: &[FileGraph], _file_index: &FileIndex) {}
 
+    /// Notify the plugin that a non-source path whose contents can affect its
+    /// resolver universe changed, was created, or was removed.
+    ///
+    /// Indexing layers that observe these paths can invoke this separately from
+    /// source-file reparsing because semantic inputs such as manifests are not
+    /// necessarily claimed by a language plugin and therefore do not produce a
+    /// [`FileGraph`]. Plugins that cache resolver-derived state can discard or
+    /// advance the relevant cache generation here; implementations must ignore
+    /// paths they do not recognize. The default is a no-op for languages whose
+    /// resolver depends only on the supplied file graphs.
+    ///
+    /// This remains object-safe: it takes `&self`, a concrete [`Path`]
+    /// argument, and returns `()`.
+    fn invalidate_resolution_for_path(&self, _path: &Path) {}
+
+    /// Discard resolver caches before an explicit full/scoped analysis reads
+    /// current semantic inputs from disk. Watch paths should prefer
+    /// [`Self::invalidate_resolution_for_path`] so ordinary source edits keep
+    /// reusable state; analysis is an explicit refresh boundary and may
+    /// conservatively invalidate plugin-owned derived data.
+    fn invalidate_resolution_cache(&self) {}
+
+    /// Report whether a prior semantic-input invalidation has not yet been
+    /// consumed by a successful preparation pass. Watch implementations use
+    /// this to retry a failed semantic batch before allowing an ordinary
+    /// per-file merge. Plugins without independently invalidated inputs remain
+    /// permanently ready.
+    fn resolution_cache_invalidated(&self) -> bool {
+        false
+    }
+
     /// Release any resources held by the plugin (e.g. tree-sitter queries).
     /// Default is a no-op; tree-sitter `Query` already drops cleanly.
     fn close(&self) {}

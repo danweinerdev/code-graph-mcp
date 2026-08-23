@@ -1,10 +1,13 @@
 # Testdata Go Project — Expected Parse Results
 
-The Go parser (`codegraph-lang-go`) must produce these exact counts when
+The Go parser (`code-graph-lang-go`) must produce these exact counts when
 each `.go` file under `testdata/go/` is parsed in isolation and the
 results are aggregated. The corpus test
-`crates/codegraph-lang-go/tests/corpus.rs` asserts every total in this
+`crates/code-graph-lang-go/tests/corpus.rs` asserts every total in this
 file; if you change a fixture, update both.
+
+Edge counts and targets below describe provisional extraction output. Resolved
+package/import behavior is pinned separately by `go_resolution.rs`.
 
 ## Totals
 

@@ -76,14 +76,17 @@ use std::path::{Path, PathBuf};
 ///   exists to prevent. The layout change also shifts every archived
 ///   edge, so pre-v11 caches fail the version check and route to the
 ///   documented silent re-index before any decode is attempted.
-/// - v12: Go call and import resolution semantics changed. Re-index rather
-///   than retain call edges resolved under the package-agnostic fallback.
+/// - v12: Go call and import resolution semantics changed, and symbol indexes
+///   gained de-genericized parent keys for unparameterized associated calls.
+///   Re-index rather than retain edges resolved under the older lookup rules.
+/// - v13: Go control-declaration scope resolution changed. Re-index rather
+///   than retain false receiver edges produced by the token-blind v12 logic.
 ///
 /// This constant is the single source of truth for the on-disk version.
 /// `super::CACHE_VERSION` is a re-export at the module
 /// boundary so the rest of the crate's call sites don't have to know
 /// which sub-module owns it.
-pub const CACHE_VERSION: u32 = 12;
+pub const CACHE_VERSION: u32 = 13;
 
 /// 4-byte native-endian probe at file offset 0. A reader whose host
 /// endianness disagrees with the writer's reads a different `u32`

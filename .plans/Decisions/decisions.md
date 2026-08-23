@@ -3,7 +3,7 @@ title: "Decision Ledger"
 type: decision-log
 status: active
 created: 2026-08-08
-updated: 2026-08-20
+updated: 2026-08-22
 tags: [decisions]
 related: []
 decisions:
@@ -241,7 +241,33 @@ decisions:
       - Specs/GraphPlatformExpansion
     tags: [vcs, perforce, dependencies, subprocess]
     reversibility: two-way
+  - id: D-0016
+    kind: decision
+    status: superseded
+    date: 2026-08-22
+    decided_by: user-approved
+    statement: "Watch mode treats go.mod create, modify, and remove events as Go resolver-semantic changes: it invalidates the cached Go module universe and atomically reparses and re-resolves all indexed Go files under the manifest directory. Ordinary Go source edits reuse the cached module model when the Go path universe and manifest epoch are unchanged."
+    rejected: [Ignoring go.mod changes until the next analyze_codebase call, Reindexing affected Go files one at a time with a full resolver rebuild per file, Caching module discovery solely by the Go file path set without explicit manifest invalidation]
+    rationale: "A go.mod change can alter every descendant symbol namespace and import/call target without changing any .go path. A coherent subtree rescan is therefore required for correctness, while a shared module model removes the repeated ancestor stat/read cost from ordinary edits. Publishing the affected replacements atomically prevents mixed old/new module identities from becoming query-visible."
+    scope: [Plans/RustSupportGaps, crates/code-graph-lang-go, crates/code-graph-tools]
+    tags: [go, watch, go-mod, invalidation, resolver, performance]
+    reversibility: two-way
+    superseded_by: D-0017
+  - id: D-0017
+    kind: decision
+    status: accepted
+    supersedes: D-0016
+    date: 2026-08-22
+    decided_by: user-approved
+    statement: "Any watched go.mod create, modify, or remove event invalidates the cached Go module universe and atomically reparses and re-resolves all indexed Go files. Ordinary Go source edits reuse the cached module model while the Go path universe and manifest epoch are unchanged, and reuse derived resolution state when resolver-relevant file metadata is unchanged."
+    rejected: [Rescanning only Go files beneath the changed manifest, Trying to infer all affected external importers from currently resolved graph edges, Ignoring go.mod changes until the next analyze_codebase call]
+    rationale: "A manifest change affects descendants directly and can also invalidate or newly enable imports and calls from any indexed Go file outside that subtree. The graph does not retain dropped unresolved imports, so current edges cannot identify every external consumer. A conservative all-Go rebuild is the smallest correctness-preserving watch behavior until reverse manifest dependency metadata exists; ordinary body-only edits retain the fast cached path."
+    scope: [Plans/RustSupportGaps, crates/code-graph-lang-go, crates/code-graph-tools]
+    tags: [go, watch, go-mod, invalidation, resolver, correctness]
+    reversibility: two-way
 ---
+
+
 
 
 

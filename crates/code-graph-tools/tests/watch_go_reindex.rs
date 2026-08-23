@@ -21,7 +21,7 @@
 //! so the lifecycle gets exercised even though the per-edit assertion
 //! path is the deterministic one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_go::GoParser;
@@ -29,7 +29,7 @@ use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::handlers::query::{callers_or_callees, Direction};
 use code_graph_tools::handlers::symbols::{get_file_symbols, get_symbol_detail};
 use code_graph_tools::handlers::watch::{
-    try_reindex_file, watch_start, watch_stop, ReindexOutcome,
+    try_reindex_file, try_reindex_go_manifest, watch_start, watch_stop, ReindexOutcome,
 };
 use code_graph_tools::handlers::NO_BYTE_BUDGET;
 use code_graph_tools::CodeGraphServer;
@@ -87,6 +87,45 @@ fn symbol_names_from(body: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn symbol_namespace(server: &CodeGraphServer, path: &Path, name: &str) -> String {
+    server
+        .inner
+        .graph
+        .read()
+        .file_symbols(path)
+        .into_iter()
+        .find(|symbol| symbol.name == name)
+        .unwrap_or_else(|| panic!("missing symbol {name:?} in {}", path.display()))
+        .namespace
+}
+
+fn assert_reindexed(outcome: ReindexOutcome) {
+    assert!(
+        matches!(outcome, ReindexOutcome::Reindexed),
+        "expected Reindexed, got {outcome:?}"
+    );
+}
+
+fn has_direct_callee(server: &CodeGraphServer, caller: &str, callee: &str) -> bool {
+    let result = callers_or_callees(
+        &server.inner.graph,
+        caller,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+        None,
+    );
+    if result.is_error == Some(true) {
+        return false;
+    }
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
+    body["results"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["symbol_id"] == callee))
 }
 
 /// CRITICAL: a watch-driven reindex of a `.go`
@@ -349,4 +388,208 @@ async fn watch_start_stop_against_go_temp_project() {
     );
 
     drop(dir);
+}
+
+#[tokio::test]
+async fn go_mod_create_modify_remove_rebuilds_go_universe() {
+    let dir = TempDir::new().expect("TempDir");
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(
+        dir.path().join("root.go"),
+        b"package root\nfunc Root() {}\n",
+    )
+    .unwrap();
+    // This external importer deliberately names the module version that will
+    // be created later. Its unresolved edge is dropped from the initial graph,
+    // so only an all-Go manifest rescan can make the call appear.
+    std::fs::write(
+        dir.path().join("external.go"),
+        b"package root\nimport nested \"example.com/nested/v2\"\nfunc ExternalCaller() { nested.Target() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("target.go"),
+        b"package nested\nfunc Target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("caller.go"),
+        b"package nested\nfunc Caller() { Target() }\n",
+    )
+    .unwrap();
+    let root_manifest = dir.path().join("go.mod");
+    let nested_manifest = nested.join("go.mod");
+    std::fs::write(&root_manifest, b"module example.com/root/v1\n").unwrap();
+    std::fs::write(&nested_manifest, b"module example.com/nested/v1\n").unwrap();
+
+    let server = fresh_server();
+    let result = analyze_codebase(
+        server.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "initial analyze: {result:?}");
+
+    let root_go = code_graph_core::paths::canonicalize(&dir.path().join("root.go")).unwrap();
+    let external_go =
+        code_graph_core::paths::canonicalize(&dir.path().join("external.go")).unwrap();
+    let target_go = code_graph_core::paths::canonicalize(&nested.join("target.go")).unwrap();
+    let caller_go = code_graph_core::paths::canonicalize(&nested.join("caller.go")).unwrap();
+    assert_eq!(
+        symbol_namespace(&server, &root_go, "Root"),
+        "example.com/root/v1"
+    );
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v1"
+        );
+    }
+    let external_caller_id = format!("{}:ExternalCaller", external_go.display());
+    let target_id = format!("{}:Target", target_go.display());
+    assert!(
+        !has_direct_callee(&server, &external_caller_id, &target_id),
+        "future module import must start unresolved"
+    );
+
+    // Changing the ancestor manifest updates its own package but must not
+    // steal files from the nearer nested module.
+    std::fs::write(&root_manifest, b"module example.com/root/v2\n").unwrap();
+    assert_reindexed(try_reindex_go_manifest(&server.inner, &root_manifest).await);
+    assert_eq!(
+        symbol_namespace(&server, &root_go, "Root"),
+        "example.com/root/v2"
+    );
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v1"
+        );
+    }
+
+    // Removing the nested manifest transfers every indexed descendant to the
+    // ancestor module in one publication.
+    std::fs::remove_file(&nested_manifest).unwrap();
+    assert_reindexed(try_reindex_go_manifest(&server.inner, &nested_manifest).await);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/root/v2/nested"
+        );
+    }
+
+    // Recreating the nested manifest establishes a new nearest owner for all
+    // of its indexed Go files.
+    std::fs::write(&nested_manifest, b"module example.com/nested/v2\n").unwrap();
+    assert_reindexed(try_reindex_go_manifest(&server.inner, &nested_manifest).await);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v2"
+        );
+    }
+    assert!(
+        has_direct_callee(&server, &external_caller_id, &target_id),
+        "creating nested/v2 must reparse the external importer and enable its dropped edge"
+    );
+
+    // Changing the nested module away from the importer's path must also
+    // reparse that external file and remove the now-invalid call edge.
+    std::fs::write(&nested_manifest, b"module example.com/nested/v3\n").unwrap();
+    assert_reindexed(try_reindex_go_manifest(&server.inner, &nested_manifest).await);
+    assert!(
+        !has_direct_callee(&server, &external_caller_id, &target_id),
+        "nested module rename must invalidate external importer edges"
+    );
+
+    // Explicit analyze is another disk-refresh boundary. This edit is not
+    // delivered through watch, so the analyze path itself must invalidate the
+    // path-stable module cache.
+    std::fs::write(&nested_manifest, b"module example.com/nested/v4\n").unwrap();
+    let result = analyze_codebase(
+        server.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "refresh analyze: {result:?}");
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v4"
+        );
+    }
+
+    // A transient all-Go read failure leaves the manifest epoch dirty. The
+    // next ordinary Go event must retry the transaction rather than merge one
+    // file against the old module model.
+    std::fs::write(&nested_manifest, b"module example.com/nested/v5\n").unwrap();
+    let target_backup = nested.join("target.go.backup");
+    std::fs::rename(&target_go, &target_backup).unwrap();
+    std::fs::create_dir(&target_go).unwrap();
+    let failed = try_reindex_go_manifest(&server.inner, &nested_manifest).await;
+    assert!(
+        matches!(failed, ReindexOutcome::Error(_)),
+        "directory in place of indexed source must fail the transaction: {failed:?}"
+    );
+    std::fs::remove_dir(&target_go).unwrap();
+    std::fs::rename(&target_backup, &target_go).unwrap();
+
+    assert_reindexed(try_reindex_file(&server.inner, &root_go, false).await);
+    for (path, symbol) in [(&target_go, "Target"), (&caller_go, "Caller")] {
+        assert_eq!(
+            symbol_namespace(&server, path, symbol),
+            "example.com/nested/v5"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_watch_dispatches_go_mod_events() {
+    let dir = TempDir::new().expect("TempDir");
+    let source = dir.path().join("main.go");
+    let manifest = dir.path().join("go.mod");
+    std::fs::write(&source, b"package main\nfunc Main() {}\n").unwrap();
+    std::fs::write(&manifest, b"module example.com/before\n").unwrap();
+
+    let server = fresh_server();
+    let result = analyze_codebase(
+        server.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "initial analyze: {result:?}");
+    let source = code_graph_core::paths::canonicalize(&source).unwrap();
+    assert_eq!(
+        symbol_namespace(&server, &source, "Main"),
+        "example.com/before"
+    );
+
+    let started = watch_start(&server.inner);
+    assert_ne!(started.is_error, Some(true), "watch_start: {started:?}");
+    std::fs::write(&manifest, b"module example.com/after\n").unwrap();
+
+    let mut observed = false;
+    for _ in 0..100 {
+        if symbol_namespace(&server, &source, "Main") == "example.com/after" {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let stopped = watch_stop(&server.inner);
+    assert_ne!(stopped.is_error, Some(true), "watch_stop: {stopped:?}");
+    assert!(
+        observed,
+        "go.mod modify event never crossed the non-source dispatch boundary"
+    );
 }

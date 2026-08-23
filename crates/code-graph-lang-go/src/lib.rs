@@ -70,7 +70,10 @@ pub(crate) mod queries;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, RwLock,
+};
 
 use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 use code_graph_lang::helpers::find_enclosing_kind;
@@ -114,10 +117,16 @@ pub struct GoParser {
     metadata: RwLock<HashMap<PathBuf, GoFileMetadata>>,
     /// Immutable state rebuilt from the complete resolution universe before
     /// each resolution pass.
-    resolution: RwLock<GoResolutionState>,
+    resolution: RwLock<GoResolutionCache>,
+    /// Cached module lookup shared by namespace rewriting and resolution.
+    /// A manifest invalidation advances `manifest_epoch`, making the prior
+    /// entry ineligible without requiring the event path to be a Go source
+    /// file.
+    module_model: Mutex<GoModuleModelCache>,
+    manifest_epoch: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Eq, PartialEq)]
 struct GoFileMetadata {
     declared_package: String,
     package_value_bindings: HashSet<String>,
@@ -136,6 +145,49 @@ struct GoResolutionState {
     package_values: HashMap<PackageIdentity, HashSet<String>>,
     imported_packages: HashMap<String, PackageIdentity>,
     representatives: HashMap<String, PathBuf>,
+}
+
+/// The module-model cache key deliberately includes both the active source
+/// paths and a manifest epoch. A `go.mod` change can alter module ownership
+/// without changing any `.go` path, so path equality alone is insufficient.
+#[derive(Clone, Eq, PartialEq)]
+struct GoModuleModelKey {
+    paths: Vec<PathBuf>,
+    manifest_epoch: u64,
+}
+
+struct GoModuleModelEntry {
+    key: GoModuleModelKey,
+    model: Arc<crate::module_model::GoModuleModel>,
+}
+
+#[derive(Default)]
+struct GoModuleModelCache {
+    entry: Option<GoModuleModelEntry>,
+}
+
+/// Resolution state is valid only for an exact metadata snapshot and module
+/// model generation. Bodies that leave package metadata unchanged reuse the
+/// same state, while package/value-binding edits rebuild it.
+#[derive(Clone, Eq, PartialEq)]
+struct GoResolutionKey {
+    paths: Vec<PathBuf>,
+    metadata: Vec<(PathBuf, GoFileMetadata)>,
+    module: GoModuleModelKey,
+}
+
+struct GoResolutionCache {
+    key: Option<GoResolutionKey>,
+    state: Arc<GoResolutionState>,
+}
+
+impl Default for GoResolutionCache {
+    fn default() -> Self {
+        Self {
+            key: None,
+            state: Arc::new(GoResolutionState::default()),
+        }
+    }
 }
 
 impl GoParser {
@@ -162,7 +214,9 @@ impl GoParser {
             call_query,
             import_query,
             metadata: RwLock::new(HashMap::new()),
-            resolution: RwLock::new(GoResolutionState::default()),
+            resolution: RwLock::new(GoResolutionCache::default()),
+            module_model: Mutex::new(GoModuleModelCache::default()),
+            manifest_epoch: AtomicU64::new(0),
         })
     }
 
@@ -171,6 +225,41 @@ impl GoParser {
     /// argument parsing) share the single source of truth.
     pub fn extensions() -> &'static [&'static str] {
         EXTENSIONS
+    }
+
+    /// Return the cached module model for one canonical Go-path universe.
+    ///
+    /// The mutex intentionally covers only this cache. Metadata and
+    /// resolution locks are never held while acquiring it, so the three cache
+    /// domains cannot form a lock cycle. Keeping the miss build under this one
+    /// mutex also ensures concurrent `post_index` and `prepare_resolution`
+    /// callers materialize at most one model for a key.
+    fn module_model_for_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> (GoModuleModelKey, Arc<crate::module_model::GoModuleModel>) {
+        let key = GoModuleModelKey {
+            paths: paths.to_vec(),
+            manifest_epoch: self.manifest_epoch.load(Ordering::Acquire),
+        };
+        let mut cache = self
+            .module_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = &cache.entry {
+            if entry.key == key {
+                return (key, Arc::clone(&entry.model));
+            }
+        }
+
+        let model = Arc::new(crate::module_model::GoModuleModel::discover(
+            paths.iter().cloned(),
+        ));
+        cache.entry = Some(GoModuleModelEntry {
+            key: key.clone(),
+            model: Arc::clone(&model),
+        });
+        (key, model)
     }
 
     /// Parse `content` (UTF-8 bytes) as Go and produce a [`FileGraph`].
@@ -587,27 +676,28 @@ impl LanguagePlugin for GoParser {
     /// no-module fallback). This is the same additive-not-disruptive
     /// shape the Rust no-`Cargo.toml` fallback uses.
     ///
-    /// Discovery is per-pass — `index_directory` does NOT surface
-    /// `go.mod` files (no plugin claims `.mod`), so we walk every
-    /// `.go` file's ancestor directories ourselves, dedup via
-    /// `HashSet`, and stat each candidate. Sub-second on real
-    /// workspaces because directory chains rarely exceed a dozen
-    /// `is_file()` calls.
+    /// Discovery is cached by the sorted active Go-path universe plus a
+    /// `go.mod` invalidation epoch. `index_directory` does NOT surface
+    /// `go.mod` files (no plugin claims `.mod`), so a cache miss walks every
+    /// `.go` file's ancestor directories, dedups via `HashSet`, and stats each
+    /// candidate. Namespace rewriting and resolution share the resulting model.
     fn post_index(
         &self,
         graphs: &mut [code_graph_core::FileGraph],
         _file_index: &code_graph_lang::FileIndex,
     ) {
-        let go_paths: Vec<PathBuf> = graphs
+        let mut go_paths: Vec<PathBuf> = graphs
             .iter()
             .filter(|fg| fg.language == Language::Go)
             .map(|fg| PathBuf::from(&fg.path))
             .collect();
+        go_paths.sort();
+        go_paths.dedup();
         if go_paths.is_empty() {
             return;
         }
 
-        let gmm = crate::module_model::GoModuleModel::discover(go_paths);
+        let (_, gmm) = self.module_model_for_paths(&go_paths);
 
         for fg in graphs.iter_mut() {
             if fg.language != Language::Go {
@@ -636,12 +726,26 @@ impl LanguagePlugin for GoParser {
         paths.sort();
         paths.dedup();
         if paths.is_empty() {
+            self.module_model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry = None;
+            self.metadata
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             *self
                 .resolution
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = GoResolutionState::default();
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = GoResolutionCache::default();
             return;
         }
+
+        let active_paths: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        self.metadata
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|path, _| active_paths.contains(path.as_path()));
 
         // Fresh files populated metadata while their parse tree was live.
         // A missing entry can therefore only be cache-loaded context. Parse it
@@ -677,46 +781,69 @@ impl LanguagePlugin for GoParser {
             }
         }
 
-        let model = crate::module_model::GoModuleModel::discover(paths.iter().cloned());
-        let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
+        // Snapshot metadata before looking up the module cache. No lock is
+        // held while acquiring another cache lock: parsing may run in parallel
+        // with this preparation pass, and the caches deliberately have no
+        // lock-order dependency.
+        let metadata: Vec<(PathBuf, GoFileMetadata)> = {
+            let metadata = self.metadata.read().unwrap_or_else(|p| p.into_inner());
+            paths
+                .iter()
+                .filter_map(|path| {
+                    metadata
+                        .get(path)
+                        .cloned()
+                        .map(|file_metadata| (path.clone(), file_metadata))
+                })
+                .collect()
+        };
+        let (module_key, model) = self.module_model_for_paths(&paths);
+        let key = GoResolutionKey {
+            paths: paths.clone(),
+            metadata: metadata.clone(),
+            module: module_key,
+        };
+        {
+            let resolution = self.resolution.read().unwrap_or_else(|p| p.into_inner());
+            if resolution.key.as_ref() == Some(&key) {
+                return;
+            }
+        }
+
+        let metadata: HashMap<_, _> = metadata.into_iter().collect();
         let mut state = GoResolutionState::default();
         let mut package_identities: BTreeMap<String, BTreeSet<PackageIdentity>> = BTreeMap::new();
         let mut representative_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for path in paths {
-            let Some(file_metadata) = metadata.get(&path) else {
+        for path in &paths {
+            let Some(file_metadata) = metadata.get(path) else {
                 continue;
             };
-            let identity = PackageIdentity {
-                import_path: model
-                    .namespace_for(&path)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        path.parent()
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .into_owned()
-                    }),
-                declared_package: file_metadata.declared_package.clone(),
-                // Internal tests can share the declared package text with
-                // production files but are a separate resolution universe;
-                // otherwise their duplicate helpers make production calls
-                // spuriously ambiguous.
-                is_test: is_test_file(&path),
-            };
+            let identity =
+                PackageIdentity {
+                    import_path: model.namespace_for(path).map(str::to_owned).unwrap_or_else(
+                        || path.parent().unwrap_or(path).to_string_lossy().into_owned(),
+                    ),
+                    declared_package: file_metadata.declared_package.clone(),
+                    // Internal tests can share the declared package text with
+                    // production files but are a separate resolution universe;
+                    // otherwise their duplicate helpers make production calls
+                    // spuriously ambiguous.
+                    is_test: is_test_file(path),
+                };
             state
                 .package_values
                 .entry(identity.clone())
                 .or_default()
                 .extend(file_metadata.package_value_bindings.iter().cloned());
             state.files.insert(path.clone(), identity.clone());
-            if !is_test_file(&path) {
+            if !is_test_file(path) {
                 package_identities
                     .entry(identity.import_path.clone())
                     .or_default()
                     .insert(identity.clone());
                 representative_candidates
                     .entry(identity.import_path.clone())
-                    .or_insert(path);
+                    .or_insert_with(|| path.clone());
             }
         }
         for (import_path, identities) in package_identities {
@@ -730,7 +857,10 @@ impl LanguagePlugin for GoParser {
                 }
             }
         }
-        *self.resolution.write().unwrap_or_else(|p| p.into_inner()) = state;
+        *self.resolution.write().unwrap_or_else(|p| p.into_inner()) = GoResolutionCache {
+            key: Some(key),
+            state: Arc::new(state),
+        };
     }
 
     fn resolve_include(
@@ -738,9 +868,14 @@ impl LanguagePlugin for GoParser {
         raw: &str,
         _file_index: &FileIndex,
     ) -> Option<(PathBuf, Confidence, u32)> {
-        self.resolution
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+        let state = Arc::clone(
+            &self
+                .resolution
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .state,
+        );
+        state
             .representatives
             .get(raw)
             .cloned()
@@ -753,7 +888,13 @@ impl LanguagePlugin for GoParser {
         ctx: &CallContext<'_>,
         index: &SymbolIndex,
     ) -> Option<(code_graph_core::SymbolId, Confidence, u32)> {
-        let state = self.resolution.read().unwrap_or_else(|p| p.into_inner());
+        let state = Arc::clone(
+            &self
+                .resolution
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .state,
+        );
         let caller_identity = state.files.get(ctx.caller_file)?;
         if callee.starts_with(BOUND_RECEIVER_PREFIX) {
             return None;
@@ -784,6 +925,30 @@ impl LanguagePlugin for GoParser {
         // unrelated sole project candidate are both unresolved.
         resolve_go_free(index, callee, caller_identity, &state)
             .map(|id| (id, Confidence::Resolved, 1))
+    }
+
+    fn invalidate_resolution_for_path(&self, path: &Path) {
+        if path.file_name().and_then(|name| name.to_str()) == Some("go.mod") {
+            // The epoch belongs in the module-model key, not in a blanket
+            // cache clear: an in-flight reader may safely finish on its Arc,
+            // while the next preparation pass must build against the changed
+            // manifest universe.
+            self.manifest_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn invalidate_resolution_cache(&self) {
+        self.manifest_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn resolution_cache_invalidated(&self) -> bool {
+        let epoch = self.manifest_epoch.load(Ordering::Acquire);
+        self.module_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.key.manifest_epoch != epoch)
     }
 
     /// AST-backed fingerprint (phase 8.3, following the 8.1 shape). Go has
@@ -1122,12 +1287,8 @@ fn method_receiver_type(call: Node<'_>, binding: &str, content: &[u8]) -> Option
             | "expression_switch_statement"
             | "type_switch_statement"
             | "communication_case"
-                if binding_scope_started(node, call, content)
-                    && control_header_binds(node, binding, content) =>
+                if control_binding_is_active(node, call, binding, content) =>
             {
-                return None;
-            }
-            "range_clause" | "receive_statement" if declaration_binds(node, binding, content) => {
                 return None;
             }
             _ => {}
@@ -1242,12 +1403,8 @@ fn lexical_binding_exists(call: Node<'_>, name: &str, content: &[u8]) -> bool {
             | "expression_switch_statement"
             | "type_switch_statement"
             | "communication_case"
-                if binding_scope_started(scope, call, content)
-                    && control_header_binds(scope, name, content) =>
+                if control_binding_is_active(scope, call, name, content) =>
             {
-                return true;
-            }
-            "range_clause" | "receive_statement" if declaration_binds(scope, name, content) => {
                 return true;
             }
             "source_file" if package_declaration_binds(scope, name, content) => return true,
@@ -1259,30 +1416,75 @@ fn lexical_binding_exists(call: Node<'_>, name: &str, content: &[u8]) -> bool {
     false
 }
 
-/// Go short declarations do not bind their own initializer. A receiver used
-/// on the RHS of `if s := s.Clone(); ...` still refers to the outer `s`, while
-/// uses after the header semicolon refer to the newly declared value.
-fn binding_scope_started(scope: Node<'_>, call: Node<'_>, content: &[u8]) -> bool {
-    let mut cursor = scope.walk();
-    if let Some(body) = scope
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "block")
-    {
-        if call.start_byte() >= body.start_byte() {
-            return true;
+/// Go control declarations have construct-specific scope boundaries. In
+/// particular, no declaration binds its own RHS, type-switch aliases begin at
+/// the cases, and select receive names begin in the case statement list.
+fn control_binding_is_active(scope: Node<'_>, call: Node<'_>, name: &str, content: &[u8]) -> bool {
+    match scope.kind() {
+        "if_statement" | "expression_switch_statement" => scope
+            .child_by_field_name("initializer")
+            .is_some_and(|initializer| {
+                declaration_binds(initializer, name, content)
+                    && call.start_byte() >= initializer.end_byte()
+            }),
+        "type_switch_statement" => {
+            let initializer_is_active =
+                scope
+                    .child_by_field_name("initializer")
+                    .is_some_and(|initializer| {
+                        declaration_binds(initializer, name, content)
+                            && call.start_byte() >= initializer.end_byte()
+                    });
+            let alias_binds = scope
+                .child_by_field_name("alias")
+                .and_then(|alias| alias.utf8_text(content).ok())
+                .is_some_and(|alias| alias.trim() == name);
+            initializer_is_active
+                || alias_binds
+                    && first_child_start(scope, &["type_case", "default_case"])
+                        .is_some_and(|start| call.start_byte() >= start)
         }
+        "for_statement" => {
+            let mut cursor = scope.walk();
+            let clause = scope
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "for_clause" | "range_clause"));
+            clause.is_some_and(|clause| match clause.kind() {
+                "for_clause" => {
+                    clause
+                        .child_by_field_name("initializer")
+                        .is_some_and(|initializer| {
+                            declaration_binds(initializer, name, content)
+                                && call.start_byte() >= initializer.end_byte()
+                        })
+                }
+                "range_clause" => {
+                    declaration_binds(clause, name, content)
+                        && scope
+                            .child_by_field_name("body")
+                            .is_some_and(|body| call.start_byte() >= body.start_byte())
+                }
+                _ => false,
+            })
+        }
+        "communication_case" => {
+            scope
+                .child_by_field_name("communication")
+                .is_some_and(|communication| declaration_binds(communication, name, content))
+                && first_child_start(scope, &["statement_list"])
+                    .is_some_and(|start| call.start_byte() >= start)
+        }
+        _ => false,
     }
-    if !matches!(
-        scope.kind(),
-        "if_statement" | "expression_switch_statement" | "type_switch_statement"
-    ) {
-        return false;
-    }
-    let header = &content[scope.start_byte()..call.start_byte()];
-    match header.iter().rposition(|&byte| byte == b':') {
-        Some(declaration) => header[declaration..].contains(&b';'),
-        None => true,
-    }
+}
+
+fn first_child_start(node: Node<'_>, kinds: &[&str]) -> Option<usize> {
+    let mut cursor = node.walk();
+    let start = node
+        .named_children(&mut cursor)
+        .find(|child| kinds.contains(&child.kind()))
+        .map(|child| child.start_byte());
+    start
 }
 
 fn package_declaration_binds(source_file: Node<'_>, name: &str, content: &[u8]) -> bool {
@@ -1292,18 +1494,6 @@ fn package_declaration_binds(source_file: Node<'_>, name: &str, content: &[u8]) 
         .filter(|child| child.kind() == "var_declaration")
         .any(|declaration| declaration_binds(declaration, name, content));
     binds
-}
-
-fn control_header_binds(node: Node<'_>, name: &str, content: &[u8]) -> bool {
-    if declaration_binds(node, name, content) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    let bound = node.named_children(&mut cursor).any(|child| {
-        !matches!(child.kind(), "block" | "statement_list")
-            && control_header_binds(child, name, content)
-    });
-    bound
 }
 
 fn parameters_bind_name(parameters: Node<'_>, name: &str, content: &[u8]) -> bool {
@@ -1384,17 +1574,27 @@ fn declaration_binds(node: Node<'_>, name: &str, content: &[u8]) -> bool {
         "short_var_declaration" => identifiers_before(node, ":=", content)
             .iter()
             .any(|identifier| identifier == name),
-        "range_clause" => identifiers_before(node, "range", content)
-            .iter()
-            .any(|identifier| identifier == name),
-        "receive_statement" => identifiers_before(node, "<-", content)
-            .iter()
-            .any(|identifier| identifier == name),
+        "range_clause" if has_immediate_child(node, ":=") => {
+            identifiers_before(node, "range", content)
+                .iter()
+                .any(|identifier| identifier == name)
+        }
+        "receive_statement" if has_immediate_child(node, ":=") => {
+            identifiers_before(node, "<-", content)
+                .iter()
+                .any(|identifier| identifier == name)
+        }
         "type_switch_guard" => identifiers_before(node, ":=", content)
             .iter()
             .any(|identifier| identifier == name),
         _ => false,
     }
+}
+
+fn has_immediate_child(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|child| child.kind() == kind);
+    found
 }
 
 fn declared_identifiers(node: Node<'_>, content: &[u8]) -> Vec<String> {
@@ -1549,6 +1749,168 @@ mod tests {
     fn id_is_go() {
         let p = GoParser::new().unwrap();
         assert_eq!(p.id(), Language::Go);
+    }
+
+    #[test]
+    fn prepare_resolution_prunes_metadata_for_inactive_paths() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let active = parser
+            .parse_file(
+                Path::new("/tmp/active.go"),
+                b"package main\nfunc Active() {}\n",
+            )
+            .expect("parse active");
+        parser
+            .parse_file(
+                Path::new("/tmp/stale.go"),
+                b"package main\nfunc Stale() {}\n",
+            )
+            .expect("parse stale");
+        assert_eq!(parser.metadata.read().expect("metadata").len(), 2);
+
+        parser.prepare_resolution(std::slice::from_ref(&active), &FileIndex::new());
+        let metadata = parser.metadata.read().expect("metadata");
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata.contains_key(Path::new("/tmp/active.go")));
+        drop(metadata);
+
+        parser.prepare_resolution(&[], &FileIndex::new());
+        assert!(parser.metadata.read().expect("metadata").is_empty());
+    }
+
+    fn cached_module_model(parser: &GoParser) -> Arc<crate::module_model::GoModuleModel> {
+        Arc::clone(
+            &parser
+                .module_model
+                .lock()
+                .expect("module cache")
+                .entry
+                .as_ref()
+                .expect("module model must be cached")
+                .model,
+        )
+    }
+
+    fn cached_resolution_state(parser: &GoParser) -> Arc<GoResolutionState> {
+        Arc::clone(&parser.resolution.read().expect("resolution cache").state)
+    }
+
+    fn parse_cache_graph(parser: &GoParser, path: &str, source: &[u8]) -> FileGraph {
+        parser
+            .parse_file(Path::new(path), source)
+            .expect("cache-test Go source must parse")
+    }
+
+    #[test]
+    fn post_index_and_prepare_resolution_share_one_module_model() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let mut graphs = vec![parse_cache_graph(
+            &parser,
+            "/__code_graph_go_cache_tests/share.go",
+            b"package cachetest\nfunc Shared() {}\n",
+        )];
+        let file_index = FileIndex::new();
+
+        parser.post_index(&mut graphs, &file_index);
+        let after_post_index = cached_module_model(&parser);
+        parser.prepare_resolution(&graphs, &file_index);
+        let after_prepare = cached_module_model(&parser);
+
+        assert!(
+            Arc::ptr_eq(&after_post_index, &after_prepare),
+            "post_index and prepare_resolution must use one model for an unchanged universe"
+        );
+    }
+
+    #[test]
+    fn body_only_reparse_reuses_module_and_resolution_state() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let path = "/__code_graph_go_cache_tests/body.go";
+        let file_index = FileIndex::new();
+        let first = parse_cache_graph(&parser, path, b"package cachetest\nfunc Body() {}\n");
+        parser.prepare_resolution(std::slice::from_ref(&first), &file_index);
+        let first_model = cached_module_model(&parser);
+        let first_state = cached_resolution_state(&parser);
+
+        let reparsed = parse_cache_graph(
+            &parser,
+            path,
+            b"package cachetest\nfunc Body() { println(\"changed body\") }\n",
+        );
+        parser.prepare_resolution(std::slice::from_ref(&reparsed), &file_index);
+
+        assert!(Arc::ptr_eq(&first_model, &cached_module_model(&parser)));
+        assert!(Arc::ptr_eq(&first_state, &cached_resolution_state(&parser)));
+    }
+
+    #[test]
+    fn metadata_change_rebuilds_resolution_without_rebuilding_module() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let path = "/__code_graph_go_cache_tests/metadata.go";
+        let file_index = FileIndex::new();
+        let first = parse_cache_graph(&parser, path, b"package first\nfunc Value() {}\n");
+        parser.prepare_resolution(std::slice::from_ref(&first), &file_index);
+        let first_model = cached_module_model(&parser);
+        let first_state = cached_resolution_state(&parser);
+
+        let reparsed = parse_cache_graph(
+            &parser,
+            path,
+            b"package second\nvar Dynamic = func() {}\nfunc Value() {}\n",
+        );
+        parser.prepare_resolution(std::slice::from_ref(&reparsed), &file_index);
+
+        assert!(Arc::ptr_eq(&first_model, &cached_module_model(&parser)));
+        assert!(
+            !Arc::ptr_eq(&first_state, &cached_resolution_state(&parser)),
+            "declared-package or package-value changes must rebuild resolution"
+        );
+    }
+
+    #[test]
+    fn path_universe_change_rebuilds_module_model() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let file_index = FileIndex::new();
+        let first = parse_cache_graph(
+            &parser,
+            "/__code_graph_go_cache_tests/universe_a.go",
+            b"package cachetest\nfunc A() {}\n",
+        );
+        parser.prepare_resolution(std::slice::from_ref(&first), &file_index);
+        let first_model = cached_module_model(&parser);
+
+        let second = parse_cache_graph(
+            &parser,
+            "/__code_graph_go_cache_tests/universe_b.go",
+            b"package cachetest\nfunc B() {}\n",
+        );
+        parser.prepare_resolution(&[first, second], &file_index);
+
+        assert!(
+            !Arc::ptr_eq(&first_model, &cached_module_model(&parser)),
+            "the sorted active path universe is part of the module-model key"
+        );
+    }
+
+    #[test]
+    fn manifest_invalidation_rebuilds_module_model() {
+        let parser = GoParser::new().expect("GoParser::new");
+        let file_index = FileIndex::new();
+        let graph = parse_cache_graph(
+            &parser,
+            "/__code_graph_go_cache_tests/manifest.go",
+            b"package cachetest\nfunc Manifest() {}\n",
+        );
+        parser.prepare_resolution(std::slice::from_ref(&graph), &file_index);
+        let first_model = cached_module_model(&parser);
+
+        parser.invalidate_resolution_for_path(Path::new("/__code_graph_go_cache_tests/go.mod"));
+        parser.prepare_resolution(std::slice::from_ref(&graph), &file_index);
+
+        assert!(
+            !Arc::ptr_eq(&first_model, &cached_module_model(&parser)),
+            "a go.mod invalidation must advance the module-model epoch"
+        );
     }
 
     /// Canonical compile-time-interface check + `id() -> Language::Go`
@@ -1922,6 +2284,156 @@ func Helper() {}
         let edges = calls(&fg);
         assert_eq!(edges.len(), 1, "expected exactly 1 Calls edge: {edges:?}");
         assert_eq!(edges[0].to, "@method-receiver::\u{1f}Server\u{1f}Clone");
+    }
+
+    #[test]
+    fn colon_text_after_if_initializer_does_not_restore_outer_receiver() {
+        for condition in [r#""a:b" != "" && s.Check()"#, "true /* a:b */ && s.Check()"] {
+            let fg = parse(&format!(
+                "package main\nfunc f(s *Outer) {{ if s := makeInner(); {condition} {{}} }}\n"
+            ));
+            let edges = calls(&fg);
+            let check = edges
+                .iter()
+                .find(|edge| edge.to.ends_with("Check"))
+                .expect("Check call");
+            assert_eq!(check.to, "@bound-receiver::Check", "condition: {condition}");
+        }
+    }
+
+    #[test]
+    fn switch_case_call_uses_initializer_binding() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             switch s := makeInner(); true {\n\
+             case true: s.Check()\n\
+             }\n}\n",
+        );
+        let edges = calls(&fg);
+        let check = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Check"))
+            .expect("Check call");
+        assert_eq!(check.to, "@bound-receiver::Check");
+    }
+
+    #[test]
+    fn for_clause_calls_after_initializer_use_inner_binding() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             for s := makeInner(); s.Check(); { s.Check() }\n}\n",
+        );
+        let edges = calls(&fg);
+        let check_targets: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.to.ends_with("Check"))
+            .map(|edge| edge.to.as_str())
+            .collect();
+        assert_eq!(
+            check_targets,
+            ["@bound-receiver::Check", "@bound-receiver::Check"]
+        );
+    }
+
+    #[test]
+    fn range_binding_starts_after_its_rhs() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             for s := range s.Stream() { s.Check() }\n}\n",
+        );
+        let edges = calls(&fg);
+        let stream = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Stream"))
+            .expect("Stream call");
+        let check = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Check"))
+            .expect("Check call");
+        assert_eq!(stream.to, "@method-receiver::\u{1f}Outer\u{1f}Stream");
+        assert_eq!(check.to, "@bound-receiver::Check");
+    }
+
+    #[test]
+    fn range_assignment_keeps_existing_receiver_in_body() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             for s = range s.Stream() { s.Check() }\n}\n",
+        );
+        let edges = calls(&fg);
+        for method in ["Stream", "Check"] {
+            let edge = edges
+                .iter()
+                .find(|edge| edge.to.ends_with(method))
+                .unwrap_or_else(|| panic!("{method} call"));
+            assert_eq!(
+                edge.to,
+                format!("@method-receiver::\u{1f}Outer\u{1f}{method}")
+            );
+        }
+    }
+
+    #[test]
+    fn type_switch_alias_starts_in_cases() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             switch s := s.AsAny().(type) {\n\
+             case Outer: s.Check()\n\
+             }\n}\n",
+        );
+        let edges = calls(&fg);
+        let as_any = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("AsAny"))
+            .expect("AsAny call");
+        let check = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Check"))
+            .expect("Check call");
+        assert_eq!(as_any.to, "@method-receiver::\u{1f}Outer\u{1f}AsAny");
+        assert_eq!(check.to, "@bound-receiver::Check");
+    }
+
+    #[test]
+    fn select_receive_binding_starts_in_case_body() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             select {\n\
+             case s := <-s.Channel(): s.Check()\n\
+             }\n}\n",
+        );
+        let edges = calls(&fg);
+        let channel = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Channel"))
+            .expect("Channel call");
+        let check = edges
+            .iter()
+            .find(|edge| edge.to.ends_with("Check"))
+            .expect("Check call");
+        assert_eq!(channel.to, "@method-receiver::\u{1f}Outer\u{1f}Channel");
+        assert_eq!(check.to, "@bound-receiver::Check");
+    }
+
+    #[test]
+    fn select_receive_assignment_keeps_existing_receiver_in_body() {
+        let fg = parse(
+            "package main\nfunc f(s *Outer) {\n\
+             select {\n\
+             case s = <-s.Channel(): s.Check()\n\
+             }\n}\n",
+        );
+        let edges = calls(&fg);
+        for method in ["Channel", "Check"] {
+            let edge = edges
+                .iter()
+                .find(|edge| edge.to.ends_with(method))
+                .unwrap_or_else(|| panic!("{method} call"));
+            assert_eq!(
+                edge.to,
+                format!("@method-receiver::\u{1f}Outer\u{1f}{method}")
+            );
+        }
     }
 
     #[test]

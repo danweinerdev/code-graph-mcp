@@ -502,6 +502,13 @@ pub(crate) async fn run_analyze_job(
         // through the inner sink, so a peer-forwarding sink observes
         // the phase boundary in addition to the per-file events.
         sink.transition_to(AnalyzePhase::Parsing);
+        // An explicit analyze is a disk-refresh boundary. In particular,
+        // `go.mod` may have changed while watch mode was inactive without
+        // changing the indexed `.go` path universe, so a path-keyed module
+        // cache must not survive into this pass.
+        for plugin in registry.registry.plugins() {
+            plugin.invalidate_resolution_cache();
+        }
         let (mut fresh_graphs, parse_warnings) =
             match index_directory(&abs_path_for_pool, &registry.registry, &cfg_for_pool, &sink) {
                 Ok(v) => v,
@@ -526,9 +533,8 @@ pub(crate) async fn run_analyze_job(
             .map(|graph| graph.path.as_str())
             .collect();
         let mut resolution_graphs: Vec<_> = cached_snapshot
-            .iter()
+            .into_iter()
             .filter(|graph| !fresh_paths.contains(graph.path.as_str()))
-            .cloned()
             .collect();
         resolution_graphs.extend(fresh_graphs.iter().cloned());
         let symbol_index = build_symbol_index(&resolution_graphs);

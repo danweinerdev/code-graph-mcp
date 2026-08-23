@@ -1,7 +1,8 @@
 //! Watch-mode handlers — the `watch_start` / `watch_stop` lifecycle plus
 //! the reindex loop: each batch of debounced filesystem events drives
-//! a per-file reindex through [`try_reindex_file`], which is index-lock-aware
-//! so an in-flight `analyze_codebase` can never race a watch-driven merge.
+//! per-file reindexes through [`try_reindex_file`] plus atomic all-Go
+//! reindexes for `go.mod` changes. Both paths are index-lock-aware so an
+//! in-flight `analyze_codebase` can never race a watch-driven merge.
 //!
 //! The wire-format contract for this module:
 //! - `watch mode is already active` — second `watch_start` while watching.
@@ -20,13 +21,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use code_graph_core::{paths, symbol_id, EdgeKind, FileGraph, SymbolId};
+use code_graph_core::{paths, symbol_id, EdgeKind, FileGraph, Language, SymbolId};
 use code_graph_lang::CallContext;
 use notify_debouncer_full::notify::EventKind;
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::indexer::{build_file_index, build_symbol_index};
+use crate::indexer::{
+    build_file_index, build_symbol_index, resolve_edges_with_indexes, NoopProgressSink,
+};
 use crate::server::ServerInner;
 
 /// Debounce window for the filesystem watcher. The `notify-debouncer-full`
@@ -177,6 +180,28 @@ pub async fn try_reindex_file(
     path: &Path,
     is_remove: bool,
 ) -> ReindexOutcome {
+    // A prior go.mod batch may have failed after invalidating the module
+    // universe but before publishing replacement graphs. Retry that all-Go
+    // transaction before an ordinary per-file merge can expose mixed module
+    // identities. The synthetic go.mod path is only an invalidation trigger;
+    // discovery reads the current manifest set from all indexed Go paths.
+    let extensions = inner.config.read().extensions.clone();
+    if inner
+        .registry
+        .language_for_path_with_config(path, &extensions)
+        == Some(Language::Go)
+        && inner
+            .registry
+            .plugin_for(Language::Go)
+            .is_some_and(|plugin| plugin.resolution_cache_invalidated())
+    {
+        let manifest_trigger = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("go.mod");
+        return try_reindex_go_manifest(inner, &manifest_trigger).await;
+    }
+
     // Design Decision: drop the event on contention rather than queue or
     // retry. The in-flight `analyze_codebase` will pick up the file's
     // current state, so the user-observable graph eventually converges.
@@ -487,6 +512,159 @@ pub async fn try_reindex_file(
     ReindexOutcome::Reindexed
 }
 
+/// Rebuild all indexed Go files after `manifest_path` (`go.mod`) was created,
+/// modified, or removed.
+///
+/// Unlike an ordinary source edit, a manifest edit can change namespaces and
+/// import/call resolution for every descendant without changing any `.go`
+/// file, including external importers outside the manifest's directory. The
+/// graph does not retain dropped unresolved imports, so current edges cannot
+/// identify every affected external consumer. All Go files are therefore
+/// parsed and resolved as one batch, then published under one graph write so
+/// queries never observe mixed module identities. Nested modules retain their
+/// own nearest-manifest ownership in `GoModuleModel`.
+pub async fn try_reindex_go_manifest(
+    inner: &Arc<ServerInner>,
+    manifest_path: &Path,
+) -> ReindexOutcome {
+    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("go.mod") {
+        return ReindexOutcome::NotASource;
+    }
+    if manifest_path.parent().is_none() {
+        return ReindexOutcome::Error(format!(
+            "go.mod path has no parent: {}",
+            manifest_path.display()
+        ));
+    }
+    let Ok(_index_guard) = inner.index_lock.try_lock() else {
+        return ReindexOutcome::LockContended;
+    };
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        return ReindexOutcome::Error(error);
+    }
+    let Some(go_plugin) = inner.registry.plugin_for(Language::Go) else {
+        return ReindexOutcome::NotASource;
+    };
+    // Mark the old universe ineligible before any fallible IO. If this batch
+    // fails, the next ordinary Go event sees the pending invalidation and
+    // retries this all-Go transaction instead of publishing one file against
+    // stale module ownership.
+    go_plugin.invalidate_resolution_for_path(manifest_path);
+
+    let config = inner.config.read().clone();
+    let config_for_blocking = config.clone();
+    let (mut unaffected, affected_paths, pre_existing_ids) = {
+        let graph = inner.graph.read();
+        let mut unaffected = Vec::new();
+        let mut affected_paths = Vec::new();
+        let mut pre_existing_ids = HashSet::new();
+        for file_graph in graph.file_graphs_snapshot() {
+            let path = PathBuf::from(&file_graph.path);
+            if file_graph.language == Language::Go {
+                pre_existing_ids.extend(file_graph.symbols.iter().map(symbol_id));
+                affected_paths.push(path);
+            } else {
+                unaffected.push(file_graph);
+            }
+        }
+        (unaffected, affected_paths, pre_existing_ids)
+    };
+
+    // Read every still-present file before parsing any of them. Besides
+    // keeping synchronous IO off the async worker, this prevents a transient
+    // read failure from partially updating plugin metadata before publication.
+    let inner_for_blocking = Arc::clone(inner);
+    let paths_for_blocking = affected_paths.clone();
+    let manifest_for_error = manifest_path.to_path_buf();
+    let parse_result: Result<Vec<FileGraph>, ReindexOutcome> =
+        tokio::task::spawn_blocking(move || {
+            let Some(plugin) = inner_for_blocking.registry.plugin_for(Language::Go) else {
+                return Err(ReindexOutcome::NotASource);
+            };
+            let mut sources = Vec::new();
+            for path in paths_for_blocking {
+                match std::fs::read(&path) {
+                    Ok(content) => sources.push((path, content)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ReindexOutcome::Error(format!(
+                            "read {} while applying {}: {error}",
+                            path.display(),
+                            manifest_for_error.display()
+                        )))
+                    }
+                }
+            }
+
+            let mut fresh = Vec::with_capacity(sources.len());
+            for (path, content) in sources {
+                let cleaned = plugin.preprocess(&content, &config_for_blocking);
+                let mut file_graph = plugin.parse_file(&path, &cleaned).map_err(|error| {
+                    ReindexOutcome::Error(format!(
+                        "parse {} while applying {}: {error}",
+                        path.display(),
+                        manifest_for_error.display()
+                    ))
+                })?;
+                plugin.synthesize_symbols(&path, &content, &config_for_blocking, &mut file_graph);
+                fresh.push(file_graph);
+            }
+            Ok(fresh)
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(ReindexOutcome::Error(format!(
+                "blocking task panicked while applying {}: {join_error}",
+                manifest_path.display()
+            )))
+        });
+    let mut fresh = match parse_result {
+        Ok(graphs) => graphs,
+        Err(outcome) => return outcome,
+    };
+
+    let fresh_start = unaffected.len();
+    unaffected.extend(fresh.iter().cloned());
+    let file_index = build_file_index(&unaffected);
+    for plugin in inner.registry.plugins() {
+        plugin.post_index(&mut unaffected, &file_index);
+    }
+    fresh = unaffected[fresh_start..].to_vec();
+    let symbol_index = build_symbol_index(&unaffected);
+    resolve_edges_with_indexes(
+        &mut fresh,
+        &unaffected,
+        &symbol_index,
+        &file_index,
+        &inner.registry,
+        &NoopProgressSink,
+        &config.extensions,
+    );
+
+    let new_ids: HashSet<SymbolId> = fresh
+        .iter()
+        .flat_map(|file_graph| file_graph.symbols.iter().map(symbol_id))
+        .collect();
+    let removed_ids: HashSet<SymbolId> = pre_existing_ids
+        .into_iter()
+        .filter(|id| !new_ids.contains(id))
+        .collect();
+
+    if let Err(error) = inner.ensure_daemon_root_current() {
+        return ReindexOutcome::Error(error);
+    }
+    let _publication = inner.status_publication.write();
+    let mut graph = inner.graph.write();
+    for path in affected_paths {
+        graph.remove_file(&path);
+    }
+    for file_graph in fresh {
+        graph.merge_file_graph(file_graph);
+    }
+    graph.prune_dangling_edges(&removed_ids);
+    ReindexOutcome::Reindexed
+}
+
 /// Normalize a filesystem-event path so its shape matches what the
 /// indexer stored.
 ///
@@ -565,6 +743,7 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
     // produces a correct result; the snapshot here just keeps the cheap
     // filter consistent within the batch.
     let extensions = inner.config.read().extensions.clone();
+    let mut paths_in_batch = Vec::new();
     for evt in evts {
         let kind_is_remove = matches!(evt.event.kind, EventKind::Remove(_));
         for raw_path in &evt.event.paths {
@@ -594,37 +773,86 @@ async fn process_event_batch(inner: &Arc<ServerInner>, evts: Vec<DebouncedEvent>
             // `contains_path` check would miss the existing stripped-
             // form key.
             let path = canonicalize_event_path(raw_path, !is_remove);
-            // Filter to source paths up-front so we don't pay
-            // `index_lock.try_lock` for every random `.swp` an editor
-            // touches. `try_reindex_file` re-checks defensively.
-            if inner
+            paths_in_batch.push((path, is_remove));
+        }
+    }
+
+    // Manifests are semantic inputs, not source files, so no plugin claims
+    // their extension. Process one before source edits from the same debounce
+    // batch: every go.mod event observes the same final disk state and causes
+    // the same conservative all-Go rescan.
+    let mut manifest_paths: Vec<PathBuf> = paths_in_batch
+        .iter()
+        .filter(|(path, _)| path.file_name().and_then(|name| name.to_str()) == Some("go.mod"))
+        .map(|(path, _)| path.clone())
+        .collect();
+    manifest_paths.sort();
+    manifest_paths.dedup();
+
+    let go_rescanned = if let Some(manifest_path) = manifest_paths.first() {
+        match try_reindex_go_manifest(inner, manifest_path).await {
+            ReindexOutcome::Reindexed => true,
+            ReindexOutcome::Error(message) => {
+                eprintln!(
+                    "watch: Go manifest reindex failed for {}: {message}",
+                    manifest_path.display()
+                );
+                false
+            }
+            ReindexOutcome::LockContended | ReindexOutcome::NotASource => false,
+        }
+    } else {
+        false
+    };
+
+    for (path, is_remove) in paths_in_batch {
+        if path.file_name().and_then(|name| name.to_str()) == Some("go.mod") {
+            continue;
+        }
+        // Existing Go files were already parsed from their final on-disk bytes
+        // by a successful manifest rescan. A newly-created file is not yet in
+        // the graph and must still take the ordinary source path; a removed
+        // file likewise falls through to the idempotent remove arm. Any write
+        // racing after this rescan produces a subsequent filesystem event.
+        if go_rescanned
+            && inner
                 .registry
-                .for_path_with_config(&path, &extensions)
-                .is_none()
-            {
-                // Not a source file. But on a Remove event the path
-                // may have been a DIRECTORY whose subtree contained
-                // many indexed files (a `git checkout` that drops a
-                // crate, a rebase that nukes a module dir, etc.). The
-                // OS/notify-debouncer surfaces those as a single Remove
-                // event on the parent dir whose extension doesn't
-                // match any plugin. Check the graph: if any indexed
-                // file lives under this path, drop the whole subtree
-                // in one trie op via `Graph::remove_files_under`. This
-                // is Phase E.3 (B)'s `PathTrie::remove_subtree`
-                // payoff site.
-                if is_remove {
-                    try_reindex_subtree_removal(inner, &path).await;
-                }
-                continue;
+                .language_for_path_with_config(&path, &extensions)
+                == Some(Language::Go)
+            && inner.graph.read().has_file(&path)
+        {
+            continue;
+        }
+        // Filter to source paths up-front so we don't pay
+        // `index_lock.try_lock` for every random `.swp` an editor
+        // touches. `try_reindex_file` re-checks defensively.
+        if inner
+            .registry
+            .for_path_with_config(&path, &extensions)
+            .is_none()
+        {
+            // Not a source file. But on a Remove event the path
+            // may have been a DIRECTORY whose subtree contained
+            // many indexed files (a `git checkout` that drops a
+            // crate, a rebase that nukes a module dir, etc.). The
+            // OS/notify-debouncer surfaces those as a single Remove
+            // event on the parent dir whose extension doesn't
+            // match any plugin. Check the graph: if any indexed
+            // file lives under this path, drop the whole subtree
+            // in one trie op via `Graph::remove_files_under`. This
+            // is Phase E.3 (B)'s `PathTrie::remove_subtree`
+            // payoff site.
+            if is_remove {
+                try_reindex_subtree_removal(inner, &path).await;
             }
-            let outcome = try_reindex_file(inner, &path, is_remove).await;
-            if let ReindexOutcome::Error(msg) = outcome {
-                // No `tracing` dep on this workspace; eprintln only for
-                // hard errors so test output isn't spammed by routine
-                // contention or non-source noise.
-                eprintln!("watch: reindex failed for {}: {msg}", path.display());
-            }
+            continue;
+        }
+        let outcome = try_reindex_file(inner, &path, is_remove).await;
+        if let ReindexOutcome::Error(msg) = outcome {
+            // No `tracing` dep on this workspace; eprintln only for
+            // hard errors so test output isn't spammed by routine
+            // contention or non-source noise.
+            eprintln!("watch: reindex failed for {}: {msg}", path.display());
         }
     }
 }

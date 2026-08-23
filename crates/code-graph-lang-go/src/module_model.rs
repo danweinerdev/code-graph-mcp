@@ -38,8 +38,9 @@ struct GoModInfo {
     name: String,
 }
 
-/// Materialized Go-file → import-path lookup. Built once per index
-/// pass via [`GoModuleModel::build`]; queried via
+/// Materialized Go-file → import-path lookup. Built once per distinct source
+/// path/manifest universe via [`GoModuleModel::build`], then shared by
+/// namespace rewriting and resolution through
 /// [`GoModuleModel::namespace_for`].
 pub(crate) struct GoModuleModel {
     /// File → fully-qualified import path of its containing directory.
