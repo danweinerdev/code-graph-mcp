@@ -50,9 +50,8 @@ running the CLI attaches to it, otherwise it answers from the on-disk cache.
   `code-graph-refactor-survey`, `code-graph-indexing`, `code-graph-configure`,
   `code-graph-smoke-test`).
 - **Commands directory** -- `/cg`, `/cg-index`, `/cg-impact`, `/cg-deps`, `/cg-survey`,
-  `/cg-status`. OpenCode discovers commands only from its configured command directories; when
-  using this repository's local installer, it links these files into
-  `~/.config/opencode/commands/`.
+  `/cg-status`. OpenCode discovers commands only from its configured command directories; local
+  installations must link or copy these files into `~/.config/opencode/commands/`.
 - **A session-start check** that warns once if the repo has no `.code-graph-cache.db`, so the
   agent indexes before querying instead of reading an empty graph as "no results".
 
