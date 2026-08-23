@@ -10,7 +10,9 @@ use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+use code_graph_vcs::{
+    BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+};
 
 /// A Git provider bound to one discovered working tree.
 ///
@@ -20,6 +22,7 @@ use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProv
 #[derive(Clone, Debug)]
 pub struct GitProvider {
     project_root: PathBuf,
+    common_git_dir: PathBuf,
 }
 
 impl GitProvider {
@@ -43,6 +46,7 @@ impl GitProvider {
         let work_dir = dunce::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
 
         Ok(Self {
+            common_git_dir: common_git_dir(&repository),
             project_root: work_dir,
         })
     }
@@ -65,16 +69,23 @@ impl VcsProvider for GitProvider {
         "git"
     }
 
-    fn detect(&self, working_tree: &Path) -> bool {
+    fn detect(&self, working_tree: &Path) -> ProviderDetection {
         // A provider is bound to ONE working tree; answering "yes" for any
         // git tree would let the registry select this provider for a root
         // whose operations then run against the wrong bound repository
         // (phase-gate review F1). Detection is an identity check: the probe
         // must discover the same canonical working tree this provider is
         // bound to.
-        Self::open(working_tree)
-            .map(|discovered| discovered.project_root == self.project_root)
-            .unwrap_or(false)
+        let Ok(discovered) = Self::open(working_tree) else {
+            return ProviderDetection::NoMatch;
+        };
+        if discovered.project_root == self.project_root {
+            ProviderDetection::Selected
+        } else if discovered.common_git_dir == self.common_git_dir {
+            ProviderDetection::DifferentCheckout
+        } else {
+            ProviderDetection::BoundElsewhere
+        }
     }
 
     async fn blame(
@@ -106,9 +117,9 @@ impl VcsProvider for GitProvider {
             .await
     }
 
-    async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-        let spec = spec.to_owned();
-        self.blocking(move |project_root| resolve_rev(&project_root, &spec))
+    async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+        let spec = spec.map(ToOwned::to_owned);
+        self.blocking(move |project_root| resolve_rev(&project_root, spec.as_deref()))
             .await
     }
 }
@@ -118,8 +129,9 @@ fn open_repository(project_root: &Path) -> Result<gix::Repository, VcsError> {
         .map_err(|error| VcsError::Unavailable(format!("{}: {error}", project_root.display())))
 }
 
-fn resolve_rev(project_root: &Path, spec: &str) -> Result<RevId, VcsError> {
+fn resolve_rev(project_root: &Path, spec: Option<&str>) -> Result<RevId, VcsError> {
     let repository = open_repository(project_root)?;
+    let spec = spec.unwrap_or("HEAD");
     let object = repository
         .rev_parse_single(spec)
         .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
@@ -129,6 +141,14 @@ fn resolve_rev(project_root: &Path, spec: &str) -> Result<RevId, VcsError> {
         .peel_to_commit()
         .map_err(|error| VcsError::NotFound(format!("{spec}: {error}")))?;
     Ok(RevId::new(commit.id.to_string()))
+}
+
+/// Canonical identity of the repository object store shared by linked
+/// worktrees. `gix` owns parsing Git's worktree metadata and returns the main
+/// repository directory for linked worktrees.
+fn common_git_dir(repository: &gix::Repository) -> PathBuf {
+    let common = repository.common_dir();
+    dunce::canonicalize(common).unwrap_or_else(|_| common.to_path_buf())
 }
 
 fn read_at(project_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>, VcsError> {
@@ -541,17 +561,31 @@ fn require_owned_by_bound_repository(project_root: &Path, path: &Path) -> Result
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    // A parent that no longer exists (deleted directory) or lies outside
-    // any repository is settled downstream by the lexical strip and the
-    // tree-membership lookup.
-    let Ok(repository) = gix::discover(parent) else {
-        return Ok(());
+    let missing = missing_path(path)?;
+    let repository = match gix::discover(parent) {
+        Ok(repository) => repository,
+        Err(error) if missing => {
+            return Err(VcsError::NotFound(format!(
+                "cannot verify repository ownership for missing path {} from {}: {error}",
+                path.display(),
+                parent.display()
+            )))
+        }
+        // Existing untracked files may have no discoverable parent repository;
+        // the immutable tree lookup below gives their normal no-history result.
+        Err(_) => return Ok(()),
     };
     let Some(work_dir) = repository.workdir() else {
         return Ok(());
     };
     let work_dir = dunce::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
     if work_dir == project_root {
+        if missing && has_nested_git_marker(project_root, parent)? {
+            return Err(VcsError::NotFound(format!(
+                "cannot verify repository ownership for missing path {}: a nested Git marker blocks discovery",
+                path.display()
+            )));
+        }
         Ok(())
     } else {
         Err(VcsError::NotFound(format!(
@@ -561,6 +595,43 @@ fn require_owned_by_bound_repository(project_root: &Path, path: &Path) -> Result
             project_root.display()
         )))
     }
+}
+
+/// A malformed nested `.git` file can make discovery climb to the outer
+/// checkout even though the path belongs to a missing nested checkout. For a
+/// missing path that would permit an outer tree entry at the same lexical
+/// location to shadow it, so treat the marker as an ownership boundary.
+fn missing_path(path: &Path) -> Result<bool, VcsError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(VcsError::NotFound(format!(
+            "cannot verify repository ownership for {}: inspect path metadata: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn has_nested_git_marker(project_root: &Path, parent: &Path) -> Result<bool, VcsError> {
+    let root = normalize_lexical_path(project_root);
+    let mut current = normalize_lexical_path(parent);
+    while current.starts_with(&root) && current != root {
+        let marker = current.join(".git");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(VcsError::NotFound(format!(
+                    "cannot verify repository ownership for missing path below {}: inspect nested Git marker metadata: {error}",
+                    marker.display()
+                )))
+            }
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf, VcsError> {
@@ -1170,22 +1241,36 @@ mod harness {
     #[tokio::test]
     async fn git_provider_matches_git_cli_for_fixture_operations_and_path_history() {
         use super::GitProvider;
-        use code_graph_vcs::{VcsError, VcsProvider};
+        use code_graph_vcs::{ProviderDetection, VcsError, VcsProvider};
 
         const PATH: &str = "src/calculator.rs";
         let fixture = Fixture::build(provider_script()).expect("fixture must build");
         let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
         let source_path = fixture.path().join(PATH);
 
-        assert!(provider.detect(fixture.path()));
+        assert_eq!(provider.detect(fixture.path()), ProviderDetection::Selected);
         let plain_directory = tempfile::tempdir().expect("plain temporary directory");
-        assert!(!provider.detect(plain_directory.path()));
+        assert_eq!(
+            provider.detect(plain_directory.path()),
+            ProviderDetection::NoMatch
+        );
         assert!(GitProvider::open(plain_directory.path()).is_err());
 
         let revision = provider
-            .resolve_rev("HEAD~2")
+            .resolve_rev(Some("HEAD~2"))
             .await
             .expect("Git revision resolves");
+        assert_eq!(
+            provider
+                .resolve_rev(None)
+                .await
+                .expect("provider default revision resolves"),
+            provider
+                .resolve_rev(Some("HEAD"))
+                .await
+                .expect("explicit Git revision resolves"),
+            "None selects the provider default without exposing a Git default to callers"
+        );
         assert_eq!(
             provider
                 .read_at(&revision, Path::new(PATH))
@@ -1297,7 +1382,10 @@ mod harness {
         const PATH: &str = "src/calculator.rs";
         let fixture = merge_parent_fixture().expect("merge fixture builds");
         let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
-        let merge_revision = provider.resolve_rev("HEAD").await.expect("resolve merge");
+        let merge_revision = provider
+            .resolve_rev(Some("HEAD"))
+            .await
+            .expect("resolve merge");
         let history = provider
             .revisions_touching(&fixture.path().join(PATH), 10)
             .await
@@ -1432,7 +1520,10 @@ mod harness {
             .expect("commit gitlink entry");
 
         let provider = GitProvider::open(fixture.path()).expect("fixture is a Git working tree");
-        let head = provider.resolve_rev("HEAD").await.expect("resolve HEAD");
+        let head = provider
+            .resolve_rev(Some("HEAD"))
+            .await
+            .expect("resolve HEAD");
 
         let unreadable = provider
             .read_at(&head, Path::new("vendored/module"))
@@ -1455,9 +1546,11 @@ mod harness {
 
     /// AC-36 letter: a second provider registers ALONGSIDE the git provider
     /// without editing it, and detection selects each for its own tree.
-    #[test]
-    fn registry_selects_git_alongside_an_independent_second_provider() {
-        use code_graph_vcs::{BlameHunk, RevId, VcsError, VcsProvider, VcsRegistry};
+    #[tokio::test]
+    async fn registry_selects_git_alongside_an_independent_second_provider() {
+        use code_graph_vcs::{
+            BlameHunk, ProviderDetection, RevId, VcsError, VcsProvider, VcsRegistry,
+        };
 
         struct MarkerProvider;
 
@@ -1466,8 +1559,12 @@ mod harness {
             fn id(&self) -> &'static str {
                 "marker-test"
             }
-            fn detect(&self, working_tree: &Path) -> bool {
-                working_tree.join(".marker-vcs").is_dir()
+            fn detect(&self, working_tree: &Path) -> ProviderDetection {
+                if working_tree.join(".marker-vcs").is_dir() {
+                    ProviderDetection::Selected
+                } else {
+                    ProviderDetection::NoMatch
+                }
             }
             async fn blame(
                 &self,
@@ -1490,8 +1587,8 @@ mod harness {
             async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
                 Ok(Vec::new())
             }
-            async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-                Ok(RevId::new(spec))
+            async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+                Ok(RevId::new(spec.unwrap_or("default")))
             }
         }
 
@@ -1507,29 +1604,32 @@ mod harness {
             .unwrap();
         registry.register(Box::new(MarkerProvider)).unwrap();
 
-        assert_eq!(
-            registry
-                .detect(fixture.path())
-                .map(code_graph_vcs::VcsProvider::id),
-            Some("git"),
+        assert!(
+            matches!(
+                registry.detect(fixture.path()).await.unwrap(),
+                code_graph_vcs::VcsDetection::Selected(provider) if provider.id() == "git"
+            ),
             "the git tree selects the git provider"
         );
-        assert_eq!(
-            registry
-                .detect(marker_tree.path())
-                .map(code_graph_vcs::VcsProvider::id),
-            Some("marker-test"),
+        assert!(
+            matches!(
+                registry.detect(marker_tree.path()).await.unwrap(),
+                code_graph_vcs::VcsDetection::Selected(provider) if provider.id() == "marker-test"
+            ),
             "the marker tree selects the second provider without touching git"
         );
-        assert_eq!(
-            registry
-                .detect(
-                    std::env::temp_dir()
-                        .join("code-graph-nonexistent-vcs-probe")
-                        .as_path()
-                )
-                .map(code_graph_vcs::VcsProvider::id),
-            None,
+        assert!(
+            matches!(
+                registry
+                    .detect(
+                        std::env::temp_dir()
+                            .join("code-graph-nonexistent-vcs-probe")
+                            .as_path()
+                    )
+                    .await
+                    .unwrap(),
+                code_graph_vcs::VcsDetection::NoProvider
+            ),
             "an unrecognized tree selects nothing"
         );
     }
@@ -1539,7 +1639,7 @@ mod harness {
     /// on them through the outer tree's lexical namespace.
     #[tokio::test]
     async fn provider_refuses_files_owned_by_a_different_repository() {
-        use code_graph_vcs::{VcsError, VcsProvider};
+        use code_graph_vcs::{ProviderDetection, VcsDetection, VcsError, VcsProvider, VcsRegistry};
 
         const PATH: &str = "src/calculator.rs";
         let bound = Fixture::build(initial_only_script()).expect("bound fixture");
@@ -1547,9 +1647,15 @@ mod harness {
         let provider = super::GitProvider::open(bound.path()).expect("open bound fixture");
 
         assert!(
-            !provider.detect(other.path()),
+            provider.detect(other.path()) == ProviderDetection::BoundElsewhere,
             "detection is an identity check on the bound tree, not 'any git tree'"
         );
+        let mut registry = VcsRegistry::new();
+        registry.register(Box::new(provider.clone())).unwrap();
+        assert!(matches!(
+            registry.detect(other.path()).await.unwrap(),
+            VcsDetection::ProviderBoundElsewhere { provider: "git" }
+        ));
 
         let foreign = other.path().join(PATH);
         let error = provider
@@ -1560,6 +1666,132 @@ mod harness {
             matches!(&error, VcsError::NotFound(reason)
                 if reason.contains("belongs to a different repository")),
             "the refusal names the real cause: {error}"
+        );
+    }
+
+    /// A linked worktree shares the repository object store but is still a
+    /// separate checkout: a provider bound to the main worktree must not be
+    /// selected for it.
+    #[tokio::test]
+    async fn provider_classifies_linked_worktree_as_different_checkout() {
+        use code_graph_vcs::{ProviderDetection, VcsDetection, VcsProvider, VcsRegistry};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture");
+        fixture
+            .git(&["worktree", "add", "--detach", "linked"])
+            .expect("create linked worktree");
+        let linked = fixture.path().join("linked");
+        let provider = super::GitProvider::open(fixture.path()).expect("open main worktree");
+        assert_eq!(
+            provider.detect(&linked),
+            ProviderDetection::DifferentCheckout,
+            "linked worktrees share a repository but not a checkout"
+        );
+
+        let mut registry = VcsRegistry::new();
+        registry.register(Box::new(provider)).unwrap();
+        assert!(matches!(
+            registry.detect(&linked).await.unwrap(),
+            VcsDetection::DifferentCheckout { provider: "git" }
+        ));
+    }
+
+    /// A missing file below a deleted nested clone must not fall back to an
+    /// outer tree entry with the same lexical path. There is no retained
+    /// ownership metadata once the clone is fully deleted, so this
+    /// intentionally conservative rule also refuses an ordinary deleted
+    /// directory when direct-parent discovery fails.
+    #[tokio::test]
+    async fn ownership_fails_closed_for_deleted_nested_clone_over_outer_shadow() {
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture");
+        let shadow = fixture.path().join("nested/src/calculator.rs");
+        fs::create_dir_all(shadow.parent().expect("shadow parent")).expect("create shadow");
+        fs::write(&shadow, "outer shadow\n").expect("write outer shadow");
+        fixture
+            .git(&["add", "nested/src/calculator.rs"])
+            .expect("stage shadow");
+        fixture
+            .commit_staged("add outer shadow", "2001-01-02T00:00:00+0000")
+            .expect("commit shadow");
+        fixture.git(&["init", "nested"]).expect("init nested clone");
+        fs::remove_dir_all(fixture.path().join("nested")).expect("delete nested clone");
+
+        let provider = super::GitProvider::open(fixture.path()).expect("open outer");
+        let head = provider.resolve_rev(None).await.expect("resolve default");
+        let read_error = provider
+            .read_at(&head, &shadow)
+            .await
+            .expect_err("missing nested path must not read outer shadow");
+        assert!(
+            matches!(read_error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership"))
+        );
+        let history_error = provider
+            .revisions_touching(&shadow, 10)
+            .await
+            .expect_err("missing nested path must not walk outer shadow history");
+        assert!(
+            matches!(history_error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership"))
+        );
+        let blame_error = provider
+            .blame(&shadow, Some((1, 1)), Some(&head))
+            .await
+            .expect_err("missing nested path must not blame outer shadow");
+        assert!(
+            matches!(blame_error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership"))
+        );
+    }
+
+    /// A malformed gitlink/worktree marker blocks parent discovery. If its
+    /// nested file is missing, do not let the outer repository's historical
+    /// entry shadow it through lexical containment.
+    #[tokio::test]
+    async fn ownership_fails_closed_for_broken_gitlink_over_outer_shadow() {
+        use code_graph_vcs::{VcsError, VcsProvider};
+
+        let fixture = Fixture::build(initial_only_script()).expect("fixture");
+        let shadow = fixture.path().join("nested/src/calculator.rs");
+        fs::create_dir_all(shadow.parent().expect("shadow parent")).expect("create shadow");
+        fs::write(&shadow, "outer shadow\n").expect("write outer shadow");
+        fixture
+            .git(&["add", "nested/src/calculator.rs"])
+            .expect("stage shadow");
+        fixture
+            .commit_staged("add outer shadow", "2001-01-02T00:00:00+0000")
+            .expect("commit shadow");
+        fs::remove_file(&shadow).expect("remove working file");
+        fs::write(
+            fixture.path().join("nested/.git"),
+            "gitdir: missing-git-dir\n",
+        )
+        .expect("write broken gitlink marker");
+
+        let provider = super::GitProvider::open(fixture.path()).expect("open outer");
+        let head = provider.resolve_rev(None).await.expect("resolve default");
+        let error = provider
+            .read_at(&head, &shadow)
+            .await
+            .expect_err("broken nested Git marker must not read outer shadow");
+        assert!(
+            matches!(error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_nested_git_marker_is_an_ownership_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        symlink("missing-git-dir", nested.join(".git")).expect("dangling Git marker");
+
+        assert!(
+            super::has_nested_git_marker(root.path(), &nested.join("src"))
+                .expect("symlink metadata succeeds"),
+            "a dangling marker must not be mistaken for no nested repository"
         );
     }
 

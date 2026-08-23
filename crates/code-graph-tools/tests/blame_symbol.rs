@@ -12,13 +12,14 @@ mod common;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use code_graph_lang::LanguageRegistry;
 use code_graph_lang_rust::RustParser;
 use code_graph_tools::handlers::analyze::analyze_codebase;
 use code_graph_tools::CodeGraphServer;
-use code_graph_vcs::{BlameHunk, RevId, VcsError, VcsProvider, VcsRegistry};
+use code_graph_vcs::{BlameHunk, ProviderDetection, RevId, VcsError, VcsProvider, VcsRegistry};
 use code_graph_vcs_git::GitProvider;
 use common::{first_text, ok_json};
 use tempfile::TempDir;
@@ -296,6 +297,38 @@ async fn blame_symbol_at_prior_revision_pins_attribution_and_flags_divergence() 
     );
 }
 
+/// An old revision can predate the entire graph span. This is still an
+/// available blame result: it reports both the working-tree divergence and
+/// the independent fact that no lines were attributable at that revision.
+#[tokio::test]
+async fn blame_symbol_preserves_divergence_and_empty_span_facts() {
+    let fixture = GitFixture::build();
+    let file = fixture.path().join("lib.rs");
+    std::fs::write(
+        &file,
+        format!("{}{}", "// newer context\n".repeat(20), EDITED),
+    )
+    .expect("move function beyond old revision EOF");
+    let server = git_backed_server(fixture.path());
+    analyze(&server, fixture.path()).await;
+    let (_root, _file, symbol) = fixture_symbol(fixture.path());
+    let first = fixture.rev_parse("HEAD~1");
+
+    let body = ok_json(&call_blame(&server, &symbol, Some(&first)).await);
+    assert_eq!(body["available"], serde_json::json!(true));
+    assert_eq!(body["stale"], serde_json::json!(true));
+    assert!(body["hunks"].as_array().unwrap().is_empty());
+    let reason = body["stale_reason"].as_str().expect("stale reason");
+    assert!(
+        reason.contains("on-disk contents differ"),
+        "divergence: {body}"
+    );
+    assert!(
+        reason.contains("no attributable lines"),
+        "empty span fact survives divergence: {body}"
+    );
+}
+
 #[tokio::test]
 async fn blame_symbol_flags_uncommitted_edits_as_stale() {
     let fixture = GitFixture::build();
@@ -418,6 +451,43 @@ async fn blame_symbol_reports_untracked_file_as_unavailable() {
 }
 
 #[tokio::test]
+async fn blame_symbol_reports_provider_bound_elsewhere() {
+    let bound = GitFixture::build();
+    let queried = GitFixture::build();
+    let server = git_backed_server(bound.path());
+    analyze(&server, queried.path()).await;
+    let (_root, _file, symbol) = fixture_symbol(queried.path());
+
+    let body = ok_json(&call_blame(&server, &symbol, None).await);
+    assert_eq!(body["available"], serde_json::json!(false));
+    assert_eq!(
+        body["reason"],
+        serde_json::json!(
+            "provider bound elsewhere: git recognizes this root but is bound to a different repository"
+        )
+    );
+}
+
+#[tokio::test]
+async fn blame_symbol_reports_linked_worktree_as_different_checkout() {
+    let fixture = GitFixture::build();
+    fixture.git(&["worktree", "add", "--detach", "linked"], None);
+    let linked = fixture.path().join("linked");
+    let server = git_backed_server(fixture.path());
+    analyze(&server, &linked).await;
+    let (_root, _file, symbol) = fixture_symbol(&linked);
+
+    let body = ok_json(&call_blame(&server, &symbol, None).await);
+    assert_eq!(body["available"], serde_json::json!(false));
+    assert_eq!(
+        body["reason"],
+        serde_json::json!(
+            "different checkout: git is bound to another linked worktree of this repository"
+        )
+    );
+}
+
+#[tokio::test]
 async fn blame_symbol_unknown_symbol_is_a_tool_error_with_suggestions() {
     let fixture = GitFixture::build();
     let server = git_backed_server(fixture.path());
@@ -457,6 +527,67 @@ async fn blame_symbol_unresolvable_at_is_a_tool_error() {
 /// across the await would make the spawned future non-`Send` — so this
 /// test pins the observable half: an unrelated query completes while the
 /// provider hangs, and the blame future is still pending afterwards.)
+struct SlowDetectionProvider {
+    started: Arc<tokio::sync::Notify>,
+    release: Mutex<mpsc::Receiver<()>>,
+    calls: Arc<AtomicUsize>,
+    panic: bool,
+}
+
+#[async_trait::async_trait]
+impl VcsProvider for SlowDetectionProvider {
+    fn id(&self) -> &'static str {
+        "slow-detection"
+    }
+
+    fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(!self.panic, "handler detection panic fixture");
+        self.started.notify_one();
+        self.release
+            .lock()
+            .expect("detection release lock")
+            .recv()
+            .expect("test releases detector");
+        ProviderDetection::Selected
+    }
+
+    async fn blame(
+        &self,
+        _path: &Path,
+        lines: Option<(u32, u32)>,
+        _at: Option<&RevId>,
+    ) -> Result<Vec<BlameHunk>, VcsError> {
+        let (start_line, end_line) = lines.unwrap_or((1, 1));
+        Ok(vec![BlameHunk {
+            rev: RevId::new("slow-detection-rev"),
+            author: "fixture".to_string(),
+            timestamp_utc: 0,
+            start_line,
+            line_count: end_line.saturating_sub(start_line).saturating_add(1),
+        }])
+    }
+
+    async fn revisions_touching(
+        &self,
+        _path: &Path,
+        _limit: u32,
+    ) -> Result<code_graph_vcs::RevisionWindow, VcsError> {
+        Ok(code_graph_vcs::RevisionWindow {
+            commits: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+        Err(VcsError::NotFound("fixture has no blobs".to_string()))
+    }
+
+    async fn resolve_rev(&self, _spec: Option<&str>) -> Result<RevId, VcsError> {
+        Ok(RevId::new("slow-detection-rev"))
+    }
+}
+
 struct GatedProvider {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -468,8 +599,8 @@ impl VcsProvider for GatedProvider {
         "gated-test"
     }
 
-    fn detect(&self, _working_tree: &Path) -> bool {
-        true
+    fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+        ProviderDetection::Selected
     }
 
     async fn blame(
@@ -505,9 +636,121 @@ impl VcsProvider for GatedProvider {
         Err(VcsError::NotFound("gated provider has no blobs".into()))
     }
 
-    async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-        Ok(RevId::new(spec))
+    async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+        Ok(RevId::new(spec.unwrap_or("gated-rev")))
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blame_symbol_slow_detection_is_blocking_isolated_and_not_cached() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release, receiver) = mpsc::channel();
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(SlowDetectionProvider {
+        started: Arc::clone(&started),
+        release: Mutex::new(receiver),
+        calls: Arc::clone(&calls),
+        panic: false,
+    }))
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), INITIAL).unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let (_root, file, symbol) = fixture_symbol(dir.path());
+
+    let inner = server.inner.clone();
+    let root = inner.root_path.read().clone();
+    let first_symbol = symbol.clone();
+    let first = tokio::spawn(async move {
+        code_graph_tools::handlers::history::blame_symbol(
+            &inner.graph,
+            true,
+            &inner.vcs,
+            root,
+            &first_symbol,
+            None,
+        )
+        .await
+    });
+    started.notified().await;
+    assert!(!first.is_finished(), "blame waits at blocking detection");
+
+    let symbols = code_graph_tools::handlers::symbols::get_file_symbols(
+        &server.inner.graph,
+        true,
+        &file.to_string_lossy(),
+        false,
+        true,
+        None,
+        None,
+        false,
+        usize::MAX,
+    );
+    assert_eq!(ok_json(&symbols)["total"], serde_json::json!(1));
+    assert!(
+        !first.is_finished(),
+        "normal query runs while detect blocks"
+    );
+    release.send(()).unwrap();
+    assert_eq!(
+        ok_json(&first.await.unwrap())["available"],
+        serde_json::json!(true)
+    );
+
+    let inner = server.inner.clone();
+    let root = inner.root_path.read().clone();
+    let second_symbol = symbol.clone();
+    let second = tokio::spawn(async move {
+        code_graph_tools::handlers::history::blame_symbol(
+            &inner.graph,
+            true,
+            &inner.vcs,
+            root,
+            &second_symbol,
+            None,
+        )
+        .await
+    });
+    started.notified().await;
+    release.send(()).unwrap();
+    assert_eq!(
+        ok_json(&second.await.unwrap())["available"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "each history request must re-run provider detection"
+    );
+}
+
+#[tokio::test]
+async fn blame_symbol_detection_panic_is_a_tool_error() {
+    let mut vcs = VcsRegistry::new();
+    let (_release, receiver) = mpsc::channel();
+    vcs.register(Box::new(SlowDetectionProvider {
+        started: Arc::new(tokio::sync::Notify::new()),
+        release: Mutex::new(receiver),
+        calls: Arc::new(AtomicUsize::new(0)),
+        panic: true,
+    }))
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), INITIAL).unwrap();
+    let server = rust_server(vcs);
+    analyze(&server, dir.path()).await;
+    let (_root, _file, symbol) = fixture_symbol(dir.path());
+
+    let result = call_blame(&server, &symbol, None).await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        first_text(&result).contains("detect VCS provider failed"),
+        "detector infrastructure failure is not success-shaped absence: {}",
+        first_text(&result)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

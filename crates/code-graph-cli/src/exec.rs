@@ -78,19 +78,10 @@ fn make_server(root: &Path) -> Result<CodeGraphServer, CliError> {
     }
 
     let mut vcs = code_graph_vcs::VcsRegistry::new();
-    match code_graph_vcs_git::GitProvider::open(root) {
-        Ok(provider) => {
-            if let Err(error) = vcs.register(Box::new(provider)) {
-                eprintln!("code-graph: register git provider: {error}");
-            }
+    if let Ok(provider) = code_graph_vcs_git::GitProvider::open(root) {
+        if let Err(error) = vcs.register(Box::new(provider)) {
+            eprintln!("code-graph: register git provider: {error}");
         }
-        // Outside any repository: the ordinary no-VCS case; history tools
-        // report unavailability as a success (FR-36).
-        Err(code_graph_vcs::VcsError::Unavailable(_)) => {}
-        Err(error) => eprintln!(
-            "code-graph: git provider unavailable at {}: {error}",
-            root.display()
-        ),
     }
 
     Ok(CodeGraphServer::with_vcs_registry(registry, vcs))

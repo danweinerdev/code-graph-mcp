@@ -599,7 +599,9 @@ async fn symbol_history_file_deletion_reports_removed() {
 /// window — `at_window_boundary` says so (gate artifact 18 boundary fix).
 #[tokio::test]
 async fn symbol_history_skipped_oldest_marks_boundary() {
-    use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
 
     struct SkipOldestProvider;
 
@@ -608,8 +610,8 @@ async fn symbol_history_skipped_oldest_marks_boundary() {
         fn id(&self) -> &'static str {
             "skip-oldest"
         }
-        fn detect(&self, _working_tree: &Path) -> bool {
-            true
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::Selected
         }
         async fn blame(
             &self,
@@ -649,8 +651,8 @@ async fn symbol_history_skipped_oldest_marks_boundary() {
             }
             Ok(b"pub fn target_function() -> u32 {\n    1\n}\n".to_vec())
         }
-        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-            Ok(RevId::new(spec))
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
         }
     }
 
@@ -691,7 +693,9 @@ async fn symbol_history_skipped_oldest_marks_boundary() {
 /// `introduced` boundary-ambiguous (gate artifact 18 cycle-2 test gap).
 #[tokio::test]
 async fn symbol_history_provider_truncation_reaches_the_wire() {
-    use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
 
     struct TruncatedProvider;
 
@@ -700,8 +704,8 @@ async fn symbol_history_provider_truncation_reaches_the_wire() {
         fn id(&self) -> &'static str {
             "truncated-history"
         }
-        fn detect(&self, _working_tree: &Path) -> bool {
-            true
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::Selected
         }
         async fn blame(
             &self,
@@ -729,8 +733,8 @@ async fn symbol_history_provider_truncation_reaches_the_wire() {
         async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
             Ok(b"pub fn target_function() -> u32 {\n    1\n}\n".to_vec())
         }
-        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-            Ok(RevId::new(spec))
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
         }
     }
 
@@ -766,12 +770,15 @@ async fn symbol_history_provider_truncation_reaches_the_wire() {
 /// completes while the walk is gated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symbol_history_slow_provider_delays_only_history_tools() {
-    use code_graph_vcs::{BlameHunk, Commit, RevId, RevisionWindow, VcsError, VcsProvider};
+    use code_graph_vcs::{
+        BlameHunk, Commit, ProviderDetection, RevId, RevisionWindow, VcsError, VcsProvider,
+    };
     use std::sync::Arc;
 
     struct GatedProvider {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        panic_detect: bool,
     }
 
     #[async_trait::async_trait]
@@ -779,8 +786,9 @@ async fn symbol_history_slow_provider_delays_only_history_tools() {
         fn id(&self) -> &'static str {
             "gated-history"
         }
-        fn detect(&self, _working_tree: &Path) -> bool {
-            true
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            assert!(!self.panic_detect, "symbol history detection panic fixture");
+            ProviderDetection::Selected
         }
         async fn blame(
             &self,
@@ -810,8 +818,8 @@ async fn symbol_history_slow_provider_delays_only_history_tools() {
         async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
             Ok(b"pub fn target_function() -> u32 {\n    1\n}\n".to_vec())
         }
-        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-            Ok(RevId::new(spec))
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
         }
     }
 
@@ -822,6 +830,7 @@ async fn symbol_history_slow_provider_delays_only_history_tools() {
     vcs.register(Box::new(GatedProvider {
         started: Arc::clone(&started),
         release: Arc::clone(&release),
+        panic_detect: false,
     }))
     .unwrap();
 
@@ -871,4 +880,24 @@ async fn symbol_history_slow_provider_delays_only_history_tools() {
         changes(&body),
         vec![("introduced".to_string(), "gated-rev".to_string())]
     );
+
+    let mut vcs = VcsRegistry::new();
+    vcs.register(Box::new(GatedProvider {
+        started: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        panic_detect: true,
+    }))
+    .unwrap();
+    let panic_dir = TempDir::new().unwrap();
+    std::fs::write(
+        panic_dir.path().join("lib.rs"),
+        "pub fn target_function() -> u32 {\n    1\n}\n",
+    )
+    .unwrap();
+    let panic_server = rust_server(vcs);
+    analyze(&panic_server, panic_dir.path()).await;
+    let panic_symbol = symbol_id(panic_dir.path(), "lib.rs", "target_function");
+    let result = call_history(&panic_server, &panic_symbol, None, None).await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(first_text(&result).contains("detect VCS provider failed"));
 }

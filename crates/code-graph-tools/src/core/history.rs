@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use code_graph_graph::Graph;
 use code_graph_lang::FingerprintMode;
-use code_graph_vcs::{VcsError, VcsRegistry};
+use code_graph_vcs::{VcsDetection, VcsError, VcsProvider, VcsRegistry};
 use parking_lot::RwLock;
 use serde::Serialize;
 
@@ -60,7 +60,7 @@ pub struct BlameSymbolResponse {
     /// One-based last line of the symbol's span, from the graph.
     pub end_line: u32,
     /// The revision attribution reflects: the resolved `at` argument, or
-    /// the provider's default revision (Git: `HEAD`). `null` when
+    /// the provider's default revision. `null` when
     /// unavailable or when the default could not be resolved (blame then
     /// still ran against the provider default).
     pub rev: Option<String>,
@@ -123,6 +123,33 @@ fn unavailable(
     }))
 }
 
+/// Select a provider at the async detection boundary. Detection is deliberately
+/// repeated for each history request: a registry never caches a selection
+/// across repository/worktree changes.
+enum SelectionFailure {
+    Unavailable(String),
+    Operational(VcsError),
+}
+
+async fn select_provider(
+    vcs: &VcsRegistry,
+    root: &Path,
+) -> Result<Arc<dyn VcsProvider>, SelectionFailure> {
+    match vcs.detect(root).await.map_err(SelectionFailure::Operational)? {
+        VcsDetection::Selected(provider) => Ok(provider),
+        VcsDetection::NoProvider => Err(SelectionFailure::Unavailable(format!(
+            "no supported version-control system detected at {}",
+            root.display()
+        ))),
+        VcsDetection::ProviderBoundElsewhere { provider } => Err(SelectionFailure::Unavailable(format!(
+            "provider bound elsewhere: {provider} recognizes this root but is bound to a different repository"
+        ))),
+        VcsDetection::DifferentCheckout { provider } => Err(SelectionFailure::Unavailable(format!(
+            "different checkout: {provider} is bound to another linked worktree of this repository"
+        ))),
+    }
+}
+
 /// `blame_symbol` body: resolve the symbol's span from the graph, then
 /// attribute it through the detected provider.
 ///
@@ -131,7 +158,7 @@ fn unavailable(
 /// indexed; `stale` reports when those two file states diverge, detected by
 /// comparing on-disk bytes against [`code_graph_vcs::VcsProvider::read_at`]
 /// for the blamed revision. The default-revision echo resolves the
-/// provider's `"HEAD"` spec and degrades to `rev: null` (with blame still
+/// provider's default revision and degrades to `rev: null` (with blame still
 /// running at the provider default) if that spec does not resolve.
 pub async fn blame_symbol(
     graph: &RwLock<Graph>,
@@ -178,23 +205,20 @@ pub async fn blame_symbol(
             "no indexed root recorded; re-run analyze_codebase".to_string(),
         );
     };
-    let Some(provider) = vcs.detect(&root) else {
-        return unavailable(
-            symbol,
-            &span,
-            format!(
-                "no supported version-control system detected at {}",
-                root.display()
-            ),
-        );
+    let provider = match select_provider(vcs, &root).await {
+        Ok(provider) => provider,
+        Err(SelectionFailure::Unavailable(reason)) => return unavailable(symbol, &span, reason),
+        Err(SelectionFailure::Operational(error)) => {
+            return Err(ToolError(format!("detect VCS provider failed: {error}")))
+        }
     };
 
     // Resolve the revision attribution will reflect. An explicit `at` that
     // does not resolve is a caller error; the default-revision echo is
-    // best-effort ("HEAD" is resolved purely so the response can NAME the
+    // best-effort (the provider's default is resolved purely so the response can NAME the
     // revision — blame itself falls back to the provider default).
     let resolved = match at.filter(|spec| !spec.is_empty()) {
-        Some(spec) => match provider.resolve_rev(spec).await {
+        Some(spec) => match provider.resolve_rev(Some(spec)).await {
             Ok(rev) => Some(rev),
             Err(error) => {
                 return Err(ToolError(format!(
@@ -202,7 +226,7 @@ pub async fn blame_symbol(
                 )))
             }
         },
-        None => provider.resolve_rev("HEAD").await.ok(),
+        None => provider.resolve_rev(None).await.ok(),
     };
 
     let path = Path::new(&span.file);
@@ -282,12 +306,17 @@ pub async fn blame_symbol(
     // A span lying wholly beyond the blamed revision's EOF clamps to zero
     // attributable lines (gate review F4). Make the empty page carry its
     // own signal rather than looking like a quietly successful blame.
-    if hunks.is_empty() && stale_reason.is_none() {
-        stale_reason = Some(
+    if hunks.is_empty() {
+        let empty_span_reason =
             "the symbol's span has no attributable lines at the blamed revision \
-             (the file is shorter there than the on-disk span)"
-                .to_string(),
-        );
+             (the file is shorter there than the on-disk span)";
+        match &mut stale_reason {
+            Some(reason) => {
+                reason.push_str("; ");
+                reason.push_str(empty_span_reason);
+            }
+            None => stale_reason = Some(empty_span_reason.to_string()),
+        }
     }
 
     Ok(ToolOk::Value(BlameSymbolResponse {
@@ -503,17 +532,14 @@ pub async fn symbol_history(
             "no indexed root recorded; re-run analyze_codebase".to_string(),
         );
     };
-    let Some(provider) = inner.vcs.detect(&root) else {
-        return history_unavailable(
-            symbol,
-            &file,
-            mode,
-            window,
-            format!(
-                "no supported version-control system detected at {}",
-                root.display()
-            ),
-        );
+    let provider = match select_provider(&inner.vcs, &root).await {
+        Ok(provider) => provider,
+        Err(SelectionFailure::Unavailable(reason)) => {
+            return history_unavailable(symbol, &file, mode, window, reason)
+        }
+        Err(SelectionFailure::Operational(error)) => {
+            return Err(ToolError(format!("detect VCS provider failed: {error}")))
+        }
     };
 
     let revision_window = match provider.revisions_touching(Path::new(&file), window).await {

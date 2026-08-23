@@ -7,7 +7,8 @@
 //! [`RevId`] is an opaque token: this crate never assumes a hash shape,
 //! length, or alphabet.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,39 @@ pub enum VcsError {
     Io(#[from] std::io::Error),
 }
 
+/// How one registered provider classifies a working-tree probe.
+///
+/// Detection is metadata rather than one of the four required asynchronous
+/// VCS operations. [`VcsRegistry::detect`] runs it on Tokio's blocking pool:
+/// repository discovery may touch the filesystem (or, for a future provider,
+/// invoke its native discovery mechanism).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderDetection {
+    /// This provider does not recognize the probe.
+    NoMatch,
+    /// The probe is the checkout this provider is bound to.
+    Selected,
+    /// The provider recognizes the VCS but is bound to another repository.
+    BoundElsewhere,
+    /// The provider recognizes the same repository in another checkout.
+    DifferentCheckout,
+}
+
+/// Result of detecting a provider for a history request.
+#[derive(Clone)]
+pub enum VcsDetection {
+    /// A provider bound to the requested checkout.
+    Selected(Arc<dyn VcsProvider>),
+    /// No registered provider recognized the requested root.
+    NoProvider,
+    /// A registered provider recognized the VCS, but its bound repository is
+    /// not the requested repository.
+    ProviderBoundElsewhere { provider: &'static str },
+    /// A registered provider recognized the same repository in a linked (or
+    /// otherwise separate) checkout.
+    DifferentCheckout { provider: &'static str },
+}
+
 /// A source-control backend for one kind of working tree.
 ///
 /// The four async methods are the complete required VCS operation set:
@@ -120,8 +154,12 @@ pub trait VcsProvider: Send + Sync {
     /// `"git"` or `"perforce"`).
     fn id(&self) -> &'static str;
 
-    /// Whether this provider recognizes `working_tree`.
-    fn detect(&self, working_tree: &Path) -> bool;
+    /// Classify `working_tree` relative to this provider's bound checkout.
+    ///
+    /// This synchronous hook is always called through
+    /// [`VcsRegistry::detect`]'s blocking boundary, never directly from a
+    /// history tool's async task.
+    fn detect(&self, working_tree: &Path) -> ProviderDetection;
 
     /// Attribute an optional inclusive one-based line range at an optional
     /// revision.
@@ -149,8 +187,9 @@ pub trait VcsProvider: Send + Sync {
     /// Read `path` as it existed at `rev`.
     async fn read_at(&self, rev: &RevId, path: &Path) -> Result<Vec<u8>, VcsError>;
 
-    /// Resolve a provider-native revision specifier to its opaque identity.
-    async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError>;
+    /// Resolve an optional provider-native revision specifier to its opaque
+    /// identity. `None` asks the provider for its default revision.
+    async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError>;
 }
 
 /// Registration failures from [`VcsRegistry`].
@@ -168,7 +207,7 @@ pub enum RegistryError {
 /// when provider markers overlap. Adding another provider requires only
 /// registering it; existing providers are not modified.
 pub struct VcsRegistry {
-    providers: Vec<Box<dyn VcsProvider>>,
+    providers: Vec<Arc<dyn VcsProvider>>,
 }
 
 impl VcsRegistry {
@@ -188,29 +227,55 @@ impl VcsRegistry {
         {
             return Err(RegistryError::DuplicateProvider(provider.id().to_string()));
         }
-        self.providers.push(provider);
+        self.providers.push(Arc::from(provider));
         Ok(())
     }
 
-    /// Return the first provider that recognizes `working_tree`.
-    pub fn detect(&self, working_tree: &Path) -> Option<&dyn VcsProvider> {
-        self.providers
-            .iter()
-            .map(Box::as_ref)
-            .find(|provider| provider.detect(working_tree))
+    /// Detect a provider for `working_tree` without blocking the async
+    /// runtime. Detection intentionally runs on every request: binding can
+    /// change as repositories, worktrees, and provider state change.
+    pub async fn detect(&self, working_tree: &Path) -> Result<VcsDetection, VcsError> {
+        let providers = self.providers.clone();
+        let working_tree = PathBuf::from(working_tree);
+        match tokio::task::spawn_blocking(move || {
+            for provider in providers {
+                match provider.detect(&working_tree) {
+                    ProviderDetection::Selected => return VcsDetection::Selected(provider),
+                    ProviderDetection::BoundElsewhere => {
+                        return VcsDetection::ProviderBoundElsewhere {
+                            provider: provider.id(),
+                        }
+                    }
+                    ProviderDetection::DifferentCheckout => {
+                        return VcsDetection::DifferentCheckout {
+                            provider: provider.id(),
+                        }
+                    }
+                    ProviderDetection::NoMatch => {}
+                }
+            }
+            VcsDetection::NoProvider
+        })
+        .await
+        {
+            Ok(detection) => Ok(detection),
+            Err(error) => Err(VcsError::Operation(format!(
+                "VCS detection task failed: {error}"
+            ))),
+        }
     }
 
     /// Look up a registered provider by its stable identifier.
     pub fn provider(&self, id: &str) -> Option<&dyn VcsProvider> {
         self.providers
             .iter()
-            .map(Box::as_ref)
+            .map(AsRef::as_ref)
             .find(|provider| provider.id() == id)
     }
 
     /// Iterate over registered providers in detection precedence order.
     pub fn providers(&self) -> impl Iterator<Item = &dyn VcsProvider> + '_ {
-        self.providers.iter().map(Box::as_ref)
+        self.providers.iter().map(AsRef::as_ref)
     }
 }
 
@@ -223,6 +288,7 @@ impl Default for VcsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -246,8 +312,12 @@ mod tests {
             "integer-test"
         }
 
-        fn detect(&self, working_tree: &Path) -> bool {
-            working_tree.join(".integer-vcs").is_dir()
+        fn detect(&self, working_tree: &Path) -> ProviderDetection {
+            if working_tree.join(".integer-vcs").is_dir() {
+                ProviderDetection::Selected
+            } else {
+                ProviderDetection::NoMatch
+            }
         }
 
         async fn blame(
@@ -289,7 +359,7 @@ mod tests {
             Ok(b"integer provider contents".to_vec())
         }
 
-        async fn resolve_rev(&self, _spec: &str) -> Result<RevId, VcsError> {
+        async fn resolve_rev(&self, _spec: Option<&str>) -> Result<RevId, VcsError> {
             Ok(self.revision())
         }
     }
@@ -306,8 +376,12 @@ mod tests {
             self.id
         }
 
-        fn detect(&self, working_tree: &Path) -> bool {
-            working_tree.join(self.marker).is_dir()
+        fn detect(&self, working_tree: &Path) -> ProviderDetection {
+            if working_tree.join(self.marker).is_dir() {
+                ProviderDetection::Selected
+            } else {
+                ProviderDetection::NoMatch
+            }
         }
 
         async fn blame(
@@ -334,8 +408,8 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
-            Ok(RevId::new(spec))
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new(spec.unwrap_or("default")))
         }
     }
 
@@ -345,6 +419,60 @@ mod tests {
     struct SlowProvider {
         started: Arc<Notify>,
         release: Arc<Notify>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingDetectionProvider {
+        started: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        classification: ProviderDetection,
+        panic: bool,
+        delay: bool,
+    }
+
+    #[async_trait]
+    impl VcsProvider for BlockingDetectionProvider {
+        fn id(&self) -> &'static str {
+            "blocking-detection"
+        }
+
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.store(true, Ordering::SeqCst);
+            assert!(!self.panic, "detector panic fixture");
+            if self.delay {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            self.classification
+        }
+
+        async fn blame(
+            &self,
+            _path: &Path,
+            _lines: Option<(u32, u32)>,
+            _at: Option<&RevId>,
+        ) -> Result<Vec<BlameHunk>, VcsError> {
+            Ok(Vec::new())
+        }
+
+        async fn revisions_touching(
+            &self,
+            _path: &Path,
+            _limit: u32,
+        ) -> Result<RevisionWindow, VcsError> {
+            Ok(RevisionWindow {
+                commits: Vec::new(),
+                truncated: false,
+            })
+        }
+
+        async fn read_at(&self, _rev: &RevId, _path: &Path) -> Result<Vec<u8>, VcsError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_rev(&self, _spec: Option<&str>) -> Result<RevId, VcsError> {
+            Ok(RevId::new("default"))
+        }
     }
 
     impl SlowProvider {
@@ -360,8 +488,8 @@ mod tests {
             "slow-test"
         }
 
-        fn detect(&self, _working_tree: &Path) -> bool {
-            false
+        fn detect(&self, _working_tree: &Path) -> ProviderDetection {
+            ProviderDetection::NoMatch
         }
 
         async fn blame(
@@ -391,9 +519,9 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn resolve_rev(&self, spec: &str) -> Result<RevId, VcsError> {
+        async fn resolve_rev(&self, spec: Option<&str>) -> Result<RevId, VcsError> {
             self.wait().await;
-            Ok(RevId::new(spec))
+            Ok(RevId::new(spec.unwrap_or("default")))
         }
     }
 
@@ -410,7 +538,7 @@ mod tests {
 
         // Calling all four required operations on an integer-native provider
         // makes a future fifth *required* operation a compile failure here.
-        let revision = provider.resolve_rev("latest").await.unwrap();
+        let revision = provider.resolve_rev(Some("latest")).await.unwrap();
         let blame = provider
             .blame(path, Some((4, 6)), Some(&revision))
             .await
@@ -427,8 +555,8 @@ mod tests {
         assert_eq!(contents, b"integer provider contents");
     }
 
-    #[test]
-    fn registry_selects_an_independently_registered_second_provider() {
+    #[tokio::test]
+    async fn registry_selects_an_independently_registered_second_provider() {
         let temporary_tree = tempfile::tempdir().unwrap();
         std::fs::create_dir(temporary_tree.path().join(".second-vcs")).unwrap();
 
@@ -446,9 +574,11 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(
-            registry.detect(temporary_tree.path()).map(VcsProvider::id),
-            Some("second"),
+        assert!(
+            matches!(
+                registry.detect(temporary_tree.path()).await.unwrap(),
+                VcsDetection::Selected(provider) if provider.id() == "second"
+            ),
             "detection must consult the independently registered provider"
         );
         assert_eq!(
@@ -457,8 +587,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn duplicate_provider_registration_is_rejected_without_replacement() {
+    #[tokio::test]
+    async fn duplicate_provider_registration_is_rejected_without_replacement() {
         let temporary_tree = tempfile::tempdir().unwrap();
         std::fs::create_dir(temporary_tree.path().join(".one")).unwrap();
 
@@ -478,9 +608,11 @@ mod tests {
 
         assert!(matches!(error, RegistryError::DuplicateProvider(id) if id == "same"));
         assert_eq!(registry.providers().count(), 1);
-        assert_eq!(
-            registry.detect(temporary_tree.path()).map(VcsProvider::id),
-            Some("same"),
+        assert!(
+            matches!(
+                registry.detect(temporary_tree.path()).await.unwrap(),
+                VcsDetection::Selected(provider) if provider.id() == "same"
+            ),
             "the rejected duplicate must not replace the original provider"
         );
     }
@@ -494,7 +626,8 @@ mod tests {
             release: Arc::clone(&release),
         };
 
-        let operation = tokio::spawn(async move { provider.resolve_rev("network-rev").await });
+        let operation =
+            tokio::spawn(async move { provider.resolve_rev(Some("network-rev")).await });
         started.notified().await;
         assert!(
             !operation.is_finished(),
@@ -513,5 +646,114 @@ mod tests {
 
         release.notify_one();
         assert_eq!(operation.await.unwrap().unwrap().as_str(), "network-rev");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detection_is_blocking_isolated_and_never_cached() {
+        let started = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = VcsRegistry::new();
+        registry
+            .register(Box::new(BlockingDetectionProvider {
+                started: Arc::clone(&started),
+                calls: Arc::clone(&calls),
+                classification: ProviderDetection::Selected,
+                panic: false,
+                delay: true,
+            }))
+            .unwrap();
+        let registry = Arc::new(registry);
+        let root = PathBuf::from("/blocking-detection-root");
+
+        let first_registry = Arc::clone(&registry);
+        let first_root = root.clone();
+        let detection = tokio::spawn(async move { first_registry.detect(&first_root).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking detector started");
+        assert!(
+            !detection.is_finished(),
+            "detection must wait in spawn_blocking rather than block the runtime"
+        );
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            sent.send(()).expect("probe receiver remains alive");
+        });
+        tokio::time::timeout(Duration::from_millis(50), received)
+            .await
+            .expect("unrelated async work runs while detection blocks")
+            .expect("probe completes");
+        assert!(matches!(
+            detection.await.unwrap().unwrap(),
+            VcsDetection::Selected(_)
+        ));
+
+        assert!(matches!(
+            registry.detect(&root).await.unwrap(),
+            VcsDetection::Selected(_)
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each history request must execute detection; selection is not cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_detector_is_an_operational_error() {
+        let mut registry = VcsRegistry::new();
+        registry
+            .register(Box::new(BlockingDetectionProvider {
+                started: Arc::new(AtomicBool::new(false)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                classification: ProviderDetection::NoMatch,
+                panic: true,
+                delay: false,
+            }))
+            .unwrap();
+
+        let error = match registry.detect(Path::new("/panicking-detector")).await {
+            Ok(_) => panic!("a detector panic must not become no-provider"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, VcsError::Operation(ref reason) if reason.contains("detection task failed")),
+            "panic becomes an operational detection error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_recognized_provider_wins_over_later_selection() {
+        let mut registry = VcsRegistry::new();
+        registry
+            .register(Box::new(BlockingDetectionProvider {
+                started: Arc::new(AtomicBool::new(false)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                classification: ProviderDetection::BoundElsewhere,
+                panic: false,
+                delay: false,
+            }))
+            .unwrap();
+        // Use a distinct marker provider for the later registration; it is
+        // selected only if registry precedence incorrectly skips the first
+        // recognized classification.
+        registry
+            .register(Box::new(MarkerProvider {
+                id: "later-selected",
+                marker: ".always-selected",
+            }))
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".always-selected")).unwrap();
+        assert!(matches!(
+            registry.detect(root.path()).await.unwrap(),
+            VcsDetection::ProviderBoundElsewhere {
+                provider: "blocking-detection"
+            }
+        ));
     }
 }
