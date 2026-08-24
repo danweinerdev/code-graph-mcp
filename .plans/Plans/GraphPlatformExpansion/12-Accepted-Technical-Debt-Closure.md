@@ -52,10 +52,31 @@ tasks:
     justifies: "FR-48, AC-57, NFR-11, and D-0007; prevents unresolved override tokens from appearing as resolved candidate-1 rows and ensures the full adapter path pins contested candidate counts, as recorded by review 21."
     verification: >-
       cargo test -p code-graph-tools --test candidate_count and cargo test -p code-graph-tools --test watch_virtual_overrides and cargo test -p code-graph-tools --test snapshot_responses and cargo test -p code-graph-tools --test snapshot_tools_list pass; bare unresolved override keys emit no provisional rows, a real candidates>=2 edge is snapshotted through the rmcp adapter, and trait/docs/tests state which confidence/count invariant future language-specific resolve_call overrides must preserve without deriving either signal from the other; make verify passes.
+  - id: "12.9"
+    title: "Preserve analyze admission through queue compaction"
+    status: planned
+    depends_on: ["12.2"]
+    justifies: "FR-02, AC-01, AC-28, and the Phase 12 four-lane review; prevents pending path coverage from bypassing file validation, nested project-root isolation, or configuration provenance."
+    verification: >-
+      cargo test -p code-graph-tools --lib core::analyze and cargo test -p code-graph-tools --test integration pass; invalid file and malformed-config followers cannot attach to a successful pending ancestor, nested project roots remain distinct, same-project path compaction and progress fan-out remain intact, and make verify passes.
+  - id: "12.10"
+    title: "Bound and confine fingerprint sidecar I/O"
+    status: planned
+    depends_on: ["12.5"]
+    justifies: "FR-37, AC-46, NFR-10, and the Phase 12 four-lane review; prevents cache symlinks, special files, oversized shards, and per-request full-cache scans from escaping the sidecar's non-authoritative bounded-work contract."
+    verification: >-
+      cargo test -p code-graph-tools --lib core::fingerprint_cache and cargo test -p code-graph-tools --test symbol_history pass; shard reads are regular-file-only and byte-bounded, cache writes fail closed on symlinked components, maintenance retains open-time crash recovery without an O(total-shards) scan on every history request, cross-process eviction remains harmless, and make verify passes.
+  - id: "12.11"
+    title: "Make CLI table wrapping grapheme-safe"
+    status: planned
+    depends_on: ["12.6"]
+    justifies: "FR-18, FR-19, AC-10, and the Phase 12 four-lane review; prevents display-width wrapping from splitting ZWJ emoji and other extended grapheme clusters."
+    verification: >-
+      cargo test -p code-graph-cli passes; ASCII and CJK width caps remain stable, combining sequences and ZWJ emoji wrap only at grapheme boundaries, machine output remains unchanged, and make verify passes.
   - id: "12.8"
     title: "Pin residual Windows path, ACL, shutdown, and dogfood behavior"
     status: planned
-    depends_on: ["12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7"]
+    depends_on: ["12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7", "12.9", "12.10", "12.11"]
     justifies: "NFR-13, AC-60, and D-0014; closes the remaining native-Windows test omissions recorded by reviews 19 and 22 without expanding the accepted single-user security scope."
     verification: >-
       On a native Windows runner, make submodules, make dogfood-required, and make verify pass; cargo test -p code-graph-mcp --test daemon_serve, cargo test -p code-graph-mcp --test daemon_proxy, cargo test -p code-graph-cli, and cargo test -p code-graph-tools --test path_normalization pass with bounded shutdown diagnostics, exact invoking-SID validation against an icacls-saved SDDL ACE, existing-path casing convergence plus the documented nonexistent/remove seam, explicit short-form/long-form canonicalization equivalence, and a dogfood-required gate that fails if any baseline auto-skips. A Linux make verify run at the same final candidate also passes.
@@ -68,7 +89,7 @@ Phases 1-9 and 11 are complete and frozen-reviewed, but their final review artif
 
 Phase 10 macOS completion and the Perforce provider are excluded. Follow-ups already resolved after their source review are also excluded from implementation: the Python decorator pin and candidate-count doc/fixture corrections (`49a5a21`), watch override resolution (`8091042`), Rust lifetime-list fingerprinting and the revived literal-insensitive path (phase 8), the original Linux post-Windows verification (`14e2681`), and the D-0014 specification reconciliation (`385cc31`). Review 22’s suggested extra D-0014 annotation is historical decision-evidence bookkeeping, not product debt, and is explicitly excluded under this phase’s approved boundary. The coverage table below records those exclusions so “all debt” cannot silently mean “all prose ever written in a review.”
 
-Execution may proceed in parallel for 12.1, 12.2, 12.3, 12.6, and 12.7. Task 12.4 follows provider hardening; 12.5 follows the history contract; 12.8 follows every implementation task so its native Windows run certifies the actual final candidate.
+Execution may proceed in parallel for 12.1, 12.2, 12.3, 12.6, and 12.7. Task 12.4 follows provider hardening; 12.5 follows the history contract. Tasks 12.9-12.11 close findings from the completed-scope Phase 12 review, then 12.8 follows every implementation task so its native Windows run certifies the actual final candidate.
 
 ## Debt Coverage
 | Source | Still-open follow-ups owned here | Already resolved or excluded |
@@ -336,6 +357,55 @@ Do not globally drop unresolved Calls from storage: scoped cache growth delibera
 |---|---|---|---|
 | `Targeted task verification and four-lane review` | `task 12.7 implementation at fd65c0df32d8f5bda6670cb3f43dfdf70656ea56` | PASS | `PASS: graph callgraph (29), code-graph-lang (66), typed core/handler query (80), custom resolve_call contract (1), candidate_count (4), watch_virtual_overrides (1), snapshot_responses (60), and snapshot_tools_list (33) passed. Quality and plan-drift reviews found no issues; blind-spots and spec-compliance findings were fixed and re-reviewed closed. Review-21's already-closed docs/watch/staleness items remained intact, with no cache bump, compatibility shim, global unresolved-Calls drop, or duplicate watch change.` |
 
+## 12.9: Preserve analyze admission through queue compaction
+### Subtasks
+- [ ] Probe and retain the full admission result for every synchronous and asynchronous analyze request before it can attach to pending work.
+- [ ] Reject invalid file and malformed-config followers instead of aliasing them to a successful pending ancestor.
+- [ ] Compact ancestor/descendant requests only when their discovered project roots match; a nested `.code-graph.toml` remains a separate canonical job.
+- [ ] Preserve same-project force OR, FIFO replacement, alias resolution, queue capacity, and synchronous progress-sink fan-out.
+- [ ] Add deterministic pending-parent regressions for file, malformed-config, nested-project, daemon-root, and valid same-project descendants.
+
+### Notes
+Revision boundary: path compaction remains a same-project optimization and can no longer change whether an individual request is valid or which project/configuration owns it.
+
+### Trap
+Do not compact against the running job, and do not change async invalid-request status semantics merely to simplify admission. An invalid request may retain its established failed-job channel, but it must never alias to successful foreign work.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 12.10: Bound and confine fingerprint sidecar I/O
+### Subtasks
+- [ ] Treat every sidecar path as untrusted state: reject symlinked/reparse components and non-regular shard files on reads and writes without following them outside the cache.
+- [ ] Bound shard reads before allocation/deserialization and make FIFO/device/special-file entries prompt cache misses rather than blocking workers.
+- [ ] Publish through exclusively created temporary files and preserve atomic replacement, corruption-as-miss, and cross-process harmless-eviction behavior.
+- [ ] Retain a best-effort maintenance pass at sidecar open for crash/restart recovery, but run it at most once per cache root per process instead of scanning all shards on every history request; keep the 256-write trigger.
+- [ ] Add direct read/write symlink, special-file, oversized-shard, and repeated-open scan-count regressions within the same-local-user threat model.
+
+### Notes
+Revision boundary: the disposable sidecar remains non-authoritative and self-healing, while every individual operation is byte-bounded and cache-root-confined and ordinary repeated history reads are not O(total shards).
+
+### Trap
+Do not promote the cache to an authoritative error source or claim a cross-account security boundary. Fail closed to a cache miss, preserve D-0014's same-local-user scope, and keep the main graph cache format/version untouched.
+
+### Completion Evidence
+
+Pending — not complete.
+
+## 12.11: Make CLI table wrapping grapheme-safe
+### Subtasks
+- [ ] Wrap table cells and headers by extended grapheme cluster rather than Unicode scalar while retaining display-width accounting and explicit newline handling.
+- [ ] Add ZWJ emoji, combining-sequence-at-boundary, CJK, and hard-width-cap regressions.
+- [ ] Keep JSON/machine output and non-table text rendering byte-identical.
+
+### Notes
+Revision boundary: human tables remain bounded and display-width aligned without splitting a user-perceived character across lines.
+
+### Completion Evidence
+
+Pending — not complete.
+
 ## 12.8: Pin residual Windows path, ACL, shutdown, and dogfood behavior
 ### Subtasks
 - [ ] Add a native NTFS regression proving mixed casing of an existing file converges to one canonical graph key; retain an explicit known limitation for nonexistent/remove-event casing if the OS cannot canonicalize it.
@@ -362,6 +432,7 @@ Pending — not complete.
 - [ ] VCS and symbol-history failures, blocking boundaries, memory bounds, and cache behavior satisfy FR-27, FR-29, FR-32-FR-37, AC-19-AC-22, AC-34, AC-35, AC-37, AC-44, AC-46, and NFR-10.
 - [ ] CLI machine output remains byte-identical across daemon and standalone paths while stale metadata, rendering, cleanup, and argument behavior satisfy FR-12, FR-16-FR-20, AC-09-AC-12, and AC-40.
 - [ ] Candidate-count and override behavior preserve FR-48, AC-57, NFR-11, and D-0007 without collapsing confidence and candidate count into one signal.
+- [ ] The completed-scope Phase 12 review findings are closed: pending analyze compaction preserves validation/project identity, fingerprint sidecar I/O is confined and bounded without per-request full scans, and CLI wrapping is grapheme-safe.
 - [ ] Native Windows evidence closes the remaining path, ACL, shutdown, and dogfood omissions within NFR-13, AC-60, and D-0014; Linux `make verify` passes at the same final candidate.
 - [ ] Every task lands as a focused native-SCM revision with its named focused tests and `make verify` passing; no pending snapshots or plugin drift remain.
 - [ ] A fresh four-lane phase review over the complete frozen Phase 12 range returns Aligned with no open findings before the phase is marked complete.
