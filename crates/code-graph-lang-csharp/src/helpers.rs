@@ -5,8 +5,59 @@
 //! directly from `code-graph-lang` at their use sites in `lib.rs` rather
 //! than re-exported through this module. C#-specific helpers live here.
 
+use code_graph_core::CallShape;
 use code_graph_lang::helpers::find_enclosing_kind;
 use tree_sitter::Node;
+
+/// Classify a captured callee identifier's call shape (F2).
+///
+/// `cap_node` is the `call.name` capture. A generic callee (`Foo<int>()`)
+/// captures the inner identifier of a `generic_name`; classification uses
+/// the `generic_name`'s position. When the (possibly generic) name is the
+/// `name` child of a `member_access_expression`, the call goes through a
+/// receiver: `this.M()` is [`CallShape::SelfReceiver`] (the receiver type
+/// is the enclosing class), anything else — including `base.M()` (the
+/// generic resolver cannot verify the base chain), namespace/type-qualified
+/// static calls (`Ns.Type.Method()`, indistinguishable from an instance
+/// variable without semantic info), and chained calls — is
+/// [`CallShape::Receiver`]. A null-conditional call (`obj?.M()`, the
+/// `member_binding_expression` form) is likewise [`CallShape::Receiver`].
+/// Direct calls (`Foo()`, `new Foo()`, lambda/LINQ leaves, and unqualified
+/// implicit-`this` calls — same decision as C++'s implicit-`this` note in
+/// KNOWN_ISSUES F2) are [`CallShape::Free`].
+pub fn csharp_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
+    let mut node = cap_node;
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "generic_name" {
+            node = parent;
+        }
+    }
+    let Some(parent) = node.parent() else {
+        return CallShape::Free;
+    };
+    match parent.kind() {
+        "member_access_expression" => {
+            if parent.child_by_field_name("name").map(|n| n.id()) != Some(node.id()) {
+                return CallShape::Free;
+            }
+            // Compare the receiver's TEXT rather than its node kind: the
+            // grammar's spelling for the `this` receiver has shifted across
+            // tree-sitter-c-sharp versions, while the source text is stable.
+            match parent
+                .child_by_field_name("expression")
+                .and_then(|receiver| receiver.utf8_text(content).ok())
+            {
+                Some("this") => CallShape::SelfReceiver,
+                _ => CallShape::Receiver,
+            }
+        }
+        // `obj?.M()` — the receiver rides the enclosing
+        // conditional_access_expression and is never `this` in practice;
+        // classify as an unverified receiver.
+        "member_binding_expression" => CallShape::Receiver,
+        _ => CallShape::Free,
+    }
+}
 
 /// Build a `path:fn_name` (free fn / local function) or
 /// `path:Parent::fn_name` (method/constructor) symbol-ID anchor for the

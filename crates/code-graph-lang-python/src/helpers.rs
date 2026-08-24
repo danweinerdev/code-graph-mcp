@@ -16,7 +16,37 @@
 // 7.2's definition extractor.
 pub use code_graph_lang::helpers::truncate_signature;
 
+use code_graph_core::CallShape;
 use tree_sitter::Node;
+
+/// Classify a captured callee identifier's call shape (F2).
+///
+/// `cap_node` is the `call.name` capture. When it is the `attribute` child
+/// of an `attribute` node (attribute call `recv.method()`), the call goes
+/// through a receiver value: `self.method()` / `cls.method()` is
+/// [`CallShape::SelfReceiver`] (the receiver is the enclosing class),
+/// anything else is [`CallShape::Receiver`] — including module-qualified
+/// calls (`mod.func()`), which the generic resolver cannot distinguish
+/// from instance calls without import analysis, and chained calls. Direct
+/// calls (`foo()`, `MyClass()`, `super()`) are [`CallShape::Free`].
+pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
+    let Some(parent) = cap_node.parent() else {
+        return CallShape::Free;
+    };
+    if parent.kind() != "attribute" {
+        return CallShape::Free;
+    }
+    if parent.child_by_field_name("attribute").map(|n| n.id()) != Some(cap_node.id()) {
+        return CallShape::Free;
+    }
+    match parent
+        .child_by_field_name("object")
+        .and_then(|receiver| receiver.utf8_text(content).ok())
+    {
+        Some("self") | Some("cls") => CallShape::SelfReceiver,
+        _ => CallShape::Receiver,
+    }
+}
 
 /// Walk `node`'s parent chain and return the first ancestor that is a
 /// `class_definition`, or `None` if `node` is not nested inside a class.

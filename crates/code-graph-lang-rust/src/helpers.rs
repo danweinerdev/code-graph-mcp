@@ -31,7 +31,41 @@
 
 pub use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 
+use code_graph_core::CallShape;
 use tree_sitter::Node;
+
+/// Classify a captured callee identifier's call shape (F2).
+///
+/// `cap_node` is the `call.name` capture — the bare identifier the call
+/// query matched. When it is the `field` child of a `field_expression`
+/// (method call `recv.foo()`), the call goes through a receiver value:
+/// `self.foo()` is [`CallShape::SelfReceiver`] (the receiver type is the
+/// enclosing impl type, statically known), anything else is
+/// [`CallShape::Receiver`] (the receiver's type is not verifiable by the
+/// generic resolver — chained calls `a.b().c()` land here too). Every
+/// other capture position (direct `foo()`, macro `println!()`, turbofish
+/// `foo::<T>()`, scoped `call.qname` paths) is [`CallShape::Free`].
+pub fn rust_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
+    let Some(parent) = cap_node.parent() else {
+        return CallShape::Free;
+    };
+    if parent.kind() != "field_expression" {
+        return CallShape::Free;
+    }
+    // Only when this identifier IS the field (the method name). The
+    // receiver (`value` child) of a chained call can itself be an
+    // identifier — that position must not classify as a method name.
+    if parent.child_by_field_name("field").map(|n| n.id()) != Some(cap_node.id()) {
+        return CallShape::Free;
+    }
+    match parent
+        .child_by_field_name("value")
+        .and_then(|receiver| receiver.utf8_text(content).ok())
+    {
+        Some("self") => CallShape::SelfReceiver,
+        _ => CallShape::Receiver,
+    }
+}
 
 /// Walk a `use_tree` (the `argument` field of a `use_declaration`, or any
 /// node nested inside a `scoped_use_list`/`use_list`) and produce one

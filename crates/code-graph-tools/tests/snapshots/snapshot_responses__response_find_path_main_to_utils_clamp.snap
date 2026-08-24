@@ -1,6 +1,5 @@
 ---
 source: crates/code-graph-tools/tests/snapshot_responses.rs
-assertion_line: 1546
 expression: parsed
 ---
 {
@@ -25,5 +24,5 @@ expression: parsed
     }
   ],
   "node_cap": 100000,
-  "nodes_examined": 5
+  "nodes_examined": 2
 }

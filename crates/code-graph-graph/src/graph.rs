@@ -732,6 +732,7 @@ mod tests {
                     line: 12,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
             ],
         );

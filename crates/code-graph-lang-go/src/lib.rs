@@ -566,6 +566,7 @@ impl GoParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }
@@ -649,6 +650,7 @@ impl GoParser {
                     line,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }

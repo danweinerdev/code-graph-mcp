@@ -33,7 +33,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use code_graph_core::{symbol_id, EdgeKind, ExtensionsConfig, FileGraph, Language, RootConfig};
+use code_graph_core::{
+    symbol_id, CallShape, EdgeKind, ExtensionsConfig, FileGraph, Language, RootConfig,
+};
 use code_graph_lang::{CallContext, FileIndex, LanguageRegistry, SymbolEntry, SymbolIndex};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rayon::ThreadPoolBuildError;
@@ -537,6 +539,9 @@ pub fn resolve_edges_with_indexes(
                         caller_id: &edge.from,
                         caller_file: &path_for_ctx,
                         language: fg.language,
+                        // Parse-time call shape (F2): gates the resolver's
+                        // sole-candidate shortcut for receiver-typed calls.
+                        shape: edge.shape,
                     };
                     if let Some((id, confidence, candidates)) =
                         plugin.resolve_call(&edge.to, &ctx, symbol_index)
@@ -576,6 +581,9 @@ pub fn resolve_edges_with_indexes(
                         caller_id: &edge.from,
                         caller_file: &path_for_ctx,
                         language: fg.language,
+                        // Overrides tokens are declarative `Parent::name`
+                        // forms, never receiver calls — always Free.
+                        shape: CallShape::Free,
                     };
                     if let Some((id, confidence, candidates)) =
                         plugin.resolve_call(&edge.to, &ctx, symbol_index)
@@ -956,6 +964,7 @@ mod tests {
                     line: 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
                 Edge {
                     from: format!("{main_path}:main"),
@@ -966,6 +975,7 @@ mod tests {
                     line: 6,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
             ],
         };
@@ -1050,6 +1060,7 @@ mod tests {
                 line: 2,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             }],
         };
         let b = FileGraph {
@@ -1123,6 +1134,7 @@ mod tests {
             line: 2,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         };
         let a = FileGraph {
             path: path.clone(),
@@ -1188,6 +1200,7 @@ mod tests {
                     line: 2,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 }],
             },
             FileGraph {
@@ -1383,6 +1396,7 @@ mod tests {
                 line: 30,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             }],
         };
 
@@ -1468,6 +1482,7 @@ mod tests {
                     line: 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
                 Edge {
                     from: main_path.clone(),
@@ -1478,6 +1493,7 @@ mod tests {
                     line: 2,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
             ],
         };
@@ -1567,6 +1583,7 @@ mod tests {
                     line: 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 }],
             };
             vec![dep, main]

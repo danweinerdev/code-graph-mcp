@@ -71,7 +71,7 @@ use tree_sitter::{
 use crate::crate_model::CrateModuleModel;
 use crate::helpers::{
     enclosing_function_id, find_enclosing_kind, find_nearest_def_ancestor, resolve_mod_namespace,
-    split_use_path, truncate_signature, NearestDefAncestor,
+    rust_call_shape, split_use_path, truncate_signature, NearestDefAncestor,
 };
 use crate::queries::{
     CALL_QUERIES, DEFINITION_QUERIES, INHERITANCE_QUERIES, MOD_DECL_QUERIES, SUPERTRAIT_QUERY,
@@ -438,6 +438,7 @@ impl RustParser {
                                 line,
                                 confidence: Confidence::Resolved,
                                 candidates: 1,
+                                shape: Default::default(),
                             });
                         }
                     }
@@ -458,6 +459,7 @@ impl RustParser {
                             line,
                             confidence: Confidence::Resolved,
                             candidates: 1,
+                            shape: Default::default(),
                         });
                     }
 
@@ -570,6 +572,7 @@ impl RustParser {
                 line,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
     }
@@ -637,6 +640,11 @@ impl RustParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    // F2: method calls through a receiver value carry
+                    // their shape so the resolver can refuse the
+                    // sole-candidate `Resolved` shortcut for unverified
+                    // receivers. Scoped paths (`call.qname`) are Free.
+                    shape: rust_call_shape(cap_node, content),
                 });
             }
         }
@@ -750,6 +758,7 @@ impl RustParser {
                 line,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
 
@@ -799,6 +808,7 @@ impl RustParser {
                 line: bound.start_position().row as u32 + 1,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
     }
@@ -2304,6 +2314,32 @@ mod tests {
         assert_eq!(e.from, "/tmp/test.rs:caller");
         assert_eq!(e.file, "/tmp/test.rs");
         assert!(e.line >= 1);
+    }
+
+    /// F2 pin: call shapes recorded at extraction. `self.a()` is
+    /// SelfReceiver (receiver type = enclosing impl type, statically
+    /// known), `other.b()` is Receiver (unverifiable), `c()` and the
+    /// scoped `D::e()` are Free.
+    #[test]
+    fn f2_call_shapes_recorded_at_extraction() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "struct S;\n\
+             impl S {\n\
+                 fn m(&self) { self.a(); other.b(); c(); D::e(); }\n\
+             }\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("a"), CallShape::SelfReceiver, "self.a()");
+        assert_eq!(shape_of("b"), CallShape::Receiver, "other.b()");
+        assert_eq!(shape_of("c"), CallShape::Free, "c()");
+        assert_eq!(shape_of("D::e"), CallShape::Free, "scoped D::e()");
     }
 
     #[test]

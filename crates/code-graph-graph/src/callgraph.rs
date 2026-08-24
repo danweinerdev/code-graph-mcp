@@ -674,6 +674,7 @@ mod tests {
                     line: 10,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
                 // A real base method remains queryable even when resolution
                 // had two candidates; `candidates` is preserved on the row.
@@ -685,6 +686,7 @@ mod tests {
                     line: 20,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
             ],
         ));
@@ -1184,6 +1186,7 @@ mod tests {
             line,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         };
         g.merge_file_graph(make_fg(
             "/a.cpp",
@@ -1229,6 +1232,7 @@ mod tests {
             line,
             confidence: Confidence::Heuristic,
             candidates: 2,
+            shape: Default::default(),
         }
     }
 

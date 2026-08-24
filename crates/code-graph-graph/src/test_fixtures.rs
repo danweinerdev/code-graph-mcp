@@ -59,6 +59,7 @@ pub(crate) fn call_edge(from: &str, to: &str, file: &str, line: u32) -> Edge {
         line,
         confidence: Confidence::Resolved,
         candidates: 1,
+        shape: Default::default(),
     }
 }
 
@@ -74,6 +75,7 @@ pub(crate) fn inherit_edge(from: &str, to: &str, file: &str) -> Edge {
         line: 0,
         confidence: Confidence::Resolved,
         candidates: 1,
+        shape: Default::default(),
     }
 }
 
@@ -89,6 +91,7 @@ pub(crate) fn include_edge(from: &str, to: &str, file: &str) -> Edge {
         line: 0,
         confidence: Confidence::Resolved,
         candidates: 1,
+        shape: Default::default(),
     }
 }
 

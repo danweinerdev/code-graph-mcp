@@ -1017,6 +1017,7 @@ mod tests {
                 line: 9,
                 confidence: code_graph_core::Confidence::Heuristic,
                 candidates: 3,
+                shape: Default::default(),
             }],
         ));
         g.save(dir.path()).unwrap();

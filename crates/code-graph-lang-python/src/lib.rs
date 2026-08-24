@@ -98,7 +98,8 @@ use tree_sitter::{
 };
 
 use crate::helpers::{
-    enclosing_function_id, extract_module_path, find_enclosing_class, truncate_signature,
+    enclosing_function_id, extract_module_path, find_enclosing_class, python_call_shape,
+    truncate_signature,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, IMPORT_QUERIES, INHERITANCE_QUERIES};
 
@@ -385,6 +386,11 @@ impl PythonParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    // F2: attribute calls through a receiver value carry
+                    // their shape so the resolver can refuse the
+                    // sole-candidate `Resolved` shortcut for unverified
+                    // receivers.
+                    shape: python_call_shape(cap_node, content),
                 });
             }
         }
@@ -498,6 +504,7 @@ impl PythonParser {
                             line,
                             confidence: Confidence::Resolved,
                             candidates: 1,
+                            shape: Default::default(),
                         });
                     }
                     "import.module" => {
@@ -513,6 +520,7 @@ impl PythonParser {
                             line,
                             confidence: Confidence::Resolved,
                             candidates: 1,
+                            shape: Default::default(),
                         });
                     }
                     "import.from_module" => {
@@ -528,6 +536,7 @@ impl PythonParser {
                             line,
                             confidence: Confidence::Resolved,
                             candidates: 1,
+                            shape: Default::default(),
                         });
                     }
                     "import.from_module_relative" => {
@@ -552,6 +561,7 @@ impl PythonParser {
                                     line,
                                     confidence: Confidence::Resolved,
                                     candidates: 1,
+                                    shape: Default::default(),
                                 });
                             }
                         } else {
@@ -566,6 +576,7 @@ impl PythonParser {
                                 line,
                                 confidence: Confidence::Resolved,
                                 candidates: 1,
+                                shape: Default::default(),
                             });
                         }
                     }
@@ -648,6 +659,7 @@ impl PythonParser {
                 line,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
     }
@@ -1189,6 +1201,34 @@ mod tests {
             .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect()
+    }
+
+    /// F2 pin: call shapes recorded at extraction. `self.a()` (and
+    /// `cls.b()`) are SelfReceiver (the receiver is the enclosing class),
+    /// `obj.c()` is Receiver (unverifiable — module-qualified calls land
+    /// here too, indistinguishable without import analysis), `d()` is Free.
+    #[test]
+    fn f2_call_shapes_recorded_at_extraction() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C:\n\
+             \x20   def m(self):\n\
+             \x20       self.a()\n\
+             \x20       cls.b()\n\
+             \x20       obj.c()\n\
+             \x20       d()\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("a"), CallShape::SelfReceiver, "self.a()");
+        assert_eq!(shape_of("b"), CallShape::SelfReceiver, "cls.b()");
+        assert_eq!(shape_of("c"), CallShape::Receiver, "obj.c()");
+        assert_eq!(shape_of("d"), CallShape::Free, "d()");
     }
 
     #[test]

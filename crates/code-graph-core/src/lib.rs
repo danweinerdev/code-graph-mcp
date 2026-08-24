@@ -134,6 +134,41 @@ pub enum Confidence {
     Heuristic,
 }
 
+/// Parse-time shape of a call site (F2, KNOWN_ISSUES): whether the call
+/// went through a receiver value whose type the index may not know.
+///
+/// Extractors know the shape at parse time; the resolver cannot recover it
+/// later. The shape gates the sole-candidate shortcut in
+/// `default_scope_aware_resolve`: a bare `foo()` with exactly one indexed
+/// `foo` is genuinely unambiguous, but `x.foo()` is only a *name* match —
+/// the receiver's type (frequently unindexed std/external) selects the true
+/// target, so a sole-candidate pick through an unverified receiver is a
+/// guess and must not be stamped `Resolved`.
+///
+/// PARSE-ONLY plumbing: this field is consumed at resolve time, immediately
+/// after parse, on both the analyze and watch paths. It is never persisted
+/// — `PackedEdge` and the v13 cache layout are untouched (KNOWN_ISSUES F2,
+/// no-bump decision 2026-08-24).
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallShape {
+    /// Direct/free/qualified call: `foo()`, `NS::foo()`, `Type::method()`.
+    /// No receiver value stands between the name and its target. The
+    /// default (also what declarative and non-call edges carry).
+    #[default]
+    Free,
+    /// Call through the enclosing type's own receiver: `self.foo()`,
+    /// `this->foo()`, `this.M()`. The receiver type IS statically known —
+    /// it is the caller's parent — so a sole candidate in that same parent
+    /// remains a verified pick.
+    SelfReceiver,
+    /// Call through any other receiver value: `x.foo()`, `obj->bar()`,
+    /// `expr.method()`. The receiver's type is not verifiable against the
+    /// index by the generic resolver, so a sole-candidate pick is a
+    /// name-only guess.
+    Receiver,
+}
+
 /// Sparse, language-specific facts retained for a later resolver pass.
 ///
 /// This deliberately lives outside [`FileGraph`]: most languages have no
@@ -208,6 +243,14 @@ pub struct Edge {
     /// re-indexes; it is never read with a guessed count).
     #[serde(default = "default_candidate_count")]
     pub candidates: u32,
+    /// Parse-time call shape (F2): set by extractors on `Calls` edges so
+    /// the resolver can gate its sole-candidate shortcut on whether the
+    /// call went through an unverifiable receiver. `Free` for every other
+    /// edge kind and for declarative edges. PARSE-ONLY — consumed at
+    /// resolve time and never persisted (the packed cache does not carry
+    /// it), so the serde default exists for hand-written fixtures only.
+    #[serde(default)]
+    pub shape: CallShape,
 }
 
 /// Serde default for [`Edge::candidates`]: the unambiguous count.
@@ -475,6 +518,7 @@ mod tests {
                 line: 42,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             };
             let v = serde_json::to_value(&e).unwrap();
             let back: Edge = serde_json::from_value(v).unwrap();
@@ -495,6 +539,7 @@ mod tests {
                 // Non-default value so the round-trip proves the field
                 // actually serializes rather than riding the default.
                 candidates: 3,
+                shape: Default::default(),
             };
             let v = serde_json::to_value(&e).unwrap();
             let back: Edge = serde_json::from_value(v).unwrap();
@@ -580,6 +625,7 @@ mod tests {
             line: 7,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         };
         let fg = FileGraph {
             path: "src/main.cpp".to_string(),

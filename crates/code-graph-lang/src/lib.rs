@@ -20,8 +20,8 @@ pub mod fingerprint;
 pub mod helpers;
 
 use code_graph_core::{
-    Confidence, ExtensionsConfig, FileGraph, Language, ResolverMetadata, RootConfig, Symbol,
-    SymbolId,
+    CallShape, Confidence, ExtensionsConfig, FileGraph, Language, ResolverMetadata, RootConfig,
+    Symbol, SymbolId,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -98,6 +98,13 @@ pub struct CallContext<'a> {
     /// [`SymbolIndex`] by `(Language, name)` so cross-language collisions
     /// are impossible.
     pub language: Language,
+    /// Parse-time call shape (F2): gates the sole-candidate shortcut in
+    /// [`default_scope_aware_resolve`]. `Free` for direct/qualified calls
+    /// (and for Overrides edges, which are declarative `Parent::name`
+    /// tokens, not receiver calls); `SelfReceiver`/`Receiver` for member
+    /// calls through a value. Populated from `Edge::shape` by both resolve
+    /// loops.
+    pub shape: CallShape,
 }
 
 /// One candidate for [`SymbolIndex`] lookup — a symbol that bears the name
@@ -216,8 +223,40 @@ pub(crate) fn default_scope_aware_resolve(
     // losing candidates are gone and the count cannot be reconstructed.
     let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
     if candidates.len() == 1 {
-        // Sole candidate — no ambiguity, no heuristic involved.
-        return Some((candidates[0].id.clone(), Confidence::Resolved, 1));
+        // Sole candidate. Whether that makes the pick UNAMBIGUOUS depends
+        // on the call shape (F2, KNOWN_ISSUES): for a receiver-typed call
+        // (`x.foo()`) the receiver's TYPE — not the name — selects the
+        // true target, and that type is frequently outside the index
+        // (std/external), so "the only indexed thing with that name" is a
+        // name-only guess, not a verified match. Stamping it `Resolved/1`
+        // would make a confidently-wrong edge unfilterable via
+        // `min_confidence=resolved`.
+        let confidence = match ctx.shape {
+            // Direct/free/qualified call: no receiver value stands between
+            // the name and its target — the sole candidate is the target.
+            CallShape::Free => Confidence::Resolved,
+            // The receiver is the enclosing type itself (`self.foo()`,
+            // `this->foo()`): the receiver type IS statically known — the
+            // caller's parent — so a sole candidate in that same parent is
+            // a verified pick. A sole candidate elsewhere means the call
+            // targets an unindexed member (or the parent match failed);
+            // that pick is unverified.
+            CallShape::SelfReceiver => {
+                if !candidates[0].parent.is_empty()
+                    && candidates[0].parent == caller_id_parent(ctx.caller_id)
+                {
+                    Confidence::Resolved
+                } else {
+                    Confidence::Heuristic
+                }
+            }
+            // Any other receiver value: the generic resolver cannot verify
+            // its type against the index. `Heuristic/1` is the documented
+            // "sole candidate, receiver unverified" wire state (D-0007
+            // holds the confidence and count axes independent by design).
+            CallShape::Receiver => Confidence::Heuristic,
+        };
+        return Some((candidates[0].id.clone(), confidence, 1));
     }
 
     let caller_parent = caller_id_parent(ctx.caller_id);
@@ -992,6 +1031,7 @@ mod tests {
             caller_id: "/tmp/foo.cpp:caller",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let idx = SymbolIndex::new();
         // Empty index: nothing to resolve to.
@@ -1127,6 +1167,7 @@ mod tests {
             caller_id: "/proj/a.cpp:caller",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "helper", &ctx, &idx);
         let (id, confidence, candidates) = resolved.expect("must resolve");
@@ -1158,6 +1199,7 @@ mod tests {
             caller_id: "/proj/a.cpp:Engine::update",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "tick", &ctx, &idx);
         let (id, confidence, candidates) = resolved.expect("must resolve");
@@ -1178,6 +1220,7 @@ mod tests {
             caller_id: "/proj/a.cpp:caller",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "nope", &ctx, &idx);
         assert!(resolved.is_none());
@@ -1200,6 +1243,7 @@ mod tests {
             caller_id: "/proj/other.cpp:caller",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "init", &ctx, &idx);
         // Single C++ candidate after language scoping: Resolved, count 1.
@@ -1214,6 +1258,7 @@ mod tests {
             caller_id: "/proj/other.py:caller",
             caller_file: &py_caller_file,
             language: Language::Python,
+            shape: CallShape::Free,
         };
         let resolved_py = default_scope_aware_resolve(Language::Python, "init", &py_ctx, &idx);
         assert_eq!(
@@ -1233,12 +1278,135 @@ mod tests {
             caller_id: "/proj/elsewhere.cpp:caller",
             caller_file: &caller_file,
             language: Language::Cpp,
+            shape: CallShape::Free,
         };
         let resolved = default_scope_aware_resolve(Language::Cpp, "only_one", &ctx, &idx);
         assert_eq!(
             resolved,
             Some(("/proj/x.cpp:only_one".to_string(), Confidence::Resolved, 1)),
             "single-candidate match is unambiguous → Confidence::Resolved, count 1"
+        );
+    }
+
+    /// F2 pin (KNOWN_ISSUES acceptance criterion 3): the FREE sole-candidate
+    /// shortcut is byte-identical to the pre-F2 behavior — `Resolved, 1` —
+    /// so a future "safety" change cannot silently widen the receiver
+    /// downgrade to direct calls.
+    #[test]
+    fn f2_free_sole_candidate_stays_resolved() {
+        let only = entry("/proj/x.cpp:is_empty", "/proj/x.cpp", "Registry", "");
+        let idx = build_index(vec![(Language::Cpp, "is_empty", only)]);
+        let caller_file = PathBuf::from("/proj/elsewhere.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/elsewhere.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::Free,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some(("/proj/x.cpp:is_empty".to_string(), Confidence::Resolved, 1)),
+        );
+    }
+
+    /// F2 pin: a RECEIVER-typed sole-candidate pick is `Heuristic/1` — the
+    /// receiver's type (frequently unindexed std/external) selects the true
+    /// target, so "the only indexed thing with that name" is a name-only
+    /// guess. This is the documented "sole candidate, receiver unverified"
+    /// wire state (D-0007 holds confidence and count independent).
+    #[test]
+    fn f2_receiver_sole_candidate_downgrades_to_heuristic() {
+        let only = entry("/proj/x.cpp:is_empty", "/proj/x.cpp", "Registry", "");
+        let idx = build_index(vec![(Language::Cpp, "is_empty", only)]);
+        let caller_file = PathBuf::from("/proj/elsewhere.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/elsewhere.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::Receiver,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some(("/proj/x.cpp:is_empty".to_string(), Confidence::Heuristic, 1)),
+        );
+    }
+
+    /// F2 pin: a SELF-receiver sole-candidate pick stays `Resolved/1` when
+    /// the candidate's parent matches the caller's parent — the receiver
+    /// type IS statically known (the enclosing class), so the pick is
+    /// verified, not guessed.
+    #[test]
+    fn f2_self_receiver_sole_candidate_with_parent_match_stays_resolved() {
+        let member = entry(
+            "/proj/x.cpp:Registry::is_empty",
+            "/proj/x.cpp",
+            "Registry",
+            "",
+        );
+        let idx = build_index(vec![(Language::Cpp, "is_empty", member)]);
+        let caller_file = PathBuf::from("/proj/x.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/x.cpp:Registry::validate",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::SelfReceiver,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some((
+                "/proj/x.cpp:Registry::is_empty".to_string(),
+                Confidence::Resolved,
+                1
+            )),
+        );
+    }
+
+    /// F2 pin: a SELF-receiver sole-candidate pick whose parent does NOT
+    /// match the caller's parent is `Heuristic/1` — the enclosing class has
+    /// no such indexed member, so the call targets an unindexed member (or
+    /// an unrelated same-named symbol); the pick is unverified.
+    #[test]
+    fn f2_self_receiver_sole_candidate_without_parent_match_downgrades() {
+        let unrelated = entry("/proj/y.cpp:Other::is_empty", "/proj/y.cpp", "Other", "");
+        let idx = build_index(vec![(Language::Cpp, "is_empty", unrelated)]);
+        let caller_file = PathBuf::from("/proj/x.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/x.cpp:Registry::validate",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::SelfReceiver,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some((
+                "/proj/y.cpp:Other::is_empty".to_string(),
+                Confidence::Heuristic,
+                1
+            )),
+        );
+    }
+
+    /// F2 pin: the multi-candidate path is UNCHANGED by call shape — the
+    /// scope rule still picks, and the pick is `Heuristic/N` exactly as
+    /// before (the shape gate applies only to the sole-candidate shortcut).
+    #[test]
+    fn f2_receiver_multi_candidate_path_is_unchanged() {
+        let same_file = entry("/proj/a.cpp:is_empty", "/proj/a.cpp", "", "");
+        let other = entry("/proj/b.cpp:is_empty", "/proj/b.cpp", "", "");
+        let idx = build_index(vec![
+            (Language::Cpp, "is_empty", other),
+            (Language::Cpp, "is_empty", same_file),
+        ]);
+        let caller_file = PathBuf::from("/proj/a.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/a.cpp:caller",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::Receiver,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some(("/proj/a.cpp:is_empty".to_string(), Confidence::Heuristic, 2)),
         );
     }
 

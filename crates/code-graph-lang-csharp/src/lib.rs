@@ -126,7 +126,7 @@ use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, S
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
 
-use crate::helpers::enclosing_function_id;
+use crate::helpers::{csharp_call_shape, enclosing_function_id};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     Language as TsLanguage, Node, Parser as TsParser, Query, QueryCursor, Tree as TsTree,
@@ -606,6 +606,11 @@ impl CSharpParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    // F2: member-access calls through a receiver value
+                    // carry their shape so the resolver can refuse the
+                    // sole-candidate `Resolved` shortcut for unverified
+                    // receivers.
+                    shape: csharp_call_shape(cap_node, content),
                 });
             }
         }
@@ -692,6 +697,7 @@ impl CSharpParser {
                     line: cap_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }
@@ -799,6 +805,7 @@ impl CSharpParser {
                 line: def.start_position().row as u32 + 1,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
     }
@@ -1757,6 +1764,32 @@ class Foo {
             .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect()
+    }
+
+    /// F2 pin: call shapes recorded at extraction. `this.A()` is
+    /// SelfReceiver (receiver type = enclosing class), `obj.B()` and the
+    /// null-conditional `obj?.D()` are Receiver (unverifiable —
+    /// namespace/type-qualified static calls land here too), and the
+    /// direct `E()` is Free (implicit-`this` decision mirrors C++).
+    #[test]
+    fn f2_call_shapes_recorded_at_extraction() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C {\n\
+                 void M() { this.A(); obj.B(); obj?.D(); E(); }\n\
+             }\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("A"), CallShape::SelfReceiver, "this.A()");
+        assert_eq!(shape_of("B"), CallShape::Receiver, "obj.B()");
+        assert_eq!(shape_of("D"), CallShape::Receiver, "obj?.D()");
+        assert_eq!(shape_of("E"), CallShape::Free, "direct E()");
     }
 
     /// Assert that exactly one Calls edge with `from = expected_from`

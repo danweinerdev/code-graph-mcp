@@ -342,6 +342,7 @@ mod tests {
             line: 1,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -354,6 +355,7 @@ mod tests {
             line: 1,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -366,6 +368,7 @@ mod tests {
             line: 0,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -1006,6 +1009,7 @@ mod tests {
                     line: 1,
                     confidence: code_graph_core::Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
             ],
         });
@@ -3259,6 +3263,7 @@ mod tests {
                     line: 1,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
                 call_edge("/x.cpp:c", "/x.cpp:a", "/x.cpp"),
             ],

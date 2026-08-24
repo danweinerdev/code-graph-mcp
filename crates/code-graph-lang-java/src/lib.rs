@@ -114,6 +114,8 @@ pub(crate) mod queries;
 use std::path::Path;
 
 use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
+
+use crate::helpers::java_call_shape;
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
@@ -588,6 +590,10 @@ impl JavaParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    // F2: member calls through a receiver value carry their
+                    // shape so the resolver can refuse the sole-candidate
+                    // `Resolved` shortcut for unverified receivers.
+                    shape: java_call_shape(cap_node, content),
                 });
             }
         }
@@ -644,6 +650,7 @@ impl JavaParser {
                     line: cap_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }
@@ -764,6 +771,7 @@ impl JavaParser {
                 line: def.start_position().row as u32 + 1,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             });
         }
     }
@@ -1915,6 +1923,32 @@ class Foo {
             .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect()
+    }
+
+    /// F2 pin: call shapes recorded at extraction. `this.a()` is
+    /// SelfReceiver (receiver type = enclosing class), `obj.b()` is
+    /// Receiver (unverifiable — package/type-qualified static calls land
+    /// here too), and the unqualified `c()` is Free (implicit-`this`
+    /// decision mirrors C++: with one indexed candidate,
+    /// member-if-exists-else-global lookup makes it the target either way).
+    #[test]
+    fn f2_call_shapes_recorded_at_extraction() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C {\n\
+                 void m() { this.a(); obj.b(); c(); }\n\
+             }\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("a"), CallShape::SelfReceiver, "this.a()");
+        assert_eq!(shape_of("b"), CallShape::Receiver, "obj.b()");
+        assert_eq!(shape_of("c"), CallShape::Free, "unqualified c()");
     }
 
     /// Assert that exactly one Calls edge with `from = expected_from`

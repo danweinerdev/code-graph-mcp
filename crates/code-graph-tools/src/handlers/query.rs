@@ -210,6 +210,7 @@ mod tests {
             line,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -222,6 +223,7 @@ mod tests {
             line: 1,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -274,6 +276,7 @@ mod tests {
                     line: 10,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 },
                 Edge {
                     from: "/derived.cpp:DerivedReal::Foo".to_string(),
@@ -283,6 +286,7 @@ mod tests {
                     line: 20,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
             ],
         });
@@ -464,6 +468,7 @@ mod tests {
                     line: 11,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
             ],
         });
@@ -2040,6 +2045,7 @@ mod tests {
             line,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -2402,6 +2408,7 @@ mod tests {
                     line: 1,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
                 Edge {
                     from: "/x.cpp:h1".to_string(),
@@ -2411,6 +2418,7 @@ mod tests {
                     line: 2,
                     confidence: Confidence::Heuristic,
                     candidates: 2,
+                    shape: Default::default(),
                 },
             ],
         });

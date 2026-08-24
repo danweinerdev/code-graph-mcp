@@ -17,7 +17,45 @@
 
 pub use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 
+use code_graph_core::CallShape;
 use tree_sitter::Node;
+
+/// Classify a captured callee identifier's call shape (F2).
+///
+/// `cap_node` is the `call.name`/`call.qname` capture. When it is the
+/// `field` child of a `field_expression` (member call `obj.foo()` /
+/// `obj->foo()`), the call goes through a receiver value: `this->foo()` is
+/// [`CallShape::SelfReceiver`] (the receiver type is the enclosing class,
+/// statically known), anything else is [`CallShape::Receiver`] (the
+/// receiver's type is not verifiable by the generic resolver — chained
+/// calls land here too). Every other position — direct `foo()`, qualified
+/// `NS::foo()`/`Class::method()` — is [`CallShape::Free`].
+///
+/// Per-language decision (KNOWN_ISSUES F2 implementation note): an
+/// UNQUALIFIED call inside a method (implicit `this`) stays `Free`. With
+/// exactly one indexed candidate, C++ unqualified lookup picks
+/// member-if-exists-else-global — either way the sole candidate is the
+/// target, so downgrading these would gut `min_confidence=resolved` for
+/// ordinary intra-class calls. The residual (sole indexed global while an
+/// UNINDEXED inherited member shadows it) is accepted and documented.
+pub fn cpp_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
+    let Some(parent) = cap_node.parent() else {
+        return CallShape::Free;
+    };
+    if parent.kind() != "field_expression" {
+        return CallShape::Free;
+    }
+    if parent.child_by_field_name("field").map(|n| n.id()) != Some(cap_node.id()) {
+        return CallShape::Free;
+    }
+    match parent
+        .child_by_field_name("argument")
+        .and_then(|receiver| receiver.utf8_text(content).ok())
+    {
+        Some("this") | Some("(*this)") | Some("*this") => CallShape::SelfReceiver,
+        _ => CallShape::Receiver,
+    }
+}
 
 /// Split a qualified identifier `Scope::Name` into `(scope, name)`. Mirrors
 /// `splitQualified` in cpp.go, including its use of last-occurrence so that

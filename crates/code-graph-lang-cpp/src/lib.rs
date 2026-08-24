@@ -105,7 +105,7 @@ use tree_sitter::{
 };
 
 use crate::helpers::{
-    enclosing_function_id, find_enclosing_kind, is_cpp_cast, resolve_namespace,
+    cpp_call_shape, enclosing_function_id, find_enclosing_kind, is_cpp_cast, resolve_namespace,
     resolve_parent_class, split_qualified, strip_include_path, truncate_signature,
 };
 use crate::queries::{CALL_QUERIES, DEFINITION_QUERIES, INCLUDE_QUERIES, INHERITANCE_QUERIES};
@@ -475,6 +475,10 @@ impl CppParser {
                     line: call_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    // F2: member calls through a receiver value carry their
+                    // shape so the resolver can refuse the sole-candidate
+                    // `Resolved` shortcut for unverified receivers.
+                    shape: cpp_call_shape(cap_node, content),
                 });
             }
         }
@@ -509,6 +513,7 @@ impl CppParser {
                     line: cap_node.start_position().row as u32 + 1,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }
@@ -552,6 +557,7 @@ impl CppParser {
                     line: 0,
                     confidence: Confidence::Resolved,
                     candidates: 1,
+                    shape: Default::default(),
                 });
             }
         }
@@ -713,6 +719,7 @@ fn extract_overrides_global(graphs: &mut [FileGraph]) {
                             line: sym.line,
                             confidence: Confidence::Resolved,
                             candidates: 1,
+                            shape: Default::default(),
                         });
                     }
                 }
@@ -1054,6 +1061,39 @@ mod tests {
         assert_eq!(fg.path, "/tmp/test.cpp");
         assert_eq!(fg.language, Language::Cpp);
         assert!(!fg.symbols.is_empty(), "extraction must populate symbols");
+    }
+
+    /// F2 pin: call shapes recorded at extraction. `this->a()` is
+    /// SelfReceiver (receiver type = enclosing class, statically known),
+    /// `obj.b()` / `ptr->c()` are Receiver (unverifiable), the unqualified
+    /// `d()` is Free (the documented implicit-`this` decision: with one
+    /// indexed candidate, member-if-exists-else-global lookup makes the
+    /// sole candidate the target either way), and the qualified `NS::e()`
+    /// is Free.
+    #[test]
+    fn f2_call_shapes_recorded_at_extraction() {
+        use code_graph_core::{CallShape, EdgeKind};
+        let p = CppParser::new().unwrap();
+        let fg = p
+            .parse_file(
+                Path::new("/tmp/shapes.cpp"),
+                b"struct S { void a(); };\n\
+                  void S::m() { this->a(); obj.b(); ptr->c(); d(); NS::e(); }\n",
+            )
+            .unwrap();
+        let shape_of = |name: &str| {
+            fg.edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("a"), CallShape::SelfReceiver, "this->a()");
+        assert_eq!(shape_of("b"), CallShape::Receiver, "obj.b()");
+        assert_eq!(shape_of("c"), CallShape::Receiver, "ptr->c()");
+        assert_eq!(shape_of("d"), CallShape::Free, "unqualified d()");
+        assert_eq!(shape_of("NS::e"), CallShape::Free, "qualified NS::e()");
     }
 }
 

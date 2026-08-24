@@ -793,6 +793,7 @@ mod tests {
             line: 1,
             confidence: Confidence::Resolved,
             candidates: 1,
+            shape: Default::default(),
         }
     }
 
@@ -931,6 +932,7 @@ mod tests {
                 line: 1,
                 confidence: Confidence::Resolved,
                 candidates: 1,
+                shape: Default::default(),
             }],
         });
         g

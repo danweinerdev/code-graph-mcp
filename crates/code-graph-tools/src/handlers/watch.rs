@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use code_graph_core::{paths, symbol_id, EdgeKind, FileGraph, Language, SymbolId};
+use code_graph_core::{paths, symbol_id, CallShape, EdgeKind, FileGraph, Language, SymbolId};
 use code_graph_lang::CallContext;
 use notify_debouncer_full::notify::EventKind;
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
@@ -456,6 +456,10 @@ pub async fn try_reindex_file(
                     caller_id: &edge.from,
                     caller_file: &path_for_ctx,
                     language: new_fg.language,
+                    // Parse-time call shape (F2): gates the resolver's
+                    // sole-candidate shortcut for receiver-typed calls
+                    // (mirrors the indexer's Calls arm).
+                    shape: edge.shape,
                 };
                 if let Some((id, confidence, candidates)) =
                     plugin.resolve_call(&edge.to, &ctx, &symbol_index)
@@ -490,6 +494,9 @@ pub async fn try_reindex_file(
                     caller_id: &edge.from,
                     caller_file: &path_for_ctx,
                     language: new_fg.language,
+                    // Overrides tokens are declarative `Parent::name`
+                    // forms, never receiver calls — always Free.
+                    shape: CallShape::Free,
                 };
                 if let Some((id, confidence, candidates)) =
                     plugin.resolve_call(&edge.to, &ctx, &symbol_index)
