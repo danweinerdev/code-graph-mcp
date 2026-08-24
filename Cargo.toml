@@ -73,6 +73,7 @@ anyhow = "1"
 # the four NFR-02-protected crates.
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 async-trait = "0.1"
 schemars = "1"
 insta = { version = "1", features = ["json", "redactions", "filters"] }

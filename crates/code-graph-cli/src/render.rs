@@ -21,11 +21,13 @@
 use std::collections::BTreeSet;
 
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-/// A human table cell never exceeds this many terminal columns. Wrapping is
-/// display-width-aware (not byte or scalar-count-aware), so CJK and combining
-/// text keep subsequent columns aligned.
+/// A human table cell targets at most this many terminal columns. Wrapping is
+/// display-width-aware (not byte or scalar-count-aware), so CJK, combining,
+/// and multi-scalar grapheme text keep subsequent columns aligned. One
+/// indivisible grapheme wider than the cap is retained whole.
 const MAX_CELL_DISPLAY_WIDTH: usize = 48;
 
 /// Renders a JSON payload for terminal reading. The caller has already
@@ -236,19 +238,23 @@ fn pad_display(value: &str, width: usize) -> String {
 fn wrap_cell(value: &str) -> Vec<String> {
     let mut lines = vec![String::new()];
     let mut width = 0;
-    for character in value.chars() {
-        if character == '\n' {
+    for grapheme in value.graphemes(true) {
+        // Unicode segmentation treats CRLF as one grapheme cluster.
+        if matches!(grapheme, "\n" | "\r" | "\r\n") {
             lines.push(String::new());
             width = 0;
             continue;
         }
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width > 0 && width + character_width > MAX_CELL_DISPLAY_WIDTH {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width > 0 && width + grapheme_width > MAX_CELL_DISPLAY_WIDTH {
             lines.push(String::new());
             width = 0;
         }
-        lines.last_mut().expect("one initial line").push(character);
-        width += character_width;
+        lines
+            .last_mut()
+            .expect("one initial line")
+            .push_str(grapheme);
+        width += grapheme_width;
     }
     lines
 }
@@ -288,7 +294,7 @@ fn scalar_text(value: &Value) -> String {
 mod tests {
     use unicode_width::UnicodeWidthStr;
 
-    use super::{human, MAX_CELL_DISPLAY_WIDTH};
+    use super::{human, wrap_cell, MAX_CELL_DISPLAY_WIDTH};
 
     #[test]
     fn table_includes_columns_present_only_in_later_rows() {
@@ -313,6 +319,70 @@ mod tests {
             let before = line.strip_suffix(marker).expect("value marker");
             assert_eq!(UnicodeWidthStr::width(before), 6, "aligned: {line}");
         }
+    }
+
+    #[test]
+    fn table_cells_wrap_cjk_by_display_width() {
+        let value = "表".repeat(MAX_CELL_DISPLAY_WIDTH / 2 + 1);
+        let lines = wrap_cell(&value);
+
+        assert_eq!(
+            lines,
+            vec!["表".repeat(MAX_CELL_DISPLAY_WIDTH / 2), String::from("表")]
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(lines[0].as_str()),
+            MAX_CELL_DISPLAY_WIDTH
+        );
+    }
+
+    #[test]
+    fn table_cells_fit_zwj_emoji_at_the_display_width_boundary() {
+        let emoji = "👩\u{200d}💻";
+        let emoji_width = UnicodeWidthStr::width(emoji);
+        assert!(emoji_width > 0 && emoji_width <= MAX_CELL_DISPLAY_WIDTH);
+
+        let prefix = "x".repeat(MAX_CELL_DISPLAY_WIDTH - emoji_width);
+        let lines = wrap_cell(&format!("{prefix}{emoji}z"));
+
+        assert_eq!(lines, vec![format!("{prefix}{emoji}"), String::from("z")]);
+        assert_eq!(
+            UnicodeWidthStr::width(lines[0].as_str()),
+            MAX_CELL_DISPLAY_WIDTH
+        );
+    }
+
+    #[test]
+    fn table_cells_move_zwj_emoji_to_the_next_line_as_one_grapheme() {
+        let emoji = "👩\u{200d}💻";
+        let emoji_width = UnicodeWidthStr::width(emoji);
+        assert!(emoji_width > 0 && emoji_width <= MAX_CELL_DISPLAY_WIDTH);
+
+        let prefix = "x".repeat(MAX_CELL_DISPLAY_WIDTH - emoji_width + 1);
+        let lines = wrap_cell(&format!("{prefix}{emoji}"));
+
+        assert_eq!(lines, vec![prefix, emoji.to_string()]);
+    }
+
+    #[test]
+    fn table_cells_keep_combining_sequences_together_at_the_boundary() {
+        let base = "x".repeat(MAX_CELL_DISPLAY_WIDTH - 1);
+        let combined = "e\u{301}";
+        let lines = wrap_cell(&format!("{base}{combined}y"));
+
+        assert_eq!(lines, vec![format!("{base}{combined}"), String::from("y")]);
+        assert_eq!(
+            UnicodeWidthStr::width(lines[0].as_str()),
+            MAX_CELL_DISPLAY_WIDTH
+        );
+    }
+
+    #[test]
+    fn table_cells_treat_lf_cr_and_crlf_as_explicit_line_breaks() {
+        assert_eq!(
+            wrap_cell("first\r\nsecond\nthird\rfourth"),
+            vec!["first", "second", "third", "fourth"]
+        );
     }
 
     #[test]
