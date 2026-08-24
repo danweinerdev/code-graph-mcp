@@ -9,8 +9,10 @@
 //! the resolution).
 //!
 //! Optional BOOLEAN flags take an optional explicit value: `--brief` means
-//! `Some(true)`, `--brief false` means `Some(false)`, absent means `None`
-//! (NOT false — several tools default a bool to `true`).
+//! `Some(true)`, `--brief=false` means `Some(false)`, absent means `None`
+//! (NOT false — several tools default a bool to `true`). Put required
+//! positionals before optional-bool flags so a positional literally named
+//! `true` or `false` is never mistaken for a flag value.
 
 use std::path::PathBuf;
 
@@ -21,8 +23,10 @@ use clap::{Parser, Subcommand};
     name = "code-graph",
     version,
     about = "Query the code graph from the terminal: same typed core, same payloads, \
-             same defaults as the MCP surface. Attaches to a repository daemon when \
-             one is running; answers from the on-disk cache when not."
+              same defaults as the MCP surface. Attaches to a repository daemon when \
+              one is running; answers from the on-disk cache when not.",
+    after_help = "Optional boolean flags: put required positionals first, then use \
+                  --flag=<true|false> for an explicit value. A bare --flag means true."
 )]
 pub struct Cli {
     /// Invocation path for config/cache/daemon discovery (default: current directory)
@@ -53,11 +57,11 @@ pub enum Command {
     /// List symbols defined in one file
     GetFileSymbols {
         file: String,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         top_level_only: Option<bool>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         brief: Option<bool>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         count_only: Option<bool>,
         #[arg(long)]
         limit: Option<u32>,
@@ -80,11 +84,11 @@ pub enum Command {
         limit: Option<u32>,
         #[arg(long)]
         offset: Option<u32>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         brief: Option<bool>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         count_only: Option<bool>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         near: Option<bool>,
         #[arg(long)]
         max_distance: Option<u32>,
@@ -99,7 +103,7 @@ pub enum Command {
         limit: Option<u32>,
         #[arg(long)]
         offset: Option<u32>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         count_only: Option<bool>,
     },
     /// Symbols enclosing a 1-based line, innermost first (span containment)
@@ -183,9 +187,9 @@ pub enum Command {
         limit: Option<u32>,
         #[arg(long)]
         offset: Option<u32>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         brief: Option<bool>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         count_only: Option<bool>,
         #[arg(long)]
         reliability: Option<String>,
@@ -242,7 +246,7 @@ pub enum Command {
         direction: Option<String>,
         #[arg(long)]
         min_confidence: Option<String>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         styled: Option<bool>,
     },
     /// Who last changed each line of a symbol's span
@@ -265,6 +269,26 @@ pub enum Command {
 }
 
 impl Command {
+    /// Classifies successful daemon payloads by the declared typed-core
+    /// contract. Payload parseability is not a discriminator: Mermaid may
+    /// look like JSON, while a future Value payload need not parse here.
+    pub fn daemon_success_outcome(&self, payload: String) -> crate::Outcome {
+        match self {
+            Command::GenerateDiagram {
+                format: Some(format),
+                ..
+            } if format == "mermaid" => crate::Outcome::Text(payload),
+            Command::GetCallers { .. } | Command::GetCallees { .. }
+                if is_non_callable_advisory(&payload) =>
+            {
+                // This is the fixed non-callable soft-hint branch. Callable
+                // zero-hop responses remain Page values, including empty ones.
+                crate::Outcome::Text(payload)
+            }
+            _ => crate::Outcome::Json(payload),
+        }
+    }
+
     /// The MCP tool name this subcommand mirrors, plus its `tools/call`
     /// arguments with MCP field spellings. Consumed by the daemon backend;
     /// the standalone backend calls `core::` directly (`exec.rs`).
@@ -535,5 +559,128 @@ impl Command {
     /// ungated and never produces the error.
     pub fn unindexed_fallback_eligible(&self) -> bool {
         !matches!(self, Command::AnalyzeCodebase { .. } | Command::GetStatus)
+    }
+}
+
+/// The sole text success branch for callers/callees. Keep this complete wire
+/// grammar in lockstep with `core::query::callers_or_callees`: accepting only
+/// its suffix plus a non-empty basename prevents a Page value whose field text
+/// happens to mention the advisory from being reclassified as text.
+fn is_non_callable_advisory(payload: &str) -> bool {
+    const HIERARCHY_HINT: &str =
+        "Try `get_class_hierarchy` for inheritance or `get_symbol_detail` for a full symbol view.";
+    const DETAIL_HINT: &str = "Try `get_symbol_detail` for a full symbol view.";
+    [
+        ("a", "struct", HIERARCHY_HINT),
+        ("an", "enum", HIERARCHY_HINT),
+        ("a", "trait", HIERARCHY_HINT),
+        ("a", "typedef", DETAIL_HINT),
+        ("an", "interface", HIERARCHY_HINT),
+    ]
+    .iter()
+    .any(|(article, kind, hint)| {
+        let suffix = format!(" is {article} {kind}; {kind}s don't have call edges. {hint}");
+        payload
+            .strip_suffix(&suffix)
+            .is_some_and(|basename| !basename.is_empty())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+    use crate::Outcome;
+
+    #[test]
+    fn daemon_success_classification_follows_command_contracts() {
+        let mermaid = Command::GenerateDiagram {
+            symbol: None,
+            file: None,
+            class: None,
+            depth: None,
+            max_nodes: None,
+            format: Some("mermaid".to_string()),
+            direction: None,
+            min_confidence: None,
+            styled: None,
+        };
+        assert!(matches!(
+            mermaid.daemon_success_outcome("{looks like JSON}".to_string()),
+            Outcome::Text(_)
+        ));
+
+        let status = Command::GetStatus;
+        assert!(matches!(
+            status.daemon_success_outcome("not JSON".to_string()),
+            Outcome::Json(_)
+        ));
+
+        let callers = Command::GetCallers {
+            symbol: "x".to_string(),
+            depth: None,
+            limit: None,
+            offset: None,
+            min_confidence: None,
+        };
+        assert!(matches!(
+            callers.daemon_success_outcome(
+                "Thing is a struct; structs don't have call edges. Try `get_class_hierarchy` for inheritance or `get_symbol_detail` for a full symbol view."
+                    .to_string()
+            ),
+            Outcome::Text(_)
+        ));
+        assert!(matches!(
+            callers.daemon_success_outcome(
+                "{\"results\":[],\"total\":0,\"offset\":0,\"limit\":100,\"truncated\":false,\"next_offset\":null}"
+                    .to_string()
+            ),
+            Outcome::Json(_)
+        ));
+        assert!(matches!(
+            callers.daemon_success_outcome(
+                "{\"results\":[{\"note\":\"Thing is a struct; structs don't have call edges. Try `get_class_hierarchy` for inheritance or `get_symbol_detail` for a full symbol view.\"}],\"total\":1}"
+                    .to_string()
+            ),
+            Outcome::Json(_)
+        ));
+    }
+
+    #[test]
+    fn optional_bool_positionals_and_equals_values_parse_unambiguously() {
+        for file in ["true", "false"] {
+            let cli =
+                Cli::try_parse_from(["code-graph", "get-file-symbols", file, "--brief=false"])
+                    .expect("parse optional bool after file positional");
+            match cli.command {
+                Command::GetFileSymbols {
+                    file: parsed,
+                    brief,
+                    ..
+                } => {
+                    assert_eq!(parsed, file);
+                    assert_eq!(brief, Some(false));
+                }
+                command => panic!("wrong command: {command:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn help_documents_unambiguous_optional_bool_spelling() {
+        let help = Cli::try_parse_from(["code-graph", "--help"])
+            .expect_err("help exits through clap")
+            .to_string();
+        assert!(help.contains("positionals first"), "help: {help}");
+        assert!(help.contains("--flag=<true|false>"), "help: {help}");
+
+        let subcommand_help = Cli::try_parse_from(["code-graph", "get-file-symbols", "--help"])
+            .expect_err("subcommand help exits through clap")
+            .to_string();
+        assert!(
+            subcommand_help.contains("--brief[=<BRIEF>]"),
+            "subcommand help requires an equals sign for explicit values: {subcommand_help}"
+        );
     }
 }

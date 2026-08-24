@@ -38,7 +38,7 @@ use parking_lot::Mutex as PlMutex;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Meta};
+use rmcp::model::{CallToolResult, Content, Meta, ServerInfo};
 use rmcp::service::RoleServer;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Peer, ServerHandler};
 use schemars::JsonSchema;
@@ -529,6 +529,7 @@ pub(crate) struct WorkerStartHook {
 #[derive(Clone)]
 pub struct CodeGraphServer {
     pub inner: Arc<ServerInner>,
+    server_version: &'static str,
     /// `tool_router` snapshot used only by test helpers
     /// (`tool_count`, `tool_router_contains_every_expected_name`). The
     /// `#[tool_handler]` macro generates `call_tool` / `list_tools` bodies
@@ -581,8 +582,17 @@ impl CodeGraphServer {
                 #[cfg(test)]
                 worker_start_hook: PlMutex::new(None),
             }),
+            server_version: env!("CARGO_PKG_VERSION"),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Override the implementation version advertised by the MCP initialize
+    /// response. The binary injects its own package version so compatibility
+    /// checks never accidentally key on this library crate's version.
+    pub fn with_server_version(mut self, version: &'static str) -> Self {
+        self.server_version = version;
+        self
     }
 
     /// Number of registered tools. Used by the smoke test to confirm the
@@ -2648,7 +2658,16 @@ impl CodeGraphServer {
 }
 
 #[tool_handler]
-impl ServerHandler for CodeGraphServer {}
+impl ServerHandler for CodeGraphServer {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        // rmcp's default reports its own dependency package version. The MCP
+        // server identifies this application package instead; retain every
+        // other default field so the initialize response shape is unchanged.
+        info.server_info.version = self.server_version.to_owned();
+        info
+    }
+}
 
 #[cfg(test)]
 mod tests {

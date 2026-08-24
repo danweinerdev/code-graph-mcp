@@ -72,6 +72,7 @@ anyhow = "1"
 # CLI binary only (Designs/CommandLineInterface Decision 6): never enters
 # the four NFR-02-protected crates.
 clap = { version = "4", features = ["derive"] }
+unicode-width = "0.2"
 async-trait = "0.1"
 schemars = "1"
 insta = { version = "1", features = ["json", "redactions", "filters"] }

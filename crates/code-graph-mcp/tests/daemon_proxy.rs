@@ -708,6 +708,130 @@ fn default_clients_are_daemon_backed_but_opt_outs_create_no_runtime_state() {
     assert!(!forced.0.join(".code-graph").exists());
 }
 
+/// Attach-only recovers a compatible publication left by a dead daemon under
+/// a temporary cleanup lease, then falls back in-process without a replacement
+/// request or resident contender.
+#[test]
+fn attach_only_removes_proven_dead_compatible_metadata_without_replacement() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let initial = Client::spawn(&root.0, &[]);
+    initial.close();
+    let metadata = wait_metadata(&root);
+    let runtime = root.0.join(".code-graph");
+    kill_hard(metadata["pid"].as_u64().expect("daemon pid") as u32);
+    assert!(
+        wait_for_process_exit_bounded(
+            metadata["pid"].as_u64().expect("daemon pid") as u32,
+            TIMEOUT
+        ),
+        "crashed daemon exited before attach-only recovery"
+    );
+    // Windows mandatory locks reject reads while the daemon is alive; the
+    // confirmed hard stop above is the required boundary before attach-only
+    // may acquire and remove its temporary cleanup lease.
+
+    let mut attachment = Client::spawn(&root.0, &["--attach-only"]);
+    assert_eq!(
+        attachment.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        25
+    );
+    let attach_stderr = attachment.close();
+
+    assert!(
+        !runtime.join("daemon.json").exists(),
+        "only proven-dead compatible metadata is removed; stderr: {attach_stderr}; lock exists: {}",
+        runtime.join("daemon.lock").exists()
+    );
+    assert!(
+        !runtime.join("daemon.lock").exists(),
+        "attach-only removes its temporary cleanup lease instead of spawning a contender"
+    );
+    assert!(
+        !runtime.join("shutdown.request").exists() && !runtime.join("shutdown.ack").exists(),
+        "attach-only must not initiate replacement"
+    );
+}
+
+/// A compatible live daemon is attached as-is. No attach-only request may
+/// replace it or leave replacement-control files behind.
+#[test]
+fn attach_only_attaches_to_live_compatible_owner_without_replacement() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let initial = Client::spawn(&root.0, &[]);
+    initial.close();
+    let metadata = wait_metadata(&root);
+    let runtime = root.0.join(".code-graph");
+
+    let mut attachment = Client::spawn(&root.0, &["--attach-only"]);
+    assert_eq!(
+        attachment.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        25
+    );
+    attachment.close();
+
+    let current: Value = serde_json::from_slice(&fs::read(runtime.join("daemon.json")).unwrap())
+        .expect("live metadata parses");
+    assert_eq!(current["owner"], metadata["owner"]);
+    assert!(
+        !runtime.join("shutdown.request").exists() && !runtime.join("shutdown.ack").exists(),
+        "attach-only must not initiate replacement for a compatible owner"
+    );
+    stop_daemon(&root.0, &current);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
+/// An incompatible live owner remains entirely untouched: attach-only serves
+/// in-process instead of requesting shutdown, replacing metadata, or spawning
+/// a contender.
+#[test]
+fn attach_only_leaves_live_incompatible_owner_untouched() {
+    let _guard = process_test_guard();
+    let root = TestRoot::new(true);
+    let initial = Client::spawn(&root.0, &[]);
+    initial.close();
+    let metadata = wait_metadata(&root);
+    replace_metadata_sha(&root, &metadata, "attach-only-incompatible".to_owned());
+    let runtime = root.0.join(".code-graph");
+    let incompatible_bytes = fs::read(runtime.join("daemon.json")).expect("read metadata");
+
+    let mut attachment = Client::spawn(&root.0, &["--attach-only"]);
+    assert_eq!(
+        attachment.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        25
+    );
+    attachment.close();
+
+    assert_eq!(
+        fs::read(runtime.join("daemon.json")).expect("metadata retained"),
+        incompatible_bytes,
+        "attach-only must not touch a live incompatible owner's metadata"
+    );
+    assert!(
+        process_is_alive(metadata["pid"].as_u64().expect("daemon pid") as u32),
+        "attach-only must not kill the incompatible owner"
+    );
+    assert!(
+        !runtime.join("shutdown.request").exists() && !runtime.join("shutdown.ack").exists(),
+        "attach-only must not initiate incompatible-owner replacement"
+    );
+    let current: Value = serde_json::from_slice(&incompatible_bytes).expect("metadata parses");
+    stop_daemon(&root.0, &current);
+    wait_runtime_cleanup(&root.0);
+    root.disarm_daemon();
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn root_and_nested_clients_share_index_watch_and_async_slot() {

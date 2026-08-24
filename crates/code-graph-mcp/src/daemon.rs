@@ -812,6 +812,11 @@ pub async fn proxy_attach_only(root: PathBuf) -> anyhow::Result<()> {
             ));
         }
         if !metadata_owner_is_active(&paths, &metadata) {
+            // A connect failure alone never authorizes cleanup. This branch
+            // already proved compatibility and a missing matching live owner;
+            // cleanup acquires the authoritative namespace lease before its
+            // final metadata/identity revalidation and unlink.
+            let _ = remove_proven_dead_attach_metadata(&paths, &metadata).await;
             return Err(anyhow::anyhow!(
                 "published daemon metadata has no live lock owner"
             ));
@@ -1073,6 +1078,29 @@ fn metadata_owner_is_active(paths: &DaemonPaths, metadata: &DaemonMetadata) -> b
             Err(_) => false,
         }
     }
+}
+
+/// Removes attach-only metadata only under a temporary authoritative lease.
+/// This is deliberately narrower than daemon-owner cleanup: attach-only must
+/// neither start a contender nor disturb a live (including incompatible)
+/// owner, and it rechecks the expected metadata and exact process identity
+/// while holding that lease immediately before unlinking.
+async fn remove_proven_dead_attach_metadata(
+    paths: &DaemonPaths,
+    expected: &DaemonMetadata,
+) -> bool {
+    // Taking the same authority lease as daemon startup closes the pathname
+    // race: a live owner returns None, while a reclaimed lock remains ours
+    // across reread, exact identity check, and unlink. Deferred acquisition
+    // deliberately leaves metadata intact until those checks succeed.
+    let Ok(Some(lock)) = acquire_stale_cleanup_lease(paths).await else {
+        return false;
+    };
+    let removable = read_metadata(paths).is_ok_and(|current| current == *expected)
+        && !identity_is_alive(&expected.owner);
+    let removed = removable && paths.remove_regular_child(METADATA_FILE).is_ok();
+    lock.remove_if_owned();
+    removed
 }
 
 /// Unix-only advisory-lock probe. Windows callers never probe by re-locking:
@@ -2386,14 +2414,36 @@ fn shutdown_ack_matches(paths: &DaemonPaths, owner: &LockIdentity) -> bool {
 }
 
 async fn acquire_or_detect_live(paths: &DaemonPaths) -> anyhow::Result<Option<DaemonLock>> {
-    acquire_or_detect_live_with_initial_file(paths, None).await
+    acquire_or_detect_live_with_policy(paths, None, StaleCleanup::Immediate).await
+}
+
+/// Acquires a temporary authority lease for attach-only stale-metadata
+/// recovery. Unlike daemon startup, this must defer all runtime cleanup until
+/// the expected metadata has been reread under the lease.
+async fn acquire_stale_cleanup_lease(paths: &DaemonPaths) -> anyhow::Result<Option<DaemonLock>> {
+    acquire_or_detect_live_with_policy(paths, None, StaleCleanup::Deferred).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaleCleanup {
+    Immediate,
+    Deferred,
 }
 
 /// `initial_file` makes the unlinked-inode handoff regression deterministic;
 /// normal daemon acquisition always starts from the current pathname.
+#[cfg(test)]
 async fn acquire_or_detect_live_with_initial_file(
     paths: &DaemonPaths,
+    initial_file: Option<std::fs::File>,
+) -> anyhow::Result<Option<DaemonLock>> {
+    acquire_or_detect_live_with_policy(paths, initial_file, StaleCleanup::Immediate).await
+}
+
+async fn acquire_or_detect_live_with_policy(
+    paths: &DaemonPaths,
     mut initial_file: Option<std::fs::File>,
+    stale_cleanup: StaleCleanup,
 ) -> anyhow::Result<Option<DaemonLock>> {
     #[cfg(target_os = "linux")]
     let root_file = match acquire_root_ownership(paths)? {
@@ -2459,7 +2509,9 @@ async fn acquire_or_detect_live_with_initial_file(
                 // The OS lock is the single-instance authority. Once it is ours,
                 // lock-file contents cannot retain ownership, even if a stale
                 // identity happens to name a currently live process.
-                cleanup_stale_runtime(paths, previous_identity.as_ref()).await;
+                if stale_cleanup == StaleCleanup::Immediate {
+                    cleanup_stale_runtime(paths, previous_identity.as_ref()).await;
+                }
                 let identity = previous_identity.unwrap_or(LockIdentity {
                     pid: 0,
                     start_time: 0,

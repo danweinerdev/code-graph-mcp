@@ -130,7 +130,8 @@ fn make_server() -> anyhow::Result<CodeGraphServer> {
         ))
         .context("register Java language plugin")?;
 
-    Ok(CodeGraphServer::with_vcs_registry(registry, vcs_registry()))
+    Ok(CodeGraphServer::with_vcs_registry(registry, vcs_registry())
+        .with_server_version(env!("CARGO_PKG_VERSION")))
 }
 
 /// Version-control providers for the history tools. Binding happens here in

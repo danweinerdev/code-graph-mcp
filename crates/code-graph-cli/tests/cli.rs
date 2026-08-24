@@ -55,6 +55,67 @@ fn exit_code(output: &Output) -> i32 {
     output.status.code().expect("exit code")
 }
 
+/// Owns a daemon process for a CLI process test. Drop uses the platform's
+/// normal daemon stop route first, then boundedly kills a wedged child so a
+/// failed assertion cannot retain the TempDir through a live daemon.
+struct DaemonChild {
+    child: std::process::Child,
+    root: PathBuf,
+    metadata_path: PathBuf,
+}
+
+impl DaemonChild {
+    fn spawn(binary: &Path, root: &Path) -> Self {
+        let child = Command::new(binary)
+            .arg("--serve")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        let metadata_path = root.join(".code-graph/daemon.json");
+        let mut daemon = Self {
+            child,
+            root: root.to_path_buf(),
+            metadata_path,
+        };
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while !daemon.metadata_path.exists() {
+            assert!(
+                daemon.child.try_wait().ok().flatten().is_none(),
+                "daemon exited before publishing metadata"
+            );
+            assert!(Instant::now() < deadline, "daemon did not publish metadata");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon
+    }
+
+    fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        if self.metadata_path.exists() {
+            stop_daemon_best_effort(&self.root, &self.metadata_path);
+        }
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Two Rust files with a cross-file call chain, so call-graph queries,
 /// find-path, and community detection all have something to answer.
 fn fixture() -> TempDir {
@@ -246,6 +307,11 @@ fn cli_depends_on_the_typed_core_only() {
     for source in sources {
         let text = std::fs::read_to_string(&source).expect("read CLI source");
         assert!(
+            !text.contains("rmcp"),
+            "{} references rmcp — the CLI must stay on the typed core side of the wire boundary",
+            source.display()
+        );
+        assert!(
             !text.contains("handlers::") && !text.contains("::handlers"),
             "{} imports the handlers layer — the unguarded \
               hardcoded-indexed surface the design forbids (Decision 1)",
@@ -282,20 +348,7 @@ fn daemon_and_standalone_output_are_byte_identical() {
     let standalone = query("standalone query");
 
     // Spawn a daemon and wait for it to publish metadata.
-    let mut daemon = Command::new(&mcp)
-        .arg("--serve")
-        .current_dir(&root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
-    let metadata_path = root.join(".code-graph/daemon.json");
-    let deadline = Instant::now() + READY_TIMEOUT;
-    while !metadata_path.exists() {
-        assert!(Instant::now() < deadline, "daemon did not publish metadata");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut daemon = DaemonChild::spawn(&mcp, &root);
 
     // Decision 7 window: the daemon holds no graph yet; the CLI answers
     // from the on-disk cache, byte-identical to the no-daemon invocation.
@@ -314,8 +367,7 @@ fn daemon_and_standalone_output_are_byte_identical() {
         "daemon-backed output must be byte-identical to standalone (AC-40)"
     );
 
-    stop_daemon(&root, &metadata_path);
-    let _ = daemon.wait();
+    daemon.stop();
 }
 
 /// Design Decision 3's attach-only contract: with a STALE `daemon.json`
@@ -341,24 +393,16 @@ fn stale_daemon_metadata_answers_without_spawning_a_daemon() {
     let standalone = run(dir.path(), &["get-callers", &symbol, "--json"]);
     assert_eq!(exit_code(&standalone), 0);
 
-    // Fabricate stale metadata: a plausibly-shaped record whose owner is
-    // not a live lock owner (no daemon.lock exists at all).
+    // Leave a real, compatible daemon publication behind after an unclean
+    // stop. Attach-only can safely reclaim only this compatible dead owner.
     let runtime = root.join(".code-graph");
-    std::fs::create_dir_all(&runtime).expect("create runtime dir");
-    std::fs::write(
-        runtime.join("daemon.json"),
-        serde_json::json!({
-            "pid": 4_000_000_000u32,
-            "transport": "tcp",
-            "endpoint": "127.0.0.1:1",
-            "binary_sha": "unknown",
-            "executable_fingerprint": "0000000000000000-0000000000000000",
-            "started_at": "2000-01-01T00:00:00Z",
-            "owner": { "pid": 4_000_000_000u32, "start_time": 0, "nonce": "00000000000000000000000000000000" }
-        })
-        .to_string(),
-    )
-    .expect("write stale daemon metadata");
+    let mut dead_daemon = DaemonChild::spawn(&mcp_binary().expect("MCP binary checked"), &root);
+    dead_daemon.child.kill().expect("hard-stop daemon");
+    dead_daemon.child.wait().expect("reap hard-stopped daemon");
+    assert!(
+        runtime.join("daemon.json").exists(),
+        "crash leaves metadata"
+    );
 
     let through_stale = run(dir.path(), &["get-callers", &symbol, "--json"]);
     assert_eq!(
@@ -378,30 +422,56 @@ fn stale_daemon_metadata_answers_without_spawning_a_daemon() {
     );
 }
 
+/// Required positionals stay unambiguous when their literal values are the
+/// strings clap otherwise accepts as optional-bool values. The documented
+/// `--flag=<true|false>` spelling leaves those positionals already consumed.
+#[test]
+fn optional_bool_flags_do_not_consume_true_or_false_positionals() {
+    let dir = TempDir::new().expect("optional bool fixture");
+    for file in ["true", "false"] {
+        std::fs::write(dir.path().join(file), "fn fixture() {}\n").expect("write fixture");
+        let output = run(dir.path(), &["get-file-symbols", file, "--brief=false"]);
+        assert_eq!(
+            exit_code(&output),
+            1,
+            "{file} positional must reach the unindexed tool guard: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("no codebase indexed"),
+            "{file} parsed as a file positional rather than an optional-bool value"
+        );
+    }
+}
+
 #[cfg(unix)]
-fn stop_daemon(_root: &Path, metadata_path: &Path) {
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(metadata_path).expect("read daemon metadata"))
-            .expect("parse daemon metadata");
-    let pid = metadata["pid"].as_u64().expect("metadata pid").to_string();
-    let status = Command::new("kill")
-        .args(["-INT", &pid])
-        .status()
-        .expect("send SIGINT to daemon");
-    assert!(status.success(), "SIGINT daemon");
+fn stop_daemon_best_effort(_root: &Path, metadata_path: &Path) {
+    let Some(pid) = std::fs::read(metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|metadata| metadata["pid"].as_u64())
+    else {
+        return;
+    };
+    let _ = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Windows has no SIGINT for detached console processes; the owner-bound
 /// `shutdown.request` file is the graceful-stop channel (daemon_serve
 /// precedent).
 #[cfg(windows)]
-fn stop_daemon(root: &Path, metadata_path: &Path) {
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(metadata_path).expect("read daemon metadata"))
-            .expect("parse daemon metadata");
-    std::fs::write(
-        root.join(".code-graph/shutdown.request"),
-        serde_json::to_vec(&metadata["owner"]).expect("encode daemon owner identity"),
-    )
-    .expect("write daemon shutdown request");
+fn stop_daemon_best_effort(root: &Path, metadata_path: &Path) {
+    let Some(owner) = std::fs::read(metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|metadata| metadata.get("owner").cloned())
+        .and_then(|owner| serde_json::to_vec(&owner).ok())
+    else {
+        return;
+    };
+    let _ = std::fs::write(root.join(".code-graph/shutdown.request"), owner);
 }

@@ -26,6 +26,10 @@ use crate::CliError;
 pub struct DaemonAnswer {
     pub payload: String,
     pub is_error: bool,
+    /// The initialized daemon's package version. Decision 7 treats the
+    /// not-indexed wording as package-versioned rather than a cross-version
+    /// protocol contract.
+    pub server_version: Option<String>,
 }
 
 /// Locates the sibling `code-graph-mcp` binary: next to our own executable
@@ -115,9 +119,13 @@ pub async fn call(
         .await
         .map_err(|e| channel_err(&format!("write initialize: {e}")))?;
 
-    read_response(&mut lines, 1)
+    let initialize = read_response(&mut lines, 1)
         .await?
         .ok_or_else(|| channel_err("no initialize response"))?;
+    let server_version = initialize
+        .pointer("/result/serverInfo/version")
+        .and_then(|version| version.as_str())
+        .map(str::to_owned);
 
     stdin
         .write_all(
@@ -172,7 +180,11 @@ pub async fn call(
         .and_then(|f| f.as_bool())
         .unwrap_or(false);
 
-    Ok(Some(DaemonAnswer { payload, is_error }))
+    Ok(Some(DaemonAnswer {
+        payload,
+        is_error,
+        server_version,
+    }))
 }
 
 /// Reads frames until the response with `id` arrives (skipping requests,

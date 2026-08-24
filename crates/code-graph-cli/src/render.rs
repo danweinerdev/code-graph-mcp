@@ -18,7 +18,15 @@
 //! - Everything else → labelled `key: value` lines with arrays-of-objects
 //!   as sub-tables (find_path hops, blame hunks, history entries).
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// A human table cell never exceeds this many terminal columns. Wrapping is
+/// display-width-aware (not byte or scalar-count-aware), so CJK and combining
+/// text keep subsequent columns aligned.
+const MAX_CELL_DISPLAY_WIDTH: usize = 48;
 
 /// Renders a JSON payload for terminal reading. The caller has already
 /// decided the payload IS JSON; `ToolOk::Text` bodies bypass this.
@@ -133,13 +141,14 @@ fn hierarchy_node(node: &Value, depth: usize, out: &mut String) {
     }
 }
 
-/// A uniform array: objects render as an aligned table on the first row's
-/// key order; anything else renders one entry per line.
+/// A uniform array: objects render as an aligned table using the deterministic
+/// union of keys from every object row; anything else renders one entry per
+/// line. Cells hard-wrap at [`MAX_CELL_DISPLAY_WIDTH`] terminal columns.
 fn table_or_list(rows: &[Value]) -> String {
     if rows.is_empty() {
         return "(no results)\n".to_string();
     }
-    let Some(first) = rows.first().and_then(Value::as_object) else {
+    let Some(_) = rows.first().and_then(Value::as_object) else {
         let mut out = String::new();
         for row in rows {
             out.push_str(&scalar_text(row));
@@ -147,39 +156,101 @@ fn table_or_list(rows: &[Value]) -> String {
         }
         return out;
     };
-    let columns: Vec<&String> = first.keys().collect();
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
-    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    let mut keys = BTreeSet::new();
+    for row in rows.iter().filter_map(Value::as_object) {
+        keys.extend(row.keys().cloned());
+    }
+    let columns: Vec<String> = keys.into_iter().collect();
+    let headers: Vec<Vec<String>> = columns.iter().map(|column| wrap_cell(column)).collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| {
+            header
+                .iter()
+                .map(|part| UnicodeWidthStr::width(part.as_str()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut cells: Vec<Vec<Vec<String>>> = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut line: Vec<String> = Vec::with_capacity(columns.len());
+        let mut line: Vec<Vec<String>> = Vec::with_capacity(columns.len());
         for (i, column) in columns.iter().enumerate() {
             let text = row
                 .get(column.as_str())
                 .map(scalar_text)
                 .unwrap_or_default();
-            widths[i] = widths[i].max(text.chars().count());
-            line.push(text);
+            let wrapped = wrap_cell(&text);
+            widths[i] = widths[i].max(
+                wrapped
+                    .iter()
+                    .map(|part| UnicodeWidthStr::width(part.as_str()))
+                    .max()
+                    .unwrap_or(0),
+            );
+            line.push(wrapped);
         }
         cells.push(line);
     }
     let mut out = String::new();
-    let header: Vec<String> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
-        .collect();
-    out.push_str(header.join("  ").trim_end());
-    out.push('\n');
-    for line in cells {
-        let rendered: Vec<String> = line
+    let header_height = headers.iter().map(Vec::len).max().unwrap_or(1);
+    for line_index in 0..header_height {
+        let rendered: Vec<String> = headers
             .iter()
             .enumerate()
-            .map(|(i, cell)| format!("{:<width$}", cell, width = widths[i]))
+            .map(|(column, header)| {
+                pad_display(
+                    header.get(line_index).map(String::as_str).unwrap_or(""),
+                    widths[column],
+                )
+            })
             .collect();
         out.push_str(rendered.join("  ").trim_end());
         out.push('\n');
     }
+    for row in cells {
+        let height = row.iter().map(Vec::len).max().unwrap_or(1);
+        for line_index in 0..height {
+            let rendered: Vec<String> = row
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    pad_display(
+                        cell.get(line_index).map(String::as_str).unwrap_or(""),
+                        widths[column],
+                    )
+                })
+                .collect();
+            out.push_str(rendered.join("  ").trim_end());
+            out.push('\n');
+        }
+    }
     out
+}
+
+fn pad_display(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn wrap_cell(value: &str) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut width = 0;
+    for character in value.chars() {
+        if character == '\n' {
+            lines.push(String::new());
+            width = 0;
+            continue;
+        }
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width > 0 && width + character_width > MAX_CELL_DISPLAY_WIDTH {
+            lines.push(String::new());
+            width = 0;
+        }
+        lines.last_mut().expect("one initial line").push(character);
+        width += character_width;
+    }
+    lines
 }
 
 /// Labelled `key: value` lines; arrays of objects become sub-tables.
@@ -210,5 +281,58 @@ fn scalar_text(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use unicode_width::UnicodeWidthStr;
+
+    use super::{human, MAX_CELL_DISPLAY_WIDTH};
+
+    #[test]
+    fn table_includes_columns_present_only_in_later_rows() {
+        let rendered = human(&serde_json::json!([
+            { "first": "one" },
+            { "later": "two" }
+        ]));
+        let mut lines = rendered.lines();
+        assert_eq!(lines.next(), Some("first  later"));
+        assert_eq!(lines.next(), Some("one"));
+        assert_eq!(lines.next(), Some("       two"));
+    }
+
+    #[test]
+    fn table_alignment_uses_unicode_display_width() {
+        let rendered = human(&serde_json::json!([
+            { "name": "表", "value": "x" },
+            { "name": "e\u{301}", "value": "y" }
+        ]));
+        let lines: Vec<_> = rendered.lines().collect();
+        for (line, marker) in [(lines[1], "x"), (lines[2], "y")] {
+            let before = line.strip_suffix(marker).expect("value marker");
+            assert_eq!(UnicodeWidthStr::width(before), 6, "aligned: {line}");
+        }
+    }
+
+    #[test]
+    fn table_cells_hard_wrap_to_the_display_width_cap() {
+        let value = "x".repeat(MAX_CELL_DISPLAY_WIDTH + 2);
+        let rendered = human(&serde_json::json!([{ "value": value }]));
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(UnicodeWidthStr::width(lines[1]), MAX_CELL_DISPLAY_WIDTH);
+        assert_eq!(UnicodeWidthStr::width(lines[2]), 2);
+    }
+
+    #[test]
+    fn table_headers_hard_wrap_to_the_display_width_cap() {
+        let key = "k".repeat(MAX_CELL_DISPLAY_WIDTH + 2);
+        let rendered = human(&serde_json::json!([{ (key): "value" }]));
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(UnicodeWidthStr::width(lines[0]), MAX_CELL_DISPLAY_WIDTH);
+        assert_eq!(UnicodeWidthStr::width(lines[1]), 2);
+        assert_eq!(lines[2], "value");
     }
 }

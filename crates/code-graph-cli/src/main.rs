@@ -83,12 +83,13 @@ async fn run(cli: Cli) -> Result<Outcome, CliError> {
         match daemon_client::call(&project_root, tool, arguments, cli.quiet).await? {
             Some(answer) if answer.is_error => {
                 // Decision 7: a daemon that holds no graph does not hide
-                // the cache. Byte-exact match on the core guard's own
-                // message — computed, not duplicated.
+                // the cache. The guard wording is package-versioned, so its
+                // byte-exact match is valid only against our package version.
+                // Compute it rather than duplicating it.
                 let not_indexed = code_graph_tools::core::require_indexed(false)
                     .expect_err("require_indexed(false) is always an error")
                     .0;
-                if answer.payload == not_indexed && cli.command.unindexed_fallback_eligible() {
+                if unindexed_fallback_allowed(&cli.command, &answer, &not_indexed) {
                     if !cli.quiet {
                         eprintln!(
                             "code-graph: daemon holds no graph yet; answering from the on-disk cache"
@@ -101,14 +102,9 @@ async fn run(cli: Cli) -> Result<Outcome, CliError> {
             }
             Some(answer) => {
                 // The daemon's payload is already the MCP wire text; keep
-                // it verbatim (Decision 4). JSON-vs-text is decided by
-                // whether it parses — mermaid/advisory bodies do not.
-                return Ok(
-                    match serde_json::from_str::<serde_json::Value>(&answer.payload) {
-                        Ok(_) => Outcome::Json(answer.payload),
-                        Err(_) => Outcome::Text(answer.payload),
-                    },
-                );
+                // it verbatim (Decision 4). Its response contract, not
+                // parseability, determines whether human mode renders JSON.
+                return Ok(cli.command.daemon_success_outcome(answer.payload));
             }
             // Spawn failure: breadcrumb already printed; fall through.
             None => {}
@@ -118,6 +114,16 @@ async fn run(cli: Cli) -> Result<Outcome, CliError> {
     let load_cache = !matches!(cli.command, args::Command::AnalyzeCodebase { .. });
     let app = exec::bootstrap(&root, load_cache)?;
     exec::run(&app, &cli.command).await
+}
+
+fn unindexed_fallback_allowed(
+    command: &args::Command,
+    answer: &daemon_client::DaemonAnswer,
+    not_indexed: &str,
+) -> bool {
+    answer.server_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+        && answer.payload == not_indexed
+        && command.unindexed_fallback_eligible()
 }
 
 fn daemon_metadata_path(project_root: &std::path::Path) -> PathBuf {
@@ -141,5 +147,46 @@ fn render(outcome: Outcome, json_mode: bool) {
             }
         }
         Outcome::Text(text) => println!("{text}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{args::Command, daemon_client::DaemonAnswer, unindexed_fallback_allowed};
+
+    fn query_command() -> Command {
+        Command::GetCallers {
+            symbol: "symbol".to_owned(),
+            depth: None,
+            limit: None,
+            offset: None,
+            min_confidence: None,
+        }
+    }
+
+    #[test]
+    fn unindexed_fallback_requires_the_same_package_version() {
+        let not_indexed = "package-versioned not-indexed message";
+        let answer = |server_version: Option<&str>| DaemonAnswer {
+            payload: not_indexed.to_owned(),
+            is_error: true,
+            server_version: server_version.map(str::to_owned),
+        };
+
+        assert!(unindexed_fallback_allowed(
+            &query_command(),
+            &answer(Some(env!("CARGO_PKG_VERSION"))),
+            not_indexed
+        ));
+        assert!(!unindexed_fallback_allowed(
+            &query_command(),
+            &answer(Some("different-package-version")),
+            not_indexed
+        ));
+        assert!(!unindexed_fallback_allowed(
+            &query_command(),
+            &answer(None),
+            not_indexed
+        ));
     }
 }

@@ -140,9 +140,18 @@ fn binary_advertises_twenty_three_tools() {
         }
     });
     writeln!(stdin, "{init}").expect("write initialize");
-    let _init_resp = stdout
+    let init_resp_line = stdout
         .read_line(READ_TIMEOUT)
         .expect("read initialize response");
+    let init_resp: Value =
+        serde_json::from_str(&init_resp_line).expect("initialize response is valid JSON");
+    assert_eq!(
+        init_resp
+            .pointer("/result/serverInfo/version")
+            .and_then(Value::as_str),
+        Some(env!("CARGO_PKG_VERSION")),
+        "initialize reports the application package version"
+    );
 
     // The MCP spec requires a notifications/initialized after the client
     // receives the initialize response.
