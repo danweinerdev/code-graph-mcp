@@ -42,7 +42,7 @@ tasks:
       cargo test -p code-graph-lang and cargo test -p code-graph-lang-cpp and cargo test -p code-graph-lang-rust and cargo test -p code-graph-lang-go and cargo test -p code-graph-lang-python and cargo test -p code-graph-lang-csharp and cargo test -p code-graph-lang-java and cargo test -p code-graph-tools --lib fingerprint_cache and cargo test -p code-graph-tools --test symbol_history pass; all six plugins use one shared override helper, all six pin unlocatable-span degradation and cross-parser determinism, literal-insensitive failures cache a visible versioned outcome, key and AST streams use unambiguous framing, config identity includes extraction-relevant settings only, unreadable binaries do not collapse to identity zero, and a cross-process-locked sidecar trim triggers above 256 MiB or 100,000 completed shards and trims oldest completed shards toward 192 MiB and 75,000 while preserving temporary files and current-walk keys; extractor-span caveats are agent-visible and make verify passes.
   - id: "12.6"
     title: "Harden CLI and daemon fallback, cleanup, and rendering"
-    status: planned
+    status: complete
     justifies: "FR-12, FR-16, FR-17, FR-18, FR-19, FR-20, AC-09, AC-10, AC-11, AC-12, AC-40, and NFR-01; prevents permanent dead-owner metadata overhead, split-install fallback drift, leaked test daemons, positional swallowing surprises, and incorrect human rendering, as recorded by review 19."
     verification: >-
       cargo test -p code-graph-cli and cargo test -p code-graph-mcp --test daemon_serve and cargo test -p code-graph-mcp --test daemon_proxy pass; attach-only removes metadata only after proving the owner dead, Decision 7 fallback requires initialize.serverInfo.version to equal the CLI package version before matching the not-indexed error and the fallback wording is an explicit package-versioned contract, dead-owner and live-incompatible paths are independently pinned, optional-bool help gives an unambiguous invocation form, source scans walk every CLI source file, process fixtures clean up through RAII, tables preserve later-row fields and use unicode-width display measurement with bounded wrapping, and daemon results are classified from the command/response contract rather than generic JSON parseability; no daemon or MCP framing changes, machine payload parity remains byte-identical, and make verify passes.
@@ -271,15 +271,15 @@ Do not make pruning “delete every identity except the current process.” Prun
 
 ## 12.6: Harden CLI and daemon fallback, cleanup, and rendering
 ### Subtasks
-- [ ] Remove dead-owner `daemon.json` only after lock/process-identity revalidation proves no live owner, so later CLI calls avoid the permanent spawn/handshake/fallback double hop.
-- [ ] Retain the existing initialize response and require `serverInfo.version == env!("CARGO_PKG_VERSION")` before Decision 7 may match the byte-exact not-indexed wording and retry standalone. Treat that wording as a package-versioned compatibility contract: any wording/discriminator change requires a package-version bump. Mismatch returns the original daemon result without fallback.
-- [ ] Split stale-metadata tests so dead-owner, live-compatible, and live-incompatible attach-only branches are independently exercised; pin that attach-only never triggers replacement.
-- [ ] Document optional-bool flags with positional-first or `--flag=<bool>` syntax and add clap regressions for filenames literally named `true`/`false`.
-- [ ] Make no-rmcp/no-handlers structural scans traverse every CLI source file, including future modules.
-- [ ] Wrap spawned daemon fixtures in kill-on-drop RAII guards so assertion failures cannot leak processes or hold TempDirs.
-- [ ] Add the scoped `unicode-width` dependency to `code-graph-cli` and fix human table rendering with Unicode display-width measurement, bounded cell wrapping, and union-of-all-row columns in deterministic order.
-- [ ] Classify daemon results from the command contract, not generic JSON parseability: `generate-diagram --format mermaid` and the fixed non-callable advisory branches are Text; all declared JSON response shapes are Value. Keep the raw MCP/daemon byte stream unchanged and preserve `--json` payload bytes and plain-text output exactly.
-- [ ] Retain all existing daemon fallback breadcrumbs on stderr and add no `tracing` dependency.
+- [x] Remove dead-owner `daemon.json` only after lock/process-identity revalidation proves no live owner, so later CLI calls avoid the permanent spawn/handshake/fallback double hop.
+- [x] Retain the existing initialize response and require `serverInfo.version == env!("CARGO_PKG_VERSION")` before Decision 7 may match the byte-exact not-indexed wording and retry standalone. Treat that wording as a package-versioned compatibility contract: any wording/discriminator change requires a package-version bump. Mismatch returns the original daemon result without fallback.
+- [x] Split stale-metadata tests so dead-owner, live-compatible, and live-incompatible attach-only branches are independently exercised; pin that attach-only never triggers replacement.
+- [x] Document optional-bool flags with positional-first or `--flag=<bool>` syntax and add clap regressions for filenames literally named `true`/`false`.
+- [x] Make no-rmcp/no-handlers structural scans traverse every CLI source file, including future modules.
+- [x] Wrap spawned daemon fixtures in kill-on-drop RAII guards so assertion failures cannot leak processes or hold TempDirs.
+- [x] Add the scoped `unicode-width` dependency to `code-graph-cli` and fix human table rendering with Unicode display-width measurement, bounded cell wrapping, and union-of-all-row columns in deterministic order.
+- [x] Classify daemon results from the command contract, not generic JSON parseability: `generate-diagram --format mermaid` and the fixed non-callable advisory branches are Text; all declared JSON response shapes are Value. Keep the raw MCP/daemon byte stream unchanged and preserve `--json` payload bytes and plain-text output exactly.
+- [x] Retain all existing daemon fallback breadcrumbs on stderr and add no `tracing` dependency.
 
 ### Notes
 Revision boundary: stale daemon state self-cleans safely, split installations fail or fall back honestly, CLI argument behavior is explainable, tests cannot leak daemons, and human rendering is correct without changing machine output.
@@ -291,7 +291,18 @@ Do not delete `daemon.json` merely because one connection attempt failed. Replac
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `f9e44dd519c4ead0616377c8de285d80f2036032`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `f9e44dd519c4ead0616377c8de285d80f2036032`
+- Focused review: `git show f9e44dd519c4ead0616377c8de285d80f2036032`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `f9e44dd519c4ead0616377c8de285d80f2036032`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `Passed workspace lint, formatting, tests, snapshot cleanliness, and plugin-sync checks; focused CLI, daemon proxy/serve, and smoke suites also passed; cargo build --release -p code-graph-mcp succeeded.` |
 
 ## 12.7: Close resolver and candidate-count exposure seams
 ### Subtasks
