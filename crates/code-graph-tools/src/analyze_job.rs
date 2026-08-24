@@ -22,16 +22,16 @@ use code_graph_core::RootConfig;
 use crate::handlers::analyze::AnalyzeResult;
 use crate::indexer::ProgressSink;
 
-/// Filesystem-derived facts captured before an asynchronous analyze request is
-/// admitted. They belong to the canonical request only: path containment, not
-/// configuration identity, controls pending-work compaction.
+/// Filesystem-derived facts captured before every analyze request is admitted.
+/// They belong to the canonical request and let pending-work compaction require
+/// both successful preparation and matching project roots.
 #[derive(Clone)]
 pub(crate) struct AnalyzeAdmission {
     pub(crate) path: std::path::PathBuf,
     pub(crate) preparation: Result<AnalyzePreparation, String>,
 }
 
-/// Successful config/project discovery captured by an async admission probe.
+/// Successful config/project discovery captured by an admission probe.
 #[derive(Clone)]
 pub(crate) struct AnalyzePreparation {
     pub(crate) config: RootConfig,
@@ -159,9 +159,9 @@ pub(crate) struct AnalyzeJob {
     /// Original request force, retained for the existing status view.
     pub(crate) force: bool,
     pub(crate) started_at: u64,
-    /// Present only for async work after its blocking admission probe has
+    /// Present for production work after its blocking admission probe has
     /// canonicalized the invocation path and discovered its project config.
-    /// Sync analyzes retain their established execution-time discovery path.
+    /// Test-only direct jobs may omit it and use the worker's fallback probe.
     pub(crate) admission: Option<AnalyzeAdmission>,
     pub(crate) state: PlRwLock<JobMutableState>,
     terminal: tokio::sync::Notify,

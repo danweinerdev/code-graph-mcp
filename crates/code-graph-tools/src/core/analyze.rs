@@ -860,8 +860,19 @@ pub async fn analyze_codebase(
     if path_raw.is_empty() {
         return Err(ToolError("'path' is required".to_string()));
     }
-    let path = canonicalize_admission_path(&inner, &path_raw)?;
-    let admission = admit_sync(&inner, path, force, Arc::clone(&sink))?;
+    // Keep synchronous and asynchronous requests on the same admission path.
+    // In particular, pending-work compaction must see the request's directory
+    // validation and discovered project root before deciding whether it can
+    // attach to another request. This probe may read config files, so keep it
+    // off the Tokio worker just as the async kickoff does.
+    let probe_inner = Arc::clone(&inner);
+    let admission =
+        tokio::task::spawn_blocking(move || probe_analyze_admission(&probe_inner, &path_raw))
+            .await
+            .map_err(|error| {
+                ToolError(format!("sync analyze admission probe panicked: {error}"))
+            })??;
+    let admission = admit_sync_with_admission(&inner, admission, force, Arc::clone(&sink))?;
 
     let job = match admission {
         SyncAdmission::RunNow { job, guard } => {
@@ -961,16 +972,10 @@ enum PendingAdmission {
     Attached(Arc<AnalyzeJob>),
 }
 
-fn canonicalize_admission_path(inner: &ServerInner, path_raw: &str) -> Result<String, ToolError> {
-    inner.ensure_daemon_root_current().map_err(ToolError)?;
-    paths::canonicalize(std::path::Path::new(path_raw))
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|_| ToolError(format!("directory does not exist: {path_raw}")))
-}
-
-/// Perform all filesystem-bound checks needed before an async request enters
-/// the slot. This deliberately captures configuration only for the eventual
-/// canonical scan; [`compact_pending`] still decides coverage solely by path.
+/// Perform all filesystem-bound checks needed before a request enters the
+/// slot. The resulting admission is retained by both synchronous and
+/// asynchronous canonical jobs so [`compact_pending`] can require matching
+/// successful project discovery before using path coverage.
 fn probe_analyze_admission(
     inner: &ServerInner,
     path_raw: &str,
@@ -1061,7 +1066,7 @@ fn compact_pending(
     slot: &mut crate::analyze_job::AnalyzeSlot,
     path: String,
     force: bool,
-    admission: Option<AnalyzeAdmission>,
+    admission: AnalyzeAdmission,
     guard: crate::server::AnalyzeGuard,
     sync_sink: Option<Arc<dyn ProgressSink>>,
 ) -> Result<PendingAdmission, ToolError> {
@@ -1074,11 +1079,10 @@ fn compact_pending(
         ));
     }
 
-    if let Some(index) = slot
-        .pending
-        .iter()
-        .position(|entry| is_ancestor_or_equal(&entry.job.path, &path))
-    {
+    if let Some(index) = slot.pending.iter().position(|entry| {
+        admissions_share_project_root(entry.job.admission.as_ref(), &admission)
+            && is_ancestor_or_equal(&entry.job.path, &path)
+    }) {
         let entry = &mut slot.pending[index];
         entry.job.or_force(force);
         entry.request_count += 1;
@@ -1092,9 +1096,13 @@ fn compact_pending(
         .pending
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| is_ancestor_or_equal(&path, &entry.job.path).then_some(index))
+        .filter_map(|(index, entry)| {
+            (admissions_share_project_root(entry.job.admission.as_ref(), &admission)
+                && is_ancestor_or_equal(&path, &entry.job.path))
+            .then_some(index)
+        })
         .collect();
-    let job = next_job(path, force, admission);
+    let job = next_job(path, force, Some(admission));
     if descendants.is_empty() {
         slot.pending.push_back(crate::analyze_job::PendingAnalyze {
             job: Arc::clone(&job),
@@ -1143,12 +1151,29 @@ fn compact_pending(
     Ok(PendingAdmission::Canonical(job))
 }
 
-fn admit_sync(
+fn admissions_share_project_root(
+    pending: Option<&AnalyzeAdmission>,
+    incoming: &AnalyzeAdmission,
+) -> bool {
+    matches!(
+        (pending, &incoming.preparation),
+        (
+            Some(AnalyzeAdmission {
+                preparation: Ok(pending),
+                ..
+            }),
+            Ok(incoming),
+        ) if pending.project_root == incoming.project_root
+    )
+}
+
+fn admit_sync_with_admission(
     inner: &Arc<ServerInner>,
-    path: String,
+    admission: AnalyzeAdmission,
     force: bool,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<SyncAdmission, ToolError> {
+    let path = admission.path.to_string_lossy().into_owned();
     let mut slot = inner.analyze_slot.write();
     if slot
         .current
@@ -1160,7 +1185,7 @@ fn admit_sync(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, None, guard, Some(sink))?;
+        let pending = compact_pending(&mut slot, path, force, admission, guard, Some(sink))?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         let job = match pending {
@@ -1172,7 +1197,7 @@ fn admit_sync(
         .persist
         .begin_analyze()
         .map_err(|message| ToolError(message.to_string()))?;
-    let job = install_new_running(&mut slot, path, force, None);
+    let job = install_new_running(&mut slot, path, force, Some(admission));
     Ok(SyncAdmission::RunNow { job, guard })
 }
 
@@ -1193,7 +1218,7 @@ fn admit_async_with_admission(
             .persist
             .begin_analyze()
             .map_err(|message| ToolError(message.to_string()))?;
-        let pending = compact_pending(&mut slot, path, force, Some(admission), guard, None)?;
+        let pending = compact_pending(&mut slot, path, force, admission, guard, None)?;
         #[cfg(debug_assertions)]
         debug_record_pending_admission();
         return match pending {
@@ -1221,14 +1246,14 @@ fn admit_async_with_admission(
 /// [`admit_async_with_admission`] after the blocking probe.
 #[cfg(test)]
 fn admit_async(inner: &Arc<ServerInner>, path: String, force: bool) -> Result<Kickoff, ToolError> {
-    let path = std::path::PathBuf::from(path);
+    let path_buf = std::path::PathBuf::from(&path);
     admit_async_with_admission(
         inner,
         AnalyzeAdmission {
-            path: path.clone(),
+            path: path_buf,
             preparation: Ok(AnalyzePreparation {
                 config: RootConfig::default(),
-                project_root: path,
+                project_root: std::path::PathBuf::from("/"),
                 applied_config_path: None,
             }),
         },
@@ -1336,12 +1361,21 @@ mod queue_tests {
     }
 
     fn queue(server: &crate::server::CodeGraphServer, path: &str, force: bool) -> Arc<AnalyzeJob> {
+        queue_admission(server, test_admission(path), force)
+    }
+
+    fn queue_admission(
+        server: &crate::server::CodeGraphServer,
+        admission: AnalyzeAdmission,
+        force: bool,
+    ) -> Arc<AnalyzeJob> {
+        let path = admission.path.to_string_lossy().into_owned();
         let guard = server.inner.persist.begin_analyze().unwrap();
         compact_pending(
             &mut server.inner.analyze_slot.write(),
-            path.to_string(),
+            path,
             force,
-            None,
+            admission,
             guard,
             None,
         )
@@ -1349,6 +1383,26 @@ mod queue_tests {
             PendingAdmission::Canonical(job) | PendingAdmission::Attached(job) => job,
         })
         .unwrap()
+    }
+
+    fn test_admission(path: &str) -> AnalyzeAdmission {
+        AnalyzeAdmission {
+            path: std::path::PathBuf::from(path),
+            preparation: Ok(AnalyzePreparation {
+                config: RootConfig::default(),
+                project_root: std::path::PathBuf::from("/"),
+                applied_config_path: None,
+            }),
+        }
+    }
+
+    fn admit_sync(
+        inner: &Arc<ServerInner>,
+        path: String,
+        force: bool,
+        sink: Arc<dyn ProgressSink>,
+    ) -> Result<SyncAdmission, ToolError> {
+        admit_sync_with_admission(inner, test_admission(&path), force, sink)
     }
 
     struct ReentrantSink {
@@ -1509,6 +1563,186 @@ mod queue_tests {
         }
     }
 
+    fn write_config(root: &std::path::Path) {
+        std::fs::write(root.join(".code-graph.toml"), "[cpp]\nmacro_strip = []\n")
+            .expect("write fixture config");
+    }
+
+    fn preparation_error(job: &AnalyzeJob) -> &str {
+        job.admission
+            .as_ref()
+            .and_then(|admission| admission.preparation.as_ref().err())
+            .expect("fixture job must retain its failed admission")
+    }
+
+    #[test]
+    fn pending_file_children_keep_sync_and_async_failure_jobs() {
+        let root = tempfile::tempdir().expect("create admission fixture");
+        let parent_dir = root.path().join("parent");
+        std::fs::create_dir(&parent_dir).expect("create parent directory");
+        write_config(&parent_dir);
+        let file = parent_dir.join("child.cpp");
+        std::fs::write(&file, "void child() {}\n").expect("write child file");
+        let server = server();
+
+        let parent = probe_analyze_admission(&server.inner, &parent_dir.to_string_lossy())
+            .expect("valid parent admission");
+        let child = probe_analyze_admission(&server.inner, &file.to_string_lossy())
+            .expect("file path still produces a retained admission");
+        assert!(matches!(
+            &child.preparation,
+            Err(message) if message.contains("path is not a directory")
+        ));
+        let parent_job = queue_admission(&server, parent, false);
+
+        let sync_job = match admit_sync_with_admission(
+            &server.inner,
+            child.clone(),
+            false,
+            Arc::new(NoopProgressSink),
+        )
+        .expect("file sync request must queue its own failed job")
+        {
+            SyncAdmission::Follower(job) => job,
+            SyncAdmission::RunNow { .. } => {
+                panic!("pending work must keep the sync request queued")
+            }
+        };
+        let async_id = match admit_async_with_admission(&server.inner, child, false)
+            .expect("file async request must retain kickoff semantics")
+        {
+            Kickoff::Pending { job_id, .. } => job_id,
+            Kickoff::New(_, _) => panic!("pending work must keep the async request queued"),
+        };
+        let slot = server.inner.analyze_slot.read();
+        let async_job = slot
+            .resolve_async_job(&async_id)
+            .expect("failed async request remains pollable through its canonical ID");
+        assert_eq!(slot.pending.len(), 3);
+        assert!(!Arc::ptr_eq(&parent_job, &sync_job));
+        assert!(!Arc::ptr_eq(&parent_job, &async_job));
+        assert!(preparation_error(&sync_job).contains("path is not a directory"));
+        assert!(preparation_error(&async_job).contains("path is not a directory"));
+    }
+
+    #[test]
+    fn pending_malformed_and_daemon_root_failures_keep_canonical_jobs() {
+        let malformed_root = tempfile::tempdir().expect("create malformed-config fixture");
+        let parent_dir = malformed_root.path().join("parent");
+        let malformed_dir = parent_dir.join("malformed");
+        std::fs::create_dir_all(&malformed_dir).expect("create malformed child directory");
+        write_config(&parent_dir);
+        std::fs::write(malformed_dir.join(".code-graph.toml"), "[cpp\n")
+            .expect("write malformed config");
+        let malformed_server = server();
+        let parent =
+            probe_analyze_admission(&malformed_server.inner, &parent_dir.to_string_lossy())
+                .expect("valid parent admission");
+        let malformed =
+            probe_analyze_admission(&malformed_server.inner, &malformed_dir.to_string_lossy())
+                .expect("malformed config remains a retained admission");
+        let parent_job = queue_admission(&malformed_server, parent, false);
+        let malformed_job =
+            match admit_async_with_admission(&malformed_server.inner, malformed, false)
+                .expect("malformed async request must retain kickoff semantics")
+            {
+                Kickoff::Pending { job_id, .. } => malformed_server
+                    .inner
+                    .analyze_slot
+                    .read()
+                    .resolve_async_job(&job_id)
+                    .expect("malformed canonical job remains pending"),
+                Kickoff::New(_, _) => panic!("pending parent must keep malformed request queued"),
+            };
+        assert!(!Arc::ptr_eq(&parent_job, &malformed_job));
+        assert!(preparation_error(&malformed_job).contains("failed to parse .code-graph.toml"));
+
+        let daemon_root = tempfile::tempdir().expect("create daemon-root fixture");
+        let daemon_child = daemon_root.path().join("nested");
+        std::fs::create_dir(&daemon_child).expect("create nested project");
+        write_config(daemon_root.path());
+        write_config(&daemon_child);
+        let daemon_server = server();
+        let daemon_project_root =
+            paths::canonicalize(daemon_root.path()).expect("canonicalize root");
+        daemon_server
+            .bind_daemon_project_root(daemon_project_root)
+            .expect("bind daemon project root once");
+        let parent =
+            probe_analyze_admission(&daemon_server.inner, &daemon_root.path().to_string_lossy())
+                .expect("daemon parent remains valid");
+        let child = probe_analyze_admission(&daemon_server.inner, &daemon_child.to_string_lossy())
+            .expect("daemon-root mismatch remains a retained admission");
+        let parent_job = queue_admission(&daemon_server, parent, false);
+        let daemon_job = match admit_async_with_admission(&daemon_server.inner, child, false)
+            .expect("daemon-root-invalid child must retain kickoff semantics")
+        {
+            Kickoff::Pending { job_id, .. } => daemon_server
+                .inner
+                .analyze_slot
+                .read()
+                .resolve_async_job(&job_id)
+                .expect("daemon-root-invalid canonical job remains pending"),
+            Kickoff::New(_, _) => panic!("pending parent must keep daemon-invalid request queued"),
+        };
+        assert!(!Arc::ptr_eq(&parent_job, &daemon_job));
+        assert!(preparation_error(&daemon_job).contains("cannot analyze project root"));
+    }
+
+    #[test]
+    fn pending_nested_project_does_not_compact() {
+        let root = tempfile::tempdir().expect("create nested-project fixture");
+        let child_dir = root.path().join("nested");
+        std::fs::create_dir(&child_dir).expect("create nested project");
+        write_config(root.path());
+        write_config(&child_dir);
+        let server = server();
+        let parent = probe_analyze_admission(&server.inner, &root.path().to_string_lossy())
+            .expect("parent project admission");
+        let child = probe_analyze_admission(&server.inner, &child_dir.to_string_lossy())
+            .expect("nested project admission");
+        let parent_root = match &parent.preparation {
+            Ok(preparation) => preparation.project_root.clone(),
+            Err(error) => panic!("parent must prepare successfully: {error}"),
+        };
+        let child_root = match &child.preparation {
+            Ok(preparation) => preparation.project_root.clone(),
+            Err(error) => panic!("child must prepare successfully: {error}"),
+        };
+        assert_ne!(parent_root, child_root);
+        let parent_job = queue_admission(&server, parent, false);
+        let child_job = queue_admission(&server, child, false);
+        assert!(!Arc::ptr_eq(&parent_job, &child_job));
+        assert_eq!(server.inner.analyze_slot.read().pending.len(), 2);
+    }
+
+    #[test]
+    fn pending_same_project_descendant_still_compacts() {
+        let root = tempfile::tempdir().expect("create same-project fixture");
+        let child_dir = root.path().join("child");
+        std::fs::create_dir(&child_dir).expect("create child scope");
+        write_config(root.path());
+        let server = server();
+        let parent = probe_analyze_admission(&server.inner, &root.path().to_string_lossy())
+            .expect("parent project admission");
+        let child = probe_analyze_admission(&server.inner, &child_dir.to_string_lossy())
+            .expect("child scope admission");
+        let parent_root = match &parent.preparation {
+            Ok(preparation) => preparation.project_root.clone(),
+            Err(error) => panic!("parent must prepare successfully: {error}"),
+        };
+        let child_root = match &child.preparation {
+            Ok(preparation) => preparation.project_root.clone(),
+            Err(error) => panic!("child must prepare successfully: {error}"),
+        };
+        assert_eq!(parent_root, child_root);
+        let parent_job = queue_admission(&server, parent, false);
+        let child_job = queue_admission(&server, child, true);
+        assert!(Arc::ptr_eq(&parent_job, &child_job));
+        assert!(parent_job.force(), "same-project follower force still ORs");
+        assert_eq!(server.inner.analyze_slot.read().pending_request_count(), 2);
+    }
+
     #[test]
     fn pending_compaction_absorbs_followers_or_force_and_preserves_disjoint_fifo() {
         let server = server();
@@ -1614,6 +1848,11 @@ mod queue_tests {
             .expect("create sync follower fixture directory");
         std::fs::write(successor_dir.join("main.cpp"), b"void recovered() {}\n")
             .expect("write successor source");
+        std::fs::write(
+            successor_dir.join(".code-graph.toml"),
+            "[cpp]\nmacro_strip = []\n",
+        )
+        .expect("write successor project config");
 
         let mut registry = code_graph_lang::LanguageRegistry::new();
         registry
@@ -1739,7 +1978,7 @@ mod queue_tests {
                 &mut server.inner.analyze_slot.write(),
                 path.into(),
                 true,
-                None,
+                test_admission(path),
                 guard,
                 None,
             ) {
@@ -1784,7 +2023,7 @@ mod queue_tests {
             &mut server.inner.analyze_slot.write(),
             "/queue/0/covered".into(),
             false,
-            None,
+            test_admission("/queue/0/covered"),
             guard,
             None,
         )
