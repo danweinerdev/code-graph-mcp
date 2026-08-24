@@ -1,0 +1,28 @@
+---
+source: crates/code-graph-tools/tests/snapshot_responses.rs
+assertion_line: 589
+expression: parsed
+---
+{
+  "limit": 100,
+  "next_offset": null,
+  "offset": 0,
+  "results": [
+    {
+      "candidates": 2,
+      "depth": 1,
+      "file": "[testdata]/main.rs",
+      "line": 6,
+      "symbol_id": "[testdata]/a.rs:duplicate_name"
+    },
+    {
+      "candidates": 1,
+      "depth": 1,
+      "file": "[testdata]/main.rs",
+      "line": 6,
+      "symbol_id": "[testdata]/main.rs:unique_helper"
+    }
+  ],
+  "total": 2,
+  "truncated": false
+}

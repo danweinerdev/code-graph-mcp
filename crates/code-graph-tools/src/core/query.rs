@@ -490,6 +490,52 @@ mod tests {
         RwLock::new(g)
     }
 
+    fn graph_with_overrides() -> Graph {
+        let mut g = Graph::new();
+        let mut base = sym("Foo", "/base.cpp");
+        base.kind = SymbolKind::Method;
+        base.parent = "Base".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/base.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![base],
+            edges: vec![],
+        });
+
+        let mut missing_derived = sym("Foo", "/derived.cpp");
+        missing_derived.kind = SymbolKind::Method;
+        missing_derived.parent = "DerivedMissing".to_string();
+        let mut real_derived = sym("Foo", "/derived.cpp");
+        real_derived.kind = SymbolKind::Method;
+        real_derived.parent = "DerivedReal".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/derived.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![missing_derived, real_derived],
+            edges: vec![
+                Edge {
+                    from: "/derived.cpp:DerivedMissing::Foo".to_string(),
+                    to: "MissingBase::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 10,
+                    confidence: Confidence::Resolved,
+                    candidates: 1,
+                },
+                Edge {
+                    from: "/derived.cpp:DerivedReal::Foo".to_string(),
+                    to: "/base.cpp:Base::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 20,
+                    confidence: Confidence::Heuristic,
+                    candidates: 2,
+                },
+            ],
+        });
+        g
+    }
+
     /// AC-28: an unindexed `callers_or_callees` returns `Err(ToolError)`,
     /// discriminable without ever going through serialization.
     #[test]
@@ -608,6 +654,27 @@ mod tests {
             Ok(_) => panic!("unindexed find_overrides must error"),
         };
         assert_eq!(err.0, "no codebase indexed — call analyze_codebase first");
+    }
+
+    #[test]
+    fn find_overrides_rejects_unresolved_base_and_keeps_resolved_contested_edge() {
+        let g = locked(graph_with_overrides());
+
+        let err = match find_overrides(&g, true, "MissingBase::Foo", None, None, usize::MAX) {
+            Err(error) => error,
+            Ok(_) => panic!("unresolved base token must retain symbol-not-found behavior"),
+        };
+        assert_eq!(err.0, "symbol not found: \"MissingBase::Foo\"");
+
+        match find_overrides(&g, true, "/base.cpp:Base::Foo", None, None, usize::MAX) {
+            Ok(ToolOk::Value(page)) => {
+                assert_eq!(page.total, 1);
+                assert_eq!(page.results[0].symbol_id, "/derived.cpp:DerivedReal::Foo");
+                assert_eq!(page.results[0].candidates, 2);
+            }
+            Ok(ToolOk::Text(text)) => panic!("expected page, got text: {text}"),
+            Err(error) => panic!("resolved base must succeed: {}", error.0),
+        }
     }
 
     /// AC-28 for `get_dependencies`.

@@ -109,6 +109,12 @@ impl Graph {
     /// transitively reaches an override of X" can compose
     /// `find_overrides` with `callers`.
     pub fn find_overrides(&self, id: &str) -> Vec<CallChain> {
+        // Override edges may retain unresolved base-method tokens in `radj`,
+        // but they must not make a bare token queryable as a graph symbol.
+        if !self.is_resolved_node(id) {
+            return Vec::new();
+        }
+
         let mut out = Vec::new();
         if let Some(entries) = self.radj.get(id) {
             for entry in entries {
@@ -590,7 +596,7 @@ pub struct PathResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{call_edge, inherit_edge, make_fg, sym};
+    use crate::test_fixtures::{call_edge, inherit_edge, make_fg, sym, sym_full};
     use code_graph_core::{Confidence, Edge, Language};
 
     /// Linear chain `a -> b -> c -> d` all in `/x.cpp`.
@@ -618,6 +624,80 @@ mod tests {
         let mut v: Vec<String> = chain.iter().map(|c| c.symbol_id.clone()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn find_overrides_requires_a_resolved_base_method_but_preserves_candidates() {
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/base.cpp",
+            Language::Cpp,
+            vec![sym_full(
+                "Foo",
+                SymbolKind::Method,
+                "/base.cpp",
+                "",
+                "Base",
+                Language::Cpp,
+            )],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/derived.cpp",
+            Language::Cpp,
+            vec![
+                sym_full(
+                    "Foo",
+                    SymbolKind::Method,
+                    "/derived.cpp",
+                    "",
+                    "DerivedMissing",
+                    Language::Cpp,
+                ),
+                sym_full(
+                    "Foo",
+                    SymbolKind::Method,
+                    "/derived.cpp",
+                    "",
+                    "DerivedReal",
+                    Language::Cpp,
+                ),
+            ],
+            vec![
+                // Storage intentionally retains this provisional edge. The
+                // bare target is not a graph node and must not be queryable.
+                Edge {
+                    from: "/derived.cpp:DerivedMissing::Foo".to_string(),
+                    to: "MissingBase::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 10,
+                    confidence: Confidence::Resolved,
+                    candidates: 1,
+                },
+                // A real base method remains queryable even when resolution
+                // had two candidates; `candidates` is preserved on the row.
+                Edge {
+                    from: "/derived.cpp:DerivedReal::Foo".to_string(),
+                    to: "/base.cpp:Base::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 20,
+                    confidence: Confidence::Heuristic,
+                    candidates: 2,
+                },
+            ],
+        ));
+
+        assert!(
+            g.find_overrides("MissingBase::Foo").is_empty(),
+            "an unresolved base token must never be queryable"
+        );
+
+        let overrides = g.find_overrides("/base.cpp:Base::Foo");
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].symbol_id, "/derived.cpp:DerivedReal::Foo");
+        assert_eq!(overrides[0].candidates, 2);
     }
 
     // --- callers / callees on a linear chain ---
@@ -1148,7 +1228,7 @@ mod tests {
             file: file.to_string(),
             line,
             confidence: Confidence::Heuristic,
-            candidates: 1,
+            candidates: 2,
         }
     }
 

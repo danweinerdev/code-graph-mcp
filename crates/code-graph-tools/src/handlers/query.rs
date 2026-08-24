@@ -243,6 +243,52 @@ mod tests {
         RwLock::new(g)
     }
 
+    fn graph_with_overrides() -> Graph {
+        let mut g = Graph::new();
+        let mut base = sym("Foo", "/base.cpp");
+        base.kind = SymbolKind::Method;
+        base.parent = "Base".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/base.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![base],
+            edges: vec![],
+        });
+
+        let mut missing_derived = sym("Foo", "/derived.cpp");
+        missing_derived.kind = SymbolKind::Method;
+        missing_derived.parent = "DerivedMissing".to_string();
+        let mut real_derived = sym("Foo", "/derived.cpp");
+        real_derived.kind = SymbolKind::Method;
+        real_derived.parent = "DerivedReal".to_string();
+        g.merge_file_graph(FileGraph {
+            path: "/derived.cpp".to_string(),
+            language: Language::Cpp,
+            symbols: vec![missing_derived, real_derived],
+            edges: vec![
+                Edge {
+                    from: "/derived.cpp:DerivedMissing::Foo".to_string(),
+                    to: "MissingBase::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 10,
+                    confidence: Confidence::Resolved,
+                    candidates: 1,
+                },
+                Edge {
+                    from: "/derived.cpp:DerivedReal::Foo".to_string(),
+                    to: "/base.cpp:Base::Foo".to_string(),
+                    kind: EdgeKind::Overrides,
+                    file: "/derived.cpp".to_string(),
+                    line: 20,
+                    confidence: Confidence::Heuristic,
+                    candidates: 2,
+                },
+            ],
+        });
+        g
+    }
+
     // --- callers / callees ---
 
     #[test]
@@ -592,6 +638,25 @@ mod tests {
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(body_text(&r), "symbol not found: \"nope\"");
+    }
+
+    #[test]
+    fn find_overrides_rejects_unresolved_base_and_returns_contested_resolved_edge() {
+        let g = locked(graph_with_overrides());
+
+        let missing = find_overrides(&g, true, "MissingBase::Foo", None, None, NO_BYTE_BUDGET);
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            body_text(&missing),
+            "symbol not found: \"MissingBase::Foo\""
+        );
+
+        let resolved = find_overrides(&g, true, "/base.cpp:Base::Foo", None, None, NO_BYTE_BUDGET);
+        assert!(resolved.is_error.is_none() || resolved.is_error == Some(false));
+        let (rows, total, _, _) = page_parts(&resolved);
+        assert_eq!(total, 1);
+        assert_eq!(rows[0]["symbol_id"], "/derived.cpp:DerivedReal::Foo");
+        assert_eq!(rows[0]["candidates"], 2);
     }
 
     // --- non-callable soft hint -------------------------------------------

@@ -49,3 +49,5 @@ walkdir = { workspace = true }
 insta = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# Full adapter snapshots exercise generated dispatch through an rmcp client.
+rmcp = { workspace = true, features = ["client"] }

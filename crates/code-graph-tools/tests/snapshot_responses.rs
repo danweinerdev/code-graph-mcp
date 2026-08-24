@@ -56,8 +56,14 @@ use code_graph_tools::handlers::symbols::{
 use code_graph_tools::handlers::{ENVELOPE_OVERHEAD_BYTES, NO_BYTE_BUDGET};
 use code_graph_tools::server::ServerInner;
 use code_graph_tools::CodeGraphServer;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolRequestParams, CallToolResult};
+use rmcp::{ClientHandler, ServiceExt};
 use tempfile::TempDir;
+
+#[derive(Clone, Default)]
+struct SnapshotClient;
+
+impl ClientHandler for SnapshotClient {}
 
 // Shared `testdata_cpp_path` and `copy_testdata` live in `tests/common/mod.rs`.
 
@@ -509,6 +515,101 @@ async fn response_get_callees_engine_update() {
     settings_with_path_redaction(&fx.indexed_root).bind(|| {
         insta::assert_json_snapshot!(parsed);
     });
+}
+
+#[tokio::test]
+async fn response_get_callees_rmcp_adapter_candidate_counts() {
+    // This deliberately crosses the complete rmcp adapter: Rust analysis
+    // stamps a sole and a contested call, then generated tool dispatch emits
+    // the actual CallToolResult a client receives.
+    let dir = TempDir::new().expect("candidate-count fixture tempdir");
+    std::fs::write(
+        dir.path().join("main.rs"),
+        "pub fn unique_helper() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    unique_helper() + duplicate_name()\n}\n",
+    )
+    .expect("write main.rs");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "pub fn duplicate_name() -> u32 {\n    10\n}\n",
+    )
+    .expect("write a.rs");
+    std::fs::write(
+        dir.path().join("b.rs"),
+        "pub fn duplicate_name() -> u32 {\n    20\n}\n",
+    )
+    .expect("write b.rs");
+    let indexed_root = code_graph_core::paths::canonicalize(dir.path())
+        .expect("canonicalize candidate-count fixture root");
+
+    let mut registry = LanguageRegistry::new();
+    registry
+        .register(Box::new(RustParser::new().expect("RustParser::new")))
+        .expect("register RustParser");
+    let server = CodeGraphServer::new(registry);
+    let analyzed = analyze_codebase(
+        server.inner.clone(),
+        indexed_root.to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        analyzed.is_error.is_none() || analyzed.is_error == Some(false),
+        "analyze_codebase failed: {analyzed:?}"
+    );
+
+    let caller = format!("{}:caller", indexed_root.join("main.rs").display());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let mut server_task = tokio::spawn(async move {
+        let service = server
+            .serve(server_transport)
+            .await
+            .expect("rmcp server handshake");
+        service.waiting().await.expect("rmcp server service loop");
+    });
+    let client = SnapshotClient
+        .serve(client_transport)
+        .await
+        .expect("rmcp client handshake");
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_callees").with_arguments(
+                serde_json::json!({ "symbol": caller })
+                    .as_object()
+                    .expect("tool arguments object")
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("generated get_callees dispatch");
+
+    let parsed = parsed_sorted(&result);
+    settings_with_path_redaction(&indexed_root).bind(|| {
+        insta::assert_json_snapshot!(parsed);
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(1), client.cancel()).await {
+        Ok(Ok(_reason)) => {}
+        Ok(Err(error)) => {
+            server_task.abort();
+            let _ = server_task.await;
+            panic!("rmcp client cancellation failed: {error}");
+        }
+        Err(_) => {
+            server_task.abort();
+            let _ = server_task.await;
+            panic!("rmcp client cancellation timed out");
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut server_task).await {
+        Ok(joined) => joined.expect("rmcp server task did not panic"),
+        Err(_) => {
+            server_task.abort();
+            let _ = server_task.await;
+            panic!("rmcp server task did not stop after client cancellation");
+        }
+    }
 }
 
 // `sort_chains_by_symbol_id` removed: the handler now sorts the

@@ -469,14 +469,15 @@ pub trait LanguagePlugin: Send + Sync {
     ///
     /// Returns the resolved [`SymbolId`] paired with a [`Confidence`]
     /// tag and the competing-candidate count (FR-48, D-0007):
-    /// [`Confidence::Resolved`] when the lookup had a sole candidate
-    /// (count 1, no ambiguity), [`Confidence::Heuristic`] when the
-    /// resolver picked from N ≥ 2 same-name candidates via the scope
-    /// rule (count N). Plugins that override and have their own
-    /// ambiguity model must produce the same distinction AND the real
-    /// count; an override returning `Resolved`/1 for an ambiguous match
-    /// would defeat both the per-tool `min_confidence` filter and the
-    /// candidate count the reporting tools surface.
+    /// The current default mapping is explicit: a sole candidate returns
+    /// [`Confidence::Resolved`]/1; a scope-heuristic pick from N ≥ 2
+    /// same-name candidates returns [`Confidence::Heuristic`]/N. Overrides
+    /// must return the real, nonzero pre-pick candidate count and choose
+    /// [`Confidence`] from their actual certainty independently. In
+    /// particular, `min_confidence=resolved` filters only by the confidence
+    /// tag, so a future structurally or type-resolved call with candidates=2
+    /// remains admitted. `Resolved`/N is valid only when the resolver
+    /// genuinely disambiguated the target, not merely because it picked one.
     fn resolve_call(
         &self,
         callee: &str,

@@ -590,8 +590,9 @@ mod tests {
     use super::*;
     use code_graph_core::{
         Confidence, DiscoveryConfig, Edge, FileGraph, Language, ParsingConfig, RootConfig, Symbol,
-        SymbolKind,
+        SymbolId, SymbolKind,
     };
+    use code_graph_graph::Graph;
     use code_graph_lang::{LanguagePlugin, LanguageRegistry, ParseError};
     use std::fs;
     use std::path::Path;
@@ -637,6 +638,38 @@ mod tests {
                 symbols,
                 edges: Vec::new(),
             })
+        }
+    }
+
+    /// Simulates a language resolver with enough semantic information to
+    /// disambiguate one target despite multiple same-name candidates.
+    struct SemanticResolverPlugin;
+
+    impl LanguagePlugin for SemanticResolverPlugin {
+        fn id(&self) -> Language {
+            Language::Cpp
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &[".cpp"]
+        }
+
+        fn parse_file(&self, _path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
+            panic!("SemanticResolverPlugin is only used with hand-built file graphs")
+        }
+
+        fn resolve_call(
+            &self,
+            callee: &str,
+            _ctx: &CallContext,
+            index: &SymbolIndex,
+        ) -> Option<(SymbolId, Confidence, u32)> {
+            let candidates = index.by_name.get(&(Language::Cpp, callee.to_string()))?;
+            let selected = candidates
+                .iter()
+                .find(|candidate| candidate.namespace == "selected")?;
+            let count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+            Some((selected.id.clone(), Confidence::Resolved, count))
         }
     }
 
@@ -1038,6 +1071,83 @@ mod tests {
             "multi-candidate match must be marked Heuristic — the per-tool \
              min_confidence filter relies on this"
         );
+    }
+
+    #[test]
+    fn custom_resolver_preserves_resolved_multi_candidate_contract() {
+        fn func_sym(name: &str, file: &str, namespace: &str) -> Symbol {
+            Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                file: file.to_string(),
+                line: 1,
+                column: 0,
+                end_line: 1,
+                signature: format!("void {name}()"),
+                namespace: namespace.to_string(),
+                parent: String::new(),
+                language: Language::Cpp,
+            }
+        }
+
+        let caller_path = "/proj/caller.cpp".to_string();
+        let selected_path = "/proj/selected.cpp".to_string();
+        let other_path = "/proj/other.cpp".to_string();
+        let mut graphs = vec![
+            FileGraph {
+                path: caller_path.clone(),
+                language: Language::Cpp,
+                symbols: vec![func_sym("caller", &caller_path, "")],
+                edges: vec![Edge {
+                    from: format!("{caller_path}:caller"),
+                    to: "helper".to_string(),
+                    kind: EdgeKind::Calls,
+                    file: caller_path.clone(),
+                    line: 2,
+                    confidence: Confidence::Resolved,
+                    candidates: 1,
+                }],
+            },
+            FileGraph {
+                path: selected_path.clone(),
+                language: Language::Cpp,
+                symbols: vec![func_sym("helper", &selected_path, "selected")],
+                edges: vec![],
+            },
+            FileGraph {
+                path: other_path.clone(),
+                language: Language::Cpp,
+                symbols: vec![func_sym("helper", &other_path, "other")],
+                edges: vec![],
+            },
+        ];
+        let mut registry = LanguageRegistry::new();
+        registry
+            .register(Box::new(SemanticResolverPlugin))
+            .expect("register semantic resolver");
+
+        resolve_all_edges(&mut graphs, &registry, &NoopProgressSink);
+
+        let call = &graphs[0].edges[0];
+        assert_eq!(call.to, format!("{selected_path}:helper"));
+        assert_eq!(call.confidence, Confidence::Resolved);
+        assert_eq!(
+            call.candidates, 2,
+            "resolver must report the pre-pick count"
+        );
+
+        let mut graph = Graph::new();
+        for file_graph in graphs {
+            graph.merge_file_graph(file_graph);
+        }
+        let chain = graph.callees(
+            &format!("{caller_path}:caller"),
+            1,
+            Some(Confidence::Resolved),
+        );
+        assert_eq!(chain.len(), 1, "min_confidence filters by tag, not count");
+        assert_eq!(chain[0].symbol_id, format!("{selected_path}:helper"));
+        assert_eq!(chain[0].candidates, 2);
     }
 
     /// A method whose parent carries a generic parameter list (`Page<T>`)
