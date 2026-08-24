@@ -1,9 +1,9 @@
 /**
  * code-graph plugin for OpenCode.ai
  *
- * Registers the code-graph MCP server (a stdio binary) and the skills directory
- * shipped with the package. OpenCode discovers the plugin via the `plugin`
- * array in `opencode.json`; the function exported here is
+ * Registers the code-graph MCP server (a stdio binary) and the skills +
+ * commands directories shipped with the package. OpenCode discovers the plugin
+ * via the `plugin` array in `opencode.json`; the function exported here is
  * called once at startup with the live client + directory and returns a config
  * hook that mutates OpenCode's resolved config in place.
  *
@@ -28,6 +28,7 @@ function resolveDir(name) {
 }
 
 const skillsDir = resolveDir("skills");
+const commandsDir = resolveDir("commands");
 
 // The server is a plain stdio binary. Honour an explicit override, otherwise
 // expect `code-graph-mcp` on PATH.
@@ -54,6 +55,36 @@ const hooks = ({ client, directory } = {}) => {
         config.skills.paths = config.skills.paths || [];
         if (!config.skills.paths.includes(skillsDir)) {
           config.skills.paths.push(skillsDir);
+        }
+      }
+
+      if (commandsDir) {
+        // Current OpenCode expects `command` to be an object of
+        // { [name]: { template, description, ... } } definitions —
+        // a `paths` array fails schema validation at startup.
+        config.command = config.command || {};
+        for (const file of fs.readdirSync(commandsDir)) {
+          if (!file.endsWith(".md")) continue;
+          const raw = fs.readFileSync(path.join(commandsDir, file), "utf8");
+          let name = path.basename(file, ".md");
+          let description;
+          let template = raw;
+          const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+          if (fm) {
+            template = raw.slice(fm[0].length);
+            for (const line of fm[1].split(/\r?\n/)) {
+              const kv = line.match(/^([A-Za-z-]+):\s*(.*)$/);
+              if (!kv) continue;
+              if (kv[1] === "name") name = kv[2].trim();
+              else if (kv[1] === "description") description = kv[2].trim();
+            }
+          }
+          if (!config.command[name]) {
+            config.command[name] = {
+              template,
+              ...(description ? { description } : {}),
+            };
+          }
         }
       }
 
