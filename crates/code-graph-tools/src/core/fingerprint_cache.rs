@@ -19,18 +19,23 @@
 //! decode, or I/O failure is a miss; a corrupt shard is deleted and its
 //! entry recomputed; a failed write is ignored. Concurrent eviction can turn
 //! a hit into a miss, never into a wrong answer.
+//!
+//! Sidecar entries are untrusted, same-local-user project state (D-0014), not
+//! a cross-account security boundary. Static symlink/reparse and special-file
+//! entries are rejected before use. Safe portable Rust cannot hold every path
+//! component stable between metadata inspection and a later filesystem call,
+//! so a same-user concurrent replacement race remains best-effort only; the
+//! cache's miss/no-op behavior keeps that race non-authoritative.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, FileType, Metadata, OpenOptions};
 use std::hash::Hasher;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(debug_assertions)]
-use std::sync::Mutex;
 
 use code_graph_lang::FingerprintMode;
 use serde::{Deserialize, Serialize};
@@ -44,6 +49,47 @@ const LOW_WATER_BYTES: u64 = 192 * 1024 * 1024;
 const HIGH_WATER_SHARDS: usize = 100_000;
 const LOW_WATER_SHARDS: usize = 75_000;
 const MAINTENANCE_WRITE_INTERVAL: u64 = 256;
+/// A shard holds one short framed key and one cached outcome. One MiB leaves
+/// ample room for valid keys while preventing a cache file from driving an
+/// unbounded allocation before JSON deserialization.
+const MAX_SHARD_BYTES: u64 = 1024 * 1024;
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct CacheRootState {
+    maintenance_opened: AtomicBool,
+    successful_writes: AtomicU64,
+    #[cfg(test)]
+    maintenance_scans: AtomicU64,
+}
+
+impl CacheRootState {
+    fn new() -> Self {
+        Self {
+            maintenance_opened: AtomicBool::new(false),
+            successful_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            maintenance_scans: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Sidecar lifecycle state is shared by every history request for one
+/// canonical project root. Keeping the `Arc` in this process-wide map makes
+/// both open-time recovery and the successful-write cadence root-wide rather
+/// than request-local.
+static CACHE_ROOT_STATES: OnceLock<Mutex<HashMap<PathBuf, Arc<CacheRootState>>>> = OnceLock::new();
+
+fn cache_root_state(root: &Path) -> Arc<CacheRootState> {
+    let mut states = CACHE_ROOT_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    Arc::clone(
+        states
+            .entry(root.to_path_buf())
+            .or_insert_with(|| Arc::new(CacheRootState::new())),
+    )
+}
 
 /// One cached answer: the symbol's fingerprint at a revision, or a
 /// tombstone recording that the symbol was **absent** at that revision.
@@ -223,9 +269,10 @@ const DEFAULT_LIMITS: MaintenanceLimits = MaintenanceLimits {
 /// reads but remain eligible for lifecycle trimming.
 #[derive(Clone)]
 pub struct FingerprintCache {
+    project_root: Option<PathBuf>,
     directory: PathBuf,
     protected_shards: Arc<HashSet<PathBuf>>,
-    successful_writes: Arc<AtomicU64>,
+    root_state: Arc<CacheRootState>,
     limits: MaintenanceLimits,
 }
 
@@ -311,13 +358,24 @@ impl FingerprintCache {
     /// pass the current walk's shard paths so its own entries are not pruned.
     /// The directory is still created lazily on the first write.
     pub fn open(project_root: &Path, protected_shards: HashSet<PathBuf>) -> Self {
+        let project_root = fs::canonicalize(project_root)
+            .ok()
+            .filter(|root| is_safe_directory(root));
+        let root_state = project_root
+            .as_deref()
+            .map(cache_root_state)
+            .unwrap_or_else(|| Arc::new(CacheRootState::new()));
         let cache = Self {
-            directory: project_root.join(".code-graph").join("fingerprints"),
+            directory: project_root
+                .as_deref()
+                .map(|root| root.join(".code-graph").join("fingerprints"))
+                .unwrap_or_default(),
+            project_root,
             protected_shards: Arc::new(protected_shards),
-            successful_writes: Arc::new(AtomicU64::new(0)),
+            root_state,
             limits: DEFAULT_LIMITS,
         };
-        cache.maintain();
+        cache.maintain_on_open();
         cache
     }
 
@@ -334,10 +392,13 @@ impl FingerprintCache {
         {
             hook();
         }
-        let path = self.directory.join(&key.relative_shard);
+        let path = self.shard_path(key)?;
+        if !self.safe_existing_shard_parent(key.relative_shard()) {
+            return None;
+        }
         let shard = self.read_shard(&path)?;
         if shard.version != SHARD_FORMAT_VERSION || shard.key != key.stored {
-            let _ = std::fs::remove_file(path);
+            remove_regular_file(&path);
             return None;
         }
         Some(Cached::from(&shard.outcome))
@@ -346,7 +407,9 @@ impl FingerprintCache {
     /// Record one entry with an atomic temp+rename publish. Failures are
     /// ignored — the cache is never authoritative.
     pub fn put(&self, key: &FingerprintKey, value: Cached) {
-        let path = self.directory.join(&key.relative_shard);
+        let Some(path) = self.shard_path(key) else {
+            return;
+        };
         let shard = StoredShard {
             version: SHARD_FORMAT_VERSION,
             key: key.stored.clone(),
@@ -355,56 +418,148 @@ impl FingerprintCache {
         let Ok(encoded) = serde_json::to_vec(&shard) else {
             return;
         };
-        let Some(parent) = path.parent() else {
+        let Some(parent) = self.ensure_shard_parent(key.relative_shard()) else {
             return;
         };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
         // Process id alone is not enough: two walks in one process writing
         // the same shard would share a temp path and could publish a torn
         // file (self-healing, but avoidable for the cost of a counter).
-        static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
-        if std::fs::write(&temp, encoded).is_err() {
+        if !self.publish_shard(&path, &parent, &temp, &encoded) {
             return;
         }
-        if std::fs::rename(&temp, &path).is_err() {
-            let _ = std::fs::remove_file(&temp);
-            return;
-        }
-        let writes = self.successful_writes.fetch_add(1, Ordering::Relaxed) + 1;
+        let writes = self
+            .root_state
+            .successful_writes
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         if writes.is_multiple_of(self.limits.write_interval) {
             self.maintain();
         }
     }
 
     fn read_shard(&self, path: &Path) -> Option<StoredShard> {
-        let bytes = std::fs::read(path).ok()?;
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !is_safe_regular_file(&metadata) || metadata.len() > MAX_SHARD_BYTES {
+            return None;
+        }
+        let file = OpenOptions::new().read(true).open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_SHARD_BYTES {
+            return None;
+        }
+        let capacity = usize::try_from(metadata.len()).ok()?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(MAX_SHARD_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_SHARD_BYTES {
+            return None;
+        }
         match serde_json::from_slice(&bytes) {
             Ok(shard) => Some(shard),
             Err(_) => {
                 // Corrupt shard: delete and recompute rather than error
                 // (AC-46). A failed delete just means another miss later.
-                let _ = std::fs::remove_file(path);
+                remove_regular_file(path);
                 None
             }
         }
     }
 
+    fn shard_path(&self, key: &FingerprintKey) -> Option<PathBuf> {
+        let relative = key.relative_shard();
+        if self.project_root.is_none() || !is_v2_relative_shard(relative) {
+            return None;
+        }
+        Some(self.directory.join(relative))
+    }
+
+    fn ensure_shard_parent(&self, relative: &Path) -> Option<PathBuf> {
+        if !is_v2_relative_shard(relative) {
+            return None;
+        }
+        let root = self.project_root.as_deref()?;
+        if !is_safe_directory(root) {
+            return None;
+        }
+        let code_graph = root.join(".code-graph");
+        let v2 = self.directory.join(SHARD_DIRECTORY);
+        let prefix = relative.parent()?.file_name()?;
+        if !ensure_safe_directory(&code_graph)
+            || !ensure_safe_directory(&self.directory)
+            || !ensure_safe_directory(&v2)
+        {
+            return None;
+        }
+        let parent = v2.join(prefix);
+        ensure_safe_directory(&parent).then_some(parent)
+    }
+
+    fn safe_existing_shard_parent(&self, relative: &Path) -> bool {
+        let Some(prefix) = relative.parent().and_then(Path::file_name) else {
+            return false;
+        };
+        self.safe_shard_parent(&self.directory.join(SHARD_DIRECTORY).join(prefix))
+    }
+
+    fn safe_shard_parent(&self, parent: &Path) -> bool {
+        let v2 = self.directory.join(SHARD_DIRECTORY);
+        self.safe_existing_cache_directory()
+            && parent.parent() == Some(v2.as_path())
+            && is_safe_directory(&v2)
+            && is_safe_directory(parent)
+    }
+
+    /// Publish one already-encoded shard through a unique, exclusively
+    /// created sibling temporary. `temp` must be a sibling of `path` so this
+    /// remains an atomic replacement on supported filesystems.
+    fn publish_shard(&self, path: &Path, parent: &Path, temp: &Path, encoded: &[u8]) -> bool {
+        if temp.parent() != Some(parent)
+            || !self.safe_shard_parent(parent)
+            || !is_regular_file_or_missing(path)
+        {
+            return false;
+        }
+        let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(temp) else {
+            // `create_new` refuses an existing temporary entry, including a
+            // planted symlink, without opening or truncating its target.
+            return false;
+        };
+        if file.write_all(encoded).is_err() || file.flush().is_err() {
+            drop(file);
+            remove_regular_file(temp);
+            return false;
+        }
+        drop(file);
+        if !self.safe_shard_parent(parent) || !is_regular_file_or_missing(path) {
+            remove_regular_file(temp);
+            return false;
+        }
+        if fs::rename(temp, path).is_err() {
+            remove_regular_file(temp);
+            return false;
+        }
+        true
+    }
+
+    fn maintain_on_open(&self) {
+        if !self
+            .root_state
+            .maintenance_opened
+            .swap(true, Ordering::AcqRel)
+        {
+            self.maintain();
+        }
+    }
+
     fn maintain(&self) {
-        if !is_real_directory(&self.directory) {
+        if !self.safe_existing_cache_directory() {
             return;
         }
         let lock_path = self.directory.join(MAINTENANCE_LOCK);
-        let Ok(lock) = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
-        else {
+        let Some(lock) = open_maintenance_lock(&lock_path) else {
             return;
         };
         if lock.try_lock().is_err() {
@@ -414,7 +569,20 @@ impl FingerprintCache {
         let _ = lock.unlock();
     }
 
+    fn safe_existing_cache_directory(&self) -> bool {
+        let Some(root) = self.project_root.as_deref() else {
+            return false;
+        };
+        is_safe_directory(root)
+            && is_safe_directory(&root.join(".code-graph"))
+            && is_safe_directory(&self.directory)
+    }
+
     fn maintain_locked(&self) {
+        #[cfg(test)]
+        self.root_state
+            .maintenance_scans
+            .fetch_add(1, Ordering::Relaxed);
         let mut shards = Vec::new();
         collect_completed_shards(&self.directory, &mut shards);
         let mut total_bytes = shards
@@ -437,7 +605,7 @@ impl FingerprintCache {
             if self.protected_shards.contains(&shard.relative) {
                 continue;
             }
-            if std::fs::remove_file(&shard.path).is_ok() {
+            if remove_regular_file(&shard.path) {
                 total_bytes = total_bytes.saturating_sub(shard.bytes);
                 total_shards = total_shards.saturating_sub(1);
             }
@@ -450,16 +618,21 @@ impl FingerprintCache {
             );
         }
     }
+
+    #[cfg(test)]
+    fn maintenance_scan_count(&self) -> u64 {
+        self.root_state.maintenance_scans.load(Ordering::Relaxed)
+    }
 }
 
 /// Enumerate only the two recognized completed-shard layouts: legacy v1
-/// `??.json` files at the sidecar root and v2 `??/<hash>.json` files. A
-/// bounded two-level scan avoids following arbitrary directory trees, and
-/// every traversed directory/file must be a real entry rather than a symlink.
+/// `??.json` files at the sidecar root and v2 `??/<hash>.json` files. The
+/// scan never recurses into arbitrary directory trees, and every traversed
+/// directory/file must be a real entry rather than a symlink or reparse point.
 fn collect_completed_shards(root: &Path, output: &mut Vec<CompletedShard>) {
     collect_shard_files(root, root, is_legacy_shard_name, output);
     let v2 = root.join(SHARD_DIRECTORY);
-    if !is_real_directory(&v2) {
+    if !is_safe_directory(&v2) {
         return;
     }
     let Ok(prefixes) = std::fs::read_dir(&v2) else {
@@ -467,7 +640,7 @@ fn collect_completed_shards(root: &Path, output: &mut Vec<CompletedShard>) {
     };
     for prefix in prefixes.flatten() {
         let path = prefix.path();
-        if !is_hex_name(&prefix.file_name(), 2) || !is_real_directory(&path) {
+        if !is_hex_name(&prefix.file_name(), 2) || !is_safe_directory(&path) {
             continue;
         }
         collect_shard_files(root, &path, is_v2_shard_name, output);
@@ -488,10 +661,13 @@ fn collect_shard_files(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_file() || !accepts_name(&entry.file_name()) {
+        if !is_safe_regular_file_type(&file_type) || !accepts_name(&entry.file_name()) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !is_safe_regular_file(&metadata) {
             continue;
         };
         let Ok(relative) = path.strip_prefix(root).map(Path::to_path_buf) else {
@@ -506,10 +682,97 @@ fn collect_shard_files(
     }
 }
 
-fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_dir())
+fn ensure_safe_directory(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => is_safe_directory_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).is_ok()
+                && fs::symlink_metadata(path)
+                    .map(|metadata| is_safe_directory_metadata(&metadata))
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_safe_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| is_safe_directory_metadata(&metadata))
         .unwrap_or(false)
+}
+
+fn is_safe_directory_metadata(metadata: &Metadata) -> bool {
+    let file_type = metadata.file_type();
+    file_type.is_dir() && !is_link_or_reparse(metadata)
+}
+
+fn is_safe_regular_file(metadata: &Metadata) -> bool {
+    metadata.file_type().is_file() && !is_link_or_reparse(metadata)
+}
+
+fn is_safe_regular_file_type(file_type: &FileType) -> bool {
+    file_type.is_file() && !file_type.is_symlink()
+}
+
+fn is_regular_file_or_missing(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => is_safe_regular_file(&metadata),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn remove_regular_file(path: &Path) -> bool {
+    if !is_regular_file_or_missing(path) {
+        return false;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn open_maintenance_lock(path: &Path) -> Option<std::fs::File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_safe_regular_file(&metadata) => {
+            OpenOptions::new().read(true).write(true).open(path).ok()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .ok(),
+        _ => None,
+    }
+}
+
+fn is_v2_relative_shard(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(directory)) = components.next() else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(prefix)) = components.next() else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(file)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && directory == SHARD_DIRECTORY
+        && is_hex_name(prefix, 2)
+        && is_v2_shard_name(file)
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
 }
 
 fn is_legacy_shard_name(name: &std::ffi::OsStr) -> bool {
@@ -570,12 +833,9 @@ mod tests {
         protected_shards: HashSet<PathBuf>,
         limits: MaintenanceLimits,
     ) -> FingerprintCache {
-        let cache = FingerprintCache {
-            directory: root.path().join(".code-graph").join("fingerprints"),
-            protected_shards: Arc::new(protected_shards),
-            successful_writes: Arc::new(AtomicU64::new(0)),
-            limits,
-        };
+        let mut cache = cache(root);
+        cache.protected_shards = Arc::new(protected_shards);
+        cache.limits = limits;
         cache.maintain();
         cache
     }
@@ -787,6 +1047,104 @@ mod tests {
     }
 
     #[test]
+    fn oversized_regular_shard_is_a_prompt_cache_miss_without_deserialization() {
+        let root = TempDir::new().unwrap();
+        let cache = cache(&root);
+        let k = key("abc123", "target", FingerprintMode::Normalized);
+        let path = cache.directory.join(k.relative_shard());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_SHARD_BYTES as usize + 1]).unwrap();
+
+        assert_eq!(cache.get(&k), None);
+        assert!(path.exists(), "an oversized shard is rejected, not decoded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_shard_is_rejected_without_opening_it() {
+        use std::os::unix::net::UnixListener;
+
+        let root = TempDir::new().unwrap();
+        let cache = cache(&root);
+        let k = key("abc123", "target", FingerprintMode::Normalized);
+        let path = cache.directory.join(k.relative_shard());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(cache.get(&k), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a socket shard must be rejected by no-follow metadata inspection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_shard_directory_rejects_reads_and_writes() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let cache = cache(&root);
+        let k = key("abc123", "target", FingerprintMode::Normalized);
+        let relative = k.relative_shard();
+        let prefix = relative.parent().unwrap().file_name().unwrap();
+        let outside_shard = outside.path().join(relative.file_name().unwrap());
+        std::fs::write(&outside_shard, b"outside sentinel").unwrap();
+        let v2 = cache.directory.join(SHARD_DIRECTORY);
+        std::fs::create_dir_all(&v2).unwrap();
+        symlink(outside.path(), v2.join(prefix)).unwrap();
+
+        assert_eq!(cache.get(&k), None, "read must not follow shard directory");
+        cache.put(&k, Cached::Fingerprint(42));
+        assert_eq!(
+            std::fs::read(&outside_shard).unwrap(),
+            b"outside sentinel",
+            "write must not follow shard directory"
+        );
+    }
+
+    #[test]
+    fn publish_requires_an_exclusive_temporary_file() {
+        let root = TempDir::new().unwrap();
+        let cache = cache(&root);
+        let k = key("abc123", "target", FingerprintMode::Normalized);
+        let path = cache.shard_path(&k).unwrap();
+        let parent = cache.ensure_shard_parent(k.relative_shard()).unwrap();
+        let temp = parent.join("fixed.tmp");
+        std::fs::write(&temp, b"preexisting temporary").unwrap();
+
+        assert!(!cache.publish_shard(&path, &parent, &temp, b"replacement"));
+        assert_eq!(std::fs::read(&temp).unwrap(), b"preexisting temporary");
+        assert!(!path.exists(), "an occupied temp cannot publish a shard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_does_not_follow_a_preexisting_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let cache = cache(&root);
+        let k = key("abc123", "target", FingerprintMode::Normalized);
+        let path = cache.shard_path(&k).unwrap();
+        let parent = cache.ensure_shard_parent(k.relative_shard()).unwrap();
+        let temp = parent.join("fixed.tmp");
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside sentinel").unwrap();
+        symlink(&sentinel, &temp).unwrap();
+
+        assert!(!cache.publish_shard(&path, &parent, &temp, b"replacement"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside sentinel");
+        assert!(
+            temp.is_symlink(),
+            "failed publication retains the foreign temp entry"
+        );
+    }
+
+    #[test]
     fn fingerprint_cache_is_independent_of_the_graph_cache() {
         let root = TempDir::new().unwrap();
         let graph_cache = root.path().join(".code-graph-cache.db");
@@ -872,6 +1230,58 @@ mod tests {
             completed_shards(&cache).len(),
             1,
             "the configured successful-write interval triggers trimming"
+        );
+    }
+
+    #[test]
+    fn repeated_open_scans_each_cache_root_at_most_once_per_process() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join(".code-graph/fingerprints");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("aa.json"), b"legacy shard").unwrap();
+
+        let first = cache(&root);
+        assert_eq!(
+            first.maintenance_scan_count(),
+            1,
+            "first open recovers stale state"
+        );
+        let second = cache(&root);
+        assert_eq!(
+            second.maintenance_scan_count(),
+            1,
+            "later history requests reuse the root-wide open state"
+        );
+    }
+
+    #[test]
+    fn successful_write_maintenance_cadence_is_shared_by_cache_root() {
+        let root = TempDir::new().unwrap();
+        let limits = MaintenanceLimits {
+            high_bytes: u64::MAX,
+            low_bytes: u64::MAX,
+            high_shards: usize::MAX,
+            low_shards: usize::MAX,
+            write_interval: 2,
+        };
+        let mut first = cache(&root);
+        first.limits = limits;
+        first.put(
+            &key("write-1", "target", FingerprintMode::Normalized),
+            Cached::Fingerprint(1),
+        );
+        assert_eq!(first.maintenance_scan_count(), 0);
+
+        let mut second = cache(&root);
+        second.limits = limits;
+        second.put(
+            &key("write-2", "target", FingerprintMode::Normalized),
+            Cached::Fingerprint(2),
+        );
+        assert_eq!(
+            second.maintenance_scan_count(),
+            1,
+            "the second successful write across two handles triggers maintenance"
         );
     }
 
