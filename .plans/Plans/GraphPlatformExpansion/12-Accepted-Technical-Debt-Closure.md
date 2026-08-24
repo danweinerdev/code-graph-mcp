@@ -54,21 +54,21 @@ tasks:
       cargo test -p code-graph-tools --test candidate_count and cargo test -p code-graph-tools --test watch_virtual_overrides and cargo test -p code-graph-tools --test snapshot_responses and cargo test -p code-graph-tools --test snapshot_tools_list pass; bare unresolved override keys emit no provisional rows, a real candidates>=2 edge is snapshotted through the rmcp adapter, and trait/docs/tests state which confidence/count invariant future language-specific resolve_call overrides must preserve without deriving either signal from the other; make verify passes.
   - id: "12.9"
     title: "Preserve analyze admission through queue compaction"
-    status: planned
+    status: complete
     depends_on: ["12.2"]
     justifies: "FR-02, AC-01, AC-28, and the Phase 12 four-lane review; prevents pending path coverage from bypassing file validation, nested project-root isolation, or configuration provenance."
     verification: >-
       cargo test -p code-graph-tools --lib core::analyze and cargo test -p code-graph-tools --test integration pass; invalid file and malformed-config followers cannot attach to a successful pending ancestor, nested project roots remain distinct, same-project path compaction and progress fan-out remain intact, and make verify passes.
   - id: "12.10"
     title: "Bound and confine fingerprint sidecar I/O"
-    status: planned
+    status: complete
     depends_on: ["12.5"]
     justifies: "FR-37, AC-46, NFR-10, and the Phase 12 four-lane review; prevents cache symlinks, special files, oversized shards, and per-request full-cache scans from escaping the sidecar's non-authoritative bounded-work contract."
     verification: >-
       cargo test -p code-graph-tools --lib core::fingerprint_cache and cargo test -p code-graph-tools --test symbol_history pass; shard reads are regular-file-only and byte-bounded, cache writes fail closed on symlinked components, maintenance retains open-time crash recovery without an O(total-shards) scan on every history request, cross-process eviction remains harmless, and make verify passes.
   - id: "12.11"
     title: "Make CLI table wrapping grapheme-safe"
-    status: planned
+    status: complete
     depends_on: ["12.6"]
     justifies: "FR-18, FR-19, AC-10, and the Phase 12 four-lane review; prevents display-width wrapping from splitting ZWJ emoji and other extended grapheme clusters."
     verification: >-
@@ -359,11 +359,11 @@ Do not globally drop unresolved Calls from storage: scoped cache growth delibera
 
 ## 12.9: Preserve analyze admission through queue compaction
 ### Subtasks
-- [ ] Probe and retain the full admission result for every synchronous and asynchronous analyze request before it can attach to pending work.
-- [ ] Reject invalid file and malformed-config followers instead of aliasing them to a successful pending ancestor.
-- [ ] Compact ancestor/descendant requests only when their discovered project roots match; a nested `.code-graph.toml` remains a separate canonical job.
-- [ ] Preserve same-project force OR, FIFO replacement, alias resolution, queue capacity, and synchronous progress-sink fan-out.
-- [ ] Add deterministic pending-parent regressions for file, malformed-config, nested-project, daemon-root, and valid same-project descendants.
+- [x] Probe and retain the full admission result for every synchronous and asynchronous analyze request before it can attach to pending work.
+- [x] Reject invalid file and malformed-config followers instead of aliasing them to a successful pending ancestor.
+- [x] Compact ancestor/descendant requests only when their discovered project roots match; a nested `.code-graph.toml` remains a separate canonical job.
+- [x] Preserve same-project force OR, FIFO replacement, alias resolution, queue capacity, and synchronous progress-sink fan-out.
+- [x] Add deterministic pending-parent regressions for file, malformed-config, nested-project, daemon-root, and valid same-project descendants.
 
 ### Notes
 Revision boundary: path compaction remains a same-project optimization and can no longer change whether an individual request is valid or which project/configuration owns it.
@@ -373,15 +373,30 @@ Do not compact against the running job, and do not change async invalid-request 
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`
+- Focused review: `git show 4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): clean detached task commit passed clippy with warnings denied, formatting, all workspace tests, snapshot cleanliness, and plugin-sync checks.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted tests and independent focused review` | `task 12.9 implementation at 4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e` | PASS | `PASS/Aligned: 24 core::analyze tests and 8 integration tests passed; invalid admissions remained distinct while same-project compaction, aliases, FIFO, force OR, capacity, and progress fan-out remained intact; quality review found no issues.` |
 
 ## 12.10: Bound and confine fingerprint sidecar I/O
 ### Subtasks
-- [ ] Treat every sidecar path as untrusted state: reject symlinked/reparse components and non-regular shard files on reads and writes without following them outside the cache.
-- [ ] Bound shard reads before allocation/deserialization and make FIFO/device/special-file entries prompt cache misses rather than blocking workers.
-- [ ] Publish through exclusively created temporary files and preserve atomic replacement, corruption-as-miss, and cross-process harmless-eviction behavior.
-- [ ] Retain a best-effort maintenance pass at sidecar open for crash/restart recovery, but run it at most once per cache root per process instead of scanning all shards on every history request; keep the 256-write trigger.
-- [ ] Add direct read/write symlink, special-file, oversized-shard, and repeated-open scan-count regressions within the same-local-user threat model.
+- [x] Treat every sidecar path as untrusted state: reject symlinked/reparse components and non-regular shard files on reads and writes without following them outside the cache.
+- [x] Bound shard reads before allocation/deserialization and make FIFO/device/special-file entries prompt cache misses rather than blocking workers.
+- [x] Publish through exclusively created temporary files and preserve atomic replacement, corruption-as-miss, and cross-process harmless-eviction behavior.
+- [x] Retain a best-effort maintenance pass at sidecar open for crash/restart recovery, but run it at most once per cache root per process instead of scanning all shards on every history request; keep the 256-write trigger.
+- [x] Add direct read/write symlink, special-file, oversized-shard, and repeated-open scan-count regressions within the same-local-user threat model.
 
 ### Notes
 Revision boundary: the disposable sidecar remains non-authoritative and self-healing, while every individual operation is byte-bounded and cache-root-confined and ordinary repeated history reads are not O(total shards).
@@ -391,20 +406,50 @@ Do not promote the cache to an authoritative error source or claim a cross-accou
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
+- Focused review: `git show 251214e7c8abaa1f64a9e976bfd5f51f774d9791`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): clean detached task commit passed clippy with warnings denied, formatting, all workspace tests, snapshot cleanliness, and plugin-sync checks.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted tests and focused review` | `task 12.10 implementation at 251214e7c8abaa1f64a9e976bfd5f51f774d9791` | PASS | `PASS/Aligned: 26 fingerprint-cache tests and 17 symbol-history tests passed; static symlink/reparse and special-file entries fail closed, reads are capped at 1 MiB, publication is exclusive and atomic, open scans are once per root, and eviction remains a harmless miss. Review residuals are governed by the same-user scope and task 12.8 native Windows gate.` |
 
 ## 12.11: Make CLI table wrapping grapheme-safe
 ### Subtasks
-- [ ] Wrap table cells and headers by extended grapheme cluster rather than Unicode scalar while retaining display-width accounting and explicit newline handling.
-- [ ] Add ZWJ emoji, combining-sequence-at-boundary, CJK, and hard-width-cap regressions.
-- [ ] Keep JSON/machine output and non-table text rendering byte-identical.
+- [x] Wrap table cells and headers by extended grapheme cluster rather than Unicode scalar while retaining display-width accounting and explicit newline handling.
+- [x] Add ZWJ emoji, combining-sequence-at-boundary, CJK, and hard-width-cap regressions.
+- [x] Keep JSON/machine output and non-table text rendering byte-identical.
 
 ### Notes
 Revision boundary: human tables remain bounded and display-width aligned without splitting a user-perceived character across lines.
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
+- Focused review: `git show cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): clean detached task commit passed clippy with warnings denied, formatting, all workspace tests, snapshot cleanliness, and plugin-sync checks.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted tests and independent focused review` | `task 12.11 implementation at cd3eb76da4a487fc0f047a778a1d40ac47b84cb0` | PASS | `PASS/Aligned: 13 CLI unit tests, 6 command tests, and 6 parity tests passed; CJK, combining sequences, ZWJ emoji, LF, CR, and CRLF preserve grapheme and table-row boundaries while machine payloads remain byte-identical. Fresh final review found no issues.` |
 
 ## 12.8: Pin residual Windows path, ACL, shutdown, and dogfood behavior
 ### Subtasks
