@@ -752,6 +752,16 @@ fn no_inherits_edges_for_classes_without_bases() {
 /// When the pinned submodule SHA is bumped, the symbol count will
 /// usually drift. Re-measure and update `requests-baseline.txt` in the
 /// same commit as the SHA bump.
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 #[test]
 fn requests_dogfood_baseline_within_ten_percent() {
     let requests_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -762,11 +772,11 @@ fn requests_dogfood_baseline_within_ten_percent() {
         .join("src")
         .join("requests");
     if !requests_root.is_dir() {
-        eprintln!(
-            "skipping requests dogfood baseline test: \
+        dogfood_skip_or_fail(
+            "requests dogfood baseline test: \
              external/requests/src/requests not present — run `git \
              submodule update --init external/requests` (or `make \
-             submodules`) to opt in"
+             submodules`) to opt in",
         );
         return;
     }

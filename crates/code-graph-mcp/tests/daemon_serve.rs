@@ -75,7 +75,8 @@ impl DaemonChild {
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon child {} did not exit",
+                "daemon child {} did not exit within {READY_TIMEOUT:?}; \
+                 process still running at timeout",
                 self.pid()
             );
             thread::sleep(Duration::from_millis(10));
@@ -208,16 +209,40 @@ fn kill_unclean(child: &mut DaemonChild) {
     child.wait();
 }
 
+/// Last-observed runtime control-file state for shutdown diagnostics
+/// (task 12.8): names which control files remain when a bounded wait times
+/// out, instead of a bare boolean assertion.
+fn runtime_control_state(root: &std::path::Path) -> String {
+    let runtime = root.join(".code-graph");
+    [
+        "daemon.lock",
+        "daemon.json",
+        "secret",
+        "shutdown.request",
+        "shutdown.ack",
+    ]
+    .iter()
+    .map(|name| format!("{name}={}", runtime.join(name).exists()))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 fn wait_for_cleanup(root: &std::path::Path) {
     let runtime = root.join(".code-graph");
     let deadline = Instant::now() + READY_TIMEOUT;
     while runtime.join("daemon.lock").exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(!runtime.join("daemon.lock").exists(), "daemon lock cleanup");
+    assert!(
+        !runtime.join("daemon.lock").exists(),
+        "daemon lock cleanup timed out after {READY_TIMEOUT:?}; \
+         last observed control-file state: {}",
+        runtime_control_state(root)
+    );
     assert!(
         !runtime.join("daemon.json").exists(),
-        "daemon metadata cleanup"
+        "daemon metadata cleanup; last observed control-file state: {}",
+        runtime_control_state(root)
     );
 }
 
@@ -522,6 +547,60 @@ fn simultaneous_contenders_recover_one_stale_lock() {
     assert!(!runtime.join("daemon.lock").exists(), "lock cleanup");
 }
 
+/// The invoking user's SID via `whoami /user /fo csv /nh` — the same
+/// unambiguous machine identity the daemon's grant path uses, derived
+/// independently here so the test does not trust the code under test.
+#[cfg(windows)]
+fn invoking_user_sid() -> String {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("run whoami /user");
+    assert!(output.status.success(), "whoami /user succeeds");
+    // /fo csv /nh emits one line: "domain\user","S-1-5-21-…"
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .trim()
+        .rsplit(',')
+        .next()
+        .expect("whoami csv SID field")
+        .trim()
+        .trim_matches('"')
+        .to_owned();
+    assert!(sid.starts_with("S-1-"), "whoami /user yields a SID: {text}");
+    sid
+}
+
+/// Save the runtime directory's DACL with `icacls /save` and return the
+/// SDDL line. The saved file is UTF-16LE (with BOM); its first line names
+/// the saved path and the second carries the SDDL string.
+#[cfg(windows)]
+fn saved_runtime_dir_sddl(runtime_dir: &std::path::Path, save_dir: &std::path::Path) -> String {
+    let aclfile = save_dir.join("dacl-save.txt");
+    let output = Command::new("icacls")
+        .arg(runtime_dir)
+        .arg("/save")
+        .arg(&aclfile)
+        .output()
+        .expect("run icacls /save against the daemon runtime directory");
+    assert!(
+        output.status.success(),
+        "icacls /save succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(&aclfile).expect("read icacls-saved ACL file");
+    let utf16: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16(&utf16).expect("decode UTF-16LE ACL file");
+    text.lines()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .find(|line| line.starts_with("D:"))
+        .unwrap_or_else(|| panic!("icacls-saved ACL file has no SDDL line: {text:?}"))
+        .to_owned()
+}
+
 /// Phase 11.2 security check: the daemon's runtime directory DACL must be
 /// restricted to the invoking user. `restrict_windows_runtime_dir` strips
 /// inheritance and grants exactly one principal, so the `icacls` listing
@@ -569,6 +648,37 @@ fn runtime_directory_dacl_is_restricted_to_the_invoking_user() {
     assert!(
         listing.to_lowercase().contains(&username.to_lowercase()),
         "the single grant must name the invoking user {username}: {listing}"
+    );
+
+    // Task 12.8: exact-SID validation against an icacls-saved SDDL ACE.
+    // The summary listing above is localized, account-name-based text; the
+    // saved SDDL string is the unambiguous machine form — require exactly
+    // one full-control allow ACE whose SID exactly matches `whoami /user`.
+    let sid = invoking_user_sid();
+    let sddl = saved_runtime_dir_sddl(&root.0.join(".code-graph"), &root.0);
+    let aces: Vec<&str> = sddl
+        .split('(')
+        .skip(1)
+        .map(|ace| ace.trim_end_matches(')'))
+        .collect();
+    assert_eq!(
+        aces.len(),
+        1,
+        "exactly one ACE in the runtime dir DACL SDDL: {sddl}"
+    );
+    let fields: Vec<&str> = aces[0].split(';').collect();
+    assert!(
+        fields.len() >= 6,
+        "SDDL ACE has the six standard fields: {sddl}"
+    );
+    assert_eq!(fields[0], "A", "the single ACE is an allow ACE: {sddl}");
+    assert_eq!(
+        fields[2], "FA",
+        "the single ACE grants full control: {sddl}"
+    );
+    assert_eq!(
+        fields[5], sid,
+        "the ACE SID exactly matches the invoking user's `whoami /user` SID: {sddl}"
     );
 
     stop_owned_daemon(&root.0, &metadata);

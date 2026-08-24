@@ -927,6 +927,16 @@ fn no_inherits_edges_for_classes_without_bases() {
 /// When the pinned submodule SHA is bumped, the symbol count will
 /// usually drift. Re-measure and update `commons-lang-baseline.txt` in
 /// the same commit as the SHA bump.
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 #[test]
 fn commons_lang_dogfood_baseline_within_ten_percent() {
     let commons_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -938,11 +948,11 @@ fn commons_lang_dogfood_baseline_within_ten_percent() {
         .join("main")
         .join("java");
     if !commons_root.is_dir() {
-        eprintln!(
-            "skipping commons-lang dogfood baseline test: \
+        dogfood_skip_or_fail(
+            "commons-lang dogfood baseline test: \
              external/commons-lang/src/main/java not present — run \
              `git submodule update --init external/commons-lang` (or \
-             `make submodules`) to opt in"
+             `make submodules`) to opt in",
         );
         return;
     }

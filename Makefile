@@ -3,7 +3,7 @@
 
 .PHONY: build release test lint fmt fmt-check clean verify leak-scan \
 	snapshot-clean snapshot-accept snapshot-audit install-hooks submodules \
-	plugin-sync plugin-sync-check \
+	dogfood-required plugin-sync plugin-sync-check \
 	rust-build rust-test rust-lint rust-fmt rust-fmt-check rust-clean
 
 # Default `build` is a host-target release build of the binary crate.
@@ -164,6 +164,27 @@ snapshot-audit:
 submodules:
 	@git submodule update --init --depth 1 external/
 	@echo "✓ External submodules initialized — dogfood tests will now run."
+
+# Dogfood gate (task 12.8): preflight every pinned dogfood checkout, then
+# run all eight baselines with CODE_GRAPH_DOGFOOD_REQUIRED=1, which
+# promotes any baseline auto-skip to a hard test failure. Run after
+# `make submodules`; fails fast with the missing submodule named when a
+# checkout is absent or empty.
+DOGFOOD_SUBMODULES := ripgrep logrus requests fmt curl abseil-cpp efcore commons-lang
+
+dogfood-required:
+	@for repo in $(DOGFOOD_SUBMODULES); do \
+		if [ ! -d "external/$$repo" ] || [ -z "$$(ls -A "external/$$repo" 2>/dev/null | grep -v '^\.git$$')" ]; then \
+			echo "✗ dogfood-required: external/$$repo is not initialized — run 'make submodules' first"; \
+			exit 1; \
+		fi; \
+	done
+	@echo ">>> dogfood-required: 8 pinned checkouts present; running baselines (auto-skip promoted to failure)"
+	@CODE_GRAPH_DOGFOOD_REQUIRED=1 cargo test \
+		-p code-graph-lang-cpp -p code-graph-lang-rust -p code-graph-lang-go \
+		-p code-graph-lang-python -p code-graph-lang-csharp -p code-graph-lang-java \
+		--test corpus -- dogfood_baseline_within_ten_percent
+	@echo "✓ dogfood-required: executed 8, passed 8, failed 0 (cargo fails this target on any failure or promoted skip)"
 
 # One-time setup: point git at the tracked hook scripts under
 # scripts/hooks/ so pre-commit checks fire on every commit. Run this

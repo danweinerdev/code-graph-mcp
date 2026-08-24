@@ -104,6 +104,20 @@ impl DaemonChild {
             std::thread::sleep(Duration::from_millis(20));
         }
         if self.child.try_wait().ok().flatten().is_none() {
+            // Bounded-shutdown diagnostic (task 12.8): name the last
+            // observed process/control-file state before the hard kill so
+            // a timed-out graceful stop is attributable.
+            let runtime = self.root.join(".code-graph");
+            eprintln!(
+                "daemon child {} did not exit within {READY_TIMEOUT:?} after a graceful \
+                 stop request; killing. Last observed control-file state: \
+                 daemon.json={}, daemon.lock={}, shutdown.request={}, shutdown.ack={}",
+                self.child.id(),
+                self.metadata_path.exists(),
+                runtime.join("daemon.lock").exists(),
+                runtime.join("shutdown.request").exists(),
+                runtime.join("shutdown.ack").exists(),
+            );
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

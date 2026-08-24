@@ -599,6 +599,16 @@ fn walk_collect_rust(dir: &Path, out: &mut Vec<PathBuf>) {
 /// baseline panics. When the pinned submodule SHA is bumped, the symbol
 /// count will usually drift — re-measure and update the baseline in the
 /// same commit as the SHA bump.
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 #[test]
 fn ripgrep_dogfood_baseline_within_ten_percent() {
     let ripgrep_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -608,11 +618,11 @@ fn ripgrep_dogfood_baseline_within_ten_percent() {
         .join("ripgrep")
         .join("crates");
     if !ripgrep_root.is_dir() {
-        eprintln!(
-            "skipping ripgrep dogfood baseline test: \
+        dogfood_skip_or_fail(
+            "ripgrep dogfood baseline test: \
              external/ripgrep/crates not present — run `git submodule \
              update --init external/ripgrep` (or `make submodules`) to \
-             opt in"
+             opt in",
         );
         return;
     }

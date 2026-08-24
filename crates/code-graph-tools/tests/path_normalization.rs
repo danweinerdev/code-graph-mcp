@@ -513,3 +513,71 @@ async fn four_file_taking_tools_resolve_dot_segment_paths() {
          generate_diagram(file=…)",
     );
 }
+
+/// Task 12.8 NTFS casing pin: mixed casing of an EXISTING file converges to
+/// one canonical graph key. `normalize_user_path` canonicalizes existing
+/// paths to their on-disk casing before any graph lookup, so a re-cased
+/// spelling of an indexed file must return byte-identical results to the
+/// stored spelling.
+///
+/// Explicit KNOWN LIMITATION (documented, deliberately unpinned): a
+/// NONEXISTENT path — and a remove-event path, which normalizes via lexical
+/// `paths::simplify` — cannot be case-folded against the disk, so two
+/// casings of a not-yet-existing file remain distinct `PathTrie` keys in
+/// principle. The operative protection is canonicalize-at-boundary for
+/// paths that exist; see CLAUDE.md "NTFS case-insensitivity".
+#[cfg(windows)]
+#[tokio::test]
+async fn file_taking_tools_converge_mixed_casing_to_one_graph_key() {
+    let fx = build_indexed().await;
+
+    let recased = fx.main_cpp.replace(r"\src\main.cpp", r"\SRC\MAIN.CPP");
+    assert_ne!(
+        recased, fx.main_cpp,
+        r"fixture path must end in src\main.cpp for the re-casing to apply: {:?}",
+        fx.main_cpp
+    );
+
+    let original = get_file_symbols(
+        &fx.inner.graph,
+        true,
+        &fx.main_cpp,
+        false,
+        true,
+        None,
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
+    let recased_result = get_file_symbols(
+        &fx.inner.graph,
+        true,
+        &recased,
+        false,
+        true,
+        None,
+        None,
+        false,
+        NO_BYTE_BUDGET,
+    );
+    assert!(
+        recased_result.is_error.is_none() || recased_result.is_error == Some(false),
+        "get_file_symbols: re-cased existing path {recased:?} must resolve; got: {recased_result:?}",
+    );
+    let original_body = first_text(&original);
+    let recased_body = first_text(&recased_result);
+    assert_eq!(
+        original_body, recased_body,
+        "re-cased spelling of an existing indexed file must hit the SAME \
+         canonical graph key and return byte-identical results"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&recased_body).expect("get_file_symbols returns Page JSON");
+    assert!(
+        !parsed["results"]
+            .as_array()
+            .expect("results array")
+            .is_empty(),
+        "re-cased lookup must return the indexed symbols, not an empty page: {parsed:?}"
+    );
+}

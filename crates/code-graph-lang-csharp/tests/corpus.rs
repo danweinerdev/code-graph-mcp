@@ -762,6 +762,16 @@ fn namespace_is_populated_for_declarations_inside_namespace_block() {
 /// When the pinned submodule SHA is bumped, the symbol count will
 /// usually drift. Re-measure and update `efcore-baseline.txt` in the
 /// same commit as the SHA bump.
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 #[test]
 fn efcore_dogfood_baseline_within_ten_percent() {
     let efcore_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -772,11 +782,11 @@ fn efcore_dogfood_baseline_within_ten_percent() {
         .join("src")
         .join("EFCore");
     if !efcore_root.is_dir() {
-        eprintln!(
-            "skipping efcore dogfood baseline test: \
+        dogfood_skip_or_fail(
+            "efcore dogfood baseline test: \
              external/efcore/src/EFCore not present — run `git \
              submodule update --init external/efcore` (or `make \
-             submodules`) to opt in"
+             submodules`) to opt in",
         );
         return;
     }

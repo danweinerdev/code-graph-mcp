@@ -662,6 +662,16 @@ fn two_init_functions_coexist_in_distinct_packages() {
 /// When the pinned submodule SHA is bumped, the symbol count will
 /// usually drift. Re-measure and update `logrus-baseline.txt` in the
 /// same commit as the SHA bump.
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 #[test]
 fn logrus_dogfood_baseline_within_ten_percent() {
     let logrus_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -680,10 +690,10 @@ fn logrus_dogfood_baseline_within_ten_percent() {
             })
             .unwrap_or(true)
     {
-        eprintln!(
-            "skipping logrus dogfood baseline test: external/logrus is \
+        dogfood_skip_or_fail(
+            "logrus dogfood baseline test: external/logrus is \
              not initialized — run `git submodule update --init \
-             external/logrus` (or `make submodules`) to opt in"
+             external/logrus` (or `make submodules`) to opt in",
         );
         return;
     }

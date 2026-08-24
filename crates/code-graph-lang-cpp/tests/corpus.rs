@@ -713,6 +713,16 @@ fn read_baseline_count(name: &str) -> usize {
         })
 }
 
+/// Under `make dogfood-required` (`CODE_GRAPH_DOGFOOD_REQUIRED` set
+/// non-empty) an uninitialized dogfood submodule is a hard failure instead
+/// of a silent auto-skip, so the gate cannot pass vacuously.
+fn dogfood_skip_or_fail(message: &str) {
+    if std::env::var_os("CODE_GRAPH_DOGFOOD_REQUIRED").is_some_and(|v| !v.is_empty()) {
+        panic!("CODE_GRAPH_DOGFOOD_REQUIRED is set but the baseline cannot run: {message}");
+    }
+    eprintln!("skipping {message}");
+}
+
 fn dogfood_within_ten_percent(repo_name: &str, source_subpath: Option<&str>) {
     let mut root = external_repo(repo_name);
     if let Some(sub) = source_subpath {
@@ -727,11 +737,11 @@ fn dogfood_within_ten_percent(repo_name: &str, source_subpath: Option<&str>) {
         .map(|mut it| it.next().is_none())
         .unwrap_or(true);
     if !root.is_dir() || empty {
-        eprintln!(
-            "skipping {repo_name} dogfood baseline test: {root:?} not \
+        dogfood_skip_or_fail(&format!(
+            "{repo_name} dogfood baseline test: {root:?} not \
              present — run `git submodule update --init external/{repo_name}` \
              (or `make submodules`) to opt in"
-        );
+        ));
         return;
     }
 
