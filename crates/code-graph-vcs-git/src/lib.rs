@@ -760,6 +760,101 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+mod canonicalize_allowing_missing_tests {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::canonicalize_allowing_missing;
+
+    #[test]
+    fn missing_tail_reattaches_to_canonical_ancestor() {
+        let dir = TempDir::new().expect("TempDir");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        let canonical_sub = dunce::canonicalize(&sub).expect("canonicalize sub");
+        let missing = sub.join("deleted").join("calculator.rs");
+        assert_eq!(
+            canonicalize_allowing_missing(&missing),
+            canonical_sub.join("deleted").join("calculator.rs"),
+            "a multi-segment missing tail must reattach onto the canonical ancestor"
+        );
+    }
+
+    #[test]
+    fn dot_dot_tail_gives_up_lexically_unchanged() {
+        let dir = TempDir::new().expect("TempDir");
+        // Two missing segments so direct canonicalization fails on every
+        // platform (Windows resolves a trailing `..` under an EXISTING dir
+        // lexically, which would canonicalize successfully).
+        let path = dir.path().join("missing_a").join("missing_b").join("..");
+        assert_eq!(
+            canonicalize_allowing_missing(&path),
+            path,
+            "a `..` tail component aborts ancestor reattachment; the caller's \
+             lexical normalization owns dot segments"
+        );
+    }
+
+    /// Task 12.8 seam pin: an alternate casing of an existing prefix must
+    /// converge to the on-disk canonical form even when the queried file is
+    /// missing. Deterministic on NTFS regardless of 8.3 availability.
+    #[cfg(windows)]
+    #[test]
+    fn alternate_prefix_casing_converges_for_missing_windows_paths() {
+        let dir = TempDir::new().expect("TempDir");
+        let sub = dir.path().join("MixedCase");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        let canonical_sub = dunce::canonicalize(&sub).expect("canonicalize sub");
+        let respelled = dir.path().join("MIXEDCASE").join("missing.rs");
+        assert_eq!(
+            canonicalize_allowing_missing(&respelled),
+            canonical_sub.join("missing.rs"),
+            "a re-cased existing prefix must converge to on-disk casing"
+        );
+    }
+
+    /// Task 12.8 seam pin, independent of the runner's TEMP spelling: derive
+    /// the 8.3 short form of a long directory explicitly and require a
+    /// missing file under it to converge to the long canonical form. Skips
+    /// (with a breadcrumb) on volumes where 8.3 name generation is disabled.
+    #[cfg(windows)]
+    #[test]
+    fn short_form_prefix_converges_for_missing_windows_paths() {
+        let dir = TempDir::new().expect("TempDir");
+        let long = dir.path().join("LongDirectoryNameBeyondEightDotThree");
+        std::fs::create_dir_all(&long).expect("create long dir");
+        let long_canonical = dunce::canonicalize(&long).expect("canonicalize long dir");
+        let script = format!("for %A in (\"{}\") do @echo %~sA", long_canonical.display());
+        // `raw_arg`: std's default MSVC-style quoting escapes the embedded
+        // quotes as `\"`, which cmd.exe does not understand — the script must
+        // reach cmd byte-for-byte.
+        let output = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .raw_arg("/C")
+                .raw_arg(&script)
+                .output()
+                .expect("derive 8.3 short form via cmd")
+        };
+        let short = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if short.is_empty() || Path::new(&short) == long_canonical.as_path() {
+            eprintln!(
+                "skipping short-form pin: volume reports no 8.3 short name for {}",
+                long_canonical.display()
+            );
+            return;
+        }
+        let missing = Path::new(&short).join("missing.rs");
+        assert_eq!(
+            canonicalize_allowing_missing(&missing),
+            long_canonical.join("missing.rs"),
+            "an 8.3 short-form prefix must converge to the long canonical form"
+        );
+    }
+}
+
+#[cfg(test)]
 mod harness {
     use std::ffi::OsString;
     use std::fmt;
