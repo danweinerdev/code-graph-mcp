@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 12
 status: planned
 created: 2026-08-22
-updated: 2026-08-23
+updated: 2026-08-24
 deliverable: "Every still-open, non-macOS, non-Perforce follow-up accepted by the completed GraphPlatformExpansion phase reviews is resolved through code, tests, or an explicit contract correction, with Linux and Windows evidence and no reopened completed phase."
 tasks:
   - id: "12.1"
@@ -452,6 +452,37 @@ Revision boundary: human tables remain bounded and display-width aligned without
 | `Targeted tests and independent focused review` | `task 12.11 implementation at cd3eb76da4a487fc0f047a778a1d40ac47b84cb0` | PASS | `PASS/Aligned: 13 CLI unit tests, 6 command tests, and 6 parity tests passed; CJK, combining sequences, ZWJ emoji, LF, CR, and CRLF preserve grapheme and table-row boundaries while machine payloads remain byte-identical. Fresh final review found no issues.` |
 
 ## 12.8: Pin residual Windows path, ACL, shutdown, and dogfood behavior
+### Subtasks
+- [x] Add a native NTFS regression proving mixed casing of an existing file converges to one canonical graph key; retain an explicit known limitation for nonexistent/remove-event casing if the OS cannot canonicalize it.
+- [x] Add a dedicated short-form/long-form Windows path equivalence fixture independent of the runner’s TEMP spelling.
+- [x] Save the runtime directory DACL through `icacls /save`, parse its SDDL ACEs, and require exactly one full-control allow ACE whose SID exactly matches `whoami /user`; do not infer identity from localized account-name text, path text, or summary output.
+- [x] Bound Windows CLI/daemon shutdown waits and report the last observed process/control-file state on timeout.
+- [x] Add `make dogfood-required`: preflight every pinned dogfood checkout, set a harness flag that promotes any baseline auto-skip to failure, run all eight listed baselines, and emit an executed/pass/fail count. Run it after `make submodules` on the native runner.
+- [x] Run the full native Windows matrix after tasks 12.1-12.7, including daemon serve/proxy, CLI parity, path normalization, VCS/history, resolver, and fingerprint rows affected by this phase.
+- [ ] Run Linux `make verify` at the same final candidate and record both platform identities in phase evidence.
+
+### Notes
+Revision boundary: the remaining Windows omissions are directly pinned and the complete debt-closure candidate is certified on Windows and Linux. This task does not claim or test cross-account isolation; D-0014’s one-local-user/one-local-project scope remains binding.
+
+Native Windows evidence is mandatory. Cross-compilation, Wine, or Linux path simulation cannot complete this task. Phase 10 macOS seams remain untouched.
+
+The native Windows half landed as `1b833e4` (short/long-form convergence pins in code-graph-vcs-git, independent of the runner's TEMP spelling) and `5725dc2` (NTFS casing pin, icacls /save SDDL exact-SID validation, bounded shutdown-wait diagnostics, `make dogfood-required` gate). Only the Linux `make verify` run at the final candidate remains; it requires a Linux host.
+
+### Completion Evidence
+
+- Verified: 2026-08-24
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-24 00:00 matched `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
+- Focused review: `git show 5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make submodules && make dogfood-required` | `.` | PASS (`exit 0`) | `PASS on native Windows: all eight pinned checkouts preflighted present (ripgrep, logrus, requests, fmt, curl, abseil-cpp, efcore, commons-lang); baselines ran with CODE_GRAPH_DOGFOOD_REQUIRED=1 promoting auto-skip to failure; executed 8, passed 8, failed 0 (fmt/curl/abseil 3-in-suite 36.4s, efcore 17.6s, logrus 0.6s, commons-lang 3.4s, requests 0.3s, ripgrep 5.8s).` |
+
 ### Subtasks
 - [ ] Add a native NTFS regression proving mixed casing of an existing file converges to one canonical graph key; retain an explicit known limitation for nonexistent/remove-event casing if the OS cannot canonicalize it.
 - [ ] Add a dedicated short-form/long-form Windows path equivalence fixture independent of the runner’s TEMP spelling.
