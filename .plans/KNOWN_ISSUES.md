@@ -18,11 +18,21 @@ cold.
 ---
 
 ## F2 — Generic-resolver receiver calls can resolve as false `Resolved/1` edges
-**Status:** open for C++, Rust, Python, C#, and Java (surfaced 2026-08-21,
-build-mcp smoke test). Go now carries package/receiver provenance and suppresses
-unknown selectors (`ecb3ca6`); sibling findings F1 and F3 were fixed in
-`fb4b01e` / `936aca9` and documented in the docs commit. F3's remaining
-first-step opportunities were closed in `cd4e19b`.
+**Status:** FIXED 2026-08-24 (`68abe00`) — Option B implemented for all five
+generic-resolver languages, plus a SelfReceiver refinement: a parse-time
+`CallShape` (Free / SelfReceiver / Receiver) gates the sole-candidate
+shortcut in `default_scope_aware_resolve`. Receiver-typed sole-candidate
+picks are now `Heuristic/1` (machine-detectable, filterable); `self.`/`this`
+calls stay `Resolved/1` iff the sole candidate's parent matches the caller's
+parent (the receiver type IS the enclosing class); free/qualified calls are
+byte-identical to before (pinned). No `CACHE_VERSION` bump (v13 unreleased,
+decision 2026-08-24) — pre-fix dev caches keep the old tags until their
+files re-parse; refresh with `analyze_codebase(force=true)`. Option C
+(receiver type inference) remains the long-term direction for turning
+`Heuristic/1` receiver picks into verified `Resolved` edges. History:
+surfaced 2026-08-21 (build-mcp smoke test); Go was fixed separately in
+`ecb3ca6`; sibling findings F1/F3 landed in `fb4b01e` / `936aca9`, and F3's
+first step in `cd4e19b`. The sections below are the historical analysis.
 
 ### Symptom
 
@@ -159,27 +169,36 @@ Rationale:
 
 ### Acceptance criteria (for the follow-up)
 
-1. `get_callers(AdapterRegistry::is_empty, min_confidence="resolved")` on
-   build-mcp returns exactly `server.rs:398`.
-2. Under the default `min_confidence="any"`, the ~123 false callers still
-   appear but are tagged `Heuristic, candidates: 1` — visible as unverified,
-   filterable, and correctly excluded from `find_path`'s
-   `min_confidence="resolved"` traversals and the resolved-only filters on
-   `get_callees` / `generate_diagram(symbol=…)`.
-3. Unqualified free-function sole-candidate resolution is byte-identical to
-   today (`Resolved, 1`) — pinned by a test so a future "safety" change cannot
-   silently widen the downgrade.
-4. NO `CACHE_VERSION` bump (v13 unreleased); the stale-dev-cache note and the
-   CLAUDE.md updates land in the same commit as the resolver change
-   (wire-visible behavior change → docs move with it).
+1. ~~`get_callers(AdapterRegistry::is_empty, min_confidence="resolved")` on
+   build-mcp returns exactly `server.rs:398`.~~ CORRECTED at implementation:
+   `registry.is_empty()` is itself a receiver-typed call the generic
+   resolver cannot verify, so as written this criterion is achievable only
+   under Option C. The implemented B outcome (pinned end-to-end by
+   `crates/code-graph-tools/tests/receiver_shape_resolution.rs`):
+   `min_confidence="resolved"` returns exactly the parent-verified
+   `self.is_empty()` caller; every unverified receiver caller — true or
+   false — is excluded, restoring "resolved = confident".
+2. ~~Under the default `min_confidence="any"`, the false callers still
+   appear but are tagged `Heuristic, candidates: 1`.~~ DONE (`68abe00`):
+   pinned by the same integration test (the `any` page keeps every
+   receiver-typed caller) and by the resolver unit pins
+   (`f2_receiver_sole_candidate_downgrades_to_heuristic`,
+   `f2_self_receiver_sole_candidate_without_parent_match_downgrades`).
+3. ~~Unqualified free-function sole-candidate resolution is byte-identical
+   (`Resolved, 1`).~~ DONE: pinned by `f2_free_sole_candidate_stays_resolved`
+   plus per-parser shape pins asserting direct/qualified/implicit-`this`
+   calls extract as `Free`.
+4. ~~NO `CACHE_VERSION` bump; docs land with the resolver change.~~ DONE:
+   no bump (parse-only `Edge.shape`, cache layout untouched); CLAUDE.md's
+   confidence section, D-0007 disposition, and `min_confidence` semantics
+   were rewritten in `68abe00`.
 
-### Interim mitigation (until B lands)
+### Interim mitigation (obsolete)
 
-Agents querying callers of common method names (`is_empty`, `len`, `push`,
-`new`) on codebases where the name is also defined in-project should treat
-`Resolved/1` callers skeptically and cross-check the receiver type at the call
-site. Optional zero-risk first step, independent of B: land Option A's
-CLAUDE.md limitation entry so the hazard is at least documented.
+Superseded by the fix: `Resolved/1` on a call edge now means verified. The
+one residual caveat is pre-fix v13 dev caches, which keep the old tags until
+the owning files re-parse — run `analyze_codebase(force=true)` after
+upgrading a checkout.
 
 ---
 
