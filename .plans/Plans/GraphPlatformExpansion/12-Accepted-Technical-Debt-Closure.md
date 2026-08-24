@@ -48,7 +48,7 @@ tasks:
       cargo test -p code-graph-cli and cargo test -p code-graph-mcp --test daemon_serve and cargo test -p code-graph-mcp --test daemon_proxy pass; attach-only removes metadata only after proving the owner dead, Decision 7 fallback requires initialize.serverInfo.version to equal the CLI package version before matching the not-indexed error and the fallback wording is an explicit package-versioned contract, dead-owner and live-incompatible paths are independently pinned, optional-bool help gives an unambiguous invocation form, source scans walk every CLI source file, process fixtures clean up through RAII, tables preserve later-row fields and use unicode-width display measurement with bounded wrapping, and daemon results are classified from the command/response contract rather than generic JSON parseability; no daemon or MCP framing changes, machine payload parity remains byte-identical, and make verify passes.
   - id: "12.7"
     title: "Close resolver and candidate-count exposure seams"
-    status: planned
+    status: complete
     justifies: "FR-48, AC-57, NFR-11, and D-0007; prevents unresolved override tokens from appearing as resolved candidate-1 rows and ensures the full adapter path pins contested candidate counts, as recorded by review 21."
     verification: >-
       cargo test -p code-graph-tools --test candidate_count and cargo test -p code-graph-tools --test watch_virtual_overrides and cargo test -p code-graph-tools --test snapshot_responses and cargo test -p code-graph-tools --test snapshot_tools_list pass; bare unresolved override keys emit no provisional rows, a real candidates>=2 edge is snapshotted through the rmcp adapter, and trait/docs/tests state which confidence/count invariant future language-specific resolve_call overrides must preserve without deriving either signal from the other; make verify passes.
@@ -306,11 +306,11 @@ Do not delete `daemon.json` merely because one connection attempt failed. Replac
 
 ## 12.7: Close resolver and candidate-count exposure seams
 ### Subtasks
-- [ ] Filter unresolved `Overrides` targets before reverse traversal so a bare provisional token cannot produce a candidate-1 `find_overrides` row.
-- [ ] Add graph/core/handler regressions distinguishing unresolved override tokens from resolved contested overrides.
-- [ ] Add a full rmcp adapter snapshot with a real `candidates >= 2` edge; retain the existing core-level literal-key assertions.
-- [ ] State and test the `LanguagePlugin::resolve_call` contract future overrides must satisfy for `Confidence`, `candidates`, and `min_confidence`; keep the signals independent under D-0007.
-- [ ] Re-audit the review-21 follow-ups already closed by later commits and add no duplicate compatibility shim or cache invalidation.
+- [x] Filter unresolved `Overrides` targets before reverse traversal so a bare provisional token cannot produce a candidate-1 `find_overrides` row.
+- [x] Add graph/core/handler regressions distinguishing unresolved override tokens from resolved contested overrides.
+- [x] Add a full rmcp adapter snapshot with a real `candidates >= 2` edge; retain the existing core-level literal-key assertions.
+- [x] State and test the `LanguagePlugin::resolve_call` contract future overrides must satisfy for `Confidence`, `candidates`, and `min_confidence`; keep the signals independent under D-0007.
+- [x] Re-audit the review-21 follow-ups already closed by later commits and add no duplicate compatibility shim or cache invalidation.
 
 ### Notes
 Revision boundary: no unresolved override token reaches an agent-facing row, contested counts are pinned through the complete adapter, and future language-specific resolvers have an executable signal contract.
@@ -319,7 +319,22 @@ Do not globally drop unresolved Calls from storage: scoped cache growth delibera
 
 ### Completion Evidence
 
-Pending — not complete.
+- Verified: 2026-08-23
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-23 00:00 matched `fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`
+- Focused review: `git show fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0): final rerun passed workspace clippy with warnings denied, formatting, all workspace and integration tests, snapshot cleanliness, and plugin mirror synchronization. The initial run had one transient daemon metadata-publication timeout; its exact test rerun passed before this complete gate rerun.` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `Targeted task verification and four-lane review` | `task 12.7 implementation at fd65c0df32d8f5bda6670cb3f43dfdf70656ea56` | PASS | `PASS: graph callgraph (29), code-graph-lang (66), typed core/handler query (80), custom resolve_call contract (1), candidate_count (4), watch_virtual_overrides (1), snapshot_responses (60), and snapshot_tools_list (33) passed. Quality and plan-drift reviews found no issues; blind-spots and spec-compliance findings were fixed and re-reviewed closed. Review-21's already-closed docs/watch/staleness items remained intact, with no cache bump, compatibility shim, global unresolved-Calls drop, or duplicate watch change.` |
 
 ## 12.8: Pin residual Windows path, ACL, shutdown, and dogfood behavior
 ### Subtasks
