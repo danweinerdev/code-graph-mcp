@@ -249,23 +249,27 @@ async fn go_resolution_rejects_bound_and_external_calls_without_losing_valid_cal
         .map(|row| row["symbol_id"].as_str().expect("callee symbol ID"))
         .collect();
     assert!(
-        any_ids.iter().any(|id| id.ends_with("pkg/dep/a.go:Run")),
+        any_ids
+            .iter()
+            .any(|id| id.replace('\\', "/").ends_with("pkg/dep/a.go:Run")),
         "imported project package call must resolve: {any_ids:?}"
+    );
+    assert!(
+        any_ids.iter().any(|id| id
+            .replace('\\', "/")
+            .ends_with("cmd/main.go:Receiver::Method")),
+        "resolvable local receiver method call must remain: {any_ids:?}"
     );
     assert!(
         any_ids
             .iter()
-            .any(|id| id.ends_with("cmd/main.go:Receiver::Method")),
-        "resolvable local receiver method call must remain: {any_ids:?}"
-    );
-    assert!(
-        any_ids.iter().any(|id| id.ends_with("cmd/main.go:local")),
+            .any(|id| id.replace('\\', "/").ends_with("cmd/main.go:local")),
         "same-package local function call must remain: {any_ids:?}"
     );
     assert!(
         any_ids
             .iter()
-            .any(|id| id.ends_with("cmd/other.go:PackageLocal")),
+            .any(|id| id.replace('\\', "/").ends_with("cmd/other.go:PackageLocal")),
         "same-package cross-file call must resolve: {any_ids:?}"
     );
     assert!(
@@ -293,17 +297,19 @@ async fn go_resolution_rejects_bound_and_external_calls_without_losing_valid_cal
     assert!(
         resolved_ids
             .iter()
-            .any(|id| id.ends_with("pkg/dep/a.go:Run")),
+            .any(|id| id.replace('\\', "/").ends_with("pkg/dep/a.go:Run")),
         "resolved mode retains imported project call: {resolved_ids:?}"
     );
     assert!(
-        resolved_ids
-            .iter()
-            .any(|id| id.ends_with("cmd/main.go:Receiver::Method")),
+        resolved_ids.iter().any(|id| id
+            .replace('\\', "/")
+            .ends_with("cmd/main.go:Receiver::Method")),
         "resolved mode retains receiver method: {resolved_ids:?}"
     );
     assert!(
-        !resolved_ids.iter().any(|id| id.ends_with(":Ambiguous")),
+        !resolved_ids
+            .iter()
+            .any(|id| id.replace('\\', "/").ends_with(":Ambiguous")),
         "resolved mode excludes genuinely ambiguous calls: {resolved_ids:?}"
     );
     assert!(
@@ -378,7 +384,8 @@ async fn go_dot_import_calls_do_not_fall_back_to_unrelated_project_symbols() {
         "dot-import call must not resolve to an unrelated project symbol: {ids:?}"
     );
     assert!(
-        ids.iter().any(|id| id.ends_with("cmd/main.go:local")),
+        ids.iter()
+            .any(|id| id.replace('\\', "/").ends_with("cmd/main.go:local")),
         "dot import must not hide a unique local package call: {ids:?}"
     );
 }
@@ -615,7 +622,7 @@ func SelectAssign(s Outer) {
                 .iter()
                 .all(|row| !row["symbol_id"]
                     .as_str()
-                    .is_some_and(|id| id.ends_with("control.go:Outer::Check"))),
+                    .is_some_and(|id| id.replace('\\', "/").ends_with("control.go:Outer::Check"))),
             "{caller} must not resolve its shadowed receiver to Outer::Check: {result}"
         );
     }
@@ -639,7 +646,7 @@ func SelectAssign(s Outer) {
                 .iter()
                 .any(|row| row["symbol_id"]
                     .as_str()
-                    .is_some_and(|id| id.ends_with("control.go:Outer::Check"))),
+                    .is_some_and(|id| id.replace('\\', "/").ends_with("control.go:Outer::Check"))),
             "{caller} assigns rather than declares and must retain Outer::Check: {result}"
         );
     }
@@ -713,12 +720,13 @@ func MultiLocal() {
         .collect();
     assert!(
         ids.iter()
-            .any(|id| id.ends_with("cmd/main.go:Client::Ping")),
+            .any(|id| id.replace('\\', "/").ends_with("cmd/main.go:Client::Ping")),
         "typed local declarations must retain a concrete receiver call: {ids:?}"
     );
     assert!(
-        ids.iter()
-            .any(|id| id.ends_with("pkg/dep/dep.go:Client::Ping")),
+        ids.iter().any(|id| id
+            .replace('\\', "/")
+            .ends_with("pkg/dep/dep.go:Client::Ping")),
         "qualified imported parameter type must resolve to its imported package: {ids:?}"
     );
     assert!(
@@ -745,7 +753,7 @@ func MultiLocal() {
             .iter()
             .any(|row| row["symbol_id"]
                 .as_str()
-                .is_some_and(|id| id.ends_with("cmd/main.go:Client::Ping"))),
+                .is_some_and(|id| id.replace('\\', "/").ends_with("cmd/main.go:Client::Ping"))),
         "explicit pointer locals must normalize to their bare receiver type: {pointer_result}"
     );
 
@@ -767,7 +775,7 @@ func MultiLocal() {
             .iter()
             .all(|row| !row["symbol_id"]
                 .as_str()
-                .is_some_and(|id| id.ends_with("cmd/main.go:First::Ping"))),
+                .is_some_and(|id| id.replace('\\', "/").ends_with("cmd/main.go:First::Ping"))),
         "multi-name inferred declarations must not reuse the first initializer type: {multi_result}"
     );
 }
@@ -826,9 +834,9 @@ async fn go_internal_test_package_can_call_production_without_leaking_back() {
             .as_array()
             .expect("test callee rows")
             .iter()
-            .any(|row| row["symbol_id"]
-                .as_str()
-                .is_some_and(|id| id.ends_with("pkg/prod/main.go:Production"))),
+            .any(|row| row["symbol_id"].as_str().is_some_and(|id| id
+                .replace('\\', "/")
+                .ends_with("pkg/prod/main.go:Production"))),
         "internal tests must retain production-package visibility: {test_result}"
     );
 }
@@ -870,7 +878,9 @@ async fn go_external_test_package_duplicate_does_not_ambiguate_production_call()
         .iter()
         .map(|row| row["symbol_id"].as_str().expect("callee symbol ID"))
         .collect();
-    assert!(ids.iter().any(|id| id.ends_with("pkg/prod/main.go:Func")));
+    assert!(ids
+        .iter()
+        .any(|id| id.replace('\\', "/").ends_with("pkg/prod/main.go:Func")));
     assert!(
         !ids.iter()
             .any(|id| id.contains(external_test.to_string_lossy().as_ref())),

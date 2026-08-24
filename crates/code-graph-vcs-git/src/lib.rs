@@ -616,7 +616,7 @@ fn require_owned_by_bound_repository(project_root: &Path, path: &Path) -> Result
     };
     let work_dir = dunce::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
     if work_dir == project_root {
-        if missing && has_nested_git_marker(project_root, parent)? {
+        if missing && has_nested_git_marker(project_root, &canonicalize_allowing_missing(parent))? {
             return Err(VcsError::NotFound(format!(
                 "cannot verify repository ownership for missing path {}: a nested Git marker blocks discovery",
                 path.display()
@@ -677,7 +677,7 @@ fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf,
         // not defeated by 8.3 short names or symlinked prefixes. A path
         // that does not exist on disk (e.g. deleted, queried at an old
         // revision) falls back to its lexical form unchanged.
-        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = canonicalize_allowing_missing(path);
         let normalized_root = normalize_lexical_path(project_root);
         let normalized_path = normalize_lexical_path(&canonical);
         normalized_path
@@ -705,6 +705,38 @@ fn repository_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf,
         )));
     }
     Ok(relative_path)
+}
+
+/// Canonicalize a possibly-missing path by canonicalizing its nearest
+/// existing ancestor and reattaching the missing tail. A queried file that no
+/// longer exists on disk cannot be canonicalized directly, but its prefix
+/// spelling must still converge with the canonical bound root — otherwise an
+/// 8.3 short-form prefix (e.g. a short-form Windows TEMP) defeats the lexical
+/// comparisons in `repository_relative_path` and `has_nested_git_marker`. A
+/// path with no canonicalizable ancestor is returned unchanged.
+fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match current.file_name() {
+            Some(name) => tail.push(name.to_os_string()),
+            // Ends in a root, prefix, or `..` component: give up and let the
+            // caller's lexical normalization handle it.
+            None => return path.to_path_buf(),
+        }
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+        if let Ok(mut canonical) = dunce::canonicalize(&current) {
+            for segment in tail.iter().rev() {
+                canonical.push(segment);
+            }
+            return canonical;
+        }
+    }
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -1939,7 +1971,8 @@ mod harness {
             .await
             .expect_err("broken nested Git marker must not read outer shadow");
         assert!(
-            matches!(error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership"))
+            matches!(error, VcsError::NotFound(ref reason) if reason.contains("cannot verify repository ownership")),
+            "actual error: {error:?}"
         );
     }
 

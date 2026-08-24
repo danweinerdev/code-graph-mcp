@@ -2432,7 +2432,11 @@ enum StaleCleanup {
 
 /// `initial_file` makes the unlinked-inode handoff regression deterministic;
 /// normal daemon acquisition always starts from the current pathname.
-#[cfg(test)]
+/// Unix-gated with its sole caller
+/// (`recovered_detached_lock_does_not_cleanup_successor_runtime`): the
+/// detached-inode scenario has no Windows analogue under mandatory locks,
+/// and an un-gated helper is dead code on Windows test builds.
+#[cfg(all(test, unix))]
 async fn acquire_or_detect_live_with_initial_file(
     paths: &DaemonPaths,
     initial_file: Option<std::fs::File>,
