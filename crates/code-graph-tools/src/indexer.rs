@@ -544,13 +544,20 @@ pub fn resolve_edges_with_indexes(
                         edge.to = id;
                         edge.confidence = confidence;
                         edge.candidates = candidates;
+                    } else if plugin.discard_unresolved_call(&edge.to) {
+                        // Terminal provisional markers (e.g. Go's
+                        // `@bound-receiver::`) can never resolve on any
+                        // future pass — drop them instead of persisting
+                        // dead adjacency/cache entries.
+                        return false;
                     }
-                    // Unresolved bare-token calls keep their pre-resolve
-                    // `Confidence::Resolved` mark (and provisional
-                    // candidate count 1); they're filtered at
-                    // BFS time via `is_resolved_node` and never surface
-                    // to agent queries, so the confidence on them is
-                    // observable only through cache introspection.
+                    // Other unresolved calls RETAIN their provisional
+                    // token (with the pre-resolve `Confidence::Resolved`
+                    // mark and candidate count 1): scoped cache growth
+                    // can add the missing target later. They're filtered
+                    // at BFS time via `is_resolved_node` and never
+                    // surface to agent queries, so they are observable
+                    // only through cache introspection.
                 }
                 // Bare derived class names are the canonical form; the
                 // graph engine resolves them to a concrete class node only
@@ -1070,6 +1077,81 @@ mod tests {
             Confidence::Heuristic,
             "multi-candidate match must be marked Heuristic — the per-tool \
              min_confidence filter relies on this"
+        );
+    }
+
+    /// F3 first step: after `resolve_call` returns `None`, the shared
+    /// resolve loop consults `discard_unresolved_call` — a TERMINAL
+    /// provisional marker (one the plugin's own resolver maps to `None`
+    /// unconditionally, e.g. Go's `@bound-receiver::`) is dropped, while
+    /// every other unresolved call RETAINS its provisional token (the
+    /// cache contract: scoped cache growth can add the missing target
+    /// later).
+    #[test]
+    fn resolve_all_edges_discards_terminal_markers_and_retains_other_unresolved() {
+        struct TerminalMarkerPlugin;
+
+        impl LanguagePlugin for TerminalMarkerPlugin {
+            fn id(&self) -> Language {
+                Language::Go
+            }
+            fn extensions(&self) -> &'static [&'static str] {
+                &[".go"]
+            }
+            fn parse_file(&self, _path: &Path, _content: &[u8]) -> Result<FileGraph, ParseError> {
+                panic!("TerminalMarkerPlugin is only used with hand-built file graphs")
+            }
+            fn resolve_call(
+                &self,
+                _callee: &str,
+                _ctx: &CallContext,
+                _index: &SymbolIndex,
+            ) -> Option<(SymbolId, Confidence, u32)> {
+                None
+            }
+            fn discard_unresolved_call(&self, target: &str) -> bool {
+                target.starts_with("@terminal::")
+            }
+        }
+
+        let path = "/proj/a.go".to_string();
+        let edge = |to: &str| Edge {
+            from: format!("{path}:caller"),
+            to: to.to_string(),
+            kind: EdgeKind::Calls,
+            file: path.clone(),
+            line: 2,
+            confidence: Confidence::Resolved,
+            candidates: 1,
+        };
+        let a = FileGraph {
+            path: path.clone(),
+            language: Language::Go,
+            symbols: vec![Symbol {
+                name: "caller".to_string(),
+                kind: SymbolKind::Function,
+                file: path.clone(),
+                line: 1,
+                column: 0,
+                end_line: 3,
+                signature: "func caller()".to_string(),
+                namespace: String::new(),
+                parent: String::new(),
+                language: Language::Go,
+            }],
+            edges: vec![edge("@terminal::Check"), edge("@retained::Other")],
+        };
+        let mut graphs = vec![a];
+        let mut reg = LanguageRegistry::new();
+        reg.register(Box::new(TerminalMarkerPlugin)).unwrap();
+        resolve_all_edges(&mut graphs, &reg, &NoopProgressSink);
+
+        let remaining: Vec<&str> = graphs[0].edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            remaining,
+            vec!["@retained::Other"],
+            "the terminal marker must be dropped and the ordinary unresolved \
+             provisional token retained"
         );
     }
 

@@ -926,6 +926,18 @@ impl LanguagePlugin for GoParser {
             .map(|id| (id, Confidence::Resolved, 1))
     }
 
+    /// `@bound-receiver::` markers are terminal by construction:
+    /// `resolve_call` above maps them to `None` unconditionally (they exist
+    /// precisely so a shadowing local/function-value binding can never fall
+    /// through to a same-named project symbol). No future pass — scoped
+    /// cache growth included — can resolve one, so the shared resolve loop
+    /// may discard them instead of persisting dead adjacency/cache entries.
+    /// `@method-receiver::` and `@dot-import::` markers stay retained: a
+    /// later scoped analyze can index their missing target.
+    fn discard_unresolved_call(&self, target: &str) -> bool {
+        target.starts_with(BOUND_RECEIVER_PREFIX)
+    }
+
     fn invalidate_resolution_for_path(&self, path: &Path) {
         if path.file_name().and_then(|name| name.to_str()) == Some("go.mod") {
             // Mark the watch transaction before its caller performs fallible

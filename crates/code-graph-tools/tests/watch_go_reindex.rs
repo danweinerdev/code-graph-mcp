@@ -711,3 +711,87 @@ async fn cache_fast_path_hydrates_go_metadata_before_watch_edit() {
         "cache-fast-path metadata must keep the package value from resolving to the candidate"
     );
 }
+
+/// F3 first step, watch-path half: a watch reindex that introduces both an
+/// unknown-selector call (`x.Start()` → terminal `@bound-receiver::` marker)
+/// and a typed-receiver call to an unindexed method (`s.Missing()` →
+/// retained `@method-receiver::` marker) must add exactly ONE adjacency
+/// entry — the retained marker. The terminal marker is discarded by the
+/// inlined watch resolve loop via `discard_unresolved_call`, mirroring the
+/// indexer's `resolve_all_edges`. Public queries surface neither.
+#[tokio::test]
+async fn watch_go_reindex_discards_terminal_bound_receiver_markers() {
+    let (dir, srv_path) = seed_go_project_with_alpha_beta_caller();
+    let server = fresh_server();
+
+    let r = analyze_codebase(
+        server.inner.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "initial analyze must succeed: {r:?}"
+    );
+
+    // Diagnostic sentinel: the seed's resolved Caller → Beta edge exists
+    // before the discriminator assertion (test-conventions pattern; a
+    // failure here means the fixture or analyze broke, not the discard).
+    let srv_str = srv_path.to_string_lossy().into_owned();
+    let beta_id = format!("{srv_str}:Server::Beta");
+    let caller_id = format!("{srv_str}:Server::Caller");
+    assert!(
+        has_direct_callee(&server, &caller_id, &beta_id),
+        "sentinel: seed fixture must resolve Caller → Beta before the edit"
+    );
+    let pre_edges = server.inner.graph.read().stats().edges;
+
+    // Edit: append a method whose body carries one terminal marker and one
+    // retained marker.
+    std::fs::write(
+        &srv_path,
+        b"package srv\n\
+          type Server struct{}\n\
+          func (s *Server) Alpha() {}\n\
+          func (s *Server) Beta() {}\n\
+          func (s *Server) Caller() { s.Beta() }\n\
+          func (s *Server) Runner() { x.Start(); s.Missing() }\n",
+    )
+    .unwrap();
+    assert_reindexed(try_reindex_file(&server.inner, &srv_path, false).await);
+
+    let post_edges = server.inner.graph.read().stats().edges;
+    assert_eq!(
+        post_edges,
+        pre_edges + 1,
+        "exactly one adjacency entry must be added: the retained \
+         @method-receiver:: marker; the terminal @bound-receiver:: marker \
+         must be discarded by the watch resolve loop"
+    );
+
+    // Neither marker surfaces on the public query surface.
+    let runner_id = format!("{srv_str}:Server::Runner");
+    let r = callers_or_callees(
+        &server.inner.graph,
+        true,
+        &runner_id,
+        Some(1),
+        Direction::Callees,
+        None,
+        None,
+        NO_BYTE_BUDGET,
+        None,
+    );
+    assert!(
+        r.is_error.is_none() || r.is_error == Some(false),
+        "post-edit callees must succeed: {r:?}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
+    assert!(
+        body["results"].as_array().unwrap().is_empty(),
+        "unresolved markers must never surface as callees: {body}"
+    );
+}

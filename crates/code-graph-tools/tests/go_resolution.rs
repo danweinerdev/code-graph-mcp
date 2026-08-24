@@ -1157,3 +1157,62 @@ async fn go_non_force_analyze_replaces_cached_symbols_before_resolution() {
         "fresh paths must replace same-path cached symbols before uniqueness checks: {result}"
     );
 }
+
+/// F3 first step: `@bound-receiver::` markers are terminal by construction
+/// (the Go resolver maps them to `None` unconditionally), so the resolve
+/// loop discards them — they must not reach graph adjacency or the packed
+/// cache. `@method-receiver::` markers with an unindexed target stay
+/// RETAINED (scoped cache growth can add the missing target later), and
+/// public traversals keep filtering both to real graph nodes.
+#[tokio::test]
+async fn go_terminal_bound_receiver_markers_never_reach_the_cache() {
+    let dir = TempDir::new().expect("TempDir");
+    std::fs::write(dir.path().join("go.mod"), "module example.test/project\n")
+        .expect("write go.mod");
+    let main_go = write_go(
+        dir.path(),
+        "cmd/main.go",
+        "package main\n\
+         type Server struct{}\n\
+         func (s *Server) M() { s.Missing() }\n\
+         func run() { x.Start() }\n",
+    );
+    let root = code_graph_core::paths::canonicalize(dir.path()).expect("canonicalize root");
+    let server = go_only_server();
+    analyze(&server, &root).await;
+
+    // Cache bytes are the observable storage surface: provisional tokens
+    // serialize literally into the rkyv archive.
+    let cache = std::fs::read(root.join(".code-graph-cache.db")).expect("read cache");
+    let contains = |needle: &[u8]| cache.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        contains(b"@method-receiver::"),
+        "unresolved @method-receiver:: markers must stay retained in the cache \
+         (scoped cache growth can add the missing target later)"
+    );
+    assert!(
+        !contains(b"@bound-receiver::"),
+        "terminal @bound-receiver:: markers must be discarded at resolve time \
+         and never reach the packed cache"
+    );
+
+    // Public surface: neither marker shape surfaces as a callee.
+    let callees = ok_json(&callers_or_callees(
+        &server.inner.graph,
+        true,
+        &format!("{}:run", main_go.to_string_lossy()),
+        Some(1),
+        Direction::Callees,
+        Some(50),
+        Some(0),
+        NO_BYTE_BUDGET,
+        None,
+    ));
+    assert!(
+        callees["results"]
+            .as_array()
+            .expect("callee rows")
+            .is_empty(),
+        "unresolved markers must never surface to agent queries: {callees}"
+    );
+}

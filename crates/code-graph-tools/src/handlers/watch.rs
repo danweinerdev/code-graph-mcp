@@ -405,10 +405,14 @@ pub async fn try_reindex_file(
         .collect();
 
     // Resolve only the new file's edges in place. The existing graph's
-    // edges are already stored as resolved edge entries (in adj/radj/
-    // includes); they don't need re-resolution. The `resolve_all_edges`
-    // helper walks every graph in its slice, but since we own only
-    // `new_fg`, we inline the per-edge dispatch here.
+    // edges already went through their own resolve pass (in adj/radj/
+    // includes) and are not re-resolved here — note that "went through
+    // resolution" is NOT "resolved": unresolved Calls/Overrides edges
+    // legitimately persist with their provisional token (public traversals
+    // filter non-node targets), except terminal markers dropped via
+    // `discard_unresolved_call`. The `resolve_all_edges` helper walks every
+    // graph in its slice, but since we own only `new_fg`, we inline the
+    // per-edge dispatch here.
     //
     // The plugin re-lookup here mirrors the one in the blocking parse
     // task above. It's bounded (HashMap-of-extensions probe) and avoids
@@ -459,6 +463,14 @@ pub async fn try_reindex_file(
                     edge.to = id;
                     edge.confidence = confidence;
                     edge.candidates = candidates;
+                } else if plugin.discard_unresolved_call(&edge.to) {
+                    // Terminal provisional markers (e.g. Go's
+                    // `@bound-receiver::`) can never resolve on any future
+                    // pass — drop them (mirrors the indexer's Calls arm).
+                    // Other unresolved calls retain their provisional token:
+                    // scoped cache growth can add the missing target later,
+                    // and public traversals filter non-node targets.
+                    return false;
                 }
             }
             // Bare derived class names are the canonical form for inherits

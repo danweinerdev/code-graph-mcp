@@ -487,6 +487,25 @@ pub trait LanguagePlugin: Send + Sync {
         default_scope_aware_resolve(self.id(), callee, ctx, index)
     }
 
+    /// After [`Self::resolve_call`] returns `None`, should this unresolved
+    /// provisional call target be DISCARDED instead of retained?
+    ///
+    /// Default: retain (`false`). Retention is the cache contract —
+    /// unresolved Calls edges keep their provisional token in the graph and
+    /// the packed cache so scoped cache growth can add the missing target
+    /// later; public traversals filter non-node targets, so clients never
+    /// see them. Override only for marker shapes that are TERMINAL by
+    /// construction — targets the plugin's own `resolve_call` maps to
+    /// `None` unconditionally (e.g. Go's `@bound-receiver::` tokens, minted
+    /// precisely so a shadowing local binding can never fall through to a
+    /// same-named project symbol). A terminal marker can never resolve on
+    /// any future pass, so keeping it only bloats adjacency and cache.
+    ///
+    /// Object-safe: `&self`, concrete params, no `Self` return.
+    fn discard_unresolved_call(&self, _target: &str) -> bool {
+        false
+    }
+
     /// Optional language-specific include/import resolution. Default is
     /// basename-based path matching with a suffix-disambiguation pass.
     /// Languages with package systems (Go modules, Python dotted imports)
