@@ -524,7 +524,7 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - `12.5`: `359847bd9e6e88bab3c21011d237e55feefaa848`
 - `12.6`: `f9e44dd519c4ead0616377c8de285d80f2036032`
 - `12.7`: `fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`
-- `12.8`: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
+- `12.8`: `9ac79e51edf826c4bea1c84f238e5e2a2db29779`
 - `12.9`: `4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`
 - `12.10`: `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
 - `12.11`: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
