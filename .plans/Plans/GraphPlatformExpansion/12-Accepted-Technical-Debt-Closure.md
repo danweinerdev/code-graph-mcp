@@ -484,16 +484,48 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 | `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0) on native Windows re-certification at the rebased final candidate 9ac79e5 (docs-only delta from 69bb87c plus the Linux import fix): 0 failed suites across clippy with warnings denied, formatting, all workspace tests including the 24 vcs-git tests with the rescoped import, snapshot cleanliness, and plugin-sync checks.` |
 
 ## Acceptance Criteria
-- [ ] Every still-open implementation, contract, test, performance, and Windows-certification follow-up in final reviews 15-22 is mapped to exactly one completed Phase 12 task; already-resolved, macOS, Perforce, and historical-evidence items are explicitly dispositioned in the coverage table.
-- [ ] `find_path`, shortest-path cap reporting, and community responses satisfy FR-05, FR-22, FR-24, FR-25, AC-16, AC-29, and AC-32 with agent-facing descriptions matching runtime behavior.
-- [ ] Typed-core consumers cannot acquire MCP coupling or bypass honest indexed-state gating, satisfying FR-01, FR-02, FR-04, AC-01, AC-28, and NFR-02.
-- [ ] VCS and symbol-history failures, blocking boundaries, memory bounds, and cache behavior satisfy FR-27, FR-29, FR-32-FR-37, AC-19-AC-22, AC-34, AC-35, AC-37, AC-44, AC-46, and NFR-10.
-- [ ] CLI machine output remains byte-identical across daemon and standalone paths while stale metadata, rendering, cleanup, and argument behavior satisfy FR-12, FR-16-FR-20, AC-09-AC-12, and AC-40.
-- [ ] Candidate-count and override behavior preserve FR-48, AC-57, NFR-11, and D-0007 without collapsing confidence and candidate count into one signal.
-- [ ] The completed-scope Phase 12 review findings are closed: pending analyze compaction preserves validation/project identity, fingerprint sidecar I/O is confined and bounded without per-request full scans, and CLI wrapping is grapheme-safe.
+- [x] Every still-open implementation, contract, test, performance, and Windows-certification follow-up in final reviews 15-22 is mapped to exactly one completed Phase 12 task; already-resolved, macOS, Perforce, and historical-evidence items are explicitly dispositioned in the coverage table.
+- [x] `find_path`, shortest-path cap reporting, and community responses satisfy FR-05, FR-22, FR-24, FR-25, AC-16, AC-29, and AC-32 with agent-facing descriptions matching runtime behavior.
+- [x] Typed-core consumers cannot acquire MCP coupling or bypass honest indexed-state gating, satisfying FR-01, FR-02, FR-04, AC-01, AC-28, and NFR-02.
+- [x] VCS and symbol-history failures, blocking boundaries, memory bounds, and cache behavior satisfy FR-27, FR-29, FR-32-FR-37, AC-19-AC-22, AC-34, AC-35, AC-37, AC-44, AC-46, and NFR-10.
+- [x] CLI machine output remains byte-identical across daemon and standalone paths while stale metadata, rendering, cleanup, and argument behavior satisfy FR-12, FR-16-FR-20, AC-09-AC-12, and AC-40.
+- [x] Candidate-count and override behavior preserve FR-48, AC-57, NFR-11, and D-0007 without collapsing confidence and candidate count into one signal.
+- [x] The completed-scope Phase 12 review findings are closed: pending analyze compaction preserves validation/project identity, fingerprint sidecar I/O is confined and bounded without per-request full scans, and CLI wrapping is grapheme-safe.
 - [ ] Native Windows evidence closes the remaining path, ACL, shutdown, and dogfood omissions within NFR-13, AC-60, and D-0014; Linux `make verify` passes at the same final candidate.
-- [ ] Every task lands as a focused native-SCM revision with its named focused tests and `make verify` passing; no pending snapshots or plugin drift remain.
-- [ ] A fresh four-lane phase review over the complete frozen Phase 12 range returns Aligned with no open findings before the phase is marked complete.
+- [x] Every task lands as a focused native-SCM revision with its named focused tests and `make verify` passing; no pending snapshots or plugin drift remain.
+- [x] A fresh four-lane phase review over the complete frozen Phase 12 range returns Aligned with no open findings before the phase is marked complete.
 
 ## Phase Completion Evidence
-Pending — not complete.
+- Verified: 2026-08-25
+- Repository: `.`
+- VCS: `git`
+- Revision / checkpoint: `f9ca2caf78ea02a5b491f2120eacfd24e4848fe8` (final candidate; phase range `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`)
+- Identity recheck: `git rev-parse HEAD` at 2026-08-25 matched the review-gate endpoint lineage (`f9ca2ca` + the resolved review artifact commit)
+- Focused review: five-cycle four-lane frozen gate over `0b41bbd..f9ca2ca` — cycle-1 findings (drift: 12.8 Notes missing `32e5b9a`; spec: four stale D-0007 tool descriptions; blind-spots: Python cls-shadowing, Java static imports, C++ qualified parents) repaired in `f2d001d`; cycle-2 (argument schemas, internal comments, Python lambda/rebinding, Java method references) in `3c6f4fe`; cycle-3 (dead `as_pattern_target` arm) in `e38081e`; cycle-4 (statement-level rebindings) in `498f41a`; cycle-5 (staticmethod/variadic, parameter-bound callables, CLAUDE.md candidates bullet) in `f9ca2ca`
+- Reviewed candidate / final: `f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
+- Review result: PASS/Aligned
+
+| Command | Working directory | Result | Observable evidence |
+|---|---|---|---|
+| `make verify` (native Windows, MSVC) | `.` | PASS (`exit 0`) | `0 failed suites at f9ca2ca: clippy -D warnings, fmt, all workspace tests (including the 8 dogfood baselines with submodules initialized), snapshot cleanliness, and plugin mirror sync all green.` |
+| `make submodules && make dogfood-required` (native Windows) | `.` | PASS (`exit 0`) | `All eight pinned checkouts preflighted present; baselines ran with CODE_GRAPH_DOGFOOD_REQUIRED=1 promoting auto-skip to failure; executed 8, passed 8, failed 0.` |
+| `make verify` (Linux) | `.` | PASS (per owner run) | `Run by the repository owner at 69bb87c (which carried the one Linux-only fix: the 8.3-pin test import rescoped to its cfg(windows) test); per its recorded verification Linux clippy and all vcs-git tests pass and the x86_64-pc-windows-msvc check passes. The tail 69bb87c..f9ca2ca is docs plus platform-neutral resolver/parser code with no new cfg-gated seams; a confirmatory Linux rerun at f9ca2ca satisfies AC-8's same-final-candidate wording (the one item held open until that run).` |
+
+| Tool / inspection | Context | Result | Observable evidence |
+|---|---|---|---|
+| `four-lane phase gate` | `frozen 0b41bbd..f9ca2ca, review artifact 23` | PASS | `Drift and quality lanes PASS/Aligned at the final candidate (quality with an independent 11/11 out-of-tree probe of the production parse_file entry); spec and blind-spots cycle-5 findings verified closed at f9ca2ca by executed greps (zero stale '= unambiguous' surfaces) and the 15 pinned f2_/receiver_shape tests. Accepted residuals (callable-value parameters in Rust/C++/C#/Java, C++ nested-parent and implicit-this conservative downgrades) recorded in KNOWN_ISSUES F2.` |
+
+### Completed task identities
+- `12.1`: `97078e1d54c1639c4d8855d296af53974478ed8a`
+- `12.2`: `75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`
+- `12.3`: `dd1bdcbf095eff024aafcdcb4ef1d86dcf8f8beb`
+- `12.4`: `eb8bbd17f54d5349c63b6ae0b6f5daaabd6663bd`
+- `12.5`: `359847bd9e6e88bab3c21011d237e55feefaa848`
+- `12.6`: `f9e44dd519c4ead0616377c8de285d80f2036032`
+- `12.7`: `fd65c0df32d8f5bda6670cb3f43dfdf70656ea56`
+- `12.8`: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50` (Windows pins; production short/long-form fix in `32e5b9a`, dedicated pins in `1b833e4`, Linux run at `69bb87c`, Windows re-certification at `9ac79e5`)
+- `12.9`: `4cd4e434e4cc24b58457e3baf2e1ddbedfd5345e`
+- `12.10`: `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
+- `12.11`: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
+
+- Final aligned review: `.plans/Plans/GraphPlatformExpansion/reviews/23-graphplatformexpansion-code-review-f9ca2ca.md`; frozen: `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
