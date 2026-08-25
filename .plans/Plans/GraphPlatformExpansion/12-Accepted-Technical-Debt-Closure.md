@@ -517,6 +517,8 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 |---|---|---|---|
 | `four-lane phase gate` | `frozen 0b41bbd..f9ca2ca, review artifact 23` | PASS | `Drift and quality lanes PASS/Aligned at the final candidate (quality with an independent 11/11 out-of-tree probe of the production parse_file entry); spec and blind-spots cycle-5 findings verified closed at f9ca2ca by executed greps (zero stale '= unambiguous' surfaces) and the 15 pinned f2_/receiver_shape tests. Accepted residuals (callable-value parameters in Rust/C++/C#/Java, C++ nested-parent and implicit-this conservative downgrades) recorded in KNOWN_ISSUES F2.` |
 
+(Artifact 23 at the same frozen range is the review's first persisted resolution; it was superseded — not edited — by artifact 24 after post-resolution bookkeeping legitimately amended the phase doc's AC-8 disposition text and the plan README's phase row, which SDD174 correctly requires the reviewed planning revision to cover. The four lane observations are identical between the two artifacts.)
+
 ### Completed task identities
 - `12.1`: `97078e1d54c1639c4d8855d296af53974478ed8a`
 - `12.2`: `75fea77bcf1fceebbd8e5a8a7a8fedfc36fcd8f1`
@@ -531,5 +533,3 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - `12.11`: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
 
 - Final aligned review: `Plans/GraphPlatformExpansion/reviews/24-graphplatformexpansion-code-review-f9ca2ca.md`; frozen: `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
-
-(Artifact 23 at the same frozen range is the review's first persisted resolution; it was superseded — not edited — by artifact 24 after post-resolution bookkeeping legitimately amended the phase doc's AC-8 disposition text and the plan README's phase row, which SDD174 correctly requires the reviewed planning revision to cover. The four lane observations are identical between the two artifacts.)
