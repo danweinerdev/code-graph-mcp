@@ -1262,6 +1262,70 @@ mod tests {
         );
     }
 
+    /// Cycle-2 re-binding pins (phase-12 review, blind-spots F1 cycle 2):
+    /// `self`/`cls` are ordinary identifiers, so a LAMBDA parameter
+    /// shadowing the name (`lambda self: self.g()` inside `m(self)`), a
+    /// WALRUS re-binding (`(self := other)`), a plain assignment
+    /// re-binding, and a `for`-target re-binding all make the receiver
+    /// unverifiable — every one degrades to Receiver, never a false
+    /// SelfReceiver. The clean method (`k`) keeps SelfReceiver, proving
+    /// the scan does not over-fire on `self.x = 1` (that binds the
+    /// attribute `x`, not `self`).
+    #[test]
+    fn f2_rebound_self_names_degrade_to_receiver() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C:\n\
+             \x20   def lam(self):\n\
+             \x20       h = lambda self: self.g()\n\
+             \x20   def walrus(self):\n\
+             \x20       (self := other)\n\
+             \x20       self.w()\n\
+             \x20   def assigned(self):\n\
+             \x20       self = other\n\
+             \x20       self.a2()\n\
+             \x20   def looped(self):\n\
+             \x20       for self in items:\n\
+             \x20           self.l2()\n\
+             \x20   def k(self):\n\
+             \x20       self.x = 1\n\
+             \x20       self.clean()\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(
+            shape_of("g"),
+            CallShape::Receiver,
+            "lambda-parameter shadowing must not verify"
+        );
+        assert_eq!(
+            shape_of("w"),
+            CallShape::Receiver,
+            "walrus re-binding must not verify"
+        );
+        assert_eq!(
+            shape_of("a2"),
+            CallShape::Receiver,
+            "assignment re-binding must not verify"
+        );
+        assert_eq!(
+            shape_of("l2"),
+            CallShape::Receiver,
+            "for-target re-binding must not verify"
+        );
+        assert_eq!(
+            shape_of("clean"),
+            CallShape::SelfReceiver,
+            "attribute assignment (self.x = 1) binds x, not self — the \
+             clean method keeps its verified shape"
+        );
+    }
+
     #[test]
     fn direct_call_in_free_function_produces_one_calls_edge() {
         // `def f(): foo()` → 1 edge, To=foo, From=path:f.

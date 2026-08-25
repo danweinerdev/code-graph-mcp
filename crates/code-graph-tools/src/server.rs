@@ -1012,9 +1012,10 @@ pub struct FindPathArgs {
     #[schemars(
         description = "Minimum resolver confidence required for an edge to be traversable. \
                        \"any\" (default) allows every resolved edge; \"resolved\" restricts \
-                       the search to edges the resolver was unambiguous about, dropping \
-                       Heuristic edges (picked from ≥ 2 same-name candidates via the scope \
-                       rule)."
+                       the search to edges the resolver VERIFIED, dropping every Heuristic \
+                       edge — both scope-rule picks from ≥ 2 same-name candidates AND \
+                       receiver-typed sole-candidate picks (Heuristic/1: the receiver's \
+                       type was not verifiable against the index)."
     )]
     #[serde(default)]
     pub min_confidence: Option<String>,
@@ -1035,12 +1036,14 @@ pub struct GetCallersArgs {
     pub offset: Option<u32>,
     #[schemars(
         description = "Minimum resolver confidence required for a hop to appear. \"any\" \
-                       (default) includes every resolved edge; \"resolved\" drops edges \
-                       the resolver picked from N same-name candidates (Heuristic) and \
-                       returns only chains the resolver was sure about. Heuristic edges \
-                       arise when ≥ 2 symbols share a callee name and the scope rule \
-                       (same file > same parent > same namespace > global) picked one \
-                       — useful filter when several unrelated classes have a method \
+                       (default) includes every resolved edge; \"resolved\" drops every \
+                       Heuristic hop and returns only chains the resolver VERIFIED. \
+                       Heuristic edges arise two ways: ≥ 2 symbols share a callee name \
+                       and the scope rule (same file > same parent > same namespace > \
+                       global) picked one, OR the call went through a receiver whose \
+                       type the index could not verify (Heuristic with candidates: 1 — \
+                       e.g. `x.foo()` where the sole indexed `foo` is a name-only \
+                       guess). Useful when several unrelated classes have a method \
                        with the same name (e.g. `init`). Filter applies at each hop, \
                        so a depth-2 walk through a Heuristic intermediate is pruned \
                        entirely."
@@ -1064,10 +1067,11 @@ pub struct GetCalleesArgs {
     pub offset: Option<u32>,
     #[schemars(
         description = "Minimum resolver confidence required for a hop to appear. \"any\" \
-                       (default) includes every resolved edge; \"resolved\" drops edges \
-                       the resolver picked from N same-name candidates (Heuristic) and \
-                       returns only chains the resolver was sure about. Same semantics \
-                       as on `get_callers`."
+                       (default) includes every resolved edge; \"resolved\" drops every \
+                       Heuristic hop — scope-rule picks from N same-name candidates AND \
+                       receiver-typed sole-candidate picks (Heuristic/1) — and returns \
+                       only chains the resolver VERIFIED. Same semantics as on \
+                       `get_callers`."
     )]
     #[serde(default)]
     pub min_confidence: Option<String>,
@@ -1294,8 +1298,9 @@ pub struct GenerateDiagramArgs {
     #[schemars(
         description = "Minimum resolver confidence required for an edge to appear (symbol \
                        mode only): \"any\" (default) admits Heuristic edges, \"resolved\" \
-                       drops edges the resolver picked from N same-name candidates. Same \
-                       wire spelling and semantics as on `get_callers`/`get_callees`. \
+                       drops every Heuristic edge — scope-rule picks from N same-name \
+                       candidates AND receiver-typed sole-candidate picks (Heuristic/1). \
+                       Same wire spelling and semantics as on `get_callers`/`get_callees`. \
                        Ignored by file and class modes — file dependencies and \
                        inheritance edges don't carry confidence today."
     )]

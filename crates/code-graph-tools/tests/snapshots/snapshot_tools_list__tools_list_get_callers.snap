@@ -30,7 +30,7 @@ expression: "tool_entry(\"get_callers\")"
       },
       "min_confidence": {
         "default": null,
-        "description": "Minimum resolver confidence required for a hop to appear. \"any\" (default) includes every resolved edge; \"resolved\" drops edges the resolver picked from N same-name candidates (Heuristic) and returns only chains the resolver was sure about. Heuristic edges arise when ≥ 2 symbols share a callee name and the scope rule (same file > same parent > same namespace > global) picked one — useful filter when several unrelated classes have a method with the same name (e.g. `init`). Filter applies at each hop, so a depth-2 walk through a Heuristic intermediate is pruned entirely.",
+        "description": "Minimum resolver confidence required for a hop to appear. \"any\" (default) includes every resolved edge; \"resolved\" drops every Heuristic hop and returns only chains the resolver VERIFIED. Heuristic edges arise two ways: ≥ 2 symbols share a callee name and the scope rule (same file > same parent > same namespace > global) picked one, OR the call went through a receiver whose type the index could not verify (Heuristic with candidates: 1 — e.g. `x.foo()` where the sole indexed `foo` is a name-only guess). Useful when several unrelated classes have a method with the same name (e.g. `init`). Filter applies at each hop, so a depth-2 walk through a Heuristic intermediate is pruned entirely.",
         "type": [
           "string",
           "null"

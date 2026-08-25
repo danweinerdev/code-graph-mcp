@@ -107,6 +107,27 @@ pub fn java_call_shape(
     let Some(parent) = cap_node.parent() else {
         return CallShape::Free;
     };
+    // Method references (phase-12 review, blind-spots cycle-2 F2): the
+    // captured identifier is the RHS name (the query anchors `"::"` before
+    // it). `this::doIt` is SelfReceiver (the receiver type is the
+    // enclosing class); everything else — `obj::method`, `super::doIt`,
+    // and type-qualified `String::length` (a bare-identifier LHS is
+    // indistinguishable from a variable without semantic info) — is
+    // Receiver, so a sole unrelated indexed name cannot resolve falsely
+    // `Resolved/1`.
+    if parent.kind() == "method_reference" {
+        let Some(receiver) = parent.named_child(0) else {
+            return CallShape::Receiver;
+        };
+        if receiver.id() == cap_node.id() {
+            // Defensive: the capture should always be the RHS.
+            return CallShape::Receiver;
+        }
+        return match receiver.utf8_text(content).ok() {
+            Some("this") => CallShape::SelfReceiver,
+            _ => CallShape::Receiver,
+        };
+    }
     if parent.kind() != "method_invocation" {
         return CallShape::Free;
     }

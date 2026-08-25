@@ -90,15 +90,18 @@ pub enum EdgeKind {
 /// How confident the indexer is that an edge points at the correct target.
 ///
 /// All edges start life as [`Confidence::Resolved`] at construction. The
-/// resolve pass downgrades to [`Confidence::Heuristic`] when the resolver
-/// had to pick one of several same-name candidates via the scope-aware
-/// heuristic (same file > same parent > same namespace > global). Tools
-/// expose a `min_confidence` filter so agents can ask for
-/// resolved-only chains when they need to avoid noisy heuristic hits
-/// (e.g. when the same method name lives on several unrelated classes).
+/// resolve pass downgrades to [`Confidence::Heuristic`] when the pick is
+/// unverified — either the resolver had to pick one of several same-name
+/// candidates via the scope-aware heuristic (same file > same parent >
+/// same namespace > global), or the sole candidate was reached through a
+/// receiver whose type the index could not verify (F2, KNOWN_ISSUES —
+/// `Heuristic` with `candidates: 1`). Tools expose a `min_confidence`
+/// filter so agents can ask for verified-only chains when they need to
+/// avoid noisy heuristic hits (e.g. when the same method name lives on
+/// several unrelated classes, or `x.foo()` receivers are unindexed).
 ///
 /// The two-variant design is deliberately minimal: the binary
-/// "definitive vs. picked" distinction is the only one the indexer can
+/// "verified vs. guessed" distinction is the only one the indexer can
 /// stake out without per-language type inference. Future variants
 /// (e.g. `Template`, `DynamicDispatch`) would require type-system work
 /// the resolver does not do today.
@@ -217,8 +220,9 @@ pub struct Symbol {
 
 /// A relationship between symbols or files. Mirrors the Go `parser.Edge`
 /// and adds [`Confidence`] so the resolver can mark whether the `to`
-/// target was a single-candidate match or a multi-candidate heuristic
-/// pick.
+/// target was a verified match or an unverified heuristic pick (a
+/// scope-rule choice among N same-name candidates, or a receiver-typed
+/// sole-candidate guess — see [`Confidence`] and [`CallShape`]).
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
@@ -228,7 +232,9 @@ pub struct Edge {
     pub line: u32,
     /// Resolver-stamped confidence in the `to` target. Defaults to
     /// [`Confidence::Resolved`]; the resolve pass overwrites with
-    /// [`Confidence::Heuristic`] for multi-candidate picks. Old caches
+    /// [`Confidence::Heuristic`] for unverified picks — multi-candidate
+    /// scope-rule choices AND receiver-typed sole-candidate guesses
+    /// (F2: `Heuristic` with `candidates: 1`). Old caches
     /// missing this field deserialize as `Resolved` via
     /// `#[serde(default)]` (defensive — the cache version bump that
     /// landed with this field also triggers a silent re-index, so the
@@ -236,9 +242,11 @@ pub struct Edge {
     #[serde(default)]
     pub confidence: Confidence,
     /// How many same-named candidates competed for `to` when the resolver
-    /// picked it (FR-48, D-0007). `1` = unambiguous (sole candidate, or a
+    /// picked it (FR-48, D-0007). `1` = sole candidate (or a
     /// declarative edge — Inherits, Rust `mod`-resolved Includes — which
-    /// has exactly one target by construction); `N ≥ 2` = the scope rule
+    /// has exactly one target by construction); NOTE that count 1 does
+    /// not imply `Resolved` — a receiver-typed sole-candidate pick is
+    /// `Heuristic/1` (F2). `N ≥ 2` = the scope rule
     /// picked one of N. Overrides edges are NOT declarative: they route
     /// through `resolve_call` like calls (a `Parent::name` token can have
     /// same-named candidates in several ancestor classes), so they carry

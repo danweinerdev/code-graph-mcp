@@ -1967,6 +1967,40 @@ class Foo {
         );
     }
 
+    /// Cycle-2 method-reference pins (phase-12 review, blind-spots F2):
+    /// `this::e` is SelfReceiver (receiver type = enclosing class);
+    /// `obj::f` and the type-qualified `String::g` are Receiver — a
+    /// bare-identifier LHS is indistinguishable from a variable without
+    /// semantic info, so a sole unrelated indexed name must not resolve
+    /// falsely `Resolved/1`.
+    #[test]
+    fn f2_method_references_classify_by_receiver() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C {\n\
+                 void m() {\n\
+                     Runnable r = this::e;\n\
+                     Runnable s = obj::f;\n\
+                     java.util.function.Function<String, Integer> t = String::g;\n\
+                 }\n\
+             }\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(shape_of("e"), CallShape::SelfReceiver, "this::e");
+        assert_eq!(shape_of("f"), CallShape::Receiver, "obj::f");
+        assert_eq!(
+            shape_of("g"),
+            CallShape::Receiver,
+            "type-qualified String::g is unverifiable without semantic info"
+        );
+    }
+
     /// Cycle-2 wildcard pin: `import static external.Lib.*;` makes EVERY
     /// unqualified call unverifiable (the bound set is unknowable), so
     /// both `c()` and `d()` classify Receiver under a wildcard.

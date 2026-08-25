@@ -51,25 +51,41 @@ pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
         .child_by_field_name("object")
         .and_then(|receiver| receiver.utf8_text(content).ok())
     {
-        Some(name @ ("self" | "cls")) if first_param_is(parent, content, name) => {
+        Some(name @ ("self" | "cls")) if receiver_binds_enclosing_class(parent, content, name) => {
             CallShape::SelfReceiver
         }
         _ => CallShape::Receiver,
     }
 }
 
-/// True when the function definition enclosing `node` declares `name` as
-/// its FIRST parameter — the binding Python's method-call protocol gives
-/// the instance/class receiver. Handles the plain (`self`), typed
-/// (`self: Foo`), and defaulted (`cls=...`, degenerate but parseable)
-/// parameter node kinds by looking for the first identifier inside the
-/// first named parameter child.
-fn first_param_is(node: Node<'_>, content: &[u8], name: &str) -> bool {
+/// True when, at `node`'s position, the identifier `name` (`self`/`cls`)
+/// can only be the enclosing method's receiver binding: it is the
+/// enclosing `function_definition`'s FIRST parameter (the binding
+/// Python's method-call protocol supplies), no intervening `lambda`
+/// between the call and that function re-binds it, and nothing inside
+/// the function's subtree re-binds it (assignments, walrus expressions,
+/// `for` targets, `as` patterns, `global`/`nonlocal` declarations, or
+/// nested lambda parameters — phase-12 review, blind-spots cycle-2 F1:
+/// `self`/`cls` are ordinary identifiers, so any re-binding makes the
+/// receiver unverifiable). Every uncertain path returns `false`, which
+/// degrades to [`CallShape::Receiver`] — conservative, never a false
+/// `Resolved`. The subtree scan is deliberately coarse (a re-binding
+/// inside a nested `def` poisons the whole enclosing method): the cost
+/// of the false-negative is a `Heuristic/1` tag on a true edge, the
+/// cost of the alternative is a confidently-wrong `Resolved/1`.
+fn receiver_binds_enclosing_class(node: Node<'_>, content: &[u8], name: &str) -> bool {
+    // Walk up to the nearest function_definition; a lambda on the way
+    // whose parameters bind `name` shadows the method receiver.
     let mut current = node.parent();
     let func = loop {
         match current {
             Some(n) if n.kind() == "function_definition" => break n,
-            Some(n) => current = n.parent(),
+            Some(n) => {
+                if n.kind() == "lambda" && lambda_params_bind(n, content, name) {
+                    return false;
+                }
+                current = n.parent();
+            }
             None => return false,
         }
     };
@@ -88,9 +104,121 @@ fn first_param_is(node: Node<'_>, content: &[u8], name: &str) -> bool {
             .filter_map(|i| first.named_child(i))
             .find(|c| c.kind() == "identifier")
     };
-    ident
+    let first_matches = ident
         .and_then(|n| n.utf8_text(content).ok())
-        .is_some_and(|text| text == name)
+        .is_some_and(|text| text == name);
+    if !first_matches {
+        return false;
+    }
+    let Some(body) = func.child_by_field_name("body") else {
+        return false;
+    };
+    !subtree_rebinds(body, content, name)
+}
+
+/// Push every child of `n` (named and anonymous) onto `stack` by index —
+/// avoids `TreeCursor` borrow-lifetime tangles in iterative walks.
+fn push_children<'a>(n: Node<'a>, stack: &mut Vec<Node<'a>>) {
+    for i in 0..n.child_count() {
+        if let Some(child) = n.child(u32::try_from(i).unwrap_or(u32::MAX)) {
+            stack.push(child);
+        }
+    }
+}
+
+/// True when a `lambda` node's parameters bind `name`.
+fn lambda_params_bind(lambda: Node<'_>, content: &[u8], name: &str) -> bool {
+    let Some(params) = lambda.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut stack = vec![params];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "identifier" && n.utf8_text(content).ok() == Some(name) {
+            return true;
+        }
+        push_children(n, &mut stack);
+    }
+    false
+}
+
+/// Conservative re-binding scan: does any node inside `body` re-bind
+/// `name`? Binding positions checked: assignment / augmented-assignment
+/// left sides, walrus (`named_expression`) names, `for` and
+/// comprehension targets, `as`-pattern aliases, `global` / `nonlocal`
+/// declarations, and nested lambda parameters. Attribute/call positions
+/// (`self.x = 1` re-binds `x`, not `self`) do not match because the
+/// binding-position child there is an `attribute`, not a bare
+/// `identifier`.
+fn subtree_rebinds(body: Node<'_>, content: &[u8], name: &str) -> bool {
+    fn is_name(n: Node<'_>, content: &[u8], name: &str) -> bool {
+        n.kind() == "identifier" && n.utf8_text(content).ok() == Some(name)
+    }
+    // A binding position may be a bare identifier or a tuple/list pattern
+    // containing one. An `attribute`/`subscript` target (`self.x = 1`,
+    // `d[k] = v`) binds the member/element, NOT the receiver name, so the
+    // walk descends ONLY through pattern-shaped containers.
+    fn is_pattern_container(kind: &str) -> bool {
+        matches!(
+            kind,
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "parenthesized_expression"
+        )
+    }
+    fn pattern_binds(n: Node<'_>, content: &[u8], name: &str) -> bool {
+        if is_name(n, content, name) {
+            return true;
+        }
+        if !is_pattern_container(n.kind()) {
+            return false;
+        }
+        let mut stack: Vec<Node<'_>> = Vec::new();
+        push_children(n, &mut stack);
+        while let Some(child) = stack.pop() {
+            if is_name(child, content, name) {
+                return true;
+            }
+            if is_pattern_container(child.kind()) {
+                push_children(child, &mut stack);
+            }
+        }
+        false
+    }
+
+    fn declares_name(n: Node<'_>, content: &[u8], name: &str) -> bool {
+        let mut found = false;
+        for i in 0..n.child_count() {
+            if let Some(child) = n.child(u32::try_from(i).unwrap_or(u32::MAX)) {
+                if is_name(child, content, name) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        let binds = match n.kind() {
+            "assignment" | "augmented_assignment" => n
+                .child_by_field_name("left")
+                .is_some_and(|l| pattern_binds(l, content, name)),
+            "named_expression" => n
+                .child_by_field_name("name")
+                .is_some_and(|l| is_name(l, content, name)),
+            "for_statement" | "for_in_clause" => n
+                .child_by_field_name("left")
+                .is_some_and(|l| pattern_binds(l, content, name)),
+            "as_pattern_target" => is_name(n, content, name) || pattern_binds(n, content, name),
+            "global_statement" | "nonlocal_statement" => declares_name(n, content, name),
+            "lambda" => lambda_params_bind(n, content, name),
+            _ => false,
+        };
+        if binds {
+            return true;
+        }
+        push_children(n, &mut stack);
+    }
+    false
 }
 
 /// Walk `node`'s parent chain and return the first ancestor that is a

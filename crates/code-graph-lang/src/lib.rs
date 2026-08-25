@@ -300,26 +300,23 @@ pub(crate) fn default_scope_aware_resolve(
     best.map(|e| (e.id.clone(), Confidence::Heuristic, candidate_count))
 }
 
-/// Extract the parent class name from a caller's symbol ID.
-///
-/// Symbol IDs have the shape `file:Name` (free function) or
-/// `file:Parent::Name` (method). For methods this returns `"Parent"`; for
-/// free functions and unparseable IDs it returns `""`.
-///
-/// We need to find the colon that separates the path from the symbol name.
-/// On Windows the path can itself contain colons (`C:\proj\foo.cpp`), and
-/// the symbol name can contain `::` scope separators. The path/symbol
-/// boundary is the LAST *singleton* `:` — a colon that is neither
-/// immediately preceded nor immediately followed by another `:`. The `::`
-/// scope separator and the Windows drive `:` are both correctly skipped
-/// by this rule.
 /// Extract the FULL parent scope from a caller's symbol ID: for
 /// `file:ns::Class::method` this returns `"ns::Class"` (everything between
 /// the path/name separator and the LAST `::`), matching how C++ out-of-line
 /// qualified definitions record `Symbol.parent` via `split_qualified`'s
 /// `rfind("::")`. Used by the F2 SelfReceiver verification, where the
 /// comparison target is the candidate's recorded parent, not the first
-/// scope segment. `""` for free functions and unparseable IDs.
+/// scope segment. `""` for free functions and unparseable IDs. Uses the
+/// same LAST-singleton-`:` path/name separator rule as
+/// [`caller_id_parent`] (see its doc for the Windows drive-colon
+/// rationale).
+///
+/// Known conservative residual (phase-12 review): an in-class-declared
+/// member records its immediate parent only (`Inner`), while an
+/// out-of-line qualified caller ID carries the full chain
+/// (`Outer::Inner`) — that mixed pair fails the compare and lands
+/// `Heuristic/1`. The failure direction is a false DOWNGRADE, never a
+/// false `Resolved`.
 fn caller_id_full_parent(caller_id: &str) -> String {
     let bytes = caller_id.as_bytes();
     let mut sep: Option<usize> = None;
@@ -343,6 +340,22 @@ fn caller_id_full_parent(caller_id: &str) -> String {
     }
 }
 
+/// Extract the parent class name from a caller's symbol ID.
+///
+/// Symbol IDs have the shape `file:Name` (free function) or
+/// `file:Parent::Name` (method). For methods this returns the FIRST scope
+/// segment (`"Parent"`, or `"ns"` for `file:ns::Class::method` — the
+/// historical Go-parity behavior the multi-candidate scope scoring keeps);
+/// for free functions and unparseable IDs it returns `""`. The F2
+/// SelfReceiver verification uses [`caller_id_full_parent`] instead.
+///
+/// We need to find the colon that separates the path from the symbol name.
+/// On Windows the path can itself contain colons (`C:\proj\foo.cpp`), and
+/// the symbol name can contain `::` scope separators. The path/symbol
+/// boundary is the LAST *singleton* `:` — a colon that is neither
+/// immediately preceded nor immediately followed by another `:`. The `::`
+/// scope separator and the Windows drive `:` are both correctly skipped
+/// by this rule.
 fn caller_id_parent(caller_id: &str) -> String {
     let bytes = caller_id.as_bytes();
     let mut sep: Option<usize> = None;

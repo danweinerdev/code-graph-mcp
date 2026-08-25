@@ -101,7 +101,9 @@ pub struct EdgeEntry {
     /// How many same-named candidates competed for `target` (FR-48,
     /// D-0007). Copied verbatim from
     /// [`code_graph_core::Edge::candidates`] at merge time: `1` =
-    /// unambiguous or declarative, `N ≥ 2` = scope-rule pick among N. The
+    /// sole candidate or declarative (NOT necessarily verified — a
+    /// receiver-typed sole-candidate pick is `Heuristic/1`, F2),
+    /// `N ≥ 2` = scope-rule pick among N. The
     /// serde default (1) exists for hand-written fixtures; cache-format
     /// safety comes from the v11 CACHE_VERSION bump — a pre-bump cache
     /// re-indexes rather than being read with a guessed count.

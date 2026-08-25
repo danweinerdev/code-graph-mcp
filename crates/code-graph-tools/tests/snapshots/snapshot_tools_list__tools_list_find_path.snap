@@ -14,7 +14,7 @@ expression: "tool_entry(\"find_path\")"
       },
       "min_confidence": {
         "default": null,
-        "description": "Minimum resolver confidence required for an edge to be traversable. \"any\" (default) allows every resolved edge; \"resolved\" restricts the search to edges the resolver was unambiguous about, dropping Heuristic edges (picked from ≥ 2 same-name candidates via the scope rule).",
+        "description": "Minimum resolver confidence required for an edge to be traversable. \"any\" (default) allows every resolved edge; \"resolved\" restricts the search to edges the resolver VERIFIED, dropping every Heuristic edge — both scope-rule picks from ≥ 2 same-name candidates AND receiver-typed sole-candidate picks (Heuristic/1: the receiver's type was not verifiable against the index).",
         "type": [
           "string",
           "null"

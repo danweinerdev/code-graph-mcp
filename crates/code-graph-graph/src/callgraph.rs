@@ -41,15 +41,17 @@ pub struct CallChain {
     pub line: u32,
     pub depth: u32,
     /// How many same-named candidates competed for the edge that reached
-    /// this hop (FR-48, D-0007): `1` = unambiguous, `N ≥ 2` = the scope
-    /// rule picked one of N. Copied from the traversed
-    /// [`EdgeEntry::candidates`]. Serde default (1) covers hand-written
-    /// fixtures only — cached graphs re-index across the v11 bump.
+    /// this hop (FR-48, D-0007): `1` = sole candidate (NOT necessarily
+    /// verified — a receiver-typed sole-candidate pick is `Heuristic/1`,
+    /// F2), `N ≥ 2` = the scope rule picked one of N. Copied from the
+    /// traversed [`EdgeEntry::candidates`]. Serde default (1) covers
+    /// hand-written fixtures only — cached graphs re-index across the
+    /// v11 bump.
     #[serde(default = "default_candidate_count")]
     pub candidates: u32,
 }
 
-/// Serde default for [`CallChain::candidates`]: the unambiguous count.
+/// Serde default for [`CallChain::candidates`]: the sole-candidate count.
 fn default_candidate_count() -> u32 {
     1
 }
@@ -62,9 +64,11 @@ impl Graph {
     ///
     /// `min_confidence` filters edges by their resolver confidence
     /// (see [`Confidence`]): `None` admits every edge,
-    /// `Some(Confidence::Resolved)` drops `Heuristic` (multi-candidate)
-    /// edges at BFS time so the resulting chain only contains hops the
-    /// resolver was sure about. The threshold is applied at each hop, so
+    /// `Some(Confidence::Resolved)` drops every `Heuristic` edge —
+    /// multi-candidate scope-rule picks AND receiver-typed
+    /// sole-candidate picks (`Heuristic/1`, F2) — at BFS time so the
+    /// resulting chain only contains hops the
+    /// resolver VERIFIED. The threshold is applied at each hop, so
     /// a depth-2 walk via a Heuristic intermediate is pruned entirely
     /// (the intermediate's own depth-1 row never enters `visited`).
     /// Passing `Some(Confidence::Heuristic)` is a no-op (every
