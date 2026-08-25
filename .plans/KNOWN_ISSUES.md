@@ -29,7 +29,10 @@ byte-identical to before (pinned). No `CACHE_VERSION` bump (v13 unreleased,
 decision 2026-08-24) — pre-fix dev caches keep the old tags until their
 files re-parse; refresh with `analyze_codebase(force=true)`. Option C
 (receiver type inference) remains the long-term direction for turning
-`Heuristic/1` receiver picks into verified `Resolved` edges. History:
+`Heuristic/1` receiver picks into verified `Resolved` edges — its data cost
+is quantified in `Research/option-c-type-inference-memory-impact.md`
+(memory is a non-blocker: ~+3-4% cache with a type-name interner; prefer
+landing its cache shape before v13 ships). History:
 surfaced 2026-08-21 (build-mcp smoke test); Go was fixed separately in
 `ecb3ca6`; sibling findings F1/F3 landed in `fb4b01e` / `936aca9`, and F3's
 first step in `cd4e19b`. The sections below are the historical analysis.
