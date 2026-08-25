@@ -66,7 +66,7 @@ phases:
     depends_on: [4, 7, 8, 9]
   - id: 12
     title: "Accepted Technical Debt Closure"
-    status: planned
+    status: complete
     doc: "12-Accepted-Technical-Debt-Closure.md"
     depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]
 ---
