@@ -529,6 +529,6 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - `12.10`: `251214e7c8abaa1f64a9e976bfd5f51f774d9791`
 - `12.11`: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
 
-- Final aligned review: `reviews/23-graphplatformexpansion-code-review-f9ca2ca.md`; frozen: `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
+- Final aligned review: `Plans/GraphPlatformExpansion/reviews/23-graphplatformexpansion-code-review-f9ca2ca.md`; frozen: `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
 
 (12.8's multi-commit identity context: the production short/long-form fix landed in `32e5b9a`, its dedicated pins in `1b833e4`, the Linux run at `69bb87c`, and the Windows re-certification at `9ac79e5` — see the task's own Completion Evidence.)
