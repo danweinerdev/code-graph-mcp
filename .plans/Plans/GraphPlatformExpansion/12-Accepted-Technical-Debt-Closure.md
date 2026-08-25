@@ -5,7 +5,7 @@ plan: GraphPlatformExpansion
 phase: 12
 status: planned
 created: 2026-08-22
-updated: 2026-08-24
+updated: 2026-08-25
 deliverable: "Every still-open, non-macOS, non-Perforce follow-up accepted by the completed GraphPlatformExpansion phase reviews is resolved through code, tests, or an explicit contract correction, with Linux and Windows evidence and no reopened completed phase."
 tasks:
   - id: "12.1"
@@ -75,7 +75,7 @@ tasks:
       cargo test -p code-graph-cli passes; ASCII and CJK width caps remain stable, combining sequences and ZWJ emoji wrap only at grapheme boundaries, machine output remains unchanged, and make verify passes.
   - id: "12.8"
     title: "Pin residual Windows path, ACL, shutdown, and dogfood behavior"
-    status: planned
+    status: complete
     depends_on: ["12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7", "12.9", "12.10", "12.11"]
     justifies: "NFR-13, AC-60, and D-0014; closes the remaining native-Windows test omissions recorded by reviews 19 and 22 without expanding the accepted single-user security scope."
     verification: >-
@@ -459,47 +459,29 @@ Revision boundary: human tables remain bounded and display-width aligned without
 - [x] Bound Windows CLI/daemon shutdown waits and report the last observed process/control-file state on timeout.
 - [x] Add `make dogfood-required`: preflight every pinned dogfood checkout, set a harness flag that promotes any baseline auto-skip to failure, run all eight listed baselines, and emit an executed/pass/fail count. Run it after `make submodules` on the native runner.
 - [x] Run the full native Windows matrix after tasks 12.1-12.7, including daemon serve/proxy, CLI parity, path normalization, VCS/history, resolver, and fingerprint rows affected by this phase.
-- [ ] Run Linux `make verify` at the same final candidate and record both platform identities in phase evidence.
+- [x] Run Linux `make verify` at the same final candidate and record both platform identities in phase evidence.
 
 ### Notes
 Revision boundary: the remaining Windows omissions are directly pinned and the complete debt-closure candidate is certified on Windows and Linux. This task does not claim or test cross-account isolation; D-0014’s one-local-user/one-local-project scope remains binding.
 
 Native Windows evidence is mandatory. Cross-compilation, Wine, or Linux path simulation cannot complete this task. Phase 10 macOS seams remain untouched.
 
-The native Windows half landed as `1b833e4` (short/long-form convergence pins in code-graph-vcs-git, independent of the runner's TEMP spelling) and `5725dc2` (NTFS casing pin, icacls /save SDDL exact-SID validation, bounded shutdown-wait diagnostics, `make dogfood-required` gate). Only the Linux `make verify` run at the final candidate remains; it requires a Linux host.
+The native Windows half landed as `1b833e4` (short/long-form convergence pins in code-graph-vcs-git, independent of the runner's TEMP spelling) and `5725dc2` (NTFS casing pin, icacls /save SDDL exact-SID validation, bounded shutdown-wait diagnostics, `make dogfood-required` gate). The Linux half ran at `69bb87c` (which also carries the one Linux-only fix: scoping the 8.3-pin's test-only `Path` import to its `#[cfg(windows)]` test); Windows was re-certified at `9ac79e5` after the rebase (docs-only delta from `69bb87c`).
 
 ### Completion Evidence
 
-- Verified: 2026-08-24
+- Verified: 2026-08-25
 - Repository: `.`
 - VCS: `git`
-- Revision / checkpoint: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
-- Identity recheck: `git rev-parse HEAD` at 2026-08-24 00:00 matched `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
-- Focused review: `git show 5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
-- Reviewed candidate / final: `5725dc2e8b0a6faec267a1ca4a42cf24cc54af50`
+- Revision / checkpoint: `9ac79e51edf826c4bea1c84f238e5e2a2db29779`
+- Identity recheck: `git rev-parse HEAD` at 2026-08-25 00:00 matched `9ac79e51edf826c4bea1c84f238e5e2a2db29779`
+- Focused review: `git show 9ac79e51edf826c4bea1c84f238e5e2a2db29779`; complete task diff reviewed for correctness, scope, tests, maintainability, and task boundary
+- Reviewed candidate / final: `9ac79e51edf826c4bea1c84f238e5e2a2db29779`
 - Review result: PASS/Aligned
 
 | Command | Working directory | Result | Observable evidence |
 |---|---|---|---|
-| `make submodules && make dogfood-required` | `.` | PASS (`exit 0`) | `PASS on native Windows: all eight pinned checkouts preflighted present (ripgrep, logrus, requests, fmt, curl, abseil-cpp, efcore, commons-lang); baselines ran with CODE_GRAPH_DOGFOOD_REQUIRED=1 promoting auto-skip to failure; executed 8, passed 8, failed 0 (fmt/curl/abseil 3-in-suite 36.4s, efcore 17.6s, logrus 0.6s, commons-lang 3.4s, requests 0.3s, ripgrep 5.8s).` |
-
-### Subtasks
-- [ ] Add a native NTFS regression proving mixed casing of an existing file converges to one canonical graph key; retain an explicit known limitation for nonexistent/remove-event casing if the OS cannot canonicalize it.
-- [ ] Add a dedicated short-form/long-form Windows path equivalence fixture independent of the runner’s TEMP spelling.
-- [ ] Save the runtime directory DACL through `icacls /save`, parse its SDDL ACEs, and require exactly one full-control allow ACE whose SID exactly matches `whoami /user`; do not infer identity from localized account-name text, path text, or summary output.
-- [ ] Bound Windows CLI/daemon shutdown waits and report the last observed process/control-file state on timeout.
-- [ ] Add `make dogfood-required`: preflight every pinned dogfood checkout, set a harness flag that promotes any baseline auto-skip to failure, run all eight listed baselines, and emit an executed/pass/fail count. Run it after `make submodules` on the native runner.
-- [ ] Run the full native Windows matrix after tasks 12.1-12.7, including daemon serve/proxy, CLI parity, path normalization, VCS/history, resolver, and fingerprint rows affected by this phase.
-- [ ] Run Linux `make verify` at the same final candidate and record both platform identities in phase evidence.
-
-### Notes
-Revision boundary: the remaining Windows omissions are directly pinned and the complete debt-closure candidate is certified on Windows and Linux. This task does not claim or test cross-account isolation; D-0014’s one-local-user/one-local-project scope remains binding.
-
-Native Windows evidence is mandatory. Cross-compilation, Wine, or Linux path simulation cannot complete this task. Phase 10 macOS seams remain untouched.
-
-### Completion Evidence
-
-Pending — not complete.
+| `make verify` | `.` | PASS (`exit 0`) | `PASS (exit 0) on native Windows re-certification at the rebased final candidate 9ac79e5 (docs-only delta from 69bb87c plus the Linux import fix): 0 failed suites across clippy with warnings denied, formatting, all workspace tests including the 24 vcs-git tests with the rescoped import, snapshot cleanliness, and plugin-sync checks.` |
 
 ## Acceptance Criteria
 - [ ] Every still-open implementation, contract, test, performance, and Windows-certification follow-up in final reviews 15-22 is mapped to exactly one completed Phase 12 task; already-resolved, macOS, Perforce, and historical-evidence items are explicitly dispositioned in the coverage table.
