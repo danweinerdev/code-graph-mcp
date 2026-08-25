@@ -500,7 +500,7 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - Verified: 2026-08-25
 - Repository: `.`
 - VCS: `git`
-- Revision / checkpoint: `f9ca2caf78ea02a5b491f2120eacfd24e4848fe8` (final candidate; phase range `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`)
+- Revision / checkpoint: `f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
 - Identity recheck: `git rev-parse HEAD` at 2026-08-25 matched the review-gate endpoint lineage (`f9ca2ca` + the resolved review artifact commit)
 - Focused review: five-cycle four-lane frozen gate over `0b41bbd..f9ca2ca` — cycle-1 findings (drift: 12.8 Notes missing `32e5b9a`; spec: four stale D-0007 tool descriptions; blind-spots: Python cls-shadowing, Java static imports, C++ qualified parents) repaired in `f2d001d`; cycle-2 (argument schemas, internal comments, Python lambda/rebinding, Java method references) in `3c6f4fe`; cycle-3 (dead `as_pattern_target` arm) in `e38081e`; cycle-4 (statement-level rebindings) in `498f41a`; cycle-5 (staticmethod/variadic, parameter-bound callables, CLAUDE.md candidates bullet) in `f9ca2ca`
 - Reviewed candidate / final: `f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
@@ -530,5 +530,3 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - `12.11`: `cd3eb76da4a487fc0f047a778a1d40ac47b84cb0`
 
 - Final aligned review: `Plans/GraphPlatformExpansion/reviews/23-graphplatformexpansion-code-review-f9ca2ca.md`; frozen: `0b41bbd32315c6638ad0c224e249ee0c25eb05d8..f9ca2caf78ea02a5b491f2120eacfd24e4848fe8`
-
-(12.8's multi-commit identity context: the production short/long-form fix landed in `32e5b9a`, its dedicated pins in `1b833e4`, the Linux run at `69bb87c`, and the Windows re-certification at `9ac79e5` — see the task's own Completion Evidence.)
