@@ -496,6 +496,7 @@ The native Windows half landed as `32e5b9a` (the production short/long-form fix 
 - [x] A fresh four-lane phase review over the complete frozen Phase 12 range returns Aligned with no open findings before the phase is marked complete.
 
 ## Phase Completion Evidence
+
 - Verified: 2026-08-25
 - Repository: `.`
 - VCS: `git`
