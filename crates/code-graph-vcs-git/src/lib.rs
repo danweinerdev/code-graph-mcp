@@ -761,8 +761,6 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod canonicalize_allowing_missing_tests {
-    use std::path::Path;
-
     use tempfile::TempDir;
 
     use super::canonicalize_allowing_missing;
@@ -821,6 +819,8 @@ mod canonicalize_allowing_missing_tests {
     #[cfg(windows)]
     #[test]
     fn short_form_prefix_converges_for_missing_windows_paths() {
+        use std::path::Path;
+
         let dir = TempDir::new().expect("TempDir");
         let long = dir.path().join("LongDirectoryNameBeyondEightDotThree");
         std::fs::create_dir_all(&long).expect("create long dir");
