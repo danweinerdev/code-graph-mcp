@@ -205,8 +205,13 @@ Documented conservative or out-of-scope leftovers, accepted pending Option C
    a function-typed parameter or local (`fn f(cb: fn()) { cb() }`) still
    classifies `Free`, so a sole same-named indexed symbol resolves
    `Resolved/1` (phase-12 review, blind-spots cycle-5 F2). Python is FIXED
-   (`python_locally_bound_callable` degrades parameter- and body-bound bare
-   calls to Receiver); the statically typed languages are accepted debt —
+   for parameter- and body-bound bare calls
+   (`python_locally_bound_callable` degrades them to Receiver) — but NOT
+   for module-scope value re-bindings (`cb = get()` at module level, then
+   `cb()` anywhere): those stay `Free` by the same design trade-off that
+   keeps `from utils import cbx; cbx()` resolvable (degrading module-scope
+   names would gut Python's dominant cross-module call pattern; quality
+   lane cycle-6 observation). The statically typed languages are accepted debt —
    their type systems narrow the hazard (a shadowing local is visible at the
    declaration) but the syntactic resolver does not consult it. Option C's
    local-binding tracking is the structural fix.

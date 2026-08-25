@@ -2511,8 +2511,9 @@ impl CodeGraphServer {
                        In `symbol=` mode every edge carries `candidates` — how many \
                        same-named definitions competed for the traversed call edge's target \
                        (1 = sole candidate, N ≥ 2 = the scope rule picked one of N; \
-                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 edges AND the \
-                       Heuristic/1 receiver-unverified sole-candidate picks, reading \
+                       `min_confidence=\"resolved\"` drops every Heuristic edge — the N ≥ 2 \
+                       scope-rule picks AND the Heuristic/1 receiver-unverified \
+                       sole-candidate picks; reading \
                        `candidates` keeps them and says how contested each was). `file=` and \
                        `class=` edges OMIT the field entirely (not null) — include and \
                        inheritance edges carry no resolver metadata, the same boundary that \

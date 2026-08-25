@@ -46,14 +46,19 @@ pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
         // locally bound VALUE — an enclosing function's parameter or a
         // body re-binding — because the resolver cannot verify which
         // callable that value is (blind-spots cycle-5 F2). Ordinary
-        // module/class-level names stay Free.
-        let locally_bound = cap_node
+        // module/class-level names stay Free. An UNREADABLE callee name
+        // (invalid UTF-8 — unreachable in practice, upstream callee-name
+        // extraction would already have failed) also degrades to Receiver:
+        // every uncertain path takes the conservative direction, never a
+        // possible false `Resolved`.
+        let verified_free = cap_node
             .utf8_text(content)
-            .is_ok_and(|name| python_locally_bound_callable(cap_node, content, name));
-        return if locally_bound {
-            CallShape::Receiver
-        } else {
+            .map(|name| !python_locally_bound_callable(cap_node, content, name))
+            .unwrap_or(false);
+        return if verified_free {
             CallShape::Free
+        } else {
+            CallShape::Receiver
         };
     }
     if parent.child_by_field_name("attribute").map(|n| n.id()) != Some(cap_node.id()) {
@@ -528,6 +533,42 @@ mod tests {
             }
         }
         None
+    }
+
+    // ---- python_call_shape: unreadable callee name -------------------------
+
+    /// Phase-12 quality-lane note, fixed: an UNREADABLE direct-callee name
+    /// (invalid UTF-8 at the node's span) must degrade to `Receiver` — every
+    /// uncertain path takes the conservative direction. Triggered directly:
+    /// parse a valid direct call, then classify against a content buffer
+    /// whose bytes at the callee's span are invalid UTF-8, so
+    /// `utf8_text` genuinely fails. Before the fix this classified `Free`,
+    /// leaving a constructible false `Resolved/1`.
+    #[test]
+    fn unreadable_direct_callee_degrades_to_receiver() {
+        let src = "def m():\n    cb()\n";
+        let tree = parse(src);
+        let call = find_first(tree.root_node(), "call").expect("call node");
+        let callee = call.child_by_field_name("function").expect("callee");
+        assert_eq!(callee.kind(), "identifier");
+
+        // Sanity: with the true content this is an unbound bare call — Free.
+        assert_eq!(
+            python_call_shape(callee, src.as_bytes()),
+            code_graph_core::CallShape::Free,
+            "control: readable unbound bare call keeps the Free shape"
+        );
+
+        // Corrupt exactly the callee's span with invalid UTF-8 (0xFF is
+        // never valid in UTF-8), keeping the buffer length identical so the
+        // node's byte range stays in bounds.
+        let mut corrupted = src.as_bytes().to_vec();
+        corrupted[callee.start_byte()..callee.end_byte()].fill(0xFF);
+        assert_eq!(
+            python_call_shape(callee, &corrupted),
+            code_graph_core::CallShape::Receiver,
+            "an unreadable callee name is unverifiable and must degrade"
+        );
     }
 
     // ---- find_enclosing_class --------------------------------------------
