@@ -208,6 +208,6 @@ The matrix is persisted at `notes/11-windows-certification-matrix.md`: runner/to
 ### Completed task identities
 - `11.1`: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series endpoint)
 - `11.2`: `89a2af2217bb5d87139fd57d27128908deefad66` (pull-forward series endpoint)
-- `11.3`: `089db2c88ec56fada6ee6a97d6840c3590912e69` (matrix + evidence)
+- `11.3`: `ca2e7a847fe64986e56473bb3fee402d629713dd` (matrix + evidence; the task's recorded checkpoint — `089db2c` was the gate's cycle-1 endpoint, corrected here to agree with the Completion Evidence above)
 
 - Final aligned review: `reviews/22-windows-platform-completion-final-review-3dc41a9-385cc31.md`; frozen: `3dc41a9b0a6dc4ca61bcab8cf66dfc5fdb255d7f..385cc31ded8320dd54d0e094299e847bcaba1730`
