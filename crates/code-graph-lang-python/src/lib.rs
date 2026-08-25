@@ -1391,6 +1391,57 @@ mod tests {
         );
     }
 
+    /// Cycle-4 re-binding pins (phase-12 review, quality cycle-4 F6): the
+    /// four statement-level binding constructs that completed Python's
+    /// binding inventory — `import self`, `from os import self`,
+    /// `del self`, and the 3.12 `type self = int` alias — all degrade to
+    /// Receiver; a clean method keeps its verified shape.
+    #[test]
+    fn f2_statement_level_rebindings_degrade() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C:\n\
+             \x20   def imported(self):\n\
+             \x20       import self\n\
+             \x20       self.p1()\n\
+             \x20   def from_imported(self):\n\
+             \x20       from os import self\n\
+             \x20       self.p2()\n\
+             \x20   def deleted(self):\n\
+             \x20       del self\n\
+             \x20       self.p3()\n\
+             \x20   def aliased(self):\n\
+             \x20       type self = int\n\
+             \x20       self.p4()\n\
+             \x20   def untouched(self):\n\
+             \x20       self.p5()\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        for (callee, form) in [
+            ("p1", "import self"),
+            ("p2", "from os import self"),
+            ("p3", "del self"),
+            ("p4", "type self = int"),
+        ] {
+            assert_eq!(
+                shape_of(callee),
+                CallShape::Receiver,
+                "{form} re-binds the receiver name and must degrade"
+            );
+        }
+        assert_eq!(
+            shape_of("p5"),
+            CallShape::SelfReceiver,
+            "a method without re-bindings keeps its verified shape"
+        );
+    }
+
     #[test]
     fn direct_call_in_free_function_produces_one_calls_edge() {
         // `def f(): foo()` → 1 edge, To=foo, From=path:f.

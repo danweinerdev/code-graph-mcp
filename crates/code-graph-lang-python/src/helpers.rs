@@ -126,6 +126,22 @@ fn push_children<'a>(n: Node<'a>, stack: &mut Vec<Node<'a>>) {
     }
 }
 
+/// True when any `identifier` (or identifier-aliased leaf) inside `n`'s
+/// subtree has text equal to `name`. Deliberately coarse: used only for
+/// statement-level binding constructs (imports, `del`, type aliases)
+/// where over-matching a non-binding position merely degrades the shape
+/// to `Receiver` — the conservative direction.
+fn subtree_names_identifier(n: Node<'_>, content: &[u8], name: &str) -> bool {
+    let mut stack = vec![n];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node.utf8_text(content).ok() == Some(name) {
+            return true;
+        }
+        push_children(node, &mut stack);
+    }
+    false
+}
+
 /// True when a `lambda` node's parameters bind `name`.
 fn lambda_params_bind(lambda: Node<'_>, content: &[u8], name: &str) -> bool {
     let Some(params) = lambda.child_by_field_name("parameters") else {
@@ -238,6 +254,18 @@ fn subtree_rebinds(body: Node<'_>, content: &[u8], name: &str) -> bool {
             "aliased_import" => n
                 .child_by_field_name("alias")
                 .is_some_and(|a| is_name(a, content, name)),
+            // `import self` / `from os import self` / `del self` /
+            // `type self = int` (phase-12 review, quality cycle-4 F6):
+            // statement-level binding constructs with no other arm. The
+            // whole-subtree identifier scan over-fires on non-binding
+            // positions (`from self import x`, `del self.x`) — the
+            // over-fire direction is a Receiver downgrade, conservative.
+            "import_statement" | "import_from_statement" | "delete_statement" => {
+                subtree_names_identifier(n, content, name)
+            }
+            "type_alias_statement" => n
+                .child_by_field_name("left")
+                .is_some_and(|l| subtree_names_identifier(l, content, name)),
             // A nested `def self():` / `class self:` re-binds the name.
             "function_definition" | "class_definition" => n
                 .child_by_field_name("name")
