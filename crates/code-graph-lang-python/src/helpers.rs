@@ -208,7 +208,40 @@ fn subtree_rebinds(body: Node<'_>, content: &[u8], name: &str) -> bool {
             "for_statement" | "for_in_clause" => n
                 .child_by_field_name("left")
                 .is_some_and(|l| pattern_binds(l, content, name)),
-            "as_pattern_target" => is_name(n, content, name) || pattern_binds(n, content, name),
+            // `except Exception as self:` / `with open(f) as self:` — in
+            // tree-sitter-python the alias node is a grammar ALIAS of
+            // `expression` whose KIND is `as_pattern_target`, so it is a
+            // leaf compared by its own TEXT, never by an inner
+            // `identifier` kind (phase-12 review, quality cycle-3 F1: the
+            // previous is_name/pattern_binds arm was dead code here).
+            // Tuple aliases descend through pattern containers.
+            "as_pattern_target" => {
+                n.utf8_text(content).ok() == Some(name) || pattern_binds(n, content, name)
+            }
+            // `match`/`case` capture and as-patterns (`case self:`,
+            // `case [1] as self:`): any identifier in a case pattern is a
+            // potential capture binding. Over-firing on value patterns
+            // (`case CONST:`) merely degrades to Receiver — conservative.
+            "case_pattern" => {
+                let mut found = false;
+                let mut inner = vec![n];
+                while let Some(p) = inner.pop() {
+                    if is_name(p, content, name) || p.utf8_text(content).ok() == Some(name) {
+                        found = true;
+                        break;
+                    }
+                    push_children(p, &mut inner);
+                }
+                found
+            }
+            // `import os as self` re-binds the name.
+            "aliased_import" => n
+                .child_by_field_name("alias")
+                .is_some_and(|a| is_name(a, content, name)),
+            // A nested `def self():` / `class self:` re-binds the name.
+            "function_definition" | "class_definition" => n
+                .child_by_field_name("name")
+                .is_some_and(|d| is_name(d, content, name)),
             "global_statement" | "nonlocal_statement" => declares_name(n, content, name),
             "lambda" => lambda_params_bind(n, content, name),
             _ => false,

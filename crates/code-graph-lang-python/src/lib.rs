@@ -1326,6 +1326,71 @@ mod tests {
         );
     }
 
+    /// Cycle-3 re-binding pins (phase-12 review, quality cycle-3 F1/F2):
+    /// the `as_pattern_target` node is a grammar ALIAS of `expression`
+    /// compared by its own text (the previous identifier-kind arm was
+    /// dead code), so `except ... as self:` and `with ... as self:` must
+    /// degrade; likewise `match`/`case` capture and as-patterns, an
+    /// aliased import, and a nested `def self():` re-binding.
+    #[test]
+    fn f2_as_pattern_and_residual_rebindings_degrade() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C:\n\
+             \x20   def excepted(self):\n\
+             \x20       try:\n\
+             \x20           pass\n\
+             \x20       except Exception as self:\n\
+             \x20           self.h()\n\
+             \x20   def with_as(self):\n\
+             \x20       with open('f') as self:\n\
+             \x20           self.w2()\n\
+             \x20   def matched(self):\n\
+             \x20       match x:\n\
+             \x20           case self:\n\
+             \x20               self.m2()\n\
+             \x20   def match_as(self):\n\
+             \x20       match x:\n\
+             \x20           case [1] as self:\n\
+             \x20               self.m3()\n\
+             \x20   def imported(self):\n\
+             \x20       import os as self\n\
+             \x20       self.i2()\n\
+             \x20   def nested_def(self):\n\
+             \x20       def self():\n\
+             \x20           pass\n\
+             \x20       self.n2()\n\
+             \x20   def still_clean(self):\n\
+             \x20       self.c2()\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        for (callee, form) in [
+            ("h", "except ... as self"),
+            ("w2", "with ... as self"),
+            ("m2", "case self (capture pattern)"),
+            ("m3", "case [1] as self (match-as)"),
+            ("i2", "import os as self"),
+            ("n2", "nested def self()"),
+        ] {
+            assert_eq!(
+                shape_of(callee),
+                CallShape::Receiver,
+                "{form} re-binds the receiver name and must degrade"
+            );
+        }
+        assert_eq!(
+            shape_of("c2"),
+            CallShape::SelfReceiver,
+            "a method without re-bindings keeps its verified shape"
+        );
+    }
+
     #[test]
     fn direct_call_in_free_function_produces_one_calls_edge() {
         // `def f(): foo()` → 1 edge, To=foo, From=path:f.
