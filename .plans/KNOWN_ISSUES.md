@@ -369,3 +369,62 @@ only rebuilds that invocation's subtree. A future automatic fix requires
 persisting enough manifest identity (path plus mtime or content identity) to
 include the relevant manifest set in analyze staleness without weakening
 scoped-cache and nested-module behavior.
+
+---
+
+## F6 — Daemon idle-shutdown unit test livelocks under WSL2
+
+**Status:** open environment incompatibility (surfaced 2026-08-25 while
+producing phase-12's Linux verification). NOT a phase-12 regression — it
+reproduces identically at the phase range start (`0b41bbd`) and at the final
+candidate (`f9ca2ca`); the same suites pass natively on Windows, and the
+owner's Linux runs have not reported it outside WSL.
+
+### Symptom
+
+`cargo test -p code-graph-mcp --bin code-graph-mcp
+run_until_uses_the_idle_future_to_close_and_cleanup_the_listener` fails
+deterministically (3/3) on WSL2 (Fedora, kernel
+`6.18.33.2-microsoft-standard-WSL2`, tokio 1.52.1 and 1.53.1, Rust 1.98):
+the test's outer 5s `tokio::time::timeout` fires (`Elapsed`) while
+`run_until`'s 20ms idle timeout never does. Everything else in `make verify`
+passes in the same environment (1,243 of 1,244 workspace tests; clippy
+`-D warnings`, fmt, snapshots green).
+
+### Diagnostics gathered (all in a disposable WSL clone)
+
+- Probes: lock acquired → listener bound (UDS via the procfd alias, no
+  fallback breadcrumbs) → `serve_uds`'s select polled exactly TWICE → then
+  the runtime thread burns 100% CPU (`utime` +200 ticks in 2s, `wchan=0`,
+  empty syscall — spinning in userspace) with ZERO further task polls and
+  ZERO timer deliveries for ~5s.
+- Isolation probes all PASS in the same binary/environment: a bare 20ms
+  sleep on a current-thread runtime; sleep-vs-accept on a freshly bound
+  procfd-aliased UDS listener; the full nested select/loop shape of
+  `serve_uds` reconstructed minimally.
+- Component bisects all still FAIL: ownership watchdog replaced with
+  `pending()`, shutdown-request poller disabled, `wait_for_idle_shutdown`
+  replaced with a bare `sleep(20ms)` (which then never fires), the Linux
+  retained-root/procfd machinery disabled.
+- tokio 1.53.1: identical failure. `multi_thread` flavor: identical failure
+  — so it is not a current-thread-runtime starvation story; the stall
+  travels with the composition.
+
+The spin sits below the task layer (driver level) and only in the FULL
+`run_until` composition; no minimal reconstruction reproduces it. The
+observed shape — no timer delivery, no task polls, 100% CPU, then the 5s
+timer firing late — points at a WSL2 kernel/epoll interaction rather than a
+defect in this repo's code, but the responsible syscall could not be
+identified without strace/gdb (not installed; no passwordless sudo).
+
+### Follow-up
+
+1. Reproduce on a real Linux kernel to confirm the environmental
+   classification (expected: passes — the composition is exercised by the
+   sibling daemon tests that pass everywhere).
+2. If WSL2 support matters, retry the diagnosis with strace available and
+   file upstream (tokio or WSL2 kernel) with the minimal reproduction once
+   the storming fd is identified.
+3. Also observed in the same environment: `make plugin-sync-check` needs
+   diffutils (fixed — the script now fails honestly with an install hint,
+   `622949a`).
