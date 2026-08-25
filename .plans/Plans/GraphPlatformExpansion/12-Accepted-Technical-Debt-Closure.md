@@ -3,7 +3,7 @@ title: "Accepted Technical Debt Closure"
 type: phase
 plan: GraphPlatformExpansion
 phase: 12
-status: planned
+status: complete
 created: 2026-08-22
 updated: 2026-08-25
 deliverable: "Every still-open, non-macOS, non-Perforce follow-up accepted by the completed GraphPlatformExpansion phase reviews is resolved through code, tests, or an explicit contract correction, with Linux and Windows evidence and no reopened completed phase."
