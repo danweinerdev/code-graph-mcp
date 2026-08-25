@@ -34,6 +34,13 @@ CHECK_ONLY=0
 case "${1:-}" in
 --check)
 	CHECK_ONLY=1
+	# Fail honestly when the comparison tool itself is missing (minimal
+	# containers/WSL images without diffutils): a failed `diff` invocation
+	# must not masquerade as mirror drift.
+	if ! command -v diff >/dev/null 2>&1; then
+		printf 'sync-plugin-skills: `diff` not found on PATH — cannot verify mirrors (install diffutils)\n' >&2
+		exit 2
+	fi
 	;;
 "") ;;
 *)
