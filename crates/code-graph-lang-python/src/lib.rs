@@ -1203,10 +1203,19 @@ mod tests {
             .collect()
     }
 
-    /// F2 pin: call shapes recorded at extraction. `self.a()` (and
-    /// `cls.b()`) are SelfReceiver (the receiver is the enclosing class),
+    /// F2 pin: call shapes recorded at extraction. `self.a()` in a method
+    /// whose FIRST parameter is `self`, and `cls.b()` in a classmethod
+    /// whose first parameter is `cls`, are SelfReceiver (the receiver is
+    /// the enclosing class, verified via the first-parameter binding).
     /// `obj.c()` is Receiver (unverifiable — module-qualified calls land
     /// here too, indistinguishable without import analysis), `d()` is Free.
+    ///
+    /// Cycle-2 shadowing pins (phase-12 review, blind-spots F1): a
+    /// `self`/`cls` NAME that is not the enclosing function's first
+    /// parameter is an ordinary identifier — `cls.e()` inside
+    /// `def shadowed(self, cls)` and `self.f()` inside a nested `def`
+    /// (own first param `x`) both degrade to Receiver, never claiming the
+    /// verified self-receiver shape.
     #[test]
     fn f2_call_shapes_recorded_at_extraction() {
         use code_graph_core::CallShape;
@@ -1214,9 +1223,17 @@ mod tests {
             "class C:\n\
              \x20   def m(self):\n\
              \x20       self.a()\n\
-             \x20       cls.b()\n\
              \x20       obj.c()\n\
-             \x20       d()\n",
+             \x20       d()\n\
+             \x20   @classmethod\n\
+             \x20   def k(cls):\n\
+             \x20       cls.b()\n\
+             \x20   def shadowed(self, cls):\n\
+             \x20       cls.e()\n\
+             \x20   def outer(self):\n\
+             \x20       def inner(x):\n\
+             \x20           self.f()\n\
+             \x20       inner(1)\n",
         );
         let shape_of = |name: &str| {
             calls(&fg)
@@ -1226,9 +1243,23 @@ mod tests {
                 .shape
         };
         assert_eq!(shape_of("a"), CallShape::SelfReceiver, "self.a()");
-        assert_eq!(shape_of("b"), CallShape::SelfReceiver, "cls.b()");
+        assert_eq!(
+            shape_of("b"),
+            CallShape::SelfReceiver,
+            "classmethod cls.b()"
+        );
         assert_eq!(shape_of("c"), CallShape::Receiver, "obj.c()");
         assert_eq!(shape_of("d"), CallShape::Free, "d()");
+        assert_eq!(
+            shape_of("e"),
+            CallShape::Receiver,
+            "cls shadowed by a non-first parameter must not verify"
+        );
+        assert_eq!(
+            shape_of("f"),
+            CallShape::Receiver,
+            "self inside a nested def (own first param differs) degrades conservatively"
+        );
     }
 
     #[test]

@@ -466,7 +466,7 @@ Revision boundary: the remaining Windows omissions are directly pinned and the c
 
 Native Windows evidence is mandatory. Cross-compilation, Wine, or Linux path simulation cannot complete this task. Phase 10 macOS seams remain untouched.
 
-The native Windows half landed as `1b833e4` (short/long-form convergence pins in code-graph-vcs-git, independent of the runner's TEMP spelling) and `5725dc2` (NTFS casing pin, icacls /save SDDL exact-SID validation, bounded shutdown-wait diagnostics, `make dogfood-required` gate). The Linux half ran at `69bb87c` (which also carries the one Linux-only fix: scoping the 8.3-pin's test-only `Path` import to its `#[cfg(windows)]` test); Windows was re-certified at `9ac79e5` after the rebase (docs-only delta from `69bb87c`).
+The native Windows half landed as `32e5b9a` (the production short/long-form fix itself — `canonicalize_allowing_missing` in code-graph-vcs-git, resolving a missing path via its nearest existing ancestor so an 8.3 short-form prefix converges with the canonical root; plus the Windows-CI prerequisites: the unix-gated daemon test helper, go_resolution separator normalization, and the typed_core_consumer license), `1b833e4` (the dedicated convergence pins for that fix, independent of the runner's TEMP spelling), and `5725dc2` (NTFS casing pin, icacls /save SDDL exact-SID validation, bounded shutdown-wait diagnostics, `make dogfood-required` gate). The Linux half ran at `69bb87c` (which also carries the one Linux-only fix: scoping the 8.3-pin's test-only `Path` import to its `#[cfg(windows)]` test); Windows was re-certified at `9ac79e5` after the rebase (docs-only delta from `69bb87c`).
 
 ### Completion Evidence
 

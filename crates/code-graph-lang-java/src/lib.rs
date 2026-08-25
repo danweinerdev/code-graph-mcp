@@ -115,7 +115,7 @@ use std::path::Path;
 
 use code_graph_core::{Confidence, Edge, EdgeKind, FileGraph, Language, Symbol, SymbolKind};
 
-use crate::helpers::java_call_shape;
+use crate::helpers::{collect_static_imports, java_call_shape};
 use code_graph_lang::helpers::{find_enclosing_kind, truncate_signature};
 use code_graph_lang::{LanguagePlugin, ParseError};
 use streaming_iterator::StreamingIterator;
@@ -543,6 +543,11 @@ impl JavaParser {
     /// `object_creation_expression`). The probe found no Java callee-
     /// name filter worth wiring; the extractor records every match.
     fn extract_calls(&self, root: Node<'_>, content: &[u8], path: &str, fg: &mut FileGraph) {
+        // Collected once per file: static-import bindings make an
+        // unqualified call's true target live outside the enclosing class
+        // (phase-12 review, blind-spots F2), so `java_call_shape` degrades
+        // matching unqualified calls from Free to Receiver.
+        let static_imports = collect_static_imports(root, content);
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.call_query, root, content);
         let cap_names = self.call_query.capture_names();
@@ -593,7 +598,7 @@ impl JavaParser {
                     // F2: member calls through a receiver value carry their
                     // shape so the resolver can refuse the sole-candidate
                     // `Resolved` shortcut for unverified receivers.
-                    shape: java_call_shape(cap_node, content),
+                    shape: java_call_shape(cap_node, content, &static_imports),
                 });
             }
         }
@@ -1931,12 +1936,18 @@ class Foo {
     /// here too), and the unqualified `c()` is Free (implicit-`this`
     /// decision mirrors C++: with one indexed candidate,
     /// member-if-exists-else-global lookup makes it the target either way).
+    ///
+    /// Cycle-2 static-import pin (phase-12 review, blind-spots F2): an
+    /// unqualified call bound by `import static` (`d()` here) classifies
+    /// Receiver — its true target lives outside the enclosing class, so a
+    /// sole unrelated indexed `d` must not resolve falsely `Resolved/1`.
     #[test]
     fn f2_call_shapes_recorded_at_extraction() {
         use code_graph_core::CallShape;
         let fg = parse(
-            "class C {\n\
-                 void m() { this.a(); obj.b(); c(); }\n\
+            "import static external.Lib.d;\n\
+             class C {\n\
+                 void m() { this.a(); obj.b(); c(); d(); }\n\
              }\n",
         );
         let shape_of = |name: &str| {
@@ -1949,6 +1960,42 @@ class Foo {
         assert_eq!(shape_of("a"), CallShape::SelfReceiver, "this.a()");
         assert_eq!(shape_of("b"), CallShape::Receiver, "obj.b()");
         assert_eq!(shape_of("c"), CallShape::Free, "unqualified c()");
+        assert_eq!(
+            shape_of("d"),
+            CallShape::Receiver,
+            "static-import-bound unqualified d() must be unverified"
+        );
+    }
+
+    /// Cycle-2 wildcard pin: `import static external.Lib.*;` makes EVERY
+    /// unqualified call unverifiable (the bound set is unknowable), so
+    /// both `c()` and `d()` classify Receiver under a wildcard.
+    #[test]
+    fn f2_wildcard_static_import_degrades_all_unqualified_calls() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "import static external.Lib.*;\n\
+             class C {\n\
+                 void m() { c(); this.a(); }\n\
+             }\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(
+            shape_of("c"),
+            CallShape::Receiver,
+            "wildcard static import makes unqualified calls unverifiable"
+        );
+        assert_eq!(
+            shape_of("a"),
+            CallShape::SelfReceiver,
+            "this-receiver calls are unaffected by static imports"
+        );
     }
 
     /// Assert that exactly one Calls edge with `from = expected_from`

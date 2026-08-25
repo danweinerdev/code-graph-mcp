@@ -120,17 +120,27 @@ pub enum EdgeKind {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Confidence {
-    /// Unambiguous match: exactly one candidate symbol/file for the
-    /// edge's target, OR the edge is declarative (Inherits, Overrides,
-    /// mod-resolved Includes) and the parser had a known target at
-    /// emission time. The default.
+    /// VERIFIED match: exactly one candidate symbol/file for the edge's
+    /// target AND the call shape allowed verification (a [`CallShape::Free`]
+    /// direct/qualified call, or a [`CallShape::SelfReceiver`] call whose
+    /// sole candidate sits in the caller's own class), OR the edge is
+    /// declarative (Inherits, mod-resolved Includes) or structurally
+    /// disambiguated (suffix-matched includes) and the parser had a known
+    /// target at emission time. The default (parse-time provisional value;
+    /// the resolve pass overwrites it).
     #[default]
     Resolved,
-    /// Multi-candidate match: the resolver had ≥ 2 same-name candidates
-    /// and picked one via the scope heuristic (same file > same parent >
-    /// same namespace > global). The chosen target may or may not be
-    /// the semantically correct one — agents that need precision
-    /// should filter heuristic edges out via `min_confidence`.
+    /// UNVERIFIED pick. Two causes (F2, KNOWN_ISSUES): (a) the resolver
+    /// had ≥ 2 same-name candidates and picked one via the scope heuristic
+    /// (same file > same parent > same namespace > global); (b) the name
+    /// had exactly ONE indexed candidate but the call went through a
+    /// receiver whose type was not verifiable against the index
+    /// ([`CallShape::Receiver`], or a [`CallShape::SelfReceiver`] whose
+    /// candidate is outside the caller's class) — `Heuristic` with
+    /// `candidates: 1`, so the tag, not the count, discriminates verified
+    /// from guessed. The chosen target may or may not be the semantically
+    /// correct one — agents that need precision should filter heuristic
+    /// edges out via `min_confidence`.
     Heuristic,
 }
 

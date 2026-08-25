@@ -32,9 +32,11 @@ Both take a `symbol_id` (`file:name` or `file:Parent::name`) and return
   don't read `file`.
 - `depth` = BFS distance (1 = direct caller/callee).
 - `candidates` = how many same-named definitions competed for the traversed
-  edge's target. `1` = unambiguous; `N >= 2` = the scope rule picked one of N --
-  the signal to double-check with `find_class_candidates`/`get_symbol_detail`
-  when a chain looks wrong.
+  edge's target. `1` = sole candidate -- NOT necessarily verified: a
+  receiver-typed call (`x.foo()`) whose receiver type the index cannot check
+  is a Heuristic/1 name-only guess, dropped by `min_confidence="resolved"`.
+  `N >= 2` = the scope rule picked one of N -- the signal to double-check
+  with `find_class_candidates`/`get_symbol_detail` when a chain looks wrong.
 
 Levers:
 - **`depth`** (default 1): raise for transitive reach -- e.g. `depth=3` for a
@@ -64,7 +66,8 @@ are `null` only on `hops[0]`). Key readings:
 - `from == to` succeeds with `hop_count: 0`.
 - Ties break toward fewer `heuristic_hops`; a returned path is evidence a chain
   likely exists, not proof (resolution is syntactic).
-- `min_confidence="resolved"` restricts the search to unambiguous edges.
+- `min_confidence="resolved"` restricts the search to verified edges (drops
+  scope-rule picks AND receiver-unverified sole-candidate picks).
 
 ## Inheritance
 

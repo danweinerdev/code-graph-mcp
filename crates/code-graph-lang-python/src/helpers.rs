@@ -24,11 +24,19 @@ use tree_sitter::Node;
 /// `cap_node` is the `call.name` capture. When it is the `attribute` child
 /// of an `attribute` node (attribute call `recv.method()`), the call goes
 /// through a receiver value: `self.method()` / `cls.method()` is
-/// [`CallShape::SelfReceiver`] (the receiver is the enclosing class),
-/// anything else is [`CallShape::Receiver`] — including module-qualified
-/// calls (`mod.func()`), which the generic resolver cannot distinguish
-/// from instance calls without import analysis, and chained calls. Direct
-/// calls (`foo()`, `MyClass()`, `super()`) are [`CallShape::Free`].
+/// [`CallShape::SelfReceiver`] (the receiver is the enclosing class) —
+/// but ONLY when that name is also the ENCLOSING function's first
+/// parameter (phase-12 review, blind-spots F1: `self`/`cls` are ordinary
+/// identifiers in Python, so a shadowing parameter or local — e.g.
+/// `def m(self, cls): cls.foo()` — must not claim the verified
+/// self-receiver shape; it degrades to [`CallShape::Receiver`], the
+/// unverified direction). Every other receiver is [`CallShape::Receiver`]
+/// — including module-qualified calls (`mod.func()`), which the generic
+/// resolver cannot distinguish from instance calls without import
+/// analysis, and chained calls. A `self.method()` inside a nested `def`
+/// (whose own first parameter is not `self`) also degrades to `Receiver`:
+/// conservative, never a false `Resolved`. Direct calls (`foo()`,
+/// `MyClass()`, `super()`) are [`CallShape::Free`].
 pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
     let Some(parent) = cap_node.parent() else {
         return CallShape::Free;
@@ -43,9 +51,46 @@ pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
         .child_by_field_name("object")
         .and_then(|receiver| receiver.utf8_text(content).ok())
     {
-        Some("self") | Some("cls") => CallShape::SelfReceiver,
+        Some(name @ ("self" | "cls")) if first_param_is(parent, content, name) => {
+            CallShape::SelfReceiver
+        }
         _ => CallShape::Receiver,
     }
+}
+
+/// True when the function definition enclosing `node` declares `name` as
+/// its FIRST parameter — the binding Python's method-call protocol gives
+/// the instance/class receiver. Handles the plain (`self`), typed
+/// (`self: Foo`), and defaulted (`cls=...`, degenerate but parseable)
+/// parameter node kinds by looking for the first identifier inside the
+/// first named parameter child.
+fn first_param_is(node: Node<'_>, content: &[u8], name: &str) -> bool {
+    let mut current = node.parent();
+    let func = loop {
+        match current {
+            Some(n) if n.kind() == "function_definition" => break n,
+            Some(n) => current = n.parent(),
+            None => return false,
+        }
+    };
+    let Some(params) = func.child_by_field_name("parameters") else {
+        return false;
+    };
+    let Some(first) = params.named_child(0) else {
+        return false;
+    };
+    let ident = if first.kind() == "identifier" {
+        Some(first)
+    } else {
+        // typed_parameter / default_parameter / typed_default_parameter:
+        // the parameter name is the first identifier inside.
+        (0..u32::try_from(first.named_child_count()).unwrap_or(0))
+            .filter_map(|i| first.named_child(i))
+            .find(|c| c.kind() == "identifier")
+    };
+    ident
+        .and_then(|n| n.utf8_text(content).ok())
+        .is_some_and(|text| text == name)
 }
 
 /// Walk `node`'s parent chain and return the first ancestor that is a

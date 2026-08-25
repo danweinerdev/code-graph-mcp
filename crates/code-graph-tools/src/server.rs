@@ -1816,10 +1816,14 @@ impl CodeGraphServer {
                        form); `file` and `line` are the CALL site — the source file and \
                        line of the `Calls` edge that reached this hop; `candidates` is \
                        how many same-named definitions competed for the traversed \
-                       edge's target — 1 means unambiguous, N ≥ 2 means the resolver's \
-                       scope rule picked one of N (verify with find_class_candidates / \
-                       search_symbols when it matters). `min_confidence=\"resolved\"` \
-                       drops exactly the N ≥ 2 hops at BFS time; reading `candidates` \
+                       edge's target — 1 means sole candidate (verified only when the \
+                       call shape allowed verification: a receiver-typed sole-candidate \
+                       pick is Heuristic/1, an unverified name-only guess), N ≥ 2 means \
+                       the resolver's scope rule picked one of N (verify with \
+                       find_class_candidates / search_symbols when it matters). \
+                       `min_confidence=\"resolved\"` drops every Heuristic hop at BFS \
+                       time — the N ≥ 2 scope-rule picks AND the Heuristic/1 \
+                       receiver-unverified picks; reading `candidates` \
                        lets you keep them AND know how contested each one was. At depth 1 the \
                        call site lives in the caller's own file by definition; at depth \
                        ≥ 2 `file` and the file segment of `symbol_id` routinely diverge \
@@ -1903,11 +1907,15 @@ impl CodeGraphServer {
                        CALL site — the source file and line of the `Calls` edge that \
                        reached this hop; `candidates` is how many same-named \
                        definitions competed for the traversed edge's target — 1 means \
-                       unambiguous, N ≥ 2 means the resolver's scope rule picked one \
+                       sole candidate (verified only when the call shape allowed \
+                       verification: a receiver-typed sole-candidate pick is \
+                       Heuristic/1, an unverified name-only guess), N ≥ 2 means the \
+                       resolver's scope rule picked one \
                        of N (the OTHER N-1 definitions are real alternatives worth \
                        checking when the answer looks wrong). \
-                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 hops at \
-                       BFS time; reading `candidates` keeps them AND says how \
+                       `min_confidence=\"resolved\"` drops every Heuristic hop at \
+                       BFS time — the N ≥ 2 scope-rule picks AND the Heuristic/1 \
+                       receiver-unverified picks; reading `candidates` keeps them AND says how \
                        contested each one was. The call site (`file`) is always in the \
                        queried symbol's file — the function making the call — never \
                        in the callee's definition file. So `file` and the file segment \
@@ -1993,7 +2001,9 @@ impl CodeGraphServer {
                        `to`, and every adjacent pair is a real `Calls` edge; `hop_count = \
                        hops.length - 1` (the edge count, not the node count). `candidates` \
                        on each later hop is how many same-named definitions competed for \
-                       the traversed edge's target (1 = unambiguous, N ≥ 2 = the scope rule \
+                       the traversed edge's target (1 = sole candidate — NOT necessarily \
+                       verified: a receiver-typed sole-candidate pick is Heuristic/1; \
+                       N ≥ 2 = the scope rule \
                        picked one of N) — the per-hop signal behind `heuristic_hops`, so \
                        you can see WHICH hop was contested, not just how many were. IMPORTANT CAVEAT: call resolution is a syntactic \
                        heuristic (same file > same parent > same namespace > global, per \
@@ -2495,8 +2505,9 @@ impl CodeGraphServer {
                        objects, `[]` when empty) or `\"mermaid\"` (Mermaid flowchart text). \
                        In `symbol=` mode every edge carries `candidates` — how many \
                        same-named definitions competed for the traversed call edge's target \
-                       (1 = unambiguous, N ≥ 2 = the scope rule picked one of N; \
-                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 edges, reading \
+                       (1 = sole candidate, N ≥ 2 = the scope rule picked one of N; \
+                       `min_confidence=\"resolved\"` drops exactly the N ≥ 2 edges AND the \
+                       Heuristic/1 receiver-unverified sole-candidate picks, reading \
                        `candidates` keeps them and says how contested each was). `file=` and \
                        `class=` edges OMIT the field entirely (not null) — include and \
                        inheritance edges carry no resolver metadata, the same boundary that \

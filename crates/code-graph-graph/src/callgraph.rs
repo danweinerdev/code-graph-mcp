@@ -548,20 +548,23 @@ struct IncomingRecord {
 /// confidence of the edge that was traversed to reach it.
 ///
 /// **Why `entered_by` AND `candidates` both ride the wire (task 9.3's
-/// D-0007 disposition — kept deliberately, not an oversight):** for call
-/// edges TODAY the two coincide (`Resolved` ⇔ count 1, `Heuristic` ⇔
-/// count ≥ 2), and `candidates` is the signal agents should reason from —
-/// it names the next action ("3 candidates competed; disambiguate")
-/// where the one-bit tag does not. `entered_by` stays because (a)
-/// removing a shipped field breaks the phase's own additive-response
-/// contract; (b) the axes are independent by design — the include
-/// resolver already emits `Resolved` with count 2 for
-/// suffix-disambiguated picks, and [`Confidence`] is `#[non_exhaustive]`
-/// precisely so a future type-inference variant can mark a
-/// multi-candidate pick as definitively resolved, at which point
-/// deriving one field from the other would be wrong; (c) it is the
-/// per-hop form of the `heuristic_hops` tie-break cost, which explains
-/// WHY this path won over an alternative.
+/// D-0007 disposition — kept deliberately, not an oversight):** the axes
+/// are independent, and since F2 (KNOWN_ISSUES) both off-diagonal
+/// combinations are real on call edges — a receiver-typed sole-candidate
+/// pick is `Heuristic` with count 1 (the receiver's type was not
+/// verifiable, so the sole indexed name is a guess), while the include
+/// resolver emits `Resolved` with count 2 for suffix-disambiguated
+/// picks. `candidates` is the signal agents should reason from — it
+/// names the next action ("3 candidates competed; disambiguate") — but
+/// the TAG, not the count, discriminates verified from guessed (a count
+/// of 1 may be either). `entered_by` stays because (a) removing a
+/// shipped field breaks the phase's own additive-response contract;
+/// (b) deriving one field from the other is wrong-in-fact (above), and
+/// [`Confidence`] is `#[non_exhaustive]` precisely so a future
+/// type-inference variant can mark a multi-candidate pick as
+/// definitively resolved; (c) it is the per-hop form of the
+/// `heuristic_hops` tie-break cost, which explains WHY this path won
+/// over an alternative.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PathHop {
     pub symbol_id: SymbolId,

@@ -242,8 +242,16 @@ pub(crate) fn default_scope_aware_resolve(
             // targets an unindexed member (or the parent match failed);
             // that pick is unverified.
             CallShape::SelfReceiver => {
+                // Compare against the caller ID's FULL parent
+                // (`ns::Class`, not `ns`): C++ out-of-line qualified
+                // definitions record multi-segment parents via
+                // `split_qualified`'s rfind("::"), and the first-segment
+                // `caller_id_parent` would spuriously downgrade every
+                // `this->` call inside them. The multi-candidate scope
+                // scoring below deliberately keeps the historical
+                // first-segment helper (Go-parity behavior).
                 if !candidates[0].parent.is_empty()
-                    && candidates[0].parent == caller_id_parent(ctx.caller_id)
+                    && candidates[0].parent == caller_id_full_parent(ctx.caller_id)
                 {
                     Confidence::Resolved
                 } else {
@@ -305,6 +313,36 @@ pub(crate) fn default_scope_aware_resolve(
 /// immediately preceded nor immediately followed by another `:`. The `::`
 /// scope separator and the Windows drive `:` are both correctly skipped
 /// by this rule.
+/// Extract the FULL parent scope from a caller's symbol ID: for
+/// `file:ns::Class::method` this returns `"ns::Class"` (everything between
+/// the path/name separator and the LAST `::`), matching how C++ out-of-line
+/// qualified definitions record `Symbol.parent` via `split_qualified`'s
+/// `rfind("::")`. Used by the F2 SelfReceiver verification, where the
+/// comparison target is the candidate's recorded parent, not the first
+/// scope segment. `""` for free functions and unparseable IDs.
+fn caller_id_full_parent(caller_id: &str) -> String {
+    let bytes = caller_id.as_bytes();
+    let mut sep: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let prev_is_colon = i > 0 && bytes[i - 1] == b':';
+        let next_is_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+        if !prev_is_colon && !next_is_colon {
+            sep = Some(i);
+        }
+    }
+    let Some(idx) = sep else {
+        return String::new();
+    };
+    let name = &caller_id[idx + 1..];
+    match name.rfind("::") {
+        Some(scope_end) => name[..scope_end].to_string(),
+        None => String::new(),
+    }
+}
+
 fn caller_id_parent(caller_id: &str) -> String {
     let bytes = caller_id.as_bytes();
     let mut sep: Option<usize> = None;
@@ -508,15 +546,23 @@ pub trait LanguagePlugin: Send + Sync {
     ///
     /// Returns the resolved [`SymbolId`] paired with a [`Confidence`]
     /// tag and the competing-candidate count (FR-48, D-0007):
-    /// The current default mapping is explicit: a sole candidate returns
-    /// [`Confidence::Resolved`]/1; a scope-heuristic pick from N ≥ 2
-    /// same-name candidates returns [`Confidence::Heuristic`]/N. Overrides
+    /// The current default mapping is explicit and SHAPE-GATED (F2,
+    /// KNOWN_ISSUES): a sole candidate returns [`Confidence::Resolved`]/1
+    /// only when `ctx.shape` allowed verification — [`CallShape::Free`],
+    /// or [`CallShape::SelfReceiver`] with the candidate in the caller's
+    /// own class; a receiver-typed sole candidate
+    /// ([`CallShape::Receiver`], or an unmatched `SelfReceiver`) returns
+    /// [`Confidence::Heuristic`]/1 because the receiver's type — not the
+    /// name — selects the true target and was not verifiable against the
+    /// index. A scope-heuristic pick from N ≥ 2 same-name candidates
+    /// returns [`Confidence::Heuristic`]/N. Overrides
     /// must return the real, nonzero pre-pick candidate count and choose
     /// [`Confidence`] from their actual certainty independently. In
     /// particular, `min_confidence=resolved` filters only by the confidence
     /// tag, so a future structurally or type-resolved call with candidates=2
     /// remains admitted. `Resolved`/N is valid only when the resolver
-    /// genuinely disambiguated the target, not merely because it picked one.
+    /// genuinely disambiguated the target, not merely because it picked one
+    /// — and conversely, count 1 does not imply `Resolved`.
     fn resolve_call(
         &self,
         callee: &str,
@@ -1358,6 +1404,38 @@ mod tests {
                 Confidence::Resolved,
                 1
             )),
+        );
+    }
+
+    /// F2 cycle-2 pin (phase-12 review, blind-spots F3): a SelfReceiver
+    /// call inside an out-of-line QUALIFIED definition (`ns::Class::method`
+    /// — multi-segment parent recorded via `split_qualified`'s
+    /// `rfind("::")`) must still verify: the comparison uses the caller
+    /// ID's FULL parent, not the first scope segment.
+    #[test]
+    fn f2_self_receiver_verifies_against_full_qualified_parent() {
+        let member = entry(
+            "/proj/x.cpp:ns::Registry::is_empty",
+            "/proj/x.cpp",
+            "ns::Registry",
+            "",
+        );
+        let idx = build_index(vec![(Language::Cpp, "is_empty", member)]);
+        let caller_file = PathBuf::from("/proj/x.cpp");
+        let ctx = CallContext {
+            caller_id: "/proj/x.cpp:ns::Registry::validate",
+            caller_file: &caller_file,
+            language: Language::Cpp,
+            shape: CallShape::SelfReceiver,
+        };
+        assert_eq!(
+            default_scope_aware_resolve(Language::Cpp, "is_empty", &ctx, &idx),
+            Some((
+                "/proj/x.cpp:ns::Registry::is_empty".to_string(),
+                Confidence::Resolved,
+                1
+            )),
+            "the full multi-segment parent must verify, not the first segment"
         );
     }
 
