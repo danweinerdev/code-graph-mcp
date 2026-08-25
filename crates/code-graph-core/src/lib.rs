@@ -271,7 +271,8 @@ pub struct Edge {
     pub shape: CallShape,
 }
 
-/// Serde default for [`Edge::candidates`]: the unambiguous count.
+/// Serde default for [`Edge::candidates`]: the sole-candidate count
+/// (which does not imply `Resolved` — see [`Confidence::Heuristic`]).
 fn default_candidate_count() -> u32 {
     1
 }

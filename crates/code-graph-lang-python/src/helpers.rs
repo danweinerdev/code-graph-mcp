@@ -42,7 +42,19 @@ pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
         return CallShape::Free;
     };
     if parent.kind() != "attribute" {
-        return CallShape::Free;
+        // Direct call (`cb()`): degrade to Receiver when the name is a
+        // locally bound VALUE — an enclosing function's parameter or a
+        // body re-binding — because the resolver cannot verify which
+        // callable that value is (blind-spots cycle-5 F2). Ordinary
+        // module/class-level names stay Free.
+        let locally_bound = cap_node
+            .utf8_text(content)
+            .is_ok_and(|name| python_locally_bound_callable(cap_node, content, name));
+        return if locally_bound {
+            CallShape::Receiver
+        } else {
+            CallShape::Free
+        };
     }
     if parent.child_by_field_name("attribute").map(|n| n.id()) != Some(cap_node.id()) {
         return CallShape::Free;
@@ -56,6 +68,46 @@ pub fn python_call_shape(cap_node: Node<'_>, content: &[u8]) -> CallShape {
         }
         _ => CallShape::Receiver,
     }
+}
+
+/// Direct-call shape refinement (phase-12 review, blind-spots cycle-5
+/// F2): a bare `cb()` whose name is bound by an enclosing function's
+/// PARAMETER (any position, `def callback(self, cb): cb()`) or re-bound
+/// in an enclosing function's body (`cb = get_fn(); cb()`) calls a local
+/// VALUE — the generic resolver cannot verify which callable that value
+/// is, so a sole indexed symbol with that name must not resolve
+/// `Resolved/1`. Returns `true` when the name is locally bound at
+/// `cap_node`'s position; the caller degrades the shape to
+/// [`CallShape::Receiver`]. Walks every enclosing `lambda` and
+/// `function_definition` up to module level; module-level direct calls
+/// (no enclosing function) are never locally bound.
+pub fn python_locally_bound_callable(cap_node: Node<'_>, content: &[u8], name: &str) -> bool {
+    let mut current = cap_node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "lambda" => {
+                if lambda_params_bind(n, content, name) {
+                    return true;
+                }
+            }
+            "function_definition" => {
+                let params_bind = n
+                    .child_by_field_name("parameters")
+                    .is_some_and(|p| subtree_names_identifier(p, content, name));
+                if params_bind {
+                    return true;
+                }
+                if n.child_by_field_name("body")
+                    .is_some_and(|b| subtree_rebinds(b, content, name))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// True when, at `node`'s position, the identifier `name` (`self`/`cls`)
@@ -89,12 +141,44 @@ fn receiver_binds_enclosing_class(node: Node<'_>, content: &[u8], name: &str) ->
             None => return false,
         }
     };
+    // A `@staticmethod` receives NO receiver binding: a first parameter
+    // that happens to be named `self`/`cls` is an ordinary argument of
+    // arbitrary type (phase-12 review, blind-spots cycle-5 F1).
+    // Decorators wrap the function as `decorated_definition >
+    // function_definition`, and decorator text is compared without the
+    // leading `@`.
+    if let Some(wrapper) = func.parent() {
+        if wrapper.kind() == "decorated_definition" {
+            for i in 0..u32::try_from(wrapper.named_child_count()).unwrap_or(0) {
+                let Some(child) = wrapper.named_child(i) else {
+                    continue;
+                };
+                if child.kind() == "decorator"
+                    && child
+                        .utf8_text(content)
+                        .is_ok_and(|t| t.trim_start_matches('@').trim() == "staticmethod")
+                {
+                    return false;
+                }
+            }
+        }
+    }
     let Some(params) = func.child_by_field_name("parameters") else {
         return false;
     };
     let Some(first) = params.named_child(0) else {
         return false;
     };
+    // A variadic first parameter (`*self` / `**self`) is a tuple/dict of
+    // ordinary arguments, never the receiver — reject before the
+    // identifier-inside extraction can match its inner name (blind-spots
+    // cycle-5 F1).
+    if matches!(
+        first.kind(),
+        "list_splat_pattern" | "dictionary_splat_pattern"
+    ) {
+        return false;
+    }
     let ident = if first.kind() == "identifier" {
         Some(first)
     } else {

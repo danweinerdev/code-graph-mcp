@@ -97,7 +97,8 @@ pub fn collect_static_imports(root: Node<'_>, content: &[u8]) -> JavaStaticImpor
 /// [`CallShape::Receiver`], because the import declares the true target
 /// lives outside the enclosing class and a sole unrelated indexed
 /// candidate would otherwise resolve falsely `Resolved/1`. Method
-/// references (`String::length`, `obj::method`) and constructor calls
+/// references classify by their receiver (`this::e` SelfReceiver,
+/// everything else Receiver — see the branch below); constructor calls
 /// classify `Free` (their capture is not a `method_invocation` name).
 pub fn java_call_shape(
     cap_node: Node<'_>,

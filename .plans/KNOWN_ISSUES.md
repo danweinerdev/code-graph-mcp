@@ -196,6 +196,35 @@ Rationale:
    confidence section, D-0007 disposition, and `min_confidence` semantics
    were rewritten in `68abe00`.
 
+### Accepted residuals (post-fix)
+
+Documented conservative or out-of-scope leftovers, accepted pending Option C
+(receiver type inference):
+
+1. **Callable-value parameters in Rust, C++, C#, and Java.** A bare call to
+   a function-typed parameter or local (`fn f(cb: fn()) { cb() }`) still
+   classifies `Free`, so a sole same-named indexed symbol resolves
+   `Resolved/1` (phase-12 review, blind-spots cycle-5 F2). Python is FIXED
+   (`python_locally_bound_callable` degrades parameter- and body-bound bare
+   calls to Receiver); the statically typed languages are accepted debt —
+   their type systems narrow the hazard (a shadowing local is visible at the
+   declaration) but the syntactic resolver does not consult it. Option C's
+   local-binding tracking is the structural fix.
+2. **C++ inline-vs-out-of-line nested-parent mismatch.** An in-class-declared
+   member records parent `Inner` while an out-of-line qualified caller ID
+   carries `Outer::Inner`; the SelfReceiver compare fails and the true edge
+   downgrades to `Heuristic/1` — a false DOWNGRADE, never a false
+   `Resolved` (documented at `caller_id_full_parent`).
+3. **C++ implicit-`this` with an unindexed inherited member.** An unqualified
+   call inside a method stays `Free`; if the sole indexed candidate is a
+   global while an UNINDEXED inherited member actually shadows it, the pick
+   is wrong but count-1 sole-candidate picks of this shape are otherwise
+   overwhelmingly correct (documented at `cpp_call_shape`).
+4. **Python degenerate rebindings the scan cannot see** (e.g. `exec`,
+   attribute-injected globals) remain theoretically able to shadow a
+   receiver; every statically visible binding construct is covered and
+   pinned.
+
 ### Interim mitigation (obsolete)
 
 Superseded by the fix: `Resolved/1` on a call edge now means verified. The

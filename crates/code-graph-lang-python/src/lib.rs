@@ -1442,6 +1442,73 @@ mod tests {
         );
     }
 
+    /// Cycle-5 pins (phase-12 review, blind-spots cycle-5 F1/F2):
+    /// (a) a `@staticmethod` whose first parameter happens to be named
+    /// `self` receives NO receiver binding — its `self.hit()` degrades;
+    /// (b) a variadic first parameter (`*self`) is a tuple of ordinary
+    /// arguments — degrades; (c) a bare call to a PARAMETER
+    /// (`def callback(self, cb): cb()`) calls a local value the resolver
+    /// cannot verify — degrades to Receiver rather than Free; (d) a bare
+    /// call to a body-re-bound name (`cb = get(); cb()`) — degrades;
+    /// (e) a bare call to an unbound name stays Free (the control).
+    #[test]
+    fn f2_staticmethod_variadic_and_local_callables_degrade() {
+        use code_graph_core::CallShape;
+        let fg = parse(
+            "class C:\n\
+             \x20   @staticmethod\n\
+             \x20   def s(self):\n\
+             \x20       self.hit()\n\
+             \x20   def variadic(*self):\n\
+             \x20       self.star_hit()\n\
+             \x20   def callback(self, cb):\n\
+             \x20       cb()\n\
+             \x20   def rebound(self):\n\
+             \x20       cb2 = get()\n\
+             \x20       cb2()\n\
+             \x20   def control(self):\n\
+             \x20       helper()\n\
+             \x20       self.fine()\n",
+        );
+        let shape_of = |name: &str| {
+            calls(&fg)
+                .iter()
+                .find(|e| e.to == name)
+                .unwrap_or_else(|| panic!("missing Calls edge to {name}: {:?}", fg.edges))
+                .shape
+        };
+        assert_eq!(
+            shape_of("hit"),
+            CallShape::Receiver,
+            "@staticmethod first param named self is not a receiver"
+        );
+        assert_eq!(
+            shape_of("star_hit"),
+            CallShape::Receiver,
+            "variadic *self is not a receiver"
+        );
+        assert_eq!(
+            shape_of("cb"),
+            CallShape::Receiver,
+            "a parameter-bound callable is a local value — unverifiable"
+        );
+        assert_eq!(
+            shape_of("cb2"),
+            CallShape::Receiver,
+            "a body-re-bound callable is a local value — unverifiable"
+        );
+        assert_eq!(
+            shape_of("helper"),
+            CallShape::Free,
+            "an unbound bare call keeps the Free shape"
+        );
+        assert_eq!(
+            shape_of("fine"),
+            CallShape::SelfReceiver,
+            "an undecorated clean method keeps its verified receiver"
+        );
+    }
+
     #[test]
     fn direct_call_in_free_function_produces_one_calls_edge() {
         // `def f(): foo()` → 1 edge, To=foo, From=path:f.

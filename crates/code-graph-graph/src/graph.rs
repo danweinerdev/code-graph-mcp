@@ -111,7 +111,9 @@ pub struct EdgeEntry {
     pub candidates: u32,
 }
 
-/// Serde default for [`EdgeEntry::candidates`]: the unambiguous count.
+/// Serde default for [`EdgeEntry::candidates`]: the sole-candidate count
+/// (which does not imply `Resolved` — a receiver-typed sole-candidate
+/// pick is `Heuristic/1`, F2).
 fn default_candidate_count() -> u32 {
     1
 }
