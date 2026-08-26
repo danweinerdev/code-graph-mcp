@@ -383,7 +383,9 @@ scoped-cache and nested-module behavior.
 producing phase-12's Linux verification). NOT a phase-12 regression — it
 reproduces identically at the phase range start (`0b41bbd`) and at the final
 candidate (`f9ca2ca`); the same suites pass natively on Windows, and the
-owner's Linux runs have not reported it outside WSL.
+owner's Linux runs have not reported it outside WSL. The environmental
+classification was CONFIRMED 2026-08-25 on a native (non-WSL) kernel — see
+Follow-up 1.
 
 ### Symptom
 
@@ -424,9 +426,13 @@ identified without strace/gdb (not installed; no passwordless sudo).
 
 ### Follow-up
 
-1. Reproduce on a real Linux kernel to confirm the environmental
-   classification (expected: passes — the composition is exercised by the
-   sibling daemon tests that pass everywhere).
+1. (DONE 2026-08-25 — environmental classification confirmed.) Reproduce
+   on a real Linux kernel: PASS. `cargo test -p code-graph-mcp --bin
+   code-graph-mcp run_until_uses_the_idle_future` (standalone probe) and the
+   full `make verify` both green at `b1ec6d0` on Fedora 44 (kernel
+   `7.1.8-200.fc44.x86_64`, rustc 1.96.1 stable) — the livelock is
+   WSL2-specific; the composition is exercised by the sibling daemon tests
+   that pass everywhere.
 2. If WSL2 support matters, retry the diagnosis with strace available and
    file upstream (tokio or WSL2 kernel) with the minimal reproduction once
    the storming fd is identified.
