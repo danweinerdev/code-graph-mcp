@@ -70,7 +70,7 @@ pub struct Graph {
     /// `Inherits.from`" per-language notes in CLAUDE.md), which is
     /// neither a symbol id nor derivable from one. Recording that
     /// residual per file is what lets
-    /// [`Graph::remove_edges_from_file`] cost `O(edges-of-file)`
+    /// [`Graph::remove_forward_edges_from_file`] cost `O(edges-of-file)`
     /// instead of `O(all edges in the graph)`.
     ///
     /// Deliberately **not** persisted: the cache stores `adj`/`radj`
@@ -240,7 +240,7 @@ impl Graph {
             symbol_ids.push(id);
         }
         // Adjacency keys this file's edges land under that
-        // `remove_edges_from_file` can rediscover on its own: the file's
+        // `remove_forward_edges_from_file` can rediscover on its own: the file's
         // own symbol ids (ordinary `Calls`/`Overrides` sources) plus the
         // file-path pseudo-key (file-scope lambda / package-level
         // closure calls). Anything else — in practice an `Inherits`
@@ -320,6 +320,39 @@ impl Graph {
         );
     }
 
+    /// Merge many [`FileGraph`]s at once — the batch counterpart of
+    /// [`Graph::merge_file_graph`], and the shape the indexer's merge
+    /// phase must use when folding a fresh parse set into a loaded
+    /// project graph.
+    ///
+    /// Semantically identical to merging the graphs one by one: any
+    /// path already present is replaced, unknown paths are added. The
+    /// difference is purely the cost of the replacement half. A per-file
+    /// merge removes each pre-existing path individually, and each
+    /// removal re-scans the full `radj` mirror vec of every reverse key
+    /// the file touches — a *hub* symbol referenced by most of the set
+    /// (a base class, a logging function) gets its huge vec re-scanned
+    /// once per re-merged file, degrading an incremental re-index to
+    /// `O(files × hub-degree)`. Batching removes ALL pre-existing paths
+    /// first ([`Graph::remove_files_batch`] — each touched reverse key
+    /// filtered exactly once), then inserts the fresh graphs, whose
+    /// per-file merge finds no stale path and does no removal work.
+    ///
+    /// A duplicate path within `graphs` keeps last-merge-wins semantics:
+    /// the second copy finds the first already inserted and replaces it
+    /// through the ordinary single-file path.
+    pub fn merge_file_graphs(&mut self, graphs: Vec<FileGraph>) {
+        let existing: Vec<PathBuf> = graphs
+            .iter()
+            .map(|fg| PathBuf::from(&fg.path))
+            .filter(|p| self.files.contains_path(p))
+            .collect();
+        self.remove_files_batch(&existing);
+        for fg in graphs {
+            self.merge_file_graph(fg);
+        }
+    }
+
     /// Remove all symbols and edges originating from the given file.
     ///
     /// Cleanup covers all five storage maps:
@@ -357,9 +390,7 @@ impl Graph {
     /// pre-Phase-E HashMap shape required.
     pub fn drop_files_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
         let in_scope: Vec<PathBuf> = self.files.iter_subtree(scope).map(|(p, _)| p).collect();
-        for path in &in_scope {
-            self.remove_file_unsafe(path);
-        }
+        self.remove_files_batch(&in_scope);
         in_scope
     }
 
@@ -382,13 +413,8 @@ impl Graph {
     /// the project root unless they intend a full project re-validation.
     pub fn evict_missing_in_scope(&mut self, scope: &Path) -> Vec<PathBuf> {
         let candidates: Vec<PathBuf> = self.files.iter_subtree(scope).map(|(p, _)| p).collect();
-        let mut removed = Vec::new();
-        for path in candidates {
-            if !path.exists() {
-                self.remove_file_unsafe(&path);
-                removed.push(path);
-            }
-        }
+        let removed: Vec<PathBuf> = candidates.into_iter().filter(|p| !p.exists()).collect();
+        self.remove_files_batch(&removed);
         removed
     }
 
@@ -415,13 +441,8 @@ impl Graph {
             .keys()
             .filter(|p| !p.starts_with(scope))
             .collect();
-        let mut removed = Vec::new();
-        for path in candidates {
-            if !path.exists() {
-                self.remove_file_unsafe(&path);
-                removed.push(path);
-            }
-        }
+        let removed: Vec<PathBuf> = candidates.into_iter().filter(|p| !p.exists()).collect();
+        self.remove_files_batch(&removed);
         removed
     }
 
@@ -433,7 +454,7 @@ impl Graph {
     /// the iterate-the-full-files-map-and-filter-by-prefix loop the
     /// pre-Phase-E HashMap shape would have required. Includes-table
     /// drop is similarly one trie op. Per-file `adj`/`radj` scrubbing
-    /// goes through [`Graph::remove_edges_from_file`], which visits only
+    /// goes through [`Graph::remove_forward_edges_from_file`], which visits only
     /// the adjacency keys that can hold each dropped file's edges — so
     /// the whole call is `O(subtree-size + edges-of-subtree)` rather
     /// than the `O(files-in-subtree × all edges)` the previous
@@ -452,14 +473,23 @@ impl Graph {
         let mut removed_ids: HashSet<SymbolId> = HashSet::new();
         // Drop the files-table subtree in one trie op and use the
         // returned (path, FileEntry) pairs to drive per-file cleanup
-        // of nodes / adj / radj.
+        // of nodes / adj, batching the reverse-mirror scrub so shared
+        // reverse keys (hub symbols) are visited once for the whole
+        // subtree rather than once per dropped file.
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut targets: HashSet<SymbolId> = HashSet::new();
+        let mut scratch: Vec<SymbolId> = Vec::new();
         for (path, entry) in self.files.remove_subtree(prefix) {
             for id in &entry.symbol_ids {
                 self.nodes.remove(id);
                 removed_ids.insert(id.clone());
             }
-            self.remove_edges_from_file(&path, &entry.symbol_ids);
+            scratch.clear();
+            self.remove_forward_edges_from_file(&path, &entry.symbol_ids, &mut scratch);
+            targets.extend(scratch.drain(..));
+            paths.push(path);
         }
+        self.scrub_reverse_mirrors(&targets, &paths);
         // Includes table: a separate trie op; the dropped entries
         // need no follow-up since we already scrubbed adj/radj per
         // file above (and `Includes` edges live in `includes`, not
@@ -473,34 +503,101 @@ impl Graph {
     // `parking_lot::RwLock` that wraps the server-side Graph". No Rust
     // `unsafe` code is involved.
     fn remove_file_unsafe(&mut self, path: &Path) {
-        // Take the file entry out first: it owns the symbol-id list the
-        // targeted edge scrub needs as its key set, and taking it means
-        // that list is never cloned on the merge hot path. Nothing
-        // between here and the end of the method reads `files`.
-        let symbol_ids = self
-            .files
-            .remove(path)
-            .map(|entry| entry.symbol_ids)
-            .unwrap_or_default();
-
-        // Remove nodes for this file's symbols.
-        for id in &symbol_ids {
-            self.nodes.remove(id);
-        }
+        let symbol_ids = self.remove_file_local_state(path);
 
         // Remove adj/radj entries sourced from this file. Runs even when
         // `files` did not know the path: the previous whole-map filter
         // dropped `file == path` entries regardless of `files`
         // membership, and the file-path pseudo-key can carry edges
         // (file-scope lambdas) with no owning symbol at all.
-        self.remove_edges_from_file(path, &symbol_ids);
-
-        self.includes.remove(path);
-        self.resolver_metadata.remove(path);
+        let mut targets: Vec<SymbolId> = Vec::new();
+        self.remove_forward_edges_from_file(path, &symbol_ids, &mut targets);
+        for target in targets {
+            let Some(entries) = self.radj.get_mut(&target) else {
+                continue;
+            };
+            entries.retain(|e| e.file != path);
+            if entries.is_empty() {
+                self.radj.remove(&target);
+            }
+        }
     }
 
-    /// Remove every `adj`/`radj` entry contributed by `path`'s parse,
-    /// visiting only the adjacency keys that can hold them.
+    /// Remove every file in `paths` — the batch counterpart of
+    /// [`Graph::remove_file_unsafe`], and the only shape multi-file
+    /// callers should use.
+    ///
+    /// **Why batching matters.** The forward (`adj`) half of a removal
+    /// is naturally per-file — each file's edges live under its own
+    /// keys. The reverse (`radj`) half is not: a *hub* symbol (a base
+    /// class or utility function referenced by thousands of files)
+    /// holds one long mirror vec that a per-file scrub re-scans once
+    /// per removed file that touches it, degrading a large scoped drop
+    /// to `O(files × hub-degree)` — observed as a ~24-minute stall
+    /// dropping 12k files from a 3.76M-edge graph. Batching collects
+    /// the touched reverse keys across the whole set and filters each
+    /// one exactly once against a hash set of the removed paths.
+    fn remove_files_batch(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut targets: HashSet<SymbolId> = HashSet::new();
+        let mut scratch: Vec<SymbolId> = Vec::new();
+        for path in paths {
+            let symbol_ids = self.remove_file_local_state(path);
+            scratch.clear();
+            self.remove_forward_edges_from_file(path, &symbol_ids, &mut scratch);
+            targets.extend(scratch.drain(..));
+        }
+        self.scrub_reverse_mirrors(&targets, paths);
+    }
+
+    /// Drop the reverse mirrors of already-removed forward edges: for
+    /// every key in `targets`, filter out entries whose `file` is one of
+    /// `removed_files`, dropping keys whose vec empties. Each touched
+    /// reverse key is visited exactly once per batch — this is what
+    /// keeps hub symbols (huge mirror vecs shared by many files) from
+    /// being re-scanned per removed file.
+    fn scrub_reverse_mirrors(&mut self, targets: &HashSet<SymbolId>, removed_files: &[PathBuf]) {
+        if targets.is_empty() {
+            return;
+        }
+        let file_set: HashSet<&Path> = removed_files.iter().map(PathBuf::as_path).collect();
+        for target in targets {
+            let Some(entries) = self.radj.get_mut(target) else {
+                continue;
+            };
+            entries.retain(|e| !file_set.contains(e.file.as_path()));
+            if entries.is_empty() {
+                self.radj.remove(target);
+            }
+        }
+    }
+
+    /// The non-adjacency half of a single-file removal: take the file's
+    /// entry out of `files` (its symbol-id list is the key set every
+    /// edge scrub needs — taking it avoids a clone on the merge hot
+    /// path), drop its nodes, and clear its `includes` /
+    /// `resolver_metadata` rows. Returns the taken symbol ids; empty
+    /// when `files` did not know the path.
+    fn remove_file_local_state(&mut self, path: &Path) -> Vec<SymbolId> {
+        let symbol_ids = self
+            .files
+            .remove(path)
+            .map(|entry| entry.symbol_ids)
+            .unwrap_or_default();
+        for id in &symbol_ids {
+            self.nodes.remove(id);
+        }
+        self.includes.remove(path);
+        self.resolver_metadata.remove(path);
+        symbol_ids
+    }
+
+    /// Remove every `adj` entry contributed by `path`'s parse, visiting
+    /// only the adjacency keys that can hold them, and report the
+    /// removed edges' targets so the caller can scrub the `radj`
+    /// mirrors.
     ///
     /// **Why this exists.** The predecessor (`retain_edges_not_from`)
     /// filtered the *entire* `adj` and then the entire `radj` map on
@@ -529,12 +626,20 @@ impl Graph {
     /// `radj` needs no key index of its own: every `radj` entry with
     /// `file == path` is the mirror of one of the `adj` entries dropped
     /// here, and its key is that entry's `target` — so the targets
-    /// collected while filtering forward are exactly the reverse keys to
-    /// scrub. Cross-file edges that merely *target* a symbol of `path`
+    /// pushed into `targets` while filtering forward are exactly the
+    /// reverse keys the caller must scrub (per-file retain in
+    /// [`Graph::remove_file_unsafe`], batched
+    /// [`Graph::scrub_reverse_mirrors`] everywhere multiple files go at
+    /// once). Cross-file edges that merely *target* a symbol of `path`
     /// carry their own file in `file` and are deliberately left alone;
     /// [`Graph::prune_dangling_edges`] is the caller-driven pass for
     /// those.
-    fn remove_edges_from_file(&mut self, path: &Path, symbol_ids: &[SymbolId]) {
+    fn remove_forward_edges_from_file(
+        &mut self,
+        path: &Path,
+        symbol_ids: &[SymbolId],
+        targets: &mut Vec<SymbolId>,
+    ) {
         let path_key = path.to_string_lossy().into_owned();
         // Taken, not read: the file's residual keys describe the parse
         // being removed, so they go away with it. `merge_file_graph`
@@ -544,7 +649,6 @@ impl Graph {
         // Reverse keys to scrub, gathered while filtering forward.
         // Duplicates are harmless — a repeat visit finds the key already
         // filtered or already gone.
-        let mut targets: Vec<SymbolId> = Vec::new();
         for key in symbol_ids
             .iter()
             .map(String::as_str)
@@ -566,16 +670,6 @@ impl Graph {
             // keeps reflecting active sources.
             if entries.is_empty() {
                 self.adj.remove(key);
-            }
-        }
-
-        for target in targets {
-            let Some(entries) = self.radj.get_mut(&target) else {
-                continue;
-            };
-            entries.retain(|e| e.file != path);
-            if entries.is_empty() {
-                self.radj.remove(&target);
             }
         }
     }
@@ -619,7 +713,7 @@ impl Graph {
         self.adj_extra_keys = extras;
     }
 
-    /// Whether [`Graph::remove_edges_from_file`] reaches `key` for
+    /// Whether [`Graph::remove_forward_edges_from_file`] reaches `key` for
     /// `file` without consulting [`Graph::adj_extra_keys`]: the
     /// file-path pseudo-key, or a `<file>:…`-shaped symbol id backed by
     /// a live node.
@@ -1116,7 +1210,7 @@ mod tests {
         assert!(g.files().contains_path(PathBuf::from("/b.cpp")));
     }
 
-    // --- Targeted edge removal (`remove_edges_from_file`) ---------------
+    // --- Targeted edge removal (`remove_forward_edges_from_file`) -------
     //
     // These pin the key-set invariant the targeted scrub relies on. The
     // predecessor filtered every entry in `adj` and `radj` on each call,
@@ -1214,6 +1308,139 @@ mod tests {
         // The callee's own file is untouched.
         assert!(g.nodes().contains_key("/m.cpp:m_fn"));
         assert!(g.files().contains_path(PathBuf::from("/m.cpp")));
+    }
+
+    #[test]
+    fn batch_scope_drop_scrubs_shared_hub_mirror_once_and_exactly() {
+        // The hub shape the batch path exists for: several removed files
+        // all call one out-of-scope symbol, so its reverse-mirror vec is
+        // touched by every removal. Batch semantics must equal
+        // sequential semantics — only the removed files' entries leave
+        // the hub's vec, and a surviving caller's entry stays.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/lib/hub.cpp",
+            Language::Cpp,
+            vec![sym("hub", SymbolKind::Function, "/lib/hub.cpp")],
+            vec![],
+        ));
+        for (path, name) in [
+            ("/a/x.cpp", "x_fn"),
+            ("/a/y.cpp", "y_fn"),
+            ("/b/z.cpp", "z_fn"),
+        ] {
+            g.merge_file_graph(make_fg(
+                path,
+                Language::Cpp,
+                vec![sym(name, SymbolKind::Function, path)],
+                vec![call_edge(
+                    &format!("{path}:{name}"),
+                    "/lib/hub.cpp:hub",
+                    path,
+                    3,
+                )],
+            ));
+        }
+        // Plus a batch-internal edge: one in-scope file calling another
+        // in-scope file. Its mirror key is itself removed in the same
+        // batch, which must not confuse the scrub.
+        g.merge_file_graph(make_fg(
+            "/a/w.cpp",
+            Language::Cpp,
+            vec![sym("w_fn", SymbolKind::Function, "/a/w.cpp")],
+            vec![call_edge("/a/w.cpp:w_fn", "/a/x.cpp:x_fn", "/a/w.cpp", 5)],
+        ));
+        assert_eq!(
+            g.radj()["/lib/hub.cpp:hub"].len(),
+            3,
+            "sentinel: all three callers mirrored under the hub pre-drop"
+        );
+
+        let dropped = g.drop_files_in_scope(Path::new("/a"));
+
+        assert_eq!(dropped.len(), 3);
+        // The hub's mirror vec keeps exactly the surviving caller.
+        let hub_in = g.radj().get("/lib/hub.cpp:hub").expect("hub key survives");
+        assert_eq!(hub_in.len(), 1);
+        assert_eq!(hub_in[0].target, "/b/z.cpp:z_fn");
+        // Batch-internal mirror gone with its key's file.
+        assert!(!g.radj().contains_key("/a/x.cpp:x_fn"));
+        // Forward keys of dropped files gone; survivor untouched.
+        assert!(!g.adj().contains_key("/a/x.cpp:x_fn"));
+        assert!(!g.adj().contains_key("/a/w.cpp:w_fn"));
+        assert!(g.adj().contains_key("/b/z.cpp:z_fn"));
+    }
+
+    #[test]
+    fn merge_file_graphs_batch_re_merge_matches_per_file_semantics() {
+        // The indexer's merge phase folds a fresh parse set into a
+        // loaded project graph through the batch API. Re-merging the
+        // same shapes must replace, not accumulate — and a hub mirror
+        // shared with an out-of-batch file must keep that file's entry.
+        let mut g = Graph::new();
+        let hub = make_fg(
+            "/lib/hub.cpp",
+            Language::Cpp,
+            vec![sym("hub", SymbolKind::Function, "/lib/hub.cpp")],
+            vec![],
+        );
+        let outside = make_fg(
+            "/b/z.cpp",
+            Language::Cpp,
+            vec![sym("z_fn", SymbolKind::Function, "/b/z.cpp")],
+            vec![call_edge(
+                "/b/z.cpp:z_fn",
+                "/lib/hub.cpp:hub",
+                "/b/z.cpp",
+                2,
+            )],
+        );
+        let batch = vec![
+            make_fg(
+                "/a/x.cpp",
+                Language::Cpp,
+                vec![sym("x_fn", SymbolKind::Function, "/a/x.cpp")],
+                vec![call_edge(
+                    "/a/x.cpp:x_fn",
+                    "/lib/hub.cpp:hub",
+                    "/a/x.cpp",
+                    3,
+                )],
+            ),
+            make_fg(
+                "/a/y.cpp",
+                Language::Cpp,
+                vec![
+                    sym("Base", SymbolKind::Class, "/a/y.cpp"),
+                    sym("Derived", SymbolKind::Class, "/a/y.cpp"),
+                ],
+                vec![inherit_edge("Derived", "Base", "/a/y.cpp")],
+            ),
+        ];
+        g.merge_file_graph(hub);
+        g.merge_file_graph(outside);
+        g.merge_file_graphs(batch.clone());
+        let baseline = g.stats();
+        assert_eq!(
+            g.radj()["/lib/hub.cpp:hub"].len(),
+            2,
+            "sentinel: in-batch and out-of-batch callers both mirrored"
+        );
+
+        // Re-merge the same batch: counts must not grow, the
+        // out-of-batch caller's mirror must survive, and the type-name
+        // inherits key must be replaced, not duplicated.
+        g.merge_file_graphs(batch);
+
+        assert_eq!(
+            g.stats(),
+            baseline,
+            "batch re-merge must replace entries, not accumulate them"
+        );
+        let hub_in = &g.radj()["/lib/hub.cpp:hub"];
+        assert_eq!(hub_in.len(), 2);
+        assert!(hub_in.iter().any(|e| e.target == "/b/z.cpp:z_fn"));
+        assert_eq!(g.adj()["Derived"].len(), 1);
     }
 
     #[test]

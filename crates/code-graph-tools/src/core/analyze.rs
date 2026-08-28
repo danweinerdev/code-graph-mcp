@@ -610,9 +610,12 @@ pub(crate) async fn run_analyze_job(
             fresh_graphs.len()
         );
         let phase_start = std::time::Instant::now();
-        for fg in fresh_graphs {
-            merged_graph.merge_file_graph(fg);
-        }
+        // Batched: removes all stale same-path entries first so each
+        // touched reverse-mirror key (hub symbols) is filtered once for
+        // the whole fresh set, not once per re-merged file — the
+        // per-file shape degraded an incremental re-index of a large
+        // cached graph to O(files × hub-degree).
+        merged_graph.merge_file_graphs(fresh_graphs);
         // Persist metadata for the complete resolver universe, not only fresh
         // files. This upgrades footerless v13 Go cache entries reconstructed
         // by the compatibility path during prepare_resolution.
