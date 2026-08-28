@@ -421,6 +421,13 @@ impl Graph {
                 self.includes = parts.includes;
                 self.resolver_metadata = parts.resolver_metadata;
                 self.last_sweep_at = parts.last_sweep_at;
+                // `adj_extra_keys` is derived state, not cached state
+                // (see its field docs): rebuild it from the freshly
+                // assigned `adj` so the first removal / re-merge of a
+                // cached file still finds the adjacency keys that are
+                // not recoverable from `files[path]` — notably
+                // `Inherits` edges keyed by the derived type name.
+                self.rebuild_adj_extra_keys();
                 Ok((true, stale))
             }
         }
@@ -781,6 +788,60 @@ mod tests {
         assert_eq!(stats.nodes, 5);
         assert_eq!(stats.edges, 4);
         assert_eq!(stats.files, 2);
+    }
+
+    #[test]
+    fn load_rebuilds_the_derived_adjacency_key_index() {
+        // `adj_extra_keys` is derived state, not cached state: a load
+        // assigns `adj` wholesale, so the load path has to rebuild the
+        // index. Without that rebuild the first removal or re-merge of a
+        // CACHED file cannot reach its type-name-keyed `Inherits` entries
+        // (`adj["Derived"]` is neither a symbol id nor the file's
+        // pseudo-key) — the entry would survive the removal and then be
+        // duplicated by the merge.
+        let dir = TempDir::new().unwrap();
+        // `build_sample_graph` puts `inherit_edge("Derived", "Base")` in
+        // /a.cpp, which is exactly the shape at risk.
+        build_sample_graph().save(dir.path()).unwrap();
+
+        let mut loaded = Graph::new();
+        assert!(loaded.load(dir.path()).unwrap());
+        // Sentinel: the cached graph really does carry a type-name key,
+        // so a failure below is the rebuild, not a fixture change.
+        assert!(
+            loaded.adj.contains_key("Derived"),
+            "sentinel: cached /a.cpp must contribute a type-name adj key"
+        );
+        assert_eq!(
+            loaded.adj_extra_keys.get(Path::new("/a.cpp")),
+            Some(&vec!["Derived".to_string()]),
+            "load must rebuild the residual key index for cached files"
+        );
+
+        // Re-merging the cached file with the same shape must not double
+        // the inherits edge.
+        let before = loaded.stats();
+        loaded.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("foo", SymbolKind::Function, "/a.cpp"),
+                sym("bar", SymbolKind::Function, "/a.cpp"),
+                sym("Base", SymbolKind::Class, "/a.cpp"),
+                sym("Derived", SymbolKind::Class, "/a.cpp"),
+            ],
+            vec![
+                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 7),
+                inherit_edge("Derived", "Base", "/a.cpp"),
+                include_edge("/a.cpp", "/utils.h", "/a.cpp"),
+            ],
+        ));
+        assert_eq!(
+            loaded.stats(),
+            before,
+            "re-merge of a cached file must replace its edges, not accumulate them"
+        );
+        assert_eq!(loaded.adj["Derived"].len(), 1);
     }
 
     #[test]

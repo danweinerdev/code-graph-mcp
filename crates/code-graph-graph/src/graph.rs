@@ -56,6 +56,34 @@ pub struct Graph {
     /// [`FileGraph`] so files that do not need them pay no in-memory or cache
     /// payload cost.
     pub(crate) resolver_metadata: code_graph_path_trie::PathTrie<ResolverMetadata>,
+    /// Per-file list of `adj` keys that hold that file's edges but are
+    /// **not** recoverable from its [`FileEntry::symbol_ids`] or its
+    /// file-path pseudo-key.
+    ///
+    /// Why it is needed: `Calls`/`Overrides` edges are keyed by the
+    /// originating *symbol id* (`file:name`), and file-scope
+    /// lambda/closure calls are keyed by the file path itself — both
+    /// reachable from `files[path]` when the file is removed.
+    /// `Inherits` edges are not: their `from` is the derived **type
+    /// name** verbatim (`Derived`, and the generics-carrying forms
+    /// `Foo<T>` / `Vec<T>` — see the "generic verbatim in
+    /// `Inherits.from`" per-language notes in CLAUDE.md), which is
+    /// neither a symbol id nor derivable from one. Recording that
+    /// residual per file is what lets
+    /// [`Graph::remove_edges_from_file`] cost `O(edges-of-file)`
+    /// instead of `O(all edges in the graph)`.
+    ///
+    /// Deliberately **not** persisted: the cache stores `adj`/`radj`
+    /// verbatim, so [`Graph::rebuild_adj_extra_keys`] reconstructs this
+    /// index in one linear pass on load, where persisting it would cost
+    /// a `CACHE_VERSION` bump (and a full re-index of every existing
+    /// cache) for data that is already derivable.
+    ///
+    /// The index is superset-tolerant by design: a listed key that is
+    /// absent from `adj` costs one failed hash lookup, whereas a
+    /// *missing* key would leak edges — so both the merge-time record
+    /// and the load-time rebuild err toward listing too much.
+    pub(crate) adj_extra_keys: HashMap<PathBuf, Vec<SymbolId>>,
     /// Nanoseconds since UNIX_EPOCH when the out-of-scope hygiene
     /// sweep last ran across this graph. Persisted in the cache
     /// (`GraphCache.last_sweep_at`) so the cadence survives process
@@ -211,13 +239,17 @@ impl Graph {
             self.nodes.insert(id.clone(), Node { symbol });
             symbol_ids.push(id);
         }
-        self.files.insert(
-            path.clone(),
-            FileEntry {
-                language: fg.language,
-                symbol_ids,
-            },
-        );
+        // Adjacency keys this file's edges land under that
+        // `remove_edges_from_file` can rediscover on its own: the file's
+        // own symbol ids (ordinary `Calls`/`Overrides` sources) plus the
+        // file-path pseudo-key (file-scope lambda / package-level
+        // closure calls). Anything else — in practice an `Inherits`
+        // edge keyed by the derived type name — is recorded in
+        // `adj_extra_keys` below so the removal path can reach it
+        // without scanning every edge in the graph.
+        let derivable_keys: HashSet<&str> = symbol_ids.iter().map(String::as_str).collect();
+        let path_key = path.to_string_lossy().into_owned();
+        let mut extra_keys: Vec<SymbolId> = Vec::new();
 
         // Add edges, routing by kind. Confidence rides into both adj and
         // radj entries so the per-tool `min_confidence` filter can apply
@@ -230,6 +262,9 @@ impl Graph {
             let edge_file = PathBuf::from(&edge.file);
             match edge.kind {
                 EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Overrides => {
+                    if edge.from != path_key && !derivable_keys.contains(edge.from.as_str()) {
+                        extra_keys.push(edge.from.clone());
+                    }
                     self.adj
                         .entry(edge.from.clone())
                         .or_default()
@@ -264,6 +299,25 @@ impl Graph {
                 _ => {}
             }
         }
+
+        // Sorted + deduped so the recorded index is deterministic
+        // regardless of edge order (one type name typically contributes
+        // several `Inherits` edges — one per base).
+        if !extra_keys.is_empty() {
+            extra_keys.sort_unstable();
+            extra_keys.dedup();
+            self.adj_extra_keys.insert(path.clone(), extra_keys);
+        }
+
+        // Inserted last: `derivable_keys` borrows `symbol_ids` for the
+        // edge loop above, and the loop reads nothing out of `files`.
+        self.files.insert(
+            path,
+            FileEntry {
+                language: fg.language,
+                symbol_ids,
+            },
+        );
     }
 
     /// Remove all symbols and edges originating from the given file.
@@ -379,9 +433,11 @@ impl Graph {
     /// the iterate-the-full-files-map-and-filter-by-prefix loop the
     /// pre-Phase-E HashMap shape would have required. Includes-table
     /// drop is similarly one trie op. Per-file `adj`/`radj` scrubbing
-    /// still happens linearly across each dropped file's edge sets —
-    /// unavoidable while adj/radj are keyed by `SymbolId`, not by
-    /// path.
+    /// goes through [`Graph::remove_edges_from_file`], which visits only
+    /// the adjacency keys that can hold each dropped file's edges — so
+    /// the whole call is `O(subtree-size + edges-of-subtree)` rather
+    /// than the `O(files-in-subtree × all edges)` the previous
+    /// whole-map filter cost.
     ///
     /// Callers (today: the watch handler's directory-remove path)
     /// must feed the returned `HashSet<SymbolId>` to
@@ -402,8 +458,7 @@ impl Graph {
                 self.nodes.remove(id);
                 removed_ids.insert(id.clone());
             }
-            Self::retain_edges_not_from(&mut self.adj, &path);
-            Self::retain_edges_not_from(&mut self.radj, &path);
+            self.remove_edges_from_file(&path, &entry.symbol_ids);
         }
         // Includes table: a separate trie op; the dropped entries
         // need no follow-up since we already scrubbed adj/radj per
@@ -418,30 +473,163 @@ impl Graph {
     // `parking_lot::RwLock` that wraps the server-side Graph". No Rust
     // `unsafe` code is involved.
     fn remove_file_unsafe(&mut self, path: &Path) {
+        // Take the file entry out first: it owns the symbol-id list the
+        // targeted edge scrub needs as its key set, and taking it means
+        // that list is never cloned on the merge hot path. Nothing
+        // between here and the end of the method reads `files`.
+        let symbol_ids = self
+            .files
+            .remove(path)
+            .map(|entry| entry.symbol_ids)
+            .unwrap_or_default();
+
         // Remove nodes for this file's symbols.
-        if let Some(entry) = self.files.get(path) {
-            for id in &entry.symbol_ids {
-                self.nodes.remove(id);
-            }
+        for id in &symbol_ids {
+            self.nodes.remove(id);
         }
 
-        // Remove adj/radj entries sourced from this file. Keys whose vec
-        // becomes empty are dropped so `adj.len()` reflects active sources.
-        Self::retain_edges_not_from(&mut self.adj, path);
-        Self::retain_edges_not_from(&mut self.radj, path);
+        // Remove adj/radj entries sourced from this file. Runs even when
+        // `files` did not know the path: the previous whole-map filter
+        // dropped `file == path` entries regardless of `files`
+        // membership, and the file-path pseudo-key can carry edges
+        // (file-scope lambdas) with no owning symbol at all.
+        self.remove_edges_from_file(path, &symbol_ids);
 
         self.includes.remove(path);
-        self.files.remove(path);
         self.resolver_metadata.remove(path);
     }
 
-    /// Filter edge map entries: drop edges whose `file` equals `path`, and
-    /// drop keys whose retained vec is empty.
-    fn retain_edges_not_from(map: &mut HashMap<SymbolId, Vec<EdgeEntry>>, path: &Path) {
-        map.retain(|_, entries| {
+    /// Remove every `adj`/`radj` entry contributed by `path`'s parse,
+    /// visiting only the adjacency keys that can hold them.
+    ///
+    /// **Why this exists.** The predecessor (`retain_edges_not_from`)
+    /// filtered the *entire* `adj` and then the entire `radj` map on
+    /// every call, so removing one file cost `O(all edges in the
+    /// graph)` with a component-wise `Path` compare per entry. Because
+    /// [`Graph::merge_file_graph`] removes each re-merged file first, an
+    /// incremental re-index of a large cached graph degraded to
+    /// `O(files × all edges)` — observed as a multi-day single-threaded
+    /// spin on an 11 GB graph. Visiting only the keys that can hold
+    /// `path`'s edges makes a removal `O(edges-of-file)`.
+    ///
+    /// **Key-set invariant.** Every `adj` entry whose `file` equals
+    /// `path` lives under one of three keys:
+    /// 1. one of `path`'s own symbol ids (`symbol_ids`) — ordinary
+    ///    `Calls` and `Overrides` edges, whose `from` is the enclosing
+    ///    symbol's id;
+    /// 2. the file-path pseudo-key — the exact path string that
+    ///    [`Graph::merge_file_graph`] saw as `FileGraph.path`, used as
+    ///    `from` by file-scope call edges (C++ lambda at global scope,
+    ///    Go package-level closure fallback);
+    /// 3. [`Graph::adj_extra_keys`] for `path` — every remaining key,
+    ///    in practice `Inherits` edges keyed by the derived type name
+    ///    (`Derived`, `Foo<T>`), recorded at merge time and rebuilt
+    ///    after a cache load by [`Graph::rebuild_adj_extra_keys`].
+    ///
+    /// `radj` needs no key index of its own: every `radj` entry with
+    /// `file == path` is the mirror of one of the `adj` entries dropped
+    /// here, and its key is that entry's `target` — so the targets
+    /// collected while filtering forward are exactly the reverse keys to
+    /// scrub. Cross-file edges that merely *target* a symbol of `path`
+    /// carry their own file in `file` and are deliberately left alone;
+    /// [`Graph::prune_dangling_edges`] is the caller-driven pass for
+    /// those.
+    fn remove_edges_from_file(&mut self, path: &Path, symbol_ids: &[SymbolId]) {
+        let path_key = path.to_string_lossy().into_owned();
+        // Taken, not read: the file's residual keys describe the parse
+        // being removed, so they go away with it. `merge_file_graph`
+        // records the fresh set afterwards.
+        let extra_keys = self.adj_extra_keys.remove(path).unwrap_or_default();
+
+        // Reverse keys to scrub, gathered while filtering forward.
+        // Duplicates are harmless — a repeat visit finds the key already
+        // filtered or already gone.
+        let mut targets: Vec<SymbolId> = Vec::new();
+        for key in symbol_ids
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(path_key.as_str()))
+            .chain(extra_keys.iter().map(String::as_str))
+        {
+            let Some(entries) = self.adj.get_mut(key) else {
+                continue;
+            };
+            entries.retain(|e| {
+                if e.file == path {
+                    targets.push(e.target.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            // Keys whose vec becomes empty are dropped so `adj.len()`
+            // keeps reflecting active sources.
+            if entries.is_empty() {
+                self.adj.remove(key);
+            }
+        }
+
+        for target in targets {
+            let Some(entries) = self.radj.get_mut(&target) else {
+                continue;
+            };
             entries.retain(|e| e.file != path);
-            !entries.is_empty()
-        });
+            if entries.is_empty() {
+                self.radj.remove(&target);
+            }
+        }
+    }
+
+    /// Rebuild [`Graph::adj_extra_keys`] from the current `adj` map.
+    ///
+    /// A cache load assigns `adj`/`radj` wholesale, and the index is not
+    /// part of the on-disk format, so the load path calls this once to
+    /// restore the removal fast path for cached files. Without it the
+    /// first removal or re-merge of a cached file would leave its
+    /// type-name-keyed `Inherits` entries behind and then duplicate them
+    /// on merge.
+    ///
+    /// Cost: one pass over `adj` — the same order as the load that
+    /// produced the map, and paid once per load rather than per removed
+    /// file.
+    ///
+    /// A key is treated as derivable — and so left out of the index —
+    /// only when it is the file's own pseudo-key or a `<file>:…`-shaped
+    /// symbol id ([`code_graph_core::symbol_id`]) that still has a live
+    /// node. Anything else is recorded, including a `<file>:…`-shaped
+    /// key with no surviving node, so the rebuild errs toward listing
+    /// too much (cheap) rather than too little (a leak).
+    pub(crate) fn rebuild_adj_extra_keys(&mut self) {
+        let mut extras: HashMap<PathBuf, Vec<SymbolId>> = HashMap::new();
+        for (key, entries) in &self.adj {
+            for entry in entries {
+                if Self::key_is_derivable_from_file(key, &entry.file, &self.nodes) {
+                    continue;
+                }
+                extras
+                    .entry(entry.file.clone())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        for keys in extras.values_mut() {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        self.adj_extra_keys = extras;
+    }
+
+    /// Whether [`Graph::remove_edges_from_file`] reaches `key` for
+    /// `file` without consulting [`Graph::adj_extra_keys`]: the
+    /// file-path pseudo-key, or a `<file>:…`-shaped symbol id backed by
+    /// a live node.
+    fn key_is_derivable_from_file(key: &str, file: &Path, nodes: &HashMap<SymbolId, Node>) -> bool {
+        let file_key = file.to_string_lossy();
+        if key == file_key {
+            return true;
+        }
+        key.strip_prefix(file_key.as_ref())
+            .is_some_and(|rest| rest.starts_with(':') && nodes.contains_key(key))
     }
 
     /// Scrub every adjacency entry that points at a symbol in `removed_ids`.
@@ -503,6 +691,7 @@ impl Graph {
         self.files.clear();
         self.includes.clear();
         self.resolver_metadata.clear();
+        self.adj_extra_keys.clear();
         self.last_sweep_at = 0;
     }
 
@@ -925,6 +1114,261 @@ mod tests {
         assert!(!g.includes().contains_path(&path_a));
         assert!(!g.files().contains_path(&path_a));
         assert!(g.files().contains_path(PathBuf::from("/b.cpp")));
+    }
+
+    // --- Targeted edge removal (`remove_edges_from_file`) ---------------
+    //
+    // These pin the key-set invariant the targeted scrub relies on. The
+    // predecessor filtered every entry in `adj` and `radj` on each call,
+    // so it could not miss a key by construction; the fast path visits
+    // only the keys it can derive, and each test below covers one of the
+    // three key shapes (own symbol id, file-path pseudo-key, recorded
+    // residual type-name key).
+
+    #[test]
+    fn remove_file_scrubs_reverse_mirror_under_cross_file_target() {
+        // The `radj` half of the invariant: A's outbound call is stored
+        // twice — forward under `A:a_fn`, reverse under the *target*
+        // `B:b_fn`. Removing A must scrub both, and the reverse key it
+        // has to reach is keyed by a symbol that belongs to B, not A.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("a_fn", SymbolKind::Function, "/a.cpp")],
+            vec![call_edge("/a.cpp:a_fn", "/b.cpp:b_fn", "/a.cpp", 4)],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("b_fn", SymbolKind::Function, "/b.cpp")],
+            vec![call_edge("/b.cpp:b_fn", "/b.cpp:helper", "/b.cpp", 9)],
+        ));
+
+        // Sentinel: the reverse mirror exists before the removal, so a
+        // failure below is the scrub misbehaving rather than the merge
+        // never having recorded the edge.
+        assert_eq!(
+            g.radj()["/b.cpp:b_fn"]
+                .iter()
+                .filter(|e| e.file == Path::new("/a.cpp"))
+                .count(),
+            1,
+            "sentinel: A's call must be mirrored under B's symbol pre-removal"
+        );
+
+        g.remove_file(Path::new("/a.cpp"));
+
+        // Forward key gone with the file.
+        assert!(!g.adj().contains_key("/a.cpp:a_fn"));
+        // Reverse mirror under B's symbol carries no A-sourced entry.
+        // `/a.cpp` was that key's only contributor, so the key itself is
+        // dropped rather than left empty.
+        assert!(
+            g.radj()
+                .get("/b.cpp:b_fn")
+                .is_none_or(|v| v.iter().all(|e| e.file != Path::new("/a.cpp"))),
+            "reverse mirror of a removed file's edge must be scrubbed"
+        );
+        // B is untouched: its own symbol, edge, and reverse key survive.
+        assert!(g.nodes().contains_key("/b.cpp:b_fn"));
+        assert_eq!(g.adj()["/b.cpp:b_fn"][0].target, "/b.cpp:helper");
+        assert!(g.radj().contains_key("/b.cpp:helper"));
+    }
+
+    #[test]
+    fn remove_file_scrubs_file_scope_pseudo_key_edges() {
+        // C++ lambda-at-global-scope / Go package-level closure shape:
+        // the call has no enclosing symbol, so `from` is the file path
+        // itself and the file contributes zero symbols. The pseudo-key
+        // is the only way to reach that edge.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/m.cpp",
+            Language::Cpp,
+            vec![sym("m_fn", SymbolKind::Function, "/m.cpp")],
+            vec![],
+        ));
+        g.merge_file_graph(make_fg(
+            "/l.cpp",
+            Language::Cpp,
+            // No symbols at all — `symbol_ids` is empty for this file.
+            vec![],
+            vec![call_edge("/l.cpp", "/m.cpp:m_fn", "/l.cpp", 2)],
+        ));
+
+        // Sentinel: the pseudo-key edge landed where we think it did.
+        assert_eq!(g.adj()["/l.cpp"][0].target, "/m.cpp:m_fn");
+        assert!(g.radj().contains_key("/m.cpp:m_fn"));
+
+        g.remove_file(Path::new("/l.cpp"));
+
+        assert!(
+            !g.adj().contains_key("/l.cpp"),
+            "file-path pseudo-key must be scrubbed with the file"
+        );
+        assert!(
+            !g.radj().contains_key("/m.cpp:m_fn"),
+            "pseudo-key edge's reverse mirror must go too"
+        );
+        // The callee's own file is untouched.
+        assert!(g.nodes().contains_key("/m.cpp:m_fn"));
+        assert!(g.files().contains_path(PathBuf::from("/m.cpp")));
+    }
+
+    #[test]
+    fn remove_file_scrubs_inherits_edges_keyed_by_type_name() {
+        // `Inherits` edges are keyed by the derived TYPE NAME, not by a
+        // symbol id: `adj["Derived"]`, and `adj["Box<T>"]` for the
+        // generics-verbatim forms. Neither is derivable from
+        // `files[path].symbol_ids`, so they are only reachable through
+        // the recorded residual key set. A miss here would leave the
+        // edge behind and duplicate it on the next merge.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![
+                sym("Base", SymbolKind::Class, "/a.cpp"),
+                sym("Derived", SymbolKind::Class, "/a.cpp"),
+            ],
+            vec![
+                inherit_edge("Derived", "Base", "/a.cpp"),
+                // Generic form: no symbol carries this name at all.
+                inherit_edge("Box<T>", "Base", "/a.cpp"),
+            ],
+        ));
+        // A second file inheriting from the same base: its entries must
+        // survive, proving the scrub filters by `file` rather than
+        // dropping shared keys wholesale.
+        g.merge_file_graph(make_fg(
+            "/b.cpp",
+            Language::Cpp,
+            vec![sym("Other", SymbolKind::Class, "/b.cpp")],
+            vec![inherit_edge("Other", "Base", "/b.cpp")],
+        ));
+
+        // Sentinel: both type-name keys exist pre-removal.
+        assert!(g.adj().contains_key("Derived"));
+        assert!(g.adj().contains_key("Box<T>"));
+        assert_eq!(g.radj()["Base"].len(), 3);
+
+        g.remove_file(Path::new("/a.cpp"));
+
+        assert!(
+            !g.adj().contains_key("Derived"),
+            "bare type-name inherits key must be scrubbed"
+        );
+        assert!(
+            !g.adj().contains_key("Box<T>"),
+            "generics-verbatim inherits key must be scrubbed"
+        );
+        // The shared reverse key survives, holding only B's entry.
+        let base_in = g.radj().get("Base").expect("B still inherits from Base");
+        assert_eq!(base_in.len(), 1);
+        assert_eq!(base_in[0].target, "Other");
+        assert!(g.adj().contains_key("Other"));
+    }
+
+    #[test]
+    fn re_merge_replaces_inherits_edges_keyed_by_type_name() {
+        // Watch-mode reindex of a file whose class changes base. The
+        // type-name key is not a symbol id, so a removal that only
+        // consulted `symbol_ids` would accumulate one stale entry per
+        // re-merge instead of replacing it.
+        let mut g = Graph::new();
+        let first = make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("Derived", SymbolKind::Class, "/a.cpp")],
+            vec![inherit_edge("Derived", "Base", "/a.cpp")],
+        );
+        g.merge_file_graph(first.clone());
+        let baseline = g.stats();
+
+        // Same shape twice: counts must not grow.
+        g.merge_file_graph(first);
+        assert_eq!(
+            g.stats(),
+            baseline,
+            "re-merging an identical FileGraph must not duplicate inherits edges"
+        );
+        assert_eq!(g.adj()["Derived"].len(), 1);
+
+        // Now the base changes: the stale edge must be gone, not merely
+        // joined by the new one.
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("Derived", SymbolKind::Class, "/a.cpp")],
+            vec![inherit_edge("Derived", "Rebased", "/a.cpp")],
+        ));
+        assert_eq!(g.adj()["Derived"].len(), 1);
+        assert_eq!(g.adj()["Derived"][0].target, "Rebased");
+        assert!(
+            !g.radj().contains_key("Base"),
+            "reverse key of the abandoned base must be dropped"
+        );
+        assert!(g.radj().contains_key("Rebased"));
+        assert_eq!(g.stats().edges, 1);
+    }
+
+    #[test]
+    fn remove_unknown_path_leaves_graph_untouched() {
+        // Unknown-path removal stays a no-op for graph contents even
+        // though it now runs the targeted scrub (which probes the
+        // pseudo-key unconditionally).
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a.cpp",
+            Language::Cpp,
+            vec![sym("foo", SymbolKind::Function, "/a.cpp")],
+            vec![
+                call_edge("/a.cpp:foo", "/a.cpp:bar", "/a.cpp", 1),
+                inherit_edge("Derived", "Base", "/a.cpp"),
+            ],
+        ));
+        let before = g.stats();
+
+        g.remove_file(Path::new("/nowhere.cpp"));
+
+        assert_eq!(g.stats(), before);
+        assert!(g.adj().contains_key("/a.cpp:foo"));
+        assert!(g.adj().contains_key("Derived"));
+        assert!(g.files().contains_path(PathBuf::from("/a.cpp")));
+    }
+
+    #[test]
+    fn remove_files_under_scrubs_type_name_keys_per_dropped_file() {
+        // `remove_files_under` shares the same targeted scrub, driven by
+        // the `FileEntry` each `remove_subtree` pair hands back.
+        let mut g = Graph::new();
+        g.merge_file_graph(make_fg(
+            "/a/x.cpp",
+            Language::Cpp,
+            vec![sym("InA", SymbolKind::Class, "/a/x.cpp")],
+            vec![inherit_edge("InA", "Base", "/a/x.cpp")],
+        ));
+        g.merge_file_graph(make_fg(
+            "/b/z.cpp",
+            Language::Cpp,
+            vec![sym("InB", SymbolKind::Class, "/b/z.cpp")],
+            vec![inherit_edge("InB", "Base", "/b/z.cpp")],
+        ));
+
+        let removed = g.remove_files_under(Path::new("/a"));
+
+        assert!(removed.contains("/a/x.cpp:InA"));
+        assert!(
+            !g.adj().contains_key("InA"),
+            "dropped file's type-name key must be scrubbed"
+        );
+        // Out-of-subtree file keeps its edge and its share of the shared
+        // reverse key.
+        assert!(g.adj().contains_key("InB"));
+        let base_in = g.radj().get("Base").expect("B's inherits edge survives");
+        assert_eq!(base_in.len(), 1);
+        assert_eq!(base_in[0].target, "InB");
     }
 
     #[test]
