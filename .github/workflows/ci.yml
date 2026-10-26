@@ -61,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       # A snapshot test that diverged writes `*.snap.new` and fails above;
       # this catches the case where one was written without failing.
       # (Inline rather than `make snapshot-clean`: make is not guaranteed on
