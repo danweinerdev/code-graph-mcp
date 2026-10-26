@@ -57,6 +57,14 @@ jobs:
       - name: Disable CRLF conversion
         if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
+      # macOS's per-user TMPDIR (/var/folders/…/T/) is long enough that every
+      # test root's `.code-graph/daemon.sock` overflows the 104-byte sun_path
+      # limit, so the daemon degrades to TCP and every UDS-asserting test
+      # fails. /tmp (canonically /private/tmp) keeps them under the limit. The
+      # TCP fallback keeps its own coverage via the tests that force it.
+      - name: Use a short TMPDIR
+        if: runner.os == 'macOS'
+        run: echo "TMPDIR=/tmp" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
