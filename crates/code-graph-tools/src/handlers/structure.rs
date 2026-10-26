@@ -380,6 +380,12 @@ mod tests {
     /// ones (joined with the native separator), so fixtures asserting on
     /// concrete paths must use the native separator end-to-end or Windows
     /// diverges from the Unix-style literals.
+    ///
+    /// Subtree fixture roots are `/__cg_fixture_a`/`_b`, never short names like
+    /// `/a`: the `subtree` argument goes through `normalize_user_path`, which
+    /// canonicalizes against the REAL filesystem. GitHub's Windows runner checks
+    /// out under `D:\a\…`, so `\a` exists there, canonicalizes to `D:\a`, and
+    /// stops prefix-matching the in-memory fixture paths.
     fn native(p: &str) -> String {
         p.replace('/', std::path::MAIN_SEPARATOR_STR)
     }
@@ -482,42 +488,57 @@ mod tests {
     #[test]
     fn detect_cycles_subtree_filter_drops_cycles_outside_prefix() {
         // Two cycles: one entirely under /a, one entirely under /b.
-        // subtree="/a" should report only the /a cycle.
+        // subtree="/__cg_fixture_a" should report only the /a cycle.
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: native("/a/x.h"),
+            path: native("/__cg_fixture_a/x.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge(&native("/a/x.h"), &native("/a/y.h"))],
+            edges: vec![include_edge(
+                &native("/__cg_fixture_a/x.h"),
+                &native("/__cg_fixture_a/y.h"),
+            )],
         });
         g.merge_file_graph(FileGraph {
-            path: native("/a/y.h"),
+            path: native("/__cg_fixture_a/y.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge(&native("/a/y.h"), &native("/a/x.h"))],
+            edges: vec![include_edge(
+                &native("/__cg_fixture_a/y.h"),
+                &native("/__cg_fixture_a/x.h"),
+            )],
         });
         g.merge_file_graph(FileGraph {
-            path: native("/b/p.h"),
+            path: native("/__cg_fixture_b/p.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge(&native("/b/p.h"), &native("/b/q.h"))],
+            edges: vec![include_edge(
+                &native("/__cg_fixture_b/p.h"),
+                &native("/__cg_fixture_b/q.h"),
+            )],
         });
         g.merge_file_graph(FileGraph {
-            path: native("/b/q.h"),
+            path: native("/__cg_fixture_b/q.h"),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge(&native("/b/q.h"), &native("/b/p.h"))],
+            edges: vec![include_edge(
+                &native("/__cg_fixture_b/q.h"),
+                &native("/__cg_fixture_b/p.h"),
+            )],
         });
         let g = locked(g);
 
-        let subtree = native("/a");
+        let subtree = native("/__cg_fixture_a");
         let r = detect_cycles(&g, true, Some(&subtree), None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert_eq!(arr.len(), 1);
         assert_eq!(total, 1);
         let cycle = arr[0]["files"].as_array().unwrap();
         let names: Vec<&str> = cycle.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(names, vec![native("/a/x.h"), native("/a/y.h")]);
+        assert_eq!(
+            names,
+            vec![native("/__cg_fixture_a/x.h"), native("/__cg_fixture_a/y.h")]
+        );
 
         let r_all = detect_cycles(&g, true, None, None, None, None);
         let (arr_all, total_all, _, _) = page_parts(&r_all);
@@ -528,24 +549,24 @@ mod tests {
     #[test]
     fn detect_cycles_subtree_filter_drops_cross_subtree_cycle() {
         // One cycle that crosses the prefix boundary: /a/x → /b/y → /a/x.
-        // subtree="/a" should report zero cycles (every cycle must be
+        // subtree="/__cg_fixture_a" should report zero cycles (every cycle must be
         // ENTIRELY under the prefix to qualify).
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: "/a/x.h".to_string(),
+            path: "/__cg_fixture_a/x.h".to_string(),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/a/x.h", "/b/y.h")],
+            edges: vec![include_edge("/__cg_fixture_a/x.h", "/__cg_fixture_b/y.h")],
         });
         g.merge_file_graph(FileGraph {
-            path: "/b/y.h".to_string(),
+            path: "/__cg_fixture_b/y.h".to_string(),
             language: Language::Cpp,
             symbols: vec![],
-            edges: vec![include_edge("/b/y.h", "/a/x.h")],
+            edges: vec![include_edge("/__cg_fixture_b/y.h", "/__cg_fixture_a/x.h")],
         });
         let g = locked(g);
 
-        let r = detect_cycles(&g, true, Some("/a"), None, None, None);
+        let r = detect_cycles(&g, true, Some("/__cg_fixture_a"), None, None, None);
         let (arr, total, _, _) = page_parts(&r);
         assert!(arr.is_empty());
         assert_eq!(total, 0);
@@ -854,16 +875,16 @@ mod tests {
         let mut g = Graph::new();
         // /a/x.cpp: foo (orphan)
         g.merge_file_graph(FileGraph {
-            path: "/a/x.cpp".to_string(),
+            path: "/__cg_fixture_a/x.cpp".to_string(),
             language: Language::Cpp,
-            symbols: vec![sym("foo", SymbolKind::Function, "/a/x.cpp")],
+            symbols: vec![sym("foo", SymbolKind::Function, "/__cg_fixture_a/x.cpp")],
             edges: vec![],
         });
         // /b/y.cpp: bar (orphan)
         g.merge_file_graph(FileGraph {
-            path: "/b/y.cpp".to_string(),
+            path: "/__cg_fixture_b/y.cpp".to_string(),
             language: Language::Cpp,
-            symbols: vec![sym("bar", SymbolKind::Function, "/b/y.cpp")],
+            symbols: vec![sym("bar", SymbolKind::Function, "/__cg_fixture_b/y.cpp")],
             edges: vec![],
         });
         g
@@ -1466,7 +1487,7 @@ mod tests {
 
     #[test]
     fn orphans_subtree_filter_narrows_via_trie_iter_subtree() {
-        // Phase E payoff site: `get_orphans(subtree="/a")` should
+        // Phase E payoff site: `get_orphans(subtree="/__cg_fixture_a")` should
         // route through `Graph::orphans_under` and walk only the
         // path-trie subtree under `/a`. `foo` (under /a) is included;
         // `bar` (under /b) is excluded.
@@ -1475,7 +1496,7 @@ mod tests {
             &g,
             true,
             None,
-            Some("/a"),
+            Some("/__cg_fixture_a"),
             None,
             None,
             None,
@@ -1543,7 +1564,7 @@ mod tests {
             &g,
             true,
             None,
-            Some("/a"),
+            Some("/__cg_fixture_a"),
             None,
             None,
             None,

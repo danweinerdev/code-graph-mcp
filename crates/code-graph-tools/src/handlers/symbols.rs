@@ -1093,6 +1093,12 @@ mod tests {
     /// (joined with the native separator) against stored `Symbol.file`
     /// strings byte-for-byte, so subtree fixtures must use the native
     /// separator end-to-end or Windows never matches.
+    ///
+    /// Subtree fixture roots are `/__cg_fixture_a`/`_b`, never short names like
+    /// `/a`: the `subtree` argument goes through `normalize_user_path`, which
+    /// canonicalizes against the REAL filesystem. GitHub's Windows runner checks
+    /// out under `D:\a\…`, so `\a` exists there, canonicalizes to `D:\a`, and
+    /// stops prefix-matching the in-memory fixture paths.
     fn native(p: &str) -> String {
         p.replace('/', std::path::MAIN_SEPARATOR_STR)
     }
@@ -1103,15 +1109,23 @@ mod tests {
     fn graph_with_foos_in_two_subtrees() -> Graph {
         let mut g = Graph::new();
         g.merge_file_graph(FileGraph {
-            path: native("/a/x.cpp"),
+            path: native("/__cg_fixture_a/x.cpp"),
             language: Language::Cpp,
-            symbols: vec![sym_in("foo", SymbolKind::Function, &native("/a/x.cpp"))],
+            symbols: vec![sym_in(
+                "foo",
+                SymbolKind::Function,
+                &native("/__cg_fixture_a/x.cpp"),
+            )],
             edges: vec![],
         });
         g.merge_file_graph(FileGraph {
-            path: native("/b/y.cpp"),
+            path: native("/__cg_fixture_b/y.cpp"),
             language: Language::Cpp,
-            symbols: vec![sym_in("foo", SymbolKind::Function, &native("/b/y.cpp"))],
+            symbols: vec![sym_in(
+                "foo",
+                SymbolKind::Function,
+                &native("/__cg_fixture_b/y.cpp"),
+            )],
             edges: vec![],
         });
         g
@@ -1135,13 +1149,13 @@ mod tests {
 
     #[test]
     fn search_symbols_subtree_filter_narrows_via_trie_iter_subtree() {
-        // Phase E.3 (C) payoff site for search_symbols: a `subtree="/a"`
+        // Phase E.3 (C) payoff site for search_symbols: a `subtree="/__cg_fixture_a"`
         // query routes through `Graph::search`'s `subtree_files`
         // pre-walk (which uses `PathTrie::iter_subtree`) and matches
         // ONLY the /a symbol, not the /b one — even though both match
         // the regex.
         let g = locked(graph_with_foos_in_two_subtrees());
-        let subtree = native("/a");
+        let subtree = native("/__cg_fixture_a");
         let input = SearchSymbolsInput {
             query: Some("foo"),
             subtree: Some(&subtree),
@@ -1160,7 +1174,7 @@ mod tests {
         // brief/full fields the wire shape happens to expose.
         let sid = results[0]["id"].as_str().unwrap();
         assert!(
-            sid.starts_with(&native("/a/x.cpp")),
+            sid.starts_with(&native("/__cg_fixture_a/x.cpp")),
             "expected symbol from /a/x.cpp; got id={sid}"
         );
         assert_eq!(body["total"].as_u64().unwrap(), 1);
@@ -1182,7 +1196,7 @@ mod tests {
         // count_only would report graph-wide totals where the
         // materializing path reports subtree-scoped results.
         let g = locked(graph_with_foos_in_two_subtrees());
-        let subtree = native("/a");
+        let subtree = native("/__cg_fixture_a");
         let input = SearchSymbolsInput {
             query: Some("foo"),
             subtree: Some(&subtree),
