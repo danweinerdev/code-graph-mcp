@@ -1624,7 +1624,21 @@ impl DaemonMetadata {
 /// current executable. Including the byte length prevents simple prefix
 /// ambiguity; this is deliberately non-cryptographic and only separates local
 /// daemon build identities.
+///
+/// Computed once per process. Besides avoiding a full re-read of the binary
+/// on every call (a debug build is hundreds of MB), this keeps the identity
+/// bound to the image that is actually running: a rebuild that replaces the
+/// file at `current_exe()` mid-process must not change what this process
+/// reports about itself.
 fn executable_fingerprint() -> anyhow::Result<String> {
+    static FINGERPRINT: OnceLock<Result<String, String>> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| compute_executable_fingerprint().map_err(|error| format!("{error:#}")))
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+fn compute_executable_fingerprint() -> anyhow::Result<String> {
     let path = std::env::current_exe().context("locate current executable for daemon identity")?;
     let bytes = fs::read(&path).with_context(|| {
         format!(
@@ -1632,13 +1646,32 @@ fn executable_fingerprint() -> anyhow::Result<String> {
             path.display()
         )
     })?;
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let length = bytes.len();
-    for byte in (length as u64).to_le_bytes().into_iter().chain(bytes) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    Ok(fingerprint_bytes(&bytes))
+}
+
+/// FNV-style xor-multiply folded over little-endian 64-bit words (the final
+/// partial word zero-padded), seeded with the byte length. Word-at-a-time
+/// rather than byte-at-a-time because unoptimized test builds hash their own
+/// multi-hundred-MB executables on every daemon start and attach. The rotate
+/// feeds high bits back down; multiplication alone only carries upward.
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    fn mix(hash: u64, word: u64) -> u64 {
+        (hash ^ word)
+            .wrapping_mul(0x0000_0100_0000_01b3)
+            .rotate_left(29)
     }
-    Ok(format!("{length:016x}-{hash:016x}"))
+    let length = bytes.len();
+    let mut hash = mix(0xcbf2_9ce4_8422_2325, length as u64);
+    let (words, tail) = bytes.as_chunks::<8>();
+    for word in words {
+        hash = mix(hash, u64::from_le_bytes(*word));
+    }
+    if !tail.is_empty() {
+        let mut padded = [0_u8; 8];
+        padded[..tail.len()].copy_from_slice(tail);
+        hash = mix(hash, u64::from_le_bytes(padded));
+    }
+    format!("{length:016x}-{hash:016x}")
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3516,6 +3549,13 @@ mod tests {
         }
     }
 
+    /// Serializes Windows unit tests that bind this process's per-PID pipe
+    /// name (`\\.\pipe\code-graph-mcp-{pid}`). Every test in this binary
+    /// shares one PID, so two such tests running in parallel collide on the
+    /// name: `first_pipe_instance(true)` then fails with ACCESS_DENIED.
+    #[cfg(windows)]
+    static WINDOWS_PIPE_NAME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_root() -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -3791,12 +3831,13 @@ mod tests {
     }
 
     /// Windows forces TCP by occupying the daemon's per-PID pipe name rather
-    /// than planting a socket file. Safe against parallel in-process tests:
-    /// every other unit test calling `bind_listener` is unix/linux-gated, so
-    /// nothing else binds this process's pipe name on Windows.
+    /// than planting a socket file. Holds [`WINDOWS_PIPE_NAME`] because
+    /// `run_until_uses_the_idle_future_to_close_and_cleanup_the_listener` is
+    /// not platform-gated and binds the same pipe name.
     #[cfg(windows)]
     #[tokio::test]
     async fn tcp_fallback_metadata_is_loopback_only() {
+        let _pipe_name = WINDOWS_PIPE_NAME.lock().await;
         let endpoint = format!(r"\\.\pipe\code-graph-mcp-{}", std::process::id());
         let _occupied = tokio::net::windows::named_pipe::ServerOptions::new()
             .first_pipe_instance(true)
@@ -3919,6 +3960,24 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn fingerprint_separates_length_tail_and_high_bit_changes() {
+        let base = fingerprint_bytes(b"0123456789abcdef");
+        assert_eq!(base, fingerprint_bytes(b"0123456789abcdef"));
+        // Zero-padding the tail must not alias a genuinely longer input.
+        assert_ne!(fingerprint_bytes(b"abc"), fingerprint_bytes(b"abc\0"));
+        assert_ne!(base, fingerprint_bytes(b"0123456789abcdeF"));
+        // The same high bit flipped in two words must not cancel out.
+        let mut flipped = *b"0123456789abcdef";
+        flipped[7] ^= 0x80;
+        flipped[15] ^= 0x80;
+        assert_ne!(base, fingerprint_bytes(&flipped));
+        assert_eq!(
+            executable_fingerprint().unwrap(),
+            executable_fingerprint().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn graceful_shutdown_saves_only_the_active_cache_project_root() {
         let daemon_root = test_root();
@@ -3938,6 +3997,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_until_uses_the_idle_future_to_close_and_cleanup_the_listener() {
+        #[cfg(windows)]
+        let _pipe_name = WINDOWS_PIPE_NAME.lock().await;
         let root = test_root();
         let server = CodeGraphServer::new(code_graph_lang::LanguageRegistry::new());
         tokio::time::timeout(
