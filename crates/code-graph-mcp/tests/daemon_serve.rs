@@ -676,9 +676,14 @@ fn runtime_directory_dacl_is_restricted_to_the_invoking_user() {
         fields[2], "FA",
         "the single ACE grants full control: {sddl}"
     );
-    assert_eq!(
-        fields[5], sid,
-        "the ACE SID exactly matches the invoking user's `whoami /user` SID: {sddl}"
+    // SDDL renders a few well-known SIDs as two-letter aliases. The only one
+    // that can denote an invoking user is `LA`, the machine-local built-in
+    // Administrator (`S-1-5-21-<machine>-500`) — which is exactly the account
+    // GitHub's Windows runners execute as. Accept it for that SID only.
+    let is_local_administrator = sid.starts_with("S-1-5-21-") && sid.ends_with("-500");
+    assert!(
+        fields[5] == sid || (fields[5] == "LA" && is_local_administrator),
+        "the ACE SID exactly matches the invoking user's `whoami /user` SID {sid}: {sddl}"
     );
 
     stop_owned_daemon(&root.0, &metadata);
