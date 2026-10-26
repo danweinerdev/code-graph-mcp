@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Rust workspace. Minor/patch bumps are grouped into one weekly PR to keep
+  # review load down; majors arrive individually since they tend to need code
+  # changes. The `=`-pinned crates (tree-sitter grammars, rmcp) still get
+  # PRs: a grammar bump shifts the dogfood baselines (see CLAUDE.md, SHA bump
+  # protocol), so review those against `make dogfood-required`.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"
+
+  # Dogfood-baseline submodules are pinned to upstream tags on purpose and
+  # bumping one requires re-measuring its baseline in the same commit, so
+  # they are intentionally NOT tracked here (gitsubmodule ecosystem).
