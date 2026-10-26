@@ -1,0 +1,152 @@
+# Release on version bump. The version of record is `crates/code-graph-mcp`'s
+# `version`; when a push to main carries a version with no matching `v<version>`
+# tag, this builds both binaries (`code-graph-mcp`, `code-graph`) natively on
+# every target, then tags the pushed commit and publishes a GitHub release with
+# the archives and SHA-256 checksums attached.
+#
+# Native runners per target, no cross-compilation: the tree-sitter grammar
+# crates compile C through the host `cc`, and the workspace builds natively by
+# policy (CLAUDE.md, D-0004).
+#
+# Re-running is safe: an existing tag short-circuits the whole workflow.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/code-graph-mcp/Cargo.toml
+      - crates/code-graph-cli/Cargo.toml
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check-version:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.tag.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read version
+        run: |
+          read_version() {
+            sed -n 's/^version = "\(.*\)"$/\1/p' "crates/$1/Cargo.toml" | head -n1
+          }
+          mcp=$(read_version code-graph-mcp)
+          cli=$(read_version code-graph-cli)
+          if [ -z "$mcp" ]; then
+            echo "::error::could not read version from crates/code-graph-mcp/Cargo.toml"; exit 1
+          fi
+          # Both binaries ship in one archive under one version; refuse to
+          # publish a package whose two binaries disagree about it.
+          if [ "$mcp" != "$cli" ]; then
+            echo "::error::version mismatch: code-graph-mcp=$mcp code-graph-cli=$cli"; exit 1
+          fi
+          echo "version=$mcp" >> "$GITHUB_OUTPUT"
+      - id: tag
+        name: Check for existing tag
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists; nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$tag is new; releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check-version
+    if: needs.check-version.outputs.release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # ubuntu-22.04 rather than -latest: the binary links the runner's
+          # glibc, so the older image keeps it runnable on older distros.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, archive: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, archive: tar.gz }
+          - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binaries
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p code-graph-mcp -p code-graph-cli
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name="code-graph-mcp-v${{ needs.check-version.outputs.version }}-${{ matrix.target }}"
+          ext=""
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; fi
+          mkdir -p "dist/$name"
+          for bin in code-graph-mcp code-graph; do
+            cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$name/"
+          done
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            archive="$name.zip"
+            7z a -tzip "$archive" "$name" >/dev/null
+          else
+            archive="$name.tar.gz"
+            tar -czf "$archive" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Combine checksums
+        working-directory: dist
+        run: cat ./*.sha256 > SHA256SUMS
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.check-version.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes

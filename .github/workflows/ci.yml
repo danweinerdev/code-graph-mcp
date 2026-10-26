@@ -1,0 +1,92 @@
+# Pull-request gate: the `make verify` checks, split so the platform-
+# independent ones (clippy, rustfmt, pending snapshots, plugin-mirror
+# drift) run once on Linux while the test suite runs natively on all
+# three host platforms. Windows/macOS matter here: the daemon transports
+# (named pipes, UDS path limits), file locking, and `\\?\` path stripping
+# all fork per platform and are only exercised by native test runs.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Pending snapshots
+        run: make snapshot-clean
+      - name: Plugin mirrors in sync
+        run: make plugin-sync-check
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # Windows runners default to core.autocrlf=true, which would rewrite
+      # every fixture and snapshot to CRLF on checkout. Tests compare bytes
+      # and line offsets, so check out exactly what is committed.
+      - name: Disable CRLF conversion
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --locked
+      # A snapshot test that diverged writes `*.snap.new` and fails above;
+      # this catches the case where one was written without failing.
+      # (Inline rather than `make snapshot-clean`: make is not guaranteed on
+      # the Windows image.)
+      - name: Pending snapshots
+        shell: bash
+        run: |
+          pending=$(find crates -type f -name '*.snap.new')
+          if [ -n "$pending" ]; then
+            echo "::error::Pending insta snapshots:"; echo "$pending"; exit 1
+          fi
+
+  deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, bans licenses sources]
+    # New RustSec advisories land independently of any change in the PR, so
+    # they are reported but do not block merging. License, ban, and source
+    # policy is fully determined by the PR's Cargo.lock and does block.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
