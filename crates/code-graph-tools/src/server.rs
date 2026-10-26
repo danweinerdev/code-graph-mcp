@@ -2682,7 +2682,9 @@ impl ServerHandler for CodeGraphServer {
         // server identifies this application package instead; retain every
         // other default field so the initialize response shape is unchanged.
         info.server_info.version = self.server_version.to_owned();
-        info.capabilities = rmcp::model::ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
         info
     }
 }
