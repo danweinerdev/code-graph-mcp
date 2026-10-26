@@ -2060,14 +2060,17 @@ mod tests {
 
         let _ = analyze_codebase_async(inner.clone(), path, false).await;
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // Liveness bound only — the assertions below are about monotonicity,
+        // not speed. Loaded CI hosts oversleep each 10ms parse several-fold
+        // (a 3-vCPU macOS runner was seen at ~60ms/file), so leave headroom.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut parse_values: Vec<u32> = Vec::new();
         let mut all_samples: Vec<(u32, String)> = Vec::new();
         let final_status: String;
         loop {
             if Instant::now() >= deadline {
                 panic!(
-                    "progress test never reached terminal within 1s — \
+                    "progress test never reached terminal within 10s — \
                      20 × 10ms sequential parse should finish well inside this bound \
                      (parse samples observed: {} = {:?}; all samples: {:?})",
                     parse_values.len(),
